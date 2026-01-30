@@ -550,6 +550,97 @@ pub struct WorldState {
     // Workspace index integration (required)
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
 }
+
+/// Tracks client activity hints for revalidation prioritization (Requirement 15)
+#[derive(Debug, Clone, Default)]
+pub struct CrossFileActivityState {
+    /// Currently active document URI (if any)
+    pub active_uri: Option<Url>,
+    /// Currently visible document URIs
+    pub visible_uris: Vec<Url>,
+    /// Timestamp of last activity update (for ordering)
+    pub timestamp_ms: u64,
+    /// Most recently changed/opened URIs (fallback ordering)
+    pub recent_uris: Vec<Url>,
+}
+
+impl CrossFileActivityState {
+    /// Update activity state from client notification
+    pub fn update(&mut self, active_uri: Option<Url>, visible_uris: Vec<Url>, timestamp_ms: u64) {
+        self.active_uri = active_uri;
+        self.visible_uris = visible_uris;
+        self.timestamp_ms = timestamp_ms;
+    }
+
+    /// Record a document as recently changed/opened
+    pub fn record_recent(&mut self, uri: Url) {
+        // Remove if already present, then add to front
+        self.recent_uris.retain(|u| u != &uri);
+        self.recent_uris.insert(0, uri);
+        // Keep bounded
+        if self.recent_uris.len() > 100 {
+            self.recent_uris.truncate(100);
+        }
+    }
+
+    /// Get priority score for a URI (lower = higher priority)
+    pub fn priority_score(&self, uri: &Url) -> usize {
+        if Some(uri) == self.active_uri.as_ref() {
+            return 0; // Highest priority: active
+        }
+        if self.visible_uris.contains(uri) {
+            return 1; // Second priority: visible
+        }
+        // Fallback: position in recent list
+        self.recent_uris.iter().position(|u| u == uri).unwrap_or(usize::MAX)
+    }
+}
+
+/// Diagnostics publish gating to enforce monotonic publishing (Requirement 0.7, 0.8)
+#[derive(Debug, Clone, Default)]
+pub struct CrossFileDiagnosticsGate {
+    /// Last published document version per URI
+    last_published_version: HashMap<Url, i32>,
+    /// URIs that need forced republish (dependency-triggered, version unchanged)
+    force_republish: HashSet<Url>,
+}
+
+impl CrossFileDiagnosticsGate {
+    /// Check if diagnostics can be published for this version
+    /// Returns true if version is newer than last published, or if force republish is set
+    pub fn can_publish(&self, uri: &Url, version: i32) -> bool {
+        if self.force_republish.contains(uri) {
+            return true;
+        }
+        match self.last_published_version.get(uri) {
+            Some(&last) => version > last,
+            None => true,
+        }
+    }
+
+    /// Record that diagnostics were published for this version
+    pub fn record_publish(&mut self, uri: &Url, version: i32) {
+        self.last_published_version.insert(uri.clone(), version);
+        self.force_republish.remove(uri);
+    }
+
+    /// Mark a URI for forced republish (when dependency-driven changes occur
+    /// without changing the document version)
+    pub fn mark_force_republish(&mut self, uri: &Url) {
+        self.force_republish.insert(uri.clone());
+    }
+
+    /// Clear force republish flag (e.g., after successful publish)
+    pub fn clear_force_republish(&mut self, uri: &Url) {
+        self.force_republish.remove(uri);
+    }
+
+    /// Clear all state for a URI (e.g., when document is closed)
+    pub fn clear(&mut self, uri: &Url) {
+        self.last_published_version.remove(uri);
+        self.force_republish.remove(uri);
+    }
+}
 ```
 
 Notes:
@@ -671,26 +762,44 @@ pub fn revalidate_after_change_locked(
 /// against publishing stale results.
 ///
 /// IMPORTANT: publishing MUST be monotonic per document: do not publish diagnostics for
-/// an older document version than what has already been published.
+/// an older document version than what has already been published (Requirement 0.7).
 pub fn schedule_diagnostics_debounced(
     state_arc: Arc<tokio::sync::RwLock<WorldState>>,
     client: Client,
     trigger_uri: Url,
     mut affected: Vec<Url>,
     max_to_schedule: usize,
+    is_dependency_triggered: bool, // true if triggered by dependency change, not direct edit
 ) {
-    // Prioritization + cap (Requirement 0):
+    // Prioritization + cap (Requirement 0.9):
     // 1) Always schedule `trigger_uri` first.
-    // 2) If the client provides activity hints (see "Client Activity Signals (VS Code)"),
+    // 2) If the client provides activity hints (Requirement 15),
     //    prioritize active > visible > other open.
     // 3) Otherwise, fall back to most-recently-changed/opened ordering.
+    
+    // Read activity state for prioritization
+    let activity_state = {
+        let st = futures::executor::block_on(state_arc.read());
+        st.cross_file_activity.clone()
+    };
+    
     affected.sort_by_key(|u| {
         if *u == trigger_uri {
             return 0usize;
         }
-        // Placeholder: real implementation uses `state.cross_file_activity`.
-        1usize
+        // Use activity state for prioritization (Requirement 15)
+        activity_state.priority_score(u) + 1
     });
+
+    // Log if cap exceeded (Requirement 0.10)
+    if affected.len() > max_to_schedule {
+        log::trace!(
+            "Cross-file revalidation cap exceeded: {} affected, scheduling {}. \
+             Skipped documents will be revalidated on-demand.",
+            affected.len(),
+            max_to_schedule
+        );
+    }
 
     for uri in affected.into_iter().take(max_to_schedule) {
         // Determine the trigger version/hash now (freshness guard)
@@ -698,9 +807,10 @@ pub fn schedule_diagnostics_debounced(
         let state_arc2 = state_arc.clone();
         let client2 = client.clone();
         let uri2 = uri.clone();
+        let is_dep_triggered = is_dependency_triggered && uri != trigger_uri;
 
         tokio::spawn(async move {
-            // 1) Read trigger fingerprint/version
+            // 1) Read trigger fingerprint/version and mark force republish if needed
             let (debounce_ms, token, trigger_version) = {
                 let mut st = state_arc2.write().await;
                 let token = st.cross_file_revalidation.schedule(uri2.clone());
@@ -709,27 +819,51 @@ pub fn schedule_diagnostics_debounced(
                     .documents
                     .get(&uri2)
                     .and_then(|d| d.version); // Document Versioning (Required)
+                
+                // Mark for force republish if dependency-triggered (Requirement 0.8)
+                if is_dep_triggered {
+                    st.cross_file_diagnostics_gate.mark_force_republish(&uri2);
+                }
+                
                 (debounce_ms, token, trigger_version)
             };
 
-            // 2) Debounce / cancellation
+            // 2) Debounce / cancellation (Requirement 0.5)
             tokio::select! {
                 _ = token.cancelled() => { return; }
                 _ = tokio::time::sleep(Duration::from_millis(debounce_ms)) => {}
             }
 
-            // 3) Freshness guard: re-check current version before publishing
+            // 3) Freshness guard + monotonic publish check (Requirements 0.6, 0.7)
             let diagnostics_opt = {
                 let st = state_arc2.read().await;
                 let current_version = st.documents.get(&uri2).and_then(|d| d.version);
+                
+                // Check freshness: version must match trigger version
                 if current_version != trigger_version {
+                    log::trace!("Skipping stale diagnostics for {}: version changed", uri2);
                     return; // stale
                 }
+                
+                // Check monotonic publishing gate (Requirement 0.7)
+                if let Some(ver) = current_version {
+                    if !st.cross_file_diagnostics_gate.can_publish(&uri2, ver) {
+                        log::trace!("Skipping diagnostics for {}: monotonic gate", uri2);
+                        return;
+                    }
+                }
+                
                 Some(handlers::diagnostics(&st, &uri2))
             };
 
             if let Some(diagnostics) = diagnostics_opt {
                 client2.publish_diagnostics(uri2.clone(), diagnostics, None).await;
+                
+                // Record successful publish (Requirement 0.7)
+                let mut st = state_arc2.write().await;
+                if let Some(ver) = st.documents.get(&uri2).and_then(|d| d.version) {
+                    st.cross_file_diagnostics_gate.record_publish(&uri2, ver);
+                }
             }
 
             // 4) Mark completion (best-effort)
@@ -1193,6 +1327,24 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 **Validates: Requirements 2.1**
 
+### Property 47: Monotonic Diagnostic Publishing
+
+*For any* sequence of diagnostic publish attempts for a document, the server SHALL never publish diagnostics for a document version older than the most recently published version for that document.
+
+**Validates: Requirements 0.7**
+
+### Property 48: Force Republish on Dependency Change
+
+*For any* open document whose dependency-driven scope/diagnostic inputs change without changing its text document version, the server SHALL provide a mechanism to force republish updated diagnostics.
+
+**Validates: Requirements 0.8**
+
+### Property 49: Client Activity Signal Processing
+
+*For any* `rlsp/activeDocumentsChanged` notification received from the client, the server SHALL update its internal activity model and use it to prioritize subsequent cross-file revalidations.
+
+**Validates: Requirements 15.4, 15.5**
+
 
 ## Error Handling
 
@@ -1255,11 +1407,60 @@ Payload:
 - `visibleUris: string[]`
 - `timestampMs: number`
 
+### Notification Payload Structure
+
+```rust
+use serde::{Deserialize, Serialize};
+
+/// Payload for rlsp/activeDocumentsChanged notification (Requirement 15.3)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveDocumentsChangedParams {
+    /// The currently active document URI (or null if none)
+    #[serde(rename = "activeUri")]
+    pub active_uri: Option<String>,
+    /// The set of currently visible document URIs
+    #[serde(rename = "visibleUris")]
+    pub visible_uris: Vec<String>,
+    /// Client timestamp for ordering
+    #[serde(rename = "timestampMs")]
+    pub timestamp_ms: u64,
+}
+```
+
+### Server Notification Handler
+
+```rust
+/// Handle rlsp/activeDocumentsChanged notification (Requirements 15.4, 15.5)
+pub async fn handle_active_documents_changed(
+    state: Arc<tokio::sync::RwLock<WorldState>>,
+    params: ActiveDocumentsChangedParams,
+) {
+    let mut st = state.write().await;
+    
+    // Convert string URIs to Url, filtering invalid ones
+    let active_uri = params.active_uri
+        .and_then(|s| Url::parse(&s).ok());
+    let visible_uris: Vec<Url> = params.visible_uris
+        .into_iter()
+        .filter_map(|s| Url::parse(&s).ok())
+        .collect();
+    
+    // Update activity state
+    st.cross_file_activity.update(active_uri, visible_uris, params.timestamp_ms);
+    
+    log::trace!(
+        "Updated activity state: active={:?}, visible_count={}",
+        st.cross_file_activity.active_uri,
+        st.cross_file_activity.visible_uris.len()
+    );
+}
+```
+
 ### VS Code Extension Responsibilities
 
 The extension SHOULD:
-- send `rlsp/activeDocumentsChanged` when `vscode.window.onDidChangeActiveTextEditor` fires
-- send `rlsp/activeDocumentsChanged` when `vscode.window.onDidChangeVisibleTextEditors` fires
+- send `rlsp/activeDocumentsChanged` when `vscode.window.onDidChangeActiveTextEditor` fires (Requirement 15.1)
+- send `rlsp/activeDocumentsChanged` when `vscode.window.onDidChangeVisibleTextEditors` fires (Requirement 15.2)
 
 ### Server Responsibilities
 
@@ -1267,6 +1468,7 @@ The server SHALL:
 - record last-seen activity timestamp per URI
 - use these hints to prioritize revalidation scheduling: trigger first, then active, then visible, then other open
 - ignore URIs that are not currently open in the server
+- fall back to trigger-first + most-recently-changed ordering if client does not support these notifications (Requirement 15.5)
 
 ## Workspace Watching + Indexing (Required)
 
@@ -1369,10 +1571,17 @@ Unit tests focus on specific examples and edge cases:
    - Verify diagnostics fanout to open files
    - Test prioritization (trigger document first; then active/visible when hints are available)
    - Test cap enforcement and on-demand revalidation
+   - Test monotonic diagnostic publishing gate
+   - Test force republish mechanism for dependency-triggered changes
 
 6. **Configuration Tests**
    - Verify all default values match requirements
    - Test configuration change triggers re-resolution
+
+7. **Client Activity Signal Tests**
+   - Test activity state update from notifications
+   - Test priority scoring (active > visible > recent)
+   - Test fallback ordering when no activity hints available
 
 ### Property-Based Tests
 
@@ -1401,6 +1610,7 @@ Property-based tests verify universal properties across generated inputs. Each t
 - Properties 27-32: LSP feature integration
 - Properties 33-34: Configuration effects
 - Properties 35-46: Real-time updates and workspace watching
+- Properties 47-49: Monotonic publishing, force republish, and client activity signals
 
 ### Integration Tests
 
