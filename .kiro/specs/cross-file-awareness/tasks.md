@@ -44,31 +44,31 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - _Requirements: 0a.1-0a.4, 1.1-1.8, 2.1-2.7, 3.1-3.12_
 
 
-  - [ ]* 2.2 Write property test for backward directive synonym equivalence
+  - [ ] 2.2 Write property test for backward directive synonym equivalence
     - **Property 1: Backward Directive Synonym Equivalence**
     - **Validates: Requirements 1.1, 1.2, 1.3**
 
-  - [ ]* 2.3 Write property test for working directory directive synonyms
+  - [ ] 2.3 Write property test for working directory directive synonyms
     - **Property 2: Working Directory Directive Synonym Equivalence**
     - **Validates: Requirements 3.1-3.6**
 
-  - [ ]* 2.4 Write property test for workspace-root-relative path resolution
+  - [ ] 2.4 Write property test for workspace-root-relative path resolution
     - **Property 2a: Working Directory Path Resolution (Workspace-Root-Relative)**
     - **Validates: Requirements 3.9**
 
-  - [ ]* 2.5 Write property test for file-relative path resolution
+  - [ ] 2.5 Write property test for file-relative path resolution
     - **Property 2b: Working Directory Path Resolution (File-Relative)**
     - **Validates: Requirements 3.10**
 
-  - [ ]* 2.6 Write property test for directive serialization round-trip
+  - [ ] 2.6 Write property test for directive serialization round-trip
     - **Property 8: Directive Serialization Round-Trip**
     - **Validates: Requirements 14.1-14.4**
 
-  - [ ]* 2.7 Write property test for call site line parameter extraction
+  - [ ] 2.7 Write property test for call site line parameter extraction
     - **Property 9: Call Site Line Parameter Extraction**
     - **Validates: Requirements 1.6**
 
-  - [ ]* 2.8 Write property test for call site match parameter extraction
+  - [ ] 2.8 Write property test for call site match parameter extraction
     - **Property 10: Call Site Match Parameter Extraction**
     - **Validates: Requirements 1.7**
 
@@ -84,23 +84,23 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Mark `is_sys_source` flag appropriately
     - _Requirements: 4.1-4.8_
 
-  - [ ]* 3.2 Write property test for quote style equivalence
+  - [ ] 3.2 Write property test for quote style equivalence
     - **Property 3: Quote Style Equivalence for Source Detection**
     - **Validates: Requirements 4.1, 4.2**
 
-  - [ ]* 3.3 Write property test for named argument source detection
+  - [ ] 3.3 Write property test for named argument source detection
     - **Property 15: Named Argument Source Detection**
     - **Validates: Requirements 4.3**
 
-  - [ ]* 3.4 Write property test for sys.source detection
+  - [ ] 3.4 Write property test for sys.source detection
     - **Property 16: sys.source Detection**
     - **Validates: Requirements 4.4**
 
-  - [ ]* 3.5 Write property test for dynamic path graceful handling
+  - [ ] 3.5 Write property test for dynamic path graceful handling
     - **Property 17: Dynamic Path Graceful Handling**
     - **Validates: Requirements 4.5, 4.6**
 
-  - [ ]* 3.6 Write property test for source call parameter extraction
+  - [ ] 3.6 Write property test for source call parameter extraction
     - **Property 18: Source Call Parameter Extraction**
     - **Validates: Requirements 4.7, 4.8**
 
@@ -114,15 +114,15 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Implement `chdir=TRUE` working-directory override during child traversal (restore parent context after returning)
     - _Requirements: 1.8, 1.9, 3.9-3.12, 4.8_
 
-  - [ ]* 4.2 Write property test for relative path resolution
+  - [ ] 4.2 Write property test for relative path resolution
     - **Property 11: Relative Path Resolution**
     - **Validates: Requirements 1.8, 1.9, 3.9**
 
-  - [ ]* 4.3 Write property test for working directory inheritance
+  - [ ] 4.3 Write property test for working directory inheritance
     - **Property 13: Working Directory Inheritance**
     - **Validates: Requirements 3.11**
 
-  - [ ]* 4.4 Write property test for default working directory
+  - [ ] 4.4 Write property test for default working directory
     - **Property 14: Default Working Directory**
     - **Validates: Requirements 3.12**
 
@@ -145,23 +145,23 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Use `HashMap` with forward and backward indexes for efficient queries
     - _Requirements: 6.1-6.8_
 
-  - [ ]* 6.2 Write property test for dependency graph operations
+  - [ ] 6.2 Write property test for dependency graph operations
     - **Property 23: Dependency Graph Update on Change**
     - **Validates: Requirements 0.1, 0.2, 6.1, 6.2**
 
-  - [ ]* 6.3 Write property test for dependency graph edge removal
+  - [ ] 6.3 Write property test for dependency graph edge removal
     - **Property 25: Dependency Graph Edge Removal**
     - **Validates: Requirements 6.3, 13.3**
 
-  - [ ]* 6.4 Write property test for transitive dependency query
+  - [ ] 6.4 Write property test for transitive dependency query
     - **Property 26: Transitive Dependency Query**
     - **Validates: Requirements 6.4, 6.5**
 
-  - [ ]* 6.5 Write property test for edge deduplication
+  - [ ] 6.5 Write property test for edge deduplication
     - **Property 50: Edge Deduplication**
     - **Validates: Requirements 6.1, 6.2, 12.5**
 
-  - [ ]* 6.6 Write property test for directive-vs-AST conflict resolution
+  - [ ] 6.6 Write property test for directive-vs-AST conflict resolution
     - **Property 58: Directive Overrides AST For Same (from,to)**
     - **Validates: Requirements 6.8**
 
@@ -187,47 +187,47 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Use `ParentSelectionCache` for stable parent resolution
     - _Requirements: 5.1-5.10, 17.1-17.7_
 
-  - [ ]* 7.2 Write property test for local symbol precedence
+  - [ ] 7.2 Write property test for local symbol precedence
     - **Property 4: Local Symbol Precedence**
     - **Validates: Requirements 5.4, 7.3, 8.3, 9.2, 9.3**
 
-  - [ ]* 7.3 Write property test for backward-first resolution order
+  - [ ] 7.3 Write property test for backward-first resolution order
     - **Property 19: Backward-First Resolution Order**
     - **Validates: Requirements 5.1, 5.2**
 
-  - [ ]* 7.4 Write property test for call-site symbol filtering
+  - [ ] 7.4 Write property test for call-site symbol filtering
     - **Property 20: Call Site Symbol Filtering**
     - **Validates: Requirements 5.5**
 
-  - [ ]* 7.5 Write property test for default call site behavior
+  - [ ] 7.5 Write property test for default call site behavior
     - **Property 21: Default Call Site Behavior**
     - **Validates: Requirements 5.6**
 
-  - [ ]* 7.6 Write property test for maximum depth enforcement
+  - [ ] 7.6 Write property test for maximum depth enforcement
     - **Property 22: Maximum Depth Enforcement**
     - **Validates: Requirements 5.8**
 
-  - [ ]* 7.7 Write property test for position-aware symbol availability
+  - [ ] 7.7 Write property test for position-aware symbol availability
     - **Property 40: Position-Aware Symbol Availability**
     - **Validates: Requirements 5.3**
 
-  - [ ]* 7.8 Write property test for full position precision
+  - [ ] 7.8 Write property test for full position precision
     - **Property 51: Full Position Precision**
     - **Validates: Requirements 5.3, 7.1, 7.4**
 
-  - [ ]* 7.9 Write property test for circular dependency detection
+  - [ ] 7.9 Write property test for circular dependency detection
     - **Property 7: Circular Dependency Detection**
     - **Validates: Requirements 5.7, 10.6**
 
-  - [ ]* 7.10 Write property test for local=TRUE semantics
+  - [ ] 7.10 Write property test for local=TRUE semantics
     - **Property 52: Local Source Scope Isolation**
     - **Validates: Requirements 4.7, 5.3, 7.1, 10.1**
 
-  - [ ]* 7.11 Write property test for sys.source conservative handling
+  - [ ] 7.11 Write property test for sys.source conservative handling
     - **Property 53: sys.source Conservative Handling**
     - **Validates: Requirements 4.4**
 
-  - [ ]* 7.12 Write property test for v1 R symbol model
+  - [ ] 7.12 Write property test for v1 R symbol model
     - Generate files with mix of recognized and unrecognized constructs
     - Verify only v1-recognized constructs contribute to exported interface
     - Verify non-literal `assign()` does NOT suppress diagnostics
@@ -253,11 +253,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Schedule revalidation for all open documents on config change
     - _Requirements: 11.1-11.11_
 
-  - [ ]* 8.2 Write property test for configuration change re-resolution
+  - [ ] 8.2 Write property test for configuration change re-resolution
     - **Property 34: Configuration Change Re-resolution**
     - **Validates: Requirements 11.11**
 
-  - [ ]* 8.3 Write property test for undefined variables configuration
+  - [ ] 8.3 Write property test for undefined variables configuration
     - **Property 33: Undefined Variables Configuration**
     - **Validates: Requirements 11.9, 11.10**
 
@@ -277,11 +277,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Ensure minimal lock hold-time (compute outside lock, insert under lock)
     - _Requirements: 12.1-12.11_
 
-  - [ ]* 10.2 Write property test for scope cache invalidation on interface change
+  - [ ] 10.2 Write property test for scope cache invalidation on interface change
     - **Property 24: Scope Cache Invalidation on Interface Change**
     - **Validates: Requirements 0.3, 12.4, 12.5**
 
-  - [ ]* 10.3 Write property test for interface hash optimization
+  - [ ] 10.3 Write property test for interface hash optimization
     - **Property 39: Interface Hash Optimization**
     - **Validates: Requirements 12.11**
 
@@ -296,15 +296,15 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Generate ambiguous parent diagnostics when multiple parents found
     - _Requirements: 5.5, 5.6, 5.9, 5.10_
 
-  - [ ]* 11.2 Write property test for multiple source calls
+  - [ ] 11.2 Write property test for multiple source calls
     - **Property 37: Multiple Source Calls - Earliest Call Site**
     - **Validates: Requirements 5.9**
 
-  - [ ]* 11.3 Write property test for ambiguous parent determinism
+  - [ ] 11.3 Write property test for ambiguous parent determinism
     - **Property 38: Ambiguous Parent Determinism**
     - **Validates: Requirements 5.10**
 
-  - [ ]* 11.4 Write property test for parent selection stability
+  - [ ] 11.4 Write property test for parent selection stability
     - **Property 57: Parent Selection Stability**
     - **Validates: Requirements 5.10**
 
@@ -329,32 +329,32 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - _Requirements: 0.1-0.10, 15.1-15.5_
 
 
-  - [ ]* 12.2 Write property test for diagnostics fanout to open files
+  - [ ] 12.2 Write property test for diagnostics fanout to open files
     - **Property 35: Diagnostics Fanout to Open Files**
     - **Validates: Requirements 0.4, 13.4**
 
-  - [ ]* 12.3 Write property test for debounce cancellation
+  - [ ] 12.3 Write property test for debounce cancellation
     - **Property 36: Debounce Cancellation**
     - **Validates: Requirements 0.5**
 
-  - [ ]* 12.4 Write property test for freshness guard
+  - [ ] 12.4 Write property test for freshness guard
     - **Property 41: Freshness Guard Prevents Stale Diagnostics**
     - Verify freshness guard uses both version (when present) AND content hash/revision
     - **Validates: Requirements 0.6**
 
-  - [ ]* 12.5 Write property test for monotonic diagnostic publishing
+  - [ ] 12.5 Write property test for monotonic diagnostic publishing
     - **Property 47: Monotonic Diagnostic Publishing**
     - **Validates: Requirements 0.7**
 
-  - [ ]* 12.6 Write property test for force republish on dependency change
+  - [ ] 12.6 Write property test for force republish on dependency change
     - **Property 48: Force Republish on Dependency Change**
     - **Validates: Requirements 0.8**
 
-  - [ ]* 12.7 Write property test for revalidation prioritization
+  - [ ] 12.7 Write property test for revalidation prioritization
     - **Property 42: Revalidation Prioritization**
     - **Validates: Requirements 0.9**
 
-  - [ ]* 12.8 Write property test for revalidation cap enforcement
+  - [ ] 12.8 Write property test for revalidation cap enforcement
     - **Property 43: Revalidation Cap Enforcement**
     - **Validates: Requirements 0.9, 0.10**
 
@@ -396,11 +396,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Schedule diagnostics fanout for affected open documents
     - _Requirements: 13.1-13.4_
 
-  - [ ]* 14.5 Write property test for workspace index version monotonicity
+  - [ ] 14.5 Write property test for workspace index version monotonicity
     - **Property 44: Workspace Index Version Monotonicity**
     - **Validates: Requirements 13.5**
 
-  - [ ]* 14.6 Write property test for watched file cache invalidation
+  - [ ] 14.6 Write property test for watched file cache invalidation
     - **Property 45: Watched File Cache Invalidation**
     - **Validates: Requirements 13.2**
 
@@ -427,11 +427,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Prefer local definitions over inherited symbols
     - _Requirements: 7.1-7.4_
 
-  - [ ]* 16.2 Write property test for cross-file completion inclusion
+  - [ ] 16.2 Write property test for cross-file completion inclusion
     - **Property 27: Cross-File Completion Inclusion**
     - **Validates: Requirements 7.1, 7.4**
 
-  - [ ]* 16.3 Write property test for completion source attribution
+  - [ ] 16.3 Write property test for completion source attribution
     - **Property 28: Completion Source Attribution**
     - **Validates: Requirements 7.2**
 
@@ -443,7 +443,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Show effective definition when multiple definitions exist
     - _Requirements: 8.1-8.3_
 
-  - [ ]* 16.5 Write property test for cross-file hover information
+  - [ ] 16.5 Write property test for cross-file hover information
     - **Property 29: Cross-File Hover Information**
     - **Validates: Requirements 8.1, 8.2**
 
@@ -453,7 +453,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Handle shadowing (navigate to effective definition)
     - _Requirements: 9.1-9.3_
 
-  - [ ]* 16.7 Write property test for cross-file go-to-definition
+  - [ ] 16.7 Write property test for cross-file go-to-definition
     - **Property 30: Cross-File Go-to-Definition**
     - **Validates: Requirements 9.1**
 
@@ -469,19 +469,19 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Use configurable severity levels
     - _Requirements: 10.1-10.6_
 
-  - [ ]* 16.9 Write property test for diagnostic suppression
+  - [ ] 16.9 Write property test for diagnostic suppression
     - **Property 5: Diagnostic Suppression**
     - **Validates: Requirements 2.4, 2.5, 10.4, 10.5**
 
-  - [ ]* 16.10 Write property test for missing file diagnostics
+  - [ ] 16.10 Write property test for missing file diagnostics
     - **Property 6: Missing File Diagnostics**
     - **Validates: Requirements 1.10, 2.7, 10.2**
 
-  - [ ]* 16.11 Write property test for cross-file undefined variable suppression
+  - [ ] 16.11 Write property test for cross-file undefined variable suppression
     - **Property 31: Cross-File Undefined Variable Suppression**
     - **Validates: Requirements 10.1**
 
-  - [ ]* 16.12 Write property test for out-of-scope symbol warning
+  - [ ] 16.12 Write property test for out-of-scope symbol warning
     - **Property 32: Out-of-Scope Symbol Warning**
     - **Validates: Requirements 10.3**
 
@@ -508,7 +508,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Do NOT remove from dependency graph or metadata cache
     - _Requirements: 0.7, 0.8_
 
-  - [ ]* 18.4 Write property test for diagnostics gate cleanup on close
+  - [ ] 18.4 Write property test for diagnostics gate cleanup on close
     - **Property 54: Diagnostics Gate Cleanup on Close**
     - **Validates: Requirements 0.7, 0.8**
 
@@ -525,7 +525,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Log activity updates at trace level
     - _Requirements: 15.1-15.5_
 
-  - [ ]* 18.7 Write property test for client activity signal processing
+  - [ ] 18.7 Write property test for client activity signal processing
     - **Property 49: Client Activity Signal Processing**
     - **Validates: Requirements 15.4, 15.5**
 
@@ -604,7 +604,8 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
 - **Prerequisites (Task 0) are blocking** - must be completed before other tasks can proceed
 - Each task references specific requirements for traceability
 - Checkpoints ensure incremental validation
-- Property tests validate universal correctness properties (minimum 100 iterations each)
+- Property tests provide strong correctness guarantees across many randomly generated inputs
+- All tasks are now required for complete implementationy tests validate universal correctness properties (minimum 100 iterations each)
 - Unit tests validate specific examples and edge cases
 - Integration tests validate end-to-end LSP behavior
 - The implementation follows Rlsp coding style: no `bail!`, use `log::trace!`, explicit error returns
