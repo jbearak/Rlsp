@@ -112,6 +112,19 @@ impl LanguageServer for Backend {
         state.open_document(uri.clone(), &text, Some(version));
         // Record as recently opened for activity prioritization
         state.cross_file_activity.record_recent(uri.clone());
+        
+        // Update dependency graph with cross-file metadata
+        let meta = crate::cross_file::directive::parse_directives(&text);
+        let uri_clone = uri.clone();
+        state.cross_file_graph.update_file(&uri, &meta, |path| {
+            // Resolve path relative to the file
+            let file_path = uri_clone.to_file_path().ok()?;
+            let parent_dir = file_path.parent()?;
+            let resolved = parent_dir.join(path);
+            let canonical = resolved.canonicalize().ok()?;
+            Url::from_file_path(canonical).ok()
+        });
+        
         drop(state);
 
         self.publish_diagnostics(&uri).await;
@@ -132,6 +145,20 @@ impl LanguageServer for Backend {
             }
             // Record as recently changed for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
+            
+            // Update dependency graph with new cross-file metadata
+            if let Some(doc) = state.documents.get(&uri) {
+                let text = doc.text();
+                let meta = crate::cross_file::directive::parse_directives(&text);
+                let uri_clone = uri.clone();
+                state.cross_file_graph.update_file(&uri, &meta, |path| {
+                    let file_path = uri_clone.to_file_path().ok()?;
+                    let parent_dir = file_path.parent()?;
+                    let resolved = parent_dir.join(path);
+                    let canonical = resolved.canonicalize().ok()?;
+                    Url::from_file_path(canonical).ok()
+                });
+            }
             
             // Compute affected files from dependency graph
             let mut affected: Vec<Url> = vec![uri.clone()];
@@ -282,7 +309,7 @@ impl LanguageServer for Backend {
         log::trace!("Configuration changed, invalidating caches and scheduling revalidation");
         
         let open_uris: Vec<Url> = {
-            let mut state = self.state.write().await;
+            let state = self.state.write().await;
             
             // Invalidate all scope caches since config affects resolution
             state.cross_file_cache.invalidate_all();

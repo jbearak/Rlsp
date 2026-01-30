@@ -21,7 +21,8 @@ use crate::builtins;
 // ============================================================================
 
 /// Get cross-file symbols available at a position.
-/// This traverses the source() chain to include symbols from sourced files.
+/// This traverses the source() chain to include symbols from sourced files,
+/// and also includes symbols from parent files via backward directives.
 fn get_cross_file_symbols(
     state: &WorldState,
     uri: &Url,
@@ -57,7 +58,7 @@ fn get_cross_file_symbols(
     };
 
     let max_depth = state.cross_file_config.max_chain_depth;
-    let scope = scope::scope_at_position_with_deps(
+    let mut scope = scope::scope_at_position_with_deps(
         uri,
         line,
         column,
@@ -65,6 +66,34 @@ fn get_cross_file_symbols(
         &resolve_path,
         max_depth,
     );
+    
+    // Also include symbols from parent files via backward directives (Requirement 5.1)
+    // Get edges where this file is the child (callee)
+    let parent_edges = state.cross_file_graph.get_dependents(uri);
+    for edge in parent_edges {
+        // Skip local=TRUE edges (symbols not inherited)
+        if edge.local {
+            continue;
+        }
+        
+        // Get parent's artifacts
+        if let Some(parent_artifacts) = get_artifacts(&edge.from) {
+            // Determine call site position for filtering
+            let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
+            let call_site_col = edge.call_site_column.unwrap_or(u32::MAX);
+            
+            // Include parent symbols defined before the call site
+            for event in &parent_artifacts.timeline {
+                if let scope::ScopeEvent::Def { line: def_line, column: def_col, symbol } = event {
+                    if (*def_line, *def_col) <= (call_site_line, call_site_col) {
+                        // Parent symbols don't override local symbols
+                        scope.symbols.entry(symbol.name.clone()).or_insert_with(|| symbol.clone());
+                    }
+                }
+            }
+        }
+    }
+    
     scope.symbols
 }
 

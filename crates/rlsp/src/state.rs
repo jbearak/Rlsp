@@ -75,6 +75,7 @@ impl Document {
         self.loaded_packages = extract_loaded_packages(&self.tree, &text);
     }
 
+    #[allow(dead_code)]
     pub fn contents_hash(&self) -> u64 {
         self.revision
     }
@@ -388,6 +389,7 @@ pub struct WorldState {
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
+    #[allow(dead_code)]
     pub cross_file_parent_cache: ParentSelectionCache,
 }
 
