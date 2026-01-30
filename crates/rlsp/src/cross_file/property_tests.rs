@@ -1878,3 +1878,124 @@ proptest! {
         prop_assert!(artifacts.exported_interface.contains_key(&name));
     }
 }
+
+
+// ============================================================================
+// Property 5: Diagnostic Suppression
+// Validates: Requirements 2.4, 2.5, 10.4, 10.5
+// ============================================================================
+
+use super::directive::is_line_ignored;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 5: For any file containing @lsp-ignore on line n, no diagnostics
+    /// SHALL be emitted for line n.
+    #[test]
+    fn prop_diagnostic_suppression_ignore(
+        prefix_lines in 0..5u32
+    ) {
+        let mut lines = Vec::new();
+        for i in 0..prefix_lines {
+            lines.push(format!("x{} <- {}", i, i));
+        }
+        lines.push("# @lsp-ignore".to_string());
+        lines.push("undefined_var".to_string());
+        let content = lines.join("\n");
+
+        let meta = parse_directives(&content);
+
+        // The @lsp-ignore line itself should be ignored
+        prop_assert!(is_line_ignored(&meta, prefix_lines));
+    }
+
+    /// Property 5: For any file containing @lsp-ignore-next on line n, no diagnostics
+    /// SHALL be emitted for line n+1.
+    #[test]
+    fn prop_diagnostic_suppression_ignore_next(
+        prefix_lines in 0..5u32
+    ) {
+        let mut lines = Vec::new();
+        for i in 0..prefix_lines {
+            lines.push(format!("x{} <- {}", i, i));
+        }
+        lines.push("# @lsp-ignore-next".to_string());
+        lines.push("undefined_var".to_string());
+        let content = lines.join("\n");
+
+        let meta = parse_directives(&content);
+
+        // The line AFTER @lsp-ignore-next should be ignored
+        prop_assert!(is_line_ignored(&meta, prefix_lines + 1));
+        // The @lsp-ignore-next line itself should NOT be ignored
+        prop_assert!(!is_line_ignored(&meta, prefix_lines));
+    }
+}
+
+// ============================================================================
+// Property 12: Forward Directive Order Preservation
+// Validates: Requirements 2.4
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 12: For any file containing multiple @lsp-source directives,
+    /// the parsed ForwardSource list SHALL maintain the same order as they
+    /// appear in the document.
+    #[test]
+    fn prop_forward_directive_order_preservation(
+        file1 in path_component(),
+        file2 in path_component(),
+        file3 in path_component()
+    ) {
+        prop_assume!(file1 != file2 && file2 != file3 && file1 != file3);
+
+        let content = format!(
+            "# @lsp-source {}.R\n# @lsp-source {}.R\n# @lsp-source {}.R",
+            file1, file2, file3
+        );
+        let meta = parse_directives(&content);
+
+        prop_assert_eq!(meta.sources.len(), 3);
+        prop_assert_eq!(&meta.sources[0].path, &format!("{}.R", file1));
+        prop_assert_eq!(&meta.sources[1].path, &format!("{}.R", file2));
+        prop_assert_eq!(&meta.sources[2].path, &format!("{}.R", file3));
+
+        // Lines should be in order
+        prop_assert!(meta.sources[0].line < meta.sources[1].line);
+        prop_assert!(meta.sources[1].line < meta.sources[2].line);
+    }
+}
+
+// ============================================================================
+// Property 46: Forward Directive as Explicit Source
+// Validates: Requirements 2.1
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 46: For any file containing @lsp-source <path> at line N,
+    /// the Directive_Parser SHALL treat it as an explicit source() declaration at line N.
+    #[test]
+    fn prop_forward_directive_as_explicit_source(
+        path in relative_path(),
+        prefix_lines in 0..5u32
+    ) {
+        let mut lines = Vec::new();
+        for i in 0..prefix_lines {
+            lines.push(format!("x{} <- {}", i, i));
+        }
+        lines.push(format!("# @lsp-source {}", path));
+        let content = lines.join("\n");
+
+        let meta = parse_directives(&content);
+
+        prop_assert_eq!(meta.sources.len(), 1);
+        prop_assert_eq!(&meta.sources[0].path, &path);
+        prop_assert_eq!(meta.sources[0].line, prefix_lines);
+        prop_assert!(meta.sources[0].is_directive);
+    }
+}
