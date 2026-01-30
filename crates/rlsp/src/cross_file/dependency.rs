@@ -202,6 +202,34 @@ impl DependencyGraph {
             }
         }
     }
+
+    /// Detect cycles involving a URI. Returns the edge that creates the cycle back to `uri`.
+    pub fn detect_cycle(&self, uri: &Url) -> Option<DependencyEdge> {
+        let mut visited = HashSet::new();
+        self.detect_cycle_recursive(uri, uri, &mut visited)
+    }
+
+    fn detect_cycle_recursive(
+        &self,
+        start: &Url,
+        current: &Url,
+        visited: &mut HashSet<Url>,
+    ) -> Option<DependencyEdge> {
+        if visited.contains(current) {
+            return None;
+        }
+        visited.insert(current.clone());
+
+        for edge in self.get_dependencies(current) {
+            if &edge.to == start {
+                return Some(edge.clone());
+            }
+            if let Some(cycle_edge) = self.detect_cycle_recursive(start, &edge.to, visited) {
+                return Some(cycle_edge);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -369,5 +397,52 @@ mod tests {
 
         // utils should no longer have main as dependent
         assert!(graph.get_dependents(&utils).is_empty());
+    }
+
+    #[test]
+    fn test_detect_cycle_ab() {
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+
+        // a sources b at line 1
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, |p| {
+            if p == "b.R" { Some(b.clone()) } else { None }
+        });
+
+        // b sources a at line 2 (creates cycle)
+        let meta_b = make_meta_with_source("a.R", 2);
+        graph.update_file(&b, &meta_b, |p| {
+            if p == "a.R" { Some(a.clone()) } else { None }
+        });
+
+        // Cycle should be detected from a
+        let cycle = graph.detect_cycle(&a);
+        assert!(cycle.is_some());
+        let edge = cycle.unwrap();
+        assert_eq!(edge.from, b);
+        assert_eq!(edge.to, a);
+        assert_eq!(edge.call_site_line, Some(2));
+
+        // Cycle should also be detected from b
+        let cycle_b = graph.detect_cycle(&b);
+        assert!(cycle_b.is_some());
+    }
+
+    #[test]
+    fn test_no_cycle() {
+        let mut graph = DependencyGraph::new();
+        let a = url("a.R");
+        let b = url("b.R");
+
+        // a sources b (no cycle)
+        let meta_a = make_meta_with_source("b.R", 1);
+        graph.update_file(&a, &meta_a, |p| {
+            if p == "b.R" { Some(b.clone()) } else { None }
+        });
+
+        assert!(graph.detect_cycle(&a).is_none());
+        assert!(graph.detect_cycle(&b).is_none());
     }
 }

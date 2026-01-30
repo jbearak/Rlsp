@@ -283,6 +283,22 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     // Collect syntax errors (not suppressed by @lsp-ignore)
     collect_syntax_errors(tree.root_node(), &mut diagnostics);
 
+    // Check for circular dependencies
+    if let Some(cycle_edge) = state.cross_file_graph.detect_cycle(uri) {
+        let line = cycle_edge.call_site_line.unwrap_or(0);
+        let col = cycle_edge.call_site_column.unwrap_or(0);
+        let target = cycle_edge.to.path_segments().and_then(|s| s.last().map(|s| s.to_string())).unwrap_or_default();
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(line, col),
+                end: Position::new(line, col + 1),
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!("Circular dependency detected: sourcing '{}' creates a cycle", target),
+            ..Default::default()
+        });
+    }
+
     // Collect undefined variable errors if enabled in config
     if state.cross_file_config.undefined_variables_enabled {
         collect_undefined_variables_position_aware(
