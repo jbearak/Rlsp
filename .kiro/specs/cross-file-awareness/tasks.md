@@ -277,11 +277,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Ensure minimal lock hold-time (compute outside lock, insert under lock)
     - _Requirements: 12.1-12.11_
 
-  - [ ] 10.2 Write property test for scope cache invalidation on interface change
+  - [x] 10.2 Write property test for scope cache invalidation on interface change
     - **Property 24: Scope Cache Invalidation on Interface Change**
     - **Validates: Requirements 0.3, 12.4, 12.5**
 
-  - [ ] 10.3 Write property test for interface hash optimization
+  - [x] 10.3 Write property test for interface hash optimization
     - **Property 39: Interface Hash Optimization**
     - **Validates: Requirements 12.11**
 
@@ -296,7 +296,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Generate ambiguous parent diagnostics when multiple parents found
     - _Requirements: 5.5, 5.6, 5.9, 5.10_
 
-  - [ ] 11.2 Write property test for multiple source calls
+  - [x] 11.2 Write property test for multiple source calls
     - **Property 37: Multiple Source Calls - Earliest Call Site**
     - **Validates: Requirements 5.9**
 
@@ -396,7 +396,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Schedule diagnostics fanout for affected open documents
     - _Requirements: 13.1-13.4_
 
-  - [ ] 14.5 Write property test for workspace index version monotonicity
+  - [x] 14.5 Write property test for workspace index version monotonicity
     - **Property 44: Workspace Index Version Monotonicity**
     - **Validates: Requirements 13.5**
 
