@@ -32,6 +32,9 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 3. WHEN a document’s exported symbol interface changes OR its dependency edges change, THE LSP SHALL invalidate cross-file scope caches for all transitive dependents.
 4. WHEN a file is invalidated and is currently open, THE LSP SHALL recompute and publish diagnostics for that file without requiring the user to edit that file.
 5. IF multiple changes occur rapidly across files, THEN the LSP SHALL debounce revalidation and SHALL cancel outdated pending revalidations to avoid publishing stale diagnostics.
+6. BEFORE publishing diagnostics from any debounced/background task, THE LSP SHALL verify a freshness guard (document version and/or content hash) and SHALL NOT publish if the task is stale.
+7. WHEN invalidation affects many open documents, THE LSP SHALL prioritize revalidation (active document first, then other open documents) and SHALL cap the number of revalidations scheduled per trigger (configurable).
+8. WHEN the cap is exceeded, THE LSP SHALL log/trace that additional open documents were skipped for that trigger (best-effort) and SHALL revalidate skipped documents on-demand when they become active.
 
 ### Requirement 1: Backward Directive Parsing
 
@@ -42,7 +45,9 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 1. WHEN a file contains `# @lsp-sourced-by <path>`, THE Directive_Parser SHALL extract the path and associate it with the current file
 2. WHEN a file contains `# @lsp-run-by <path>`, THE Directive_Parser SHALL treat it equivalently to `@lsp-sourced-by`
 3. WHEN a file contains `# @lsp-included-by <path>`, THE Directive_Parser SHALL treat it equivalently to `@lsp-sourced-by`
-4. WHEN a backward directive includes `line=<number>`, THE Directive_Parser SHALL record the call site line number
+4. WHEN a backward directive includes `line=<number>`, THE Directive_Parser SHALL record the call site line number.
+   - The directive syntax SHALL interpret `line=` as a 1-based line number for user ergonomics.
+   - Internally, the LSP SHALL convert to 0-based lines to match LSP positions.
 5. WHEN a backward directive includes `match="<pattern>"`, THE Directive_Parser SHALL record the pattern for call site identification
 6. WHEN a directive path is relative, THE Path_Resolver SHALL resolve it relative to the current file's directory
 7. WHEN a directive path uses `..`, THE Path_Resolver SHALL correctly navigate parent directories
@@ -182,10 +187,12 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 3. THE Configuration SHALL support `crossFile.maxChainDepth` with default value 20
 4. THE Configuration SHALL support `crossFile.assumeCallSite` with values "end" or "start", defaulting to "end"
 5. THE Configuration SHALL support `crossFile.indexWorkspace` boolean, defaulting to true
-6. THE Configuration SHALL support severity settings for cross-file diagnostics
-7. THE Configuration SHALL support `diagnostics.undefinedVariables` boolean, defaulting to true, to enable or disable undefined variable diagnostics entirely
-8. WHEN `diagnostics.undefinedVariables` is false, THE Diagnostic_Engine SHALL not emit any undefined variable warnings
-9. WHEN configuration changes, THE LSP SHALL re-resolve scope chains for open documents
+6. THE Configuration SHALL support `crossFile.maxRevalidationsPerTrigger` integer, defaulting to 10
+7. THE Configuration SHALL support `crossFile.revalidationDebounceMs` integer, defaulting to 200
+8. THE Configuration SHALL support severity settings for cross-file diagnostics
+9. THE Configuration SHALL support `diagnostics.undefinedVariables` boolean, defaulting to true, to enable or disable undefined variable diagnostics entirely
+10. WHEN `diagnostics.undefinedVariables` is false, THE Diagnostic_Engine SHALL not emit any undefined variable warnings
+11. WHEN configuration changes, THE LSP SHALL re-resolve scope chains for open documents
 
 ### Requirement 12: Caching and Performance
 
@@ -199,15 +206,29 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 2. THE Cache SHALL store position-aware scope computation artifacts per file (e.g., exported interface + per-file timeline), not just a single flattened map.
 3. EACH cached entry SHALL be associated with a stable fingerprint/version that includes:
    - the file’s own document version/content hash
-   - the effective dependency edge set and call-site metadata used
-   - fingerprints of any upstream “exported interfaces” used
+   - the effective dependency edge set and call-site metadata used (including semantics-bearing edge fields like `local` and `chdir`)
+   - fingerprints of any upstream “exported interfaces” / upstream interfaces used
+   - the workspace index version (directly or indirectly) so cached results cannot outlive workspace index changes
 4. WHEN a file changes, THE Cache SHALL invalidate only affected entries.
 5. WHEN a dependency edge set changes (add/remove/modify call sites), THE Cache SHALL invalidate scope caches of all transitive dependents.
 6. THE Cache SHALL use lazy evaluation to avoid computing unused scopes.
 7. The cache design SHALL support concurrent reads and serialized writes without deadlocks.
 8. The LSP SHOULD use an interface-hash optimization: IF a file changes but its exported interface hash remains identical and its edge set remains identical, THEN dependent invalidation SHOULD be skipped.
 
-### Requirement 13: Directive Serialization
+### Requirement 13: Workspace Watching + Indexing (Required)
+
+**User Story:** As an R developer, I want cross-file scope and diagnostics to remain correct even when related files change on disk (including when those files are not open), so that the LSP does not depend on me opening every file to keep analysis fresh.
+
+#### Acceptance Criteria
+
+1. THE LSP SHALL register file watchers for relevant R files (at minimum `**/*.R` and `**/*.r`) so that changes are observed via `workspace/didChangeWatchedFiles`.
+2. WHEN a watched file is created or changed, THE LSP SHALL invalidate any disk-backed caches for that file and SHALL schedule a debounced workspace index update for that file.
+3. WHEN a watched file is deleted, THE Dependency_Graph SHALL remove all edges involving that file and THE LSP SHALL invalidate cross-file scope caches for open dependents.
+4. WHEN a watched file change affects the dependency graph (edges added/removed/modified) OR a watched file’s exported interface changes, THE LSP SHALL update diagnostics for affected open files without requiring the user to edit those files.
+5. The workspace index SHALL expose a monotonically increasing version counter that increments whenever it changes.
+6. The cross-file cache fingerprinting SHALL incorporate the workspace index version (directly or indirectly) so cached results cannot outlive workspace index changes.
+
+### Requirement 14: Directive Serialization
 
 **User Story:** As a developer, I want directive metadata to be serializable, so that it can be stored and transmitted efficiently.
 

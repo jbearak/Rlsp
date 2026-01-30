@@ -73,16 +73,23 @@ graph TB
 
 ### Data Flow
 
-1. **Document Change**: When a document is opened or modified, the Directive Parser and Source Detector extract cross-file metadata
-2. **Cache Update**: Parsed directives are stored in the Directive Cache; the Dependency Graph is updated
-3. **Invalidation**: Dependent scope caches are invalidated based on the Dependency Graph
-4. **Revalidation**: The Revalidation Engine schedules diagnostics updates for affected open files
-5. **Resolution**: LSP handlers query the Scope Resolver, which lazily computes scope chains using cached data
-6. **Response**: Handlers use resolved scope to provide completions, hover info, definitions, and diagnostics
+1. **In-memory document change**: When a document is opened or modified (`didOpen`/`didChange`), the Directive Parser and Source Detector extract cross-file metadata from the in-memory document contents.
+2. **Disk/workspace change**: When a file changes on disk (`workspace/didChangeWatchedFiles`), the server invalidates disk-backed caches/index entries for that URI/path and updates workspace indexing (see **Workspace Watching + Indexing (Required)**).
+3. **Cache update**: Parsed metadata is stored in the metadata cache; the Dependency Graph is updated.
+4. **Invalidation**: Dependent scope caches are invalidated based on the Dependency Graph.
+5. **Revalidation**: The Revalidation Engine schedules diagnostics updates for affected open files.
+6. **Resolution**: LSP handlers query the Scope Resolver, which lazily computes scope chains using cached data.
+7. **Response**: Handlers use resolved scope to provide completions, hover info, definitions, and diagnostics.
 
 ## Components and Interfaces
 
 ### Unified Cross-File Metadata Model (Single Source of Truth)
+
+#### Line Numbering Conventions (Required)
+
+- LSP positions are 0-based for `line` and `character`.
+- Directive syntax `line=` is 1-based for user ergonomics.
+- Internally, all stored line numbers in `CrossFileMetadata`, dependency edges, and scope artifacts MUST be 0-based.
 
 The implementation uses **one** structured representation for cross-file metadata (`CrossFileMetadata`) which is:
 - derived from document contents (directives + detected `source()` calls)
@@ -217,12 +224,31 @@ pub enum EdgeKind {
 }
 
 /// One call edge (a parent may source the same child multiple times).
+///
+/// The edge payload MUST include any fields that affect scope semantics so:
+/// - reverse-dep call-site inference can validate the relationship
+/// - scope resolution can apply correct inheritance rules
+/// - cache fingerprints are stable and complete
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyEdge {
     pub from: Url,
     pub to: Url,
     pub kind: EdgeKind,
+
+    /// 0-based line number in `from` where the call occurs (if known).
     pub call_site_line: Option<u32>,
+
+    /// `source(..., local=TRUE)` semantics.
+    pub local: bool,
+
+    /// `source(..., chdir=TRUE)` semantics.
+    pub chdir: bool,
+
+    /// True for sys.source() edges, false for source() edges.
+    pub is_sys_source: bool,
+
+    /// True if declared via @lsp-source directive, false if detected from AST.
+    pub is_directive: bool,
 }
 
 pub struct DependencyGraph {
@@ -255,6 +281,7 @@ The resolver exposes a single core query: **scope at a position**.
 
 ```rust
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tower_lsp::lsp_types::Url;
 
 #[derive(Debug, Clone)]
@@ -274,12 +301,37 @@ pub enum ScopeError {
     AmbiguousParents { parents: Vec<Url> },
 }
 
-/// A reusable per-file artifact: exported interface + "timeline" of scope-introducing events.
+/// A reusable per-file artifact: exported interface + a timeline of scope-introducing events.
+///
+/// IMPORTANT: call-site filtering correctness requires more than a final exported interface.
+/// Parents may introduce symbols via their own forward source() calls; children should only
+/// see the subset that is in-scope at the parent's call site.
 #[derive(Debug, Clone)]
 pub struct ScopeArtifacts {
+    /// Public surface used by dependents when importing this file wholesale.
     pub exported_interface: HashMap<String, ScopedSymbol>,
+
+    /// A deterministic, line-ordered event stream used to compute scope-at-line.
+    pub timeline: Vec<ScopeEvent>,
+
+    /// Stable hash of exported_interface AND any semantics-bearing aspects of the timeline.
     pub interface_hash: u64,
+
     pub errors: Vec<ScopeError>,
+}
+
+/// A scope-introducing event within a file.
+#[derive(Debug, Clone)]
+pub enum ScopeEvent {
+    /// A symbol definition introduced at a specific line.
+    Def { line: u32, symbol: ScopedSymbol },
+
+    /// A forward source edge introduced at a call site line.
+    /// The sourced file's interface becomes available strictly after `call_site_line`.
+    Source { call_site_line: u32, edge: DependencyEdge },
+
+    /// A working directory change that affects subsequent path resolution.
+    WorkingDirectory { line: u32, absolute_path: PathBuf },
 }
 
 /// A computed scope at a particular line.
@@ -300,8 +352,8 @@ pub trait ScopeResolver {
 ```
 
 Implementation notes:
-- `exported_interface` is the "public surface" dependents can import.
-- `scope_at_line` merges local defs + inherited interfaces gated by call-site ordering.
+- `timeline` MUST be sufficient to compute `scope_at_line(uri, N)` without accidentally including symbols introduced after N via forward sourcing.
+- `scope_at_line` merges local defs + inherited interfaces gated by call-site ordering, using the parent's own position-aware scope at the call site.
 - Both use call-site resolution ladder for backward directives (explicit → reverse deps → inference → default).
 
 
@@ -316,6 +368,13 @@ pub struct CrossFileConfig {
     pub max_chain_depth: usize,
     pub assume_call_site: CallSiteDefault,
     pub index_workspace: bool,
+
+    /// Max number of open documents to schedule for diagnostics revalidation per trigger.
+    pub max_revalidations_per_trigger: usize,
+
+    /// Debounce delay for cross-file diagnostics fanout.
+    pub revalidation_debounce_ms: u64,
+
     pub undefined_variables_enabled: bool,
     pub missing_file_severity: DiagnosticSeverity,
     pub circular_dependency_severity: DiagnosticSeverity,
@@ -336,6 +395,8 @@ impl Default for CrossFileConfig {
             max_chain_depth: 20,
             assume_call_site: CallSiteDefault::End,
             index_workspace: true,
+            max_revalidations_per_trigger: 10,
+            revalidation_debounce_ms: 200,
             undefined_variables_enabled: true,
             missing_file_severity: DiagnosticSeverity::WARNING,
             circular_dependency_severity: DiagnosticSeverity::ERROR,
@@ -358,10 +419,15 @@ use tower_lsp::lsp_types::Url;
 pub struct ScopeFingerprint {
     /// Hash of the file's own contents (or doc version mapped to a hash).
     pub self_hash: u64,
-    /// Hash of the dependency edge set (including call-site lines) used.
+
+    /// Hash of the dependency edge set used (including call-site lines and semantics-bearing edge fields).
     pub edges_hash: u64,
-    /// Hash of upstream exported interfaces used.
+
+    /// Hash of upstream exported interfaces / upstream scope artifacts used.
     pub upstream_interfaces_hash: u64,
+
+    /// Workspace index version to prevent stale reuse across index updates.
+    pub workspace_index_version: u64,
 }
 
 pub struct MetadataCache {
@@ -386,7 +452,16 @@ Implementation notes:
 
 ### Extended WorldState
 
-Rlsp already protects `WorldState` behind an async lock at the server boundary. The cross-file design must avoid nested blocking locks that can deadlock under load.
+Rlsp already protects `WorldState` behind an async lock at the server boundary (`Arc<tokio::sync::RwLock<WorldState>>`). This is a *good* fit for cross-file awareness: it enables concurrent read access from request handlers while serializing mutation.
+
+Key rule: **Never spawn background work that holds a borrowed `&mut WorldState`**. Background tasks must reacquire a fresh lock and must guard against publishing stale results.
+
+#### Document Versioning (Required)
+
+To support concurrent editing and to prevent publishing stale diagnostics:
+- Each open `Document` MUST store the LSP `TextDocumentItem.version` (monotonic per document while open).
+- Any debounced/background diagnostics task MUST capture a trigger version (or content hash) and MUST re-check it before publishing.
+- If the document is no longer open, tasks MUST no-op.
 
 ```rust
 /// Extended WorldState with cross-file support
@@ -405,10 +480,20 @@ pub struct WorldState {
     pub cross_file_graph: DependencyGraph,
     pub cross_file_cache: ArtifactsCache,
 
+    // Workspace/disk cache for closed files (used by scope resolution)
+    pub cross_file_file_cache: CrossFileFileCache,
+
     // Revalidation bookkeeping (debounce/cancellation keyed by URI)
     pub cross_file_revalidation: CrossFileRevalidationState,
+
+    // Workspace index integration (required)
+    pub cross_file_workspace_index: CrossFileWorkspaceIndex,
 }
 ```
+
+Notes:
+- `cross_file_file_cache` is the disk-backed cache used when resolving files that are not currently open.
+- `cross_file_workspace_index` is maintained via file watching and is used to keep closed-file information fresh and to reduce disk IO.
 
 
 ### Real-Time Cross-File Update System (Requirement 0)
@@ -417,13 +502,14 @@ The real-time update system ensures diagnostics, completions, hover, and definit
 
 #### Trigger Model (Diagnostics Fanout)
 
-When a document changes:
-1. **Metadata Update**: Extract `CrossFileMetadata` (directives + detected source() calls + working directory)
-2. **Graph Update**: Update `DependencyGraph` edges for the changed file
-3. **Change Detection**: Compute whether exported interface hash or edge set changed
-4. **Selective Invalidation**: If interface/edges changed, invalidate scope caches for all transitive dependents
-5. **Diagnostics Fanout**: Schedule diagnostics recomputation for affected **open** documents
-6. **Cancellation**: Cancel any outdated pending revalidations for the same files
+When a document changes (in-memory `didOpen`/`didChange` *or* on-disk `didChangeWatchedFiles`):
+1. **Metadata Update**: Extract `CrossFileMetadata` (directives + detected `source()` calls + working directory).
+2. **Graph Update**: Update `DependencyGraph` edges for the changed file.
+3. **Change Detection**: Compute whether the semantics-bearing exported interface hash or edge set changed.
+4. **Selective Invalidation**: If interface/edges changed, invalidate scope caches for all transitive dependents.
+5. **Diagnostics Fanout**: Schedule diagnostics recomputation for affected **open** documents.
+6. **Cancellation**: Cancel any outdated pending revalidations for the same files.
+7. **Freshness Guard (required)**: Before publishing diagnostics from a background task, verify the document version/hash still matches the triggering version/hash; otherwise do not publish.
 
 #### Debouncing and Cancellation
 
@@ -438,13 +524,17 @@ pub struct CrossFileRevalidationState {
     pending: HashMap<Url, CancellationToken>,
     /// Debounce delay in milliseconds
     debounce_ms: u64,
+
+    /// Max number of open documents to schedule per trigger.
+    max_revalidations_per_trigger: usize,
 }
 
 impl CrossFileRevalidationState {
-    pub fn new(debounce_ms: u64) -> Self {
+    pub fn new(debounce_ms: u64, max_revalidations_per_trigger: usize) -> Self {
         Self {
             pending: HashMap::new(),
             debounce_ms,
+            max_revalidations_per_trigger,
         }
     }
 
@@ -471,8 +561,10 @@ impl CrossFileRevalidationState {
 #### Revalidation Flow
 
 ```rust
-/// Revalidate a file and its dependents after a change
-pub async fn revalidate_after_change(
+/// Revalidate a file and its dependents after a change.
+///
+/// IMPORTANT: this runs under the server's write lock (mutating WorldState).
+pub fn revalidate_after_change_locked(
     state: &mut WorldState,
     changed_uri: &Url,
 ) -> Vec<Url> {
@@ -484,53 +576,92 @@ pub async fn revalidate_after_change(
     // 2. Update dependency graph
     state.cross_file_graph.update_file(changed_uri, &new_meta);
 
-    // 3. Compute if interface or edges changed
-    let old_hash = old_meta.map(|m| compute_interface_hash(&m));
+// 3. Compute if interface or edges changed (semantics-bearing)
+    let old_hash = old_meta.as_ref().map(|m| compute_interface_hash(m));
     let new_hash = compute_interface_hash(&new_meta);
     let interface_changed = old_hash != Some(new_hash);
 
+    let edges_changed = compute_edges_hash_from_meta(changed_uri, old_meta.as_ref())
+        != compute_edges_hash_from_meta(changed_uri, Some(&new_meta));
     // 4. Get affected files (transitive dependents)
     let mut affected = vec![changed_uri.clone()];
-    if interface_changed {
-        let dependents = state.cross_file_graph
-            .get_transitive_dependents(changed_uri, state.cross_file_config.max_chain_depth);
-        
-        // Invalidate caches for dependents
+    if interface_changed || edges_changed {
+        let dependents = state.cross_file_graph.get_transitive_dependents(
+            changed_uri,
+            state.cross_file_config.max_chain_depth,
+        );
+
         for dep in &dependents {
             state.cross_file_cache.invalidate(dep);
         }
         affected.extend(dependents);
     }
 
-    // 5. Filter to only open documents
+    // 5. Filter to only open documents (diagnostics are only pushed for open docs)
     affected.retain(|uri| state.documents.contains_key(uri));
 
     affected
 }
 
-/// Publish diagnostics for affected files with debouncing
-pub async fn publish_diagnostics_debounced(
-    state: &mut WorldState,
-    affected: Vec<Url>,
-    client: &Client,
+/// Publish diagnostics for affected files with debouncing.
+///
+/// IMPORTANT: background tasks must not capture `&mut WorldState`.
+/// Instead, they re-acquire state via `Arc<RwLock<WorldState>>` and must guard
+/// against publishing stale results.
+pub fn schedule_diagnostics_debounced(
+    state_arc: Arc<tokio::sync::RwLock<WorldState>>,
+    client: Client,
+    trigger_uri: Url,
+    mut affected: Vec<Url>,
+    max_to_schedule: usize,
 ) {
-    for uri in affected {
-        // Cancel any pending revalidation for this file
-        let token = state.cross_file_revalidation.schedule(uri.clone());
-        
-        // Spawn debounced task
-        let debounce_ms = state.cross_file_revalidation.debounce_ms;
+    // Prioritization + cap (Requirement 0):
+    // Always schedule `trigger_uri` first if present, then schedule remaining URIs.
+    affected.sort_by_key(|u| if *u == trigger_uri { 0usize } else { 1usize });
+
+    for uri in affected.into_iter().take(max_to_schedule) {
+        // Determine the trigger version/hash now (freshness guard)
+        // If we can't read the current version/hash, skip scheduling.
+        let state_arc2 = state_arc.clone();
+        let client2 = client.clone();
+        let uri2 = uri.clone();
+
         tokio::spawn(async move {
+            // 1) Read trigger fingerprint/version
+            let (debounce_ms, token, trigger_version) = {
+                let mut st = state_arc2.write().await;
+                let token = st.cross_file_revalidation.schedule(uri2.clone());
+                let debounce_ms = st.cross_file_revalidation.debounce_ms;
+                let trigger_version = st
+                    .documents
+                    .get(&uri2)
+                    .and_then(|d| d.version); // Document Versioning (Required)
+                (debounce_ms, token, trigger_version)
+            };
+
+            // 2) Debounce / cancellation
             tokio::select! {
-                _ = token.cancelled() => {
-                    // Cancelled by newer change, do nothing
-                }
-                _ = tokio::time::sleep(Duration::from_millis(debounce_ms)) => {
-                    // Debounce period passed, publish diagnostics
-                    let diagnostics = compute_diagnostics(&uri, state);
-                    client.publish_diagnostics(uri, diagnostics, None).await;
-                }
+                _ = token.cancelled() => { return; }
+                _ = tokio::time::sleep(Duration::from_millis(debounce_ms)) => {}
             }
+
+            // 3) Freshness guard: re-check current version before publishing
+            let diagnostics_opt = {
+                let st = state_arc2.read().await;
+                let current_version = st.documents.get(&uri2).and_then(|d| d.version);
+                if current_version != trigger_version {
+                    return; // stale
+                }
+                Some(handlers::diagnostics(&st, &uri2))
+            };
+
+            if let Some(diagnostics) = diagnostics_opt {
+                client2.publish_diagnostics(uri2.clone(), diagnostics, None).await;
+            }
+
+            // 4) Mark completion (best-effort)
+            let mut st = state_arc2.write().await;
+            st.cross_file_revalidation.complete(&uri2);
         });
     }
 }
@@ -568,7 +699,16 @@ pub fn resolve_multiple_source_calls(
 
 #### Ambiguous Parents (Requirement 5.10)
 
-When a file has multiple possible parents (multiple backward directives or multiple callers):
+When a file has multiple possible parents (multiple backward directives or multiple callers), selection MUST be deterministic and the precedence MUST be documented.
+
+Precedence (highest to lowest):
+1. Backward directive with explicit `line=`
+2. Backward directive with explicit `match=`
+3. Reverse-dependency edge (forward resolution) with known call site
+4. Backward directive / reverse edge without call site (uses inference/default)
+5. Deterministic tiebreak: lexicographic by URI
+
+A warning diagnostic SHOULD be emitted when multiple viable parents exist.
 
 ```rust
 /// Result of parent resolution
@@ -735,6 +875,8 @@ pub struct ScopeAtLine {
 
 *For any* directive or source() call referencing a non-existent file path, the Diagnostic_Engine SHALL emit exactly one warning diagnostic at the location of that reference.
 
+Clarification: "exactly one" means a single diagnostic per (file, line, referenced path) tuple. If the same missing path is referenced multiple times at different lines, each reference may produce its own diagnostic.
+
 **Validates: Requirements 1.8, 2.5, 10.2**
 
 ### Property 7: Circular Dependency Detection
@@ -747,7 +889,7 @@ pub struct ScopeAtLine {
 
 *For any* valid `CrossFileMetadata` structure, serializing to JSON and then deserializing SHALL produce an equivalent structure. This implies parsing is deterministic.
 
-**Validates: Requirements 13.3, 13.4**
+**Validates: Requirements 14.3, 14.4**
 
 ### Property 9: Call Site Line Parameter Extraction
 
@@ -986,10 +1128,68 @@ When traversal exceeds configured maximum depth:
 ### Ambiguous Parents
 
 When multiple parents are detected for a file:
-1. Deterministically select one parent (alphabetically by URI)
+1. Select a parent using the documented precedence order (explicit line/match first, then reverse edges, then deterministic tiebreak)
 2. Emit a warning diagnostic suggesting `line=` or `match=` to disambiguate
 3. Continue resolution with the selected parent
 
+
+## Workspace Watching + Indexing (Required)
+
+Cross-file awareness MUST remain correct when:
+- a dependent file is edited but not currently open
+- files are created/renamed/deleted on disk
+- open documents have unsaved in-memory changes while related files change on disk
+
+To achieve this, the server MUST implement workspace watcher + indexing integration similar to Sight.
+
+### Authoritative Sources (Required)
+
+1. If a file is currently open in the editor, its in-memory `Document` is authoritative.
+2. If a file is not open, the system uses:
+   - `cross_file_workspace_index` as the primary fast path for symbols/metadata, and
+   - `cross_file_file_cache` (disk read) as a fallback and/or to refresh index entries.
+
+### Watch Registration
+
+Register watched file patterns for relevant R project files (at minimum `**/*.R` and `**/*.r`, and optionally `**/*.Rprofile`, `**/*.Renviron`).
+
+### On File Changed/Created
+
+1. Invalidate disk-backed `cross_file_file_cache` entries for that file.
+2. Schedule a debounced workspace index update for that file in `cross_file_workspace_index`.
+3. If the changed file participates in the dependency graph (as a node or an edge endpoint), update dependency edges (best-effort) and schedule diagnostics fanout for affected open documents.
+
+### On File Deleted
+
+1. Remove the file from the dependency graph (remove all edges involving it).
+2. Invalidate caches that reference it.
+3. Emit missing-file diagnostics for open documents that reference it (via directives or `source()` calls).
+
+### Debounce + Yield
+
+During bulk changes, the indexer MUST debounce and MUST yield between work items so the server remains responsive.
+
+### Index Versioning
+
+The workspace index MUST have a monotonically increasing version counter that increments on modifications so scope fingerprints can include `workspace_index_version` where appropriate.
+
+### Workspace Index Contents (Required)
+
+`CrossFileWorkspaceIndex` MUST store enough information for cross-file scope resolution and diagnostics without requiring every dependent file to be open:
+- per-file extracted `CrossFileMetadata` (directives + resolvable forward sources)
+- per-file `ScopeArtifacts` (at least `exported_interface`, `timeline`, and `interface_hash`)
+- per-file bookkeeping: last indexed file timestamp/metadata (e.g., mtime + size) and last seen `workspace_index_version`
+
+The index is not required to be fully consistent at every instant, but it MUST be monotonic and MUST converge quickly after filesystem change events.
+
+### Disk File Cache (Required)
+
+`CrossFileFileCache` is the IO layer for closed files. It MUST:
+- read file contents from disk on-demand
+- cache by absolute path and file metadata (e.g., mtime + size)
+- be invalidated on `didChangeWatchedFiles`
+
+Scope resolution for a closed file SHOULD use `CrossFileWorkspaceIndex` when fresh; otherwise it SHOULD refresh via `CrossFileFileCache` and update the index entry.
 
 ## Testing Strategy
 
