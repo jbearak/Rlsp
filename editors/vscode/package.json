@@ -51,7 +51,8 @@
     "out/**",
     "bin/**",
     "node_modules/**",
-    "language-configuration.json"
+    "language-configuration.json",
+    "LICENSE"
   ],
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
