@@ -1549,21 +1549,36 @@ Cross-file awareness requires a stable definition of what the LSP considers a "d
 - exported interfaces (what a sourced file provides), and
 - timeline events (what becomes in-scope at a particular position).
 
-To keep the feature tractable and predictable, v1 scope tracking MUST use the following constrained model:
+To keep the feature tractable and predictable, v1 scope tracking MUST use the following constrained model.
 
-1. **Functions**
-- Top-level assignments of the form `name <- function(...) ...` and `name = function(...) ...` are treated as function definitions.
+#### 1) Functions
+Treat as function definitions:
+- Top-level assignments of the form `name <- function(...) ...` and `name = function(...) ...`.
+- Superassignment of the form `name <<- function(...) ...`.
+
+Notes:
 - For v1, the LSP may treat the signature as `function(...)` without attempting to infer parameter defaults.
 
-2. **Top-level variables**
-- Top-level assignments of the form `name <- <expr>` and `name = <expr>` are treated as variable definitions.
-- Assignments using `<<-`, `assign()`, `set()`, or other reflective/dynamic constructs are NOT treated as definitions in v1.
+#### 2) Variables
+Treat as variable definitions:
+- Top-level assignments of the form `name <- <expr>` and `name = <expr>`.
+- Superassignment of the form `name <<- <expr>`.
 
-3. **Namespace/exports are out of scope (v1)**
+#### 3) String-literal name assignment helpers
+These constructs are common in real R code and MUST be treated as definitions when the target name is statically known:
+
+- `assign("name", <expr>, ...)` is a definition of `name`.
+  - If the first argument is not a string literal (e.g., `assign(nm, ...)` or `assign(paste0("x", i), ...)`), it is NOT a definition in v1.
+  - `envir=` affects runtime semantics; for v1, `assign("name", ...)` still contributes a definition event, but the implementation MUST NOT assume it always targets `.GlobalEnv` unless `envir` is statically `.GlobalEnv`/`globalenv()` or omitted.
+
+- `set("name", <expr>, ...)` is treated like `assign()` ONLY when it matches a configured/recognized signature that assigns by string name.
+  - If `set()` cannot be confidently interpreted as assigning a symbol named by a string literal, it MUST be ignored for scope purposes.
+
+#### 4) Namespace/exports are out of scope (v1)
 - Package semantics (NAMESPACE exports/imports) are not part of cross-file awareness; they remain under existing workspace indexing.
 
-4. **Conservatism**
-- If a construct cannot be statically recognized as a definition (e.g., `assign(paste0("x", i), ...)`), it MUST be ignored for scope purposes and MUST NOT suppress undefined-variable diagnostics.
+#### 5) Conservatism
+- If a construct cannot be statically recognized as defining a specific name, it MUST be ignored for scope purposes and MUST NOT suppress undefined-variable diagnostics.
 
 This model MUST be documented (Requirement 16) so users understand which constructs contribute to cross-file scope.
 

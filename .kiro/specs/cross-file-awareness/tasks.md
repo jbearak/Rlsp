@@ -159,9 +159,15 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 4.7**
 
   - [ ] 7.8 Write property test for v1 R symbol model
-    - Generate files with a mix of top-level `name <- function(...)` / `name <- <expr>` definitions and dynamic constructs like `assign()`, `<<-`, and reflective calls.
-    - Verify only v1-recognized constructs contribute to exported interface and suppress undefined-variable diagnostics.
-    - **Validates: Requirements 17.1-17.6**
+    - Generate files with a mix of:
+      - top-level `name <- function(...)` / `name <- <expr>` definitions
+      - `name <<- <expr>` and `name <<- function(...)`
+      - `assign("name", <expr>)` (string literal)
+      - `assign(dynamic_name, <expr>)` and `assign(paste0(...), <expr>)` (non-literal)
+      - `set("name", <expr>)` where `set` is and is not recognized
+    - Verify only v1-recognized (statically name-resolvable) constructs contribute to exported interface and can suppress undefined-variable diagnostics.
+    - Verify non-literal `assign()` does NOT suppress diagnostics.
+    - **Validates: Requirements 17.1-17.7**
 
 - [ ] 8. Implement configuration
   - [ ] 8.1 Create `config.rs` with `CrossFileConfig` struct

@@ -348,8 +348,23 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 #### Acceptance Criteria
 
 1. The cross-file scope model SHALL define a constrained set of R constructs that are treated as symbol definitions in v1.
-2. The model SHALL, at minimum, treat top-level assignments `name <- function(...) ...` and `name = function(...) ...` as function definitions.
-3. The model SHALL, at minimum, treat top-level assignments `name <- <expr>` and `name = <expr>` as variable definitions.
-4. The model SHALL NOT treat dynamic/reflective constructs (including but not limited to `assign()`, `set()`, and `<<-`) as symbol definitions in v1.
-5. Undefined-variable diagnostics SHALL NOT be suppressed based on constructs that are not recognized as definitions by the v1 model.
-6. The README.md SHALL document this v1 symbol model and its limitations.
+
+2. The model SHALL treat the following as function definitions when the assigned name is statically known:
+   - `name <- function(...) ...`
+   - `name = function(...) ...`
+   - `name <<- function(...) ...`
+
+3. The model SHALL treat the following as variable definitions when the assigned name is statically known:
+   - `name <- <expr>`
+   - `name = <expr>`
+   - `name <<- <expr>`
+
+4. The model SHALL treat `assign("name", <expr>, ...)` as a definition of `name`.
+   - If the name argument is not a string literal, it SHALL NOT be treated as a definition in v1.
+   - `envir=` affects runtime behavior; unless `envir` is statically `.GlobalEnv`/`globalenv()` or omitted, the implementation MUST be conservative about using that definition for cross-file suppression.
+
+5. The model MAY treat `set("name", <expr>, ...)` as a definition ONLY when the implementation can confidently interpret it as assigning a symbol named by a string literal (e.g., via a configured/recognized signature). Otherwise it SHALL be ignored for scope purposes.
+
+6. Undefined-variable diagnostics SHALL NOT be suppressed based on constructs that are not recognized as definitions by the v1 model.
+
+7. The README.md SHALL document this v1 symbol model and its limitations.
