@@ -7,6 +7,7 @@
 
 mod backend;
 mod builtins;
+mod cross_file;
 mod handlers;
 mod help;
 mod r_env;
