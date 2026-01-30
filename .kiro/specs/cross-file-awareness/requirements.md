@@ -280,7 +280,9 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 6. THE Cache SHALL use lazy evaluation to avoid computing unused scopes.
 7. The cache design SHALL support concurrent reads and serialized writes without deadlocks.
 8. The implementation SHALL NOT perform blocking disk I/O while holding the Tokio `WorldState` lock (read or write). If disk reads are needed, they SHALL be performed via `tokio::fs` or `tokio::task::spawn_blocking`, and results MUST be rechecked for freshness before publishing diagnostics.
-9. The LSP SHOULD use an interface-hash optimization: IF a file changes but its exported interface hash remains identical and its edge set remains identical, THEN dependent invalidation SHOULD be skipped.
+9. The implementation SHOULD centralize cross-file reads behind a single File Content Provider abstraction with precedence: open document contents > fresh workspace index snapshot > async disk read.
+10. The LSP SHOULD cache resolved scope queries (e.g., `scope_at_position`) with cache keys incorporating a stable fingerprint so high-frequency LSP requests (completion/hover) do not repeatedly traverse long source chains.
+11. The LSP SHOULD use an interface-hash optimization: IF a file changes but its exported interface hash remains identical and its edge set remains identical, THEN dependent invalidation SHOULD be skipped.
 
 ### Requirement 13: Workspace Watching + Indexing (Required)
 

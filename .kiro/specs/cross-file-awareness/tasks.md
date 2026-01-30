@@ -20,6 +20,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
 - [ ] 2. Implement directive parser
   - [ ] 2.1 Create `directive.rs` with `CrossFileExtractor` trait
     - Implement regex-based directive parsing
+    - Ensure cross-file call-site resolution (`match=` validation/inference) reads parent content via a File Content Provider (open document > index snapshot > async disk)
     - Support all backward directive synonyms (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`)
     - Support all working directory directive synonyms
     - Support forward directives (`@lsp-source`)
@@ -77,7 +78,8 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Handle `..` navigation correctly
     - Implement working directory inheritance from parent files
     - Implement effective working directory computation
-    - _Requirements: 1.6, 1.7, 3.7, 3.8, 3.9, 3.10_
+    - Implement `chdir=TRUE` working-directory override during child traversal (restore parent context after returning)
+    - _Requirements: 1.6, 1.7, 3.7, 3.8, 3.9, 3.10, 4.8_
 
   - [ ] 4.2 Write property test for path resolution
     - **Property 13: Path Resolution Correctness**
@@ -195,6 +197,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Implement `MetadataCache` with interior mutability (`RwLock<HashMap>`)
     - Implement `ArtifactsCache` with interior mutability
     - Implement `ParentSelectionCache` with interior mutability
+    - Implement a bounded `ScopeQueryCache` for `scope_at_position` (keyed by `(uri, position bucket, ScopeFingerprint)`)
     - Implement `get_if_fresh()`, `insert()`, `invalidate()` methods
     - Ensure minimal lock hold-time (compute outside lock, insert under lock)
     - _Requirements: 12.1-12.8_

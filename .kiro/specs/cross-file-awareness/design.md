@@ -293,6 +293,23 @@ Backward directives require identifying where the parent sourced the child. Reso
 
 This mirrors Sight's robustness and is necessary to avoid defaulting too often.
 
+#### File Content Provider + I/O Rules (Critical)
+
+Several operations require reading *other* files (e.g., resolving `match=` against a parent, validating `line=` against parent contents, and performing text inference in a parent).
+
+To keep cross-file analysis correct during concurrent editing, and to avoid deadlocks/latency spikes, all cross-file file reads MUST go through a single abstraction with a clear precedence order:
+
+- If the target URI is open in the editor, use the in-memory `Document` contents.
+- Else if a workspace index entry exists and is fresh (per `FileSnapshot`), use the indexed snapshot/artifacts.
+- Else read from disk asynchronously (via `tokio::fs` or `tokio::task::spawn_blocking`).
+
+**Locking invariants:**
+- The implementation MUST NOT perform blocking disk I/O while holding the Tokio `WorldState` lock (read or write).
+- Functions invoked under the server write lock (e.g., `DependencyGraph::update_file`, `revalidate_after_change_locked`) MUST treat cross-file reads as *lazy*: record unresolved intent (e.g., `CallSiteSpec::Match`) and defer parent scanning to resolution-time code paths that can safely perform async I/O.
+- Any async read of a closed file that contributes to diagnostics published for an open file MUST be rechecked for freshness before publishing (the same freshness model as diagnostics tasks).
+
+This invariant is required so that multi-file edits + dependency-triggered revalidation cannot stall the server or publish results derived from stale disk contents.
+
 ### Source Detection (part of CrossFileExtractor)
 
 Detects `source()` and `sys.source()` calls in R code using tree-sitter.
@@ -344,6 +361,16 @@ In R, `source(..., local=TRUE)` evaluates the sourced file in a new local enviro
 
 Resolves relative paths to absolute paths considering working directory context.
 
+#### `chdir=TRUE` Semantics (Required)
+
+R's `source(..., chdir=TRUE)` temporarily sets the working directory to the directory containing the sourced file while evaluating it.
+
+Cross-file behavior MUST model this deterministically for path resolution inside the sourced file:
+- When a `ForwardSource` edge has `chdir=true`, the child file's effective inherited working directory for resolving *its own* relative `source()` calls is the child's directory for the duration of that child's scope traversal.
+- After returning from the child during scope traversal, the parent's working directory context is restored.
+
+This rule affects only relative path resolution and MUST NOT change symbol-inheritance semantics (those are governed by `local=...` / `sys.source(..., envir=...)`).
+
 ```rust
 /// Context for path resolution
 #[derive(Debug, Clone)]
@@ -372,9 +399,18 @@ Key properties:
 - Stores enough metadata to support backward call-site resolution via reverse deps.
 - Uses canonicalized URIs/paths to avoid duplicate nodes for the same file.
 - **Uses forward edges only as the canonical representation.** Backward directives are inputs used to infer/confirm forward edges, not separate edges in the graph. This prevents double-triggering invalidation and double-emitting diagnostics.
-- **Directive vs AST Conflict Policy (Required):** If both `@lsp-source` directives and AST detection produce edges to the same resolved target URI but disagree on call site position or edge flags, the implementation MUST resolve the conflict deterministically:
-  - If any `@lsp-source` directive exists for a `(from_uri, to_uri)` pair, it SHALL be treated as authoritative for that `(from,to)` pair. AST-derived edges to the same `to_uri` from that `from_uri` SHALL NOT create additional semantic edges.
-  - The server SHOULD emit a warning diagnostic on the directive line when it suppresses an AST-derived edge due to disagreement (to help users keep directives and code consistent).
+- **Directive vs AST Conflict Policy (Required):** If both `@lsp-source` directives and AST detection produce edges to the same resolved target URI but disagree on call site position or edge flags, the implementation MUST resolve the conflict deterministically.
+
+  **Call-site-aware override (preferred):**
+  - If an `@lsp-source` directive exists that resolves to the same `(from_uri, to_uri)` and has a known call site position, it SHALL override an AST-derived edge only for the matching call site (same `(line, column)`), replacing call-site metadata/flags with the directive's semantics.
+  - AST-derived edges for other call sites (same `(from,to)` but different call site positions) MUST be retained.
+
+  **Fallback override (when call site is unknown):**
+  - If an `@lsp-source` directive exists for a `(from_uri, to_uri)` pair but does NOT have a usable call site position, the directive SHALL be treated as authoritative for that `(from,to)` pair and AST-derived edges to the same `to_uri` from that `from_uri` SHALL NOT create additional semantic edges.
+  - This behavior MUST be documented as a limitation: a call-site-less directive may suppress additional AST-derived call sites for the same target.
+
+  In all cases:
+  - The server SHOULD emit a warning diagnostic on the directive line when it suppresses or replaces an AST-derived edge due to disagreement (to help users keep directives and code consistent).
   - Provenance (directive vs AST) is retained for debugging, but does not multiply semantic edges.
 
 ```rust
@@ -675,7 +711,14 @@ pub fn on_configuration_changed(state: &mut WorldState, new_config: CrossFileCon
 
 ### Cache Structures (Versioned)
 
-Caches must be versioned/fingerprinted so concurrent edits cannot reuse stale cross-file state. Caches use interior mutability to allow population during read operations (see Issue 9 in Design Review Fixes).
+Caches must be versioned/fingerprinted so concurrent edits cannot reuse stale cross-file state.
+
+In addition to caching per-file artifacts (`ScopeArtifacts`), the implementation SHOULD cache *resolved scope queries* to keep completions/hover/diagnostics fast:
+- Add a bounded cache for `scope_at_position(uri, line, character)` results.
+- Cache keys MUST incorporate a `ScopeFingerprint` (or equivalent) so cached scopes cannot outlive any relevant change.
+- The cache MAY bucket positions (e.g., by timeline index or line) but MUST preserve correctness for same-line precision.
+
+Caches use interior mutability to allow population during read operations (see Issue 9 in Design Review Fixes).
 
 ```rust
 use parking_lot::RwLock;
