@@ -85,6 +85,30 @@ source("a.R")  # Symbols from a.R available after this line
 y <- foo()     # foo() from a.R is now in scope
 ```
 
+### Symbol Recognition (v1 Model)
+
+The LSP recognizes the following R constructs as symbol definitions:
+
+**Function definitions:**
+- `name <- function(...) ...`
+- `name = function(...) ...`
+- `name <<- function(...) ...`
+
+**Variable definitions:**
+- `name <- <expr>`
+- `name = <expr>`
+- `name <<- <expr>`
+
+**String-literal assign():**
+- `assign("name", <expr>)` - only when the name is a string literal
+
+**Limitations:**
+- Dynamic `assign()` calls (e.g., `assign(varname, value)`) are not recognized
+- `set()` calls are not recognized
+- Only top-level assignments are tracked for cross-file scope
+
+Undefined variable diagnostics are only suppressed for symbols recognized by this model.
+
 ### Configuration Options
 
 Configure via VS Code settings or LSP initialization:
