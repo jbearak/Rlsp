@@ -729,17 +729,19 @@ pub struct WorldState {
     pub cross_file_parent_cache: ParentSelectionCache,
 }
 
-/// Cached parent selection to ensure stability during graph convergence
-#[derive(Debug, Clone, Default)]
+/// Cached parent selection to ensure stability during graph convergence.
+/// Uses interior mutability to allow population during read operations (consistent with MetadataCache and ArtifactsCache).
+#[derive(Debug, Default)]
 pub struct ParentSelectionCache {
     /// Map from (child_uri, metadata_fingerprint) -> selected parent
-    cache: HashMap<(Url, u64), ParentResolution>,
+    inner: RwLock<HashMap<(Url, u64), ParentResolution>>,
 }
 
 impl ParentSelectionCache {
-    /// Get or compute parent selection, ensuring stability
+    /// Get or compute parent selection, ensuring stability.
+    /// Uses interior mutability so this can be called from read-locked WorldState.
     pub fn get_or_compute(
-        &mut self,
+        &self,
         child_uri: &Url,
         metadata: &CrossFileMetadata,
         graph: &DependencyGraph,
@@ -748,23 +750,25 @@ impl ParentSelectionCache {
         let fingerprint = compute_metadata_fingerprint(metadata);
         let key = (child_uri.clone(), fingerprint);
         
-        if let Some(cached) = self.cache.get(&key) {
+        // Try read lock first
+        if let Some(cached) = self.inner.read().get(&key) {
             return cached.clone();
         }
         
+        // Compute and cache under write lock
         let resolution = resolve_parent(metadata, graph, child_uri, config);
-        self.cache.insert(key, resolution.clone());
+        self.inner.write().insert(key, resolution.clone());
         resolution
     }
     
     /// Invalidate cache for a child (called when child's metadata changes)
-    pub fn invalidate(&mut self, child_uri: &Url) {
-        self.cache.retain(|(uri, _), _| uri != child_uri);
+    pub fn invalidate(&self, child_uri: &Url) {
+        self.inner.write().retain(|(uri, _), _| uri != child_uri);
     }
     
     /// Invalidate all entries
-    pub fn invalidate_all(&mut self) {
-        self.cache.clear();
+    pub fn invalidate_all(&self) {
+        self.inner.write().clear();
     }
 }
 
@@ -2357,16 +2361,18 @@ This policy is already enforced by `CrossFileDiagnosticsGate.can_publish()` whic
 3. **Missing parents do not cause re-selection:** If a selected parent is temporarily missing (file deleted or not yet indexed), the selection remains stable. The scope resolver will emit a missing-file diagnostic but will not re-run parent selection to pick a different parent.
 
 ```rust
-/// Cached parent selection to ensure stability during graph convergence
+/// Cached parent selection to ensure stability during graph convergence.
+/// Uses interior mutability to allow population during read operations.
 pub struct ParentSelectionCache {
     /// Map from (child_uri, metadata_fingerprint) -> selected parent
-    cache: HashMap<(Url, u64), ParentResolution>,
+    inner: RwLock<HashMap<(Url, u64), ParentResolution>>,
 }
 
 impl ParentSelectionCache {
-    /// Get or compute parent selection, ensuring stability
+    /// Get or compute parent selection, ensuring stability.
+    /// Uses interior mutability so this can be called from read-locked WorldState.
     pub fn get_or_compute(
-        &mut self,
+        &self,
         child_uri: &Url,
         metadata: &CrossFileMetadata,
         graph: &DependencyGraph,
@@ -2375,18 +2381,20 @@ impl ParentSelectionCache {
         let fingerprint = compute_metadata_fingerprint(metadata);
         let key = (child_uri.clone(), fingerprint);
         
-        if let Some(cached) = self.cache.get(&key) {
+        // Try read lock first
+        if let Some(cached) = self.inner.read().get(&key) {
             return cached.clone();
         }
         
+        // Compute and cache under write lock
         let resolution = resolve_parent(metadata, graph, child_uri, config);
-        self.cache.insert(key, resolution.clone());
+        self.inner.write().insert(key, resolution.clone());
         resolution
     }
     
     /// Invalidate cache for a child (called when child's metadata changes)
-    pub fn invalidate(&mut self, child_uri: &Url) {
-        self.cache.retain(|(uri, _), _| uri != child_uri);
+    pub fn invalidate(&self, child_uri: &Url) {
+        self.inner.write().retain(|(uri, _), _| uri != child_uri);
     }
 }
 ```
@@ -2405,3 +2413,17 @@ impl ParentSelectionCache {
 
 **Documented Limitation:**
 > `sys.source()` calls with non-literal `envir` arguments (e.g., `envir = environment()`, `envir = my_env`) are treated conservatively as `local=TRUE`. Symbols from such sourced files will not be inherited by the caller. This is a known limitation of static analysis; runtime evaluation would be required to determine the actual target environment.
+
+### Issue 13: ParentSelectionCache Lock-Mode Consistency
+
+**Problem:** `ParentSelectionCache` was defined as a plain `HashMap` with `&mut self` methods, but parent resolution is called from code paths that only hold a **read lock** on `WorldState` (completion, hover, diagnostics). This creates a lock-mode inconsistency: you cannot populate the cache without taking a write lock on `WorldState`, defeating the purpose of a read-path cache.
+
+**Fix:** Update `ParentSelectionCache` to use interior mutability (`parking_lot::RwLock`) consistent with `MetadataCache` and `ArtifactsCache`. This allows the cache to be populated during read operations without requiring a write lock on `WorldState`.
+
+**Changes:**
+- Changed `cache: HashMap<...>` to `inner: RwLock<HashMap<...>>`
+- Changed `&mut self` to `&self` on all methods
+- Added read-lock-first optimization in `get_or_compute()`: try read lock, only take write lock if cache miss
+- Removed `Clone` derive (interior mutability types are not `Clone`)
+
+This ensures all three read-path caches (`MetadataCache`, `ArtifactsCache`, `ParentSelectionCache`) follow the same interior mutability pattern, maintaining consistency with Critical Design Invariant #7.
