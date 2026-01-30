@@ -409,6 +409,140 @@ fn compute_interface_hash(interface: &HashMap<String, ScopedSymbol>) -> u64 {
     hasher.finish()
 }
 
+/// Compute scope at a position with backward directive support.
+/// This processes backward directives FIRST (parent context), then forward sources.
+/// 
+/// Property 19: Backward-First Resolution Order
+/// - Backward directives establish parent context (symbols available before this file runs)
+/// - Forward source() calls add symbols in document order
+pub fn scope_at_position_with_backward<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
+    max_depth: usize,
+    parent_call_site: Option<(u32, u32)>, // (line, column) in parent where this file is sourced
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
+{
+    let mut visited = HashSet::new();
+    scope_at_position_with_backward_recursive(
+        uri, line, column, get_artifacts, get_metadata, resolve_path,
+        max_depth, 0, &mut visited, parent_call_site,
+    )
+}
+
+fn scope_at_position_with_backward_recursive<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    resolve_path: &impl Fn(&str, &Url) -> Option<Url>,
+    max_depth: usize,
+    current_depth: usize,
+    visited: &mut HashSet<Url>,
+    _parent_call_site: Option<(u32, u32)>, // Currently unused but reserved for future use
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<ScopeArtifacts>,
+    G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
+{
+    let mut scope = ScopeAtPosition::default();
+
+    if current_depth >= max_depth || visited.contains(uri) {
+        return scope;
+    }
+    visited.insert(uri.clone());
+    scope.chain.push(uri.clone());
+
+    let artifacts = match get_artifacts(uri) {
+        Some(a) => a,
+        None => return scope,
+    };
+
+    // STEP 1: Process backward directives FIRST (parent context)
+    // This establishes symbols that are available at the START of this file
+    if let Some(metadata) = get_metadata(uri) {
+        for directive in &metadata.sourced_by {
+            if let Some(parent_uri) = resolve_path(&directive.path, uri) {
+                // Get the call site in the parent
+                let call_site = match &directive.call_site {
+                    super::types::CallSiteSpec::Line(n) => Some((*n, u32::MAX)), // end of line
+                    super::types::CallSiteSpec::Match(_) => None, // TODO: implement match
+                    super::types::CallSiteSpec::Default => Some((u32::MAX, u32::MAX)), // end of file
+                };
+
+                if let Some((call_line, call_col)) = call_site {
+                    // Get parent's scope at the call site
+                    let parent_scope = scope_at_position_with_backward_recursive(
+                        &parent_uri,
+                        call_line,
+                        call_col,
+                        get_artifacts,
+                        get_metadata,
+                        resolve_path,
+                        max_depth,
+                        current_depth + 1,
+                        visited,
+                        None, // parent doesn't have a parent call site in this context
+                    );
+
+                    // Merge parent symbols (they are available at the START of this file)
+                    // These have lower precedence than local definitions
+                    for (name, symbol) in parent_scope.symbols {
+                        scope.symbols.entry(name).or_insert(symbol);
+                    }
+                    scope.chain.extend(parent_scope.chain);
+                }
+            }
+        }
+    }
+
+    // STEP 2: Process timeline events (local definitions and forward sources)
+    for event in &artifacts.timeline {
+        match event {
+            ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
+                if (*def_line, *def_col) <= (line, column) {
+                    // Local definitions take precedence over inherited symbols
+                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                }
+            }
+            ScopeEvent::Source { line: src_line, column: src_col, source } => {
+                // Only include if source() call is before the position
+                if (*src_line, *src_col) < (line, column) {
+                    // Resolve the path and get symbols from sourced file
+                    if let Some(child_uri) = resolve_path(&source.path, uri) {
+                        let child_scope = scope_at_position_with_backward_recursive(
+                            &child_uri,
+                            u32::MAX, // Include all symbols from sourced file
+                            u32::MAX,
+                            get_artifacts,
+                            get_metadata,
+                            resolve_path,
+                            max_depth,
+                            current_depth + 1,
+                            visited,
+                            Some((*src_line, *src_col)), // pass the call site
+                        );
+                        // Merge child symbols (local definitions take precedence)
+                        for (name, symbol) in child_scope.symbols {
+                            scope.symbols.entry(name).or_insert(symbol);
+                        }
+                        scope.chain.extend(child_scope.chain);
+                    }
+                }
+            }
+        }
+    }
+
+    scope
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

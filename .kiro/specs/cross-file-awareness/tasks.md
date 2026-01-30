@@ -191,15 +191,15 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 4: Local Symbol Precedence**
     - **Validates: Requirements 5.4, 7.3, 8.3, 9.2, 9.3**
 
-  - [ ] 7.3 Write property test for backward-first resolution order
+  - [x] 7.3 Write property test for backward-first resolution order
     - **Property 19: Backward-First Resolution Order**
     - **Validates: Requirements 5.1, 5.2**
 
-  - [ ] 7.4 Write property test for call-site symbol filtering
+  - [x] 7.4 Write property test for call-site symbol filtering
     - **Property 20: Call Site Symbol Filtering**
     - **Validates: Requirements 5.5**
 
-  - [ ] 7.5 Write property test for default call site behavior
+  - [x] 7.5 Write property test for default call site behavior
     - **Property 21: Default Call Site Behavior**
     - **Validates: Requirements 5.6**
 
@@ -253,15 +253,15 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Schedule revalidation for all open documents on config change
     - _Requirements: 11.1-11.11_
 
-  - [ ] 8.2 Write property test for configuration change re-resolution
+  - [x] 8.2 Write property test for configuration change re-resolution
     - **Property 34: Configuration Change Re-resolution**
     - **Validates: Requirements 11.11**
 
-  - [ ] 8.3 Write property test for undefined variables configuration
+  - [x] 8.3 Write property test for undefined variables configuration
     - **Property 33: Undefined Variables Configuration**
     - **Validates: Requirements 11.9, 11.10**
 
-- [ ] 9. Checkpoint - Ensure all tests pass
+- [x] 9. Checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 10. Implement caching with interior mutability

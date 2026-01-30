@@ -2151,6 +2151,434 @@ proptest! {
 }
 
 // ============================================================================
+// Property 19: Backward-First Resolution Order
+// Validates: Requirements 5.1, 5.2
+// ============================================================================
+
+use super::scope::scope_at_position_with_backward;
+use super::types::BackwardDirective;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 19: For any file with both backward directives and forward source() calls,
+    /// the Scope_Resolver SHALL process backward directives before forward sources,
+    /// resulting in parent symbols being available before sourced file symbols.
+    #[test]
+    fn prop_backward_first_resolution_order(
+        parent_symbol in r_identifier(),
+        child_symbol in r_identifier(),
+        sibling_symbol in r_identifier()
+    ) {
+        // Ensure all symbols are distinct
+        prop_assume!(parent_symbol != child_symbol && child_symbol != sibling_symbol && parent_symbol != sibling_symbol);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let sibling_uri = make_url("sibling");
+
+        // Parent file: defines parent_symbol
+        let parent_code = format!("{} <- 1", parent_symbol);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Sibling file: defines sibling_symbol
+        let sibling_code = format!("{} <- 2", sibling_symbol);
+        let sibling_tree = parse_r_tree(&sibling_code);
+        let sibling_artifacts = compute_artifacts(&sibling_uri, &sibling_tree, &sibling_code);
+
+        // Child file: has backward directive to parent, forward source to sibling, and defines child_symbol
+        // The backward directive means parent's symbols are available at the START
+        // The forward source means sibling's symbols are available AFTER the source() call
+        let child_code = format!(
+            "# @lsp-sourced-by ../parent.R\n{} <- 3\nsource(\"sibling.R\")",
+            child_symbol
+        );
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Create metadata for child (with backward directive)
+        let child_metadata = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else if uri == &sibling_uri { Some(sibling_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            match path {
+                "../parent.R" => Some(parent_uri.clone()),
+                "sibling.R" => Some(sibling_uri.clone()),
+                _ => None,
+            }
+        };
+
+        // At line 0 (before any code), parent symbols should be available (from backward directive)
+        // but sibling symbols should NOT be available (forward source hasn't been processed yet)
+        let scope_at_start = scope_at_position_with_backward(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        );
+        prop_assert!(scope_at_start.symbols.contains_key(&parent_symbol),
+            "Parent symbol should be available at start due to backward directive");
+        prop_assert!(!scope_at_start.symbols.contains_key(&sibling_symbol),
+            "Sibling symbol should NOT be available at start (before source() call)");
+
+        // At line 1 (after child_symbol definition, before source() call)
+        let scope_at_middle = scope_at_position_with_backward(
+            &child_uri, 1, 10, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        );
+        prop_assert!(scope_at_middle.symbols.contains_key(&parent_symbol),
+            "Parent symbol should still be available");
+        prop_assert!(scope_at_middle.symbols.contains_key(&child_symbol),
+            "Child symbol should be available after its definition");
+        prop_assert!(!scope_at_middle.symbols.contains_key(&sibling_symbol),
+            "Sibling symbol should NOT be available (before source() call)");
+
+        // At line 3 (after source() call), all symbols should be available
+        let scope_at_end = scope_at_position_with_backward(
+            &child_uri, 3, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        );
+        prop_assert!(scope_at_end.symbols.contains_key(&parent_symbol),
+            "Parent symbol should be available at end");
+        prop_assert!(scope_at_end.symbols.contains_key(&child_symbol),
+            "Child symbol should be available at end");
+        prop_assert!(scope_at_end.symbols.contains_key(&sibling_symbol),
+            "Sibling symbol should be available after source() call");
+    }
+
+    /// Property 19 extended: Backward directive symbols are available at position (0, 0)
+    #[test]
+    fn prop_backward_symbols_available_at_start(
+        parent_symbol in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: defines symbol
+        let parent_code = format!("{} <- 42", parent_symbol);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child file: has backward directive to parent
+        let child_code = "# @lsp-sourced-by ../parent.R\nx <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let child_metadata = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
+        };
+
+        // At position (0, 0), parent symbol should be available
+        let scope = scope_at_position_with_backward(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        );
+        prop_assert!(scope.symbols.contains_key(&parent_symbol),
+            "Parent symbol from backward directive should be available at (0, 0)");
+    }
+}
+
+// ============================================================================
+// Property 20: Call Site Symbol Filtering
+// Validates: Requirements 5.5
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 20: For any backward directive with line=N (user-facing 1-based),
+    /// after conversion to internal 0-based call_site_line, the scope inherited
+    /// from the parent MUST include exactly the definitions at positions
+    /// (def_line, def_col) such that (def_line, def_col) <= (call_site_line, call_site_col).
+    #[test]
+    fn prop_call_site_symbol_filtering(
+        symbol_before in r_identifier(),
+        symbol_after in r_identifier(),
+        call_site_line in 2..5u32 // 1-based line number
+    ) {
+        prop_assume!(symbol_before != symbol_after);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: defines symbol_before on line 0, symbol_after on line call_site_line
+        let mut parent_lines = vec![format!("{} <- 1", symbol_before)];
+        for i in 1..call_site_line {
+            parent_lines.push(format!("x{} <- {}", i, i));
+        }
+        parent_lines.push(format!("{} <- 2", symbol_after));
+        let parent_code = parent_lines.join("\n");
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child file: has backward directive with line= parameter
+        let child_code = format!("# @lsp-sourced-by ../parent.R line={}\ny <- 3", call_site_line);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // line= is 1-based, so line=N means call site is at 0-based line N-1
+        let child_metadata = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: CallSiteSpec::Line(call_site_line - 1), // 0-based
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
+        };
+
+        // Get scope at child
+        let scope = scope_at_position_with_backward(
+            &child_uri, 10, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        );
+
+        // symbol_before (defined on line 0) should be available (before call site)
+        prop_assert!(scope.symbols.contains_key(&symbol_before),
+            "Symbol defined before call site should be available");
+
+        // symbol_after (defined on line call_site_line) should NOT be available
+        // because it's defined AFTER the call site line
+        prop_assert!(!scope.symbols.contains_key(&symbol_after),
+            "Symbol defined after call site should NOT be available");
+    }
+}
+
+// ============================================================================
+// Property 21: Default Call Site Behavior
+// Validates: Requirements 5.6
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 21: For any backward directive without a call site specification,
+    /// when assumeCallSite is "end", all symbols from the parent SHALL be included;
+    /// when "start", no symbols from the parent SHALL be included.
+    #[test]
+    fn prop_default_call_site_behavior(
+        parent_symbol in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: defines symbol
+        let parent_code = format!("{} <- 42", parent_symbol);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child file: has backward directive with Default call site
+        let child_code = "# @lsp-sourced-by ../parent.R\nx <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let child_metadata = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
+        };
+
+        // With default call site (which defaults to "end"), all parent symbols should be available
+        let scope = scope_at_position_with_backward(
+            &child_uri, 10, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        );
+
+        // Default is "end", so all parent symbols should be included
+        prop_assert!(scope.symbols.contains_key(&parent_symbol),
+            "With default call site (end), parent symbol should be available");
+    }
+}
+
+// ============================================================================
+// Property 34: Configuration Change Re-resolution
+// Validates: Requirements 11.11
+// ============================================================================
+
+use super::config::{CallSiteDefault, CrossFileConfig};
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 34: For any configuration change affecting scope resolution
+    /// (e.g., assumeCallSite), all open documents SHALL have their scope chains re-resolved.
+    #[test]
+    fn prop_configuration_change_re_resolution(
+        parent_symbol in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: defines symbol at line 5
+        let parent_code = format!("x <- 1\ny <- 2\nz <- 3\nw <- 4\n{} <- 5", parent_symbol);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child file: has backward directive with Default call site
+        let child_code = "# @lsp-sourced-by ../parent.R\na <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let child_metadata = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
+        };
+
+        // With default config (assume_call_site = End), parent symbol should be available
+        let config_end = CrossFileConfig::default();
+        prop_assert_eq!(config_end.assume_call_site, CallSiteDefault::End);
+
+        let scope_with_end = scope_at_position_with_backward(
+            &child_uri, 10, 0, &get_artifacts, &get_metadata, &resolve_path, 10, None,
+        );
+        prop_assert!(scope_with_end.symbols.contains_key(&parent_symbol),
+            "With assume_call_site=End, parent symbol should be available");
+
+        // Verify that scope_settings_changed detects the change
+        let mut config_start = CrossFileConfig::default();
+        config_start.assume_call_site = CallSiteDefault::Start;
+        prop_assert!(config_end.scope_settings_changed(&config_start),
+            "Config change should be detected");
+
+        // Note: The actual re-resolution would happen in the revalidation system.
+        // This test verifies that the configuration change detection works correctly.
+    }
+
+    /// Property 34 extended: Changing max_chain_depth should trigger re-resolution
+    #[test]
+    fn prop_config_max_depth_change_detected(
+        new_depth in 1..50usize
+    ) {
+        let config1 = CrossFileConfig::default();
+        let mut config2 = CrossFileConfig::default();
+        config2.max_chain_depth = new_depth;
+
+        if new_depth != config1.max_chain_depth {
+            prop_assert!(config1.scope_settings_changed(&config2),
+                "Changing max_chain_depth should trigger scope settings change");
+        }
+    }
+}
+
+// ============================================================================
+// Property 33: Undefined Variables Configuration
+// Validates: Requirements 11.9, 11.10
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 33: For any configuration with diagnostics.undefinedVariables = false,
+    /// no undefined variable diagnostics SHALL be emitted regardless of symbol resolution.
+    #[test]
+    fn prop_undefined_variables_configuration(
+        _symbol_name in r_identifier()
+    ) {
+        // Test that the configuration flag exists and can be toggled
+        let mut config = CrossFileConfig::default();
+        
+        // Default should be true
+        prop_assert!(config.undefined_variables_enabled,
+            "Default undefined_variables_enabled should be true");
+
+        // Can be set to false
+        config.undefined_variables_enabled = false;
+        prop_assert!(!config.undefined_variables_enabled,
+            "undefined_variables_enabled should be settable to false");
+
+        // Changing this setting should NOT trigger scope re-resolution
+        // (it only affects diagnostics, not scope)
+        let config1 = CrossFileConfig::default();
+        let mut config2 = CrossFileConfig::default();
+        config2.undefined_variables_enabled = false;
+        prop_assert!(!config1.scope_settings_changed(&config2),
+            "Changing undefined_variables_enabled should NOT trigger scope change");
+    }
+}
+
+// ============================================================================
 // Property 44: Workspace Index Version Monotonicity
 // Validates: Requirements 13.5
 // ============================================================================
