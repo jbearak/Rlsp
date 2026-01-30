@@ -187,7 +187,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Use `ParentSelectionCache` for stable parent resolution
     - _Requirements: 5.1-5.10, 17.1-17.7_
 
-  - [ ] 7.2 Write property test for local symbol precedence
+  - [x] 7.2 Write property test for local symbol precedence
     - **Property 4: Local Symbol Precedence**
     - **Validates: Requirements 5.4, 7.3, 8.3, 9.2, 9.3**
 
@@ -203,11 +203,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 21: Default Call Site Behavior**
     - **Validates: Requirements 5.6**
 
-  - [ ] 7.6 Write property test for maximum depth enforcement
+  - [x] 7.6 Write property test for maximum depth enforcement
     - **Property 22: Maximum Depth Enforcement**
     - **Validates: Requirements 5.8**
 
-  - [ ] 7.7 Write property test for position-aware symbol availability
+  - [x] 7.7 Write property test for position-aware symbol availability
     - **Property 40: Position-Aware Symbol Availability**
     - **Validates: Requirements 5.3**
 
@@ -215,11 +215,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 51: Full Position Precision**
     - **Validates: Requirements 5.3, 7.1, 7.4**
 
-  - [ ] 7.9 Write property test for circular dependency detection
+  - [x] 7.9 Write property test for circular dependency detection
     - **Property 7: Circular Dependency Detection**
     - **Validates: Requirements 5.7, 10.6**
 
-  - [ ] 7.10 Write property test for local=TRUE semantics
+  - [x] 7.10 Write property test for local=TRUE semantics
     - **Property 52: Local Source Scope Isolation**
     - **Validates: Requirements 4.7, 5.3, 7.1, 10.1**
 

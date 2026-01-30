@@ -1332,3 +1332,330 @@ proptest! {
         prop_assert!(deps[0].is_directive);
     }
 }
+
+
+// ============================================================================
+// Property 4: Local Symbol Precedence
+// Validates: Requirements 5.4, 7.3, 8.3, 9.2, 9.3
+// ============================================================================
+
+use super::scope::{compute_artifacts, scope_at_position_with_deps, ScopeArtifacts};
+
+fn parse_r_tree(code: &str) -> tree_sitter::Tree {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+    parser.parse(code, None).unwrap()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 4: For any scope chain where a symbol s is defined in both a sourced
+    /// file and the current file, the resolved scope SHALL contain the current file's
+    /// definition of s (local definitions shadow inherited ones).
+    #[test]
+    fn prop_local_symbol_precedence(
+        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: defines symbol BEFORE sourcing child (which also defines it)
+        // Local definition should still take precedence
+        let parent_code = format!(
+            "{} <- 1\nsource(\"child.R\")",
+            symbol_name
+        );
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child file: defines same symbol
+        let child_code = format!("{} <- 999", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Create artifacts lookup
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        // Resolve path
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        };
+
+        // Get scope at end of parent file
+        let scope = scope_at_position_with_deps(
+            &parent_uri,
+            10, // After all definitions
+            0,
+            &get_artifacts,
+            &resolve_path,
+            10,
+        );
+
+        // Local definition should take precedence (defined in parent, not child)
+        prop_assert!(scope.symbols.contains_key(&symbol_name));
+        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        prop_assert_eq!(&symbol.source_uri, &parent_uri);
+    }
+}
+
+// ============================================================================
+// Property 40: Position-Aware Symbol Availability
+// Validates: Requirements 5.3
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 40: For any source() call at position (line, column), symbols from
+    /// the sourced file SHALL only be available for positions strictly after (line, column).
+    #[test]
+    fn prop_position_aware_symbol_availability(
+        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}",
+        source_line in 2..10u32
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: has source() call at specific line
+        let mut parent_lines = vec!["# comment".to_string()];
+        for i in 1..source_line {
+            parent_lines.push(format!("x{} <- {}", i, i));
+        }
+        parent_lines.push("source(\"child.R\")".to_string());
+        parent_lines.push("# after source".to_string());
+        let parent_code = parent_lines.join("\n");
+
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
+        };
+
+        // Before source() call - symbol should NOT be available
+        let scope_before = scope_at_position_with_deps(
+            &parent_uri,
+            source_line - 1,
+            0,
+            &get_artifacts,
+            &resolve_path,
+            10,
+        );
+        prop_assert!(!scope_before.symbols.contains_key(&symbol_name));
+
+        // After source() call - symbol SHOULD be available
+        let scope_after = scope_at_position_with_deps(
+            &parent_uri,
+            source_line + 1,
+            0,
+            &get_artifacts,
+            &resolve_path,
+            10,
+        );
+        prop_assert!(scope_after.symbols.contains_key(&symbol_name));
+    }
+}
+
+
+// ============================================================================
+// Property 22: Maximum Depth Enforcement
+// Validates: Requirements 5.8
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Property 22: When the source chain exceeds maxChainDepth, the Scope_Resolver
+    /// SHALL stop traversal at the configured depth.
+    #[test]
+    fn prop_maximum_depth_enforcement(
+        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+    ) {
+        // Create a chain: a -> b -> c -> d
+        let uri_a = make_url("a");
+        let uri_b = make_url("b");
+        let uri_c = make_url("c");
+        let uri_d = make_url("d");
+
+        // Each file sources the next and defines a symbol
+        let code_a = "source(\"b.R\")";
+        let code_b = "source(\"c.R\")";
+        let code_c = "source(\"d.R\")";
+        let code_d = format!("{} <- 42", symbol_name);
+
+        let tree_a = parse_r_tree(code_a);
+        let tree_b = parse_r_tree(code_b);
+        let tree_c = parse_r_tree(code_c);
+        let tree_d = parse_r_tree(&code_d);
+
+        let artifacts_a = compute_artifacts(&uri_a, &tree_a, code_a);
+        let artifacts_b = compute_artifacts(&uri_b, &tree_b, code_b);
+        let artifacts_c = compute_artifacts(&uri_c, &tree_c, code_c);
+        let artifacts_d = compute_artifacts(&uri_d, &tree_d, &code_d);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &uri_a { Some(artifacts_a.clone()) }
+            else if uri == &uri_b { Some(artifacts_b.clone()) }
+            else if uri == &uri_c { Some(artifacts_c.clone()) }
+            else if uri == &uri_d { Some(artifacts_d.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            match path {
+                "b.R" => Some(uri_b.clone()),
+                "c.R" => Some(uri_c.clone()),
+                "d.R" => Some(uri_d.clone()),
+                _ => None,
+            }
+        };
+
+        // With max_depth=2, should NOT reach d (a->b->c, stops before d)
+        let scope_shallow = scope_at_position_with_deps(
+            &uri_a, 10, 0, &get_artifacts, &resolve_path, 2,
+        );
+        prop_assert!(!scope_shallow.symbols.contains_key(&symbol_name));
+
+        // With max_depth=10, should reach d
+        let scope_deep = scope_at_position_with_deps(
+            &uri_a, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+        prop_assert!(scope_deep.symbols.contains_key(&symbol_name));
+    }
+}
+
+// ============================================================================
+// Property 7: Circular Dependency Detection
+// Validates: Requirements 5.7, 10.6
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    /// Property 7: For any set of files where file A sources file B and file B
+    /// sources file A, the Scope_Resolver SHALL detect the cycle and break it.
+    #[test]
+    fn prop_circular_dependency_detection(
+        symbol_a in "[a-zA-Z][a-zA-Z0-9_]{0,3}",
+        symbol_b in "[a-zA-Z][a-zA-Z0-9_]{0,3}"
+    ) {
+        prop_assume!(symbol_a != symbol_b);
+
+        let uri_a = make_url("a");
+        let uri_b = make_url("b");
+
+        // A sources B and defines symbol_a
+        let code_a = format!("source(\"b.R\")\n{} <- 1", symbol_a);
+        // B sources A and defines symbol_b
+        let code_b = format!("source(\"a.R\")\n{} <- 2", symbol_b);
+
+        let tree_a = parse_r_tree(&code_a);
+        let tree_b = parse_r_tree(&code_b);
+
+        let artifacts_a = compute_artifacts(&uri_a, &tree_a, &code_a);
+        let artifacts_b = compute_artifacts(&uri_b, &tree_b, &code_b);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &uri_a { Some(artifacts_a.clone()) }
+            else if uri == &uri_b { Some(artifacts_b.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            match path {
+                "a.R" => Some(uri_a.clone()),
+                "b.R" => Some(uri_b.clone()),
+                _ => None,
+            }
+        };
+
+        // Should not infinite loop - cycle should be broken
+        let scope = scope_at_position_with_deps(
+            &uri_a, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Should have symbol_a (defined locally)
+        prop_assert!(scope.symbols.contains_key(&symbol_a));
+        // Should have symbol_b (from sourced file, before cycle detected)
+        prop_assert!(scope.symbols.contains_key(&symbol_b));
+    }
+}
+
+// ============================================================================
+// Property 52: Local Source Scope Isolation
+// Validates: Requirements 4.7, 5.3, 7.1, 10.1
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 52: For any source() call with local = TRUE, symbols defined in
+    /// the sourced file SHALL NOT be added to the caller's scope.
+    #[test]
+    fn prop_local_source_scope_isolation(
+        symbol_name in "[a-zA-Z][a-zA-Z0-9_]{0,5}"
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child with local=TRUE
+        let parent_code = "source(\"child.R\", local = TRUE)";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope at end of parent file
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol from local=TRUE source should NOT be in scope
+        prop_assert!(!scope.symbols.contains_key(&symbol_name));
+    }
+}
