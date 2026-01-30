@@ -495,6 +495,20 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
         return None;
     };
 
+    // Try user-defined function first
+    if let Some(signature) = find_user_function_signature(state, uri, &name) {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```r\n{}\n```", signature),
+            }),
+            range: Some(Range {
+                start: Position::new(node.start_position().row as u32, node.start_position().column as u32),
+                end: Position::new(node.end_position().row as u32, node.end_position().column as u32),
+            }),
+        });
+    }
+
     // Check cache first
     if let Some(cached) = state.help_cache.get(&name) {
         if let Some(help_text) = cached {
@@ -806,6 +820,119 @@ fn node_text<'a>(node: Node<'a>, text: &'a str) -> &'a str {
     &text[node.byte_range()]
 }
 
+// ============================================================================
+// Signature Extraction
+// ============================================================================
+
+fn extract_parameters(params_node: Node, text: &str) -> Vec<String> {
+    let mut parameters = Vec::new();
+    let mut cursor = params_node.walk();
+    
+    for child in params_node.children(&mut cursor) {
+        if child.kind() == "parameter" {
+            let mut param_cursor = child.walk();
+            let param_children: Vec<_> = child.children(&mut param_cursor).collect();
+            
+            // Check if this parameter contains dots
+            if let Some(_dots) = param_children.iter().find(|n| n.kind() == "dots") {
+                parameters.push("...".to_string());
+            } else if let Some(identifier) = param_children.iter().find(|n| n.kind() == "identifier") {
+                let param_name = node_text(*identifier, text);
+                
+                // Check for default value
+                if param_children.len() >= 3 && param_children[1].kind() == "=" {
+                    let default_value = node_text(param_children[2], text);
+                    parameters.push(format!("{} = {}", param_name, default_value));
+                } else {
+                    parameters.push(param_name.to_string());
+                }
+            }
+        } else if child.kind() == "dots" {
+            parameters.push("...".to_string());
+        }
+    }
+    
+    parameters
+}
+
+fn extract_function_signature(func_node: Node, func_name: &str, text: &str) -> String {
+    let mut cursor = func_node.walk();
+    
+    for child in func_node.children(&mut cursor) {
+        if child.kind() == "parameters" {
+            let params = extract_parameters(child, text);
+            return format!("{}({})", func_name, params.join(", "));
+        }
+    }
+    
+    format!("{}()", func_name)
+}
+
+fn find_function_definition_node<'a>(node: Node<'a>, name: &str, text: &str) -> Option<Node<'a>> {
+    if node.kind() == "binary_operator" {
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+
+        if children.len() >= 3 {
+            let lhs = children[0];
+            let op = children[1];
+            let rhs = children[2];
+
+            let op_text = node_text(op, text);
+            if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
+                if node_text(lhs, text) == name && rhs.kind() == "function_definition" {
+                    return Some(rhs);
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(func_node) = find_function_definition_node(child, name, text) {
+            return Some(func_node);
+        }
+    }
+
+    None
+}
+
+fn find_user_function_signature(state: &WorldState, current_uri: &Url, name: &str) -> Option<String> {
+    // 1. Search current document
+    if let Some(doc) = state.get_document(current_uri) {
+        if let Some(tree) = &doc.tree {
+            let text = doc.text();
+            if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
+                return Some(extract_function_signature(func_node, name, &text));
+            }
+        }
+    }
+
+    // 2. Search open documents (skip current_uri)
+    for (uri, doc) in &state.documents {
+        if uri == current_uri {
+            continue;
+        }
+        if let Some(tree) = &doc.tree {
+            let text = doc.text();
+            if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
+                return Some(extract_function_signature(func_node, name, &text));
+            }
+        }
+    }
+
+    // 3. Search workspace index
+    for (_uri, doc) in &state.workspace_index {
+        if let Some(tree) = &doc.tree {
+            let text = doc.text();
+            if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
+                return Some(extract_function_signature(func_node, name, &text));
+            }
+        }
+    }
+
+    None
+}
 
 // ============================================================================
 // Tests
@@ -893,6 +1020,84 @@ mod tests {
         assert!(defined.contains("x"));
         assert!(defined.contains("inner"));
         assert!(defined.contains("y"));
+    }
+
+    #[test]
+    fn test_extract_parameters_simple() {
+        let code = "add <- function(a, b = 1) { }";
+        let tree = parse_r_code(code);
+        
+        let func_node = find_function_definition(tree.root_node()).unwrap();
+        let mut cursor = func_node.walk();
+        let params_node = func_node.children(&mut cursor)
+            .find(|n| n.kind() == "parameters").unwrap();
+        
+        let params = extract_parameters(params_node, code);
+        assert_eq!(params, vec!["a", "b = 1"]);
+    }
+
+    #[test]
+    fn test_extract_function_signature() {
+        let code = "add <- function(a, b = 1) { }";
+        let tree = parse_r_code(code);
+        
+        let func_node = find_function_definition(tree.root_node()).unwrap();
+        let signature = extract_function_signature(func_node, "add", code);
+        assert_eq!(signature, "add(a, b = 1)");
+    }
+
+    #[test]
+    fn test_signature_simple_function() {
+        let code = "add <- function(a, b) { a + b }";
+        let tree = parse_r_code(code);
+        
+        let func_node = find_function_definition_node(tree.root_node(), "add", code).unwrap();
+        let signature = extract_function_signature(func_node, "add", code);
+        assert_eq!(signature, "add(a, b)");
+    }
+
+    #[test]
+    fn test_signature_no_parameters() {
+        let code = "get_pi <- function() { 3.14 }";
+        let tree = parse_r_code(code);
+        
+        let func_node = find_function_definition_node(tree.root_node(), "get_pi", code).unwrap();
+        let signature = extract_function_signature(func_node, "get_pi", code);
+        assert_eq!(signature, "get_pi()");
+    }
+
+    #[test]
+    fn test_signature_with_defaults() {
+        let code = "greet <- function(name = \"World\") { }";
+        let tree = parse_r_code(code);
+        
+        let func_node = find_function_definition_node(tree.root_node(), "greet", code).unwrap();
+        let signature = extract_function_signature(func_node, "greet", code);
+        assert_eq!(signature, "greet(name = \"World\")");
+    }
+
+    #[test]
+    fn test_signature_with_dots() {
+        let code = "wrapper <- function(...) { }";
+        let tree = parse_r_code(code);
+        
+        let func_node = find_function_definition_node(tree.root_node(), "wrapper", code).unwrap();
+        let signature = extract_function_signature(func_node, "wrapper", code);
+        assert_eq!(signature, "wrapper(...)");
+    }
+
+    fn find_function_definition(node: Node) -> Option<Node> {
+        if node.kind() == "function_definition" {
+            return Some(node);
+        }
+        
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(func) = find_function_definition(child) {
+                return Some(func);
+            }
+        }
+        None
     }
 }
 
@@ -999,6 +1204,83 @@ mod proptests {
                 prop_assert!(!arg_used, "Named argument {} should not be flagged", arg_name);
             }
         }
+
+        #[test]
+        fn test_parameter_extraction_completeness(
+            param_count in 1usize..5,
+            has_defaults in prop::collection::vec(any::<bool>(), 1..5)
+        ) {
+            let param_count = param_count.min(has_defaults.len());
+            let mut params = Vec::new();
+            
+            for i in 0..param_count {
+                if has_defaults[i] {
+                    params.push(format!("p{} = {}", i, i + 1));
+                } else {
+                    params.push(format!("p{}", i));
+                }
+            }
+            
+            let code = format!("f <- function({}) {{}}", params.join(", "));
+            let tree = parse_r_code(&code);
+            
+            // Find function definition node
+            let func_node = find_function_definition(tree.root_node()).unwrap();
+            let signature = extract_function_signature(func_node, "f", &code);
+            
+            // All parameters should be present in signature
+            for i in 0..param_count {
+                let param_name = format!("p{}", i);
+                prop_assert!(signature.contains(&param_name), 
+                    "Parameter {} should be in signature: {}", param_name, signature);
+            }
+        }
+
+        #[test]
+        fn test_assignment_operators_recognized(
+            func_name in "[a-z]{3,8}",
+            op in prop::sample::select(vec!["<-", "=", "<<-"])
+        ) {
+            let code = format!("{} {} function() {{}}", func_name, op);
+            let tree = parse_r_code(&code);
+            
+            let func_def = find_function_definition_node(tree.root_node(), &func_name, &code);
+            prop_assert!(func_def.is_some(), "Function definition should be found for operator {}", op);
+            
+            if let Some(node) = func_def {
+                prop_assert_eq!(node.kind(), "function_definition");
+            }
+        }
+
+        #[test]
+        fn test_search_priority(func_name in "[a-z]{3,8}") {
+            use crate::state::{WorldState, Document};
+            use tower_lsp::lsp_types::Url;
+            
+            let current_uri = Url::parse("file:///current.R").unwrap();
+            let other_uri = Url::parse("file:///other.R").unwrap();
+            let workspace_uri = Url::parse("file:///workspace.R").unwrap();
+            
+            // Create function definitions with different signatures
+            let current_code = format!("{} <- function(a) {{ a }}", func_name);
+            let other_code = format!("{} <- function(b, c) {{ b + c }}", func_name);
+            let workspace_code = format!("{} <- function(x, y, z) {{ x + y + z }}", func_name);
+            
+            let mut state = WorldState::new(vec![]);
+            state.documents.insert(current_uri.clone(), Document::new(&current_code));
+            state.documents.insert(other_uri.clone(), Document::new(&other_code));
+            state.workspace_index.insert(workspace_uri.clone(), Document::new(&workspace_code));
+            
+            // Search should return current document's definition first
+            let signature = find_user_function_signature(&state, &current_uri, &func_name);
+            prop_assert!(signature.is_some());
+            
+            if let Some(sig) = signature {
+                prop_assert!(sig.contains("(a)"), "Should return current document's signature: {}", sig);
+                prop_assert!(!sig.contains("(b, c)"), "Should not return other document's signature");
+                prop_assert!(!sig.contains("(x, y, z)"), "Should not return workspace signature");
+            }
+        }
     }
 
     fn parse_r_code(code: &str) -> tree_sitter::Tree {
@@ -1006,6 +1288,21 @@ mod proptests {
         parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
         parser.parse(code, None).unwrap()
     }
+
+    fn find_function_definition(node: Node) -> Option<Node> {
+        if node.kind() == "function_definition" {
+            return Some(node);
+        }
+        
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(func) = find_function_definition(child) {
+                return Some(func);
+            }
+        }
+        None
+    }
+
     #[test]
     fn test_readlines_named_arg() {
         // This is the exact code from collate.r line 13
@@ -1028,6 +1325,57 @@ mod proptests {
         assert!(trimws_used, "trimws should be collected");
         assert!(readlines_used, "readLines should be collected");
         assert!(!n_used, "n should NOT be collected as it's a named argument");
+    }
+
+    proptest! {
+        #[test]
+        fn test_user_defined_priority_over_builtins(
+            builtin in prop::sample::select(vec!["print", "sum", "mean", "length"])
+        ) {
+            use crate::state::{WorldState, Document};
+            use tower_lsp::lsp_types::Url;
+            
+            let uri = Url::parse("file:///test.R").unwrap();
+            
+            // Create code with user-defined function that shadows a built-in
+            let code = format!("{} <- function(x, y) {{ x + y }}", builtin);
+            
+            let mut state = WorldState::new(vec![]);
+            state.documents.insert(uri.clone(), Document::new(&code));
+            
+            // Should return user-defined signature, not built-in
+            let signature = find_user_function_signature(&state, &uri, &builtin);
+            prop_assert!(signature.is_some(), "Should find user-defined function");
+            
+            if let Some(sig) = signature {
+                prop_assert!(sig.contains("(x, y)"), "Should return user-defined signature: {}", sig);
+                prop_assert!(sig.contains(&builtin), "Should contain function name: {}", sig);
+            }
+        }
+
+        #[test]
+        fn test_signature_format_correctness(
+            func_name in "[a-z][a-z0-9_]{2,10}",
+            param_count in 0usize..5
+        ) {
+            let params: Vec<String> = (0..param_count)
+                .map(|i| format!("p{}", i))
+                .collect();
+            
+            let code = format!("{} <- function({}) {{}}", func_name, params.join(", "));
+            let tree = parse_r_code(&code);
+            
+            let func_node = find_function_definition_node(tree.root_node(), &func_name, &code).unwrap();
+            let signature = extract_function_signature(func_node, &func_name, &code);
+            
+            // Verify format: name(params)
+            prop_assert!(signature.starts_with(&func_name), "Signature should start with function name");
+            prop_assert!(signature.contains('('), "Signature should contain opening parenthesis");
+            prop_assert!(signature.ends_with(')'), "Signature should end with closing parenthesis");
+            
+            let expected = format!("{}({})", func_name, params.join(", "));
+            prop_assert_eq!(signature, expected, "Signature format should match expected pattern");
+        }
     }
 }
 
