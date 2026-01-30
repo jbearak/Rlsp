@@ -145,6 +145,25 @@ impl LanguageServer for Backend {
                     affected.push(dep);
                 }
             }
+            
+            // Prioritize by activity (trigger first, then active, then visible, then recent)
+            let activity = &state.cross_file_activity;
+            affected.sort_by_key(|u| {
+                if *u == uri { 0 }
+                else { activity.priority_score(u) + 1 }
+            });
+            
+            // Apply revalidation cap (Requirement 0.9, 0.10)
+            let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
+            if affected.len() > max_revalidations {
+                log::trace!(
+                    "Cross-file revalidation cap exceeded: {} affected, scheduling {}",
+                    affected.len(),
+                    max_revalidations
+                );
+                affected.truncate(max_revalidations);
+            }
+            
             affected
         };
 
