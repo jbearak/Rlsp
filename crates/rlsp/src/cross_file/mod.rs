@@ -4,6 +4,7 @@
 // Cross-file awareness for Rlsp
 //
 
+pub mod cache;
 pub mod config;
 pub mod dependency;
 pub mod directive;
@@ -12,6 +13,7 @@ pub mod scope;
 pub mod source_detect;
 pub mod types;
 
+pub use cache::*;
 pub use config::*;
 pub use dependency::*;
 pub use directive::*;
