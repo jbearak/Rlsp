@@ -1310,9 +1310,15 @@ mod proptests {
     use crate::state::Document;
     use std::collections::HashSet;
 
+    // Helper to filter out R reserved keywords from generated identifiers
+    fn is_r_reserved(s: &str) -> bool {
+        matches!(s, "for" | "if" | "in" | "else" | "while" | "repeat" | "next" | "break" 
+            | "function" | "return" | "true" | "false" | "null" | "inf" | "nan")
+    }
+
     proptest! {
         #[test]
-        fn test_library_require_extraction(pkg_name in "[a-z]{3,10}") {
+        fn test_library_require_extraction(pkg_name in "[a-z]{3,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))) {
             let code_library = format!("library({})", pkg_name);
             let code_require = format!("require({})", pkg_name);
             let code_loadns = format!("loadNamespace(\"{}\")", pkg_name);
@@ -1347,8 +1353,8 @@ mod proptests {
 
         #[test]
         fn test_mixed_symbol_types(
-            var_name in "[a-z]{3,8}",
-            func_name in "[a-z]{3,8}",
+            var_name in "[a-z]{3,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            func_name in "[a-z]{3,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
             builtin in prop::sample::select(vec!["print", "sum", "mean", "length"])
         ) {
             let code = format!(
@@ -1367,8 +1373,8 @@ mod proptests {
 
         #[test]
         fn test_named_arguments_not_flagged(
-            func_name in "[a-z]{3,8}",
-            arg_name in "[a-z]{2,6}",
+            func_name in "[a-z]{3,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            arg_name in "[a-z]{2,6}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
             value in 1i32..100
         ) {
             let code = format!("{}({} = {})", func_name, arg_name, value);
@@ -1440,7 +1446,7 @@ mod proptests {
 
         #[test]
         fn test_assignment_operators_recognized(
-            func_name in "[a-z]{3,8}",
+            func_name in "[a-z]{3,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
             op in prop::sample::select(vec!["<-", "=", "<<-"])
         ) {
             let code = format!("{} {} function() {{}}", func_name, op);
@@ -1455,7 +1461,7 @@ mod proptests {
         }
 
         #[test]
-        fn test_search_priority(func_name in "[a-z]{3,8}") {
+        fn test_search_priority(func_name in "[a-z]{3,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))) {
             use crate::state::{WorldState, Document};
             use tower_lsp::lsp_types::Url;
             
