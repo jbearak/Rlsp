@@ -387,7 +387,6 @@ pub struct WorldState {
     pub cross_file_file_cache: CrossFileFileCache,
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
-    pub cross_file_diagnostics_gate: CrossFileDiagnosticsGate,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
     pub cross_file_parent_cache: ParentSelectionCache,
 }
@@ -410,7 +409,6 @@ impl WorldState {
             cross_file_file_cache: CrossFileFileCache::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
-            cross_file_diagnostics_gate: CrossFileDiagnosticsGate::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
             cross_file_parent_cache: ParentSelectionCache::new(),
         }

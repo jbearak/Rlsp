@@ -139,9 +139,12 @@ impl LanguageServer for Backend {
                 &uri,
                 state.cross_file_config.max_chain_depth,
             );
-            // Filter to only open documents
+            // Filter to only open documents and mark for force republish
             for dep in dependents {
                 if state.documents.contains_key(&dep) {
+                    // Mark dependent files for force republish (Requirement 0.8)
+                    // This allows same-version republish when dependency changes
+                    state.diagnostics_gate.mark_force_republish(&dep);
                     affected.push(dep);
                 }
             }
@@ -179,7 +182,6 @@ impl LanguageServer for Backend {
         
         // Clear diagnostics gate state
         state.diagnostics_gate.clear(uri);
-        state.cross_file_diagnostics_gate.clear(uri);
         
         // Cancel pending revalidation
         state.cross_file_revalidation.cancel(uri);
