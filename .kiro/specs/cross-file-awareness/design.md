@@ -350,6 +350,10 @@ Key properties:
 - Stores enough metadata to support backward call-site resolution via reverse deps.
 - Uses canonicalized URIs/paths to avoid duplicate nodes for the same file.
 - **Uses forward edges only as the canonical representation.** Backward directives are inputs used to infer/confirm forward edges, not separate edges in the graph. This prevents double-triggering invalidation and double-emitting diagnostics.
+- **Directive vs AST Conflict Policy (Required):** If both `@lsp-source` directives and AST detection produce edges to the same resolved target URI but disagree on call site position or edge flags, the implementation MUST resolve the conflict deterministically:
+  - If any `@lsp-source` directive exists for a `(from_uri, to_uri)` pair, it SHALL be treated as authoritative for that `(from,to)` pair. AST-derived edges to the same `to_uri` from that `from_uri` SHALL NOT create additional semantic edges.
+  - The server SHOULD emit a warning diagnostic on the directive line when it suppresses an AST-derived edge due to disagreement (to help users keep directives and code consistent).
+  - Provenance (directive vs AST) is retained for debugging, but does not multiply semantic edges.
 
 ```rust
 use std::collections::{HashMap, HashSet};
@@ -441,6 +445,7 @@ pub struct ScopedSymbol {
     pub kind: SymbolKind,
     pub source_uri: Url,
     pub defined_line: u32,
+    pub defined_column: u32,
     pub signature: Option<String>,
 }
 
@@ -457,6 +462,9 @@ pub enum ScopeError {
 /// IMPORTANT: call-site filtering correctness requires more than a final exported interface.
 /// Parents may introduce symbols via their own forward source() calls; children should only
 /// see the subset that is in-scope at the parent's call site.
+///
+/// IMPORTANT (v1 scope model): Exported interface and timeline entries are built from a
+/// constrained set of R constructs (see "R Symbol Model (v1)" below).
 #[derive(Debug, Clone)]
 pub struct ScopeArtifacts {
     /// Public surface used by dependents when importing this file wholesale.
@@ -1393,14 +1401,21 @@ impl CallSitePosition {
         Self { line, column }
     }
     
-    /// Create from 1-based line (for directive `line=` parameter), column defaults to 0
-    pub fn from_user_line(one_based_line: u32) -> Self {
-        Self { line: one_based_line.saturating_sub(1), column: 0 }
-    }
-    
-    /// Create representing "end of line" for a given 0-based line
+    /// Create representing "end of line" for a given 0-based line.
+    ///
+    /// IMPORTANT: When a user provides a `line=` hint, they are giving line-level precision,
+    /// not character-level precision. Treating it as "end of the line" is conservative and
+    /// avoids false negatives (e.g., excluding symbols defined earlier on the same line).
     pub fn end_of_line(line: u32) -> Self {
         Self { line, column: u32::MAX }
+    }
+    
+    /// Create from 1-based line (for directive `line=` parameter), interpreted as end-of-line.
+    ///
+    /// Rationale: `line=` is a coarse hint, so we interpret it as "call happens somewhere on
+    /// this line"; end-of-line is the safest approximation.
+    pub fn from_user_line(one_based_line: u32) -> Self {
+        Self::end_of_line(one_based_line.saturating_sub(1))
     }
     
     /// Lexicographic comparison: (l1, c1) < (l2, c2) iff l1 < l2 || (l1 == l2 && c1 < c2)
@@ -1528,6 +1543,30 @@ pub fn ambiguous_parent_diagnostic(
 
 See **Unified Cross-File Metadata Model (Single Source of Truth)** above (`CrossFileMetadata`). That representation is the only directive/source data model.
 
+### R Symbol Model (v1)
+
+Cross-file awareness requires a stable definition of what the LSP considers a "definition" for:
+- exported interfaces (what a sourced file provides), and
+- timeline events (what becomes in-scope at a particular position).
+
+To keep the feature tractable and predictable, v1 scope tracking MUST use the following constrained model:
+
+1. **Functions**
+- Top-level assignments of the form `name <- function(...) ...` and `name = function(...) ...` are treated as function definitions.
+- For v1, the LSP may treat the signature as `function(...)` without attempting to infer parameter defaults.
+
+2. **Top-level variables**
+- Top-level assignments of the form `name <- <expr>` and `name = <expr>` are treated as variable definitions.
+- Assignments using `<<-`, `assign()`, `set()`, or other reflective/dynamic constructs are NOT treated as definitions in v1.
+
+3. **Namespace/exports are out of scope (v1)**
+- Package semantics (NAMESPACE exports/imports) are not part of cross-file awareness; they remain under existing workspace indexing.
+
+4. **Conservatism**
+- If a construct cannot be statically recognized as a definition (e.g., `assign(paste0("x", i), ...)`), it MUST be ignored for scope purposes and MUST NOT suppress undefined-variable diagnostics.
+
+This model MUST be documented (Requirement 16) so users understand which constructs contribute to cross-file scope.
+
 ### Position-aware scope artifacts
 
 Cross-file scope is position-aware. The stable "unit of sharing" across files is a file's **exported interface** plus an **interface hash** used for invalidation.
@@ -1622,7 +1661,10 @@ Clarification: "exactly one" means a single diagnostic per (file, line, referenc
 
 **Validates: Requirements 1.4**
 
-Clarification (Required): Call-site filtering uses the 0-based `call_site_line` and MUST include only symbols with `defined_line < call_site_line` (i.e., strictly before the call line).
+Clarification (Required): `line=` is line-level precision, not character-level precision.
+- Internally, a `line=` call-site MUST be treated as a full call-site position at end-of-line: `(call_site_line = N-1, call_site_column = end_of_line)`.
+- Call-site filtering MUST then be position-aware: include a definition at `(def_line, def_col)` iff `(def_line, def_col) <= (call_site_line, call_site_col)`.
+- This avoids false negatives for symbols defined earlier on the same line as the call.
 
 ### Property 10: Call Site Match Parameter Extraction
 
@@ -1698,7 +1740,9 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 ### Property 20: Call Site Symbol Filtering
 
-*For any* backward directive with `line=N` (user-facing 1-based), after conversion to internal 0-based `call_site_line`, only symbols with `defined_line < call_site_line` in the parent file SHALL be included in the scope.
+*For any* backward directive with `line=N` (user-facing 1-based), after conversion to internal 0-based `call_site_line`, the scope inherited from the parent MUST include exactly the definitions at positions `(def_line, def_col)` such that `(def_line, def_col) <= (call_site_line, call_site_col)`, where `call_site_col` is:
+- the exact character position if known (from AST/reverse edges/match inference), or
+- end-of-line if the call site came from `line=`.
 
 **Validates: Requirements 5.5**
 
@@ -1828,6 +1872,12 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 **Validates: Requirements 6.1, 6.2, 12.5**
 
+### Property 58: Directive Overrides AST For Same (from,to)
+
+*For any* file where both an `@lsp-source` directive and AST detection (`source()` call) identify a relationship to the same resolved target URI but disagree on call site position or edge flags, the Dependency_Graph SHALL contain exactly one semantic relationship for that `(from_uri, to_uri)` pair, and that relationship SHALL use the directive's semantics.
+
+**Validates: Requirements 6.8**
+
 ### Property 51: Full Position Precision
 
 *For any* completion, hover, or go-to-definition request at position `(line, column)` on the same line as a `source()` call at position `(line, call_column)`:
@@ -1838,7 +1888,7 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 ### Property 41: Freshness Guard Prevents Stale Diagnostics
 
-*For any* debounced/background diagnostics task, if the document version changes between task scheduling and publishing, the task SHALL NOT publish diagnostics.
+*For any* debounced/background diagnostics task, if either the document version (when present) OR the document content hash/revision changes between task scheduling and publishing, the task SHALL NOT publish diagnostics.
 
 **Validates: Requirements 0.6**
 
@@ -1925,21 +1975,32 @@ These invariants MUST be preserved across all refactoring. They are the core beh
 
 2. **Never use `futures::executor::block_on()` inside Tokio runtime** - always use async/await patterns to avoid deadlocks.
 
-3. **Edge deduplication is semantic, not syntactic** - edges are deduplicated by `(to_uri, call_site_position, local, chdir, is_sys_source)`, not by provenance (directive vs AST). The dependency graph uses **forward edges only** as the canonical representation; backward directives are inputs used to infer/confirm forward edges, not separate edges.
+3. **No blocking disk I/O while holding the Tokio WorldState lock (Required)**.
+- Never call `std::fs::*` while holding `tokio::sync::RwLock<WorldState>` (read or write).
+- If disk reads are needed for scope resolution of closed files or for call-site inference, use `tokio::fs` (preferred) or `tokio::task::spawn_blocking`, and re-check freshness before publishing.
+- Heavy computations and I/O MUST follow a two-phase snapshot pattern: (1) capture inputs under lock, (2) compute off-lock, (3) re-check inputs under lock before publish.
 
-4. **Open documents are always authoritative** - disk-backed caches MUST NOT overwrite in-memory state for open files. This MUST be enforced at every read path: `CrossFileWorkspaceIndex` and `CrossFileFileCache` APIs MUST check "is it open?" before returning disk-derived data.
+4. **Edge deduplication and conflict handling MUST be deterministic**.
+- Deduplication is semantic, not syntactic.
+- Additionally, directive-vs-AST conflicts MUST have an explicit resolution policy (see "Directive vs AST Conflict Policy" below) so scope does not shift unpredictably.
 
-5. **Parent resolution MUST be deterministic and stable** - even when some parents are temporarily missing (file deleted or not yet indexed), the same inputs MUST produce the same selected parent. Once a parent is selected for a given (child_uri, metadata_fingerprint, reverse_edges_hash) cache key, it remains until either that child's metadata changes OR the reverse edges pointing to the child change (e.g., rename/delete+create convergence).
+5. **Open documents are always authoritative** - disk-backed caches MUST NOT overwrite in-memory state for open files. This MUST be enforced at every read path: `CrossFileWorkspaceIndex` and `CrossFileFileCache` APIs MUST check "is it open?" before returning disk-derived data.
 
-6. **compute_artifacts() MUST NOT read other files' content** - it depends only on the file's own content/AST plus pre-existing dependency metadata (edges) and already-indexed interface hashes. This prevents recursion and lock contention.
+6. **Parent resolution MUST be deterministic and stable** - even when some parents are temporarily missing (file deleted or not yet indexed), the same inputs MUST produce the same selected parent. Once a parent is selected for a given (child_uri, metadata_fingerprint, reverse_edges_hash) cache key, it remains until either that child's metadata changes OR the reverse edges pointing to the child change (e.g., rename/delete+create convergence).
 
-7. **handlers::diagnostics() MUST NOT mutate WorldState core fields** - it runs under a read lock and must not modify `documents`, `cross_file_graph`, `cross_file_config`, or `cross_file_diagnostics_gate`. However, caches (`cross_file_cache`, `cross_file_meta`, `cross_file_parent_cache`) use interior mutability and MAY be populated during read operations. All state mutations to core fields happen in separate write-lock passes.
+7. **compute_artifacts() MUST NOT read other files' content** - it depends only on the file's own content/AST plus pre-existing dependency metadata (edges) and already-indexed interface hashes. This prevents recursion and lock contention.
 
-8. **Interface change detection uses symbol hash, not metadata hash** - `interface_changed` MUST be computed by comparing `ScopeArtifacts.interface_hash` (the actual exported symbol surface), not `CrossFileMetadata` hash. This ensures dependents invalidate when function definitions change, even if directives/source-calls remain identical.
+8. **handlers::diagnostics() MUST NOT mutate WorldState core fields** - it runs under a read lock and must not modify `documents`, `cross_file_graph`, `cross_file_config`, or `cross_file_diagnostics_gate`. However, caches (`cross_file_cache`, `cross_file_meta`, `cross_file_parent_cache`) use interior mutability and MAY be populated during read operations.
 
-9. **Duplicate same-version diagnostic publishes are acceptable** - The monotonic gate prevents older-version publishes but allows same-version duplicates. This simplifies the implementation while maintaining correctness (client overwrites with equivalent diagnostics).
+9. **Freshness must be guarded by version AND content hash**.
+- Version alone is insufficient for dependency-triggered revalidation, and may be absent.
+- Any async task that publishes diagnostics MUST validate `(document_version, document_content_hash)` against the snapshot captured at scheduling time.
 
-10. **Interior-mutable cache lock hold-time MUST be minimal** - When populating caches during read operations, hold the inner `RwLock` only for the HashMap lookup/insert. Never hold the cache lock while performing IO (disk reads for inference) or expensive computation. Pattern: compute fingerprint → check cache (read lock) → if miss: compute resolution (no lock) → insert (write lock).
+10. **Interface change detection uses symbol hash, not metadata hash** - `interface_changed` MUST be computed by comparing `ScopeArtifacts.interface_hash` (the actual exported symbol surface), not `CrossFileMetadata` hash. This ensures dependents invalidate when function definitions change, even if directives/source-calls remain identical.
+
+11. **Duplicate same-version diagnostic publishes are acceptable** - The monotonic gate prevents older-version publishes but allows same-version duplicates. This simplifies the implementation while maintaining correctness (client overwrites with equivalent diagnostics).
+
+12. **Interior-mutable cache lock hold-time MUST be minimal** - When populating caches during read operations, hold the inner `RwLock` only for the HashMap lookup/insert. Never hold the cache lock while performing IO (disk reads for inference) or expensive computation. Pattern: compute fingerprint → check cache (read lock) → if miss: compute resolution (no lock) → insert (write lock).
 
 ### Missing Files
 

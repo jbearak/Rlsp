@@ -52,7 +52,9 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 3. WHEN a document’s exported symbol interface changes OR its dependency edges change, THE LSP SHALL invalidate cross-file scope caches for all transitive dependents.
 4. WHEN a file is invalidated and is currently open, THE LSP SHALL recompute and publish diagnostics for that file without requiring the user to edit that file.
 5. IF multiple changes occur rapidly across files, THEN the LSP SHALL debounce revalidation and SHALL cancel outdated pending revalidations to avoid publishing stale diagnostics.
-6. BEFORE publishing diagnostics from any debounced/background task, THE LSP SHALL verify a freshness guard (document version and/or content hash) and SHALL NOT publish if the task is stale.
+6. BEFORE publishing diagnostics from any debounced/background task, THE LSP SHALL verify a freshness guard and SHALL NOT publish if the task is stale.
+   - The freshness guard MUST include both the document version (when available) AND a document content hash/revision identifier.
+   - Version alone is insufficient because dependency-triggered revalidation may require same-version republish, and some clients may omit versions.
 7. THE LSP SHALL enforce monotonic diagnostic publishing per URI (never publish diagnostics for an older document version than what has already been published).
 8. WHEN dependency-driven scope/diagnostic inputs change for an open document without changing its text document version, THE LSP SHALL provide a "force republish" mechanism so updated diagnostics can still be published.
 9. WHEN invalidation affects many open documents, THE LSP SHALL prioritize revalidation and SHALL cap the number of revalidations scheduled per trigger (configurable).
@@ -73,6 +75,7 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 4. WHEN a backward directive includes `line=<number>`, THE Directive_Parser SHALL record the call site line number.
    - The directive syntax SHALL interpret `line=` as a 1-based line number for user ergonomics.
    - Internally, the LSP SHALL convert to 0-based lines to match LSP positions.
+   - The Scope_Resolver SHALL interpret `line=` as a coarse call-site hint and SHALL treat it as occurring at end-of-line for call-site filtering (conservative; avoids false negatives for same-line definitions).
 5. WHEN a backward directive includes `match="<pattern>"`, THE Directive_Parser SHALL record the pattern for call site identification
 6. WHEN a directive path is relative, THE Path_Resolver SHALL resolve it relative to the current file's directory
 7. WHEN a directive path uses `..`, THE Path_Resolver SHALL correctly navigate parent directories
@@ -134,11 +137,14 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 2. WHEN resolving scope for a file at a given position, THE Scope_Resolver SHALL then process forward source() calls in document order.
 3. WHEN a symbol is defined in a sourced file, THE Scope_Resolver SHALL make it available only for positions strictly after the source() call site.
 4. WHEN a symbol is defined in the current file, THE Scope_Resolver SHALL give it precedence over inherited symbols (shadowing).
-5. WHEN a backward directive call site line number is specified, THE Scope_Resolver SHALL only include symbols defined before that call site line in the parent.
+5. WHEN a backward directive call site is specified, THE Scope_Resolver SHALL apply position-aware call-site filtering.
+   - If the call site is known as a full position `(line, character)`, the resolver SHALL include exactly the symbols defined at positions `<= call_site_position` in the parent.
+   - If the call site comes from `line=` (line-only precision), the resolver SHALL treat it as end-of-line for that line (conservative; avoids false negatives for same-line definitions).
 6. WHEN a backward directive call site is not specified, THE Scope_Resolver SHALL attempt to identify the call site using:
    - reverse dependency edges (from forward resolution)
    - text inference in the parent (static string-literal source() only)
    - otherwise falling back to the configured default (end-of-file or start-of-file).
+   - Call-site identification MUST yield a full call-site position when possible (line + UTF-16 column).
 7. WHEN circular source dependencies exist, THE Scope_Resolver SHALL detect and break the cycle with a diagnostic.
 8. WHEN the source chain exceeds the maximum depth, THE Scope_Resolver SHALL stop traversal and emit a diagnostic.
 9. WHEN a file is sourced multiple times at different call sites, THE Scope_Resolver SHALL apply the earliest call site for “introduced symbols” semantics unless the user disambiguates using `line=` or `match=`.
@@ -159,6 +165,10 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 5. WHEN querying dependencies of a file, THE Dependency_Graph SHALL return all files it sources directly or indirectly
 6. THE Dependency_Graph SHALL support concurrent read access from multiple LSP handlers
 7. THE Dependency_Graph SHALL serialize write access to prevent data races
+8. WHEN both `@lsp-source` directives and AST detection identify a source relationship to the same resolved target URI but disagree on call site position or flags, THE system SHALL resolve the conflict deterministically:
+   - If any `@lsp-source` directive exists for a `(from_uri, to_uri)` pair, it SHALL be treated as authoritative for that pair.
+   - AST-derived edges to the same `(from_uri, to_uri)` SHALL NOT create additional semantic edges.
+   - The LSP SHOULD emit a warning diagnostic on the directive line when it suppresses an AST-derived edge due to disagreement.
 
 ### Requirement 7: Enhanced Completions
 
@@ -241,7 +251,8 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 5. WHEN a dependency edge set changes (add/remove/modify call sites), THE Cache SHALL invalidate scope caches of all transitive dependents.
 6. THE Cache SHALL use lazy evaluation to avoid computing unused scopes.
 7. The cache design SHALL support concurrent reads and serialized writes without deadlocks.
-8. The LSP SHOULD use an interface-hash optimization: IF a file changes but its exported interface hash remains identical and its edge set remains identical, THEN dependent invalidation SHOULD be skipped.
+8. The implementation SHALL NOT perform blocking disk I/O while holding the Tokio `WorldState` lock (read or write). If disk reads are needed, they SHALL be performed via `tokio::fs` or `tokio::task::spawn_blocking`, and results MUST be rechecked for freshness before publishing diagnostics.
+9. The LSP SHOULD use an interface-hash optimization: IF a file changes but its exported interface hash remains identical and its edge set remains identical, THEN dependent invalidation SHOULD be skipped.
 
 ### Requirement 13: Workspace Watching + Indexing (Required)
 
@@ -282,7 +293,6 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
    - `timestampMs`: client timestamp for ordering
 4. When the server receives these notifications, it SHALL update an in-memory activity model used to prioritize cross-file revalidations (Requirement 0.7).
 5. If the client does not support these notifications, the server MUST fall back to trigger-first + most-recently-changed ordering.
-
 
 ### Requirement 16: Documentation Updates
 
@@ -330,3 +340,16 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
    - Testing strategies for cross-file features
 7. WHEN documentation is updated, THE examples SHALL be tested to ensure accuracy
 8. THE documentation SHALL follow the existing style and structure of README.md and AGENTS.md
+
+### Requirement 17: R Symbol Model (v1)
+
+**User Story:** As an R developer, I want cross-file scope behavior to be predictable and explainable, so that the LSP does not suppress diagnostics or offer completions based on ambiguous or dynamic constructs.
+
+#### Acceptance Criteria
+
+1. The cross-file scope model SHALL define a constrained set of R constructs that are treated as symbol definitions in v1.
+2. The model SHALL, at minimum, treat top-level assignments `name <- function(...) ...` and `name = function(...) ...` as function definitions.
+3. The model SHALL, at minimum, treat top-level assignments `name <- <expr>` and `name = <expr>` as variable definitions.
+4. The model SHALL NOT treat dynamic/reflective constructs (including but not limited to `assign()`, `set()`, and `<<-`) as symbol definitions in v1.
+5. Undefined-variable diagnostics SHALL NOT be suppressed based on constructs that are not recognized as definitions by the v1 model.
+6. The README.md SHALL document this v1 symbol model and its limitations.

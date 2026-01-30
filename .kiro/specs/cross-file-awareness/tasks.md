@@ -112,10 +112,17 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 50: Edge Deduplication**
     - **Validates: Requirements 6.1, 6.2, 12.5**
 
+  - [ ] 6.5 Write property test for directive-vs-AST conflict resolution
+    - **Property 58: Directive Overrides AST For Same (from,to)**
+    - Generate cases where both an `@lsp-source` directive and an AST-detected `source()` call reference the same resolved target but disagree on call site or flags.
+    - Verify the graph contains exactly one semantic edge for the pair and that it uses the directive's semantics.
+    - **Validates: Requirements 6.8**
+
 - [ ] 7. Implement scope resolution
   - [ ] 7.1 Create `scope.rs` with `ScopeResolver` trait
-    - Define `ScopedSymbol`, `ScopeArtifacts`, `ScopeEvent`, `ScopeAtPosition` types
+    - Define `ScopedSymbol` (including `defined_column`), `ScopeArtifacts`, `ScopeEvent`, `ScopeAtPosition` types
     - Implement `compute_artifacts()` - non-recursive, file-local only
+    - Implement v1 R symbol model extraction for exported interface + timeline Def events (functions + top-level assignments only)
     - Build timeline of `ScopeEvent`s (Def, Source, WorkingDirectory)
     - Compute exported interface hash
     - Implement `scope_at_position()` with full (line, column) precision
@@ -150,6 +157,11 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
   - [ ] 7.7 Write property test for local=TRUE semantics
     - **Property 52: Local=TRUE No Inheritance**
     - **Validates: Requirements 4.7**
+
+  - [ ] 7.8 Write property test for v1 R symbol model
+    - Generate files with a mix of top-level `name <- function(...)` / `name <- <expr>` definitions and dynamic constructs like `assign()`, `<<-`, and reflective calls.
+    - Verify only v1-recognized constructs contribute to exported interface and suppress undefined-variable diagnostics.
+    - **Validates: Requirements 17.1-17.6**
 
 - [ ] 8. Implement configuration
   - [ ] 8.1 Create `config.rs` with `CrossFileConfig` struct
@@ -214,6 +226,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Extract metadata, update graph, compute interface/edge changes
     - Invalidate dependent caches selectively
     - Return list of affected open documents
+    - Ensure no blocking disk I/O is performed while holding the Tokio `WorldState` lock (use async reads or spawn_blocking + re-check freshness)
     - Implement `schedule_diagnostics_debounced()` function
     - Prioritize: trigger first, then active, then visible, then recent
     - Cap revalidations per trigger (configurable)
@@ -233,6 +246,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
 
   - [ ] 12.4 Write property test for freshness guard
     - **Property 41: Freshness Guard Prevents Stale Diagnostics**
+    - Verify freshness guard uses both version (when present) AND a content-hash/revision snapshot.
     - **Validates: Requirements 0.6**
 
   - [ ] 12.5 Write property test for monotonic publishing
