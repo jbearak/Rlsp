@@ -223,7 +223,10 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     let text = doc.text();
     let mut diagnostics = Vec::new();
 
-    // Collect syntax errors
+    // Parse directives to get ignored lines
+    let directive_meta = crate::cross_file::directive::parse_directives(&text);
+
+    // Collect syntax errors (not suppressed by @lsp-ignore)
     collect_syntax_errors(tree.root_node(), &mut diagnostics);
 
     // Collect undefined variable errors with position-aware cross-file scope
@@ -235,6 +238,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
         &doc.loaded_packages,
         &state.workspace_imports,
         &state.library,
+        &directive_meta,
         &mut diagnostics,
     );
 
@@ -274,6 +278,7 @@ fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
 
 /// Position-aware undefined variable collection.
 /// Checks each usage against the cross-file scope at that specific position.
+/// Respects @lsp-ignore and @lsp-ignore-next directives.
 fn collect_undefined_variables_position_aware(
     state: &WorldState,
     uri: &Url,
@@ -282,6 +287,7 @@ fn collect_undefined_variables_position_aware(
     loaded_packages: &[String],
     workspace_imports: &[String],
     library: &crate::state::Library,
+    directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     use std::collections::HashSet;
@@ -297,6 +303,13 @@ fn collect_undefined_variables_position_aware(
 
     // Report undefined variables with position-aware cross-file scope
     for (name, usage_node) in used {
+        let usage_line = usage_node.start_position().row as u32;
+
+        // Skip if line is ignored via @lsp-ignore or @lsp-ignore-next
+        if crate::cross_file::directive::is_line_ignored(directive_meta, usage_line) {
+            continue;
+        }
+
         // Skip if locally defined or builtin
         if defined.contains(&name)
             || is_builtin(&name)
@@ -307,7 +320,6 @@ fn collect_undefined_variables_position_aware(
         }
 
         // Get cross-file symbols at the usage position
-        let usage_line = usage_node.start_position().row as u32;
         let usage_col = usage_node.start_position().column as u32;
         let cross_file_symbols = get_cross_file_symbols(state, uri, usage_line, usage_col);
 
