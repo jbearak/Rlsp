@@ -53,8 +53,13 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 4. WHEN a file is invalidated and is currently open, THE LSP SHALL recompute and publish diagnostics for that file without requiring the user to edit that file.
 5. IF multiple changes occur rapidly across files, THEN the LSP SHALL debounce revalidation and SHALL cancel outdated pending revalidations to avoid publishing stale diagnostics.
 6. BEFORE publishing diagnostics from any debounced/background task, THE LSP SHALL verify a freshness guard (document version and/or content hash) and SHALL NOT publish if the task is stale.
-7. WHEN invalidation affects many open documents, THE LSP SHALL prioritize revalidation (active document first, then other open documents) and SHALL cap the number of revalidations scheduled per trigger (configurable).
-8. WHEN the cap is exceeded, THE LSP SHALL log/trace that additional open documents were skipped for that trigger (best-effort) and SHALL revalidate skipped documents on-demand when they become active.
+7. THE LSP SHALL enforce monotonic diagnostic publishing per URI (never publish diagnostics for an older document version than what has already been published).
+8. WHEN dependency-driven scope/diagnostic inputs change for an open document without changing its text document version, THE LSP SHALL provide a "force republish" mechanism so updated diagnostics can still be published.
+9. WHEN invalidation affects many open documents, THE LSP SHALL prioritize revalidation and SHALL cap the number of revalidations scheduled per trigger (configurable).
+   - The trigger document (the one that changed) SHALL be prioritized first.
+   - If the client provides active/visible document hints (see Requirement 15), the server SHOULD prioritize: active > visible > other open.
+   - Otherwise, the server SHOULD fall back to most-recently-changed/opened ordering.
+10. WHEN the cap is exceeded, THE LSP SHALL log/trace that additional open documents were skipped for that trigger (best-effort). Skipped documents SHALL be revalidated on-demand when they become active/visible (or next time they change).
 
 ### Requirement 1: Backward Directive Parsing
 
@@ -243,6 +248,7 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 
 1. THE LSP SHALL register file watchers for relevant R files (at minimum `**/*.R` and `**/*.r`) so that changes are observed via `workspace/didChangeWatchedFiles`.
 2. WHEN a watched file is created or changed, THE LSP SHALL invalidate any disk-backed caches for that file and SHALL schedule a debounced workspace index update for that file.
+   - IF the file is currently open in the editor (i.e., present in the in-memory Document store), the in-memory contents MUST remain authoritative and the server MUST NOT overwrite in-memory metadata/artifacts with disk-derived results for that file.
 3. WHEN a watched file is deleted, THE Dependency_Graph SHALL remove all edges involving that file and THE LSP SHALL invalidate cross-file scope caches for open dependents.
 4. WHEN a watched file change affects the dependency graph (edges added/removed/modified) OR a watched file’s exported interface changes, THE LSP SHALL update diagnostics for affected open files without requiring the user to edit those files.
 5. The workspace index SHALL expose a monotonically increasing version counter that increments whenever it changes.
@@ -258,3 +264,18 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
 2. THE Directive representation SHALL be serializable to JSON for debugging and testing
 3. THE Directive_Parser SHALL produce equivalent output when parsing the same file content (deterministic)
 4. FOR ALL valid directive strings, parsing then serializing then parsing again SHALL produce equivalent directive structures (round-trip property)
+
+### Requirement 15: Client Activity Signals (VS Code)
+
+**User Story:** As an R developer, I want cross-file revalidation to prioritize the active/visible editors, so that diagnostics update first where I’m looking.
+
+#### Acceptance Criteria
+
+1. The VS Code client extension SHALL send a custom LSP notification when the active editor changes.
+2. The VS Code client extension SHOULD send a custom LSP notification when the set of visible text editors changes.
+3. The notification payload SHALL include:
+   - `activeUri`: the currently active document URI (or null if none)
+   - `visibleUris`: the set/list of currently visible document URIs
+   - `timestampMs`: client timestamp for ordering
+4. When the server receives these notifications, it SHALL update an in-memory activity model used to prioritize cross-file revalidations (Requirement 0.7).
+5. If the client does not support these notifications, the server MUST fall back to trigger-first + most-recently-changed ordering.

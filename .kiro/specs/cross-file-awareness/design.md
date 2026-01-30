@@ -357,6 +357,13 @@ Implementation notes:
 - `scope_at_line` merges local defs + inherited interfaces gated by call-site ordering, using the parent's own position-aware scope at the call site.
 - Both use call-site resolution ladder for backward directives (explicit → reverse deps → inference → default).
 
+Required boundary:
+- `compute_artifacts(uri, ...)` MUST depend only on the file's own content/AST plus pre-existing dependency metadata (edges), and MUST NOT call `scope_at_line` for other files. This prevents recursion and avoids exponential recomputation.
+- `scope_at_line` MAY traverse to other files, but it MUST be bounded by `max_chain_depth` and MUST maintain a visited set to prevent cycles.
+
+Caching requirement (performance + correctness):
+- Cache entries for `ScopeArtifacts` and `scope_at_line` MUST be fingerprinted so that concurrent edits and index updates cannot reuse stale results (see ScopeFingerprint).
+
 
 ### Configuration
 
@@ -501,6 +508,15 @@ To support concurrent editing and to prevent publishing stale diagnostics:
 - Any debounced/background diagnostics task MUST capture a trigger version (or content hash) and MUST re-check it before publishing.
 - If the document is no longer open, tasks MUST no-op.
 
+#### Diagnostics Publish Gating (Required)
+
+To prevent stale diagnostic publishes when multiple triggers race (e.g., cross-file invalidation + user edits), the server MUST enforce monotonic publishing per URI.
+
+Minimum requirement:
+- Track `last_published_version[uri]`.
+- Never publish diagnostics for `document.version` if it is `< last_published_version[uri]`.
+- Provide a "force republish" mechanism for dependency-triggered revalidation where the document version may be unchanged but scope/diagnostic inputs changed. (Sight uses a `clear_published_version`-style mechanism.)
+
 ```rust
 /// Extended WorldState with cross-file support
 pub struct WorldState {
@@ -523,6 +539,13 @@ pub struct WorldState {
 
     // Revalidation bookkeeping (debounce/cancellation keyed by URI)
     pub cross_file_revalidation: CrossFileRevalidationState,
+
+    // Client activity hints (optional but supported by the VS Code extension)
+    // Used only for prioritization; never affects correctness.
+    pub cross_file_activity: CrossFileActivityState,
+
+    // Diagnostics publish gating / forced republish bookkeeping
+    pub cross_file_diagnostics_gate: CrossFileDiagnosticsGate,
 
     // Workspace index integration (required)
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
@@ -646,6 +669,9 @@ pub fn revalidate_after_change_locked(
 /// IMPORTANT: background tasks must not capture `&mut WorldState`.
 /// Instead, they re-acquire state via `Arc<RwLock<WorldState>>` and must guard
 /// against publishing stale results.
+///
+/// IMPORTANT: publishing MUST be monotonic per document: do not publish diagnostics for
+/// an older document version than what has already been published.
 pub fn schedule_diagnostics_debounced(
     state_arc: Arc<tokio::sync::RwLock<WorldState>>,
     client: Client,
@@ -654,8 +680,17 @@ pub fn schedule_diagnostics_debounced(
     max_to_schedule: usize,
 ) {
     // Prioritization + cap (Requirement 0):
-    // Always schedule `trigger_uri` first if present, then schedule remaining URIs.
-    affected.sort_by_key(|u| if *u == trigger_uri { 0usize } else { 1usize });
+    // 1) Always schedule `trigger_uri` first.
+    // 2) If the client provides activity hints (see "Client Activity Signals (VS Code)"),
+    //    prioritize active > visible > other open.
+    // 3) Otherwise, fall back to most-recently-changed/opened ordering.
+    affected.sort_by_key(|u| {
+        if *u == trigger_uri {
+            return 0usize;
+        }
+        // Placeholder: real implementation uses `state.cross_file_activity`.
+        1usize
+    });
 
     for uri in affected.into_iter().take(max_to_schedule) {
         // Determine the trigger version/hash now (freshness guard)
@@ -934,6 +969,8 @@ Clarification: "exactly one" means a single diagnostic per (file, line, referenc
 
 **Validates: Requirements 1.4**
 
+Clarification (Required): Call-site filtering uses the 0-based `call_site_line` and MUST include only symbols with `defined_line < call_site_line` (i.e., strictly before the call line).
+
 ### Property 10: Call Site Match Parameter Extraction
 
 *For any* backward directive with `match="pattern"` parameter, the parsed `CallSiteSpec` SHALL be `Match(pattern)` with the exact pattern string.
@@ -996,7 +1033,7 @@ Clarification: "exactly one" means a single diagnostic per (file, line, referenc
 
 ### Property 20: Call Site Symbol Filtering
 
-*For any* backward directive with `line=N`, only symbols defined on lines 0 through N-1 (0-based) in the parent file SHALL be included in the scope.
+*For any* backward directive with `line=N` (user-facing 1-based), after conversion to internal 0-based `call_site_line`, only symbols with `defined_line < call_site_line` in the parent file SHALL be included in the scope.
 
 **Validates: Requirements 5.5**
 
@@ -1128,15 +1165,15 @@ Clarification: "exactly one" means a single diagnostic per (file, line, referenc
 
 ### Property 42: Revalidation Prioritization
 
-*For any* invalidation affecting multiple open documents, the active document SHALL be revalidated before other open documents.
+*For any* invalidation affecting multiple open documents, the trigger document (the document that changed or was saved) SHALL be revalidated before other open documents. If the client provides active/visible document hints (see **Client Activity Signals (VS Code)**), the server SHOULD prioritize: active > visible > other open. If no hints are available, the server SHOULD fall back to most-recently-changed/opened ordering.
 
-**Validates: Requirements 0.7**
+**Validates: Requirements 0.9**
 
 ### Property 43: Revalidation Cap Enforcement
 
-*For any* invalidation affecting more open documents than `maxRevalidationsPerTrigger`, only the first N documents (prioritized) SHALL be scheduled, and skipped documents SHALL be revalidated on-demand when they become active.
+*For any* invalidation affecting more open documents than `maxRevalidationsPerTrigger`, only the first N documents (prioritized) SHALL be scheduled. Skipped documents SHALL be revalidated on-demand when they become active/visible (or next time they change) and the server SHOULD emit a trace/log indicating that documents were skipped.
 
-**Validates: Requirements 0.7, 0.8**
+**Validates: Requirements 0.9, 0.10**
 
 ### Property 44: Workspace Index Version Monotonicity
 
@@ -1154,232 +1191,7 @@ Clarification: "exactly one" means a single diagnostic per (file, line, referenc
 
 *For any* file containing `# @lsp-source <path>` at line N, the Directive_Parser SHALL treat it as an explicit source() declaration at line N.
 
-**Validates: Requirements 2.1**s, hover, and go-to-definition SHALL use the local definition.
-
-**Validates: Requirements 5.4, 7.3, 9.2, 9.3**
-
-### Property 5: Diagnostic Suppression
-
-*For any* file containing `# @lsp-ignore` on line `n`, no diagnostics SHALL be emitted for line `n`. *For any* file containing `# @lsp-ignore-next` on line `n`, no diagnostics SHALL be emitted for line `n+1`.
-
-**Validates: Requirements 2.2, 2.3, 10.4, 10.5**
-
-
-### Property 6: Missing File Diagnostics
-
-*For any* directive or source() call referencing a non-existent file path, the Diagnostic_Engine SHALL emit exactly one warning diagnostic at the location of that reference.
-
-Clarification: "exactly one" means a single diagnostic per (file, line, referenced path) tuple. If the same missing path is referenced multiple times at different lines, each reference may produce its own diagnostic.
-
-**Validates: Requirements 1.8, 2.5, 10.2**
-
-### Property 7: Circular Dependency Detection
-
-*For any* set of files where file A sources file B and file B sources file A (directly or transitively), the Scope_Resolver SHALL detect the cycle, break it, and emit an error diagnostic listing the cycle.
-
-**Validates: Requirements 5.7, 10.6**
-
-### Property 8: Directive Round-Trip Serialization
-
-*For any* valid `CrossFileMetadata` structure, serializing to JSON and then deserializing SHALL produce an equivalent structure. This implies parsing is deterministic.
-
-**Validates: Requirements 14.3, 14.4**
-
-### Property 9: Call Site Line Parameter Extraction
-
-*For any* backward directive with `line=N` parameter where N is a valid line number, the parsed `CallSiteSpec` SHALL be `Line(N)` with the exact value.
-
-**Validates: Requirements 1.4**
-
-### Property 10: Call Site Match Parameter Extraction
-
-*For any* backward directive with `match="pattern"` parameter, the parsed `CallSiteSpec` SHALL be `Match(pattern)` with the exact pattern string.
-
-**Validates: Requirements 1.5**
-
-### Property 11: Relative Path Resolution
-
-*For any* file at path `/a/b/c.R` and relative directive path `../d/e.R`, the Path_Resolver SHALL resolve to `/a/d/e.R`.
-
-**Validates: Requirements 1.6, 1.7**
-
-### Property 12: Forward Directive Order Preservation
-
-*For any* file containing multiple `@lsp-source` directives, the parsed `ForwardSource` list SHALL maintain the same order as they appear in the document.
-
-**Validates: Requirements 2.4**
-
-
-### Property 13: Working Directory Inheritance
-
-*For any* source chain A → B → C where only A has a working directory directive, files B and C SHALL inherit A's working directory for path resolution.
-
-**Validates: Requirements 3.5**
-
-### Property 14: Default Working Directory
-
-*For any* file at path `/a/b/c.R` with no working directory directive and no inherited working directory, the effective working directory SHALL be `/a/b/`.
-
-**Validates: Requirements 3.6**
-
-### Property 15: Named Argument Source Detection
-
-*For any* source() call using `source(file = "path.R")` syntax, the Source_Detector SHALL extract "path.R" as the path.
-
-**Validates: Requirements 4.3**
-
-### Property 16: sys.source Detection
-
-*For any* sys.source() call with a string literal path, the Source_Detector SHALL extract the path and mark `is_sys_source` as true.
-
-**Validates: Requirements 4.4**
-
-### Property 17: Dynamic Path Graceful Handling
-
-*For any* source() call where the path argument is a variable, expression, or paste0() call, the Source_Detector SHALL not extract a path and SHALL not emit an error.
-
-**Validates: Requirements 4.5, 4.6**
-
-### Property 18: Source Call Parameter Extraction
-
-*For any* source() call with `local = TRUE`, the extracted `SourceCall` SHALL have `local = true`. *For any* source() call with `chdir = TRUE`, the extracted `SourceCall` SHALL have `chdir = true`.
-
-**Validates: Requirements 4.7, 4.8**
-
-### Property 19: Backward-First Resolution Order
-
-*For any* file with both backward directives and forward source() calls, the Scope_Resolver SHALL process backward directives before forward sources, resulting in parent symbols being available before sourced file symbols.
-
-**Validates: Requirements 5.1, 5.2**
-
-
-### Property 20: Call Site Symbol Filtering
-
-*For any* backward directive with `line=N`, only symbols defined on lines 1 through N-1 in the parent file SHALL be included in the scope.
-
-**Validates: Requirements 5.5**
-
-### Property 21: Default Call Site Behavior
-
-*For any* backward directive without a call site specification, when `assumeCallSite` is "end", all symbols from the parent SHALL be included; when "start", no symbols from the parent SHALL be included.
-
-**Validates: Requirements 5.6**
-
-### Property 22: Maximum Depth Enforcement
-
-*For any* source chain exceeding `maxChainDepth`, the Scope_Resolver SHALL stop traversal at the configured depth and emit a diagnostic.
-
-**Validates: Requirements 5.8**
-
-### Property 23: Dependency Graph Update on Change
-
-*For any* file change that modifies directives or source() calls, the Dependency_Graph edges for that file SHALL reflect the new state.
-
-**Validates: Requirements 0.1, 0.2, 6.1**
-
-### Property 24: Scope Cache Invalidation on Interface Change
-
-*For any* file whose exported interface or dependency edges change, all files that depend on it (directly or transitively) SHALL have their scope caches invalidated.
-
-**Validates: Requirements 0.3, 6.2, 12.4, 12.5**
-
-### Property 25: Dependency Graph Edge Removal
-
-*For any* file that is deleted, the Dependency_Graph SHALL contain no edges where that file is either source or target.
-
-**Validates: Requirements 6.3**
-
-### Property 26: Transitive Dependency Query
-
-*For any* file A that sources B, and B sources C, querying dependencies of A SHALL include both B and C.
-
-**Validates: Requirements 6.4, 6.5**
-
-
-### Property 27: Cross-File Completion Inclusion
-
-*For any* file with a resolved scope chain containing symbol `s` from a sourced file, completions at a position after the source() call SHALL include `s`.
-
-**Validates: Requirements 7.1, 7.4**
-
-### Property 28: Completion Source Attribution
-
-*For any* completion item for a symbol from a sourced file, the completion detail SHALL contain the source file path.
-
-**Validates: Requirements 7.2**
-
-### Property 29: Cross-File Hover Information
-
-*For any* symbol from a sourced file, hovering over a usage SHALL display the source file path and function signature (if applicable).
-
-**Validates: Requirements 8.1, 8.2, 8.3**
-
-### Property 30: Cross-File Go-to-Definition
-
-*For any* symbol defined in a sourced file, go-to-definition SHALL navigate to the definition location in that file.
-
-**Validates: Requirements 9.1**
-
-### Property 31: Cross-File Undefined Variable Suppression
-
-*For any* symbol `s` defined in a sourced file and used after the source() call, no "undefined variable" diagnostic SHALL be emitted for `s`.
-
-**Validates: Requirements 10.1**
-
-### Property 32: Out-of-Scope Symbol Warning
-
-*For any* symbol `s` defined in a sourced file and used before the source() call, an "out of scope" diagnostic SHALL be emitted.
-
-**Validates: Requirements 10.3**
-
-### Property 33: Undefined Variables Configuration
-
-*For any* configuration with `diagnostics.undefinedVariables = false`, no undefined variable diagnostics SHALL be emitted regardless of symbol resolution.
-
-**Validates: Requirements 11.7, 11.8**
-
-### Property 34: Configuration Change Re-resolution
-
-*For any* configuration change affecting scope resolution (e.g., `assumeCallSite`), all open documents SHALL have their scope chains re-resolved.
-
-**Validates: Requirements 11.9**
-
-
-### Property 35: Diagnostics Fanout to Open Files
-
-*For any* file change that invalidates dependent files, all affected open files SHALL receive updated diagnostics without requiring user edits to those files.
-
-**Validates: Requirements 0.4**
-
-### Property 36: Debounce Cancellation
-
-*For any* sequence of rapid changes to a file, only the final change SHALL result in published diagnostics; intermediate pending revalidations SHALL be cancelled.
-
-**Validates: Requirements 0.5**
-
-### Property 37: Multiple Source Calls - Earliest Call Site
-
-*For any* file that is sourced multiple times at different call sites in the same parent, symbols from that file SHALL become available at the earliest call site.
-
-**Validates: Requirements 5.9**
-
-### Property 38: Ambiguous Parent Determinism
-
-*For any* file with multiple possible parents (via backward directives or reverse edges), the Scope_Resolver SHALL deterministically select the same parent given the same inputs, and SHALL emit an ambiguity diagnostic.
-
-**Validates: Requirements 5.10**
-
-### Property 39: Interface Hash Optimization
-
-*For any* file change where the exported interface hash remains identical and the edge set remains identical, dependent files SHALL NOT have their scope caches invalidated.
-
-**Validates: Requirements 12.8**
-
-### Property 40: Position-Aware Symbol Availability
-
-*For any* source() call at line N, symbols from the sourced file SHALL only be available for positions strictly after line N.
-
-**Validates: Requirements 5.3**
+**Validates: Requirements 2.1**
 
 
 ## Error Handling
@@ -1390,6 +1202,9 @@ When a directive or source() call references a non-existent file:
 1. Emit a diagnostic at the reference location with configurable severity
 2. Continue scope resolution, skipping the missing file
 3. Do not propagate the error to dependent files
+
+Deduplication requirement:
+- The implementation MUST avoid emitting duplicate missing-file diagnostics for the same (file, line, referenced path) tuple when the same relationship is represented both as a directive and a detected `source()` call.
 
 ### Circular Dependencies
 
@@ -1427,6 +1242,32 @@ When multiple parents are detected for a file:
 3. Continue resolution with the selected parent
 
 
+## Client Activity Signals (VS Code)
+
+The VS Code extension can provide active/visible editor hints that enable better prioritization of cross-file revalidations (Requirement 15). These hints MUST NOT affect correctness; they only influence the order in which the server schedules work.
+
+### Proposed Custom Notification
+
+Method: `rlsp/activeDocumentsChanged`
+
+Payload:
+- `activeUri: string | null`
+- `visibleUris: string[]`
+- `timestampMs: number`
+
+### VS Code Extension Responsibilities
+
+The extension SHOULD:
+- send `rlsp/activeDocumentsChanged` when `vscode.window.onDidChangeActiveTextEditor` fires
+- send `rlsp/activeDocumentsChanged` when `vscode.window.onDidChangeVisibleTextEditors` fires
+
+### Server Responsibilities
+
+The server SHALL:
+- record last-seen activity timestamp per URI
+- use these hints to prioritize revalidation scheduling: trigger first, then active, then visible, then other open
+- ignore URIs that are not currently open in the server
+
 ## Workspace Watching + Indexing (Required)
 
 Cross-file awareness MUST remain correct when:
@@ -1443,6 +1284,9 @@ To achieve this, the server MUST implement workspace watcher + indexing integrat
    - `cross_file_workspace_index` as the primary fast path for symbols/metadata, and
    - `cross_file_file_cache` (disk read) as a fallback and/or to refresh index entries.
 
+Required watcher rule:
+- On `workspace/didChangeWatchedFiles`, if the changed path corresponds to an open document, the server MUST invalidate disk-backed caches/index entries for that path but MUST NOT replace in-memory metadata/artifacts with disk-derived results for that file.
+
 ### Watch Registration
 
 Register watched file patterns for relevant R project files (at minimum `**/*.R` and `**/*.r`, and optionally `**/*.Rprofile`, `**/*.Renviron`).
@@ -1452,6 +1296,10 @@ Register watched file patterns for relevant R project files (at minimum `**/*.R`
 1. Invalidate disk-backed `cross_file_file_cache` entries for that file.
 2. Schedule a debounced workspace index update for that file in `cross_file_workspace_index`.
 3. If the changed file participates in the dependency graph (as a node or an edge endpoint), update dependency edges (best-effort) and schedule diagnostics fanout for affected open documents.
+
+Notes:
+- Rename/move events may arrive as delete+create. The handler SHOULD treat these as independent events and allow the graph/index to converge after debounce.
+- Canonicalization failures (e.g., path does not exist yet) MUST be handled gracefully: keep best-effort node identity but avoid panics.
 
 ### On File Deleted
 
@@ -1519,7 +1367,7 @@ Unit tests focus on specific examples and edge cases:
    - Verify debouncing behavior
    - Test cancellation of pending work
    - Verify diagnostics fanout to open files
-   - Test prioritization (active document first)
+   - Test prioritization (trigger document first; then active/visible when hints are available)
    - Test cap enforcement and on-demand revalidation
 
 6. **Configuration Tests**
