@@ -22,6 +22,38 @@ function getServerPath(context: vscode.ExtensionContext): string {
     return path.join(context.extensionPath, 'bin', binaryName);
 }
 
+/**
+ * Send activity notification to the server for cross-file revalidation prioritization.
+ */
+function sendActivityNotification() {
+    if (!client) {
+        return;
+    }
+
+    const activeEditor = vscode.window.activeTextEditor;
+    const visibleEditors = vscode.window.visibleTextEditors;
+
+    // Only include R files
+    const isRFile = (uri: vscode.Uri) => {
+        const ext = path.extname(uri.fsPath).toLowerCase();
+        return ['.r', '.rmd', '.qmd'].includes(ext);
+    };
+
+    const activeUri = activeEditor?.document.uri;
+    const activeUriStr = activeUri && isRFile(activeUri) ? activeUri.toString() : null;
+
+    const visibleUris = visibleEditors
+        .map(e => e.document.uri)
+        .filter(isRFile)
+        .map(uri => uri.toString());
+
+    client.sendNotification('rlsp/activeDocumentsChanged', {
+        activeUri: activeUriStr,
+        visibleUris: visibleUris,
+        timestampMs: Date.now(),
+    });
+}
+
 export function activate(context: vscode.ExtensionContext) {
     const serverPath = getServerPath(context);
 
@@ -48,6 +80,19 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     client.start();
+
+    // Register activity signal listeners for cross-file revalidation prioritization
+    context.subscriptions.push(
+        vscode.window.onDidChangeActiveTextEditor(() => {
+            sendActivityNotification();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.window.onDidChangeVisibleTextEditors(() => {
+            sendActivityNotification();
+        })
+    );
 }
 
 export function deactivate(): Thenable<void> | undefined {

@@ -19,6 +19,7 @@ env_logger = "0.11"
 serde = { version = "1.0.183", features = ["derive"] }
 serde_json = { version = "1.0.94", features = ["preserve_order"] }
 tokio = { version = "1.26.0", features = ["full"] }
+tokio-util = "0.7"
 tower-lsp.workspace = true
 tree-sitter = "0.24.7"
 tree-sitter-r = { git = "https://github.com/r-lib/tree-sitter-r", rev = "95aff097aa927a66bb357f715b58cde821be8867" }
@@ -33,3 +34,4 @@ xdg = "2.5.2"
 
 [dev-dependencies]
 proptest = "1.4"
+tempfile = "3"

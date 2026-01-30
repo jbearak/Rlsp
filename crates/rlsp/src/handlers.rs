@@ -5,13 +5,43 @@
 //
 //
 
+use std::collections::HashMap;
+
 use tower_lsp::lsp_types::*;
 use tree_sitter::Node;
 use tree_sitter::Point;
 
+use crate::cross_file::{scope, ScopedSymbol};
 use crate::state::WorldState;
 
 use crate::builtins;
+
+// ============================================================================
+// Cross-File Scope Helper
+// ============================================================================
+
+/// Get cross-file symbols available at a position
+fn get_cross_file_symbols(
+    state: &WorldState,
+    uri: &Url,
+    line: u32,
+    column: u32,
+) -> HashMap<String, ScopedSymbol> {
+    let doc = match state.get_document(uri) {
+        Some(d) => d,
+        None => return HashMap::new(),
+    };
+
+    let tree = match &doc.tree {
+        Some(t) => t,
+        None => return HashMap::new(),
+    };
+
+    let text = doc.text();
+    let artifacts = scope::compute_artifacts(uri, tree, &text);
+    let scope = scope::scope_at_position(&artifacts, line, column);
+    scope.symbols
+}
 
 // ============================================================================
 // Folding Range
@@ -196,6 +226,11 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     // Collect syntax errors
     collect_syntax_errors(tree.root_node(), &mut diagnostics);
 
+    // Get cross-file symbols for undefined variable suppression
+    // Use end of file position to get all symbols in scope
+    let line_count = text.lines().count() as u32;
+    let cross_file_symbols = get_cross_file_symbols(state, uri, line_count, 0);
+
     // Collect undefined variable errors
     collect_undefined_variables(
         tree.root_node(),
@@ -203,6 +238,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
         &doc.loaded_packages,
         &state.workspace_imports,
         &state.library,
+        &cross_file_symbols,
         &mut diagnostics,
     );
 
@@ -246,6 +282,7 @@ fn collect_undefined_variables(
     loaded_packages: &[String],
     workspace_imports: &[String],
     library: &crate::state::Library,
+    cross_file_symbols: &HashMap<String, ScopedSymbol>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     use std::collections::HashSet;
@@ -265,6 +302,7 @@ fn collect_undefined_variables(
             && !is_builtin(&name)
             && !is_package_export(&name, loaded_packages, library)
             && !workspace_imports.contains(&name)
+            && !cross_file_symbols.contains_key(&name)
         {
             diagnostics.push(Diagnostic {
                 range: Range {
@@ -399,6 +437,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
     let mut items = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
 
     // Check if we're in a namespace context (pkg::)
     if find_namespace_context(&node, &text).is_some() {
@@ -419,10 +458,39 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
             kind: Some(CompletionItemKind::KEYWORD),
             ..Default::default()
         });
+        seen_names.insert(kw.to_string());
     }
 
-    // Add symbols from current document
-    collect_document_completions(tree.root_node(), &text, &mut items);
+    // Add symbols from current document (local definitions take precedence)
+    collect_document_completions(tree.root_node(), &text, &mut items, &mut seen_names);
+
+    // Add cross-file symbols (from scope resolution)
+    let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
+    for (name, symbol) in cross_file_symbols {
+        if seen_names.contains(&name) {
+            continue; // Local definitions take precedence
+        }
+        seen_names.insert(name.clone());
+
+        let kind = match symbol.kind {
+            crate::cross_file::SymbolKind::Function => CompletionItemKind::FUNCTION,
+            crate::cross_file::SymbolKind::Variable => CompletionItemKind::VARIABLE,
+        };
+
+        // Add source file info to detail if from another file
+        let detail = if symbol.source_uri != *uri {
+            Some(format!("from {}", symbol.source_uri.path()))
+        } else {
+            None
+        };
+
+        items.push(CompletionItem {
+            label: name,
+            kind: Some(kind),
+            detail,
+            ..Default::default()
+        });
+    }
 
     Some(CompletionResponse::Array(items))
 }
@@ -442,7 +510,12 @@ fn find_namespace_context<'a>(node: &Node<'a>, text: &'a str) -> Option<&'a str>
     }
 }
 
-fn collect_document_completions(node: Node, text: &str, items: &mut Vec<CompletionItem>) {
+fn collect_document_completions(
+    node: Node,
+    text: &str,
+    items: &mut Vec<CompletionItem>,
+    seen: &mut std::collections::HashSet<String>,
+) {
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
         let children: Vec<_> = node.children(&mut cursor).collect();
@@ -455,24 +528,27 @@ fn collect_document_completions(node: Node, text: &str, items: &mut Vec<Completi
             let op_text = node_text(op, text);
             if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
                 let name = node_text(lhs, text).to_string();
-                let kind = if rhs.kind() == "function_definition" {
-                    CompletionItemKind::FUNCTION
-                } else {
-                    CompletionItemKind::VARIABLE
-                };
+                if !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    let kind = if rhs.kind() == "function_definition" {
+                        CompletionItemKind::FUNCTION
+                    } else {
+                        CompletionItemKind::VARIABLE
+                    };
 
-                items.push(CompletionItem {
-                    label: name,
-                    kind: Some(kind),
-                    ..Default::default()
-                });
+                    items.push(CompletionItem {
+                        label: name,
+                        kind: Some(kind),
+                        ..Default::default()
+                    });
+                }
             }
         }
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_document_completions(child, text, items);
+        collect_document_completions(child, text, items, seen);
     }
 }
 
@@ -495,6 +571,11 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
         return None;
     };
 
+    let node_range = Range {
+        start: Position::new(node.start_position().row as u32, node.start_position().column as u32),
+        end: Position::new(node.end_position().row as u32, node.end_position().column as u32),
+    };
+
     // Try user-defined function first
     if let Some(signature) = find_user_function_signature(state, uri, name) {
         return Some(Hover {
@@ -502,10 +583,28 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
                 kind: MarkupKind::Markdown,
                 value: format!("```r\n{}\n```", signature),
             }),
-            range: Some(Range {
-                start: Position::new(node.start_position().row as u32, node.start_position().column as u32),
-                end: Position::new(node.end_position().row as u32, node.end_position().column as u32),
+            range: Some(node_range),
+        });
+    }
+
+    // Try cross-file symbols
+    let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
+    if let Some(symbol) = cross_file_symbols.get(name) {
+        let mut value = String::new();
+        if let Some(sig) = &symbol.signature {
+            value.push_str(&format!("```r\n{}\n```\n", sig));
+        } else {
+            value.push_str(&format!("```r\n{}\n```\n", name));
+        }
+        if symbol.source_uri != *uri {
+            value.push_str(&format!("\n*Defined in {}*", symbol.source_uri.path()));
+        }
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
             }),
+            range: Some(node_range),
         });
     }
 
@@ -517,10 +616,7 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
                     kind: MarkupKind::Markdown,
                     value: format!("```\n{}\n```", help_text),
                 }),
-                range: Some(Range {
-                    start: Position::new(node.start_position().row as u32, node.start_position().column as u32),
-                    end: Position::new(node.end_position().row as u32, node.end_position().column as u32),
-                }),
+                range: Some(node_range),
             });
         }
         return None;
@@ -537,10 +633,7 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
             kind: MarkupKind::Markdown,
             value: format!("```\n{}\n```", help_text),
         }),
-        range: Some(Range {
-            start: Position::new(node.start_position().row as u32, node.start_position().column as u32),
-            end: Position::new(node.end_position().row as u32, node.end_position().column as u32),
-        }),
+        range: Some(node_range),
     })
 }
 // Signature Help
@@ -614,6 +707,18 @@ pub fn goto_definition(
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
             range: def_range,
+        }));
+    }
+
+    // Try cross-file symbols (from scope resolution)
+    let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
+    if let Some(symbol) = cross_file_symbols.get(name) {
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: symbol.source_uri.clone(),
+            range: Range {
+                start: Position::new(symbol.defined_line, symbol.defined_column),
+                end: Position::new(symbol.defined_line, symbol.defined_column + name.len() as u32),
+            },
         }));
     }
 

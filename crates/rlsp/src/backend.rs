@@ -110,6 +110,8 @@ impl LanguageServer for Backend {
 
         let mut state = self.state.write().await;
         state.open_document(uri.clone(), &text, Some(version));
+        // Record as recently opened for activity prioritization
+        state.cross_file_activity.record_recent(uri.clone());
         drop(state);
 
         self.publish_diagnostics(&uri).await;
@@ -126,20 +128,63 @@ impl LanguageServer for Backend {
         for change in params.content_changes {
             state.apply_change(&uri, change);
         }
+        // Record as recently changed for activity prioritization
+        state.cross_file_activity.record_recent(uri.clone());
         drop(state);
 
         self.publish_diagnostics(&uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = &params.text_document.uri;
         let mut state = self.state.write().await;
-        state.diagnostics_gate.clear(&params.text_document.uri);
-        state.close_document(&params.text_document.uri);
+        
+        // Clear diagnostics gate state
+        state.diagnostics_gate.clear(uri);
+        state.cross_file_diagnostics_gate.clear(uri);
+        
+        // Cancel pending revalidation
+        state.cross_file_revalidation.cancel(uri);
+        
+        // Remove from activity tracking
+        state.cross_file_activity.remove(uri);
+        
+        // Close the document
+        state.close_document(uri);
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         log::trace!("Received watched files change: {} changes", params.changes.len());
-        // TODO: Will be expanded in Task 14 for cross-file awareness
+        
+        let mut state = self.state.write().await;
+        for change in params.changes {
+            let uri = &change.uri;
+            
+            // Skip if document is open (open docs are authoritative)
+            if state.documents.contains_key(uri) {
+                log::trace!("Skipping watched file change for open document: {}", uri);
+                continue;
+            }
+            
+            match change.typ {
+                FileChangeType::CREATED | FileChangeType::CHANGED => {
+                    // Invalidate disk-backed caches
+                    state.cross_file_file_cache.invalidate(uri);
+                    state.cross_file_workspace_index.invalidate(uri);
+                    log::trace!("Invalidated caches for changed file: {}", uri);
+                }
+                FileChangeType::DELETED => {
+                    // Remove from dependency graph and caches
+                    state.cross_file_graph.remove_file(uri);
+                    state.cross_file_file_cache.invalidate(uri);
+                    state.cross_file_workspace_index.invalidate(uri);
+                    state.cross_file_cache.invalidate(uri);
+                    state.cross_file_meta.remove(uri);
+                    log::trace!("Removed deleted file from cross-file state: {}", uri);
+                }
+                _ => {}
+            }
+        }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {

@@ -16,53 +16,12 @@ use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
 
-/// Diagnostics publish gating to enforce monotonic publishing
-#[derive(Debug, Clone, Default)]
-pub struct CrossFileDiagnosticsGate {
-    /// Last published document version per URI
-    last_published_version: HashMap<Url, i32>,
-    /// URIs that need forced republish (dependency-triggered, version unchanged)
-    force_republish: HashSet<Url>,
-}
-
-impl CrossFileDiagnosticsGate {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Check if diagnostics can be published for this version
-    pub fn can_publish(&self, uri: &Url, version: i32) -> bool {
-        match self.last_published_version.get(uri) {
-            Some(&last) => {
-                if version < last {
-                    return false;
-                }
-                if self.force_republish.contains(uri) {
-                    return version >= last;
-                }
-                version > last
-            }
-            None => true,
-        }
-    }
-
-    /// Record that diagnostics were published for this version
-    pub fn record_publish(&mut self, uri: &Url, version: i32) {
-        self.last_published_version.insert(uri.clone(), version);
-        self.force_republish.remove(uri);
-    }
-
-    /// Mark a URI for forced republish
-    pub fn mark_force_republish(&mut self, uri: &Url) {
-        self.force_republish.insert(uri.clone());
-    }
-
-    /// Clear all state for a URI (called on didClose)
-    pub fn clear(&mut self, uri: &Url) {
-        self.last_published_version.remove(uri);
-        self.force_republish.remove(uri);
-    }
-}
+use crate::cross_file::{
+    ArtifactsCache, CrossFileActivityState, CrossFileConfig, CrossFileFileCache,
+    CrossFileRevalidationState, CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
+    ParentSelectionCache,
+};
+use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
 
 /// A parsed document
 pub struct Document {
@@ -411,6 +370,7 @@ impl Library {
 
 /// Global LSP state
 pub struct WorldState {
+    // Existing fields
     pub documents: HashMap<Url, Document>,
     pub workspace_folders: Vec<Url>,
     pub library: Library,
@@ -418,6 +378,18 @@ pub struct WorldState {
     pub workspace_imports: Vec<String>, // Symbols imported via workspace NAMESPACE
     pub help_cache: crate::help::HelpCache,
     pub diagnostics_gate: CrossFileDiagnosticsGate,
+
+    // Cross-file state
+    pub cross_file_config: CrossFileConfig,
+    pub cross_file_meta: MetadataCache,
+    pub cross_file_graph: DependencyGraph,
+    pub cross_file_cache: ArtifactsCache,
+    pub cross_file_file_cache: CrossFileFileCache,
+    pub cross_file_revalidation: CrossFileRevalidationState,
+    pub cross_file_activity: CrossFileActivityState,
+    pub cross_file_diagnostics_gate: CrossFileDiagnosticsGate,
+    pub cross_file_workspace_index: CrossFileWorkspaceIndex,
+    pub cross_file_parent_cache: ParentSelectionCache,
 }
 
 impl WorldState {
@@ -430,6 +402,17 @@ impl WorldState {
             workspace_imports: Vec::new(),
             help_cache: crate::help::HelpCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),
+            // Cross-file state
+            cross_file_config: CrossFileConfig::default(),
+            cross_file_meta: MetadataCache::new(),
+            cross_file_graph: DependencyGraph::new(),
+            cross_file_cache: ArtifactsCache::new(),
+            cross_file_file_cache: CrossFileFileCache::new(),
+            cross_file_revalidation: CrossFileRevalidationState::new(),
+            cross_file_activity: CrossFileActivityState::new(),
+            cross_file_diagnostics_gate: CrossFileDiagnosticsGate::new(),
+            cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
+            cross_file_parent_cache: ParentSelectionCache::new(),
         }
     }
 
