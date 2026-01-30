@@ -21,6 +21,9 @@ pub mod source_detect;
 pub mod types;
 pub mod workspace_index;
 
+#[cfg(test)]
+mod property_tests;
+
 pub use cache::*;
 pub use config::*;
 #[allow(unused_imports)]

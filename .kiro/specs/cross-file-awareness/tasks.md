@@ -44,31 +44,31 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - _Requirements: 0a.1-0a.4, 1.1-1.8, 2.1-2.7, 3.1-3.12_
 
 
-  - [ ] 2.2 Write property test for backward directive synonym equivalence
+  - [x] 2.2 Write property test for backward directive synonym equivalence
     - **Property 1: Backward Directive Synonym Equivalence**
     - **Validates: Requirements 1.1, 1.2, 1.3**
 
-  - [ ] 2.3 Write property test for working directory directive synonyms
+  - [x] 2.3 Write property test for working directory directive synonyms
     - **Property 2: Working Directory Directive Synonym Equivalence**
     - **Validates: Requirements 3.1-3.6**
 
-  - [ ] 2.4 Write property test for workspace-root-relative path resolution
+  - [x] 2.4 Write property test for workspace-root-relative path resolution
     - **Property 2a: Working Directory Path Resolution (Workspace-Root-Relative)**
     - **Validates: Requirements 3.9**
 
-  - [ ] 2.5 Write property test for file-relative path resolution
+  - [x] 2.5 Write property test for file-relative path resolution
     - **Property 2b: Working Directory Path Resolution (File-Relative)**
     - **Validates: Requirements 3.10**
 
-  - [ ] 2.6 Write property test for directive serialization round-trip
+  - [x] 2.6 Write property test for directive serialization round-trip
     - **Property 8: Directive Serialization Round-Trip**
     - **Validates: Requirements 14.1-14.4**
 
-  - [ ] 2.7 Write property test for call site line parameter extraction
+  - [x] 2.7 Write property test for call site line parameter extraction
     - **Property 9: Call Site Line Parameter Extraction**
     - **Validates: Requirements 1.6**
 
-  - [ ] 2.8 Write property test for call site match parameter extraction
+  - [x] 2.8 Write property test for call site match parameter extraction
     - **Property 10: Call Site Match Parameter Extraction**
     - **Validates: Requirements 1.7**
 
