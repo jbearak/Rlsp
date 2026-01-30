@@ -1,4 +1,4 @@
-use tree_sitter::{Parser, Point};
+use tree_sitter::Parser;
 
 fn main() {
     let mut parser = Parser::new();
