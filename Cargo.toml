@@ -6,7 +6,7 @@ members = ["crates/rlsp"]
 version = "0.1.0"
 authors = ["Jonathan Marc Bearak <jbearak@gmail.com>"]
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0"
 rust-version = "1.75"
 
 [workspace.dependencies]
