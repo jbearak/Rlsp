@@ -277,6 +277,26 @@ impl LanguageServer for Backend {
         state.close_document(uri);
     }
 
+    async fn did_change_configuration(&self, _params: DidChangeConfigurationParams) {
+        // Requirement 11.11: When configuration changes, re-resolve scope chains for open documents
+        log::trace!("Configuration changed, invalidating caches and scheduling revalidation");
+        
+        let open_uris: Vec<Url> = {
+            let mut state = self.state.write().await;
+            
+            // Invalidate all scope caches since config affects resolution
+            state.cross_file_cache.invalidate_all();
+            
+            // Get list of open documents
+            state.documents.keys().cloned().collect()
+        };
+        
+        // Schedule diagnostics for all open documents
+        for uri in open_uris {
+            self.publish_diagnostics(&uri).await;
+        }
+    }
+
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         log::trace!("Received watched files change: {} changes", params.changes.len());
         
