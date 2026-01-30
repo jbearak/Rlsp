@@ -101,6 +101,39 @@ If only line-based gating is used, symbols may be incorrectly included/excluded 
 - Store call sites as full LSP `Position` (`line`, `character`) in events/edges
 - Gate symbol availability by `(line, char)` ordering: a symbol from a sourced file is available only at positions strictly after the call site position
 
+**Column Unit Convention (Required):**
+LSP `Position.character` is defined as **UTF-16 code units** (per LSP spec). However:
+- Tree-sitter provides **byte offsets**
+- Ropey uses **Unicode scalar** (code point) indexing
+
+To ensure correct position comparisons (especially for lines with non-ASCII characters):
+- All stored `call_site_column` values MUST be in **UTF-16 code units** (LSP convention)
+- When extracting positions from tree-sitter, convert byte offsets to UTF-16 columns using the document text
+- Conversion helper (required):
+
+```rust
+/// Convert a byte offset to UTF-16 column for a given line.
+/// This is necessary because LSP uses UTF-16 code units for character positions.
+pub fn byte_offset_to_utf16_column(line_text: &str, byte_offset_in_line: usize) -> u32 {
+    let prefix = &line_text[..byte_offset_in_line.min(line_text.len())];
+    prefix.encode_utf16().count() as u32
+}
+
+/// Convert a tree-sitter Point to LSP Position with correct UTF-16 column.
+pub fn tree_sitter_point_to_lsp_position(
+    point: tree_sitter::Point,
+    line_text: &str,
+) -> tower_lsp::lsp_types::Position {
+    let column = byte_offset_to_utf16_column(line_text, point.column);
+    tower_lsp::lsp_types::Position {
+        line: point.row as u32,
+        character: column,
+    }
+}
+```
+
+This ensures that position comparisons work correctly even on lines containing emoji, CJK characters, or other multi-byte/multi-code-unit text.
+
 **Documented Limitation (Alternative):**
 If full `(line, character)` precision is not implemented, the spec MUST explicitly document this as a known limitation: "Symbols from sourced files become available at the start of the line following the source() call, not at the exact character position after the call."
 
@@ -444,6 +477,23 @@ Required boundary:
 - `compute_artifacts(uri, ...)` MUST depend only on the file's own content/AST plus pre-existing dependency metadata (edges), and MUST NOT call `scope_at_position` for other files. This prevents recursion and avoids exponential recomputation.
 - `scope_at_position` MAY traverse to other files, but it MUST be bounded by `max_chain_depth` and MUST maintain a visited set to prevent cycles.
 
+**Non-Recursive Artifact Computation (Critical Invariant):**
+This separation is essential to prevent exponential recomputation and stack overflow:
+
+1. **`compute_artifacts(uri)`** produces:
+   - `exported_interface`: symbols defined in this file (from AST only)
+   - `timeline`: ordered list of `ScopeEvent`s including `Source` events with edge metadata
+   - `interface_hash`: hash of the exported symbols
+   - **NO traversal**: does not read content of other files, does not call `scope_at_position` for other URIs
+
+2. **`scope_at_position(uri, line, col)`** performs:
+   - Retrieves artifacts for `uri` (from cache or computes via `compute_artifacts`)
+   - Walks the timeline up to `(line, col)`
+   - For each `Source` event encountered, **recursively** calls `scope_at_position` on the child file (bounded by depth + visited set)
+   - Merges inherited symbols with local symbols (local wins on conflict)
+
+This means `Source` events in the timeline contain edge metadata (target URI, call site, local/chdir flags) but do NOT contain resolved symbols. Symbol resolution happens lazily during `scope_at_position` traversal.
+
 Caching requirement (performance + correctness):
 - Cache entries for `ScopeArtifacts` and `scope_at_position` MUST be fingerprinted so that concurrent edits and index updates cannot reuse stale results (see ScopeFingerprint).
 
@@ -683,6 +733,24 @@ To support concurrent editing and to prevent publishing stale diagnostics:
 - Any debounced/background diagnostics task MUST capture a trigger version (or content hash) and MUST re-check it before publishing.
 - If the document is no longer open, tasks MUST no-op.
 
+**Implementation Note (rlsp-specific):**
+The current `Document` struct in `crates/rlsp/src/state.rs` does NOT have a version field. This MUST be added:
+
+```rust
+pub struct Document {
+    pub contents: Rope,
+    pub tree: Option<Tree>,
+    pub loaded_packages: Vec<String>,
+    pub version: Option<i32>,  // NEW: LSP document version for freshness/monotonicity
+}
+```
+
+Update points:
+- `Document::new()`: accept version parameter, store it
+- `did_open`: pass `params.text_document.version` to `open_document()`
+- `did_change`: update `doc.version` from `params.text_document.version`
+- `did_close`: clear diagnostics gate state (already specified in `on_did_close()`)
+
 #### Diagnostics Publish Gating (Required)
 
 To prevent stale diagnostic publishes when multiple triggers race (e.g., cross-file invalidation + user edits), the server MUST enforce monotonic publishing per URI.
@@ -733,13 +801,28 @@ pub struct WorldState {
 /// Uses interior mutability to allow population during read operations (consistent with MetadataCache and ArtifactsCache).
 #[derive(Debug, Default)]
 pub struct ParentSelectionCache {
-    /// Map from (child_uri, metadata_fingerprint) -> selected parent
-    inner: RwLock<HashMap<(Url, u64), ParentResolution>>,
+    /// Map from (child_uri, cache_key) -> selected parent
+    /// cache_key includes metadata_fingerprint AND reverse_edges_hash for rename/delete convergence
+    inner: RwLock<HashMap<(Url, ParentCacheKey), ParentResolution>>,
+}
+
+/// Cache key for parent selection stability.
+/// Includes both metadata fingerprint AND reverse edges snapshot to handle rename/delete+create.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParentCacheKey {
+    /// Hash of the child's CrossFileMetadata (backward directives)
+    pub metadata_fingerprint: u64,
+    /// Hash of the reverse edges pointing to this child (from dependency graph)
+    /// This ensures cache invalidation when graph structure changes (e.g., rename events)
+    pub reverse_edges_hash: u64,
 }
 
 impl ParentSelectionCache {
     /// Get or compute parent selection, ensuring stability.
     /// Uses interior mutability so this can be called from read-locked WorldState.
+    /// 
+    /// IMPORTANT: cache_key includes reverse_edges_hash to handle rename/delete+create convergence.
+    /// When a parent file is renamed, the reverse edges change even if child metadata doesn't.
     pub fn get_or_compute(
         &self,
         child_uri: &Url,
@@ -747,8 +830,10 @@ impl ParentSelectionCache {
         graph: &DependencyGraph,
         config: &CrossFileConfig,
     ) -> ParentResolution {
-        let fingerprint = compute_metadata_fingerprint(metadata);
-        let key = (child_uri.clone(), fingerprint);
+        let metadata_fingerprint = compute_metadata_fingerprint(metadata);
+        let reverse_edges_hash = compute_reverse_edges_hash(graph, child_uri);
+        let cache_key = ParentCacheKey { metadata_fingerprint, reverse_edges_hash };
+        let key = (child_uri.clone(), cache_key);
         
         // Try read lock first
         if let Some(cached) = self.inner.read().get(&key) {
@@ -761,7 +846,7 @@ impl ParentSelectionCache {
         resolution
     }
     
-    /// Invalidate cache for a child (called when child's metadata changes)
+    /// Invalidate cache for a child (called when child's metadata changes OR reverse edges change)
     pub fn invalidate(&self, child_uri: &Url) {
         self.inner.write().retain(|(uri, _), _| uri != child_uri);
     }
@@ -770,6 +855,22 @@ impl ParentSelectionCache {
     pub fn invalidate_all(&self) {
         self.inner.write().clear();
     }
+}
+
+/// Compute hash of reverse edges pointing to a child URI.
+/// Used for cache key to detect graph structure changes (rename/delete+create).
+fn compute_reverse_edges_hash(graph: &DependencyGraph, child_uri: &Url) -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    
+    let mut hasher = DefaultHasher::new();
+    let mut edges: Vec<_> = graph.get_dependents(child_uri)
+        .iter()
+        .map(|e| (e.from.as_str(), e.call_site_line, e.call_site_column))
+        .collect();
+    edges.sort(); // Deterministic ordering
+    edges.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Tracks client activity hints for revalidation prioritization (Requirement 15)
@@ -893,6 +994,46 @@ When a document changes (in-memory `didOpen`/`didChange` *or* on-disk `didChange
 5. **Diagnostics Fanout**: Schedule diagnostics recomputation for affected **open** documents.
 6. **Cancellation**: Cancel any outdated pending revalidations for the same files.
 7. **Freshness Guard (required)**: Before publishing diagnostics from a background task, verify the document version/hash still matches the triggering version/hash; otherwise do not publish.
+
+**Integration Point (rlsp-specific):**
+The current `backend.rs` calls `publish_diagnostics(&uri)` directly in `did_change` and `did_save`, which only publishes for the changed file. This MUST be replaced with the cross-file revalidation system:
+
+```rust
+// BEFORE (current backend.rs):
+async fn did_change(&self, params: DidChangeTextDocumentParams) {
+    // ... apply changes ...
+    self.publish_diagnostics(&uri).await;  // Only publishes for changed file
+}
+
+// AFTER (with cross-file awareness):
+async fn did_change(&self, params: DidChangeTextDocumentParams) {
+    let uri = params.text_document.uri;
+    let version = params.text_document.version;
+    
+    let affected = {
+        let mut state = self.state.write().await;
+        for change in params.content_changes {
+            state.apply_change(&uri, change);
+        }
+        // Update version
+        if let Some(doc) = state.documents.get_mut(&uri) {
+            doc.version = Some(version);
+        }
+        // Compute affected files (returns Vec<Url>)
+        revalidate_after_change_locked(&mut state, &uri)
+    };
+    
+    // Schedule debounced diagnostics for all affected files
+    schedule_diagnostics_debounced(
+        self.state.clone(),
+        self.client.clone(),
+        uri,
+        affected,
+        self.state.read().await.cross_file_config.max_revalidations_per_trigger,
+        false, // not dependency-triggered for the changed file itself
+    ).await;
+}
+```
 
 #### Debouncing and Cancellation
 
@@ -1698,7 +1839,7 @@ Clarification (Required): Call-site filtering uses the 0-based `call_site_line` 
 
 ### Property 57: Parent Selection Stability
 
-*For any* file with backward directives, once a parent is selected for a given metadata fingerprint, the same parent SHALL be selected on subsequent queries until the file's `CrossFileMetadata` changes. Parent selection SHALL NOT change due to graph/index convergence or temporary unavailability of parent files.
+*For any* file with backward directives, once a parent is selected for a given (metadata_fingerprint, reverse_edges_hash) cache key, the same parent SHALL be selected on subsequent queries until either the file's `CrossFileMetadata` changes OR the reverse edges pointing to this file change (e.g., due to rename/delete+create of a parent). Parent selection SHALL NOT change due to temporary unavailability of parent files.
 
 **Validates: Requirements 5.10**
 
@@ -1909,9 +2050,46 @@ impl CrossFileWorkspaceIndex {
 
 Register watched file patterns for relevant R project files (at minimum `**/*.R` and `**/*.r`, and optionally `**/*.Rprofile`, `**/*.Renviron`).
 
-**LSP Registration Mechanics (Required):**
+**Current VS Code Extension State:**
+The VS Code extension in `editors/vscode/src/extension.ts` already configures file watching:
+```typescript
+synchronize: {
+    fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd}'),
+},
+```
 
-The server MUST register file watchers via dynamic registration (`client/registerCapability`) during the `initialized` handler:
+This means the client already sends `workspace/didChangeWatchedFiles` notifications to the server. The server MUST implement the handler.
+
+**Server Handler (Required):**
+The server MUST implement `workspace/didChangeWatchedFiles` in `backend.rs`:
+
+```rust
+async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+    let mut state = self.state.write().await;
+    for change in params.changes {
+        match change.typ {
+            FileChangeType::CREATED | FileChangeType::CHANGED => {
+                // Invalidate caches, update index, trigger revalidation
+                on_watched_file_changed(&mut state, &change.uri);
+            }
+            FileChangeType::DELETED => {
+                on_watched_file_deleted(&mut state, &change.uri);
+            }
+            _ => {}
+        }
+    }
+    drop(state);
+    // Schedule diagnostics fanout for affected open documents
+    // (implementation uses schedule_diagnostics_debounced)
+}
+```
+
+**Dynamic Registration (Optional Enhancement):**
+Dynamic registration via `client/registerCapability` is optional since the VS Code client already watches. However, for other LSP clients that don't configure watchers, the server MAY register dynamically:
+
+**LSP Registration Mechanics (Optional):**
+
+The server MAY register file watchers via dynamic registration (`client/registerCapability`) during the `initialized` handler:
 
 ```rust
 /// Register file watchers for R files (called from initialized handler)
@@ -2362,12 +2540,21 @@ This policy is already enforced by `CrossFileDiagnosticsGate.can_publish()` whic
 
 3. **Missing parents do not cause re-selection:** If a selected parent is temporarily missing (file deleted or not yet indexed), the selection remains stable. The scope resolver will emit a missing-file diagnostic but will not re-run parent selection to pick a different parent.
 
+4. **Rename/delete+create convergence:** The cache key includes `reverse_edges_hash` so that when a parent file is renamed (which changes the graph structure), the cache correctly invalidates and re-selects based on the new graph state.
+
 ```rust
 /// Cached parent selection to ensure stability during graph convergence.
 /// Uses interior mutability to allow population during read operations.
 pub struct ParentSelectionCache {
-    /// Map from (child_uri, metadata_fingerprint) -> selected parent
-    inner: RwLock<HashMap<(Url, u64), ParentResolution>>,
+    /// Map from (child_uri, cache_key) -> selected parent
+    /// cache_key includes metadata_fingerprint AND reverse_edges_hash
+    inner: RwLock<HashMap<(Url, ParentCacheKey), ParentResolution>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParentCacheKey {
+    pub metadata_fingerprint: u64,
+    pub reverse_edges_hash: u64,
 }
 
 impl ParentSelectionCache {
@@ -2380,8 +2567,10 @@ impl ParentSelectionCache {
         graph: &DependencyGraph,
         config: &CrossFileConfig,
     ) -> ParentResolution {
-        let fingerprint = compute_metadata_fingerprint(metadata);
-        let key = (child_uri.clone(), fingerprint);
+        let metadata_fingerprint = compute_metadata_fingerprint(metadata);
+        let reverse_edges_hash = compute_reverse_edges_hash(graph, child_uri);
+        let cache_key = ParentCacheKey { metadata_fingerprint, reverse_edges_hash };
+        let key = (child_uri.clone(), cache_key);
         
         // Try read lock first
         if let Some(cached) = self.inner.read().get(&key) {
@@ -2394,7 +2583,7 @@ impl ParentSelectionCache {
         resolution
     }
     
-    /// Invalidate cache for a child (called when child's metadata changes)
+    /// Invalidate cache for a child (called when child's metadata changes OR reverse edges change)
     pub fn invalidate(&self, child_uri: &Url) {
         self.inner.write().retain(|(uri, _), _| uri != child_uri);
     }
@@ -2403,7 +2592,7 @@ impl ParentSelectionCache {
 
 **Added Property 57: Parent Selection Stability**
 
-*For any* file with backward directives, once a parent is selected for a given metadata fingerprint, the same parent SHALL be selected on subsequent queries until the file's `CrossFileMetadata` changes. Parent selection SHALL NOT change due to graph/index convergence or temporary unavailability of parent files.
+*For any* file with backward directives, once a parent is selected for a given (metadata_fingerprint, reverse_edges_hash) cache key, the same parent SHALL be selected on subsequent queries until either the file's `CrossFileMetadata` changes OR the reverse edges pointing to this file change (e.g., due to rename/delete+create of a parent). Parent selection SHALL NOT change due to temporary unavailability of parent files.
 
 **Validates: Requirements 5.10**
 
@@ -2441,3 +2630,56 @@ Even with interior mutability, keep the cache lock hold-time minimal:
 If `resolve_parent(...)` ever does IO (disk reads for inference), do **not** hold the cache lock during that IO. The pattern in `get_or_compute()` already follows this: the read lock is released before computing, and the write lock is only held for the insert.
 
 **Note:** Duplicate compute on concurrent cache miss is acceptable—correctness is unchanged (same inputs produce same output) and the cache will converge. This avoids the complexity of double-checked locking.
+
+### Issue 14: Freshness Guard Should Check Before Computing, Not Just Before Publishing
+
+**Problem:** The original design checks freshness (document version) only before publishing diagnostics. However, if the document version changes between task scheduling and diagnostics computation, the computation work is wasted.
+
+**Fix:** Check freshness at two points:
+1. **Before computing**: If version changed, skip the expensive cross-file resolution entirely
+2. **Before publishing**: Final guard to catch races during async publish
+
+```rust
+// In schedule_diagnostics_debounced task:
+tokio::spawn(async move {
+    // ... debounce/cancellation ...
+    
+    // FIRST freshness check: before expensive computation
+    {
+        let st = state_arc.read().await;
+        let current_version = st.documents.get(&uri).and_then(|d| d.version);
+        if current_version != trigger_version {
+            log::trace!("Skipping stale diagnostics computation for {}: version changed", uri);
+            return; // Don't even compute
+        }
+    }
+    
+    // Compute diagnostics (expensive)
+    let diagnostics = {
+        let st = state_arc.read().await;
+        handlers::diagnostics(&st, &uri)
+    };
+    
+    // SECOND freshness check: before publishing (catches races during computation)
+    {
+        let st = state_arc.read().await;
+        let current_version = st.documents.get(&uri).and_then(|d| d.version);
+        if current_version != trigger_version {
+            log::trace!("Skipping stale diagnostics publish for {}: version changed during computation", uri);
+            return;
+        }
+        // Also check monotonic gate
+        if let Some(ver) = current_version {
+            if !st.cross_file_diagnostics_gate.can_publish(&uri, ver) {
+                return;
+            }
+        }
+    }
+    
+    // Publish
+    client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+    // ... record publish ...
+});
+```
+
+This optimization is especially important for large files or deep source chains where cross-file resolution can be expensive.
