@@ -8,7 +8,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
 
 ## Tasks
 
-- [ ] 0. Prerequisites (blocking - must complete before other tasks)
+- [x] 0. Prerequisites (blocking - must complete before other tasks)
   - Add UTF-16 correct incremental edit application for in-memory documents
   - Add `Document.version` storage and a monotonic content revision identifier (`revision` counter)
   - Add `Document.contents_hash()` method that returns the revision counter
@@ -20,7 +20,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
   - Update `did_close` to clear diagnostics gate state
   - _Requirements: 0b.1-0b.3, 0c.1-0c.3, 0.6-0.8, 13a.1-13a.3_
 
-- [ ] 1. Set up cross-file module structure and core types
+- [x] 1. Set up cross-file module structure and core types
   - Create `crates/rlsp/src/cross_file/` directory
   - Create `mod.rs` with module declarations
   - Define `CrossFileMetadata`, `BackwardDirective`, `ForwardSource`, `CallSiteSpec` types
@@ -31,7 +31,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
   - _Requirements: 0a.1-0a.4, 1.1-1.8, 2.1-2.7, 3.1-3.12, 4.1-4.8_
 
 - [ ] 2. Implement directive parser
-  - [ ] 2.1 Create `directive.rs` with `CrossFileExtractor` trait
+  - [x] 2.1 Create `directive.rs` with `CrossFileExtractor` trait
     - Implement regex-based directive parsing
     - Support all backward directive synonyms (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`)
     - Support all working directory directive synonyms (`@lsp-working-directory`, `@lsp-wd`, `@lsp-cd`, `@lsp-current-directory`, `@lsp-current-dir`, `@lsp-working-dir`)
@@ -73,7 +73,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 1.7**
 
 - [ ] 3. Implement source() call detection
-  - [ ] 3.1 Create `source_detect.rs` with `SourceDetector` trait
+  - [x] 3.1 Create `source_detect.rs` with `SourceDetector` trait
     - Use tree-sitter to detect `source()` calls with string literal paths
     - Use tree-sitter to detect `sys.source()` calls
     - Extract path from first argument (handle both positional and named `file=`)
@@ -105,7 +105,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 4.7, 4.8**
 
 - [ ] 4. Implement path resolution
-  - [ ] 4.1 Create `path_resolve.rs` with `PathResolver` trait
+  - [x] 4.1 Create `path_resolve.rs` with `PathResolver` trait
     - Implement workspace-root-relative path resolution (paths starting with `/`)
     - Implement file-relative path resolution (paths not starting with `/`)
     - Handle `..` navigation correctly
@@ -131,7 +131,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
 
 
 - [ ] 6. Implement dependency graph
-  - [ ] 6.1 Create `dependency.rs` with `DependencyGraph` struct
+  - [x] 6.1 Create `dependency.rs` with `DependencyGraph` struct
     - Implement forward-only edge representation (no `EdgeKind` enum)
     - Store edges with full call site position (line, column in UTF-16 code units)
     - Store `local`, `chdir`, `is_sys_source`, `is_directive` flags on edges
@@ -166,7 +166,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 6.8**
 
 - [ ] 7. Implement scope resolution
-  - [ ] 7.1 Create `scope.rs` with `ScopeResolver` trait
+  - [x] 7.1 Create `scope.rs` with `ScopeResolver` trait
     - Define `ScopedSymbol` (including `defined_column` in UTF-16), `ScopeArtifacts`, `ScopeEvent`, `ScopeAtPosition` types
     - Implement `compute_artifacts()` - non-recursive, file-local only
     - Implement v1 R symbol model extraction for exported interface + timeline Def events
@@ -235,7 +235,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
 
 
 - [ ] 8. Implement configuration
-  - [ ] 8.1 Create `config.rs` with `CrossFileConfig` struct
+  - [x] 8.1 Create `config.rs` with `CrossFileConfig` struct
     - Define all configuration fields with defaults from Requirement 11
     - `max_backward_depth: 10`
     - `max_forward_depth: 10`
@@ -265,7 +265,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 10. Implement caching with interior mutability
-  - [ ] 10.1 Create `cache.rs` with cache structures
+  - [x] 10.1 Create `cache.rs` with cache structures
     - Implement `ScopeFingerprint` with all required hash components (self_hash, edges_hash, upstream_interfaces_hash, workspace_index_version)
     - Implement `MetadataCache` with interior mutability (`parking_lot::RwLock<HashMap>`)
     - Implement `ArtifactsCache` with interior mutability
@@ -286,7 +286,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 12.11**
 
 - [ ] 11. Implement parent resolution with stability
-  - [ ] 11.1 Create `parent_resolve.rs` with parent resolution logic
+  - [x] 11.1 Create `parent_resolve.rs` with parent resolution logic
     - Implement `ParentResolution` enum (Single, Ambiguous, None)
     - Implement `resolve_parent()` with strict precedence order
     - Implement call-site resolution ladder (explicit line → match → reverse deps → inference → default)
@@ -309,7 +309,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 5.10**
 
 - [ ] 12. Implement real-time update system
-  - [ ] 12.1 Create `revalidation.rs` with revalidation logic
+  - [x] 12.1 Create `revalidation.rs` with revalidation logic
     - Implement `CrossFileRevalidationState` with pending task tracking
     - Implement `CrossFileDiagnosticsGate` for monotonic publishing
     - Implement `CrossFileActivityState` for prioritization
@@ -362,7 +362,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 14. Implement workspace watching and indexing
-  - [ ] 14.1 Create `workspace_index.rs` with workspace index
+  - [x] 14.1 Create `workspace_index.rs` with workspace index
     - Implement `CrossFileWorkspaceIndex` struct
     - Store per-file metadata, artifacts, and file snapshots
     - Implement monotonic version counter
@@ -371,7 +371,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Implement debounced index updates
     - _Requirements: 13.1-13.6_
 
-  - [ ] 14.2 Create `file_cache.rs` with disk file cache
+  - [x] 14.2 Create `file_cache.rs` with disk file cache
     - Implement `CrossFileFileCache` struct
     - Implement `FileSnapshot` with mtime, size, content_hash
     - Read file contents from disk on-demand using `tokio::fs` or `spawn_blocking`
@@ -380,14 +380,14 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Enforce open-docs-authoritative rule
     - _Requirements: 13.1-13.3_
 
-  - [ ] 14.3 Create `content_provider.rs` with unified file content provider
+  - [x] 14.3 Create `content_provider.rs` with unified file content provider
     - Implement `CrossFileContentProvider` trait
     - Precedence: open document > workspace index snapshot > async disk read
     - Enforce open-docs-authoritative at every read path
     - Use for all cross-file reads (match= validation, inference, scope resolution of closed files)
     - _Requirements: 12.8, 12.9, 13.1-13.3_
 
-  - [ ] 14.4 Implement file watcher handler in backend
+  - [x] 14.4 Implement file watcher handler in backend
     - Implement `did_change_watched_files()` handler in `backend.rs`
     - Handle CREATED, CHANGED, DELETED events
     - Invalidate disk-backed caches for changed files
@@ -405,7 +405,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 13.2**
 
 - [ ] 15. Extend WorldState with cross-file support
-  - [ ] 15.1 Update `state.rs` to add cross-file fields
+  - [x] 15.1 Update `state.rs` to add cross-file fields
     - Add `cross_file_config: CrossFileConfig` to `WorldState`
     - Add `cross_file_meta: MetadataCache` to `WorldState`
     - Add `cross_file_graph: DependencyGraph` to `WorldState`
@@ -420,7 +420,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - _Requirements: 0.1-0.10, 6.1-6.8, 12.1-12.11, 13.1-13.6_
 
 - [ ] 16. Integrate cross-file into LSP handlers
-  - [ ] 16.1 Update completion handler
+  - [x] 16.1 Update completion handler
     - Query `ScopeResolver::scope_at_position()` for request position
     - Include symbols from resolved scope chain
     - Add source file path to completion detail for cross-file symbols
@@ -436,7 +436,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 7.2**
 
 
-  - [ ] 16.4 Update hover handler
+  - [x] 16.4 Update hover handler
     - Query `ScopeResolver::scope_at_position()` for hover position
     - Display source file path for cross-file symbols
     - Display function signature if applicable
@@ -447,7 +447,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 29: Cross-File Hover Information**
     - **Validates: Requirements 8.1, 8.2**
 
-  - [ ] 16.6 Update definition handler
+  - [x] 16.6 Update definition handler
     - Query `ScopeResolver::scope_at_position()` for definition request
     - Navigate to definition location in sourced file
     - Handle shadowing (navigate to effective definition)
@@ -457,7 +457,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 30: Cross-File Go-to-Definition**
     - **Validates: Requirements 9.1**
 
-  - [ ] 16.8 Update diagnostics handler
+  - [x] 16.8 Update diagnostics handler
     - Query `ScopeResolver::scope_at_position()` for each symbol usage
     - Suppress undefined variable diagnostics for symbols in scope chain
     - Check `CrossFileMetadata::ignored_lines` for suppression
@@ -489,19 +489,19 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 18. Update backend.rs with cross-file integration
-  - [ ] 18.1 Update did_open handler
+  - [x] 18.1 Update did_open handler
     - Extract cross-file metadata and update graph
     - Record document as recently opened in activity state
     - Schedule initial diagnostics with cross-file awareness
     - _Requirements: 0.1, 0.2_
 
-  - [ ] 18.2 Update did_change handler
+  - [x] 18.2 Update did_change handler
     - Call `revalidate_after_change_locked()` to get affected files
     - Call `schedule_diagnostics_debounced()` for affected files
     - Record document as recently changed in activity state
     - _Requirements: 0.1, 0.2, 0.3_
 
-  - [ ] 18.3 Update did_close handler
+  - [x] 18.3 Update did_close handler
     - Call `CrossFileDiagnosticsGate::clear()` for closed URI
     - Cancel pending revalidation for closed URI
     - Remove from activity tracking
@@ -530,7 +530,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Validates: Requirements 15.4, 15.5**
 
 - [ ] 19. Update VS Code extension for client activity signals
-  - [ ] 19.1 Update extension.ts to send activity notifications
+  - [x] 19.1 Update extension.ts to send activity notifications
     - Register `onDidChangeActiveTextEditor` listener
     - Register `onDidChangeVisibleTextEditors` listener
     - Send `rlsp/activeDocumentsChanged` notification with active/visible URIs
@@ -538,7 +538,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - _Requirements: 15.1, 15.2, 15.3_
 
 - [ ] 20. Update documentation
-  - [ ] 20.1 Update README.md with cross-file awareness section
+  - [x] 20.1 Update README.md with cross-file awareness section
     - Document all LSP directives with syntax and examples
     - Document cross-file behavior (source() detection, scope resolution, position-awareness)
     - Document all configuration options with descriptions and defaults
@@ -546,7 +546,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Document v1 R symbol model and its limitations
     - _Requirements: 16.1-16.4, 17.7_
 
-  - [ ] 20.2 Update AGENTS.md with cross-file architecture
+  - [x] 20.2 Update AGENTS.md with cross-file architecture
     - Document dependency graph structure and management
     - Document scope resolution algorithm overview
     - Document caching and invalidation strategy

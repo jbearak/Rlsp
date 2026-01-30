@@ -121,18 +121,37 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        let mut state = self.state.write().await;
-        if let Some(doc) = state.documents.get_mut(&uri) {
-            doc.version = Some(version);
-        }
-        for change in params.content_changes {
-            state.apply_change(&uri, change);
-        }
-        // Record as recently changed for activity prioritization
-        state.cross_file_activity.record_recent(uri.clone());
-        drop(state);
+        // Compute affected files while holding write lock
+        let affected_uris = {
+            let mut state = self.state.write().await;
+            if let Some(doc) = state.documents.get_mut(&uri) {
+                doc.version = Some(version);
+            }
+            for change in params.content_changes {
+                state.apply_change(&uri, change);
+            }
+            // Record as recently changed for activity prioritization
+            state.cross_file_activity.record_recent(uri.clone());
+            
+            // Compute affected files from dependency graph
+            let mut affected: Vec<Url> = vec![uri.clone()];
+            let dependents = state.cross_file_graph.get_transitive_dependents(
+                &uri,
+                state.cross_file_config.max_chain_depth,
+            );
+            // Filter to only open documents
+            for dep in dependents {
+                if state.documents.contains_key(&dep) {
+                    affected.push(dep);
+                }
+            }
+            affected
+        };
 
-        self.publish_diagnostics(&uri).await;
+        // Publish diagnostics for all affected files
+        for affected_uri in affected_uris {
+            self.publish_diagnostics(&affected_uri).await;
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -291,15 +310,15 @@ impl Backend {
         }
         
         let diagnostics = handlers::diagnostics(&state, uri);
+        
+        // Record the publish (uses interior mutability, no write lock needed)
+        if let Some(ver) = version {
+            state.diagnostics_gate.record_publish(uri, ver);
+        }
+        
         drop(state);
         
         self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
-        
-        // Record the publish
-        if let Some(ver) = version {
-            let state = self.state.write().await;
-            state.diagnostics_gate.record_publish(uri, ver);
-        }
     }
 }
 
