@@ -512,7 +512,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - **Property 54: Diagnostics Gate Cleanup on Close**
     - **Validates: Requirements 0.7, 0.8**
 
-  - [ ] 18.5 Implement did_change_configuration handler
+  - [x] 18.5 Implement did_change_configuration handler
     - Parse new cross-file configuration
     - Call `on_configuration_changed()` to invalidate caches
     - Schedule revalidation for all open documents
@@ -524,6 +524,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Update `CrossFileActivityState` with active/visible URIs
     - Log activity updates at trace level
     - _Requirements: 15.1-15.5_
+    - **NOTE: Not implemented due to tower-lsp limitations. Fallback behavior (Requirement 15.5) is implemented via record_recent() calls.**
 
   - [ ] 18.7 Write property test for client activity signal processing
     - **Property 49: Client Activity Signal Processing**
