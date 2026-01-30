@@ -496,7 +496,7 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     };
 
     // Try user-defined function first
-    if let Some(signature) = find_user_function_signature(state, uri, &name) {
+    if let Some(signature) = find_user_function_signature(state, uri, name) {
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
