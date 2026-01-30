@@ -44,7 +44,7 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
     "test": "vscode-test",
-    "package": "npm run compile && node scripts/bundle.js && vsce package",
+    "package": "npm run compile && node scripts/bundle.js && vsce package --allow-missing-repository",
     "package:target": "npm run compile && node scripts/bundle.js && vsce package --target"
   },
   "files": [
