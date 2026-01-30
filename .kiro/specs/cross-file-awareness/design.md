@@ -444,8 +444,16 @@ pub struct ScopedSymbol {
     pub name: String,
     pub kind: SymbolKind,
     pub source_uri: Url,
+
+    /// 0-based line of the definition (LSP convention)
     pub defined_line: u32,
+
+    /// 0-based UTF-16 column of the definition (LSP Position.character convention).
+    ///
+    /// IMPORTANT: defined_column MUST use UTF-16 code units to allow correct same-line
+    /// comparisons against call sites and request positions.
     pub defined_column: u32,
+
     pub signature: Option<String>,
 }
 
@@ -522,6 +530,7 @@ pub trait ScopeResolver {
 Implementation notes:
 - `timeline` MUST be sufficient to compute `scope_at_position(uri, line, char)` without accidentally including symbols introduced after that position via forward sourcing.
 - `scope_at_position` merges local defs + inherited interfaces gated by call-site ordering, using the parent's own position-aware scope at the call site.
+- For any definition event, ordering MUST use `(defined_line, defined_column)` on `ScopedSymbol` to avoid same-line off-by-one errors.
 - Both use call-site resolution ladder for backward directives (explicit → reverse deps → inference → default).
 - Position comparison: `(line1, char1) < (line2, char2)` iff `line1 < line2 || (line1 == line2 && char1 < char2)`.
 
