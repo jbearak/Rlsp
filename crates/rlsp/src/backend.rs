@@ -106,9 +106,10 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
+        let version = params.text_document.version;
 
         let mut state = self.state.write().await;
-        state.open_document(uri.clone(), &text);
+        state.open_document(uri.clone(), &text, Some(version));
         drop(state);
 
         self.publish_diagnostics(&uri).await;
@@ -116,8 +117,12 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
+        let version = params.text_document.version;
 
         let mut state = self.state.write().await;
+        if let Some(doc) = state.documents.get_mut(&uri) {
+            doc.version = Some(version);
+        }
         for change in params.content_changes {
             state.apply_change(&uri, change);
         }
@@ -128,7 +133,13 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let mut state = self.state.write().await;
+        state.diagnostics_gate.clear(&params.text_document.uri);
         state.close_document(&params.text_document.uri);
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        log::trace!("Received watched files change: {} changes", params.changes.len());
+        // TODO: Will be expanded in Task 14 for cross-file awareness
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -224,10 +235,26 @@ impl LanguageServer for Backend {
 impl Backend {
     async fn publish_diagnostics(&self, uri: &Url) {
         let state = self.state.read().await;
+        let version = state.documents.get(uri).and_then(|d| d.version);
+        
+        // Check if we can publish (monotonic gate)
+        if let Some(ver) = version {
+            if !state.diagnostics_gate.can_publish(uri, ver) {
+                log::trace!("Skipping diagnostics for {}: monotonic gate", uri);
+                return;
+            }
+        }
+        
         let diagnostics = handlers::diagnostics(&state, uri);
-        self.client
-            .publish_diagnostics(uri.clone(), diagnostics, None)
-            .await;
+        drop(state);
+        
+        self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+        
+        // Record the publish
+        if let Some(ver) = version {
+            let mut state = self.state.write().await;
+            state.diagnostics_gate.record_publish(uri, ver);
+        }
     }
 }
 

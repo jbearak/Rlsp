@@ -1117,9 +1117,9 @@ mod proptests {
             let code_require = format!("require({})", pkg_name);
             let code_loadns = format!("loadNamespace(\"{}\")", pkg_name);
             
-            let doc1 = Document::new(&code_library);
-            let doc2 = Document::new(&code_require);
-            let doc3 = Document::new(&code_loadns);
+            let doc1 = Document::new(&code_library, None);
+            let doc2 = Document::new(&code_require, None);
+            let doc3 = Document::new(&code_loadns, None);
             
             prop_assert!(doc1.loaded_packages.contains(&pkg_name));
             prop_assert!(doc2.loaded_packages.contains(&pkg_name));
@@ -1137,7 +1137,7 @@ mod proptests {
                 .collect::<Vec<_>>()
                 .join("\n");
             
-            let doc = Document::new(&code);
+            let doc = Document::new(&code, None);
             
             for pkg in &packages {
                 prop_assert!(doc.loaded_packages.contains(pkg));
@@ -1269,9 +1269,9 @@ mod proptests {
             let workspace_code = format!("{} <- function(x, y, z) {{ x + y + z }}", func_name);
             
             let mut state = WorldState::new(vec![]);
-            state.documents.insert(current_uri.clone(), Document::new(&current_code));
-            state.documents.insert(other_uri.clone(), Document::new(&other_code));
-            state.workspace_index.insert(workspace_uri.clone(), Document::new(&workspace_code));
+            state.documents.insert(current_uri.clone(), Document::new(&current_code, None));
+            state.documents.insert(other_uri.clone(), Document::new(&other_code, None));
+            state.workspace_index.insert(workspace_uri.clone(), Document::new(&workspace_code, None));
             
             // Search should return current document's definition first
             let signature = find_user_function_signature(&state, &current_uri, &func_name);
@@ -1343,7 +1343,7 @@ mod proptests {
             let code = format!("{} <- function(x, y) {{ x + y }}", builtin);
             
             let mut state = WorldState::new(vec![]);
-            state.documents.insert(uri.clone(), Document::new(&code));
+            state.documents.insert(uri.clone(), Document::new(&code, None));
             
             // Should return user-defined signature, not built-in
             let signature = find_user_function_signature(&state, &uri, &builtin);
@@ -1394,7 +1394,7 @@ mod integration_tests {
         let _state = WorldState::new(library_paths);
         
         let code = "library(stats)\nx <- rnorm(100)\ny <- mean(x)";
-        let doc = Document::new(code);
+        let doc = Document::new(code, None);
         
         // rnorm and mean should be recognized (rnorm from stats, mean from base)
         assert!(doc.loaded_packages.contains(&"stats".to_string()));
@@ -1413,7 +1413,7 @@ mod integration_tests {
         ];
         
         for (code, expected_funcs) in test_cases {
-            let doc = Document::new(code);
+            let doc = Document::new(code, None);
             let uri = tower_lsp::lsp_types::Url::parse("file:///test.R").unwrap();
             state.documents.insert(uri.clone(), doc);
             

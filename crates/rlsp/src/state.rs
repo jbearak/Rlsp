@@ -5,7 +5,7 @@
 //
 //
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -16,15 +16,65 @@ use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
 
+/// Diagnostics publish gating to enforce monotonic publishing
+#[derive(Debug, Clone, Default)]
+pub struct CrossFileDiagnosticsGate {
+    /// Last published document version per URI
+    last_published_version: HashMap<Url, i32>,
+    /// URIs that need forced republish (dependency-triggered, version unchanged)
+    force_republish: HashSet<Url>,
+}
+
+impl CrossFileDiagnosticsGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if diagnostics can be published for this version
+    pub fn can_publish(&self, uri: &Url, version: i32) -> bool {
+        match self.last_published_version.get(uri) {
+            Some(&last) => {
+                if version < last {
+                    return false;
+                }
+                if self.force_republish.contains(uri) {
+                    return version >= last;
+                }
+                version > last
+            }
+            None => true,
+        }
+    }
+
+    /// Record that diagnostics were published for this version
+    pub fn record_publish(&mut self, uri: &Url, version: i32) {
+        self.last_published_version.insert(uri.clone(), version);
+        self.force_republish.remove(uri);
+    }
+
+    /// Mark a URI for forced republish
+    pub fn mark_force_republish(&mut self, uri: &Url) {
+        self.force_republish.insert(uri.clone());
+    }
+
+    /// Clear all state for a URI (called on didClose)
+    pub fn clear(&mut self, uri: &Url) {
+        self.last_published_version.remove(uri);
+        self.force_republish.remove(uri);
+    }
+}
+
 /// A parsed document
 pub struct Document {
     pub contents: Rope,
     pub tree: Option<Tree>,
     pub loaded_packages: Vec<String>,
+    pub version: Option<i32>,
+    pub revision: u64,
 }
 
 impl Document {
-    pub fn new(text: &str) -> Self {
+    pub fn new(text: &str, version: Option<i32>) -> Self {
         let contents = Rope::from_str(text);
         let tree = parse_r(&contents);
         let loaded_packages = extract_loaded_packages(&tree, text);
@@ -32,15 +82,23 @@ impl Document {
             contents,
             tree,
             loaded_packages,
+            version,
+            revision: 0,
         }
     }
 
     pub fn apply_change(&mut self, change: TextDocumentContentChangeEvent) {
         if let Some(range) = change.range {
             let start_line = range.start.line as usize;
-            let start_char = range.start.character as usize;
+            let start_utf16_char = range.start.character as usize;
             let end_line = range.end.line as usize;
-            let end_char = range.end.character as usize;
+            let end_utf16_char = range.end.character as usize;
+
+            let start_line_text = self.contents.line(start_line).to_string();
+            let end_line_text = self.contents.line(end_line).to_string();
+
+            let start_char = utf16_offset_to_char_offset(&start_line_text, start_utf16_char);
+            let end_char = utf16_offset_to_char_offset(&end_line_text, end_utf16_char);
 
             let start_idx = self.contents.line_to_char(start_line) + start_char;
             let end_idx = self.contents.line_to_char(end_line) + end_char;
@@ -52,14 +110,33 @@ impl Document {
             self.contents = Rope::from_str(&change.text);
         }
 
+        self.revision += 1;
         self.tree = parse_r(&self.contents);
         let text = self.contents.to_string();
         self.loaded_packages = extract_loaded_packages(&self.tree, &text);
     }
 
+    pub fn contents_hash(&self) -> u64 {
+        self.revision
+    }
+
     pub fn text(&self) -> String {
         self.contents.to_string()
     }
+}
+
+fn utf16_offset_to_char_offset(line_text: &str, utf16_offset: usize) -> usize {
+    let mut utf16_count = 0;
+    let mut char_count = 0;
+    
+    for ch in line_text.chars() {
+        if utf16_count >= utf16_offset {
+            return char_count;
+        }
+        utf16_count += ch.len_utf16();
+        char_count += 1;
+    }
+    char_count
 }
 
 fn parse_r(contents: &Rope) -> Option<Tree> {
@@ -340,6 +417,7 @@ pub struct WorldState {
     pub workspace_index: HashMap<Url, Document>,
     pub workspace_imports: Vec<String>, // Symbols imported via workspace NAMESPACE
     pub help_cache: crate::help::HelpCache,
+    pub diagnostics_gate: CrossFileDiagnosticsGate,
 }
 
 impl WorldState {
@@ -351,11 +429,12 @@ impl WorldState {
             workspace_index: HashMap::new(),
             workspace_imports: Vec::new(),
             help_cache: crate::help::HelpCache::new(),
+            diagnostics_gate: CrossFileDiagnosticsGate::new(),
         }
     }
 
-    pub fn open_document(&mut self, uri: Url, text: &str) {
-        self.documents.insert(uri, Document::new(text));
+    pub fn open_document(&mut self, uri: Url, text: &str, version: Option<i32>) {
+        self.documents.insert(uri, Document::new(text, version));
     }
 
     pub fn close_document(&mut self, uri: &Url) {
@@ -411,12 +490,12 @@ impl WorldState {
             if path.is_dir() {
                 self.index_directory(&path);
             } else if path.extension().and_then(|s| s.to_str()) == Some("R") {
-                if let Ok(text) = fs::read_to_string(&path) {
-                    if let Ok(uri) = Url::from_file_path(&path) {
-                        log::debug!("Indexing file: {}", uri);
-                        self.workspace_index.insert(uri, Document::new(&text));
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        if let Ok(uri) = Url::from_file_path(&path) {
+                            log::debug!("Indexing file: {}", uri);
+                            self.workspace_index.insert(uri, Document::new(&text, None));
+                        }
                     }
-                }
             }
         }
     }
