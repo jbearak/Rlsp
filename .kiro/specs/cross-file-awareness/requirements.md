@@ -282,3 +282,51 @@ The feature is inspired by the Sight LSP for Stata and adapted for R's specific 
    - `timestampMs`: client timestamp for ordering
 4. When the server receives these notifications, it SHALL update an in-memory activity model used to prioritize cross-file revalidations (Requirement 0.7).
 5. If the client does not support these notifications, the server MUST fall back to trigger-first + most-recently-changed ordering.
+
+
+### Requirement 16: Documentation Updates
+
+**User Story:** As an R developer or contributor, I want comprehensive documentation of all LSP directives, cross-file behaviors, and configuration options, so that I can effectively use and contribute to Rlsp's cross-file awareness features.
+
+#### Acceptance Criteria
+
+1. THE README.md SHALL document all LSP directives with syntax and examples:
+   - Backward directives: `@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by` with `line=` and `match=` options
+   - Forward directives: `@lsp-source`
+   - Working directory directives: `@lsp-working-directory`, `@lsp-wd`, `@lsp-cd`, `@lsp-current-directory`, `@lsp-current-dir`, `@lsp-working-dir`
+   - Diagnostic suppression directives: `@lsp-ignore`, `@lsp-ignore-next`
+2. THE README.md SHALL document cross-file awareness behavior including:
+   - How `source()` and `sys.source()` calls are detected and processed
+   - How scope resolution works across file boundaries
+   - Position-aware symbol availability (symbols available after source() call site)
+   - Working directory resolution rules
+   - Call site identification and disambiguation
+3. THE README.md SHALL document all configuration options with descriptions and default values:
+   - `crossFile.maxBackwardDepth` (default: 10)
+   - `crossFile.maxForwardDepth` (default: 10)
+   - `crossFile.maxChainDepth` (default: 20)
+   - `crossFile.assumeCallSite` (default: "end", values: "end" or "start")
+   - `crossFile.indexWorkspace` (default: true)
+   - `crossFile.maxRevalidationsPerTrigger` (default: 10)
+   - `crossFile.revalidationDebounceMs` (default: 200)
+   - `diagnostics.undefinedVariables` (default: true)
+   - Cross-file diagnostic severity settings
+4. THE README.md SHALL include practical usage examples demonstrating:
+   - Basic multi-file project setup with source() calls
+   - Using backward directives to declare parent relationships
+   - Using forward directives for dynamic paths
+   - Working directory configuration for complex project structures
+   - Handling circular dependencies
+5. THE AGENTS.md SHALL be updated with cross-file architecture details including:
+   - Dependency graph structure and management
+   - Scope resolution algorithm overview
+   - Caching and invalidation strategy
+   - Real-time update mechanism
+   - Thread-safety considerations for cross-file state
+6. THE AGENTS.md SHALL document cross-file implementation patterns:
+   - How to add new directive types
+   - How to extend scope resolution logic
+   - How to add cross-file diagnostics
+   - Testing strategies for cross-file features
+7. WHEN documentation is updated, THE examples SHALL be tested to ensure accuracy
+8. THE documentation SHALL follow the existing style and structure of README.md and AGENTS.md
