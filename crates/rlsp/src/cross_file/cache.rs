@@ -94,6 +94,13 @@ impl ArtifactsCache {
             guard.remove(uri);
         }
     }
+
+    /// Invalidate all entries
+    pub fn invalidate_all(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.clear();
+        }
+    }
 }
 
 /// Cache key for parent selection stability
@@ -153,6 +160,13 @@ impl ParentSelectionCache {
     pub fn invalidate(&self, child_uri: &Url) {
         if let Ok(mut guard) = self.inner.write() {
             guard.retain(|(uri, _), _| uri != child_uri);
+        }
+    }
+
+    /// Invalidate all entries
+    pub fn invalidate_all(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.clear();
         }
     }
 }
