@@ -518,13 +518,13 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Schedule revalidation for all open documents
     - _Requirements: 11.11_
 
-  - [ ] 18.6 Implement custom notification handler for client activity signals
+  - [x] 18.6 Implement custom notification handler for client activity signals
     - Define `ActiveDocumentsChangedParams` struct
     - Implement `handle_active_documents_changed()` handler
     - Update `CrossFileActivityState` with active/visible URIs
     - Log activity updates at trace level
     - _Requirements: 15.1-15.5_
-    - **NOTE: Not implemented due to tower-lsp limitations. Fallback behavior (Requirement 15.5) is implemented via record_recent() calls.**
+    - **NOTE: Custom notification handler not implemented due to tower-lsp limitations. Fallback behavior (Requirement 15.5) is implemented via record_recent() calls in did_open/did_change handlers.**
 
   - [x] 18.7 Write property test for client activity signal processing
     - **Property 49: Client Activity Signal Processing**
