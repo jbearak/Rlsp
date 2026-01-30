@@ -1721,11 +1721,13 @@ These invariants MUST be preserved across all refactoring. They are the core beh
 
 6. **compute_artifacts() MUST NOT read other files' content** - it depends only on the file's own content/AST plus pre-existing dependency metadata (edges) and already-indexed interface hashes. This prevents recursion and lock contention.
 
-7. **handlers::diagnostics() MUST NOT mutate WorldState core fields** - it runs under a read lock and must not modify `documents`, `cross_file_graph`, `cross_file_config`, or `cross_file_diagnostics_gate`. However, caches (`cross_file_cache`, `cross_file_meta`) use interior mutability and MAY be populated during read operations. All state mutations to core fields happen in separate write-lock passes.
+7. **handlers::diagnostics() MUST NOT mutate WorldState core fields** - it runs under a read lock and must not modify `documents`, `cross_file_graph`, `cross_file_config`, or `cross_file_diagnostics_gate`. However, caches (`cross_file_cache`, `cross_file_meta`, `cross_file_parent_cache`) use interior mutability and MAY be populated during read operations. All state mutations to core fields happen in separate write-lock passes.
 
 8. **Interface change detection uses symbol hash, not metadata hash** - `interface_changed` MUST be computed by comparing `ScopeArtifacts.interface_hash` (the actual exported symbol surface), not `CrossFileMetadata` hash. This ensures dependents invalidate when function definitions change, even if directives/source-calls remain identical.
 
 9. **Duplicate same-version diagnostic publishes are acceptable** - The monotonic gate prevents older-version publishes but allows same-version duplicates. This simplifies the implementation while maintaining correctness (client overwrites with equivalent diagnostics).
+
+10. **Interior-mutable cache lock hold-time MUST be minimal** - When populating caches during read operations, hold the inner `RwLock` only for the HashMap lookup/insert. Never hold the cache lock while performing IO (disk reads for inference) or expensive computation. Pattern: compute fingerprint → check cache (read lock) → if miss: compute resolution (no lock) → insert (write lock).
 
 ### Missing Files
 
@@ -2316,7 +2318,7 @@ impl ArtifactsCache {
 
 **Updated Critical Design Invariant #7:**
 
-> **handlers::diagnostics() MUST NOT mutate WorldState core fields** - it runs under a read lock and must not modify `documents`, `cross_file_graph`, `cross_file_config`, or `cross_file_diagnostics_gate`. However, caches (`cross_file_cache`, `cross_file_meta`) use interior mutability and MAY be populated during read operations. All state mutations to core fields happen in separate write-lock passes.
+> **handlers::diagnostics() MUST NOT mutate WorldState core fields** - it runs under a read lock and must not modify `documents`, `cross_file_graph`, `cross_file_config`, or `cross_file_diagnostics_gate`. However, caches (`cross_file_cache`, `cross_file_meta`, `cross_file_parent_cache`) use interior mutability and MAY be populated during read operations. All state mutations to core fields happen in separate write-lock passes.
 
 ### Issue 10: Diagnostic Publish Atomicity and Duplicate Publishes
 
@@ -2427,3 +2429,15 @@ impl ParentSelectionCache {
 - Removed `Clone` derive (interior mutability types are not `Clone`)
 
 This ensures all three read-path caches (`MetadataCache`, `ArtifactsCache`, `ParentSelectionCache`) follow the same interior mutability pattern, maintaining consistency with Critical Design Invariant #7.
+
+**Implementation Note (Deadlock Avoidance):**
+
+Even with interior mutability, keep the cache lock hold-time minimal:
+1. Compute the fingerprint (no lock)
+2. Check cache (read lock, release immediately)
+3. If miss: compute resolution **without** holding any lock
+4. Insert result (write lock, release immediately)
+
+If `resolve_parent(...)` ever does IO (disk reads for inference), do **not** hold the cache lock during that IO. The pattern in `get_or_compute()` already follows this: the read lock is released before computing, and the write lock is only held for the insert.
+
+**Note:** Duplicate compute on concurrent cache miss is acceptable—correctness is unchanged (same inputs produce same output) and the cache will converge. This avoids the complexity of double-checked locking.
