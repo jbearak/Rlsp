@@ -44,7 +44,7 @@ Declare that this file is sourced by another file:
 
 Optional parameters:
 - `line=N` - Specify 1-based line number in parent where source() call occurs
-- `match="pattern"` - Specify text pattern to find source() call in parent
+- `match="pattern"` - Specify text pattern to find source() call in parent (not yet implemented, falls back to default)
 
 Example:
 ```r
