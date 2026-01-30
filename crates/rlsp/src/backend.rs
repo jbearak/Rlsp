@@ -297,7 +297,7 @@ impl Backend {
         
         // Record the publish
         if let Some(ver) = version {
-            let mut state = self.state.write().await;
+            let state = self.state.write().await;
             state.diagnostics_gate.record_publish(uri, ver);
         }
     }
