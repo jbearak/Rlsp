@@ -48,8 +48,6 @@ pub use source_detect::*;
 pub use types::*;
 pub use workspace_index::*;
 
-use tree_sitter::Parser;
-
 /// Extract cross-file metadata from R source code (Requirement 0.1)
 /// Combines directive parsing with AST-detected source() calls
 pub fn extract_metadata(content: &str) -> CrossFileMetadata {

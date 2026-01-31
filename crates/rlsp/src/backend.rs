@@ -1147,7 +1147,7 @@ impl Backend {
         let cross_file_meta = crate::cross_file::extract_metadata(&content);
         let artifacts = crate::parser_pool::with_parser(|parser| {
             if let Some(tree) = parser.parse(&content, None) {
-                crate::cross_file::scope::compute_artifacts(&file_uri, &tree, &content)
+                crate::cross_file::scope::compute_artifacts(file_uri, &tree, &content)
             } else {
                 crate::cross_file::scope::ScopeArtifacts::default()
             }
@@ -1170,7 +1170,7 @@ impl Backend {
             let state = self.state.read().await;
             let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
             state.cross_file_workspace_index.update_from_disk(
-                &file_uri,
+                file_uri,
                 &open_docs,
                 snapshot,
                 cross_file_meta.clone(),
@@ -1201,7 +1201,7 @@ impl Backend {
                 .collect();
             
             state.cross_file_graph.update_file(
-                &file_uri,
+                file_uri,
                 &cross_file_meta,
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
@@ -1209,7 +1209,7 @@ impl Backend {
         }
         
         log::info!("On-demand indexed: {} (exported {} symbols)", file_uri, 
-            self.state.read().await.cross_file_workspace_index.get_artifacts(&file_uri)
+            self.state.read().await.cross_file_workspace_index.get_artifacts(file_uri)
                 .map(|a| a.exported_interface.len()).unwrap_or(0));
         
         Some(cross_file_meta)
