@@ -211,9 +211,11 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - Guard against deadlocks by avoiding nested async lock acquisition (especially around background indexer/state access).
 - Use `saturating_add` (or equivalent) for sentinel end-of-line columns to prevent overflow.
 - Don’t “paper over” missing files: file-existence checks must preserve accurate diagnostics instead of always returning `true`.
+- Validate user-controlled package names/paths and skip suspicious values before using them in indexing or diagnostics.
 - Avoid `expect()` in long-lived server paths (e.g., parser init); propagate errors with `Option`/`Result` instead.
 - When adding new enum variants used in test match expressions, update all test helpers to keep matches exhaustive.
 - Avoid hard-coded line/column positions in property tests; compute stable positions from the generated code or parsed nodes.
+- When using `tokio::sync::watch`, guard waiters with in-flight state or revisions so late callers don’t hang on `changed()`.
 - When using `u32::MAX` as an EOF sentinel, ensure function-scope filtering treats it as “outside any function” to avoid leaking locals.
 - Distinguish “full EOF” (both line and column MAX) from end-of-line sentinels so scope filtering doesn’t drop function-local symbols at call sites.
 - In proptest, prefer `prop_assume!` for invalid generated cases instead of returning early with non-unit values.
@@ -227,6 +229,7 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - In hot scope-resolution paths, avoid repeated scans over large lists (e.g., function scopes per event); precompute mappings or cache lookups to prevent O(R·F) regressions.
 - Keep doc comments and markdown examples aligned with current behavior (e.g., list= string literals support).
 - Normalize markdown table spacing to match project lint expectations when adding spec tables.
+- `tree_sitter::Tree` implements `Clone`; preserve ASTs in cloned index entries when reference searches depend on them.
 
 ### Rust/Clippy Best Practices
 

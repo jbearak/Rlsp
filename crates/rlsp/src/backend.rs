@@ -31,6 +31,16 @@ fn extract_loaded_packages_from_tree(tree: &Option<tree_sitter::Tree>, text: &st
 
     let mut packages = Vec::new();
     
+    fn is_valid_package_name(name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        if name.contains("..") || name.contains('/') || name.contains('\\') {
+            return false;
+        }
+        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+    }
+
     fn visit_node(node: tree_sitter::Node, text: &str, packages: &mut Vec<String>) {
         if node.kind() == "call" {
             if let Some(func_node) = node.child_by_field_name("function") {
@@ -44,7 +54,11 @@ fn extract_loaded_packages_from_tree(tree: &Option<tree_sitter::Tree>, text: &st
                                     if let Some(value_node) = child.child_by_field_name("value") {
                                         let value_text = &text[value_node.byte_range()];
                                         let pkg_name = value_text.trim_matches(|c: char| c == '"' || c == '\'');
-                                        packages.push(pkg_name.to_string());
+                                        if is_valid_package_name(pkg_name) {
+                                            packages.push(pkg_name.to_string());
+                                        } else {
+                                            log::warn!("Skipping suspicious package name: {}", pkg_name);
+                                        }
                                         break;
                                     }
                                 }

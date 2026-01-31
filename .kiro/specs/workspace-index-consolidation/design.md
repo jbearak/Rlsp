@@ -143,6 +143,9 @@ impl DocumentStore {
     /// Get a document (updates LRU)
     pub fn get(&mut self, uri: &Url) -> Option<&DocumentState> { ... }
     
+    /// Get a document without updating LRU
+    pub fn get_without_touch(&self, uri: &Url) -> Option<&DocumentState> { ... }
+    
     /// Check if document is open
     pub fn contains(&self, uri: &Url) -> bool { ... }
     
@@ -306,7 +309,7 @@ pub struct DefaultContentProvider<'a> {
 impl<'a> ContentProvider for DefaultContentProvider<'a> {
     fn get_content(&self, uri: &Url) -> Option<String> {
         // 1. Check DocumentStore (open docs are authoritative)
-        if let Some(doc) = self.document_store.get(uri) {
+        if let Some(doc) = self.document_store.get_without_touch(uri) {
             return Some(doc.contents.to_string());
         }
         
@@ -315,13 +318,13 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             return Some(entry.contents.to_string());
         }
         
-        // 3. Check file cache or read from disk
-        self.file_cache.read_and_cache(uri)
+        // 3. Check file cache (no synchronous disk I/O)
+        self.file_cache.get(uri)
     }
     
     fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
         // 1. Check DocumentStore
-        if let Some(doc) = self.document_store.get(uri) {
+        if let Some(doc) = self.document_store.get_without_touch(uri) {
             return Some(doc.metadata.clone());
         }
         
@@ -331,7 +334,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     
     fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts> {
         // 1. Check DocumentStore
-        if let Some(doc) = self.document_store.get(uri) {
+        if let Some(doc) = self.document_store.get_without_touch(uri) {
             return Some(doc.artifacts.clone());
         }
         

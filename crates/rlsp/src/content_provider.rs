@@ -105,7 +105,7 @@ pub trait AsyncContentProvider: ContentProvider {
 /// 2. Check legacy documents HashMap (for migration compatibility)
 /// 3. Check WorkspaceIndex (closed files)
 /// 4. Check legacy workspace_index and cross_file_workspace_index (for migration compatibility)
-/// 5. Check file cache or read from disk
+/// 5. Check file cache (no synchronous disk I/O)
 ///
 /// **Validates: Requirements 7.2, 13.2, 14.1, 14.2, 14.3, 14.4**
 pub struct DefaultContentProvider<'a> {
@@ -179,7 +179,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// 2. Legacy documents HashMap (for migration compatibility)
     /// 3. WorkspaceIndex (closed files)
     /// 4. Legacy workspace_index (for migration compatibility)
-    /// 5. File cache or read from disk
+    /// 5. File cache (no synchronous disk I/O)
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_content(&self, uri: &Url) -> Option<String> {
@@ -207,8 +207,8 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             }
         }
 
-        // 5. Check file cache or read from disk
-        self.file_cache.read_and_cache(uri)
+        // 5. Check file cache (no synchronous disk I/O)
+        self.file_cache.get(uri)
     }
 
     /// Get metadata for a URI
@@ -363,11 +363,17 @@ impl<'a> AsyncContentProvider for DefaultContentProvider<'a> {
                 .filter_map(|u| u.to_file_path().ok())
                 .collect();
 
-            let existence_results = tokio::task::spawn_blocking(move || {
+            let existence_results = match tokio::task::spawn_blocking(move || {
                 paths.iter().map(|p| p.exists()).collect::<Vec<_>>()
             })
             .await
-            .unwrap_or_default();
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    log::warn!("Existence check failed: {err}");
+                    return results;
+                }
+            };
 
             // Map results back to URIs
             // Note: We need to handle the case where some URIs couldn't be converted to paths
@@ -1448,8 +1454,6 @@ mod tests {
                 let got_artifacts = provider.get_artifacts(&uri);
 
                 // INVARIANT: All methods return None (consistent unavailability)
-                // Note: get_content may try to read from disk, but for file:///testN.R
-                // URIs, the file won't exist, so it should return None
                 assert!(got_metadata.is_none(), "get_metadata should return None for unknown URI");
                 assert!(got_artifacts.is_none(), "get_artifacts should return None for unknown URI");
 

@@ -382,6 +382,7 @@ async fn collect_missing_file_diagnostics_standalone(
     missing_file_severity: DiagnosticSeverity,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+    let workspace_root = workspace_folders.and_then(|w| w.to_file_path().ok());
     
     // Forward sources use @lsp-cd for path resolution
     let forward_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
@@ -400,6 +401,20 @@ async fn collect_missing_file_diagnostics_standalone(
             crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
         });
         if let Some(path) = resolved {
+            if let Some(root) = &workspace_root {
+                if !path.starts_with(root) {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position::new(source.line, source.column),
+                            end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
+                        },
+                        severity: Some(missing_file_severity),
+                        message: format!("Path is outside workspace: '{}'", source.path),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            }
             paths_to_check.push((path, source.path.clone(), source.line, source.column, false));
         } else {
             diagnostics.push(Diagnostic {
@@ -419,6 +434,20 @@ async fn collect_missing_file_diagnostics_standalone(
             crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
         });
         if let Some(path) = resolved {
+            if let Some(root) = &workspace_root {
+                if !path.starts_with(root) {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position::new(directive.directive_line, 0),
+                            end: Position::new(directive.directive_line, u32::MAX),
+                        },
+                        severity: Some(missing_file_severity),
+                        message: format!("Path is outside workspace: '{}'", directive.path),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            }
             paths_to_check.push((path, directive.path.clone(), directive.directive_line, 0, true));
         } else {
             diagnostics.push(Diagnostic {
@@ -439,9 +468,15 @@ async fn collect_missing_file_diagnostics_standalone(
     
     // Batch check existence on blocking thread
     let paths: Vec<std::path::PathBuf> = paths_to_check.iter().map(|(p, _, _, _, _)| p.clone()).collect();
-    let existence = tokio::task::spawn_blocking(move || {
+    let existence = match tokio::task::spawn_blocking(move || {
         paths.iter().map(|p| p.exists()).collect::<Vec<_>>()
-    }).await.unwrap_or_default();
+    }).await {
+        Ok(v) => v,
+        Err(err) => {
+            log::warn!("Missing-file check failed: {err}");
+            return diagnostics;
+        }
+    };
     
     // Generate diagnostics for missing files
     for (i, (_, path_str, line, col, is_backward)) in paths_to_check.into_iter().enumerate() {

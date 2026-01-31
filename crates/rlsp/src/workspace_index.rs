@@ -103,7 +103,7 @@ impl Clone for IndexEntry {
     fn clone(&self) -> Self {
         Self {
             contents: self.contents.clone(),
-            tree: None, // Tree is not Clone, so we don't clone it
+            tree: self.tree.clone(),
             loaded_packages: self.loaded_packages.clone(),
             snapshot: self.snapshot.clone(),
             metadata: self.metadata.clone(),

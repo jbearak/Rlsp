@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use indexmap::IndexSet;
 use ropey::Rope;
@@ -104,8 +105,8 @@ impl DocumentState {
         // Rope content (approximate: chars * average bytes per char)
         let content_size = self.contents.len_bytes();
         
-        // Tree size (rough estimate based on typical AST overhead)
-        let tree_size = self.tree.as_ref().map(|_| content_size / 2).unwrap_or(0);
+        // Tree size (conservative estimate based on typical AST overhead)
+        let tree_size = self.tree.as_ref().map(|_| content_size).unwrap_or(0);
         
         // Loaded packages
         let packages_size: usize = self.loaded_packages.iter()
@@ -143,6 +144,8 @@ struct UpdateTracker {
     sender: Arc<watch::Sender<u64>>,
     /// Watch channel receiver - waiters subscribe to this
     receiver: watch::Receiver<u64>,
+    /// Whether an update is currently in-flight for this URI
+    in_flight: Arc<AtomicBool>,
 }
 
 impl UpdateTracker {
@@ -152,6 +155,7 @@ impl UpdateTracker {
         Self {
             sender: Arc::new(sender),
             receiver,
+            in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -159,11 +163,22 @@ impl UpdateTracker {
     fn signal_complete(&self) {
         // Increment the revision to notify all waiters
         self.sender.send_modify(|rev| *rev += 1);
+        self.in_flight.store(false, Ordering::Release);
     }
 
     /// Get the current revision
     fn current_revision(&self) -> u64 {
         *self.receiver.borrow()
+    }
+
+    /// Mark that an update is in-flight
+    fn mark_in_flight(&self) {
+        self.in_flight.store(true, Ordering::Release);
+    }
+
+    /// Check if an update is in-flight
+    fn is_in_flight(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire)
     }
 
     /// Wait for the next update to complete (revision to change)
@@ -227,6 +242,7 @@ impl DocumentStore {
     /// * `content` - Document content
     /// * `version` - LSP document version
     pub async fn open(&mut self, uri: Url, content: &str, version: i32) {
+        self.mark_update_started(&uri);
         // Parse content
         let contents = Rope::from_str(content);
         let tree = Self::parse_content(content);
@@ -310,6 +326,7 @@ impl DocumentStore {
         version: i32,
     ) {
         if let Some(state) = self.documents.get_mut(uri) {
+            self.mark_update_started(uri);
             // Apply changes to content
             for change in changes {
                 Self::apply_change_to_rope(&mut state.contents, change);
@@ -423,6 +440,13 @@ impl DocumentStore {
         // Get a clone of the tracker's receiver if one exists
         if let Some(tracker) = self.update_trackers.get(uri) {
             let mut receiver = tracker.receiver.clone();
+            if !tracker.is_in_flight() {
+                return;
+            }
+            receiver.borrow_and_update();
+            if !tracker.is_in_flight() {
+                return;
+            }
             // Wait for the next update signal
             let _ = receiver.changed().await;
         }
@@ -578,6 +602,14 @@ impl DocumentStore {
         tracker.signal_complete();
     }
 
+    /// Mark an update as started for a URI
+    fn mark_update_started(&mut self, uri: &Url) {
+        let tracker = self.update_trackers
+            .entry(uri.clone())
+            .or_insert_with(UpdateTracker::new);
+        tracker.mark_in_flight();
+    }
+
     /// Update access order for a URI (move to end = most recently accessed)
     /// 
     /// **Validates: Requirements 2.4, 2.5**
@@ -610,6 +642,15 @@ impl DocumentStore {
         Self::visit_for_packages(root, content, &mut packages);
         packages
     }
+    fn is_valid_package_name(name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        if name.contains("..") || name.contains('/') || name.contains('\\') {
+            return false;
+        }
+        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+    }
 
     /// Recursively visit nodes to find library/require calls
     fn visit_for_packages(node: tree_sitter::Node, text: &str, packages: &mut Vec<String>) {
@@ -625,7 +666,11 @@ impl DocumentStore {
                                     if let Some(value_node) = child.child_by_field_name("value") {
                                         let value_text = &text[value_node.byte_range()];
                                         let pkg_name = value_text.trim_matches(|c: char| c == '"' || c == '\'');
-                                        packages.push(pkg_name.to_string());
+                                        if Self::is_valid_package_name(pkg_name) {
+                                            packages.push(pkg_name.to_string());
+                                        } else {
+                                            log::warn!("Skipping suspicious package name: {}", pkg_name);
+                                        }
                                         break;
                                     }
                                 }
