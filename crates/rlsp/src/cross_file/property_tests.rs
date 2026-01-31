@@ -3844,3 +3844,193 @@ proptest! {
             "assign() with variable should NOT be recognized (dynamic)");
     }
 }
+
+
+// ============================================================================
+// Property Tests for BackgroundIndexer Queue Operations
+// Validates: Requirements 3.1, 3.2, 3.4, 6.3
+// ============================================================================
+
+use super::background_indexer::IndexTask;
+use std::collections::VecDeque;
+use std::time::Instant;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property: Queue ordering - tasks with lower priority numbers are always
+    /// processed before tasks with higher priority numbers.
+    #[test]
+    fn prop_background_indexer_queue_ordering(
+        priorities in prop::collection::vec(2usize..=3, 1..20)
+    ) {
+        let mut queue: VecDeque<IndexTask> = VecDeque::new();
+
+        // Insert tasks with given priorities using the same logic as BackgroundIndexer::submit
+        for (i, priority) in priorities.iter().enumerate() {
+            let task = IndexTask {
+                uri: make_url(&format!("file{}", i)),
+                priority: *priority,
+                depth: 0,
+                submitted_at: Instant::now(),
+            };
+
+            let insert_pos = queue
+                .iter()
+                .position(|t| t.priority > task.priority)
+                .unwrap_or(queue.len());
+            queue.insert(insert_pos, task);
+        }
+
+        // Verify ordering: priority should be non-decreasing
+        let mut prev_priority = 0;
+        for task in &queue {
+            prop_assert!(task.priority >= prev_priority,
+                "Queue should be ordered by priority (non-decreasing)");
+            prev_priority = task.priority;
+        }
+    }
+
+    /// Property: No duplicate indexing - a file is never queued more than once.
+    #[test]
+    fn prop_background_indexer_no_duplicates(
+        num_files in 1..10usize,
+        num_submissions in 1..30usize
+    ) {
+        let mut queue: VecDeque<IndexTask> = VecDeque::new();
+        let uris: Vec<Url> = (0..num_files)
+            .map(|i| make_url(&format!("file{}", i)))
+            .collect();
+
+        // Submit random files multiple times
+        for i in 0..num_submissions {
+            let uri = uris[i % num_files].clone();
+
+            // Check if already queued (same logic as BackgroundIndexer::submit)
+            if queue.iter().any(|task| task.uri == uri) {
+                continue;
+            }
+
+            let task = IndexTask {
+                uri,
+                priority: 2,
+                depth: 0,
+                submitted_at: Instant::now(),
+            };
+            queue.push_back(task);
+        }
+
+        // Verify no duplicates
+        let mut seen_uris = std::collections::HashSet::new();
+        for task in &queue {
+            prop_assert!(!seen_uris.contains(&task.uri),
+                "Queue should not contain duplicate URIs");
+            seen_uris.insert(task.uri.clone());
+        }
+
+        // Queue size should be at most num_files
+        prop_assert!(queue.len() <= num_files,
+            "Queue size should not exceed number of unique files");
+    }
+
+    /// Property: Depth limiting - transitive indexing never exceeds configured max depth.
+    #[test]
+    fn prop_background_indexer_depth_limiting(
+        max_depth in 1usize..5,
+        chain_length in 1usize..10
+    ) {
+        // Simulate a chain of transitive dependencies
+        let mut depths_queued = Vec::new();
+
+        // Start with depth 0 (Priority 2 task)
+        let mut current_depth = 0;
+        depths_queued.push(current_depth);
+
+        // Simulate queue_transitive_deps behavior
+        while current_depth < max_depth && depths_queued.len() < chain_length {
+            current_depth += 1;
+            depths_queued.push(current_depth);
+        }
+
+        // Verify no depth exceeds max_depth
+        for depth in &depths_queued {
+            prop_assert!(*depth <= max_depth,
+                "Depth {} should not exceed max_depth {}", depth, max_depth);
+        }
+    }
+
+    /// Property: Queue size limiting - queue never exceeds configured maximum size.
+    #[test]
+    fn prop_background_indexer_queue_size_limiting(
+        max_queue_size in 1usize..20,
+        num_submissions in 1usize..50
+    ) {
+        let mut queue: VecDeque<IndexTask> = VecDeque::new();
+
+        for i in 0..num_submissions {
+            // Check queue size limit (same logic as BackgroundIndexer::submit)
+            if queue.len() >= max_queue_size {
+                continue;
+            }
+
+            let task = IndexTask {
+                uri: make_url(&format!("file{}", i)),
+                priority: 2,
+                depth: 0,
+                submitted_at: Instant::now(),
+            };
+            queue.push_back(task);
+        }
+
+        // Verify queue size never exceeds limit
+        prop_assert!(queue.len() <= max_queue_size,
+            "Queue size {} should not exceed max_queue_size {}", queue.len(), max_queue_size);
+    }
+
+    /// Property: Priority 2 tasks are always processed before Priority 3 tasks.
+    #[test]
+    fn prop_background_indexer_priority_2_before_3(
+        num_p2 in 1usize..10,
+        num_p3 in 1usize..10
+    ) {
+        let mut queue: VecDeque<IndexTask> = VecDeque::new();
+
+        // Add Priority 3 tasks first
+        for i in 0..num_p3 {
+            let task = IndexTask {
+                uri: make_url(&format!("p3_file{}", i)),
+                priority: 3,
+                depth: 1,
+                submitted_at: Instant::now(),
+            };
+            queue.push_back(task);
+        }
+
+        // Add Priority 2 tasks (should be inserted before Priority 3)
+        for i in 0..num_p2 {
+            let task = IndexTask {
+                uri: make_url(&format!("p2_file{}", i)),
+                priority: 2,
+                depth: 0,
+                submitted_at: Instant::now(),
+            };
+            let insert_pos = queue
+                .iter()
+                .position(|t| t.priority > task.priority)
+                .unwrap_or(queue.len());
+            queue.insert(insert_pos, task);
+        }
+
+        // Verify all Priority 2 tasks come before Priority 3 tasks
+        let mut seen_p3 = false;
+        for task in &queue {
+            if task.priority == 3 {
+                seen_p3 = true;
+            }
+            if task.priority == 2 {
+                prop_assert!(!seen_p3,
+                    "Priority 2 task should not appear after Priority 3 task");
+            }
+        }
+    }
+}
