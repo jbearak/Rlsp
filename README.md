@@ -274,5 +274,5 @@ Releases use semantic versioning with git tags. Creating a tag in the format `vX
 **Inspired by and complementary to the [R Language Server](https://github.com/REditorSupport/languageserver).** Both projects serve the R community with different approaches to language server functionality.
 
 ## License
-
+[GPLv3](LICENSE) - This project is open source software. You can use, modify, and distribute it with attribution, but any derivative works must also be open source under GPLv3.
 MIT License
