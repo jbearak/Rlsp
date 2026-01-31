@@ -231,6 +231,11 @@ fn try_parse_rm_call(node: Node, content: &str) -> Option<RmCall> {
 
     let args_node = node.child_by_field_name("arguments")?;
 
+    // Skip if arguments contain error or missing nodes
+    if args_node.has_error() {
+        return None;
+    }
+
     // Check if rm() has a non-default envir= argument
     // If envir= is present and NOT globalenv() or .GlobalEnv, skip this call
     if has_non_default_envir_for_rm(&args_node, content) {
@@ -996,5 +1001,25 @@ source("b.R")"#;
         assert_eq!(rm_calls[0].line, 0);
         assert_eq!(rm_calls[1].symbols, vec!["c"]);
         assert_eq!(rm_calls[1].line, 2);
+    }
+
+    // ==================== error/missing AST node tests ====================
+
+    #[test]
+    fn test_rm_malformed_empty_arg_skipped() {
+        // rm(,) - malformed with missing argument
+        let code = "rm(,)";
+        let tree = parse_r(code);
+        let rm_calls = detect_rm_calls(&tree, code);
+        assert_eq!(rm_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_rm_malformed_list_missing_value_skipped() {
+        // rm(list = ) - malformed with missing value
+        let code = "rm(list = )";
+        let tree = parse_r(code);
+        let rm_calls = detect_rm_calls(&tree, code);
+        assert_eq!(rm_calls.len(), 0);
     }
 }
