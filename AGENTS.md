@@ -198,6 +198,12 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 
 **Flow**:
 1. File opened with backward directive → Priority 2 task submitted
+
+## Learnings
+
+- When building a new struct from `&T`, avoid `..*ref`/`..ref` in struct update syntax; clone the base (`..ref.clone()`) or construct fields explicitly.
+- In tests that locate identifiers in generated code, avoid substring matches (e.g., `inner_func` inside `outer_func`). Prefer delimiter-aware search or node positions from the AST.
+- Don’t recurse on identifier nodes just to “keep traversal going” — they have no children and the extra recursion can be removed for clarity.
 2. Worker processes task → reads file, extracts metadata, computes artifacts
 3. Updates workspace index and dependency graph
 4. Queues transitive dependencies as Priority 3 tasks (if depth allows)

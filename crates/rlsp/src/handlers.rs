@@ -993,11 +993,6 @@ fn collect_usages_with_context<'a>(
     if node.kind() == "identifier" {
         // Skip if we're in a formula or call-like arguments context
         if context.in_formula || context.in_call_like_arguments {
-            // Still need to recurse into children (though identifiers have none)
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_usages_with_context(child, text, context, used);
-            }
             return;
         }
 
@@ -1069,7 +1064,7 @@ fn collect_usages_with_context<'a>(
     let base_context = if is_formula_node {
         UsageContext {
             in_formula: true,
-            ..*context
+            ..context.clone()
         }
     } else {
         context.clone()
@@ -1089,7 +1084,7 @@ fn collect_usages_with_context<'a>(
             // The arguments field SHOULD have in_call_like_arguments set
             let args_context = UsageContext {
                 in_call_like_arguments: true,
-                ..base_context
+                ..base_context.clone()
             };
             collect_usages_with_context(arguments_node, text, &args_context, used);
         }

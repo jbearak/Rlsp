@@ -40,7 +40,7 @@ Ark's implementation uses three context flags:
 2. WHEN an identifier appears inside the arguments of a subset operation (`subset` node for `[`), THE Undefined_Variable_Diagnostic SHALL NOT be emitted for that identifier
 3. WHEN an identifier appears inside the arguments of a subset2 operation (`subset2` node for `[[`), THE Undefined_Variable_Diagnostic SHALL NOT be emitted for that identifier
 4. WHEN an identifier appears as the function name being called (the `function` field of a call-like node), THE Undefined_Variable_Diagnostic SHALL still be checked normally
-5. WHEN an identifier appears outside of any call-like arguments, THE Undefined_Variable_Diagnostic SHALL still be checked normally
+5. WHEN an identifier appears outside any call-like arguments, THE Undefined_Variable_Diagnostic SHALL still be checked normally
 
 ### Requirement 3: Skip Variables Inside Formula Expressions
 
