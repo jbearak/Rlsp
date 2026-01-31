@@ -80,6 +80,25 @@ fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_
         config.max_chain_depth_severity = parse_severity(sev);
     }
     
+    // Parse on-demand indexing settings
+    if let Some(on_demand) = cross_file.get("onDemandIndexing") {
+        if let Some(v) = on_demand.get("enabled").and_then(|v| v.as_bool()) {
+            config.on_demand_indexing_enabled = v;
+        }
+        if let Some(v) = on_demand.get("maxTransitiveDepth").and_then(|v| v.as_u64()) {
+            config.on_demand_indexing_max_transitive_depth = v as usize;
+        }
+        if let Some(v) = on_demand.get("maxQueueSize").and_then(|v| v.as_u64()) {
+            config.on_demand_indexing_max_queue_size = v as usize;
+        }
+        if let Some(v) = on_demand.get("priority2Enabled").and_then(|v| v.as_bool()) {
+            config.on_demand_indexing_priority_2_enabled = v;
+        }
+        if let Some(v) = on_demand.get("priority3Enabled").and_then(|v| v.as_bool()) {
+            config.on_demand_indexing_priority_3_enabled = v;
+        }
+    }
+    
     // Parse diagnostics.undefinedVariables
     if let Some(diag) = diagnostics {
         if let Some(v) = diag.get("undefinedVariables").and_then(|v| v.as_bool()) {
@@ -96,6 +115,12 @@ fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_
     log::info!("  max_revalidations_per_trigger: {}", config.max_revalidations_per_trigger);
     log::info!("  revalidation_debounce_ms: {}", config.revalidation_debounce_ms);
     log::info!("  undefined_variables_enabled: {}", config.undefined_variables_enabled);
+    log::info!("  On-demand indexing:");
+    log::info!("    enabled: {}", config.on_demand_indexing_enabled);
+    log::info!("    max_transitive_depth: {}", config.on_demand_indexing_max_transitive_depth);
+    log::info!("    max_queue_size: {}", config.on_demand_indexing_max_queue_size);
+    log::info!("    priority_2_enabled: {}", config.on_demand_indexing_priority_2_enabled);
+    log::info!("    priority_3_enabled: {}", config.on_demand_indexing_priority_3_enabled);
     log::info!("  Diagnostic severities:");
     log::info!("    missing_file: {:?}", config.missing_file_severity);
     log::info!("    circular_dependency: {:?}", config.circular_dependency_severity);
