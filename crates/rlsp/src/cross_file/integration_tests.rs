@@ -2524,3 +2524,431 @@ child_func <- function() { parent_func() }
         println!("  - Symbols from parent.r would be available after indexing");
     }
 }
+
+
+// ============================================================================
+// Client Activity Signal Integration Tests
+// Validates: Requirements 15.1-15.5
+// ============================================================================
+
+#[cfg(test)]
+mod activity_signal_tests {
+    use super::*;
+    use crate::cross_file::revalidation::CrossFileActivityState;
+
+    /// Test that activity state correctly tracks active document.
+    ///
+    /// **Validates: Requirement 15.4**
+    /// When the server receives activity notifications, it SHALL update
+    /// its internal activity model.
+    #[test]
+    fn test_activity_state_tracks_active_document() {
+        println!("\n=== Activity Signal Test: Active Document Tracking ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        // Simulate client notification with active document
+        let active_uri = Url::parse("file:///workspace/main.r").unwrap();
+        let visible_uris = vec![
+            Url::parse("file:///workspace/main.r").unwrap(),
+            Url::parse("file:///workspace/utils.r").unwrap(),
+        ];
+        let timestamp = 1234567890u64;
+        
+        state.update(Some(active_uri.clone()), visible_uris.clone(), timestamp);
+        
+        // Verify state was updated
+        assert_eq!(state.active_uri, Some(active_uri.clone()));
+        assert_eq!(state.visible_uris, visible_uris);
+        assert_eq!(state.timestamp_ms, timestamp);
+        
+        println!("✓ Activity state correctly tracks active document");
+        println!("  - Active URI: {}", active_uri);
+        println!("  - Visible URIs: {}", visible_uris.len());
+        println!("  - Timestamp: {}", timestamp);
+    }
+
+    /// Test that activity state correctly prioritizes active > visible > recent.
+    ///
+    /// **Validates: Requirement 0.9**
+    /// The server SHOULD prioritize: active > visible > other open.
+    #[test]
+    fn test_activity_state_priority_ordering() {
+        println!("\n=== Activity Signal Test: Priority Ordering ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        let active_uri = Url::parse("file:///workspace/active.r").unwrap();
+        let visible_uri = Url::parse("file:///workspace/visible.r").unwrap();
+        let recent_uri = Url::parse("file:///workspace/recent.r").unwrap();
+        let other_uri = Url::parse("file:///workspace/other.r").unwrap();
+        
+        // Record recent activity
+        state.record_recent(recent_uri.clone());
+        
+        // Update with active/visible
+        state.update(
+            Some(active_uri.clone()),
+            vec![active_uri.clone(), visible_uri.clone()],
+            1000,
+        );
+        
+        // Verify priority ordering
+        let active_priority = state.priority_score(&active_uri);
+        let visible_priority = state.priority_score(&visible_uri);
+        let recent_priority = state.priority_score(&recent_uri);
+        let other_priority = state.priority_score(&other_uri);
+        
+        assert_eq!(active_priority, 0, "Active should have priority 0");
+        assert_eq!(visible_priority, 1, "Visible should have priority 1");
+        assert!(recent_priority > 1, "Recent should have priority > 1");
+        assert_eq!(other_priority, usize::MAX, "Unknown should have MAX priority");
+        
+        // Verify ordering: active < visible < recent < other
+        assert!(active_priority < visible_priority, "Active < Visible");
+        assert!(visible_priority < recent_priority, "Visible < Recent");
+        assert!(recent_priority < other_priority, "Recent < Other");
+        
+        println!("✓ Priority ordering verified:");
+        println!("  - Active: {} (highest)", active_priority);
+        println!("  - Visible: {}", visible_priority);
+        println!("  - Recent: {}", recent_priority);
+        println!("  - Other: {} (lowest)", other_priority);
+    }
+
+    /// Test that activity state handles null active document.
+    ///
+    /// **Validates: Requirement 15.3**
+    /// The notification payload SHALL include activeUri (or null if none).
+    #[test]
+    fn test_activity_state_null_active() {
+        println!("\n=== Activity Signal Test: Null Active Document ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        let visible_uris = vec![
+            Url::parse("file:///workspace/file1.r").unwrap(),
+            Url::parse("file:///workspace/file2.r").unwrap(),
+        ];
+        
+        // Update with no active document
+        state.update(None, visible_uris.clone(), 1000);
+        
+        assert_eq!(state.active_uri, None);
+        assert_eq!(state.visible_uris, visible_uris);
+        
+        // Visible documents should still have priority 1
+        for uri in &visible_uris {
+            assert_eq!(state.priority_score(uri), 1);
+        }
+        
+        println!("✓ Null active document handled correctly");
+        println!("  - Active URI: None");
+        println!("  - Visible URIs still prioritized");
+    }
+
+    /// Test that activity state handles empty visible list.
+    ///
+    /// **Validates: Requirement 15.3**
+    /// The notification payload SHALL include visibleUris (set/list).
+    #[test]
+    fn test_activity_state_empty_visible() {
+        println!("\n=== Activity Signal Test: Empty Visible List ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        let active_uri = Url::parse("file:///workspace/main.r").unwrap();
+        
+        // Update with empty visible list
+        state.update(Some(active_uri.clone()), vec![], 1000);
+        
+        assert_eq!(state.active_uri, Some(active_uri.clone()));
+        assert!(state.visible_uris.is_empty());
+        
+        // Active should still have priority 0
+        assert_eq!(state.priority_score(&active_uri), 0);
+        
+        println!("✓ Empty visible list handled correctly");
+        println!("  - Active URI still prioritized");
+    }
+
+    /// Test that recent URIs are tracked correctly for fallback ordering.
+    ///
+    /// **Validates: Requirement 15.5**
+    /// If the client does not support these notifications, the server MUST
+    /// fall back to trigger-first + most-recently-changed ordering.
+    #[test]
+    fn test_activity_state_recent_fallback() {
+        println!("\n=== Activity Signal Test: Recent Fallback Ordering ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        // Simulate opening/changing files (fallback behavior)
+        let uri1 = Url::parse("file:///workspace/file1.r").unwrap();
+        let uri2 = Url::parse("file:///workspace/file2.r").unwrap();
+        let uri3 = Url::parse("file:///workspace/file3.r").unwrap();
+        
+        state.record_recent(uri1.clone());
+        state.record_recent(uri2.clone());
+        state.record_recent(uri3.clone());
+        
+        // Most recent should have lowest priority (after active/visible)
+        let priority1 = state.priority_score(&uri1);
+        let priority2 = state.priority_score(&uri2);
+        let priority3 = state.priority_score(&uri3);
+        
+        // uri3 was added last, so it's at position 0 -> priority 2
+        // uri2 is at position 1 -> priority 3
+        // uri1 is at position 2 -> priority 4
+        assert_eq!(priority3, 2, "Most recent should have priority 2");
+        assert_eq!(priority2, 3, "Second most recent should have priority 3");
+        assert_eq!(priority1, 4, "Oldest should have priority 4");
+        
+        println!("✓ Recent fallback ordering verified:");
+        println!("  - file3.r (most recent): {}", priority3);
+        println!("  - file2.r: {}", priority2);
+        println!("  - file1.r (oldest): {}", priority1);
+    }
+
+    /// Test that record_recent moves existing URIs to front.
+    ///
+    /// **Validates: Requirement 15.5**
+    /// Most-recently-changed ordering should update when files are re-edited.
+    #[test]
+    fn test_activity_state_recent_reordering() {
+        println!("\n=== Activity Signal Test: Recent Reordering ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        let uri1 = Url::parse("file:///workspace/file1.r").unwrap();
+        let uri2 = Url::parse("file:///workspace/file2.r").unwrap();
+        
+        // Add in order: uri1, uri2
+        state.record_recent(uri1.clone());
+        state.record_recent(uri2.clone());
+        
+        // uri2 should be most recent
+        assert_eq!(state.priority_score(&uri2), 2);
+        assert_eq!(state.priority_score(&uri1), 3);
+        
+        // Re-edit uri1 - should move to front
+        state.record_recent(uri1.clone());
+        
+        // Now uri1 should be most recent
+        assert_eq!(state.priority_score(&uri1), 2);
+        assert_eq!(state.priority_score(&uri2), 3);
+        
+        // Verify no duplicates
+        assert_eq!(state.recent_uris.len(), 2);
+        
+        println!("✓ Recent reordering verified:");
+        println!("  - Re-editing moves URI to front");
+        println!("  - No duplicate entries");
+    }
+
+    /// Test that recent list is bounded.
+    ///
+    /// **Validates: Requirement 15.5**
+    /// The fallback ordering should not grow unbounded.
+    #[test]
+    fn test_activity_state_recent_bounded() {
+        println!("\n=== Activity Signal Test: Recent List Bounded ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        // Add more than 100 URIs
+        for i in 0..150 {
+            let uri = Url::parse(&format!("file:///workspace/file{}.r", i)).unwrap();
+            state.record_recent(uri);
+        }
+        
+        // Should be capped at 100
+        assert_eq!(state.recent_uris.len(), 100);
+        
+        // Most recent should still be accessible
+        let most_recent = Url::parse("file:///workspace/file149.r").unwrap();
+        assert_eq!(state.priority_score(&most_recent), 2);
+        
+        // Oldest should have been evicted
+        let oldest = Url::parse("file:///workspace/file0.r").unwrap();
+        assert_eq!(state.priority_score(&oldest), usize::MAX);
+        
+        println!("✓ Recent list bounded at 100 entries");
+        println!("  - Oldest entries evicted");
+        println!("  - Most recent still accessible");
+    }
+
+    /// Test that remove() clears URI from all tracking.
+    ///
+    /// **Validates: Requirement 0.7, 0.8**
+    /// When a document is closed, it should be removed from activity tracking.
+    #[test]
+    fn test_activity_state_remove() {
+        println!("\n=== Activity Signal Test: Remove URI ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        let uri = Url::parse("file:///workspace/main.r").unwrap();
+        
+        // Add to all tracking
+        state.update(Some(uri.clone()), vec![uri.clone()], 1000);
+        state.record_recent(uri.clone());
+        
+        // Verify it's tracked
+        assert_eq!(state.active_uri, Some(uri.clone()));
+        assert!(state.visible_uris.contains(&uri));
+        assert!(state.recent_uris.contains(&uri));
+        
+        // Remove
+        state.remove(&uri);
+        
+        // Verify it's removed from all tracking
+        assert_eq!(state.active_uri, None);
+        assert!(!state.visible_uris.contains(&uri));
+        assert!(!state.recent_uris.contains(&uri));
+        
+        println!("✓ URI removed from all tracking:");
+        println!("  - Cleared from active");
+        println!("  - Cleared from visible");
+        println!("  - Cleared from recent");
+    }
+
+    /// Test timestamp ordering for activity updates.
+    ///
+    /// **Validates: Requirement 15.3**
+    /// The notification payload SHALL include timestampMs for ordering.
+    #[test]
+    fn test_activity_state_timestamp_ordering() {
+        println!("\n=== Activity Signal Test: Timestamp Ordering ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        let uri1 = Url::parse("file:///workspace/file1.r").unwrap();
+        let uri2 = Url::parse("file:///workspace/file2.r").unwrap();
+        
+        // First update
+        state.update(Some(uri1.clone()), vec![uri1.clone()], 1000);
+        assert_eq!(state.timestamp_ms, 1000);
+        
+        // Second update with later timestamp
+        state.update(Some(uri2.clone()), vec![uri2.clone()], 2000);
+        assert_eq!(state.timestamp_ms, 2000);
+        assert_eq!(state.active_uri, Some(uri2.clone()));
+        
+        println!("✓ Timestamp ordering verified:");
+        println!("  - First update: 1000ms");
+        println!("  - Second update: 2000ms");
+        println!("  - State reflects latest update");
+    }
+
+    /// Test end-to-end activity signal flow simulation.
+    ///
+    /// This test simulates the full flow from VS Code extension to server:
+    /// 1. User opens file1.r (becomes active)
+    /// 2. User opens file2.r in split view (file1 visible, file2 active)
+    /// 3. User switches back to file1.r (file1 active, file2 visible)
+    ///
+    /// **Validates: Requirements 15.1, 15.2, 15.4**
+    #[test]
+    fn test_activity_signal_end_to_end_flow() {
+        println!("\n=== Activity Signal Test: End-to-End Flow ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        let file1 = Url::parse("file:///workspace/file1.r").unwrap();
+        let file2 = Url::parse("file:///workspace/file2.r").unwrap();
+        let file3 = Url::parse("file:///workspace/file3.r").unwrap();
+        
+        // Step 1: User opens file1.r
+        println!("Step 1: User opens file1.r");
+        state.update(Some(file1.clone()), vec![file1.clone()], 1000);
+        assert_eq!(state.priority_score(&file1), 0, "file1 should be active (priority 0)");
+        
+        // Step 2: User opens file2.r in split view
+        println!("Step 2: User opens file2.r in split view");
+        state.update(
+            Some(file2.clone()),
+            vec![file1.clone(), file2.clone()],
+            2000,
+        );
+        assert_eq!(state.priority_score(&file2), 0, "file2 should be active (priority 0)");
+        assert_eq!(state.priority_score(&file1), 1, "file1 should be visible (priority 1)");
+        
+        // Step 3: User switches back to file1.r
+        println!("Step 3: User switches back to file1.r");
+        state.update(
+            Some(file1.clone()),
+            vec![file1.clone(), file2.clone()],
+            3000,
+        );
+        assert_eq!(state.priority_score(&file1), 0, "file1 should be active (priority 0)");
+        assert_eq!(state.priority_score(&file2), 1, "file2 should be visible (priority 1)");
+        
+        // file3 was never opened, should have lowest priority
+        assert_eq!(state.priority_score(&file3), usize::MAX, "file3 should have MAX priority");
+        
+        println!("✓ End-to-end flow verified:");
+        println!("  - Active document correctly tracked through switches");
+        println!("  - Visible documents correctly tracked in split view");
+        println!("  - Unopened documents have lowest priority");
+    }
+
+    /// Test that activity state integrates with revalidation prioritization.
+    ///
+    /// This test verifies that when multiple files need revalidation,
+    /// they are sorted by activity priority.
+    ///
+    /// **Validates: Requirement 0.9**
+    #[test]
+    fn test_activity_state_revalidation_prioritization() {
+        println!("\n=== Activity Signal Test: Revalidation Prioritization ===\n");
+        
+        let mut state = CrossFileActivityState::new();
+        
+        let active = Url::parse("file:///workspace/active.r").unwrap();
+        let visible1 = Url::parse("file:///workspace/visible1.r").unwrap();
+        let visible2 = Url::parse("file:///workspace/visible2.r").unwrap();
+        let recent = Url::parse("file:///workspace/recent.r").unwrap();
+        let other = Url::parse("file:///workspace/other.r").unwrap();
+        
+        // Set up activity state
+        state.record_recent(recent.clone());
+        state.update(
+            Some(active.clone()),
+            vec![active.clone(), visible1.clone(), visible2.clone()],
+            1000,
+        );
+        
+        // Simulate files needing revalidation
+        let mut files_to_revalidate = vec![
+            other.clone(),
+            visible2.clone(),
+            recent.clone(),
+            active.clone(),
+            visible1.clone(),
+        ];
+        
+        // Sort by priority (lower = higher priority)
+        files_to_revalidate.sort_by_key(|uri| state.priority_score(uri));
+        
+        // Verify order: active, visible1, visible2, recent, other
+        assert_eq!(files_to_revalidate[0], active, "Active should be first");
+        assert!(
+            files_to_revalidate[1] == visible1 || files_to_revalidate[1] == visible2,
+            "Visible should be second/third"
+        );
+        assert!(
+            files_to_revalidate[2] == visible1 || files_to_revalidate[2] == visible2,
+            "Visible should be second/third"
+        );
+        assert_eq!(files_to_revalidate[3], recent, "Recent should be fourth");
+        assert_eq!(files_to_revalidate[4], other, "Other should be last");
+        
+        println!("✓ Revalidation prioritization verified:");
+        for (i, uri) in files_to_revalidate.iter().enumerate() {
+            let priority = state.priority_score(uri);
+            let filename = uri.path().split('/').last().unwrap_or("unknown");
+            println!("  {}. {} (priority: {})", i + 1, filename, priority);
+        }
+    }
+}

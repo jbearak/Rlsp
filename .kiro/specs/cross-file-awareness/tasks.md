@@ -524,7 +524,7 @@ The implementation follows Rlsp's existing patterns: tree-sitter for parsing, `R
     - Update `CrossFileActivityState` with active/visible URIs
     - Log activity updates at trace level
     - _Requirements: 15.1-15.5_
-    - **NOTE: Custom notification handler not implemented due to tower-lsp limitations. Fallback behavior (Requirement 15.5) is implemented via record_recent() calls in did_open/did_change handlers.**
+    - **Implementation**: Custom notification handler implemented using tower-lsp's `custom_method` API. The handler is registered via `.custom_method("rlsp/activeDocumentsChanged", Backend::handle_active_documents_changed)` and receives notifications from the VS Code extension. Fallback behavior (Requirement 15.5) is also implemented via `record_recent()` calls in `did_open`/`did_change` handlers for clients that don't support custom notifications.
 
   - [x] 18.7 Write property test for client activity signal processing
     - **Property 49: Client Activity Signal Processing**
