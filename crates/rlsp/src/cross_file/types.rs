@@ -110,12 +110,14 @@ impl Default for CallSiteSpec {
 }
 
 /// Convert a byte offset to UTF-16 column for a given line.
+/// Handles multi-byte UTF-8 characters correctly for LSP position conversion.
 pub fn byte_offset_to_utf16_column(line_text: &str, byte_offset_in_line: usize) -> u32 {
     let prefix = &line_text[..byte_offset_in_line.min(line_text.len())];
     prefix.encode_utf16().count() as u32
 }
 
 /// Convert a tree-sitter Point to LSP Position with correct UTF-16 column.
+/// Ensures proper handling of multi-byte characters in LSP protocol communication.
 pub fn tree_sitter_point_to_lsp_position(
     point: tree_sitter::Point,
     line_text: &str,

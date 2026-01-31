@@ -103,6 +103,12 @@ pub struct ScopeAtPosition {
     pub depth_exceeded: Vec<(Url, u32, u32)>,
 }
 
+/// Determines if a source() call should apply local scoping rules.
+/// Returns true if the source is local=TRUE or sys.source into a non-global environment.
+fn should_apply_local_scoping(source: &ForwardSource) -> bool {
+    source.local || (source.is_sys_source && !source.sys_source_global_env)
+}
+
 /// Compute scope artifacts for a file from its AST.
 /// This includes both definitions and source() calls in the timeline.
 pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifacts {
@@ -312,7 +318,7 @@ where
                 if (*src_line, *src_col) < (line, column) {
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
-                    if source.local || (source.is_sys_source && !source.sys_source_global_env) {
+                    if should_apply_local_scoping(source) {
                         let source_function_scope = artifacts.function_scopes.iter()
                             .filter(|(start_line, start_column, end_line, end_column)| {
                                 (*start_line, *start_column) <= (*src_line, *src_col) && (*src_line, *src_col) <= (*end_line, *end_column)
@@ -493,7 +499,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
     // Handle different parameter types
     match param_node.kind() {
         "parameter" | "default_parameter" => {
-            // Look for identifier/dots child.
+            // Look for identifier or dots child.
             for child in param_node.children(&mut param_node.walk()) {
                 if child.kind() == "identifier" {
                     let name = node_text(child, content).to_string();
@@ -509,9 +515,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
                         defined_column: column,
                         signature: None,
                     });
-                }
-
-                if child.kind() == "dots" {
+                } else if child.kind() == "dots" {
                     let start = child.start_position();
                     let line_text = content.lines().nth(start.row).unwrap_or("");
                     let column = byte_offset_to_utf16_column(line_text, start.column);
@@ -544,7 +548,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
             });
         }
         "dots" => {
-            // Handle ellipsis (...) parameter
+            // Handle ellipsis (...) parameter when it's the parameter node itself
             let start = param_node.start_position();
             let line_text = content.lines().nth(start.row).unwrap_or("");
             let column = byte_offset_to_utf16_column(line_text, start.column);
@@ -957,7 +961,7 @@ where
                 if (*src_line, *src_col) < (line, column) {
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
-                    if source.local || (source.is_sys_source && !source.sys_source_global_env) {
+                    if should_apply_local_scoping(source) {
                         let source_function_scope = artifacts.function_scopes.iter()
                             .filter(|(start_line, start_column, end_line, end_column)| {
                                 (*start_line, *start_column) <= (*src_line, *src_col) && (*src_line, *src_col) <= (*end_line, *end_column)

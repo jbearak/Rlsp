@@ -99,7 +99,8 @@ impl PathContext {
     }
 }
 
-/// Resolve a path string to an absolute path
+/// Resolve a path string to an absolute path.
+/// Handles file-relative, workspace-relative, and absolute paths with working directory context.
 pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
     if path.is_empty() {
         log::trace!("Path resolution: empty path provided");
@@ -153,7 +154,8 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
     }
 }
 
-/// Resolve a working directory path
+/// Resolve a working directory path.
+/// Used for @lsp-cd directive resolution with workspace-relative and absolute path support.
 pub fn resolve_working_directory(path: &str, context: &PathContext) -> Option<PathBuf> {
     if path.is_empty() {
         log::trace!("Working directory resolution: empty path provided");
@@ -241,12 +243,14 @@ fn normalize_path(path: &Path) -> Option<PathBuf> {
     Some(result)
 }
 
-/// Public version of normalize_path for use outside this module
+/// Public version of normalize_path for use outside this module.
+/// Normalizes path by resolving . and .. components and canonicalizing when possible.
 pub fn normalize_path_public(path: &Path) -> Option<PathBuf> {
     normalize_path(path)
 }
 
-/// Convert a resolved path to a file URI
+/// Convert a resolved path to a file URI.
+/// Creates a file:// URI from an absolute filesystem path.
 pub fn path_to_uri(path: &Path) -> Option<Url> {
     Url::from_file_path(path).ok()
 }

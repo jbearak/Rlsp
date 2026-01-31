@@ -125,14 +125,16 @@ impl<'a, D: DocumentContent> ContentProvider for CrossFileContentProvider<'a, D>
     }
 }
 
-/// Check if a file exists on disk
+/// Check if a file exists on disk.
+/// Converts URI to file path and checks filesystem existence.
 pub fn file_exists(uri: &Url) -> bool {
     uri.to_file_path()
         .map(|p| p.exists())
         .unwrap_or(false)
 }
 
-/// Check if a path exists on disk
+/// Check if a path exists on disk.
+/// Direct filesystem existence check for Path objects.
 pub fn path_exists(path: &Path) -> bool {
     path.exists()
 }

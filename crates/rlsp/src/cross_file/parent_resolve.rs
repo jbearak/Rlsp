@@ -24,7 +24,8 @@ pub fn resolve_multiple_source_calls(
     call_sites.iter().copied().min()
 }
 
-/// Compute hash of CrossFileMetadata for cache key
+/// Compute hash of CrossFileMetadata for cache key.
+/// Used to detect when metadata changes require cache invalidation.
 pub fn compute_metadata_fingerprint(metadata: &CrossFileMetadata) -> u64 {
     let mut hasher = DefaultHasher::new();
     // Hash backward directives
@@ -87,6 +88,7 @@ pub fn resolve_match_pattern(
 
 /// Infer call site by scanning parent content for source()/sys.source() calls to child.
 /// Used when call_site is Default and no reverse edge exists.
+/// Returns (line, utf16_column) of the first matching source() call.
 pub fn infer_call_site_from_parent(
     parent_content: &str,
     child_path: &str,
@@ -149,7 +151,8 @@ pub fn infer_call_site_from_parent(
     None
 }
 
-/// Compute hash of reverse edges pointing to a child URI
+/// Compute hash of reverse edges pointing to a child URI.
+/// Used to detect when dependency graph changes require cache invalidation.
 pub fn compute_reverse_edges_hash(graph: &DependencyGraph, child_uri: &Url) -> u64 {
     let mut hasher = DefaultHasher::new();
     let mut edges: Vec<_> = graph
@@ -353,7 +356,8 @@ pub fn resolve_parent(
     resolve_parent_with_content(metadata, graph, child_uri, config, resolve_path, |_| None)
 }
 
-/// Create a cache key for parent resolution
+/// Create a cache key for parent resolution.
+/// Combines metadata fingerprint and reverse edges hash for efficient cache lookups.
 pub fn make_parent_cache_key(
     metadata: &CrossFileMetadata,
     graph: &DependencyGraph,

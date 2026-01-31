@@ -1181,7 +1181,7 @@ fn extract_statement_from_tree(
     // descendant_for_point_range can behave unexpectedly on 0-length ranges at node boundaries.
     // Use a small non-empty range when possible and prefer named nodes.
     let point_start = tree_sitter::Point::new(row, byte_col);
-    let byte_col_end = (byte_col + 1).min(line_text.len());
+    let byte_col_end = if byte_col < line_text.len() { byte_col + 1 } else { line_text.len() };
     let point_end = tree_sitter::Point::new(row, byte_col_end);
 
     let root = tree.root_node();
@@ -1466,7 +1466,7 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     let row = position.line as usize;
 
     let point_start = Point::new(row, byte_col);
-    let point_end = Point::new(row, (byte_col + 1).min(line_text.len()));
+    let point_end = Point::new(row, if byte_col < line_text.len() { byte_col + 1 } else { line_text.len() });
     let root = tree.root_node();
     let node = root
         .named_descendant_for_point_range(point_start, point_end)
@@ -2720,8 +2720,8 @@ mod proptests {
             let lines: Vec<&str> = info.statement.lines().collect();
             
             // The generated code has (line_count + 1) total lines (header + (line_count-1) body lines + closing brace).
-            // Truncation happens when total lines > 10, i.e. when line_count >= 10.
-            if line_count >= 10 {
+            // Truncation happens when total lines > 10, i.e. when line_count > 9.
+            if line_count > 9 {
                 prop_assert_eq!(lines.len(), 11, "Should truncate to 10 lines + ellipsis");
                 prop_assert_eq!(lines[10], "...", "Should end with ellipsis when truncated");
             } else {

@@ -8,7 +8,8 @@ use tree_sitter::{Node, Tree};
 
 use super::types::{byte_offset_to_utf16_column, ForwardSource};
 
-/// Detect source() and sys.source() calls in R code
+/// Detect source() and sys.source() calls in R code.
+/// Parses AST to find source calls with their parameters (local, chdir, envir).
 pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
     log::trace!("Starting tree-sitter parsing for source() call detection");
     let mut sources = Vec::new();

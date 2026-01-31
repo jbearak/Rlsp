@@ -66,7 +66,8 @@ fn patterns() -> &'static DirectivePatterns {
     })
 }
 
-/// Parse directives from file content
+/// Parse directives from file content.
+/// Extracts @lsp-* directives including sourced-by, source, working-directory, and ignore directives.
 pub fn parse_directives(content: &str) -> CrossFileMetadata {
     log::trace!("Starting directive parsing");
     let patterns = patterns();
@@ -158,7 +159,8 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
     meta
 }
 
-/// Check if a line should have diagnostics suppressed
+/// Check if a line should have diagnostics suppressed.
+/// Returns true if line has @lsp-ignore or is targeted by @lsp-ignore-next.
 pub fn is_line_ignored(metadata: &CrossFileMetadata, line: u32) -> bool {
     metadata.ignored_lines.contains(&line) || metadata.ignored_next_lines.contains(&line)
 }

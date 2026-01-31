@@ -119,7 +119,8 @@ impl CrossFileFileCache {
     }
 }
 
-/// Get file snapshot from disk (synchronous)
+/// Get file snapshot from disk (synchronous).
+/// Reads filesystem metadata to create a snapshot for change detection.
 pub fn get_file_snapshot(path: &Path) -> Option<FileSnapshot> {
     let metadata = std::fs::metadata(path).ok()?;
     Some(FileSnapshot::from_metadata(&metadata))
