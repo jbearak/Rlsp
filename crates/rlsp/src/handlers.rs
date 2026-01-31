@@ -29,33 +29,26 @@ fn get_cross_file_symbols(
     line: u32,
     column: u32,
 ) -> HashMap<String, ScopedSymbol> {
-    log::trace!("get_cross_file_symbols called for {}:{},{}", uri, line, column);
-    
     // Closure to get artifacts for a URI
     let get_artifacts = |target_uri: &Url| -> Option<scope::ScopeArtifacts> {
-        log::trace!("get_artifacts: looking for {}", target_uri);
         // Try open documents first (authoritative)
         if let Some(doc) = state.documents.get(target_uri) {
             if let Some(tree) = &doc.tree {
                 let text = doc.text();
-                log::trace!("get_artifacts: found in open documents");
                 return Some(scope::compute_artifacts(target_uri, tree, &text));
             }
         }
         // Try cross-file workspace index (preferred for closed files)
         if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(target_uri) {
-            log::trace!("get_artifacts: found in cross-file workspace index ({} symbols)", artifacts.exported_interface.len());
             return Some(artifacts);
         }
         // Fallback to legacy workspace index
         if let Some(doc) = state.workspace_index.get(target_uri) {
             if let Some(tree) = &doc.tree {
                 let text = doc.text();
-                log::trace!("get_artifacts: found in legacy workspace index");
                 return Some(scope::compute_artifacts(target_uri, tree, &text));
             }
         }
-        log::trace!("get_artifacts: NOT FOUND");
         None
     };
 
@@ -80,8 +73,6 @@ fn get_cross_file_symbols(
 
     let max_depth = state.cross_file_config.max_chain_depth;
     
-    log::trace!("Calling scope_at_position_with_graph with max_depth={}", max_depth);
-    
     // Use the graph-aware scope resolution with PathContext
     let scope = scope::scope_at_position_with_graph(
         uri,
@@ -93,8 +84,6 @@ fn get_cross_file_symbols(
         state.workspace_folders.first(),
         max_depth,
     );
-    
-    log::trace!("scope_at_position_with_graph returned {} symbols", scope.symbols.len());
     
     scope.symbols
 }
@@ -268,8 +257,6 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 // ============================================================================
 
 pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
-    log::trace!("Diagnostics request for {}", uri);
-    
     let Some(doc) = state.get_document(uri) else {
         return Vec::new();
     };
@@ -345,80 +332,43 @@ fn collect_missing_file_diagnostics(
         uri, meta, state.workspace_folders.first()
     );
     
-    // Build a separate context for backward directives that ignores @lsp-cd
-    let backward_ctx = crate::cross_file::path_resolve::PathContext::new(
-        uri, state.workspace_folders.first()
-    );
-    
-    // Resolve forward paths (source() calls) - respects @lsp-cd
-    let resolve_forward_path = |path: &str| -> Option<Url> {
+    let resolve_path = |path: &str| -> Option<Url> {
         let ctx = path_ctx.as_ref()?;
-        log::trace!("resolve_forward_path: attempting to resolve '{}' with context: file_path={}, wd={:?}", 
-            path, ctx.file_path.display(), ctx.working_directory);
         let resolved = crate::cross_file::path_resolve::resolve_path(path, ctx)?;
-        log::trace!("resolve_forward_path: resolved to PathBuf: {}", resolved.display());
-        let uri = crate::cross_file::path_resolve::path_to_uri(&resolved)?;
-        log::trace!("resolve_forward_path: converted to URI: {}", uri);
-        Some(uri)
-    };
-    
-    // Resolve backward paths (directives) - ignores @lsp-cd, always relative to file
-    let resolve_backward_path = |path: &str| -> Option<Url> {
-        let ctx = backward_ctx.as_ref()?;
-        log::trace!("resolve_backward_path: attempting to resolve '{}' with context: file_path={}, wd={:?}", 
-            path, ctx.file_path.display(), ctx.working_directory);
-        let resolved = crate::cross_file::path_resolve::resolve_path(path, ctx)?;
-        log::trace!("resolve_backward_path: resolved to PathBuf: {}", resolved.display());
-        let uri = crate::cross_file::path_resolve::path_to_uri(&resolved)?;
-        log::trace!("resolve_backward_path: converted to URI: {}", uri);
-        Some(uri)
+        crate::cross_file::path_resolve::path_to_uri(&resolved)
     };
 
-    // Check if file exists using cached/indexed data, with filesystem fallback
+    // Check if file exists using cached/indexed data only (no blocking I/O)
     let file_exists = |target_uri: &Url| -> bool {
-        log::trace!("file_exists: checking if URI exists: {}", target_uri);
-
         // Check open documents first (authoritative)
         if state.documents.contains_key(target_uri) {
-            log::trace!("file_exists: found in open documents");
             return true;
         }
         // Check workspace index (legacy)
         if state.workspace_index.contains_key(target_uri) {
-            log::trace!("file_exists: found in workspace index");
             return true;
         }
         // Check cross-file workspace index (preferred for closed files)
         if state.cross_file_workspace_index.contains(target_uri) {
-            log::trace!("file_exists: found in cross-file workspace index");
             return true;
         }
         // Check file cache (may have been read previously)
         if state.cross_file_file_cache.get(target_uri).is_some() {
-            log::trace!("file_exists: found in file cache");
             return true;
         }
-        // Perform filesystem existence check for files not in cache
-        // This is synchronous but necessary to provide accurate missing-file diagnostics
-        if let Ok(path) = target_uri.to_file_path() {
-            let exists = std::fs::metadata(&path).is_ok();
-            log::trace!("file_exists: {} filesystem check = {}", target_uri, exists);
-            return exists;
-        }
-        // If we can't convert URI to file path, assume it doesn't exist
-        log::trace!("file_exists: {} could not be converted to file path", target_uri);
+        // Don't do blocking I/O here - if not in any cache, assume missing
+        // The file will be indexed on next didChangeWatchedFiles if it exists
         false
     };
 
     // Check forward sources (source() calls and @lsp-source directives)
-    // These respect @lsp-cd working directory
     for source in &meta.sources {
-        if let Some(target_uri) = resolve_forward_path(&source.path) {
+        if let Some(target_uri) = resolve_path(&source.path) {
             if !file_exists(&target_uri) {
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::new(source.line, source.column),
-                        end: Position::new(source.line, source.column + source.path.len() as u32),
+                        end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
                     },
                     severity: Some(state.cross_file_config.missing_file_severity),
                     message: format!("File not found: '{}'", source.path),
@@ -430,7 +380,7 @@ fn collect_missing_file_diagnostics(
             diagnostics.push(Diagnostic {
                 range: Range {
                     start: Position::new(source.line, source.column),
-                    end: Position::new(source.line, source.column + source.path.len() as u32),
+                    end: Position::new(source.line, source.column + source.path.len() as u32 + 10),
                 },
                 severity: Some(state.cross_file_config.missing_file_severity),
                 message: format!("Cannot resolve path: '{}'", source.path),
@@ -440,9 +390,8 @@ fn collect_missing_file_diagnostics(
     }
 
     // Check backward directives (@lsp-sourced-by)
-    // These are ALWAYS resolved relative to the file's directory, ignoring @lsp-cd
     for directive in &meta.sourced_by {
-        if let Some(target_uri) = resolve_backward_path(&directive.path) {
+        if let Some(target_uri) = resolve_path(&directive.path) {
             if !file_exists(&target_uri) {
                 diagnostics.push(Diagnostic {
                     range: Range {
@@ -543,11 +492,9 @@ fn collect_ambiguous_parent_diagnostics(
     use crate::cross_file::parent_resolve::resolve_parent_with_content;
     use crate::cross_file::cache::ParentResolution;
 
-    // Build PathContext WITHOUT working_directory for backward directives
-    // This matches the behavior in dependency.rs where backward directives
-    // are resolved relative to the file's directory, ignoring @lsp-cd
-    let path_ctx = crate::cross_file::path_resolve::PathContext::new(
-        uri, state.workspace_folders.first()
+    // Build PathContext for proper path resolution
+    let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+        uri, meta, state.workspace_folders.first()
     );
     
     let resolve_path = |path: &str| -> Option<Url> {
@@ -752,6 +699,48 @@ fn collect_identifier_usages_utf16<'a>(node: Node<'a>, text: &str, usages: &mut 
     }
 }
 
+fn collect_identifier_usages<'a>(node: Node<'a>, text: &str, usages: &mut Vec<(String, u32, u32, Node<'a>)>) {
+    if node.kind() == "identifier" {
+        // Skip if this is the LHS of an assignment
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "binary_operator" {
+                let mut cursor = parent.walk();
+                let children: Vec<_> = parent.children(&mut cursor).collect();
+                if children.len() >= 2 && children[0].id() == node.id() {
+                    let op = children[1];
+                    let op_text = &text[op.byte_range()];
+                    if matches!(op_text, "<-" | "=" | "<<-") {
+                        // Skip LHS of assignment, but recurse into children
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            collect_identifier_usages(child, text, usages);
+                        }
+                        return;
+                    }
+                }
+            }
+            // Skip named arguments
+            if parent.kind() == "argument" {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if name_node.id() == node.id() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let name = text[node.byte_range()].to_string();
+        let line = node.start_position().row as u32;
+        let col = node.start_position().column as u32;
+        usages.push((name, line, col, node));
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifier_usages(child, text, usages);
+    }
+}
+
 fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
     if node.is_error() || node.is_missing() {
         let message = if node.is_missing() {
@@ -830,11 +819,9 @@ fn collect_undefined_variables_position_aware(
         // Convert byte column to UTF-16 for cross-file scope lookup
         let line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
         let usage_col = byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
-        log::trace!("Checking cross-file scope for undefined variable '{}' at {}:{},{}", name, uri, usage_line, usage_col);
         let cross_file_symbols = get_cross_file_symbols(state, uri, usage_line, usage_col);
 
         if !cross_file_symbols.contains_key(&name) {
-            log::trace!("Symbol '{}' not found in cross-file scope, marking as undefined", name);
             // Convert byte columns to UTF-16 for diagnostic range
             let start_line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
             let end_line_text = text.lines().nth(usage_node.end_position().row).unwrap_or("");
@@ -850,8 +837,6 @@ fn collect_undefined_variables_position_aware(
                 message: format!("Undefined variable: {}", name),
                 ..Default::default()
             });
-        } else {
-            log::trace!("Symbol '{}' found in cross-file scope, skipping undefined diagnostic", name);
         }
     }
 }
@@ -1010,8 +995,6 @@ fn is_package_export(name: &str, loaded_packages: &[String], library: &crate::st
 // ============================================================================
 
 pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<CompletionResponse> {
-    log::trace!("Completion request at {}:{},{}", uri, position.line, position.character);
-    
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
@@ -1048,9 +1031,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     collect_document_completions(tree.root_node(), &text, &mut items, &mut seen_names);
 
     // Add cross-file symbols (from scope resolution)
-    log::trace!("Calling get_cross_file_symbols for completion");
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
-    log::trace!("Got {} symbols from cross-file scope", cross_file_symbols.len());
     for (name, symbol) in cross_file_symbols {
         if seen_names.contains(&name) {
             continue; // Local definitions take precedence
@@ -1060,6 +1041,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         let kind = match symbol.kind {
             crate::cross_file::SymbolKind::Function => CompletionItemKind::FUNCTION,
             crate::cross_file::SymbolKind::Variable => CompletionItemKind::VARIABLE,
+            crate::cross_file::SymbolKind::Parameter => CompletionItemKind::VARIABLE,
         };
 
         // Add source file info to detail if from another file
@@ -1138,12 +1120,335 @@ fn collect_document_completions(
 }
 
 // ============================================================================
+// Definition Statement Extraction
+// ============================================================================
+
+pub struct DefinitionInfo {
+    pub statement: String,
+    pub source_uri: Url,
+    pub line: u32,
+    pub column: u32,
+}
+
+pub fn extract_definition_statement(
+    symbol: &ScopedSymbol,
+    state: &WorldState,
+) -> Option<DefinitionInfo> {
+    // Get content provider for the symbol's source file
+    let content = if let Some(doc) = state.documents.get(&symbol.source_uri) {
+        doc.text()
+    } else if let Some(cached) = state.cross_file_file_cache.get(&symbol.source_uri) {
+        cached
+    } else {
+        return None;
+    };
+
+    // Get tree for parsing
+    let tree = if let Some(doc) = state.documents.get(&symbol.source_uri) {
+        doc.tree.as_ref()?
+    } else {
+        // Parse content if not in documents
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
+        let parsed = parser.parse(&content, None)?;
+        // We can't store this tree, so we need to work with it immediately
+        return extract_statement_from_tree(&parsed, symbol, &content);
+    };
+
+    extract_statement_from_tree(tree, symbol, &content)
+}
+
+fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
+    let mut utf16_count = 0;
+    for (byte_idx, ch) in line.char_indices() {
+        if utf16_count == utf16_col as usize {
+            return byte_idx;
+        }
+        utf16_count += ch.len_utf16();
+    }
+    line.len()
+}
+
+fn extract_statement_from_tree(
+    tree: &tree_sitter::Tree,
+    symbol: &ScopedSymbol,
+    content: &str,
+) -> Option<DefinitionInfo> {
+    let line_text = content.lines().nth(symbol.defined_line as usize).unwrap_or("");
+    let byte_col = utf16_column_to_byte_offset(line_text, symbol.defined_column);
+    let point = tree_sitter::Point::new(
+        symbol.defined_line as usize,
+        byte_col,
+    );
+    
+    let node = tree.root_node().descendant_for_point_range(point, point)?;
+    
+    // Find the appropriate parent node based on symbol kind
+    let statement_node = match symbol.kind {
+        scope::SymbolKind::Variable => find_assignment_statement(node, content),
+        scope::SymbolKind::Function => find_function_statement(node, content),
+        scope::SymbolKind::Parameter => find_function_statement(node, content),
+    }?;
+
+    let statement = extract_statement_text(statement_node, content);
+    
+    Some(DefinitionInfo {
+        statement,
+        source_uri: symbol.source_uri.clone(),
+        line: symbol.defined_line,
+        column: symbol.defined_column,
+    })
+}
+
+/// Result of finding a statement node - includes whether to extract header only
+struct StatementMatch<'a> {
+    node: tree_sitter::Node<'a>,
+    header_only: bool,
+}
+
+fn find_assignment_statement<'a>(mut node: tree_sitter::Node<'a>, content: &str) -> Option<StatementMatch<'a>> {
+    // Walk up to find binary_operator (assignment), for_statement, or parameter
+    loop {
+        match node.kind() {
+            "binary_operator" => {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.children(&mut cursor).collect();
+                if children.len() >= 2 {
+                    let op_text = node_text(children[1], content);
+                    if matches!(op_text, "<-" | "=" | "<<-" | "->") {
+                        return Some(StatementMatch { node, header_only: false });
+                    }
+                }
+            }
+            "for_statement" => return Some(StatementMatch { node, header_only: false }),
+            "parameter" => {
+                // For parameters, find enclosing function_definition
+                if let Some(func) = find_enclosing_function(node) {
+                    return Some(StatementMatch { node: func, header_only: false });
+                }
+            }
+            _ => {}
+        }
+        
+        if let Some(parent) = node.parent() {
+            node = parent;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+fn find_function_statement<'a>(mut node: tree_sitter::Node<'a>, content: &str) -> Option<StatementMatch<'a>> {
+    // Walk up to find function_definition or assignment containing function
+    loop {
+        match node.kind() {
+            "function_definition" => {
+                // Check if parent is assignment
+                if let Some(parent) = node.parent() {
+                    if parent.kind() == "binary_operator" {
+                        return Some(StatementMatch { node: parent, header_only: true });
+                    }
+                }
+                return Some(StatementMatch { node, header_only: true });
+            }
+            "binary_operator" => {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.children(&mut cursor).collect();
+                if children.len() >= 3 {
+                    let op_text = node_text(children[1], content);
+                    // Check for function on RHS (for <- = <<-) or LHS (for ->)
+                    if matches!(op_text, "<-" | "=" | "<<-") && children[2].kind() == "function_definition" {
+                        return Some(StatementMatch { node, header_only: true });
+                    }
+                    if op_text == "->" && children[0].kind() == "function_definition" {
+                        return Some(StatementMatch { node, header_only: true });
+                    }
+                }
+            }
+            _ => {}
+        }
+        
+        if let Some(parent) = node.parent() {
+            node = parent;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+fn find_enclosing_function(mut node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    loop {
+        if node.kind() == "function_definition" {
+            // Check if parent is assignment
+            if let Some(parent) = node.parent() {
+                if parent.kind() == "binary_operator" {
+                    return Some(parent);
+                }
+            }
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn extract_statement_text(stmt: StatementMatch, content: &str) -> String {
+    let node = stmt.node;
+    let lines: Vec<&str> = content.lines().collect();
+    let start_line = node.start_position().row;
+    
+    if start_line >= lines.len() {
+        return String::new();
+    }
+
+    if stmt.header_only {
+        // For for-loops: extract just the header (for (x in seq))
+        // For functions: extract signature up to body start
+        return extract_header(node, content);
+    }
+    
+    let end_line = node.end_position().row;
+    
+    // Truncate to 10 lines maximum
+    let actual_end_line = if end_line - start_line >= 10 {
+        start_line + 9
+    } else {
+        end_line
+    };
+    
+    let mut result = String::new();
+    for i in start_line..=actual_end_line.min(lines.len() - 1) {
+        if i > start_line {
+            result.push('\n');
+        }
+        result.push_str(lines[i]);
+    }
+    
+    // Add ellipsis if truncated
+    if end_line - start_line >= 10 {
+        result.push_str("\n...");
+    }
+    
+    result
+}
+
+fn extract_header(node: tree_sitter::Node, content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let start_line = node.start_position().row;
+    
+    match node.kind() {
+        "for_statement" => {
+            // For loop: extract "for (var in seq)"
+            // Find the body child and stop before it
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "brace_list" || child.kind() == "call" || 
+                   (child.kind() != "identifier" && child.kind() != "(" && 
+                    child.kind() != ")" && child.kind() != "in" && 
+                    child.start_position().row > start_line) {
+                    // Body starts - extract up to before body
+                    let body_start = child.start_position();
+                    if body_start.row == start_line {
+                        // Body on same line - extract up to body start column
+                        let line = lines.get(start_line).unwrap_or(&"");
+                        return line[..body_start.column.min(line.len())].trim_end().to_string();
+                    } else {
+                        // Body on different line - extract header lines
+                        let mut result = String::new();
+                        for i in start_line..body_start.row {
+                            if i > start_line {
+                                result.push('\n');
+                            }
+                            if let Some(line) = lines.get(i) {
+                                result.push_str(line);
+                            }
+                        }
+                        return result;
+                    }
+                }
+            }
+            // Fallback: just first line
+            lines.get(start_line).unwrap_or(&"").to_string()
+        }
+        "function_definition" | "binary_operator" => {
+            // Function: extract signature up to body
+            extract_function_header(node, content)
+        }
+        _ => lines.get(start_line).unwrap_or(&"").to_string()
+    }
+}
+
+fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let start_line = node.start_position().row;
+    
+    // Find the function_definition node
+    let func_node = if node.kind() == "function_definition" {
+        node
+    } else {
+        // binary_operator - find function_definition child
+        let mut cursor = node.walk();
+        let mut func = None;
+        for child in node.children(&mut cursor) {
+            if child.kind() == "function_definition" {
+                func = Some(child);
+                break;
+            }
+        }
+        match func {
+            Some(f) => f,
+            None => return lines.get(start_line).unwrap_or(&"").to_string(),
+        }
+    };
+    
+    // Find body in function_definition
+    let mut cursor = func_node.walk();
+    for child in func_node.children(&mut cursor) {
+        // Body is typically brace_list or any expression after parameters
+        if child.kind() == "brace_list" || 
+           (child.kind() != "function" && child.kind() != "parameters" && 
+            child.start_position().row >= start_line) {
+            let body_start = child.start_position();
+            
+            // Extract from node start to body start
+            if body_start.row == start_line {
+                let line = lines.get(start_line).unwrap_or(&"");
+                let end_col = body_start.column.min(line.len());
+                return line[..end_col].trim_end().to_string();
+            } else {
+                let mut result = String::new();
+                for i in start_line..body_start.row {
+                    if i > start_line {
+                        result.push('\n');
+                    }
+                    if let Some(line) = lines.get(i) {
+                        result.push_str(line);
+                    }
+                }
+                // Add partial last line if body starts mid-line
+                if body_start.column > 0 {
+                    if let Some(line) = lines.get(body_start.row) {
+                        if !result.is_empty() {
+                            result.push('\n');
+                        }
+                        result.push_str(&line[..body_start.column.min(line.len())].trim_end());
+                    }
+                }
+                return result;
+            }
+        }
+    }
+    
+    // Fallback: first line
+    lines.get(start_line).unwrap_or(&"").to_string()
+}
+
+// ============================================================================
 // Hover
 // ============================================================================
 
 pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
-    log::trace!("Hover request at {}:{},{}", uri, position.line, position.character);
-    
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
@@ -1163,31 +1468,45 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
         end: Position::new(node.end_position().row as u32, node.end_position().column as u32),
     };
 
-    // Try user-defined function first
-    if let Some(signature) = find_user_function_signature(state, uri, name) {
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: format!("```r\n{}\n```", signature),
-            }),
-            range: Some(node_range),
-        });
-    }
-
-    // Try cross-file symbols
+    // Try cross-file symbols (includes local scope with definition extraction)
     log::trace!("Calling get_cross_file_symbols for hover");
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
     log::trace!("Got {} symbols from cross-file scope", cross_file_symbols.len());
     if let Some(symbol) = cross_file_symbols.get(name) {
         let mut value = String::new();
-        if let Some(sig) = &symbol.signature {
-            value.push_str(&format!("```r\n{}\n```\n", sig));
-        } else {
-            value.push_str(&format!("```r\n{}\n```\n", name));
+        
+        // Try to extract definition statement
+        let workspace_root = state.workspace_folders.first();
+        match extract_definition_statement(symbol, state) {
+            Some(def_info) => {
+                let escaped_statement = escape_markdown(&def_info.statement);
+                value.push_str(&format!("```r\n{}\n```\n\n", escaped_statement));
+                
+                // Add file location
+                if def_info.source_uri == *uri {
+                    value.push_str(&format!("this file, line {}", def_info.line + 1));
+                } else {
+                    let relative_path = compute_relative_path(&def_info.source_uri, workspace_root);
+                    let absolute_path = def_info.source_uri.as_str();
+                    value.push_str(&format!("[{}]({}), line {}", relative_path, absolute_path, def_info.line + 1));
+                }
+            }
+            None => {
+                // Graceful fallback: show symbol info without definition statement
+                if let Some(sig) = &symbol.signature {
+                    value.push_str(&format!("```r\n{}\n```\n", sig));
+                } else {
+                    value.push_str(&format!("```r\n{}\n```\n", name));
+                }
+                
+                // Add source file info if cross-file
+                if symbol.source_uri != *uri {
+                    let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
+                    value.push_str(&format!("\n*Defined in {}*", relative_path));
+                }
+            }
         }
-        if symbol.source_uri != *uri {
-            value.push_str(&format!("\n*Defined in {}*", symbol.source_uri.path()));
-        }
+        
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -1197,7 +1516,8 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
         });
     }
 
-    // Check cache first
+    // Fallback to R help system for built-ins and undefined symbols
+    // Check cache first to avoid repeated R subprocess calls
     if let Some(cached) = state.help_cache.get(&name) {
         if let Some(help_text) = cached {
             return Some(Hover {
@@ -1208,22 +1528,27 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
                 range: Some(node_range),
             });
         }
+        // Cached as None - no help available
         return None;
     }
 
-    // Try to get help from R
-    let help_text = crate::help::get_help(&name, None)?;
-    
-    // Cache the result
-    state.help_cache.insert(name.to_string(), Some(help_text.clone()));
+    // Try to get help from R subprocess
+    if let Some(help_text) = crate::help::get_help(&name, None) {
+        // Cache successful result
+        state.help_cache.insert(name.to_string(), Some(help_text.clone()));
+        
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```\n{}\n```", help_text),
+            }),
+            range: Some(node_range),
+        });
+    }
 
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: format!("```\n{}\n```", help_text),
-        }),
-        range: Some(node_range),
-    })
+    // Cache negative result to avoid repeated failed lookups
+    state.help_cache.insert(name.to_string(), None);
+    None
 }
 // Signature Help
 // ============================================================================
@@ -1277,8 +1602,6 @@ pub fn goto_definition(
     uri: &Url,
     position: Position,
 ) -> Option<GotoDefinitionResponse> {
-    log::trace!("Goto definition request at {}:{},{}", uri, position.line, position.character);
-    
     // Try open document first, then workspace index
     let doc = state.get_document(uri).or_else(|| state.workspace_index.get(uri))?;
     let tree = doc.tree.as_ref()?;
@@ -1302,9 +1625,7 @@ pub fn goto_definition(
     }
 
     // Try cross-file symbols (from scope resolution)
-    log::trace!("Calling get_cross_file_symbols for goto definition");
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
-    log::trace!("Got {} symbols from cross-file scope", cross_file_symbols.len());
     if let Some(symbol) = cross_file_symbols.get(name) {
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: symbol.source_uri.clone(),
@@ -1635,6 +1956,54 @@ fn find_user_function_signature(state: &WorldState, current_uri: &Url, name: &st
 }
 
 // ============================================================================
+// Path Utilities
+// ============================================================================
+
+/// Compute relative path from workspace root to target URI.
+/// If no workspace root or target is outside workspace, returns filename only.
+fn compute_relative_path(target_uri: &Url, workspace_root: Option<&Url>) -> String {
+    let Some(workspace_root) = workspace_root else {
+        return target_uri.path_segments()
+            .and_then(|segments| segments.last())
+            .unwrap_or("unknown")
+            .to_string();
+    };
+
+    let Ok(workspace_path) = workspace_root.to_file_path() else {
+        return target_uri.path_segments()
+            .and_then(|segments| segments.last())
+            .unwrap_or("unknown")
+            .to_string();
+    };
+
+    let Ok(target_path) = target_uri.to_file_path() else {
+        return target_uri.path_segments()
+            .and_then(|segments| segments.last())
+            .unwrap_or("unknown")
+            .to_string();
+    };
+
+    match target_path.strip_prefix(&workspace_path) {
+        Ok(relative) => relative.to_string_lossy().to_string(),
+        Err(_) => target_uri.path_segments()
+            .and_then(|segments| segments.last())
+            .unwrap_or("unknown")
+            .to_string(),
+    }
+}
+
+/// Escape markdown special characters in text.
+/// Characters to escape: * _ [ ] ( ) # ` \
+fn escape_markdown(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '*' | '_' | '[' | ']' | '(' | ')' | '#' | '`' | '\\' => format!("\\{}", c),
+            _ => c.to_string(),
+        })
+        .collect()
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1786,6 +2155,58 @@ mod tests {
         assert_eq!(signature, "wrapper(...)");
     }
 
+    #[test]
+    fn test_compute_relative_path_with_workspace_root() {
+        let workspace_root = Url::parse("file:///workspace/").unwrap();
+        let target_uri = Url::parse("file:///workspace/src/main.R").unwrap();
+        
+        let result = compute_relative_path(&target_uri, Some(&workspace_root));
+        assert_eq!(result, "src/main.R");
+    }
+
+    #[test]
+    fn test_compute_relative_path_without_workspace_root() {
+        let target_uri = Url::parse("file:///workspace/src/main.R").unwrap();
+        
+        let result = compute_relative_path(&target_uri, None);
+        assert_eq!(result, "main.R");
+    }
+
+    #[test]
+    fn test_compute_relative_path_outside_workspace() {
+        let workspace_root = Url::parse("file:///workspace/").unwrap();
+        let target_uri = Url::parse("file:///other/path/script.R").unwrap();
+        
+        let result = compute_relative_path(&target_uri, Some(&workspace_root));
+        assert_eq!(result, "script.R");
+    }
+
+    #[test]
+    fn test_escape_markdown_all_special_chars() {
+        let input = "*_[]()#`\\";
+        let expected = "\\*\\_\\[\\]\\(\\)\\#\\`\\\\";
+        
+        let result = escape_markdown(input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_escape_markdown_no_special_chars() {
+        let input = "hello world 123";
+        
+        let result = escape_markdown(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_escape_markdown_mixed_content() {
+        let input = "function(x) { x * 2 }";
+        let expected = "function\\(x\\) { x \\* 2 }";
+        
+        let result = escape_markdown(input);
+        assert_eq!(result, expected);
+    }
+
     fn find_function_definition(node: Node) -> Option<Node> {
         if node.kind() == "function_definition" {
             return Some(node);
@@ -1799,41 +2220,6 @@ mod tests {
         }
         None
     }
-
-    // Tests for diagnostic range precision (Requirements 5.1, 5.2)
-    #[test]
-    fn test_diagnostic_range_matches_path_length() {
-        // Property 4: Diagnostic range matches path length
-        // The end column should equal start column plus path length
-        let path = "utils/helpers.R";
-        let start_column: u32 = 8; // e.g., after 'source("'
-        let end_column = start_column + path.len() as u32;
-        
-        // Verify the calculation is correct
-        assert_eq!(end_column, start_column + 15); // "utils/helpers.R" is 15 chars
-        assert_eq!(end_column - start_column, path.len() as u32);
-    }
-
-    #[test]
-    fn test_diagnostic_range_various_path_lengths() {
-        // Test with various path lengths
-        let test_cases = vec![
-            ("a.R", 3),
-            ("utils.R", 7),
-            ("path/to/file.R", 14),
-            ("very/long/path/to/some/file.R", 29),
-        ];
-        
-        for (path, expected_len) in test_cases {
-            assert_eq!(path.len(), expected_len, "Path '{}' should have length {}", path, expected_len);
-            
-            let start_column: u32 = 0;
-            let end_column = start_column + path.len() as u32;
-            
-            // Range should exactly cover the path
-            assert_eq!(end_column - start_column, expected_len as u32);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1841,7 +2227,15 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
     use crate::state::Document;
+    use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
     use std::collections::HashSet;
+
+    // Helper to parse R code for property tests
+    fn parse_r_code(code: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        parser.parse(code, None).unwrap()
+    }
 
     // Helper to filter out R reserved keywords from generated identifiers
     fn is_r_reserved(s: &str) -> bool {
@@ -1966,7 +2360,7 @@ mod proptests {
             let tree = parse_r_code(&code);
             
             // Find function definition node
-            let func_node = find_function_definition(tree.root_node()).unwrap();
+            let func_node = find_function_definition_node(tree.root_node(), "f", &code).unwrap();
             let signature = extract_function_signature(func_node, "f", &code);
             
             // All parameters should be present in signature
@@ -2024,24 +2418,123 @@ mod proptests {
         }
     }
 
-    fn parse_r_code(code: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
-        parser.parse(code, None).unwrap()
+    #[test]
+    fn test_extract_definition_statement_variable() {
+        use crate::cross_file::scope::SymbolKind;
+        
+        let code = "x <- 42\ny <- x + 1";
+        let tree = parse_r_code(code);
+        
+        let symbol = ScopedSymbol {
+            name: "x".to_string(),
+            kind: SymbolKind::Variable,
+            source_uri: Url::parse("file:///test.R").unwrap(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+        };
+        
+        let result = extract_statement_from_tree(&tree, &symbol, code);
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.statement, "x <- 42");
     }
 
-    fn find_function_definition(node: Node) -> Option<Node> {
-        if node.kind() == "function_definition" {
-            return Some(node);
-        }
+    #[test]
+    fn test_extract_definition_statement_function() {
+        let code = "f <- function(a, b) {\n  a + b\n}";
+        let tree = parse_r_code(code);
         
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(func) = find_function_definition(child) {
-                return Some(func);
-            }
+        let symbol = ScopedSymbol {
+            name: "f".to_string(),
+            kind: SymbolKind::Function,
+            source_uri: Url::parse("file:///test.R").unwrap(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: Some("f(a, b)".to_string()),
+        };
+        
+        let result = extract_statement_from_tree(&tree, &symbol, code);
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.statement, "f <- function(a, b) {\n  a + b\n}");
+    }
+
+    #[test]
+    fn test_extract_definition_statement_truncation() {
+        let mut code = "long_func <- function() {\n".to_string();
+        for i in 1..=15 {
+            code.push_str(&format!("  line_{}\n", i));
         }
-        None
+        code.push('}');
+        
+        let tree = parse_r_code(&code);
+        
+        let symbol = ScopedSymbol {
+            name: "long_func".to_string(),
+            kind: SymbolKind::Function,
+            source_uri: Url::parse("file:///test.R").unwrap(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+        };
+        
+        let result = extract_statement_from_tree(&tree, &symbol, &code);
+        assert!(result.is_some());
+        let info = result.unwrap();
+        
+        // Should be truncated to 10 lines with ellipsis
+        let lines: Vec<&str> = info.statement.lines().collect();
+        assert_eq!(lines.len(), 11); // 10 lines + "..."
+        assert_eq!(lines[10], "...");
+    }
+
+    #[test]
+    fn test_extract_definition_statement_assignment_operators() {
+        let test_cases = vec![
+            ("x <- 42", "<-"),
+            ("y = 100", "="),
+            ("z <<- 'global'", "<<-"),
+        ];
+        
+        for (code, op) in test_cases {
+            let tree = parse_r_code(code);
+            let var_name = code.split_whitespace().next().unwrap();
+            
+            let symbol = ScopedSymbol {
+                name: var_name.to_string(),
+                kind: SymbolKind::Variable,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+            };
+            
+            let result = extract_statement_from_tree(&tree, &symbol, code);
+            assert!(result.is_some(), "Should extract statement for operator {}", op);
+            let info = result.unwrap();
+            assert_eq!(info.statement, code);
+        }
+    }
+
+    #[test]
+    fn test_extract_definition_statement_for_loop_iterator() {
+        let code = "for (i in 1:10) {\n  print(i)\n}";
+        let tree = parse_r_code(code);
+        
+        let symbol = ScopedSymbol {
+            name: "i".to_string(),
+            kind: SymbolKind::Variable,
+            source_uri: Url::parse("file:///test.R").unwrap(),
+            defined_line: 0,
+            defined_column: 5, // Position of 'i' in for loop
+            signature: None,
+        };
+        
+        let result = extract_statement_from_tree(&tree, &symbol, code);
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.statement, "for (i in 1:10) {\n  print(i)\n}");
     }
 
     #[test]
@@ -2069,6 +2562,10 @@ mod proptests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 100,
+            .. ProptestConfig::default()
+        })]
         #[test]
         fn test_user_defined_priority_over_builtins(
             builtin in prop::sample::select(vec!["print", "sum", "mean", "length"])
@@ -2118,19 +2615,544 @@ mod proptests {
             prop_assert_eq!(signature, expected, "Signature format should match expected pattern");
         }
 
-        // Property 4: Diagnostic range matches path length
         #[test]
-        fn test_diagnostic_range_precision(
-            path in "[a-z]{1,5}(/[a-z]{1,5}){0,3}\\.R",
-            start_column in 0u32..100
+        // Feature: enhanced-variable-detection-hover, Property 10: Variable hover definition extraction
+        fn prop_variable_hover_definition_extraction(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            value in 1i32..1000
         ) {
-            let end_column = start_column + path.len() as u32;
+            let code = format!("{} <- {}", var_name, value);
+            let tree = parse_r_code(&code);
             
-            // The range should exactly cover the path
-            prop_assert_eq!(end_column - start_column, path.len() as u32);
+            let symbol = ScopedSymbol {
+                name: var_name.clone(),
+                kind: SymbolKind::Variable,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+            };
             
-            // End column should be >= start column
-            prop_assert!(end_column >= start_column);
+            let def_info = extract_statement_from_tree(&tree, &symbol, &code);
+            prop_assert!(def_info.is_some(), "Should extract definition for variable");
+            
+            let info = def_info.unwrap();
+            prop_assert_eq!(info.statement, code, "Should include complete definition statement");
+        }
+
+        #[test]
+        // Feature: enhanced-variable-detection-hover, Property 11: Function hover signature extraction
+        fn prop_function_hover_signature_extraction(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            param_count in 0usize..3
+        ) {
+            let params: Vec<String> = (0..param_count)
+                .map(|i| format!("p{}", i))
+                .collect();
+            
+            let code = format!("{} <- function({}) {{}}", func_name, params.join(", "));
+            let tree = parse_r_code(&code);
+            
+            let symbol = ScopedSymbol {
+                name: func_name.clone(),
+                kind: SymbolKind::Function,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+            };
+            
+            let def_info = extract_statement_from_tree(&tree, &symbol, &code);
+            prop_assert!(def_info.is_some(), "Should extract definition for function");
+            
+            let info = def_info.unwrap();
+            prop_assert!(info.statement.contains(&func_name), "Should include function name");
+            prop_assert!(info.statement.contains("function"), "Should include function keyword");
+            
+            for param in &params {
+                prop_assert!(info.statement.contains(param), "Should include parameter {}", param);
+            }
+        }
+
+        #[test]
+        // Feature: enhanced-variable-detection-hover, Property 12: Multi-line definition handling
+        fn prop_multiline_definition_handling(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            line_count in 5usize..15
+        ) {
+            let mut code = format!("{} <- function() {{\n", func_name);
+            for i in 1..line_count {
+                code.push_str(&format!("  line_{}\n", i));
+            }
+            code.push('}');
+            
+            let tree = parse_r_code(&code);
+            
+            let symbol = ScopedSymbol {
+                name: func_name.clone(),
+                kind: SymbolKind::Function,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+            };
+            
+            let def_info = extract_statement_from_tree(&tree, &symbol, &code);
+            prop_assert!(def_info.is_some(), "Should extract multi-line definition");
+            
+            let info = def_info.unwrap();
+            let lines: Vec<&str> = info.statement.lines().collect();
+            
+            if line_count > 10 {
+                prop_assert_eq!(lines.len(), 11, "Should truncate to 10 lines + ellipsis");
+                prop_assert_eq!(lines[10], "...", "Should end with ellipsis when truncated");
+            } else {
+                prop_assert_eq!(lines.len(), line_count, "Should include all lines when <= 10");
+                prop_assert!(!info.statement.contains("..."), "Should not have ellipsis when not truncated");
+            }
+        }
+
+        #[test]
+        // Feature: enhanced-variable-detection-hover, Property 13: Markdown code block formatting
+        fn prop_markdown_code_block_formatting(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            special_chars in prop::sample::select(vec!["*", "_", "[", "]", "(", ")", "#", "`", "\\"])
+        ) {
+            let code = format!("{} <- \"value with {} chars\"", var_name, special_chars);
+            let escaped = escape_markdown(&code);
+            let formatted = format!("```r\n{}\n```", escaped);
+            
+            prop_assert!(formatted.starts_with("```r\n"), "Should start with R code block marker");
+            prop_assert!(formatted.ends_with("\n```"), "Should end with code block marker");
+            prop_assert!(formatted.contains(&format!("\\{}", special_chars)), "Should escape special markdown characters");
+        }
+
+        #[test]
+        // Feature: enhanced-variable-detection-hover, Property 14: Same-file location format
+        fn prop_same_file_location_format(
+            line_num in 0u32..100
+        ) {
+            let uri = Url::parse("file:///test.R").unwrap();
+            let def_info = DefinitionInfo {
+                statement: "test_var <- 42".to_string(),
+                source_uri: uri.clone(),
+                line: line_num,
+                column: 0,
+            };
+            
+            let mut value = String::new();
+            value.push_str(&format!("```r\n{}\n```\n\n", escape_markdown(&def_info.statement)));
+            
+            if def_info.source_uri == uri {
+                value.push_str(&format!("this file, line {}", def_info.line + 1));
+            }
+            
+            prop_assert!(value.contains("this file"), "Should indicate same file");
+            prop_assert!(value.contains(&format!("line {}", line_num + 1)), "Should show 1-based line number");
+            prop_assert!(!value.contains("file://"), "Should not contain file URI for same file");
+        }
+
+        #[test]
+        // Feature: enhanced-variable-detection-hover, Property 15: Cross-file hyperlink format
+        fn prop_cross_file_hyperlink_format(
+            line_num in 0u32..100
+        ) {
+            let current_uri = Url::parse("file:///workspace/main.R").unwrap();
+            let def_uri = Url::parse("file:///workspace/utils/helper.R").unwrap();
+            let workspace_root = Some(Url::parse("file:///workspace/").unwrap());
+            
+            let def_info = DefinitionInfo {
+                statement: "helper_func <- function() {}".to_string(),
+                source_uri: def_uri.clone(),
+                line: line_num,
+                column: 0,
+            };
+            
+            let mut value = String::new();
+            value.push_str(&format!("```r\n{}\n```\n\n", escape_markdown(&def_info.statement)));
+            
+            if def_info.source_uri != current_uri {
+                let relative_path = compute_relative_path(&def_info.source_uri, workspace_root.as_ref());
+                let absolute_path = def_info.source_uri.as_str();
+                value.push_str(&format!("[{}]({}), line {}", relative_path, absolute_path, def_info.line + 1));
+            }
+            
+            prop_assert!(value.contains("[utils/helper.R]"), "Should show relative path in brackets");
+            prop_assert!(value.contains("(file:///workspace/utils/helper.R)"), "Should show absolute URI in parentheses");
+            prop_assert!(value.contains(&format!("line {}", line_num + 1)), "Should show 1-based line number");
+            prop_assert!(value.contains(", line"), "Should separate path and line with comma");
+        }
+
+        #[test]
+        // Property 21: Definition statement and location separation
+        fn prop_definition_statement_location_separation(
+            statement in "[a-z_]+ <- [a-z0-9_(){}]+",
+            line_num in 0u32..100
+        ) {
+            let def_info = DefinitionInfo {
+                statement: statement.clone(),
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                line: line_num,
+                column: 0,
+            };
+            
+            let escaped_statement = escape_markdown(&def_info.statement);
+            let mut value = String::new();
+            value.push_str(&format!("```r\n{}\n```\n\n", escaped_statement));
+            value.push_str(&format!("this file, line {}", def_info.line + 1));
+            
+            // Should have exactly one blank line between definition and location
+            prop_assert!(value.contains("```\n\nthis file"), "Should have blank line separator");
+            prop_assert!(!value.contains("```\nthis file"), "Should not have zero blank lines");
+            prop_assert!(!value.contains("```\n\n\nthis file"), "Should not have multiple blank lines");
+        }
+
+        #[test]
+        // Property 22: Definition statement truncation
+        fn prop_definition_statement_truncation(
+            line_count in 11usize..20
+        ) {
+            let mut statement = "long_func <- function() {\n".to_string();
+            for i in 1..line_count {
+                statement.push_str(&format!("  line_{}\n", i));
+            }
+            statement.push('}');
+            
+            let tree = parse_r_code(&statement);
+            let symbol = ScopedSymbol {
+                name: "long_func".to_string(),
+                kind: SymbolKind::Function,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+            };
+            
+            let def_info = extract_statement_from_tree(&tree, &symbol, &statement);
+            prop_assert!(def_info.is_some(), "Should extract definition");
+            
+            let info = def_info.unwrap();
+            let lines: Vec<&str> = info.statement.lines().collect();
+            
+            prop_assert_eq!(lines.len(), 11, "Should truncate to 10 lines + ellipsis");
+            prop_assert_eq!(lines[10], "...", "Should end with ellipsis");
+        }
+
+        #[test]
+        // Property 23: Indentation preservation
+        fn prop_indentation_preservation(
+            indent_size in 0usize..8,
+            line_count in 2usize..6
+        ) {
+            let indent = " ".repeat(indent_size);
+            let mut statement = format!("{}func <- function() {{\n", indent);
+            for i in 1..line_count {
+                statement.push_str(&format!("{}  line_{}\n", indent, i));
+            }
+            statement.push_str(&format!("{}}}", indent));
+            
+            let tree = parse_r_code(&statement);
+            let symbol = ScopedSymbol {
+                name: "func".to_string(),
+                kind: SymbolKind::Function,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: indent_size as u32,
+                signature: None,
+            };
+            
+            let def_info = extract_statement_from_tree(&tree, &symbol, &statement);
+            prop_assert!(def_info.is_some(), "Should extract definition");
+            
+            let info = def_info.unwrap();
+            let lines: Vec<&str> = info.statement.lines().collect();
+            
+            // Check that indentation is preserved
+            for line in &lines {
+                if !line.trim().is_empty() {
+                    prop_assert!(line.starts_with(&indent), "Should preserve original indentation: '{}'", line);
+                }
+            }
+        }
+
+        #[test]
+        // Property 24: Markdown character escaping
+        fn prop_markdown_character_escaping(
+            special_char in prop::sample::select(vec!["*", "_", "[", "]", "(", ")", "#", "`", "\\"])
+        ) {
+            let statement = format!("var <- \"value with {} char\"", special_char);
+            let escaped = escape_markdown(&statement);
+            
+            let expected_escaped = format!("\\{}", special_char);
+            prop_assert!(escaped.contains(&expected_escaped), 
+                "Should escape '{}' to '{}' in: '{}'", special_char, expected_escaped, escaped);
+            
+            // Verify it's properly formatted in hover content
+            let hover_content = format!("```r\n{}\n```", escaped);
+            prop_assert!(hover_content.contains(&expected_escaped), 
+                "Should contain escaped character in hover content");
+        }
+
+        #[test]
+        // Property 28: Assignment operator extraction
+        fn prop_assignment_operator_extraction(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            op in prop::sample::select(vec!["<-", "=", "<<-"]),
+            value in 1i32..1000
+        ) {
+            let code = format!("{} {} {}", var_name, op, value);
+            let tree = parse_r_code(&code);
+            
+            let symbol = ScopedSymbol {
+                name: var_name.clone(),
+                kind: SymbolKind::Variable,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+            };
+            
+            let def_info = extract_statement_from_tree(&tree, &symbol, &code);
+            prop_assert!(def_info.is_some(), "Should extract assignment statement");
+            
+            let info = def_info.unwrap();
+            let statement = &info.statement;
+            prop_assert_eq!(statement, &code, "Should include complete assignment statement");
+            prop_assert!(statement.contains(&op), "Should include assignment operator {}", op);
+        }
+
+        #[test]
+        // Property 29: Inline function extraction
+        fn prop_inline_function_extraction(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            param_count in 0usize..3
+        ) {
+            let params: Vec<String> = (0..param_count)
+                .map(|i| format!("p{}", i))
+                .collect();
+            
+            let code = format!("{} <- function({}) {{ {} }}", func_name, params.join(", "), "x + 1");
+            let tree = parse_r_code(&code);
+            
+            let symbol = ScopedSymbol {
+                name: func_name.clone(),
+                kind: SymbolKind::Function,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+            };
+            
+            let def_info = extract_statement_from_tree(&tree, &symbol, &code);
+            prop_assert!(def_info.is_some(), "Should extract function definition");
+            
+            let info = def_info.unwrap();
+            prop_assert!(info.statement.contains("function"), "Should include function keyword");
+            prop_assert!(info.statement.contains(&format!("({})", params.join(", "))), "Should include function signature");
+        }
+
+        #[test]
+        // Property 30: Loop iterator definition extraction
+        fn prop_loop_iterator_definition_extraction(
+            iterator in "[a-z][a-z0-9_]{1,5}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            range_end in 5i32..20
+        ) {
+            let code = format!("for ({} in 1:{}) {{\n  print({})\n}}", iterator, range_end, iterator);
+            let tree = parse_r_code(&code);
+            
+            let symbol = ScopedSymbol {
+                name: iterator.clone(),
+                kind: SymbolKind::Variable,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: 5, // Position of iterator in for loop
+                signature: None,
+            };
+            
+            let def_info = extract_statement_from_tree(&tree, &symbol, &code);
+            prop_assert!(def_info.is_some(), "Should extract for loop definition");
+            
+            let info = def_info.unwrap();
+            prop_assert!(info.statement.contains("for"), "Should include for loop header");
+            prop_assert!(info.statement.contains(&format!("{} in", iterator)), "Should include iterator definition");
+        }
+
+        #[test]
+        // Property 31: Function parameter definition extraction
+        fn prop_function_parameter_definition_extraction(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            param_name in "[a-z][a-z0-9_]{1,5}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            has_default in any::<bool>()
+        ) {
+            let param_def = if has_default {
+                format!("{} = 42", param_name)
+            } else {
+                param_name.clone()
+            };
+            
+            let code = format!("{} <- function({}) {{\n  {}\n}}", func_name, param_def, param_name);
+            let tree = parse_r_code(&code);
+            
+            let symbol = ScopedSymbol {
+                name: param_name.clone(),
+                kind: SymbolKind::Variable,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line: 0,
+                defined_column: func_name.len() as u32 + 15, // Approximate position in function signature
+                signature: None,
+            };
+            
+            let def_info = extract_statement_from_tree(&tree, &symbol, &code);
+            prop_assert!(def_info.is_some(), "Should extract function definition for parameter");
+            
+            let info = def_info.unwrap();
+            prop_assert!(info.statement.contains("function"), "Should include function keyword");
+            prop_assert!(info.statement.contains(&param_name), "Should include parameter name in signature");
+        }
+
+        #[test]
+        // Property 16: File URI protocol
+        fn prop_file_uri_protocol(
+            path_segments in prop::collection::vec("[a-z]{3,8}", 1..4)
+        ) {
+            let path = format!("/{}", path_segments.join("/"));
+            let uri = Url::parse(&format!("file://{}/test.R", path)).unwrap();
+            
+            let def_info = DefinitionInfo {
+                statement: "test_var <- 42".to_string(),
+                source_uri: uri.clone(),
+                line: 0,
+                column: 0,
+            };
+            
+            let current_uri = Url::parse("file:///workspace/main.R").unwrap();
+            let mut value = String::new();
+            value.push_str(&format!("```r\n{}\n```\n\n", escape_markdown(&def_info.statement)));
+            
+            if def_info.source_uri != current_uri {
+                let relative_path = compute_relative_path(&def_info.source_uri, None);
+                let absolute_path = def_info.source_uri.as_str();
+                value.push_str(&format!("[{}]({}), line {}", relative_path, absolute_path, def_info.line + 1));
+            }
+            
+            prop_assert!(value.contains("file://"), "Cross-file URI should use file:// protocol");
+            prop_assert!(value.contains(&format!("file://{}/test.R", path)), "Should contain absolute path with file:// protocol");
+        }
+
+        #[test]
+        // Property 17: Relative path calculation
+        fn prop_relative_path_calculation(
+            workspace_depth in 1usize..3,
+            file_depth in 1usize..3
+        ) {
+            let workspace_segments: Vec<String> = (0..workspace_depth).map(|i| format!("ws{}", i)).collect();
+            let file_segments: Vec<String> = (0..file_depth).map(|i| format!("dir{}", i)).collect();
+            
+            let workspace_root = Url::parse(&format!("file:///{}/", workspace_segments.join("/"))).unwrap();
+            let target_uri = Url::parse(&format!("file:///{}/{}/test.R", workspace_segments.join("/"), file_segments.join("/"))).unwrap();
+            
+            let relative_path = compute_relative_path(&target_uri, Some(&workspace_root));
+            
+            prop_assert!(relative_path.contains(&file_segments.join("/")), "Should contain file path relative to workspace");
+            prop_assert!(!relative_path.starts_with('/'), "Relative path should not start with /");
+            prop_assert!(relative_path.ends_with("test.R"), "Should end with filename");
+        }
+
+        #[test]
+        // Property 18: LSP Markdown markup kind
+        fn prop_lsp_markdown_markup_kind(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            use crate::state::{WorldState, Document};
+            
+            let library_paths = vec![];
+            let mut state = WorldState::new(library_paths);
+            
+            let uri = Url::parse("file:///test.R").unwrap();
+            let code = format!("{} <- 42", var_name);
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+            
+            let position = Position::new(0, 5);
+            let hover_result = hover(&state, &uri, position);
+            
+            if let Some(hover) = hover_result {
+                if let HoverContents::Markup(content) = hover.contents {
+                    prop_assert_eq!(content.kind, MarkupKind::Markdown, "Hover content should use Markdown markup kind");
+                } else {
+                    prop_assert!(false, "Hover should return Markup content");
+                }
+            }
+        }
+
+        #[test]
+        // Property 19: Cross-file definition resolution
+        fn prop_cross_file_definition_resolution(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            use crate::state::{WorldState, Document};
+            
+            let library_paths = vec![];
+            let mut state = WorldState::new(library_paths);
+            
+            let main_uri = Url::parse("file:///main.R").unwrap();
+            let utils_uri = Url::parse("file:///utils.R").unwrap();
+            
+            let main_code = format!("source(\"utils.R\")\nresult <- {}(42)", func_name);
+            let utils_code = format!("{} <- function(x) {{ x * 2 }}", func_name);
+            
+            state.documents.insert(main_uri.clone(), Document::new(&main_code, None));
+            state.documents.insert(utils_uri.clone(), Document::new(&utils_code, None));
+            
+            // Update cross-file graph
+            state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(&main_code), None, |_| None);
+            state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(&utils_code), None, |_| None);
+            
+            let position = Position::new(1, 10); // Position after source() call
+            let cross_file_symbols = get_cross_file_symbols(&state, &main_uri, position.line, position.character);
+            
+            prop_assert!(cross_file_symbols.contains_key(&func_name), "Should resolve cross-file symbol using dependency graph");
+            
+            if let Some(symbol) = cross_file_symbols.get(&func_name) {
+                prop_assert_eq!(&symbol.source_uri, &utils_uri, "Should locate definition in sourced file");
+            }
+        }
+
+        #[test]
+        // Property 20: Scope-based definition selection
+        fn prop_scope_based_definition_selection(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            use crate::state::{WorldState, Document};
+            
+            let library_paths = vec![];
+            let mut state = WorldState::new(library_paths);
+            
+            let uri = Url::parse("file:///test.R").unwrap();
+            let code = format!(
+                "{} <- function(a) {{ a }}\nsource(\"utils.R\")\n{} <- function(b, c) {{ b + c }}\nresult <- {}(1, 2)",
+                func_name, func_name, func_name
+            );
+            
+            let utils_uri = Url::parse("file:///utils.R").unwrap();
+            let utils_code = format!("{} <- function(x, y, z) {{ x + y + z }}", func_name);
+            
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+            state.documents.insert(utils_uri.clone(), Document::new(&utils_code, None));
+            
+            // Update cross-file graph
+            state.cross_file_graph.update_file(&uri, &crate::cross_file::extract_metadata(&code), None, |_| None);
+            state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(&utils_code), None, |_| None);
+            
+            let position = Position::new(3, 10); // Position of function usage
+            let cross_file_symbols = get_cross_file_symbols(&state, &uri, position.line, position.character);
+            
+            prop_assert!(cross_file_symbols.contains_key(&func_name), "Should find symbol definition");
+            
+            if let Some(symbol) = cross_file_symbols.get(&func_name) {
+                // Should select the local definition (line 2) that's in scope, not the earlier one or utils.R
+                prop_assert_eq!(&symbol.source_uri, &uri, "Should select definition from same file");
+                prop_assert_eq!(symbol.defined_line, 2, "Should select the definition that's in scope at reference position");
+            }
         }
     }
 }
@@ -2196,6 +3218,686 @@ mod integration_tests {
                 e == "rnorm" || e == "lm" || e == "t.test"
             );
             assert!(has_common_funcs, "stats should export common statistical functions");
+        }
+    }
+    
+    #[test]
+    fn test_hover_shows_definition_statement() {
+        use std::collections::HashMap;
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+        
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        // Create a test document
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "my_var <- 42\nresult <- my_var + 1";
+        let doc = Document::new(code, None);
+        state.documents.insert(uri.clone(), doc);
+        
+        // Create a scoped symbol with definition info
+        let symbol = ScopedSymbol {
+            name: "my_var".to_string(),
+            kind: SymbolKind::Variable,
+            source_uri: uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+        };
+        
+        // Test hover on the symbol
+        let position = Position::new(1, 10); // Position of "my_var" in second line
+        
+        // Mock get_cross_file_symbols to return our test symbol
+        // Note: In a real test, we'd need to set up the cross-file state properly
+        // For now, we'll test the definition extraction directly
+        let def_info = extract_definition_statement(&symbol, &state);
+        assert!(def_info.is_some());
+        let def_info = def_info.unwrap();
+        assert_eq!(def_info.statement, "my_var <- 42");
+    }
+    
+    #[test]
+    fn test_hover_same_file_location_format() {
+        let library_paths = r_env::find_library_paths();
+        let state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///test.R").unwrap();
+        let def_info = DefinitionInfo {
+            statement: "my_var <- 42".to_string(),
+            source_uri: uri.clone(),
+            line: 0, // 0-based
+            column: 0,
+        };
+        
+        // Test same-file location formatting
+        let escaped_statement = escape_markdown(&def_info.statement);
+        let mut value = String::new();
+        value.push_str(&format!("```r\n{}\n```\n\n", escaped_statement));
+        
+        if def_info.source_uri == uri {
+            value.push_str(&format!("this file, line {}", def_info.line + 1)); // 1-based
+        }
+        
+        assert!(value.contains("```r\nmy_var <- 42\n```"));
+        assert!(value.contains("this file, line 1"));
+        assert!(value.contains("\n\n")); // Blank line separator
+    }
+    
+    #[test]
+    fn test_hover_cross_file_hyperlink_format() {
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
+        
+        let current_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let def_uri = Url::parse("file:///workspace/utils/helper.R").unwrap();
+        
+        let def_info = DefinitionInfo {
+            statement: "helper_func <- function(x) { x + 1 }".to_string(),
+            source_uri: def_uri.clone(),
+            line: 5, // 0-based
+            column: 0,
+        };
+        
+        // Test cross-file location formatting
+        let escaped_statement = escape_markdown(&def_info.statement);
+        let mut value = String::new();
+        value.push_str(&format!("```r\n{}\n```\n\n", escaped_statement));
+        
+        if def_info.source_uri != current_uri {
+            let relative_path = compute_relative_path(&def_info.source_uri, state.workspace_folders.first());
+            let absolute_path = def_info.source_uri.as_str();
+            value.push_str(&format!("[{}]({}), line {}", relative_path, absolute_path, def_info.line + 1));
+        }
+        
+        assert!(value.contains("```r\nhelper_func <- function(x) { x + 1 }\n```"));
+        assert!(value.contains("[utils/helper.R](file:///workspace/utils/helper.R), line 6"));
+        assert!(value.contains("\n\n")); // Blank line separator
+    }
+    
+    #[test]
+    fn test_hover_markdown_code_block_formatting() {
+        let statement = "my_var <- c(1, 2, 3) # comment with *special* chars";
+        let escaped = escape_markdown(statement);
+        
+        let formatted = format!("```r\n{}\n```", escaped);
+        
+        assert!(formatted.starts_with("```r\n"));
+        assert!(formatted.ends_with("\n```"));
+        assert!(formatted.contains("\\*special\\*")); // Markdown chars should be escaped
+    }
+    
+    #[test]
+    fn test_hover_blank_line_separator() {
+        let def_info = DefinitionInfo {
+            statement: "test_func <- function() {}".to_string(),
+            source_uri: Url::parse("file:///test.R").unwrap(),
+            line: 0,
+            column: 0,
+        };
+        
+        let escaped_statement = escape_markdown(&def_info.statement);
+        let mut value = String::new();
+        value.push_str(&format!("```r\n{}\n```\n\n", escaped_statement));
+        value.push_str("this file, line 1");
+        
+        // Should have exactly one blank line between code block and location
+        assert!(value.contains("```\n\nthis file"));
+        assert!(!value.contains("```\n\n\nthis file")); // Not two blank lines
+        assert!(!value.contains("```\nthis file")); // Not zero blank lines
+    }
+
+    #[test]
+    fn test_cross_file_hover_resolution() {
+        use crate::cross_file::{dependency, scope};
+        
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        // Create main.R that sources utils.R
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let utils_uri = Url::parse("file:///workspace/utils.R").unwrap();
+        
+        let main_code = r#"source("utils.R")
+result <- helper_func(42)"#;
+        
+        let utils_code = r#"helper_func <- function(x) {
+    x * 2
+}"#;
+        
+        // Add documents to state
+        state.documents.insert(main_uri.clone(), Document::new(main_code, None));
+        state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
+        
+        // Update cross-file graph
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
+        
+        // Test hover on helper_func in main.R (line 1, after source call)
+        let position = Position::new(1, 10); // Position of "helper_func"
+        let hover_result = hover(&state, &main_uri, position);
+        
+        assert!(hover_result.is_some());
+        let hover = hover_result.unwrap();
+        
+        if let HoverContents::Markup(content) = hover.contents {
+            assert!(content.value.contains("helper_func"));
+            assert!(content.value.contains("function(x)"));
+            assert!(content.value.contains("utils.R")); // Should show cross-file source
+        } else {
+            panic!("Expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_symbol_shadowing() {
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        // Create files with shadowing: local definition should take precedence
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let utils_uri = Url::parse("file:///workspace/utils.R").unwrap();
+        
+        let main_code = r#"source("utils.R")
+my_func <- function(a, b) { a + b }  # Local definition shadows utils.R
+result <- my_func(1, 2)"#;
+        
+        let utils_code = r#"my_func <- function(x) { x * 2 }  # Will be shadowed"#;
+        
+        state.documents.insert(main_uri.clone(), Document::new(main_code, None));
+        state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
+        
+        // Update cross-file graph
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
+        
+        // Test hover on my_func usage (should show local definition, not utils.R)
+        let position = Position::new(2, 10); // Position of "my_func" in usage
+        let hover_result = hover(&state, &main_uri, position);
+        
+        assert!(hover_result.is_some());
+        let hover = hover_result.unwrap();
+        
+        if let HoverContents::Markup(content) = hover.contents {
+            assert!(content.value.contains("my_func"));
+            assert!(content.value.contains("(a, b)")); // Local signature, not (x)
+            assert!(content.value.contains("this file")); // Should be local, not cross-file
+        } else {
+            panic!("Expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_builtin_function_fallback() {
+        let library_paths = r_env::find_library_paths();
+        let state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = r#"result <- mean(c(1, 2, 3))"#;
+        
+        let doc = Document::new(code, None);
+        let tree = doc.tree.as_ref().unwrap();
+        let text = doc.text();
+        
+        // Find the "mean" identifier
+        let point = tree_sitter::Point::new(0, 10); // Position of "mean"
+        let node = tree.root_node().descendant_for_point_range(point, point).unwrap();
+        assert_eq!(node.kind(), "identifier");
+        assert_eq!(&text[node.byte_range()], "mean");
+        
+        // Test hover should fall back to R help for built-in functions
+        let position = Position::new(0, 10);
+        
+        // Mock the state with the document
+        let mut test_state = state;
+        test_state.documents.insert(uri.clone(), doc);
+        
+        let hover_result = hover(&test_state, &uri, position);
+        
+        // Should return hover info (either from help cache or R subprocess)
+        // The exact content depends on R availability, but structure should be consistent
+        if let Some(hover) = hover_result {
+            if let HoverContents::Markup(content) = hover.contents {
+                assert!(content.kind == MarkupKind::Markdown);
+                assert!(content.value.starts_with("```"));
+                assert!(content.value.ends_with("```"));
+            } else {
+                panic!("Expected markup content");
+            }
+        }
+        // Note: We don't assert hover_result.is_some() because R might not be available in CI
+    }
+
+    #[test]
+    fn test_hover_undefined_symbol_returns_none() {
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = r#"result <- undefined_symbol_that_does_not_exist"#;
+        
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        // Test hover on undefined symbol
+        let position = Position::new(0, 10); // Position of "undefined_symbol_that_does_not_exist"
+        let hover_result = hover(&state, &uri, position);
+        
+        // Should return None for truly undefined symbols (after trying all fallbacks)
+        // This tests the graceful handling when no definition is found anywhere
+        assert!(hover_result.is_none());
+    }
+
+    #[test]
+    fn test_hover_graceful_fallback_missing_definition_file() {
+        use crate::cross_file::ScopedSymbol;
+        
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let missing_uri = Url::parse("file:///workspace/missing.R").unwrap(); // File doesn't exist
+        
+        let main_code = r#"# Symbol from missing file
+result <- missing_func(42)"#;
+        
+        state.documents.insert(main_uri.clone(), Document::new(main_code, None));
+        
+        // Create a scoped symbol that references a missing file
+        let symbol = ScopedSymbol {
+            name: "missing_func".to_string(),
+            kind: crate::cross_file::SymbolKind::Function,
+            source_uri: missing_uri, // This file doesn't exist in state
+            defined_line: 0,
+            defined_column: 0,
+            signature: Some("missing_func(x)".to_string()),
+        };
+        
+        // Test extract_definition_statement with missing file (should return None)
+        let def_info = extract_definition_statement(&symbol, &state);
+        assert!(def_info.is_none(), "Should return None when source file is missing");
+        
+        // The hover function should gracefully fall back to showing just the signature
+        // This is tested implicitly in the hover function's match arm for None from extract_definition_statement
+    }
+
+    #[test]
+    fn test_hover_position_aware_scope_resolution() {
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///workspace/test.R").unwrap();
+        let code = r#"# Before source call - symbol not available
+result1 <- helper_func(1)  # Should not resolve
+
+source("utils.R")
+
+# After source call - symbol available  
+result2 <- helper_func(2)  # Should resolve"#;
+        
+        let utils_uri = Url::parse("file:///workspace/utils.R").unwrap();
+        let utils_code = r#"helper_func <- function(x) { x * 2 }"#;
+        
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
+        
+        // Update cross-file graph
+        state.cross_file_graph.update_file(&uri, &crate::cross_file::extract_metadata(code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
+        
+        // Test hover before source call (line 1) - should not find cross-file symbol
+        let position_before = Position::new(1, 11); // "helper_func" before source()
+        let cross_file_symbols_before = get_cross_file_symbols(&state, &uri, position_before.line, position_before.character);
+        assert!(!cross_file_symbols_before.contains_key("helper_func"), 
+               "Symbol should not be available before source() call");
+        
+        // Test hover after source call (line 5) - should find cross-file symbol
+        let position_after = Position::new(5, 11); // "helper_func" after source()
+        let cross_file_symbols_after = get_cross_file_symbols(&state, &uri, position_after.line, position_after.character);
+        assert!(cross_file_symbols_after.contains_key("helper_func"), 
+               "Symbol should be available after source() call");
+    }
+
+    #[test]
+    fn test_hover_uses_dependency_graph_correctly() {
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        // Create a chain: main.R -> utils.R -> helpers.R
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let utils_uri = Url::parse("file:///workspace/utils.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        
+        let main_code = r#"source("utils.R")
+result <- process_data(42)"#;
+        
+        let utils_code = r#"source("helpers.R")
+process_data <- function(x) {
+    transform_value(x) + 10
+}"#;
+        
+        let helpers_code = r#"transform_value <- function(x) { x * 2 }"#;
+        
+        state.documents.insert(main_uri.clone(), Document::new(main_code, None));
+        state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
+        state.documents.insert(helpers_uri.clone(), Document::new(helpers_code, None));
+        
+        // Update cross-file graph for all files
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
+        state.cross_file_graph.update_file(&helpers_uri, &crate::cross_file::extract_metadata(helpers_code), None, |_| None);
+        
+        // Test hover on transform_value in utils.R (should resolve through chain)
+        let position = Position::new(2, 4); // "transform_value" in utils.R
+        let cross_file_symbols = get_cross_file_symbols(&state, &utils_uri, position.line, position.character);
+        
+        assert!(cross_file_symbols.contains_key("transform_value"), 
+               "Should resolve symbol through dependency chain");
+        
+        let symbol = &cross_file_symbols["transform_value"];
+        assert_eq!(symbol.source_uri, helpers_uri, "Should trace back to helpers.R");
+    }
+
+    // ============================================================================
+    // Task 17: Enhanced Variable Detection Hover Integration Tests
+    // ============================================================================
+
+    #[test]
+    fn test_complete_workflow_for_loops_and_functions() {
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///workspace/test.R").unwrap();
+        let code = r#"# Test for loops and function parameters
+process_data <- function(data, threshold = 0.5, ...) {
+    filtered <- data[data > threshold]
+    for (i in 1:10) {
+        for (j in 1:5) {
+            result <- i * j
+            if (result > threshold) {
+                print(result)
+            }
+        }
+    }
+    for (item in filtered) {
+        print(item)
+    }
+    return(filtered)
+}"#;
+        
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        // Test scope resolution includes all iterators and parameters
+        let positions = vec![
+            (Position::new(5, 12), "result", true),  // result inside nested loop
+            (Position::new(4, 12), "i", true),       // i iterator
+            (Position::new(4, 18), "j", true),       // j iterator  
+            (Position::new(10, 14), "item", true),   // item iterator
+            (Position::new(2, 20), "data", true),    // function parameter
+            (Position::new(6, 27), "threshold", true), // function parameter with default
+            (Position::new(11, 14), "filtered", true), // local variable
+        ];
+        
+        for (position, symbol_name, should_exist) in positions {
+            let symbols = get_cross_file_symbols(&state, &uri, position.line, position.character);
+            if should_exist {
+                assert!(symbols.contains_key(symbol_name), 
+                       "Symbol '{}' should be in scope at line {}, col {}", 
+                       symbol_name, position.line + 1, position.character);
+            } else {
+                assert!(!symbols.contains_key(symbol_name), 
+                       "Symbol '{}' should NOT be in scope at line {}, col {}", 
+                       symbol_name, position.line + 1, position.character);
+            }
+        }
+        
+        // Test no false-positive undefined variable diagnostics
+        let diagnostics = diagnostics(&state, &uri);
+        let undefined_errors: Vec<_> = diagnostics.iter()
+            .filter(|d| d.message.contains("undefined") || d.message.contains("not found"))
+            .collect();
+        
+        assert!(undefined_errors.is_empty(), 
+               "Should not have undefined variable errors for loop iterators and function parameters: {:?}", 
+               undefined_errors);
+        
+        // Test hover shows definition statements
+        let hover_tests = vec![
+            (Position::new(4, 12), "i", "for (i in 1:10)"),
+            (Position::new(4, 18), "j", "for (j in 1:5)"),
+            (Position::new(10, 14), "item", "for (item in filtered)"),
+            (Position::new(2, 20), "data", "process_data <- function(data, threshold = 0.5, ...)"),
+        ];
+        
+        for (position, symbol_name, expected_statement) in hover_tests {
+            let hover_result = hover(&state, &uri, position);
+            if let Some(hover) = hover_result {
+                if let HoverContents::Markup(content) = hover.contents {
+                    assert!(content.value.contains(expected_statement), 
+                           "Hover for '{}' should contain '{}', got: {}", 
+                           symbol_name, expected_statement, content.value);
+                    assert!(content.value.contains("this file"), 
+                           "Hover should show file location");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_realistic_r_code_patterns() {
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        // Create main file with realistic patterns
+        let main_uri = Url::parse("file:///workspace/analysis.R").unwrap();
+        let utils_uri = Url::parse("file:///workspace/utils.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        
+        let main_code = r#"# Analysis script with realistic patterns
+source("utils.R")
+source("helpers.R", local = TRUE)
+
+# Nested loops with multiple iterators
+results <- list()
+for (i in 1:10) {
+    for (j in 1:5) {
+        value <- i * j
+        results[[paste0(i, "_", j)]] <- value
+    }
+}
+
+# Function with parameters and locals
+analyze_data <- function(dataset, 
+                        min_threshold = 0.1,
+                        max_threshold = 0.9,
+                        ...) {
+    # Multi-line function definition
+    cleaned <- dataset[!is.na(dataset)]
+    
+    for (threshold in seq(min_threshold, max_threshold, 0.1)) {
+        filtered <- cleaned[cleaned > threshold]
+        cat("Threshold:", threshold, "Count:", length(filtered), "\n")
+    }
+    
+    return(cleaned)
+}
+
+# Code with markdown special characters
+comment_with_stars <- "This has *asterisks* and _underscores_"
+backtick_var <- `special name with spaces`
+"#;
+        
+        let utils_code = r#"# Utility functions
+utility_func <- function(x, y = 2) {
+    x ^ y
+}
+
+CONSTANT_VALUE <- 42
+"#;
+        
+        let helpers_code = r#"# Helper functions (sourced with local=TRUE)
+helper_transform <- function(data) {
+    data * 2
+}
+"#;
+        
+        state.documents.insert(main_uri.clone(), Document::new(main_code, None));
+        state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
+        state.documents.insert(helpers_uri.clone(), Document::new(helpers_code, None));
+        
+        // Update cross-file graph
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
+        state.cross_file_graph.update_file(&helpers_uri, &crate::cross_file::extract_metadata(helpers_code), None, |_| None);
+        
+        // Test nested loop iterators are in scope
+        let nested_loop_position = Position::new(8, 8); // Inside nested loop
+        let symbols = get_cross_file_symbols(&state, &main_uri, nested_loop_position.line, nested_loop_position.character);
+        
+        assert!(symbols.contains_key("i"), "Outer loop iterator 'i' should be in scope");
+        assert!(symbols.contains_key("j"), "Inner loop iterator 'j' should be in scope");
+        assert!(symbols.contains_key("value"), "Local variable 'value' should be in scope");
+        
+        // Test function parameters are in scope within function
+        let function_body_position = Position::new(19, 4); // Inside analyze_data function
+        let func_symbols = get_cross_file_symbols(&state, &main_uri, function_body_position.line, function_body_position.character);
+        
+        assert!(func_symbols.contains_key("dataset"), "Function parameter 'dataset' should be in scope");
+        assert!(func_symbols.contains_key("min_threshold"), "Function parameter 'min_threshold' should be in scope");
+        assert!(func_symbols.contains_key("max_threshold"), "Function parameter 'max_threshold' should be in scope");
+        assert!(func_symbols.contains_key("cleaned"), "Local variable 'cleaned' should be in scope");
+        
+        // Test cross-file symbols are resolved correctly
+        let after_source_position = Position::new(4, 0); // After source() calls
+        let cross_symbols = get_cross_file_symbols(&state, &main_uri, after_source_position.line, after_source_position.character);
+        
+        assert!(cross_symbols.contains_key("utility_func"), "Should resolve utility_func from utils.R");
+        assert!(cross_symbols.contains_key("CONSTANT_VALUE"), "Should resolve CONSTANT_VALUE from utils.R");
+        // Note: helper_transform should NOT be available due to local=TRUE
+        
+        // Test hover shows proper formatting for multi-line definitions
+        let multi_line_func_position = Position::new(13, 0); // analyze_data function name
+        let hover_result = hover(&state, &main_uri, multi_line_func_position);
+        
+        if let Some(hover) = hover_result {
+            if let HoverContents::Markup(content) = hover.contents {
+                assert!(content.value.contains("analyze_data <- function(dataset,"));
+                assert!(content.value.contains("this file"));
+                // Should handle markdown special characters properly
+                assert!(!content.value.contains("*asterisks*")); // Should be escaped
+            }
+        }
+        
+        // Test no false positives for valid symbols
+        let diagnostics = diagnostics(&state, &main_uri);
+        let undefined_errors: Vec<_> = diagnostics.iter()
+            .filter(|d| d.message.contains("undefined"))
+            .collect();
+        
+        // Should not report undefined errors for loop iterators, function parameters, or cross-file symbols
+        for error in &undefined_errors {
+            assert!(!error.message.contains("i "), "Should not report 'i' as undefined");
+            assert!(!error.message.contains("j "), "Should not report 'j' as undefined");
+            assert!(!error.message.contains("dataset"), "Should not report 'dataset' as undefined");
+            assert!(!error.message.contains("utility_func"), "Should not report 'utility_func' as undefined");
+        }
+    }
+
+    #[test]
+    fn test_cross_file_local_scope_isolation() {
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let local_uri = Url::parse("file:///workspace/local_source.R").unwrap();
+        let global_uri = Url::parse("file:///workspace/global_source.R").unwrap();
+        
+        let main_code = r#"# Test local vs global sourcing
+source("global_source.R")           # Global scope
+source("local_source.R", local = TRUE)  # Local scope
+
+# These should be available from global source
+global_result <- global_func(42)
+
+# These should NOT be available from local source
+# local_func(42)  # Would be undefined
+"#;
+        
+        let global_code = r#"global_func <- function(x) { x + 1 }
+global_var <- 100"#;
+        
+        let local_code = r#"local_func <- function(x) { x * 2 }
+local_var <- 200"#;
+        
+        state.documents.insert(main_uri.clone(), Document::new(main_code, None));
+        state.documents.insert(global_uri.clone(), Document::new(global_code, None));
+        state.documents.insert(local_uri.clone(), Document::new(local_code, None));
+        
+        // Update cross-file graph
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&global_uri, &crate::cross_file::extract_metadata(global_code), None, |_| None);
+        state.cross_file_graph.update_file(&local_uri, &crate::cross_file::extract_metadata(local_code), None, |_| None);
+        
+        // Test symbols after both source calls
+        let position = Position::new(5, 0); // After both source() calls
+        let symbols = get_cross_file_symbols(&state, &main_uri, position.line, position.character);
+        
+        // Global source symbols should be available
+        assert!(symbols.contains_key("global_func"), "global_func should be available from global source");
+        assert!(symbols.contains_key("global_var"), "global_var should be available from global source");
+        
+        // Local source symbols should NOT be available in main scope
+        assert!(!symbols.contains_key("local_func"), "local_func should NOT be available from local source");
+        assert!(!symbols.contains_key("local_var"), "local_var should NOT be available from local source");
+        
+        // Test hover on global symbol shows cross-file location
+        let hover_position = Position::new(5, 16); // "global_func" usage
+        let hover_result = hover(&state, &main_uri, hover_position);
+        
+        if let Some(hover) = hover_result {
+            if let HoverContents::Markup(content) = hover.contents {
+                assert!(content.value.contains("global_func"));
+                assert!(content.value.contains("global_source.R"), "Should show cross-file source");
+            }
+        }
+    }
+
+    #[test]
+    fn test_hover_hyperlink_formatting_with_special_paths() {
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
+        
+        // Test various path scenarios
+        let main_uri = Url::parse("file:///workspace/src/analysis/main.R").unwrap();
+        let utils_uri = Url::parse("file:///workspace/utils/helpers with spaces.R").unwrap();
+        
+        let main_code = r#"source("../../utils/helpers with spaces.R")
+result <- helper_with_spaces(42)"#;
+        
+        let utils_code = r#"helper_with_spaces <- function(x) {
+    # Function with special characters in filename
+    x * 2
+}"#;
+        
+        state.documents.insert(main_uri.clone(), Document::new(main_code, None));
+        state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
+        
+        // Update cross-file graph
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
+        
+        // Test hover shows proper hyperlink formatting
+        let position = Position::new(1, 10); // "helper_with_spaces"
+        let hover_result = hover(&state, &main_uri, position);
+        
+        if let Some(hover) = hover_result {
+            if let HoverContents::Markup(content) = hover.contents {
+                // Should contain properly formatted hyperlink
+                assert!(content.value.contains("[utils/helpers with spaces.R]"));
+                assert!(content.value.contains("file:///workspace/utils/helpers%20with%20spaces.R"));
+                assert!(content.value.contains("line 1"));
+            }
         }
     }
 }

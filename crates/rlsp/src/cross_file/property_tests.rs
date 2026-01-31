@@ -1849,55 +1849,221 @@ proptest! {
 
 
 // ============================================================================
-// Property 5: Diagnostic Suppression
-// Validates: Requirements 2.4, 2.5, 10.4, 10.5
+// Property 5: Function-local variable scope boundaries
+// Validates: Variables defined inside function NOT available outside
 // ============================================================================
-
-use super::directive::is_line_ignored;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Property 5: For any file containing @lsp-ignore on line n, no diagnostics
-    /// SHALL be emitted for line n.
+    /// Property 5: For any function definition containing a local variable definition,
+    /// that variable SHALL NOT be available in scope outside the function body.
     #[test]
-    fn prop_diagnostic_suppression_ignore(
-        prefix_lines in 0..5u32
+    fn prop_function_local_variable_scope_boundaries(
+        func_name in r_identifier(),
+        local_var in r_identifier(),
+        global_var in r_identifier()
     ) {
-        let mut lines = Vec::new();
-        for i in 0..prefix_lines {
-            lines.push(format!("x{} <- {}", i, i));
-        }
-        lines.push("# @lsp-ignore".to_string());
-        lines.push("undefined_var".to_string());
-        let content = lines.join("\n");
+        prop_assume!(func_name != local_var && local_var != global_var && func_name != global_var);
 
-        let meta = parse_directives(&content);
+        let uri = make_url("test");
 
-        // The @lsp-ignore line itself should be ignored
-        prop_assert!(is_line_ignored(&meta, prefix_lines));
+        // Code with function containing local variable, followed by global variable
+        let code = format!(
+            "{} <- function() {{ {} <- 42 }}\n{} <- 100",
+            func_name, local_var, global_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // At end of file (outside function), local variable should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+            "Global variable should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+            "Function-local variable should NOT be available outside function");
+
+        // Inside function body, local variable SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 35); // Position within function body
+        prop_assert!(scope_inside.symbols.contains_key(&func_name),
+            "Function name should be available inside function");
+        prop_assert!(scope_inside.symbols.contains_key(&local_var),
+            "Function-local variable should be available inside function");
+        // Global variable defined after function should NOT be available inside
+        prop_assert!(!scope_inside.symbols.contains_key(&global_var),
+            "Global variable defined after function should NOT be available inside function");
     }
 
-    /// Property 5: For any file containing @lsp-ignore-next on line n, no diagnostics
-    /// SHALL be emitted for line n+1.
+    /// Property 5 extended: Nested functions have separate scopes
     #[test]
-    fn prop_diagnostic_suppression_ignore_next(
-        prefix_lines in 0..5u32
+    fn prop_nested_function_separate_scopes(
+        outer_func in r_identifier(),
+        inner_func in r_identifier(),
+        outer_var in r_identifier(),
+        inner_var in r_identifier()
     ) {
-        let mut lines = Vec::new();
-        for i in 0..prefix_lines {
-            lines.push(format!("x{} <- {}", i, i));
-        }
-        lines.push("# @lsp-ignore-next".to_string());
-        lines.push("undefined_var".to_string());
-        let content = lines.join("\n");
+        prop_assume!(outer_func != inner_func && outer_var != inner_var);
+        prop_assume!(outer_func != outer_var && outer_func != inner_var);
+        prop_assume!(inner_func != outer_var && inner_func != inner_var);
 
-        let meta = parse_directives(&content);
+        let uri = make_url("test");
 
-        // The line AFTER @lsp-ignore-next should be ignored
-        prop_assert!(is_line_ignored(&meta, prefix_lines + 1));
-        // The @lsp-ignore-next line itself should NOT be ignored
-        prop_assert!(!is_line_ignored(&meta, prefix_lines));
+        // Code with nested functions
+        let code = format!(
+            "{} <- function() {{ {} <- 1; {} <- function() {{ {} <- 2 }} }}",
+            outer_func, outer_var, inner_func, inner_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Outside all functions - only outer function should be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope_outside.symbols.contains_key(&outer_func),
+            "Outer function should be available outside");
+        prop_assert!(!scope_outside.symbols.contains_key(&inner_func),
+            "Inner function should NOT be available outside outer function");
+        prop_assert!(!scope_outside.symbols.contains_key(&outer_var),
+            "Outer function variable should NOT be available outside");
+        prop_assert!(!scope_outside.symbols.contains_key(&inner_var),
+            "Inner function variable should NOT be available outside");
+
+        // Inside outer function but outside inner function
+        let scope_outer = scope_at_position(&artifacts, 0, 25);
+        prop_assert!(scope_outer.symbols.contains_key(&outer_func),
+            "Outer function should be available inside itself");
+        prop_assert!(scope_outer.symbols.contains_key(&outer_var),
+            "Outer function variable should be available inside outer function");
+        prop_assert!(scope_outer.symbols.contains_key(&inner_func),
+            "Inner function should be available inside outer function");
+        prop_assert!(!scope_outer.symbols.contains_key(&inner_var),
+            "Inner function variable should NOT be available outside inner function");
+
+        // Inside inner function
+        let scope_inner = scope_at_position(&artifacts, 0, 65);
+        prop_assert!(scope_inner.symbols.contains_key(&outer_func),
+            "Outer function should be available inside inner function");
+        prop_assert!(scope_inner.symbols.contains_key(&outer_var),
+            "Outer function variable should be available inside inner function");
+        prop_assert!(scope_inner.symbols.contains_key(&inner_func),
+            "Inner function should be available inside itself");
+        prop_assert!(scope_inner.symbols.contains_key(&inner_var),
+            "Inner function variable should be available inside inner function");
+    }
+}
+
+// ============================================================================
+// Property 6: Function parameter scope boundaries
+// Validates: Parameters NOT available outside function body
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 6: For any function definition with parameters, those parameters
+    /// SHALL NOT be available in scope outside the function body.
+    #[test]
+    fn prop_function_parameter_scope_boundaries(
+        func_name in r_identifier(),
+        param1 in r_identifier(),
+        param2 in r_identifier(),
+        global_var in r_identifier()
+    ) {
+        prop_assume!(func_name != param1 && param1 != param2 && func_name != param2);
+        prop_assume!(global_var != func_name && global_var != param1 && global_var != param2);
+
+        let uri = make_url("test");
+
+        // Function with parameters, followed by global variable
+        let code = format!(
+            "{} <- function({}, {}) {{ {} + {} }}\n{} <- 100",
+            func_name, param1, param2, param1, param2, global_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Outside function - parameters should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+            "Global variable should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&param1),
+            "Function parameter 1 should NOT be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&param2),
+            "Function parameter 2 should NOT be available outside function");
+
+        // Inside function - parameters SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 40);
+        prop_assert!(scope_inside.symbols.contains_key(&func_name),
+            "Function name should be available inside function");
+        prop_assert!(scope_inside.symbols.contains_key(&param1),
+            "Function parameter 1 should be available inside function");
+        prop_assert!(scope_inside.symbols.contains_key(&param2),
+            "Function parameter 2 should be available inside function");
+        // Global variable defined after function should NOT be available inside
+        prop_assert!(!scope_inside.symbols.contains_key(&global_var),
+            "Global variable defined after function should NOT be available inside function");
+    }
+
+    /// Property 6 extended: Function parameters with default values
+    #[test]
+    fn prop_function_parameter_default_values_scope(
+        func_name in r_identifier(),
+        param_name in r_identifier()
+    ) {
+        prop_assume!(func_name != param_name);
+
+        let uri = make_url("test");
+
+        let code = format!("{} <- function({} = 42) {{ {} * 2 }}", func_name, param_name, param_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Outside function - parameter should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&param_name),
+            "Function parameter with default should NOT be available outside function");
+
+        // Inside function - parameter SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 40);
+        prop_assert!(scope_inside.symbols.contains_key(&param_name),
+            "Function parameter with default should be available inside function");
+    }
+
+    /// Property 6 extended: Ellipsis parameter scope
+    #[test]
+    fn prop_function_ellipsis_parameter_scope(
+        func_name in r_identifier(),
+        param_name in r_identifier()
+    ) {
+        prop_assume!(func_name != param_name);
+
+        let uri = make_url("test");
+
+        let code = format!("{} <- function({}, ...) {{ list({}, ...) }}", func_name, param_name, param_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Outside function - parameters should NOT be available
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&param_name),
+            "Named parameter should NOT be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key("..."),
+            "Ellipsis parameter should NOT be available outside function");
+
+        // Inside function - parameters SHOULD be available
+        let scope_inside = scope_at_position(&artifacts, 0, 50);
+        prop_assert!(scope_inside.symbols.contains_key(&param_name),
+            "Named parameter should be available inside function");
+        prop_assert!(scope_inside.symbols.contains_key("..."),
+            "Ellipsis parameter should be available inside function");
     }
 }
 
@@ -3845,266 +4011,513 @@ proptest! {
     }
 }
 
-
 // ============================================================================
-// Property Tests for BackgroundIndexer Queue Operations
-// Validates: Requirements 3.1, 3.2, 3.4, 6.3
+// Property 1: Loop Iterator Scope Inclusion
+// Validates: Loop iterator detection and scope persistence
 // ============================================================================
 
-use super::background_indexer::IndexTask;
-use std::collections::VecDeque;
-use std::time::Instant;
+use super::scope::scope_at_position;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Property: Queue ordering - tasks with lower priority numbers are always
-    /// processed before tasks with higher priority numbers.
+    /// Property 1: For any for loop with iterator variable i, the iterator SHALL
+    /// be included in the exported interface and available in scope after the
+    /// for statement position.
     #[test]
-    fn prop_background_indexer_queue_ordering(
-        priorities in prop::collection::vec(2usize..=3, 1..20)
+    fn prop_loop_iterator_scope_inclusion(
+        iterator_name in r_identifier()
     ) {
-        let mut queue: VecDeque<IndexTask> = VecDeque::new();
+        let uri = make_url("test");
 
-        // Insert tasks with given priorities using the same logic as BackgroundIndexer::submit
-        for (i, priority) in priorities.iter().enumerate() {
-            let task = IndexTask {
-                uri: make_url(&format!("file{}", i)),
-                priority: *priority,
-                depth: 0,
-                submitted_at: Instant::now(),
-            };
+        // Code with for loop
+        let code = format!("for ({} in 1:10) {{ print({}) }}", iterator_name, iterator_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
 
-            let insert_pos = queue
-                .iter()
-                .position(|t| t.priority > task.priority)
-                .unwrap_or(queue.len());
-            queue.insert(insert_pos, task);
-        }
+        // Iterator should be in exported interface
+        prop_assert!(artifacts.exported_interface.contains_key(&iterator_name),
+            "Loop iterator should be in exported interface");
 
-        // Verify ordering: priority should be non-decreasing
-        let mut prev_priority = 0;
-        for task in &queue {
-            prop_assert!(task.priority >= prev_priority,
-                "Queue should be ordered by priority (non-decreasing)");
-            prev_priority = task.priority;
-        }
+        // Iterator should have Variable kind
+        let symbol = artifacts.exported_interface.get(&iterator_name).unwrap();
+        prop_assert_eq!(symbol.kind, super::scope::SymbolKind::Variable,
+            "Loop iterator should have Variable kind");
+
+        // Iterator should be available in timeline as Def event
+        let has_def_event = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if symbol.name == iterator_name)
+        });
+        prop_assert!(has_def_event, "Loop iterator should have Def event in timeline");
     }
 
-    /// Property: No duplicate indexing - a file is never queued more than once.
+    /// Property 1 extended: Loop iterator persists after loop completion
     #[test]
-    fn prop_background_indexer_no_duplicates(
-        num_files in 1..10usize,
-        num_submissions in 1..30usize
+    fn prop_loop_iterator_persists_after_loop(
+        iterator_name in r_identifier(),
+        var_name in r_identifier()
     ) {
-        let mut queue: VecDeque<IndexTask> = VecDeque::new();
-        let uris: Vec<Url> = (0..num_files)
-            .map(|i| make_url(&format!("file{}", i)))
-            .collect();
+        prop_assume!(iterator_name != var_name);
 
-        // Submit random files multiple times
-        for i in 0..num_submissions {
-            let uri = uris[i % num_files].clone();
+        let uri = make_url("test");
 
-            // Check if already queued (same logic as BackgroundIndexer::submit)
-            if queue.iter().any(|task| task.uri == uri) {
-                continue;
-            }
+        // Code with for loop followed by variable assignment
+        let code = format!(
+            "for ({} in 1:5) {{ }}\n{} <- {}",
+            iterator_name, var_name, iterator_name
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
 
-            let task = IndexTask {
-                uri,
-                priority: 2,
-                depth: 0,
-                submitted_at: Instant::now(),
-            };
-            queue.push_back(task);
-        }
+        // Both iterator and variable should be in exported interface
+        prop_assert!(artifacts.exported_interface.contains_key(&iterator_name),
+            "Loop iterator should persist after loop");
+        prop_assert!(artifacts.exported_interface.contains_key(&var_name),
+            "Variable should be in exported interface");
 
-        // Verify no duplicates
-        let mut seen_uris = std::collections::HashSet::new();
-        for task in &queue {
-            prop_assert!(!seen_uris.contains(&task.uri),
-                "Queue should not contain duplicate URIs");
-            seen_uris.insert(task.uri.clone());
-        }
-
-        // Queue size should be at most num_files
-        prop_assert!(queue.len() <= num_files,
-            "Queue size should not exceed number of unique files");
+        // Get scope at end of code - iterator should be available
+        let scope = scope_at_position(&artifacts, 10, 0);
+        prop_assert!(scope.symbols.contains_key(&iterator_name),
+            "Loop iterator should be available in scope after loop");
+        prop_assert!(scope.symbols.contains_key(&var_name),
+            "Variable should be available in scope");
     }
 
-    /// Property: Depth limiting - transitive indexing never exceeds configured max depth.
+    /// Property 1 extended: Nested loops create multiple iterators
     #[test]
-    fn prop_background_indexer_depth_limiting(
-        max_depth in 1usize..5,
-        chain_length in 1usize..10
+    fn prop_nested_loops_multiple_iterators(
+        outer_iterator in r_identifier(),
+        inner_iterator in r_identifier()
     ) {
-        // Simulate a chain of transitive dependencies
-        let mut depths_queued = Vec::new();
+        prop_assume!(outer_iterator != inner_iterator);
 
-        // Start with depth 0 (Priority 2 task)
-        let mut current_depth = 0;
-        depths_queued.push(current_depth);
+        let uri = make_url("test");
 
-        // Simulate queue_transitive_deps behavior
-        while current_depth < max_depth && depths_queued.len() < chain_length {
-            current_depth += 1;
-            depths_queued.push(current_depth);
-        }
+        // Code with nested for loops
+        let code = format!(
+            "for ({} in 1:3) {{ for ({} in 1:2) {{ print({}, {}) }} }}",
+            outer_iterator, inner_iterator, outer_iterator, inner_iterator
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
 
-        // Verify no depth exceeds max_depth
-        for depth in &depths_queued {
-            prop_assert!(*depth <= max_depth,
-                "Depth {} should not exceed max_depth {}", depth, max_depth);
-        }
-    }
+        // Both iterators should be in exported interface
+        prop_assert!(artifacts.exported_interface.contains_key(&outer_iterator),
+            "Outer loop iterator should be in exported interface");
+        prop_assert!(artifacts.exported_interface.contains_key(&inner_iterator),
+            "Inner loop iterator should be in exported interface");
 
-    /// Property: Queue size limiting - queue never exceeds configured maximum size.
-    #[test]
-    fn prop_background_indexer_queue_size_limiting(
-        max_queue_size in 1usize..20,
-        num_submissions in 1usize..50
-    ) {
-        let mut queue: VecDeque<IndexTask> = VecDeque::new();
-
-        for i in 0..num_submissions {
-            // Check queue size limit (same logic as BackgroundIndexer::submit)
-            if queue.len() >= max_queue_size {
-                continue;
-            }
-
-            let task = IndexTask {
-                uri: make_url(&format!("file{}", i)),
-                priority: 2,
-                depth: 0,
-                submitted_at: Instant::now(),
-            };
-            queue.push_back(task);
-        }
-
-        // Verify queue size never exceeds limit
-        prop_assert!(queue.len() <= max_queue_size,
-            "Queue size {} should not exceed max_queue_size {}", queue.len(), max_queue_size);
-    }
-
-    /// Property: Priority 2 tasks are always processed before Priority 3 tasks.
-    #[test]
-    fn prop_background_indexer_priority_2_before_3(
-        num_p2 in 1usize..10,
-        num_p3 in 1usize..10
-    ) {
-        let mut queue: VecDeque<IndexTask> = VecDeque::new();
-
-        // Add Priority 3 tasks first
-        for i in 0..num_p3 {
-            let task = IndexTask {
-                uri: make_url(&format!("p3_file{}", i)),
-                priority: 3,
-                depth: 1,
-                submitted_at: Instant::now(),
-            };
-            queue.push_back(task);
-        }
-
-        // Add Priority 2 tasks (should be inserted before Priority 3)
-        for i in 0..num_p2 {
-            let task = IndexTask {
-                uri: make_url(&format!("p2_file{}", i)),
-                priority: 2,
-                depth: 0,
-                submitted_at: Instant::now(),
-            };
-            let insert_pos = queue
-                .iter()
-                .position(|t| t.priority > task.priority)
-                .unwrap_or(queue.len());
-            queue.insert(insert_pos, task);
-        }
-
-        // Verify all Priority 2 tasks come before Priority 3 tasks
-        let mut seen_p3 = false;
-        for task in &queue {
-            if task.priority == 3 {
-                seen_p3 = true;
-            }
-            if task.priority == 2 {
-                prop_assert!(!seen_p3,
-                    "Priority 2 task should not appear after Priority 3 task");
-            }
-        }
+        // Both should have Def events
+        let outer_has_def = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if symbol.name == outer_iterator)
+        });
+        let inner_has_def = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if symbol.name == inner_iterator)
+        });
+        prop_assert!(outer_has_def, "Outer iterator should have Def event");
+        prop_assert!(inner_has_def, "Inner iterator should have Def event");
     }
 }
 
 // ============================================================================
-// Property Tests for Directive Parsing (Quoted Paths with Spaces)
-// Feature: coderabbit-pr-review-fixes
+// Property 8: Function Parameter Scope Inclusion
+// Validates: Function parameter detection and scope boundaries
 // ============================================================================
-
-/// Strategy for generating valid path characters (no quotes)
-fn directive_path_char_strategy() -> impl Strategy<Value = char> {
-    prop_oneof![
-        Just('a'),
-        Just('z'),
-        Just('A'),
-        Just('Z'),
-        Just('0'),
-        Just('9'),
-        Just('_'),
-        Just('-'),
-        Just('.'),
-        Just('/'),
-        Just(' '),
-    ]
-}
-
-/// Strategy for generating paths with spaces
-fn directive_path_with_spaces_strategy() -> impl Strategy<Value = String> {
-    prop::collection::vec(directive_path_char_strategy(), 1..30)
-        .prop_map(|chars| chars.into_iter().collect::<String>())
-        .prop_filter("must contain space", |s| s.contains(' '))
-        .prop_filter("must not be only spaces", |s| !s.trim().is_empty())
-}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    /// Property 2: Quoted path extraction preserves spaces
-    /// For any path with spaces, parsing a double-quoted directive should preserve the path.
-    /// Feature: coderabbit-pr-review-fixes, Property 2: Quoted Path Extraction Preserves Spaces
+    /// Property 8: For any function definition with parameters, the parameters
+    /// SHALL be available in scope within the function body boundaries.
     #[test]
-    fn prop_directive_double_quoted_path_preserves_spaces(path in directive_path_with_spaces_strategy()) {
-        let content = format!(r#"# @lsp-sourced-by "{}""#, path);
-        let meta = parse_directives(&content);
-        prop_assert_eq!(meta.sourced_by.len(), 1);
-        prop_assert_eq!(&meta.sourced_by[0].path, &path);
+    fn prop_function_parameter_scope_inclusion(
+        func_name in r_identifier(),
+        param1 in r_identifier(),
+        param2 in r_identifier()
+    ) {
+        prop_assume!(func_name != param1 && param1 != param2 && func_name != param2);
+
+        let uri = make_url("test");
+
+        // Function with multiple parameters
+        let code = format!("{} <- function({}, {}) {{ {} + {} }}", func_name, param1, param2, param1, param2);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Function should be in exported interface
+        prop_assert!(artifacts.exported_interface.contains_key(&func_name),
+            "Function should be in exported interface");
+
+        // Should have FunctionScope event in timeline
+        let has_function_scope = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
+                if parameters.iter().any(|p| p.name == param1) && 
+                   parameters.iter().any(|p| p.name == param2))
+        });
+        prop_assert!(has_function_scope, "Should have FunctionScope event with parameters");
+
+        // Get scope within function body (should include parameters)
+        let scope_in_body = scope_at_position(&artifacts, 0, 50); // Position within function body
+        prop_assert!(scope_in_body.symbols.contains_key(&param1),
+            "Parameter 1 should be available within function body");
+        prop_assert!(scope_in_body.symbols.contains_key(&param2),
+            "Parameter 2 should be available within function body");
+        prop_assert!(scope_in_body.symbols.contains_key(&func_name),
+            "Function name should be available within function body");
     }
 
-    /// Property 2: Single-quoted path extraction preserves spaces
-    /// Feature: coderabbit-pr-review-fixes, Property 2: Quoted Path Extraction Preserves Spaces
+    /// Property 8 extended: Function with no parameters
     #[test]
-    fn prop_directive_single_quoted_path_preserves_spaces(path in directive_path_with_spaces_strategy()) {
-        let content = format!("# @lsp-sourced-by '{}'", path);
-        let meta = parse_directives(&content);
-        prop_assert_eq!(meta.sourced_by.len(), 1);
-        prop_assert_eq!(&meta.sourced_by[0].path, &path);
+    fn prop_function_no_parameters_scope(
+        func_name in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        let code = format!("{} <- function() {{ 42 }}", func_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Should have FunctionScope event with empty parameters
+        let has_function_scope = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
+                if parameters.is_empty())
+        });
+        prop_assert!(has_function_scope, "Should have FunctionScope event with empty parameters");
     }
 
-    /// Property 2: Forward directive quoted path preserves spaces
-    /// Feature: coderabbit-pr-review-fixes, Property 2: Quoted Path Extraction Preserves Spaces
+    /// Property 8 extended: Function with default parameter values
     #[test]
-    fn prop_directive_forward_quoted_path_preserves_spaces(path in directive_path_with_spaces_strategy()) {
-        let content = format!(r#"# @lsp-source "{}""#, path);
-        let meta = parse_directives(&content);
-        prop_assert_eq!(meta.sources.len(), 1);
-        prop_assert_eq!(&meta.sources[0].path, &path);
+    fn prop_function_default_parameter_scope(
+        func_name in r_identifier(),
+        param_name in r_identifier()
+    ) {
+        prop_assume!(func_name != param_name);
+
+        let uri = make_url("test");
+
+        let code = format!("{} <- function({} = 42) {{ {} * 2 }}", func_name, param_name, param_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Should have FunctionScope event with parameter
+        let has_function_scope = artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
+                if parameters.iter().any(|p| p.name == param_name))
+        });
+        prop_assert!(has_function_scope, "Should have FunctionScope event with default parameter");
+
+        // Parameter should be available within function body
+        let scope_in_body = scope_at_position(&artifacts, 0, 50);
+        prop_assert!(scope_in_body.symbols.contains_key(&param_name),
+            "Parameter with default value should be available within function body");
+    }
+}
+
+// ============================================================================
+// Task 15 Property Tests: Source() Scoping
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 25: Source local=FALSE global scope
+    /// For any file sourced with local=FALSE, all symbols defined in that file 
+    /// should be available in the global scope.
+    #[test]
+    fn prop_source_local_false_global_scope(
+        symbol_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child with local=FALSE (default)
+        let parent_code = "source(\"child.R\", local = FALSE)";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope at end of parent file (after source() call)
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol from child should be available in global scope (local=FALSE)
+        prop_assert!(scope.symbols.contains_key(&symbol_name),
+            "Symbol from file sourced with local=FALSE should be available in global scope");
     }
 
-    /// Property 2: Working directory quoted path preserves spaces
-    /// Feature: coderabbit-pr-review-fixes, Property 2: Quoted Path Extraction Preserves Spaces
+    /// Property 26: Source local=TRUE function scope
+    /// For any file sourced with local=TRUE inside a function, all symbols 
+    /// defined in that file should be available only within that function scope.
     #[test]
-    fn prop_directive_working_dir_quoted_path_preserves_spaces(path in directive_path_with_spaces_strategy()) {
-        let content = format!(r#"# @lsp-cd "{}""#, path);
-        let meta = parse_directives(&content);
-        prop_assert_eq!(meta.working_directory, Some(path));
+    fn prop_source_local_true_function_scope(
+        symbol_name in r_identifier(),
+        func_name in r_identifier()
+    ) {
+        prop_assume!(symbol_name != func_name);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: function that sources child with local=TRUE
+        let parent_code = format!(
+            "{} <- function() {{ source(\"child.R\", local = TRUE); {} }}",
+            func_name, symbol_name
+        );
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope within function body (after source() call)
+        let scope_in_function = scope_at_position_with_deps(
+            &parent_uri, 0, 60, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should be available within function scope (local=TRUE)
+        prop_assert!(scope_in_function.symbols.contains_key(&symbol_name),
+            "Symbol from file sourced with local=TRUE should be available within function scope");
+
+        // Get scope outside function (global scope)
+        let scope_global = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should NOT be available in global scope (local=TRUE isolates it)
+        prop_assert!(!scope_global.symbols.contains_key(&symbol_name),
+            "Symbol from file sourced with local=TRUE should NOT be available in global scope");
+
+        // Function name should be available in global scope
+        prop_assert!(scope_global.symbols.contains_key(&func_name),
+            "Function name should be available in global scope");
+    }
+
+    /// Property 27: Source local parameter default
+    /// For any source() call without an explicit local parameter, the system 
+    /// should treat it as local=FALSE.
+    #[test]
+    fn prop_source_local_parameter_default(
+        symbol_name in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+
+        // Parent file: sources child without explicit local parameter (defaults to FALSE)
+        let parent_code = "source(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: defines symbol
+        let child_code = format!("{} <- 42", symbol_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        // Get scope at end of parent file
+        let scope = scope_at_position_with_deps(
+            &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
+        );
+
+        // Symbol should be available (default local=FALSE means global scope)
+        prop_assert!(scope.symbols.contains_key(&symbol_name),
+            "Symbol from file sourced without explicit local parameter should be available (default local=FALSE)");
+
+        // Verify the source() call was detected with local=false by default
+        let has_source_call = parent_artifacts.timeline.iter().any(|event| {
+            matches!(event, super::scope::ScopeEvent::Source { source, .. } 
+                if source.path == "child.R" && !source.local)
+        });
+        prop_assert!(has_source_call,
+            "Source call should be detected with local=false by default");
+    }
+}
+
+// ============================================================================
+// Task 11 Property Tests: Scope Resolution Invariants
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: enhanced-variable-detection-hover, Property 2: Loop iterator persistence after loop
+    #[test]
+    fn prop_loop_iterator_persistence_after_loop(
+        iterator_name in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // For loop with iterator variable
+        let code = format!("for ({} in 1:10) {{ print({}) }}\nafter_loop <- {}", 
+                          iterator_name, iterator_name, iterator_name);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope at position after loop body completes
+        let scope_after_loop = scope_at_position(&artifacts, 10, 0);
+
+        // Iterator variable should still be included in available symbols
+        prop_assert!(scope_after_loop.symbols.contains_key(&iterator_name),
+            "Loop iterator should persist in scope after loop completes");
+    }
+
+    // Feature: enhanced-variable-detection-hover, Property 3: Nested loop iterator tracking
+    #[test]
+    fn prop_nested_loop_iterator_tracking(
+        outer_iterator in r_identifier(),
+        inner_iterator in r_identifier()
+    ) {
+        prop_assume!(outer_iterator != inner_iterator);
+
+        let uri = make_url("test");
+
+        // Nested for loops
+        let code = format!(
+            "for ({} in 1:3) {{ for ({} in 1:2) {{ print({}, {}) }} }}",
+            outer_iterator, inner_iterator, outer_iterator, inner_iterator
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope at position after both loops complete
+        let scope_after_loops = scope_at_position(&artifacts, 10, 0);
+
+        // Both outer and inner iterator variables should be available in scope
+        prop_assert!(scope_after_loops.symbols.contains_key(&outer_iterator),
+            "Outer loop iterator should be available after nested loops complete");
+        prop_assert!(scope_after_loops.symbols.contains_key(&inner_iterator),
+            "Inner loop iterator should be available after nested loops complete");
+    }
+
+    // Feature: enhanced-variable-detection-hover, Property 4: Loop iterator shadowing
+    #[test]
+    fn prop_loop_iterator_shadowing(
+        var_name in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Variable defined, then for loop uses same name as iterator
+        let code = format!(
+            "{} <- 42\nfor ({} in 1:5) {{ print({}) }}",
+            var_name, var_name, var_name
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope after the for statement
+        let scope_after_for = scope_at_position(&artifacts, 10, 0);
+
+        // Iterator definition should take precedence over original variable
+        prop_assert!(scope_after_for.symbols.contains_key(&var_name),
+            "Variable should be in scope after for loop");
+
+        // The symbol should be the iterator (most recent definition)
+        let symbol = scope_after_for.symbols.get(&var_name).unwrap();
+        prop_assert_eq!(symbol.kind, super::scope::SymbolKind::Variable,
+            "Symbol should be Variable kind (iterator)");
+    }
+
+    // Feature: enhanced-variable-detection-hover, Property 7: Function-local undefined variable diagnostics
+    #[test]
+    fn prop_function_local_undefined_variable_diagnostics(
+        func_name in r_identifier(),
+        local_var in r_identifier(),
+        usage_var in r_identifier()
+    ) {
+        prop_assume!(func_name != local_var && local_var != usage_var && func_name != usage_var);
+
+        let uri = make_url("test");
+
+        // Function with local variable, then usage outside function
+        let code = format!(
+            "{} <- function() {{ {} <- 42 }}\nresult <- {}",
+            func_name, local_var, local_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope outside function body (where local_var is referenced)
+        let scope_outside = scope_at_position(&artifacts, 1, 15);
+
+        // Function-local variable should NOT be available outside function
+        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+            "Function-local variable should NOT be available outside function body");
+
+        // Function name should be available
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+    }
+
+    // Feature: enhanced-variable-detection-hover, Property 9: Function parameter with default value recognition
+    #[test]
+    fn prop_function_parameter_default_value_recognition(
+        func_name in r_identifier(),
+        param_with_default in r_identifier(),
+        param_without_default in r_identifier()
+    ) {
+        prop_assume!(func_name != param_with_default && param_with_default != param_without_default && func_name != param_without_default);
+
+        let uri = make_url("test");
+
+        // Function with parameter with default value and parameter without
+        let code = format!(
+            "{} <- function({}, {} = 42) {{ {} + {} }}",
+            func_name, param_without_default, param_with_default, param_without_default, param_with_default
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Get scope within function body
+        let scope_in_body = scope_at_position(&artifacts, 0, 60);
+
+        // Both parameters should be recognized and included in function body scope
+        prop_assert!(scope_in_body.symbols.contains_key(&param_with_default),
+            "Parameter with default value should be recognized in function body scope");
+        prop_assert!(scope_in_body.symbols.contains_key(&param_without_default),
+            "Parameter without default value should be recognized in function body scope");
+
+        // Both should have Parameter kind
+        let param_with_default_symbol = scope_in_body.symbols.get(&param_with_default).unwrap();
+        let param_without_default_symbol = scope_in_body.symbols.get(&param_without_default).unwrap();
+        
+        prop_assert_eq!(param_with_default_symbol.kind, super::scope::SymbolKind::Parameter,
+            "Parameter with default should have Parameter kind");
+        prop_assert_eq!(param_without_default_symbol.kind, super::scope::SymbolKind::Parameter,
+            "Parameter without default should have Parameter kind");
     }
 }

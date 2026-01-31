@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f7ac08a965f65fddb5f425507127abd6e73071846d31023135b22813cf18fa80 # shrinks to func_name = "for", op = "<-"
+cc d6dce68510d43087d831b71902eb7841d1b741ed63b04231223b0a5662ae7ce0 # shrinks to indent_size = 0, line_count = 2

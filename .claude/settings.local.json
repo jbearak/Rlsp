@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAddress additional CodeRabbit PR review feedback\n\n- Fix markdown linting issues in design.md files \\(MD036 bold-only lines, MD040 code block language\\)\n- Fix priority-2-3-indexing design.md: queue type, sync/async lock, shutdown method, transitive deps for Priority 3\n- Make ''@'' optional in directive regexes \\(# lsp-sourced-by now works without @\\)\n- Move directive property tests to property_tests.rs per coding guidelines\n- Improve child_path computation in parent_resolve.rs to produce relative paths\n- Enhance infer_call_site_from_parent to match paths like \"subdir/child.R\"\n- Fix file_exists closure to perform filesystem check for missing-file diagnostics\nEOF\n\\)\")"
+    ]
+  }
+}
