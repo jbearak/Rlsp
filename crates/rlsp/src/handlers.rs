@@ -1169,6 +1169,22 @@ fn utf16_column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
     line.len()
 }
 
+fn next_utf8_char_boundary(line: &str, byte_offset: usize) -> usize {
+    if byte_offset >= line.len() {
+        return line.len();
+    }
+
+    // Find the next UTF-8 codepoint boundary (i.e., the start byte of the next char).
+    // This avoids creating Point ranges that land mid-codepoint (which tree-sitter rejects).
+    for (idx, _ch) in line.char_indices() {
+        if idx > byte_offset {
+            return idx;
+        }
+    }
+
+    line.len()
+}
+
 fn extract_statement_from_tree(
     tree: &tree_sitter::Tree,
     symbol: &ScopedSymbol,
@@ -1181,7 +1197,7 @@ fn extract_statement_from_tree(
     // descendant_for_point_range can behave unexpectedly on 0-length ranges at node boundaries.
     // Use a small non-empty range when possible and prefer named nodes.
     let point_start = tree_sitter::Point::new(row, byte_col);
-    let byte_col_end = if byte_col < line_text.len() { byte_col + 1 } else { line_text.len() };
+    let byte_col_end = next_utf8_char_boundary(line_text, byte_col);
     let point_end = tree_sitter::Point::new(row, byte_col_end);
 
     let root = tree.root_node();
@@ -1466,7 +1482,7 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     let row = position.line as usize;
 
     let point_start = Point::new(row, byte_col);
-    let point_end = Point::new(row, if byte_col < line_text.len() { byte_col + 1 } else { line_text.len() });
+    let point_end = Point::new(row, next_utf8_char_boundary(line_text, byte_col));
     let root = tree.root_node();
     let node = root
         .named_descendant_for_point_range(point_start, point_end)
