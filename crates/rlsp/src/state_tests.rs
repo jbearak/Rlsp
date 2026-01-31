@@ -4,7 +4,6 @@
 mod workspace_scan_tests {
     use super::super::*;
     use std::fs;
-    use std::path::PathBuf;
     use tempfile::TempDir;
     use tower_lsp::lsp_types::Url;
 
