@@ -39,9 +39,14 @@ impl Position {
         }
     }
 
-    /// Check if this is an EOF sentinel position
+    /// Check if this is an EOF sentinel position (any MAX component).
     pub fn is_eof(&self) -> bool {
         self.line == u32::MAX || self.column == u32::MAX
+    }
+
+    /// Check if this is a full EOF sentinel position (both line and column are MAX)
+    pub fn is_full_eof(&self) -> bool {
+        self.line == u32::MAX && self.column == u32::MAX
     }
 }
 
@@ -145,7 +150,10 @@ impl FunctionScopeTree {
             .filter_map(|&tuple| {
                 let interval = FunctionScopeInterval::from_tuple(tuple);
                 // Filter out invalid intervals where start > end
-                if interval.start > interval.end {
+                if interval.start.line > interval.end.line
+                    || (interval.start.line == interval.end.line
+                        && interval.start.column > interval.end.column)
+                {
                     log::warn!(
                         "Filtering out invalid interval: start ({}, {}) > end ({}, {})",
                         interval.start.line,
@@ -277,8 +285,7 @@ impl FunctionScopeTree {
 
     /// Query for the innermost (latest start) interval containing the position.
     /// 
-    /// Time complexity: O(log n + k) where n is the number of intervals and k is the
-    /// number of containing intervals.
+    /// Time complexity: O(log n) for balanced trees.
     /// 
     /// The "innermost" interval is defined as the one with the lexicographically largest
     /// start position among all intervals containing the query point. This corresponds
@@ -294,12 +301,48 @@ impl FunctionScopeTree {
     /// # Requirements
     /// Implements Requirements 2.1 (select interval with latest start), 2.2 (return None when empty)
     pub fn query_innermost(&self, pos: Position) -> Option<FunctionScopeInterval> {
-        // Get all intervals containing the position
-        let containing = self.query_point(pos);
-        
-        // Return the interval with the maximum start position (lexicographically largest)
-        // This corresponds to the innermost/most deeply nested scope
-        containing.into_iter().max_by_key(|interval| interval.start)
+        if let Some(ref root) = self.root {
+            Self::query_innermost_recursive(root, pos)
+        } else {
+            None
+        }
+    }
+
+    /// Recursive helper for innermost query that finds the interval with maximum start position.
+    fn query_innermost_recursive(
+        node: &IntervalNode,
+        pos: Position,
+    ) -> Option<FunctionScopeInterval> {
+        // If the current node starts after the position, only the left subtree might contain pos.
+        if node.interval.start > pos {
+            if let Some(ref left) = node.left {
+                if left.max_end >= pos {
+                    return Self::query_innermost_recursive(left, pos);
+                }
+            }
+            return None;
+        }
+
+        // Prefer right subtree first (larger start positions).
+        if let Some(ref right) = node.right {
+            if right.max_end >= pos {
+                if let Some(right_result) = Self::query_innermost_recursive(right, pos) {
+                    return Some(right_result);
+                }
+            }
+        }
+
+        if node.interval.contains(pos) {
+            return Some(node.interval);
+        }
+
+        if let Some(ref left) = node.left {
+            if left.max_end >= pos {
+                return Self::query_innermost_recursive(left, pos);
+            }
+        }
+
+        None
     }
 }
 
@@ -559,7 +602,7 @@ pub fn scope_at_position(
             ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
-                let is_eof_position = line == u32::MAX || column == u32::MAX;
+                let is_eof_position = Position::new(line, column).is_full_eof();
                 if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
@@ -1494,7 +1537,7 @@ where
     // STEP 2: Process timeline events (local definitions and forward sources)
     // Use interval tree for function scope queries (skip EOF sentinel)
     let query_pos = Position::new(line, column);
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if query_pos.is_eof() {
+    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if query_pos.is_full_eof() {
         Vec::new()
     } else {
         artifacts.function_scope_tree.query_point(query_pos)
@@ -4500,6 +4543,7 @@ mod tests {
         // Query at full EOF position (u32::MAX, u32::MAX)
         let eof_pos = Position::eof();
         assert!(eof_pos.is_eof(), "Position::eof() should be recognized as EOF");
+        assert!(eof_pos.is_full_eof(), "Position::eof() should be recognized as full EOF");
         
         // EOF position is lexicographically after all normal scopes
         let results_at_eof = tree.query_point(eof_pos);
@@ -4513,6 +4557,7 @@ mod tests {
         // Test with just MAX line
         let max_line_pos = Position::new(u32::MAX, 0);
         assert!(max_line_pos.is_eof(), "Position with MAX line should be recognized as EOF");
+        assert!(!max_line_pos.is_full_eof(), "Position with MAX line only should not be full EOF");
         
         let results_max_line = tree.query_point(max_line_pos);
         assert!(results_max_line.is_empty(),
@@ -4523,6 +4568,7 @@ mod tests {
         // because line 50 < line 100, so it IS inside the interval (50, 0) to (100, 0)
         let max_col_pos = Position::new(50, u32::MAX);
         assert!(max_col_pos.is_eof(), "Position with MAX column should be recognized as EOF");
+        assert!(!max_col_pos.is_full_eof(), "Position with MAX column only should not be full EOF");
         
         // The interval tree correctly includes this position because lexicographically:
         // (50, 0) <= (50, MAX) <= (100, 0) is true (50 < 100 for line comparison)
@@ -4544,6 +4590,9 @@ mod tests {
         assert!(Position::new(u32::MAX, 0).is_eof(), "MAX line should be EOF");
         assert!(Position::new(0, u32::MAX).is_eof(), "MAX column should be EOF");
         assert!(Position::new(u32::MAX, u32::MAX).is_eof(), "Both MAX should be EOF");
+        assert!(!Position::new(u32::MAX, 0).is_full_eof(), "MAX line only should not be full EOF");
+        assert!(!Position::new(0, u32::MAX).is_full_eof(), "MAX column only should not be full EOF");
+        assert!(Position::new(u32::MAX, u32::MAX).is_full_eof(), "Both MAX should be full EOF");
     }
 
     #[test]

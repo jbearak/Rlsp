@@ -215,6 +215,9 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - When adding new enum variants used in test match expressions, update all test helpers to keep matches exhaustive.
 - Avoid hard-coded line/column positions in property tests; compute stable positions from the generated code or parsed nodes.
 - When using `u32::MAX` as an EOF sentinel, ensure function-scope filtering treats it as “outside any function” to avoid leaking locals.
+- Distinguish “full EOF” (both line and column MAX) from end-of-line sentinels so scope filtering doesn’t drop function-local symbols at call sites.
+- In proptest, prefer `prop_assume!` for invalid generated cases instead of returning early with non-unit values.
+- Keep requirements docs aligned with the actual API surface (e.g., static construction vs insertion guarantees).
 - Convert UTF-16 columns to byte offsets before constructing tree-sitter `Point`s; avoid mixing column units.
 - When expanding point windows by a byte, advance to the next UTF-8 boundary to avoid mid-codepoint positions.
 - Watch for O(n²) scope detection or duplicate-detection paths in large files; prefer indexed lookups when possible.

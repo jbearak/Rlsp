@@ -7091,13 +7091,19 @@ use super::scope::{FunctionScopeInterval, FunctionScopeTree, Position};
 fn valid_interval() -> impl Strategy<Value = (u32, u32, u32, u32)> {
     // Generate start position, then end position >= start
     (0..1000u32, 0..100u32).prop_flat_map(|(start_line, start_col)| {
-        (start_line..1000u32, 0..100u32).prop_map(move |(end_line, end_col)| {
-            // Ensure end >= start lexicographically
-            if (end_line, end_col) < (start_line, start_col) {
-                (start_line, start_col, start_line, start_col)
+        let end_line_range = start_line..1000u32;
+        let end_col_range = if start_line == 1000u32 - 1 {
+            start_col..100u32
+        } else {
+            0..100u32
+        };
+        (end_line_range, end_col_range).prop_map(move |(end_line, end_col)| {
+            let end_col = if end_line == start_line {
+                end_col.max(start_col)
             } else {
-                (start_line, start_col, end_line, end_col)
-            }
+                end_col
+            };
+            (start_line, start_col, end_line, end_col)
         })
     })
 }
@@ -7358,10 +7364,9 @@ proptest! {
         let nested_end_col = base_end_col.saturating_sub(nest_offset_end_col);
 
         // Ensure nested is valid (start <= end)
-        if (nested_start_line, nested_start_col) > (nested_end_line, nested_end_col) {
-            // Skip invalid nested intervals
-            return Ok(());
-        }
+        prop_assume!(
+            (nested_start_line, nested_start_col) <= (nested_end_line, nested_end_col)
+        );
 
         let nested = (nested_start_line, nested_start_col, nested_end_line, nested_end_col);
 

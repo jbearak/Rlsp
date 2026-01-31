@@ -21,7 +21,7 @@ This feature introduces an interval tree data structure to optimize function sco
 #### Acceptance Criteria
 
 1. THE Interval_Tree SHALL store intervals defined by (start_line, start_column, end_line, end_column) tuples
-2. THE Interval_Tree SHALL support insertion of new intervals in O(log n) amortized time
+2. THE Interval_Tree SHALL support construction from a list of intervals via from_scopes in O(n log n) time
 3. THE Interval_Tree SHALL support point queries that return all intervals containing a given (line, column) position
 4. WHEN multiple intervals contain the query point, THE Interval_Tree SHALL return all containing intervals
 5. THE Interval_Tree SHALL handle intervals with identical start positions correctly
