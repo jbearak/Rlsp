@@ -269,7 +269,7 @@ RUST_LOG=rlsp=trace cargo test -p rlsp cross_file -- --nocapture
 - ✅ Metadata extraction successful
 
 **Output**:
-```
+```text
 ✓ validation_functions/collate.r test passed
   - Dependency graph correctly built
   - collate.r sources get_colnames.r
@@ -289,7 +289,7 @@ RUST_LOG=rlsp=trace cargo test -p rlsp cross_file -- --nocapture
 - ✅ No "parent file not found" error
 
 **Output**:
-```
+```text
 ✓ backward directive ../oos.r test passed
   - Backward directive correctly parsed
   - Path ../oos.r correctly resolved
@@ -310,7 +310,7 @@ RUST_LOG=rlsp=trace cargo test -p rlsp cross_file -- --nocapture
 - ✅ Metadata extraction successful
 
 **Output**:
-```
+```text
 ✓ basic source() call test passed
   - source() call correctly detected in file_a.r
   - Dependency graph correctly built
@@ -333,7 +333,7 @@ RUST_LOG=rlsp=trace cargo test -p rlsp cross_file -- --nocapture
 - ✅ Affected files correctly identified for revalidation
 
 **Output**:
-```
+```text
 ✓ Document lifecycle metadata extraction test passed
   - textDocument/didOpen triggers metadata extraction
   - textDocument/didChange triggers metadata extraction

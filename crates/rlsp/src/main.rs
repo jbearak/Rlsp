@@ -10,6 +10,7 @@ mod builtins;
 mod cross_file;
 mod handlers;
 mod help;
+mod parser_pool;
 mod r_env;
 mod state;
 

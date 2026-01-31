@@ -12,7 +12,9 @@ use tower_lsp::lsp_types::Url;
 use super::cache::{ParentCacheKey, ParentResolution};
 use super::config::{CallSiteDefault, CrossFileConfig};
 use super::dependency::DependencyGraph;
-use super::types::{byte_offset_to_utf16_column, BackwardDirective, CallSiteSpec, CrossFileMetadata};
+use super::types::{byte_offset_to_utf16_column, CallSiteSpec, CrossFileMetadata};
+#[cfg(test)]
+use super::types::BackwardDirective;
 
 /// Resolve the effective call site when a file is sourced multiple times.
 /// Returns the earliest call site position using lexicographic ordering.
@@ -167,6 +169,13 @@ where
 
     let mut candidates: Vec<Candidate> = Vec::new();
 
+    // Derive child_path from child_uri for match pattern and call-site inference
+    let child_path = child_uri
+        .to_file_path()
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_default();
+
     // From backward directives
     for directive in &metadata.sourced_by {
         if let Some(parent_uri) = resolve_path(&directive.path) {
@@ -178,7 +187,7 @@ where
                 CallSiteSpec::Match(pattern) => {
                     // Resolve match pattern in parent content
                     if let Some(parent_content) = get_content(&parent_uri) {
-                        if let Some((line, col)) = resolve_match_pattern(&parent_content, pattern, &directive.path) {
+                        if let Some((line, col)) = resolve_match_pattern(&parent_content, pattern, &child_path) {
                             (Some(line), Some(col), 0) // Same precedence as line=
                         } else {
                             // Pattern not found, fall back to config default
@@ -208,7 +217,7 @@ where
                     } else {
                         // Try text-inference: scan parent for source() call to child
                         if let Some(parent_content) = get_content(&parent_uri) {
-                            if let Some((line, col)) = infer_call_site_from_parent(&parent_content, &directive.path) {
+                            if let Some((line, col)) = infer_call_site_from_parent(&parent_content, &child_path) {
                                 (Some(line), Some(col), 1) // Precedence 1: inferred
                             } else {
                                 // Fall back to config default
@@ -547,7 +556,8 @@ y <- 2"#;
         let child = url("child.R");
         let parent = url("main.R");
 
-        let parent_content = "x <- 1\nsource(\"../main.R\")\ny <- 2";
+        // Parent content should have source() call to child.R (the child file)
+        let parent_content = "x <- 1\nsource(\"child.R\")\ny <- 2";
 
         let result = resolve_parent_with_content(
             &meta,
@@ -583,7 +593,8 @@ y <- 2"#;
         let child = url("child.R");
         let parent = url("main.R");
 
-        let parent_content = "x <- 1\nsource(\"../main.R\")\ny <- 2";
+        // Parent content should have source() call to child.R (the child file)
+        let parent_content = "x <- 1\nsource(\"child.R\")\ny <- 2";
 
         let result = resolve_parent_with_content(
             &meta,
@@ -597,7 +608,7 @@ y <- 2"#;
         match result {
             ParentResolution::Single { parent_uri, call_site_line, call_site_column } => {
                 assert_eq!(parent_uri, parent);
-                // Should infer call site from source() call
+                // Should infer call site from source("child.R") call
                 assert_eq!(call_site_line, Some(1));
                 assert_eq!(call_site_column, Some(0));
             }
@@ -665,6 +676,87 @@ y <- 2"#;
                 );
             }
             _ => panic!("Expected Single resolution, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_resolve_parent_uses_child_path_for_match() {
+        // Test that match= pattern resolution uses child_path derived from child_uri,
+        // not directive.path (which is the parent path)
+        let meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../main.R".to_string(),
+                call_site: CallSiteSpec::Match("source(".to_string()),
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+        let graph = DependencyGraph::new();
+        let config = CrossFileConfig::default();
+        // Child URI with a specific filename
+        let child = Url::parse("file:///project/subdir/child.R").unwrap();
+        let parent = url("main.R");
+
+        // Parent content has source() call to child.R (not main.R)
+        let parent_content = "x <- 1\nsource(\"subdir/child.R\")\ny <- 2";
+
+        let result = resolve_parent_with_content(
+            &meta,
+            &graph,
+            &child,
+            &config,
+            |p| if p == "../main.R" { Some(parent.clone()) } else { None },
+            |_| Some(parent_content.to_string()),
+        );
+
+        match result {
+            ParentResolution::Single { parent_uri, call_site_line, call_site_column } => {
+                assert_eq!(parent_uri, parent);
+                // Should find the source() call to child.R at line 1
+                assert_eq!(call_site_line, Some(1));
+                assert_eq!(call_site_column, Some(0));
+            }
+            _ => panic!("Expected Single resolution"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_parent_uses_child_path_for_inference() {
+        // Test that call-site inference uses child_path derived from child_uri
+        let meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../main.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+        let graph = DependencyGraph::new();
+        let config = CrossFileConfig::default();
+        // Child URI with a specific filename
+        let child = Url::parse("file:///project/subdir/child.R").unwrap();
+        let parent = url("main.R");
+
+        // Parent content has source() call to child.R (not main.R)
+        let parent_content = "x <- 1\nsource(\"child.R\")\ny <- 2";
+
+        let result = resolve_parent_with_content(
+            &meta,
+            &graph,
+            &child,
+            &config,
+            |p| if p == "../main.R" { Some(parent.clone()) } else { None },
+            |_| Some(parent_content.to_string()),
+        );
+
+        match result {
+            ParentResolution::Single { parent_uri, call_site_line, call_site_column } => {
+                assert_eq!(parent_uri, parent);
+                // Should infer call site from source("child.R") at line 1
+                assert_eq!(call_site_line, Some(1));
+                assert_eq!(call_site_column, Some(0));
+            }
+            _ => panic!("Expected Single resolution"),
         }
     }
 }

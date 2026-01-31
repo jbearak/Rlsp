@@ -8,7 +8,7 @@ This design extends the on-demand indexing system to handle Priority 2 (backward
 
 ### Component Structure
 
-```
+```text
 Backend
   ├── state: Arc<RwLock<WorldState>>
   ├── client: Client

@@ -13,7 +13,7 @@ The rlsp extension has been successfully built and installed.
 
 ### Build Output
 
-```
+```text
 Building Rlsp...
    Compiling rlsp v0.1.0 (/Users/jmb/repos/rlsp/crates/rlsp)
     Finished `release` profile [optimized] target(s) in 4.83s
@@ -58,7 +58,7 @@ These warnings do not affect functionality and can be addressed in future cleanu
 - **Status**: Successfully installed in VS Code
 
 ### Extension Contents
-```
+```text
 rlsp-0.1.0.vsix
 ├─ LICENSE.txt
 ├─ language-configuration.json [0.71 KB]
@@ -191,7 +191,7 @@ If tests fail, check:
 
 ## Conclusion
 
-**Task 16.3 Build Phase: COMPLETE ✅**
+## Task 16.3 Build Phase: COMPLETE ✅
 
 The rlsp extension has been successfully built and installed. The automated portion of this task is complete. Manual testing in VS Code is now required to verify that cross-file awareness works correctly in real-world usage.
 

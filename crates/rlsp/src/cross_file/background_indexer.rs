@@ -274,22 +274,14 @@ impl BackgroundIndexer {
         // Extract cross-file metadata
         let cross_file_meta = extract_metadata(&content);
 
-        // Compute scope artifacts
-        let artifacts = {
-            let mut parser = tree_sitter::Parser::new();
-            if parser
-                .set_language(&tree_sitter_r::LANGUAGE.into())
-                .is_ok()
-            {
-                if let Some(tree) = parser.parse(&content, None) {
-                    compute_artifacts(uri, &tree, &content)
-                } else {
-                    crate::cross_file::scope::ScopeArtifacts::default()
-                }
+        // Compute scope artifacts using thread-local parser for efficiency
+        let artifacts = crate::parser_pool::with_parser(|parser| {
+            if let Some(tree) = parser.parse(&content, None) {
+                compute_artifacts(uri, &tree, &content)
             } else {
                 crate::cross_file::scope::ScopeArtifacts::default()
             }
-        };
+        });
 
         let snapshot = FileSnapshot::with_content_hash(&metadata_fs, &content);
 
@@ -401,16 +393,18 @@ impl BackgroundIndexer {
                             }
                             
                             if !q.iter().any(|t| t.uri == source_uri) {
+                                // Use saturating_add to prevent integer overflow at max depth
+                                let next_depth = current_depth.saturating_add(1);
                                 q.push_back(IndexTask {
                                     uri: source_uri.clone(),
                                     priority: 3,
-                                    depth: current_depth + 1,
+                                    depth: next_depth,
                                     submitted_at: Instant::now(),
                                 });
                                 log::trace!(
                                     "Queued transitive dependency: {} (depth {})",
                                     source_uri,
-                                    current_depth + 1
+                                    next_depth
                                 );
                             }
                         }

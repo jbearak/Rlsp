@@ -236,7 +236,7 @@ Based on the test results, I recommend:
 
 ## Test Output Summary
 
-```
+```text
 running 286 tests
 test result: ok. 286 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out
 

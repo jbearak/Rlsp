@@ -138,7 +138,7 @@ async fn did_change(&self, params: DidChangeTextDocumentParams) {
 **Test Result**: ✅ PASSED
 
 **Test Output**:
-```
+```text
 === Testing Document Lifecycle Metadata Extraction ===
 
 Step 1: Simulating textDocument/didOpen for main.r
