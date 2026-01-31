@@ -252,7 +252,7 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
 
         // Compute affected files while holding write lock
-        let (work_items, debounce_ms, files_to_index) = {
+        let (work_items, debounce_ms, files_to_index, on_demand_enabled) = {
             let mut state = self.state.write().await;
             state.open_document(uri.clone(), &text, Some(version));
             // Record as recently opened for activity prioritization
@@ -263,41 +263,46 @@ impl LanguageServer for Backend {
             let uri_clone = uri.clone();
             let workspace_root = state.workspace_folders.first().cloned();
             
+            let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
+            
             // On-demand indexing: Collect sourced files that need indexing
             // Priority 1: Files directly sourced by this open document
             let mut files_to_index = Vec::new();
-            let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
-                &uri_clone, &meta, workspace_root.as_ref()
-            );
             
-            for source in &meta.sources {
-                if let Some(ctx) = path_ctx.as_ref() {
-                    if let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&source.path, ctx) {
-                        if let Ok(source_uri) = Url::from_file_path(resolved) {
-                            // Check if file needs indexing (not open, not in workspace index)
-                            if !state.documents.contains_key(&source_uri) 
-                                && !state.cross_file_workspace_index.contains(&source_uri) {
-                                log::trace!("Scheduling on-demand indexing for sourced file: {}", source_uri);
-                                files_to_index.push((source_uri, 1)); // Priority 1
+            if on_demand_enabled {
+                let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+                    &uri_clone, &meta, workspace_root.as_ref()
+                );
+                
+                for source in &meta.sources {
+                    if let Some(ctx) = path_ctx.as_ref() {
+                        if let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&source.path, ctx) {
+                            if let Ok(source_uri) = Url::from_file_path(resolved) {
+                                // Check if file needs indexing (not open, not in workspace index)
+                                if !state.documents.contains_key(&source_uri) 
+                                    && !state.cross_file_workspace_index.contains(&source_uri) {
+                                    log::trace!("Scheduling on-demand indexing for sourced file: {}", source_uri);
+                                    files_to_index.push((source_uri, 1)); // Priority 1
+                                }
                             }
                         }
                     }
                 }
-            }
-            
-            // Priority 2: Files referenced by backward directives
-            let backward_ctx = crate::cross_file::path_resolve::PathContext::new(
-                &uri_clone, workspace_root.as_ref()
-            );
-            
-            for directive in &meta.sourced_by {
-                if let Some(ctx) = backward_ctx.as_ref() {
-                    if let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&directive.path, ctx) {
-                        if let Ok(parent_uri) = Url::from_file_path(resolved) {
-                            if !state.documents.contains_key(&parent_uri) 
-                                && !state.cross_file_workspace_index.contains(&parent_uri) {
-                                log::trace!("Scheduling on-demand indexing for parent file: {}", parent_uri);
-                                files_to_index.push((parent_uri, 2)); // Priority 2
+                
+                // Priority 2: Files referenced by backward directives
+                let backward_ctx = crate::cross_file::path_resolve::PathContext::new(
+                    &uri_clone, workspace_root.as_ref()
+                );
+                
+                for directive in &meta.sourced_by {
+                    if let Some(ctx) = backward_ctx.as_ref() {
+                        if let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&directive.path, ctx) {
+                            if let Ok(parent_uri) = Url::from_file_path(resolved) {
+                                if !state.documents.contains_key(&parent_uri) 
+                                    && !state.cross_file_workspace_index.contains(&parent_uri) {
+                                    log::trace!("Scheduling on-demand indexing for parent file: {}", parent_uri);
+                                    files_to_index.push((parent_uri, 2)); // Priority 2
+                                }
                             }
                         }
                     }
@@ -378,80 +383,83 @@ impl LanguageServer for Backend {
                 .collect();
             
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
-            (work_items, debounce_ms, files_to_index)
+            (work_items, debounce_ms, files_to_index, on_demand_enabled)
         };
         
-        // Perform SYNCHRONOUS on-demand indexing for Priority 1 files (directly sourced)
-        // This ensures symbols are available BEFORE diagnostics run
-        let priority_1_files: Vec<Url> = files_to_index.iter()
-            .filter(|(_, priority)| *priority == 1)
-            .map(|(uri, _)| uri.clone())
-            .collect();
-        
-        // Collect metadata from Priority 1 files for transitive dependency queuing
-        let mut priority_1_metadata: Vec<(Url, crate::cross_file::CrossFileMetadata)> = Vec::new();
-        
-        if !priority_1_files.is_empty() {
-            log::info!("Synchronously indexing {} directly sourced files before diagnostics", priority_1_files.len());
-            for file_uri in priority_1_files {
-                if let Some(meta) = self.index_file_on_demand(&file_uri).await {
-                    priority_1_metadata.push((file_uri, meta));
+        // Only perform on-demand indexing if enabled
+        if on_demand_enabled {
+            // Perform SYNCHRONOUS on-demand indexing for Priority 1 files (directly sourced)
+            // This ensures symbols are available BEFORE diagnostics run
+            let priority_1_files: Vec<Url> = files_to_index.iter()
+                .filter(|(_, priority)| *priority == 1)
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            
+            // Collect metadata from Priority 1 files for transitive dependency queuing
+            let mut priority_1_metadata: Vec<(Url, crate::cross_file::CrossFileMetadata)> = Vec::new();
+            
+            if !priority_1_files.is_empty() {
+                log::info!("Synchronously indexing {} directly sourced files before diagnostics", priority_1_files.len());
+                for file_uri in priority_1_files {
+                    if let Some(meta) = self.index_file_on_demand(&file_uri).await {
+                        priority_1_metadata.push((file_uri, meta));
+                    }
                 }
             }
-        }
-        
-        // Queue transitive dependencies from Priority 1 files as Priority 3
-        let (priority_3_enabled, workspace_root) = {
-            let state = self.state.read().await;
-            (
-                state.cross_file_config.on_demand_indexing_priority_3_enabled,
-                state.workspace_folders.first().cloned(),
-            )
-        };
-        
-        if priority_3_enabled && !priority_1_metadata.is_empty() {
-            for (file_uri, meta) in &priority_1_metadata {
-                let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
-                    file_uri, meta, workspace_root.as_ref()
-                );
-                
-                for source in &meta.sources {
-                    if let Some(ctx) = path_ctx.as_ref() {
-                        if let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&source.path, ctx) {
-                            if let Ok(source_uri) = Url::from_file_path(resolved) {
-                                let needs_indexing = {
-                                    let state = self.state.read().await;
-                                    !state.documents.contains_key(&source_uri)
-                                        && !state.cross_file_workspace_index.contains(&source_uri)
-                                };
-                                
-                                if needs_indexing {
-                                    log::trace!("Queuing transitive dependency from Priority 1: {}", source_uri);
-                                    self.background_indexer.submit(source_uri, 3, 1);
+            
+            // Queue transitive dependencies from Priority 1 files as Priority 3
+            let (priority_3_enabled, workspace_root) = {
+                let state = self.state.read().await;
+                (
+                    state.cross_file_config.on_demand_indexing_priority_3_enabled,
+                    state.workspace_folders.first().cloned(),
+                )
+            };
+            
+            if priority_3_enabled && !priority_1_metadata.is_empty() {
+                for (file_uri, meta) in &priority_1_metadata {
+                    let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
+                        file_uri, meta, workspace_root.as_ref()
+                    );
+                    
+                    for source in &meta.sources {
+                        if let Some(ctx) = path_ctx.as_ref() {
+                            if let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&source.path, ctx) {
+                                if let Ok(source_uri) = Url::from_file_path(resolved) {
+                                    let needs_indexing = {
+                                        let state = self.state.read().await;
+                                        !state.documents.contains_key(&source_uri)
+                                            && !state.cross_file_workspace_index.contains(&source_uri)
+                                    };
+                                    
+                                    if needs_indexing {
+                                        log::trace!("Queuing transitive dependency from Priority 1: {}", source_uri);
+                                        self.background_indexer.submit(source_uri, 3, 1);
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-        
-        // Priority 2 files (backward directive targets) are indexed in background
-        let priority_2_enabled = {
-            let state = self.state.read().await;
-            state.cross_file_config.on_demand_indexing_priority_2_enabled
-        };
-        
-        if priority_2_enabled {
-            let priority_2_files: Vec<Url> = files_to_index.iter()
-                .filter(|(_, priority)| *priority == 2)
-                .map(|(uri, _)| uri.clone())
-                .collect();
             
-            if !priority_2_files.is_empty() {
-                log::info!("Submitting {} backward directive targets for background indexing", priority_2_files.len());
-                for file_uri in priority_2_files {
-                    self.background_indexer.submit(file_uri, 2, 0);
+            // Priority 2 files (backward directive targets) are indexed in background
+            let priority_2_enabled = {
+                let state = self.state.read().await;
+                state.cross_file_config.on_demand_indexing_priority_2_enabled
+            };
+            
+            if priority_2_enabled {
+                let priority_2_files: Vec<Url> = files_to_index.iter()
+                    .filter(|(_, priority)| *priority == 2)
+                    .map(|(uri, _)| uri.clone())
+                    .collect();
+                
+                if !priority_2_files.is_empty() {
+                    log::info!("Submitting {} backward directive targets for background indexing", priority_2_files.len());
+                    for file_uri in priority_2_files {
+                        self.background_indexer.submit(file_uri, 2, 0);
+                    }
                 }
             }
         }
@@ -704,6 +712,10 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
+        
+        // Cancel pending background indexing for this URI
+        self.background_indexer.cancel_uri(uri);
+        
         let mut state = self.state.write().await;
         
         // Clear diagnostics gate state
@@ -769,6 +781,17 @@ impl LanguageServer for Backend {
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         log::trace!("Received watched files change: {} changes", params.changes.len());
+        
+        // Collect deleted URIs for batch cancellation
+        let deleted_uris: Vec<Url> = params.changes.iter()
+            .filter(|c| c.typ == FileChangeType::DELETED)
+            .map(|c| c.uri.clone())
+            .collect();
+        
+        // Cancel pending background indexing for deleted files
+        if !deleted_uris.is_empty() {
+            self.background_indexer.cancel_uris(deleted_uris.iter());
+        }
         
         // Collect URIs to update and affected open documents
         let (uris_to_update, affected_open_docs): (Vec<Url>, Vec<Url>) = {

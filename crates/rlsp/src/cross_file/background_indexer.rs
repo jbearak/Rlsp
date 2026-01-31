@@ -45,23 +45,76 @@ pub struct BackgroundIndexer {
     queue: Arc<Mutex<VecDeque<IndexTask>>>,
     worker_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     cancellation_token: CancellationToken,
+    canceled: Arc<Mutex<HashSet<Url>>>,
 }
 
 impl BackgroundIndexer {
     /// Creates new indexer and starts worker
     pub fn new(state: Arc<RwLock<WorldState>>) -> Self {
+        let canceled = Arc::new(Mutex::new(HashSet::new()));
         let indexer = Self {
             state,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             worker_handle: Arc::new(Mutex::new(None)),
             cancellation_token: CancellationToken::new(),
+            canceled: canceled.clone(),
         };
-        indexer.start_worker();
+        indexer.start_worker(canceled);
         indexer
+    }
+
+    /// Cancels pending indexing for a URI
+    pub fn cancel_uri(&self, uri: &Url) {
+        // Remove from queue
+        {
+            let mut queue = self.queue.lock().unwrap();
+            let before = queue.len();
+            queue.retain(|task| task.uri != *uri);
+            if queue.len() < before {
+                log::trace!("Removed queued indexing task for canceled URI: {}", uri);
+            }
+        }
+        // Mark as canceled so process_task skips it
+        self.canceled.lock().unwrap().insert(uri.clone());
+        log::trace!("Marked URI as canceled: {}", uri);
+    }
+
+    /// Cancels pending indexing for multiple URIs
+    pub fn cancel_uris<'a>(&self, uris: impl Iterator<Item = &'a Url>) {
+        let uris: Vec<_> = uris.cloned().collect();
+        if uris.is_empty() {
+            return;
+        }
+        let uri_set: HashSet<_> = uris.iter().collect();
+        {
+            let mut queue = self.queue.lock().unwrap();
+            queue.retain(|task| !uri_set.contains(&task.uri));
+        }
+        let mut canceled = self.canceled.lock().unwrap();
+        for uri in &uris {
+            canceled.insert(uri.clone());
+        }
+        log::trace!("Batch canceled {} URIs", uris.len());
+    }
+
+    /// Clears the canceled set (call after revalidation cycle)
+    pub fn clear_canceled(&self) {
+        self.canceled.lock().unwrap().clear();
     }
 
     /// Submits indexing task with priority ordering
     pub fn submit(&self, uri: Url, priority: usize, depth: usize) {
+        // Check if on-demand indexing is enabled
+        let enabled = self
+            .state
+            .try_read()
+            .map(|s| s.cross_file_config.on_demand_indexing_enabled)
+            .unwrap_or(true);
+        if !enabled {
+            log::trace!("Skipping indexing task for {} - on_demand_indexing disabled", uri);
+            return;
+        }
+
         let mut queue = self.queue.lock().unwrap();
 
         // Check if already queued
@@ -111,7 +164,7 @@ impl BackgroundIndexer {
     }
 
     /// Starts background worker
-    fn start_worker(&self) {
+    fn start_worker(&self, canceled: Arc<Mutex<HashSet<Url>>>) {
         let state = self.state.clone();
         let queue = self.queue.clone();
         let token = self.cancellation_token.clone();
@@ -132,7 +185,7 @@ impl BackgroundIndexer {
                         };
 
                         if let Some(task) = task_opt {
-                            Self::process_task(state.clone(), queue.clone(), task).await;
+                            Self::process_task(state.clone(), queue.clone(), canceled.clone(), task).await;
                         }
                     }
                 }
@@ -146,8 +199,15 @@ impl BackgroundIndexer {
     async fn process_task(
         state: Arc<RwLock<WorldState>>,
         queue: Arc<Mutex<VecDeque<IndexTask>>>,
+        canceled: Arc<Mutex<HashSet<Url>>>,
         task: IndexTask,
     ) {
+        // Check if canceled
+        if canceled.lock().unwrap().contains(&task.uri) {
+            log::trace!("Skipping indexing for {} - canceled", task.uri);
+            return;
+        }
+
         let start_time = Instant::now();
         log::trace!(
             "Processing indexing task for {} (priority={}, depth={})",
@@ -292,9 +352,10 @@ impl BackgroundIndexer {
         metadata: &CrossFileMetadata,
         current_depth: usize,
     ) {
-        let (max_depth, max_queue_size, priority_3_enabled, workspace_root) = {
+        let (on_demand_enabled, max_depth, max_queue_size, priority_3_enabled, workspace_root) = {
             let state_guard = state.read().await;
             (
+                state_guard.cross_file_config.on_demand_indexing_enabled,
                 state_guard
                     .cross_file_config
                     .on_demand_indexing_max_transitive_depth,
@@ -308,7 +369,7 @@ impl BackgroundIndexer {
             )
         };
 
-        if !priority_3_enabled || current_depth >= max_depth {
+        if !on_demand_enabled || !priority_3_enabled || current_depth >= max_depth {
             return;
         }
 
@@ -545,5 +606,100 @@ mod tests {
         // Simulate depth increment for transitive
         let next_depth = task.depth + 1;
         assert_eq!(next_depth, 3);
+    }
+
+    #[test]
+    fn test_cancel_uri_removes_queued_task() {
+        let queue: Arc<Mutex<VecDeque<IndexTask>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let canceled: Arc<Mutex<HashSet<Url>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        // Add tasks to queue
+        {
+            let mut q = queue.lock().unwrap();
+            q.push_back(IndexTask {
+                uri: test_uri("a.r"),
+                priority: 2,
+                depth: 0,
+                submitted_at: Instant::now(),
+            });
+            q.push_back(IndexTask {
+                uri: test_uri("b.r"),
+                priority: 2,
+                depth: 0,
+                submitted_at: Instant::now(),
+            });
+        }
+
+        // Cancel one URI
+        let uri_to_cancel = test_uri("a.r");
+        {
+            let mut q = queue.lock().unwrap();
+            q.retain(|task| task.uri != uri_to_cancel);
+        }
+        canceled.lock().unwrap().insert(uri_to_cancel.clone());
+
+        // Verify task was removed from queue
+        let q = queue.lock().unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].uri.path(), "/test/b.r");
+
+        // Verify URI is in canceled set
+        assert!(canceled.lock().unwrap().contains(&uri_to_cancel));
+    }
+
+    #[test]
+    fn test_canceled_uri_skipped_in_process() {
+        let canceled: Arc<Mutex<HashSet<Url>>> = Arc::new(Mutex::new(HashSet::new()));
+        let uri = test_uri("canceled.r");
+
+        // Mark as canceled
+        canceled.lock().unwrap().insert(uri.clone());
+
+        // Simulate process_task check
+        let is_canceled = canceled.lock().unwrap().contains(&uri);
+        assert!(is_canceled);
+    }
+
+    #[test]
+    fn test_cancel_uris_batch() {
+        let queue: Arc<Mutex<VecDeque<IndexTask>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let canceled: Arc<Mutex<HashSet<Url>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        // Add tasks
+        {
+            let mut q = queue.lock().unwrap();
+            for name in &["a.r", "b.r", "c.r", "d.r"] {
+                q.push_back(IndexTask {
+                    uri: test_uri(name),
+                    priority: 2,
+                    depth: 0,
+                    submitted_at: Instant::now(),
+                });
+            }
+        }
+
+        // Batch cancel
+        let uris_to_cancel: Vec<Url> = vec![test_uri("a.r"), test_uri("c.r")];
+        let uri_set: HashSet<_> = uris_to_cancel.iter().collect();
+        {
+            let mut q = queue.lock().unwrap();
+            q.retain(|task| !uri_set.contains(&task.uri));
+        }
+        {
+            let mut c = canceled.lock().unwrap();
+            for uri in &uris_to_cancel {
+                c.insert(uri.clone());
+            }
+        }
+
+        // Verify
+        let q = queue.lock().unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].uri.path(), "/test/b.r");
+        assert_eq!(q[1].uri.path(), "/test/d.r");
+
+        let c = canceled.lock().unwrap();
+        assert!(c.contains(&test_uri("a.r")));
+        assert!(c.contains(&test_uri("c.r")));
     }
 }

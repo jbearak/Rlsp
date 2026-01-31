@@ -98,20 +98,20 @@ This plan systematically debugs and fixes the cross-file awareness feature by ad
   - Ensure all tests pass, ask the user if questions arise
 
 - [ ] 5. Add unit tests for metadata extraction
-  - [~] 5.1 Add unit tests for source() call detection
+  - [ ] 5.1 Add unit tests for source() call detection
     - Test detection of source("file.r")
     - Test detection of source('file.r')
     - Test detection with relative paths (../file.r, subdir/file.r)
     - Test UTF-16 column calculation
     - _Requirements: 2.1_
   
-  - [~] 5.2 Write property test for source() call detection
+  - [ ] 5.2 Write property test for source() call detection
     - **Property 1: Source call detection completeness**
     - **Validates: Requirements 2.1**
     - Generate random R files with source() calls
     - Verify all source() calls are detected
   
-  - [~] 5.3 Add unit tests for directive parsing
+  - [ ] 5.3 Add unit tests for directive parsing
     - Test @lsp-run-by without colon or quotes
     - Test @lsp-run-by: with colon
     - Test @lsp-run-by: "file.r" with colon and quotes
@@ -119,14 +119,14 @@ This plan systematically debugs and fixes the cross-file awareness feature by ad
     - Test working directory directives
     - _Requirements: 2.2, 2.3_
   
-  - [~] 5.4 Write property test for directive parsing
+  - [ ] 5.4 Write property test for directive parsing
     - **Property 2: Directive parsing flexibility**
     - **Validates: Requirements 2.2**
     - Generate directives with various syntax combinations
     - Verify all parse correctly
 
 - [ ] 6. Add unit tests for path resolution
-  - [~] 6.1 Add unit tests for relative path resolution
+  - [ ] 6.1 Add unit tests for relative path resolution
     - Test path resolution with working directory
     - Test path resolution without working directory
     - Test ../ path navigation
@@ -134,53 +134,53 @@ This plan systematically debugs and fixes the cross-file awareness feature by ad
     - Test path normalization
     - _Requirements: 4.1, 4.2, 4.3, 4.6_
   
-  - [~] 6.2 Write property tests for path resolution
+  - [ ] 6.2 Write property tests for path resolution
     - **Property 14-20: Path resolution properties**
     - **Validates: Requirements 4.1-4.8**
     - Generate random paths with various components
     - Verify resolution follows documented rules
   
-  - [~] 6.3 Add unit tests for path resolution errors
+  - [ ] 6.3 Add unit tests for path resolution errors
     - Test non-existent file handling
     - Test invalid path handling
     - Verify error messages include attempted path and base
     - _Requirements: 4.5, 9.2_
 
 - [ ] 7. Add unit tests for dependency graph
-  - [~] 7.1 Add unit tests for edge creation
+  - [ ] 7.1 Add unit tests for edge creation
     - Test edge creation from source() calls
     - Test edge creation from backward directives
     - Test edge deduplication
     - Test call site position storage
     - _Requirements: 3.1, 3.2, 3.6_
   
-  - [~] 7.2 Write property tests for dependency graph
+  - [ ] 7.2 Write property tests for dependency graph
     - **Property 8-13: Dependency graph properties**
     - **Validates: Requirements 3.1-3.6**
     - Generate random file relationships
     - Verify graph operations maintain invariants
   
-  - [~] 7.3 Add unit tests for directive-AST conflict resolution
+  - [ ] 7.3 Add unit tests for directive-AST conflict resolution
     - Test directive with call site overrides AST at same call site
     - Test directive without call site suppresses all AST edges
     - Test AST edges to different targets are preserved
     - _Requirements: 3.5_
 
 - [ ] 8. Add unit tests for scope resolution
-  - [~] 8.1 Add unit tests for basic scope resolution
+  - [ ] 8.1 Add unit tests for basic scope resolution
     - Test scope after single source() call
     - Test scope with multiple source() calls
     - Test local symbol precedence over sourced symbols
     - Test symbol structure (name, type, source file)
     - _Requirements: 5.1, 5.2, 5.4, 5.6_
   
-  - [~] 8.2 Write property tests for scope resolution
+  - [ ] 8.2 Write property tests for scope resolution
     - **Property 21-26: Scope resolution properties**
     - **Validates: Requirements 5.1-5.6**
     - Generate random source chains
     - Verify scope resolution maintains invariants
   
-  - [~] 8.3 Add unit tests for scope resolution edge cases
+  - [ ] 8.3 Add unit tests for scope resolution edge cases
     - Test chain traversal with depth limit
     - Test cycle detection
     - Test empty scope (no sources)
@@ -215,97 +215,97 @@ This plan systematically debugs and fixes the cross-file awareness feature by ad
     - _Requirements: 10.1, 10.2, 10.3, 10.4_
 
 - [ ] 11. Investigate and fix path resolution issues
-  - [~] 11.1 Debug backward directive path resolution
+  - [ ] 11.1 Debug backward directive path resolution
     - Add detailed logging to directive path resolution
     - Test with ../oos.r scenario
     - Identify why "parent file not found" occurs
     - _Requirements: 2.4, 4.8_
   
-  - [~] 11.2 Fix path resolution bugs
+  - [ ] 11.2 Fix path resolution bugs
     - Implement fix for base directory selection
     - Implement fix for ../ navigation
     - Ensure paths are resolved relative to directive file
     - Add error handling with clear messages
     - _Requirements: 4.1, 4.2, 4.3, 4.8, 9.2_
   
-  - [~] 11.3 Verify path resolution fixes with property tests
+  - [ ] 11.3 Verify path resolution fixes with property tests
     - Run property tests for path resolution
     - Verify all path types resolve correctly
     - Verify error messages are clear
 
 - [ ] 12. Investigate and fix metadata extraction issues
-  - [~] 12.1 Debug source() call detection
+  - [ ] 12.1 Debug source() call detection
     - Add detailed logging to tree-sitter parsing
     - Test with validation_functions/collate.r scenario
     - Identify if source() calls are being detected
     - _Requirements: 2.1_
   
-  - [~] 12.2 Fix metadata extraction bugs
+  - [ ] 12.2 Fix metadata extraction bugs
     - Implement fix for source() call detection
     - Implement fix for directive parsing
     - Ensure metadata is cached correctly
     - Add error handling for parse failures
     - _Requirements: 2.1, 2.2, 2.5, 2.6_
   
-  - [~] 12.3 Verify metadata extraction fixes with property tests
+  - [ ] 12.3 Verify metadata extraction fixes with property tests
     - Run property tests for metadata extraction
     - Verify all source() calls are detected
     - Verify all directive syntaxes parse
 
 - [ ] 13. Investigate and fix dependency graph issues
-  - [~] 13.1 Debug edge creation
+  - [ ] 13.1 Debug edge creation
     - Add detailed logging to edge creation
     - Verify edges are created from metadata
     - Verify edges are stored with correct call sites
     - _Requirements: 3.1, 3.2_
   
-  - [~] 13.2 Fix dependency graph bugs
+  - [ ] 13.2 Fix dependency graph bugs
     - Implement fix for edge creation from source() calls
     - Implement fix for edge creation from directives
     - Implement fix for conflict resolution
     - Ensure edges are queryable
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
   
-  - [~] 13.3 Verify dependency graph fixes with property tests
+  - [ ] 13.3 Verify dependency graph fixes with property tests
     - Run property tests for dependency graph
     - Verify graph operations maintain invariants
     - Verify conflict resolution is correct
 
 - [ ] 14. Investigate and fix scope resolution issues
-  - [~] 14.1 Debug scope resolution
+  - [ ] 14.1 Debug scope resolution
     - Add detailed logging to scope traversal
     - Verify scope resolution is called by handlers
     - Verify symbols from sourced files are included
     - _Requirements: 5.1, 5.2_
   
-  - [~] 14.2 Fix scope resolution bugs
+  - [ ] 14.2 Fix scope resolution bugs
     - Implement fix for symbol inclusion from sourced files
     - Implement fix for chain traversal
     - Implement fix for local symbol precedence
     - Ensure cycle detection works
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
   
-  - [~] 14.3 Verify scope resolution fixes with property tests
+  - [ ] 14.3 Verify scope resolution fixes with property tests
     - Run property tests for scope resolution
     - Verify symbols from sourced files are available
     - Verify precedence rules are maintained
 
 - [ ] 15. Verify configuration and error handling
-  - [~] 15.1 Verify configuration is loaded correctly
+  - [ ] 15.1 Verify configuration is loaded correctly
     - Check cross-file is enabled by default
     - Check max_chain_depth is set correctly
     - Check diagnostic severities are configured
     - Add tests for configuration parsing
     - _Requirements: 8.1, 8.2, 8.3, 8.4_
   
-  - [~] 15.2 Verify error handling throughout system
+  - [ ] 15.2 Verify error handling throughout system
     - Check all errors are logged with context
     - Check system continues after non-fatal errors
     - Check error messages are actionable
     - Add missing error handling if needed
     - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6_
   
-  - [~] 15.3 Write property tests for error resilience
+  - [ ] 15.3 Write property tests for error resilience
     - **Property 6, 31: Error resilience properties**
     - **Validates: Requirements 2.6, 9.6**
     - Generate invalid inputs
