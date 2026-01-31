@@ -275,4 +275,3 @@ Releases use semantic versioning with git tags. Creating a tag in the format `vX
 
 ## License
 [GPLv3](LICENSE) - This project is open source software. You can use, modify, and distribute it with attribution, but any derivative works must also be open source under GPLv3.
-MIT License
