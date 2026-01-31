@@ -325,8 +325,8 @@ impl DocumentStore {
         changes: Vec<TextDocumentContentChangeEvent>,
         version: i32,
     ) {
+        self.mark_update_started(uri);
         if let Some(state) = self.documents.get_mut(uri) {
-            self.mark_update_started(uri);
             // Apply changes to content
             for change in changes {
                 Self::apply_change_to_rope(&mut state.contents, change);
