@@ -45,6 +45,16 @@ pub struct CrossFileConfig {
     pub ambiguous_parent_severity: DiagnosticSeverity,
     /// Severity for max chain depth exceeded diagnostics
     pub max_chain_depth_severity: DiagnosticSeverity,
+    /// Whether on-demand indexing is enabled
+    pub on_demand_indexing_enabled: bool,
+    /// Maximum transitive depth for on-demand indexing
+    pub on_demand_indexing_max_transitive_depth: usize,
+    /// Maximum queue size for background indexing
+    pub on_demand_indexing_max_queue_size: usize,
+    /// Whether Priority 2 (backward directive) indexing is enabled
+    pub on_demand_indexing_priority_2_enabled: bool,
+    /// Whether Priority 3 (transitive dependency) indexing is enabled
+    pub on_demand_indexing_priority_3_enabled: bool,
 }
 
 impl Default for CrossFileConfig {
@@ -63,6 +73,11 @@ impl Default for CrossFileConfig {
             out_of_scope_severity: DiagnosticSeverity::WARNING,
             ambiguous_parent_severity: DiagnosticSeverity::WARNING,
             max_chain_depth_severity: DiagnosticSeverity::WARNING,
+            on_demand_indexing_enabled: true,
+            on_demand_indexing_max_transitive_depth: 2,
+            on_demand_indexing_max_queue_size: 50,
+            on_demand_indexing_priority_2_enabled: true,
+            on_demand_indexing_priority_3_enabled: true,
         }
     }
 }
@@ -92,6 +107,12 @@ mod tests {
         assert_eq!(config.max_revalidations_per_trigger, 10);
         assert_eq!(config.revalidation_debounce_ms, 200);
         assert!(config.undefined_variables_enabled);
+        // On-demand indexing defaults
+        assert!(config.on_demand_indexing_enabled);
+        assert_eq!(config.on_demand_indexing_max_transitive_depth, 2);
+        assert_eq!(config.on_demand_indexing_max_queue_size, 50);
+        assert!(config.on_demand_indexing_priority_2_enabled);
+        assert!(config.on_demand_indexing_priority_3_enabled);
     }
 
     #[test]

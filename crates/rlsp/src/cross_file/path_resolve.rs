@@ -102,13 +102,33 @@ impl PathContext {
 /// Resolve a path string to an absolute path
 pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
     if path.is_empty() {
+        log::trace!("Path resolution: empty path provided");
         return None;
     }
 
+    let base_dir = context.effective_working_directory();
+    let working_dir = context.working_directory.as_ref();
+    
+    log::trace!(
+        "Resolving path '{}' with base_dir='{}', working_dir={:?}, file_path='{}'",
+        path,
+        base_dir.display(),
+        working_dir.as_ref().map(|p| p.display().to_string()),
+        context.file_path.display()
+    );
+
     let resolved = if path.starts_with('/') {
         // Workspace-root-relative path
-        let workspace_root = context.workspace_root.as_ref()?;
-        workspace_root.join(&path[1..])
+        let workspace_root = context.workspace_root.as_ref();
+        if workspace_root.is_none() {
+            log::warn!(
+                "Failed to resolve workspace-root-relative path '{}': no workspace root available, base_dir='{}'",
+                path,
+                base_dir.display()
+            );
+            return None;
+        }
+        workspace_root.unwrap().join(&path[1..])
     } else {
         // File-relative or working-directory-relative path
         let base = context.effective_working_directory();
@@ -116,26 +136,78 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
     };
 
     // Normalize the path (resolve .. and .)
-    normalize_path(&resolved)
+    match normalize_path(&resolved) {
+        Some(canonical) => {
+            log::trace!("Resolved path '{}' to canonical path: '{}'", path, canonical.display());
+            Some(canonical)
+        }
+        None => {
+            log::warn!(
+                "Failed to resolve path '{}': normalization failed, attempted_path='{}', base_dir='{}'",
+                path,
+                resolved.display(),
+                base_dir.display()
+            );
+            None
+        }
+    }
 }
 
 /// Resolve a working directory path
 pub fn resolve_working_directory(path: &str, context: &PathContext) -> Option<PathBuf> {
     if path.is_empty() {
+        log::trace!("Working directory resolution: empty path provided");
         return None;
     }
 
+    let file_dir = context.file_path.parent();
+    
+    log::trace!(
+        "Resolving working directory '{}' with file_path='{}', file_dir={:?}",
+        path,
+        context.file_path.display(),
+        file_dir.as_ref().map(|p| p.display().to_string())
+    );
+
     let resolved = if path.starts_with('/') {
         // Workspace-root-relative
-        let workspace_root = context.workspace_root.as_ref()?;
-        workspace_root.join(&path[1..])
+        let workspace_root = context.workspace_root.as_ref();
+        if workspace_root.is_none() {
+            log::warn!(
+                "Failed to resolve workspace-root-relative working directory '{}': no workspace root available",
+                path
+            );
+            return None;
+        }
+        workspace_root.unwrap().join(&path[1..])
     } else {
         // File-relative
-        let file_dir = context.file_path.parent()?;
-        file_dir.join(path)
+        let file_dir = context.file_path.parent();
+        if file_dir.is_none() {
+            log::warn!(
+                "Failed to resolve working directory '{}': file has no parent directory, file_path='{}'",
+                path,
+                context.file_path.display()
+            );
+            return None;
+        }
+        file_dir.unwrap().join(path)
     };
 
-    normalize_path(&resolved)
+    match normalize_path(&resolved) {
+        Some(canonical) => {
+            log::trace!("Resolved working directory '{}' to canonical path: '{}'", path, canonical.display());
+            Some(canonical)
+        }
+        None => {
+            log::warn!(
+                "Failed to resolve working directory '{}': normalization failed, attempted_path='{}'",
+                path,
+                resolved.display()
+            );
+            None
+        }
+    }
 }
 
 /// Normalize a path by resolving . and .. components
@@ -145,8 +217,12 @@ fn normalize_path(path: &Path) -> Option<PathBuf> {
     for component in path.components() {
         match component {
             std::path::Component::ParentDir => {
-                if !components.is_empty() {
-                    components.pop();
+                // Only pop if the last component is a Normal segment
+                // Preserve RootDir and Prefix components
+                if let Some(last) = components.last() {
+                    if matches!(last, std::path::Component::Normal(_)) {
+                        components.pop();
+                    }
                 }
             }
             std::path::Component::CurDir => {}
@@ -309,5 +385,112 @@ mod tests {
         let ctx = make_context("/project/src/main.R", Some("/project"));
         let child = ctx.child_context_for_source(Path::new("/project/data/utils.R"), false);
         assert_eq!(child.effective_working_directory(), PathBuf::from("/project/src"));
+    }
+
+    // Tests for normalize_path ParentDir handling (Requirements 4.1-4.4)
+    #[test]
+    fn test_normalize_path_preserves_root_with_parent_dir() {
+        // "/../a" should produce "/a", not "a"
+        let path = Path::new("/../a");
+        let result = normalize_path(path).unwrap();
+        assert_eq!(result, PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn test_normalize_path_normal_parent_dir() {
+        // "/a/../b" should produce "/b"
+        let path = Path::new("/a/../b");
+        let result = normalize_path(path).unwrap();
+        assert_eq!(result, PathBuf::from("/b"));
+    }
+
+    #[test]
+    fn test_normalize_path_relative_parent_dir() {
+        // "a/../b" should produce "b"
+        let path = Path::new("a/../b");
+        let result = normalize_path(path).unwrap();
+        assert_eq!(result, PathBuf::from("b"));
+    }
+
+    #[test]
+    fn test_normalize_path_multiple_parent_dirs() {
+        // "/a/b/../../c" should produce "/c"
+        let path = Path::new("/a/b/../../c");
+        let result = normalize_path(path).unwrap();
+        assert_eq!(result, PathBuf::from("/c"));
+    }
+
+    #[test]
+    fn test_normalize_path_leading_parent_dirs() {
+        // "/../../../a" should produce "/a" (can't go above root)
+        let path = Path::new("/../../../a");
+        let result = normalize_path(path).unwrap();
+        assert_eq!(result, PathBuf::from("/a"));
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for generating path segments
+    fn segment_strategy() -> impl Strategy<Value = String> {
+        prop::string::string_regex("[a-z][a-z0-9_]{0,10}")
+            .unwrap()
+            .prop_filter("non-empty", |s| !s.is_empty())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Property 3: Path normalization preserves root
+        /// For any absolute path with leading ParentDir, the root should be preserved.
+        #[test]
+        fn prop_normalize_preserves_root(
+            num_parent_dirs in 1_usize..5,
+            segments in prop::collection::vec(segment_strategy(), 1..5)
+        ) {
+            // Build path like "/../../../a/b/c"
+            let mut path_str = String::from("/");
+            for _ in 0..num_parent_dirs {
+                path_str.push_str("../");
+            }
+            path_str.push_str(&segments.join("/"));
+
+            let path = Path::new(&path_str);
+            let result = normalize_path(path);
+
+            // Result should exist and start with root
+            prop_assert!(result.is_some());
+            let normalized = result.unwrap();
+            prop_assert!(normalized.is_absolute(), "Normalized path should be absolute");
+        }
+
+        /// Property 3: Normal parent dir resolution works correctly
+        #[test]
+        fn prop_normal_parent_dir_resolution(
+            prefix_segments in prop::collection::vec(segment_strategy(), 1..3),
+            suffix_segments in prop::collection::vec(segment_strategy(), 1..3)
+        ) {
+            // Build path like "/a/b/../c/d" where .. should cancel one segment
+            let mut path_str = String::from("/");
+            path_str.push_str(&prefix_segments.join("/"));
+            path_str.push_str("/../");
+            path_str.push_str(&suffix_segments.join("/"));
+
+            let path = Path::new(&path_str);
+            let result = normalize_path(path);
+
+            prop_assert!(result.is_some());
+            let normalized = result.unwrap();
+            
+            // The result should have one fewer segment than prefix + suffix
+            let expected_segments = prefix_segments.len() - 1 + suffix_segments.len();
+            let actual_segments = normalized.components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count();
+            prop_assert_eq!(actual_segments, expected_segments);
+        }
     }
 }

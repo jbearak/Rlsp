@@ -395,6 +395,25 @@ pub struct WorldState {
 
 impl WorldState {
     pub fn new(library_paths: Vec<PathBuf>) -> Self {
+        let config = CrossFileConfig::default();
+        
+        // Log default cross-file configuration at startup
+        log::info!("Initializing cross-file configuration with defaults:");
+        log::info!("  max_backward_depth: {}", config.max_backward_depth);
+        log::info!("  max_forward_depth: {}", config.max_forward_depth);
+        log::info!("  max_chain_depth: {}", config.max_chain_depth);
+        log::info!("  assume_call_site: {:?}", config.assume_call_site);
+        log::info!("  index_workspace: {}", config.index_workspace);
+        log::info!("  max_revalidations_per_trigger: {}", config.max_revalidations_per_trigger);
+        log::info!("  revalidation_debounce_ms: {}", config.revalidation_debounce_ms);
+        log::info!("  undefined_variables_enabled: {}", config.undefined_variables_enabled);
+        log::info!("  Diagnostic severities:");
+        log::info!("    missing_file: {:?}", config.missing_file_severity);
+        log::info!("    circular_dependency: {:?}", config.circular_dependency_severity);
+        log::info!("    out_of_scope: {:?}", config.out_of_scope_severity);
+        log::info!("    ambiguous_parent: {:?}", config.ambiguous_parent_severity);
+        log::info!("    max_chain_depth: {:?}", config.max_chain_depth_severity);
+        
         Self {
             documents: HashMap::new(),
             workspace_folders: Vec::new(),
@@ -404,7 +423,7 @@ impl WorldState {
             help_cache: crate::help::HelpCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),
             // Cross-file state
-            cross_file_config: CrossFileConfig::default(),
+            cross_file_config: config,
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             cross_file_cache: ArtifactsCache::new(),
@@ -450,10 +469,20 @@ impl WorldState {
     }
 
     /// Apply pre-scanned workspace index results (for non-blocking initialization)
-    pub fn apply_workspace_index(&mut self, index: HashMap<Url, Document>, imports: Vec<String>) {
+    pub fn apply_workspace_index(&mut self, index: HashMap<Url, Document>, imports: Vec<String>, cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>) {
         self.workspace_index = index;
         self.workspace_imports = imports;
-        log::info!("Applied {} workspace files, {} imports", self.workspace_index.len(), self.workspace_imports.len());
+        
+        // Populate cross-file workspace index
+        for (uri, entry) in cross_file_entries {
+            log::info!("Indexing cross-file entry: {} (exported symbols: {})", 
+                uri, entry.artifacts.exported_interface.len());
+            self.cross_file_workspace_index.insert(uri, entry);
+        }
+        
+        log::info!("Applied {} workspace files, {} imports, {} cross-file entries", 
+            self.workspace_index.len(), self.workspace_imports.len(), 
+            self.cross_file_workspace_index.uris().len());
     }
     
     fn load_workspace_namespace(&mut self) {
@@ -492,14 +521,15 @@ impl WorldState {
 }
 
 /// Scan workspace folders for R files without holding any locks (Requirement 13a)
-pub fn scan_workspace(folders: &[Url]) -> (HashMap<Url, Document>, Vec<String>) {
+pub fn scan_workspace(folders: &[Url]) -> (HashMap<Url, Document>, Vec<String>, HashMap<Url, crate::cross_file::workspace_index::IndexEntry>) {
     let mut index = HashMap::new();
     let mut imports = Vec::new();
+    let mut cross_file_entries = HashMap::new();
 
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
-            scan_directory(&path, &mut index);
+            scan_directory(&path, &mut index, &mut cross_file_entries);
             
             // Check for NAMESPACE file
             let namespace_path = path.join("NAMESPACE");
@@ -512,11 +542,11 @@ pub fn scan_workspace(folders: &[Url]) -> (HashMap<Url, Document>, Vec<String>) 
         }
     }
 
-    log::info!("Scanned {} workspace files", index.len());
-    (index, imports)
+    log::info!("Scanned {} workspace files ({} with cross-file metadata)", index.len(), cross_file_entries.len());
+    (index, imports, cross_file_entries)
 }
 
-fn scan_directory(dir: &std::path::Path, index: &mut HashMap<Url, Document>) {
+fn scan_directory(dir: &std::path::Path, index: &mut HashMap<Url, Document>, cross_file_entries: &mut HashMap<Url, crate::cross_file::workspace_index::IndexEntry>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -525,12 +555,40 @@ fn scan_directory(dir: &std::path::Path, index: &mut HashMap<Url, Document>) {
         let path = entry.path();
         
         if path.is_dir() {
-            scan_directory(&path, index);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("R") {
-            if let Ok(text) = fs::read_to_string(&path) {
-                if let Ok(uri) = Url::from_file_path(&path) {
-                    log::trace!("Scanning file: {}", uri);
-                    index.insert(uri, Document::new(&text, None));
+            scan_directory(&path, index, cross_file_entries);
+        } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            // Match both .R and .r extensions (case-insensitive)
+            if ext.eq_ignore_ascii_case("r") {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    if let Ok(uri) = Url::from_file_path(&path) {
+                        log::trace!("Scanning file: {}", uri);
+                        let doc = Document::new(&text, None);
+                        index.insert(uri.clone(), doc);
+                        
+                        // Also compute cross-file metadata and artifacts
+                        if let Ok(metadata_result) = fs::metadata(&path) {
+                            let cross_file_meta = crate::cross_file::extract_metadata(&text);
+                            
+                            // Compute artifacts if we have a tree
+                            let artifacts = if let Some(tree) = index.get(&uri).and_then(|d| d.tree.as_ref()) {
+                                crate::cross_file::scope::compute_artifacts(&uri, tree, &text)
+                            } else {
+                                crate::cross_file::scope::ScopeArtifacts::default()
+                            };
+                            
+                            let snapshot = crate::cross_file::file_cache::FileSnapshot::with_content_hash(
+                                &metadata_result,
+                                &text,
+                            );
+                            
+                            cross_file_entries.insert(uri, crate::cross_file::workspace_index::IndexEntry {
+                                snapshot,
+                                metadata: cross_file_meta,
+                                artifacts,
+                                indexed_at_version: 0, // Initial version; not modified by insert()
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -561,11 +619,13 @@ fn parse_namespace_imports_from_text(text: &str) -> Vec<String> {
     imports
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+    
+    // Include workspace scanning tests
+    include!("state_tests.rs");
 
     #[test]
     fn test_document_apply_change_ascii() {

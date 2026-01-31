@@ -62,6 +62,9 @@ export function activate(context: vscode.ExtensionContext) {
         args: ['--stdio'],
     };
 
+    // Create output channel for server logs
+    const outputChannel = vscode.window.createOutputChannel('Rlsp');
+
     const clientOptions: LanguageClientOptions = {
         documentSelector: [
             { scheme: 'file', language: 'r' },
@@ -70,6 +73,7 @@ export function activate(context: vscode.ExtensionContext) {
         synchronize: {
             fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd}'),
         },
+        outputChannel: outputChannel,
     };
 
     client = new LanguageClient(

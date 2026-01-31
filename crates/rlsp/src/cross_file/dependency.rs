@@ -112,20 +112,36 @@ impl DependencyGraph {
     {
         let mut result = UpdateResult::default();
 
-        // Build PathContext for this file
+        // Build PathContext for this file (includes working_directory from metadata)
         let path_ctx = match PathContext::from_metadata(uri, meta, workspace_root) {
             Some(ctx) => ctx,
             None => return result,
         };
 
-        // Helper to resolve paths using PathContext
+        // Build separate PathContext for backward directives (without working_directory)
+        // Backward directives should always resolve relative to the file's directory,
+        // not affected by @lsp-cd directives
+        let backward_path_ctx = match PathContext::new(uri, workspace_root) {
+            Some(ctx) => ctx,
+            None => return result,
+        };
+
+        // Helper to resolve paths using PathContext (for forward sources)
         let do_resolve = |path: &str| -> Option<Url> {
             let resolved = resolve_path(path, &path_ctx)?;
             path_to_uri(&resolved)
         };
 
+        // Helper to resolve paths for backward directives (without working_directory)
+        let do_resolve_backward = |path: &str| -> Option<Url> {
+            let resolved = resolve_path(path, &backward_path_ctx)?;
+            path_to_uri(&resolved)
+        };
+
         // Remove existing edges where this file is the parent
-        self.remove_forward_edges(uri);
+        // BUT: only remove edges that were created by THIS file's forward sources/directives
+        // Do NOT remove edges created by backward directives in other files
+        self.remove_forward_edges_from_this_file(uri);
 
         // Also remove edges where this file is the child (from backward directives)
         // These will be re-created from the current metadata
@@ -156,8 +172,10 @@ impl DependencyGraph {
         }
 
         // Process backward directives (@lsp-sourced-by) - create forward edges from parent to this file
+        // Use separate PathContext without working_directory to ensure paths are resolved
+        // relative to the file's directory, not affected by @lsp-cd directives
         for directive in &meta.sourced_by {
-            if let Some(parent_uri) = do_resolve(&directive.path) {
+            if let Some(parent_uri) = do_resolve_backward(&directive.path) {
                 // Extract child filename for inference
                 let child_filename = uri.path_segments()
                     .and_then(|s| s.last())
@@ -294,6 +312,10 @@ impl DependencyGraph {
             }
         }
 
+        // Log total edge count after update
+        let total_edges: usize = self.forward.values().map(|v| v.len()).sum();
+        log::trace!("Dependency graph now has {} total edges after updating {}", total_edges, uri);
+
         result
     }
 
@@ -320,8 +342,13 @@ impl DependencyGraph {
             })
             .unwrap_or_default();
 
+        if !edges_to_remove.is_empty() {
+            log::trace!("Removing {} backward directive edges for child {}", edges_to_remove.len(), child_uri);
+        }
+
         // Remove from both forward and backward indices
         for edge in edges_to_remove {
+            log::trace!("  Removing backward directive edge: {} -> {}", edge.from, edge.to);
             // Remove from forward index
             if let Some(forward_edges) = self.forward.get_mut(&edge.from) {
                 forward_edges.retain(|e| !(e.to == edge.to && e.is_directive && e.call_site_line == edge.call_site_line));
@@ -393,6 +420,17 @@ impl DependencyGraph {
     }
 
     fn add_edge(&mut self, edge: DependencyEdge) {
+        log::trace!(
+            "Adding edge: {} -> {} at line {:?}, column {:?} (directive: {}, local: {}, chdir: {})",
+            edge.from,
+            edge.to,
+            edge.call_site_line,
+            edge.call_site_column,
+            edge.is_directive,
+            edge.local,
+            edge.chdir
+        );
+        
         // Add to forward index
         self.forward
             .entry(edge.from.clone())
@@ -407,7 +445,9 @@ impl DependencyGraph {
 
     fn remove_forward_edges(&mut self, uri: &Url) {
         if let Some(edges) = self.forward.remove(uri) {
+            log::trace!("Removing {} forward edges from {}", edges.len(), uri);
             for edge in edges {
+                log::trace!("  Removing edge: {} -> {}", edge.from, edge.to);
                 if let Some(backward_edges) = self.backward.get_mut(&edge.to) {
                     backward_edges.retain(|e| &e.from != uri);
                     if backward_edges.is_empty() {
@@ -418,9 +458,90 @@ impl DependencyGraph {
         }
     }
 
+    /// Remove forward edges from a file, but only those created by forward sources/directives
+    /// in that file. Preserve edges created by backward directives in other files.
+    /// 
+    /// This is used during update_file to avoid removing edges that were created by
+    /// backward directives in child files.
+    fn remove_forward_edges_from_this_file(&mut self, uri: &Url) {
+        // Get all current forward edges from this file
+        let edges_to_check = self.forward.get(uri).cloned().unwrap_or_default();
+        
+        if edges_to_check.is_empty() {
+            return;
+        }
+        
+        log::trace!("Checking {} forward edges from {} for removal", edges_to_check.len(), uri);
+        
+        // We'll rebuild the forward edges list, keeping only edges created by backward directives
+        let mut edges_to_keep = Vec::new();
+        let mut edges_to_remove = Vec::new();
+        
+        for edge in edges_to_check {
+            // Heuristic: if this is a directive edge, it might have been created by a backward
+            // directive in the child file. We'll keep it for now and let it be removed when
+            // the child file is updated (via remove_backward_edges_for_child).
+            // 
+            // However, if it's NOT a directive edge, it was definitely created by a source()
+            // call in THIS file, so we should remove it.
+            //
+            // Actually, this heuristic is not quite right. A directive edge could be from
+            // either a forward directive in this file OR a backward directive in the child.
+            // 
+            // Better approach: we'll remove ALL non-directive edges (source() calls), and
+            // we'll also remove directive edges, but they'll be re-created if they're still
+            // in the metadata. Edges from backward directives in other files will be preserved
+            // because they're not in this file's metadata.
+            //
+            // Wait, that doesn't work either because we process the metadata AFTER removing edges.
+            //
+            // The real solution: we need to track which file created each edge. But that's a
+            // bigger change. For now, let's use a simpler approach: don't remove directive edges
+            // at all. Only remove non-directive edges (source() calls).
+            //
+            // This works because:
+            // - Non-directive edges are always from source() calls in THIS file
+            // - Directive edges could be from forward directives in THIS file OR backward
+            //   directives in OTHER files
+            // - If a directive edge is from THIS file, it will be re-created from metadata
+            // - If a directive edge is from ANOTHER file, we want to keep it
+            //
+            // The downside: if we remove a forward directive from THIS file, the edge won't
+            // be removed until we update the child file. But that's acceptable for now.
+            
+            if edge.is_directive {
+                // Keep directive edges - they might be from backward directives in other files
+                edges_to_keep.push(edge);
+            } else {
+                // Remove non-directive edges - they're definitely from source() calls in this file
+                edges_to_remove.push(edge);
+            }
+        }
+        
+        // Update the forward index
+        if edges_to_keep.is_empty() {
+            self.forward.remove(uri);
+        } else {
+            self.forward.insert(uri.clone(), edges_to_keep);
+        }
+        
+        // Remove from backward index
+        for edge in edges_to_remove {
+            log::trace!("  Removing non-directive edge: {} -> {}", edge.from, edge.to);
+            if let Some(backward_edges) = self.backward.get_mut(&edge.to) {
+                backward_edges.retain(|e| !(e.from == edge.from && e.to == edge.to && !e.is_directive));
+                if backward_edges.is_empty() {
+                    self.backward.remove(&edge.to);
+                }
+            }
+        }
+    }
+
     fn remove_backward_edges(&mut self, uri: &Url) {
         if let Some(edges) = self.backward.remove(uri) {
+            log::trace!("Removing {} backward edges to {}", edges.len(), uri);
             for edge in edges {
+                log::trace!("  Removing edge: {} -> {}", edge.from, edge.to);
                 if let Some(forward_edges) = self.forward.get_mut(&edge.from) {
                     forward_edges.retain(|e| &e.to != uri);
                     if forward_edges.is_empty() {
@@ -435,6 +556,49 @@ impl DependencyGraph {
     pub fn detect_cycle(&self, uri: &Url) -> Option<DependencyEdge> {
         let mut visited = HashSet::new();
         self.detect_cycle_recursive(uri, uri, &mut visited)
+    }
+
+    /// Dump the current state of the dependency graph for debugging.
+    /// Returns a human-readable string representation of all edges.
+    pub fn dump_state(&self) -> String {
+        let total_edges: usize = self.forward.values().map(|v| v.len()).sum();
+        let mut output = String::new();
+        output.push_str(&format!("Dependency Graph State ({} total edges):\n", total_edges));
+        output.push_str(&format!("  {} parent files with outgoing edges\n", self.forward.len()));
+        output.push_str(&format!("  {} child files with incoming edges\n\n", self.backward.len()));
+        
+        if self.forward.is_empty() {
+            output.push_str("  (no edges)\n");
+            return output;
+        }
+        
+        // Sort parents for consistent output
+        let mut parents: Vec<_> = self.forward.keys().collect();
+        parents.sort();
+        
+        for parent in parents {
+            if let Some(edges) = self.forward.get(parent) {
+                output.push_str(&format!("  {}:\n", parent));
+                for edge in edges {
+                    let call_site = match (edge.call_site_line, edge.call_site_column) {
+                        (Some(line), Some(col)) => format!("line {}, col {}", line, col),
+                        (Some(line), None) => format!("line {}", line),
+                        _ => "unknown".to_string(),
+                    };
+                    let flags = {
+                        let mut f = Vec::new();
+                        if edge.is_directive { f.push("directive"); }
+                        if edge.local { f.push("local"); }
+                        if edge.chdir { f.push("chdir"); }
+                        if edge.is_sys_source { f.push("sys.source"); }
+                        if f.is_empty() { "".to_string() } else { format!(" [{}]", f.join(", ")) }
+                    };
+                    output.push_str(&format!("    -> {} ({}){}\n", edge.to, call_site, flags));
+                }
+            }
+        }
+        
+        output
     }
 
     fn detect_cycle_recursive(
@@ -944,5 +1108,54 @@ z <- 3
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].call_site_line, Some(2)); // 0-based line 2
         assert!(deps[0].call_site_column.is_some());
+    }
+
+    #[test]
+    fn test_dump_state() {
+        let mut graph = DependencyGraph::new();
+        let main = url("main.R");
+        let utils = url("utils.R");
+        let helpers = url("helpers.R");
+
+        // Add edges: main sources utils and helpers
+        let meta = CrossFileMetadata {
+            sources: vec![
+                super::super::types::ForwardSource {
+                    path: "utils.R".to_string(),
+                    line: 5,
+                    column: 10,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+                super::super::types::ForwardSource {
+                    path: "helpers.R".to_string(),
+                    line: 10,
+                    column: 5,
+                    is_directive: true,
+                    local: true,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        graph.update_file(&main, &meta, Some(&workspace_root()), |_| None);
+
+        // Test dump_state
+        let state = graph.dump_state();
+        
+        // Verify output contains expected information
+        assert!(state.contains("2 total edges"));
+        assert!(state.contains("file:///project/main.R"));
+        assert!(state.contains("file:///project/utils.R"));
+        assert!(state.contains("file:///project/helpers.R"));
+        assert!(state.contains("line 5, col 10"));
+        assert!(state.contains("line 10, col 5"));
+        assert!(state.contains("[directive, local]"));
     }
 }

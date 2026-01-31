@@ -1041,6 +1041,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         let kind = match symbol.kind {
             crate::cross_file::SymbolKind::Function => CompletionItemKind::FUNCTION,
             crate::cross_file::SymbolKind::Variable => CompletionItemKind::VARIABLE,
+            crate::cross_file::SymbolKind::Parameter => CompletionItemKind::VARIABLE,
         };
 
         // Add source file info to detail if from another file
@@ -1173,6 +1174,7 @@ fn extract_statement_from_tree(
     let statement_node = match symbol.kind {
         scope::SymbolKind::Variable => find_assignment_statement(node, content),
         scope::SymbolKind::Function => find_function_statement(node, content),
+        scope::SymbolKind::Parameter => find_function_statement(node, content),
     }?;
 
     let statement = extract_statement_text(statement_node, content);
@@ -1454,7 +1456,9 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     };
 
     // Try cross-file symbols (includes local scope with definition extraction)
+    log::trace!("Calling get_cross_file_symbols for hover");
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
+    log::trace!("Got {} symbols from cross-file scope", cross_file_symbols.len());
     if let Some(symbol) = cross_file_symbols.get(name) {
         let mut value = String::new();
         
@@ -2210,7 +2214,7 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
     use crate::state::Document;
-    use crate::cross_file::ScopedSymbol;
+    use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
     use std::collections::HashSet;
 
     // Helper to parse R code for property tests
@@ -2343,7 +2347,7 @@ mod proptests {
             let tree = parse_r_code(&code);
             
             // Find function definition node
-            let func_node = find_function_definition(tree.root_node()).unwrap();
+            let func_node = find_function_definition_node(tree.root_node(), "f", &code).unwrap();
             let signature = extract_function_signature(func_node, "f", &code);
             
             // All parameters should be present in signature
@@ -2403,12 +2407,14 @@ mod proptests {
 
     #[test]
     fn test_extract_definition_statement_variable() {
+        use crate::cross_file::scope::SymbolKind;
+        
         let code = "x <- 42\ny <- x + 1";
         let tree = parse_r_code(code);
         
         let symbol = ScopedSymbol {
             name: "x".to_string(),
-            kind: tower_lsp::lsp_types::SymbolKind::VARIABLE,
+            kind: SymbolKind::Variable,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 0,
@@ -2428,7 +2434,7 @@ mod proptests {
         
         let symbol = ScopedSymbol {
             name: "f".to_string(),
-            kind: tower_lsp::lsp_types::SymbolKind::FUNCTION,
+            kind: SymbolKind::Function,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 0,
@@ -2453,7 +2459,7 @@ mod proptests {
         
         let symbol = ScopedSymbol {
             name: "long_func".to_string(),
-            kind: tower_lsp::lsp_types::SymbolKind::FUNCTION,
+            kind: SymbolKind::Function,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 0,
@@ -2484,7 +2490,7 @@ mod proptests {
             
             let symbol = ScopedSymbol {
                 name: var_name.to_string(),
-                kind: tower_lsp::lsp_types::SymbolKind::VARIABLE,
+                kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
@@ -2505,7 +2511,7 @@ mod proptests {
         
         let symbol = ScopedSymbol {
             name: "i".to_string(),
-            kind: tower_lsp::lsp_types::SymbolKind::VARIABLE,
+            kind: SymbolKind::Variable,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
             defined_column: 5, // Position of 'i' in for loop
@@ -2607,7 +2613,7 @@ mod proptests {
             
             let symbol = ScopedSymbol {
                 name: var_name.clone(),
-                kind: tower_lsp::lsp_types::SymbolKind::VARIABLE,
+                kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
@@ -2636,7 +2642,7 @@ mod proptests {
             
             let symbol = ScopedSymbol {
                 name: func_name.clone(),
-                kind: tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
@@ -2671,7 +2677,7 @@ mod proptests {
             
             let symbol = ScopedSymbol {
                 name: func_name.clone(),
-                kind: tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
@@ -2802,7 +2808,7 @@ mod proptests {
             let tree = parse_r_code(&statement);
             let symbol = ScopedSymbol {
                 name: "long_func".to_string(),
-                kind: tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
@@ -2835,7 +2841,7 @@ mod proptests {
             let tree = parse_r_code(&statement);
             let symbol = ScopedSymbol {
                 name: "func".to_string(),
-                kind: tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: indent_size as u32,
@@ -2886,7 +2892,7 @@ mod proptests {
             
             let symbol = ScopedSymbol {
                 name: var_name.clone(),
-                kind: tower_lsp::lsp_types::SymbolKind::VARIABLE,
+                kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
@@ -2897,8 +2903,9 @@ mod proptests {
             prop_assert!(def_info.is_some(), "Should extract assignment statement");
             
             let info = def_info.unwrap();
-            prop_assert_eq!(info.statement, code, "Should include complete assignment statement");
-            prop_assert!(info.statement.contains(&op), "Should include assignment operator {}", op);
+            let statement = &info.statement;
+            prop_assert_eq!(statement, &code, "Should include complete assignment statement");
+            prop_assert!(statement.contains(&op), "Should include assignment operator {}", op);
         }
 
         #[test]
@@ -2916,7 +2923,7 @@ mod proptests {
             
             let symbol = ScopedSymbol {
                 name: func_name.clone(),
-                kind: tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 0,
@@ -2942,7 +2949,7 @@ mod proptests {
             
             let symbol = ScopedSymbol {
                 name: iterator.clone(),
-                kind: tower_lsp::lsp_types::SymbolKind::VARIABLE,
+                kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: 5, // Position of iterator in for loop
@@ -2975,7 +2982,7 @@ mod proptests {
             
             let symbol = ScopedSymbol {
                 name: param_name.clone(),
-                kind: tower_lsp::lsp_types::SymbolKind::VARIABLE,
+                kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
                 defined_column: func_name.len() as u32 + 15, // Approximate position in function signature
@@ -3084,8 +3091,8 @@ mod proptests {
             state.documents.insert(utils_uri.clone(), Document::new(&utils_code, None));
             
             // Update cross-file graph
-            state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(&main_code));
-            state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(&utils_code));
+            state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(&main_code), None, |_| None);
+            state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(&utils_code), None, |_| None);
             
             let position = Position::new(1, 10); // Position after source() call
             let cross_file_symbols = get_cross_file_symbols(&state, &main_uri, position.line, position.character);
@@ -3093,7 +3100,7 @@ mod proptests {
             prop_assert!(cross_file_symbols.contains_key(&func_name), "Should resolve cross-file symbol using dependency graph");
             
             if let Some(symbol) = cross_file_symbols.get(&func_name) {
-                prop_assert_eq!(symbol.source_uri, utils_uri, "Should locate definition in sourced file");
+                prop_assert_eq!(&symbol.source_uri, &utils_uri, "Should locate definition in sourced file");
             }
         }
 
@@ -3120,8 +3127,8 @@ mod proptests {
             state.documents.insert(utils_uri.clone(), Document::new(&utils_code, None));
             
             // Update cross-file graph
-            state.cross_file_graph.update_file(&uri, &crate::cross_file::extract_metadata(&code));
-            state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(&utils_code));
+            state.cross_file_graph.update_file(&uri, &crate::cross_file::extract_metadata(&code), None, |_| None);
+            state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(&utils_code), None, |_| None);
             
             let position = Position::new(3, 10); // Position of function usage
             let cross_file_symbols = get_cross_file_symbols(&state, &uri, position.line, position.character);
@@ -3130,7 +3137,7 @@ mod proptests {
             
             if let Some(symbol) = cross_file_symbols.get(&func_name) {
                 // Should select the local definition (line 2) that's in scope, not the earlier one or utils.R
-                prop_assert_eq!(symbol.source_uri, uri, "Should select definition from same file");
+                prop_assert_eq!(&symbol.source_uri, &uri, "Should select definition from same file");
                 prop_assert_eq!(symbol.defined_line, 2, "Should select the definition that's in scope at reference position");
             }
         }
@@ -3204,7 +3211,7 @@ mod integration_tests {
     #[test]
     fn test_hover_shows_definition_statement() {
         use std::collections::HashMap;
-        use crate::cross_file::types::ScopedSymbol;
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
         
         let library_paths = r_env::find_library_paths();
         let mut state = WorldState::new(library_paths);
@@ -3218,7 +3225,7 @@ mod integration_tests {
         // Create a scoped symbol with definition info
         let symbol = ScopedSymbol {
             name: "my_var".to_string(),
-            kind: tower_lsp::lsp_types::SymbolKind::VARIABLE,
+            kind: SymbolKind::Variable,
             source_uri: uri.clone(),
             defined_line: 0,
             defined_column: 0,
@@ -3268,7 +3275,7 @@ mod integration_tests {
     fn test_hover_cross_file_hyperlink_format() {
         let library_paths = r_env::find_library_paths();
         let mut state = WorldState::new(library_paths);
-        state.workspace_root = Some(Url::parse("file:///workspace/").unwrap());
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
         
         let current_uri = Url::parse("file:///workspace/main.R").unwrap();
         let def_uri = Url::parse("file:///workspace/utils/helper.R").unwrap();
@@ -3286,7 +3293,7 @@ mod integration_tests {
         value.push_str(&format!("```r\n{}\n```\n\n", escaped_statement));
         
         if def_info.source_uri != current_uri {
-            let relative_path = compute_relative_path(&def_info.source_uri, state.workspace_root.as_ref());
+            let relative_path = compute_relative_path(&def_info.source_uri, state.workspace_folders.first());
             let absolute_path = def_info.source_uri.as_str();
             value.push_str(&format!("[{}]({}), line {}", relative_path, absolute_path, def_info.line + 1));
         }
@@ -3351,8 +3358,8 @@ result <- helper_func(42)"#;
         state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
         
         // Update cross-file graph
-        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code));
-        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code));
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
         
         // Test hover on helper_func in main.R (line 1, after source call)
         let position = Position::new(1, 10); // Position of "helper_func"
@@ -3389,8 +3396,8 @@ result <- my_func(1, 2)"#;
         state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
         
         // Update cross-file graph
-        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code));
-        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code));
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
         
         // Test hover on my_func usage (should show local definition, not utils.R)
         let position = Position::new(2, 10); // Position of "my_func" in usage
@@ -3522,8 +3529,8 @@ result2 <- helper_func(2)  # Should resolve"#;
         state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
         
         // Update cross-file graph
-        state.cross_file_graph.update_file(&uri, &crate::cross_file::extract_metadata(code));
-        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code));
+        state.cross_file_graph.update_file(&uri, &crate::cross_file::extract_metadata(code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
         
         // Test hover before source call (line 1) - should not find cross-file symbol
         let position_before = Position::new(1, 11); // "helper_func" before source()
@@ -3563,9 +3570,9 @@ process_data <- function(x) {
         state.documents.insert(helpers_uri.clone(), Document::new(helpers_code, None));
         
         // Update cross-file graph for all files
-        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code));
-        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code));
-        state.cross_file_graph.update_file(&helpers_uri, &crate::cross_file::extract_metadata(helpers_code));
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
+        state.cross_file_graph.update_file(&helpers_uri, &crate::cross_file::extract_metadata(helpers_code), None, |_| None);
         
         // Test hover on transform_value in utils.R (should resolve through chain)
         let position = Position::new(2, 4); // "transform_value" in utils.R
@@ -3726,9 +3733,9 @@ helper_transform <- function(data) {
         state.documents.insert(helpers_uri.clone(), Document::new(helpers_code, None));
         
         // Update cross-file graph
-        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code));
-        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code));
-        state.cross_file_graph.update_file(&helpers_uri, &crate::cross_file::extract_metadata(helpers_code));
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
+        state.cross_file_graph.update_file(&helpers_uri, &crate::cross_file::extract_metadata(helpers_code), None, |_| None);
         
         // Test nested loop iterators are in scope
         let nested_loop_position = Position::new(8, 8); // Inside nested loop
@@ -3814,9 +3821,9 @@ local_var <- 200"#;
         state.documents.insert(local_uri.clone(), Document::new(local_code, None));
         
         // Update cross-file graph
-        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code));
-        state.cross_file_graph.update_file(&global_uri, &crate::cross_file::extract_metadata(global_code));
-        state.cross_file_graph.update_file(&local_uri, &crate::cross_file::extract_metadata(local_code));
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&global_uri, &crate::cross_file::extract_metadata(global_code), None, |_| None);
+        state.cross_file_graph.update_file(&local_uri, &crate::cross_file::extract_metadata(local_code), None, |_| None);
         
         // Test symbols after both source calls
         let position = Position::new(5, 0); // After both source() calls
@@ -3846,7 +3853,7 @@ local_var <- 200"#;
     fn test_hover_hyperlink_formatting_with_special_paths() {
         let library_paths = r_env::find_library_paths();
         let mut state = WorldState::new(library_paths);
-        state.workspace_root = Some(Url::parse("file:///workspace/").unwrap());
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
         
         // Test various path scenarios
         let main_uri = Url::parse("file:///workspace/src/analysis/main.R").unwrap();
@@ -3864,8 +3871,8 @@ result <- helper_with_spaces(42)"#;
         state.documents.insert(utils_uri.clone(), Document::new(utils_code, None));
         
         // Update cross-file graph
-        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code));
-        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code));
+        state.cross_file_graph.update_file(&main_uri, &crate::cross_file::extract_metadata(main_code), None, |_| None);
+        state.cross_file_graph.update_file(&utils_uri, &crate::cross_file::extract_metadata(utils_code), None, |_| None);
         
         // Test hover shows proper hyperlink formatting
         let position = Position::new(1, 10); // "helper_with_spaces"

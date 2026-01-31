@@ -224,8 +224,11 @@ pub fn scope_at_position_with_deps<F>(
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
 {
+    log::trace!("Resolving scope at {}:{}:{}", uri, line, column);
     let mut visited = HashSet::new();
-    scope_at_position_recursive(uri, line, column, get_artifacts, resolve_path, max_depth, 0, &mut visited)
+    let scope = scope_at_position_recursive(uri, line, column, get_artifacts, resolve_path, max_depth, 0, &mut visited);
+    log::trace!("Found {} symbols in scope", scope.symbols.len());
+    scope
 }
 
 fn scope_at_position_recursive<F>(
@@ -241,6 +244,7 @@ fn scope_at_position_recursive<F>(
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
 {
+    log::trace!("Traversing to file: {} (depth {})", uri, current_depth);
     let mut scope = ScopeAtPosition::default();
 
     if current_depth >= max_depth || visited.contains(uri) {
@@ -251,7 +255,10 @@ where
 
     let artifacts = match get_artifacts(uri) {
         Some(a) => a,
-        None => return scope,
+        None => {
+            log::trace!("No artifacts found for {}", uri);
+            return scope;
+        }
     };
 
     // Process timeline events up to the requested position
@@ -260,7 +267,14 @@ where
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Local definitions take precedence (don't overwrite)
-                    scope.symbols.entry(symbol.name.clone()).or_insert_with(|| symbol.clone());
+                    scope.symbols.entry(symbol.name.clone()).or_insert_with(|| {
+                        log::trace!("  Found symbol: {} ({})", symbol.name, match symbol.kind {
+                            SymbolKind::Function => "function",
+                            SymbolKind::Variable => "variable",
+                            SymbolKind::Parameter => "parameter",
+                        });
+                        symbol.clone()
+                    });
                 }
             }
             ScopeEvent::Source { line: src_line, column: src_col, source } => {
@@ -304,6 +318,7 @@ where
         }
     }
 
+    log::trace!("File {} contributed {} symbols", uri, scope.symbols.len());
     scope
 }
 
@@ -1694,6 +1709,7 @@ mod tests {
         parent_artifacts.timeline.sort_by_key(|e| match e {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
         });
 
         // Child file: defines 'child_var'

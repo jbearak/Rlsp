@@ -10,9 +10,22 @@ use super::types::{byte_offset_to_utf16_column, ForwardSource};
 
 /// Detect source() and sys.source() calls in R code
 pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
+    log::trace!("Starting tree-sitter parsing for source() call detection");
     let mut sources = Vec::new();
     let root = tree.root_node();
     visit_node(root, content, &mut sources);
+    log::trace!("Completed source() call detection, found {} calls", sources.len());
+    for source in &sources {
+        log::trace!(
+            "  Detected source() call: path='{}' at line {} column {} (is_sys_source={}, local={}, chdir={})",
+            source.path,
+            source.line,
+            source.column,
+            source.is_sys_source,
+            source.local,
+            source.chdir
+        );
+    }
     sources
 }
 

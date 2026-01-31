@@ -8,7 +8,7 @@ This design extends the on-demand indexing system to handle Priority 2 (backward
 
 ### Component Structure
 
-```
+```text
 Backend
   ├── state: Arc<RwLock<WorldState>>
   ├── client: Client
@@ -16,7 +16,7 @@ Backend
 
 BackgroundIndexer
   ├── state: Arc<RwLock<WorldState>>
-  ├── queue: Arc<Mutex<PriorityQueue<IndexTask>>>
+  ├── queue: Arc<Mutex<VecDeque<IndexTask>>>
   ├── worker_handle: Option<JoinHandle<()>>
   └── cancellation_token: CancellationToken
 
@@ -167,8 +167,8 @@ impl BackgroundIndexer {
                         .unwrap_or(0)
                 );
                 
-                // Queue transitive dependencies if Priority 2 and depth allows
-                if task.priority == 2 {
+                // Queue transitive dependencies if Priority 2 or 3 and depth allows
+                if task.priority == 2 || task.priority == 3 {
                     Self::queue_transitive_deps(
                         state.clone(),
                         queue,
@@ -323,9 +323,25 @@ impl BackgroundIndexer {
     }
 }
 
+impl BackgroundIndexer {
+    /// Gracefully shutdown the background worker.
+    /// Callers should call this method before dropping to ensure clean termination.
+    pub async fn shutdown(&self) {
+        self.cancellation_token.cancel();
+        if let Some(handle) = self.worker_handle.lock().unwrap().take() {
+            let _ = handle.await;
+        }
+    }
+}
+
 impl Drop for BackgroundIndexer {
     fn drop(&mut self) {
-        self.cancellation_token.cancel();
+        // Cancel the worker as a last resort; callers should call shutdown() for clean termination.
+        // Note: We cannot await the handle in Drop (sync context), so this only signals cancellation.
+        if !self.cancellation_token.is_cancelled() {
+            log::warn!("BackgroundIndexer dropped without calling shutdown(); worker may terminate abruptly");
+            self.cancellation_token.cancel();
+        }
     }
 }
 ```
@@ -374,7 +390,7 @@ async fn did_open(&self, params: DidOpenTextDocumentParams) {
     
     if !priority_2_files.is_empty() {
         let enabled = {
-            let state = self.state.read().await;
+            let state = self.state.read().unwrap();
             state.cross_file_config.on_demand_indexing_priority_2_enabled
         };
         

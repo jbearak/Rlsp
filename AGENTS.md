@@ -30,8 +30,26 @@ Rlsp is a static R Language Server extracted from Ark. It provides LSP features 
 
 ## Cross-File Architecture
 
+### Overview
+
+Cross-file awareness enables Rlsp to understand symbol definitions and relationships across multiple R files connected via `source()` calls and LSP directives. This allows:
+
+- **Symbol resolution**: Functions and variables from sourced files appear in completions, hover, and go-to-definition
+- **Diagnostics suppression**: Symbols from sourced files are not marked as "undefined variable"
+- **Dependency tracking**: Changes to a file trigger revalidation of dependent files
+- **Workspace indexing**: Closed files are indexed and their symbols are available
+
+**Key Features**:
+1. **Automatic detection**: Parses `source()` and `sys.source()` calls from R code
+2. **Manual directives**: `@lsp-sourced-by`, `@lsp-run-by` for files not explicitly sourced
+3. **Working directory support**: `@lsp-cd` directive affects source() path resolution
+4. **Position-aware scope**: Symbols only available after their source() call
+5. **Cycle detection**: Prevents infinite loops in circular dependencies
+6. **Real-time updates**: Changes propagate to dependent files automatically
+
 ### Module Structure (`crates/rlsp/src/cross_file/`)
 
+- `background_indexer.rs` - Background indexing queue for Priority 2/3 files
 - `types.rs` - Core types (CrossFileMetadata, BackwardDirective, ForwardSource, CallSiteSpec)
 - `directive.rs` - Directive parsing (@lsp-sourced-by, @lsp-source, etc.) with optional colon/quotes
 - `source_detect.rs` - Tree-sitter based source() call detection with UTF-16 columns
@@ -56,6 +74,60 @@ All directives support optional colon and quotes:
 
 Backward directive synonyms: `@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`
 Working directory synonyms: `@lsp-working-directory`, `@lsp-working-dir`, `@lsp-current-directory`, `@lsp-current-dir`, `@lsp-wd`, `@lsp-cd`
+
+### Path Resolution: Critical Distinction
+
+**IMPORTANT**: Path resolution behaves differently for LSP directives vs. source() statements:
+
+#### LSP Directives (Backward/Forward)
+**Always resolve relative to the file's directory, ignoring @lsp-cd:**
+- `@lsp-sourced-by: ../parent.R` - Resolved from file's directory
+- `@lsp-run-by: ../parent.R` - Resolved from file's directory
+- `@lsp-source: utils.R` - Resolved from file's directory
+- **Rationale**: Directives describe static file relationships that should not change based on runtime working directory
+
+**Implementation**:
+- Uses `PathContext::new()` which excludes working_directory from metadata
+- Applied in both `dependency.rs` (graph building) and `handlers.rs` (diagnostics)
+- See `do_resolve_backward()` helper in `dependency.rs`
+
+#### source() Statements (AST-detected)
+**Resolve using @lsp-cd working directory when present:**
+- `source("utils.R")` - Resolved from @lsp-cd directory if specified, else file's directory
+- `source("../data.R")` - Resolved from @lsp-cd directory if specified, else file's directory
+- **Rationale**: source() calls execute at runtime and are affected by working directory
+
+**Implementation**:
+- Uses `PathContext::from_metadata()` which includes working_directory from metadata
+- Applied via `do_resolve()` helper in `dependency.rs`
+
+#### Example Scenario
+```r
+# File: subdir/child.r
+# @lsp-cd: /some/other/directory
+# @lsp-run-by: ../parent.r
+
+source("utils.r")
+```
+
+**Resolution behavior**:
+- `@lsp-run-by: ../parent.r` → Resolves to `parent.r` in workspace root (ignores @lsp-cd)
+- `source("utils.r")` → Resolves to `/some/other/directory/utils.r` (uses @lsp-cd)
+
+#### Path Types
+1. **File-relative**: `utils.R`, `../parent.R`, `./data.R`
+   - LSP directives: relative to file's directory
+   - source() calls: relative to @lsp-cd or file's directory
+
+2. **Workspace-root-relative**: `/data/utils.R`
+   - Both: relative to workspace root (requires workspace_root parameter)
+
+3. **Absolute**: `/absolute/path/to/file.R`
+   - Both: used directly after canonicalization
+
+#### PathContext Types
+- `PathContext::new(uri, workspace_root)` - For LSP directives (no working_directory)
+- `PathContext::from_metadata(uri, metadata, workspace_root)` - For source() calls (includes working_directory)
 
 ### Call-Site Resolution
 
@@ -102,6 +174,34 @@ Working directory synonyms: `@lsp-working-directory`, `@lsp-working-dir`, `@lsp-
 - Freshness guards prevent stale diagnostic publishes
 - Monotonic publishing: never publish older version than last published
 
+### On-Demand Background Indexing
+
+The BackgroundIndexer handles asynchronous indexing of files not currently open in the editor:
+
+**Priority Levels**:
+- Priority 1: Files directly sourced by open documents (synchronous, before diagnostics)
+- Priority 2: Files referenced by backward directives (@lsp-run-by, @lsp-sourced-by)
+- Priority 3: Transitive dependencies (files sourced by Priority 2 files)
+
+**Architecture**:
+- Single worker thread processes queue sequentially (avoids resource contention)
+- Priority queue ensures important files indexed first
+- Depth tracking prevents infinite transitive chains
+- Duplicate detection avoids redundant work
+
+**Configuration** (via `crossFile.onDemandIndexing.*`):
+- `enabled`: Enable/disable on-demand indexing (default: true)
+- `maxTransitiveDepth`: Maximum depth for transitive indexing (default: 2)
+- `maxQueueSize`: Maximum queue size (default: 50)
+- `priority2Enabled`: Enable Priority 2 indexing (default: true)
+- `priority3Enabled`: Enable Priority 3 indexing (default: true)
+
+**Flow**:
+1. File opened with backward directive → Priority 2 task submitted
+2. Worker processes task → reads file, extracts metadata, computes artifacts
+3. Updates workspace index and dependency graph
+4. Queues transitive dependencies as Priority 3 tasks (if depth allows)
+
 ### Thread-Safety
 
 - WorldState protected by Arc<tokio::sync::RwLock>
@@ -109,6 +209,46 @@ Working directory synonyms: `@lsp-working-directory`, `@lsp-working-dir`, `@lsp-
 - Serialized writes for state mutations
 - Interior-mutable caches allow population during read operations
 - Background tasks reacquire locks, never hold borrowed &mut WorldState
+
+### Common Issues and Debugging
+
+#### "Parent file not found" Error
+**Symptom**: Backward directive reports parent file not found despite file existing
+
+**Common Causes**:
+1. **Incorrect path resolution**: Ensure path is relative to file's directory, not @lsp-cd
+2. **File not in workspace**: Parent file must be within workspace or accessible on disk
+3. **Typo in path**: Check for correct use of `..` for parent directory navigation
+
+**Debug Steps**:
+1. Enable trace logging: `RUST_LOG=rlsp=trace`
+2. Check logs for "Resolving path" messages in `path_resolve.rs`
+3. Verify file exists at resolved canonical path
+4. Ensure backward directive uses separate PathContext (without @lsp-cd)
+
+#### Symbols Not Available from Sourced File
+**Symptom**: Completions don't show functions from sourced files
+
+**Common Causes**:
+1. **Position before source() call**: Symbols only available after source() line
+2. **Path resolution failed**: source() path doesn't resolve to actual file
+3. **Cycle detected**: Circular dependencies stop traversal
+4. **Max depth exceeded**: Chain longer than configured max_chain_depth
+
+**Debug Steps**:
+1. Check dependency graph: Look for edge from parent to child
+2. Verify metadata extraction: Ensure source() call was detected
+3. Check scope resolution logs: Verify traversal reaches sourced file
+4. Test with simple two-file case to isolate issue
+
+#### @lsp-cd Not Affecting Directives (Expected Behavior)
+**Symptom**: Backward directive path resolution ignores @lsp-cd
+
+**This is correct behavior**: LSP directives always resolve relative to file's directory, ignoring @lsp-cd. Only source() statements use @lsp-cd for path resolution.
+
+**If you need @lsp-cd to affect a path**:
+- Use `source()` call instead of directive
+- Or specify absolute/workspace-relative path in directive
 
 ## VS Code Extension
 

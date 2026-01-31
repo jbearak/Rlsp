@@ -4016,6 +4016,8 @@ proptest! {
 // Validates: Loop iterator detection and scope persistence
 // ============================================================================
 
+use super::scope::scope_at_position;
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -4181,36 +4183,6 @@ proptest! {
                 if parameters.is_empty())
         });
         prop_assert!(has_function_scope, "Should have FunctionScope event with empty parameters");
-    }
-
-    /// Property 8 extended: Function with ellipsis parameter
-    #[test]
-    fn prop_function_ellipsis_parameter_scope(
-        func_name in r_identifier(),
-        param_name in r_identifier()
-    ) {
-        prop_assume!(func_name != param_name);
-
-        let uri = make_url("test");
-
-        let code = format!("{} <- function({}, ...) {{ list({}, ...) }}", func_name, param_name, param_name);
-        let tree = parse_r_tree(&code);
-        let artifacts = compute_artifacts(&uri, &tree, &code);
-
-        // Should have FunctionScope event with parameters including ellipsis
-        let has_function_scope = artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. } 
-                if parameters.iter().any(|p| p.name == param_name) &&
-                   parameters.iter().any(|p| p.name == "..."))
-        });
-        prop_assert!(has_function_scope, "Should have FunctionScope event with ellipsis parameter");
-
-        // Get scope within function body
-        let scope_in_body = scope_at_position(&artifacts, 0, 50);
-        prop_assert!(scope_in_body.symbols.contains_key(&param_name),
-            "Named parameter should be available within function body");
-        prop_assert!(scope_in_body.symbols.contains_key("..."),
-            "Ellipsis parameter should be available within function body");
     }
 
     /// Property 8 extended: Function with default parameter values

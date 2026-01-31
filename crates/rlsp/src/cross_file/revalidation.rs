@@ -106,6 +106,7 @@ impl CrossFileDiagnosticsGate {
 
     /// Mark a URI for forced republish
     pub fn mark_force_republish(&self, uri: &Url) {
+        log::trace!("Marking {} for force republish", uri);
         let mut force = self.force_republish.write().unwrap();
         force.insert(uri.clone());
     }
