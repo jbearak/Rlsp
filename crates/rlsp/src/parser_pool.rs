@@ -58,12 +58,18 @@ mod tests {
         let tree2 = with_parser(|parser| parser.parse("y <- 42", None));
         assert!(tree2.is_some());
         
-        // Verify trees are independent
+        // Verify trees are independent by checking their structure differs
         let tree1 = tree1.unwrap();
         let tree2 = tree2.unwrap();
         let root1 = tree1.root_node();
         let root2 = tree2.root_node();
-        assert_ne!(root1.kind(), root2.kind());
+        // Both roots are "program", but their children should differ
+        assert_eq!(root1.kind(), "program");
+        assert_eq!(root2.kind(), "program");
+        // First child of tree1 is a function_definition, tree2 is a binary_operator (assignment)
+        let child1 = root1.child(0).map(|n| n.kind());
+        let child2 = root2.child(0).map(|n| n.kind());
+        assert_ne!(child1, child2, "Trees should have different structure");
     }
 }
 
