@@ -398,16 +398,10 @@ fn collect_missing_file_diagnostics(
             log::trace!("file_exists: found in file cache");
             return true;
         }
-        // Fallback to filesystem check for files not yet indexed
-        // This is necessary for backward directives that reference parent files
-        // that may not have been opened or indexed yet
-        if let Ok(path) = target_uri.to_file_path() {
-            let exists = path.exists();
-            log::trace!("file_exists: filesystem check for path '{}': {}", path.display(), exists);
-            return exists;
-        }
-        log::trace!("file_exists: could not convert URI to file path");
-        false
+        // Don't block on filesystem I/O - assume file exists if not in cache
+        // On-demand indexing will populate the cache when the file is needed
+        log::trace!("file_exists: {} not in cache, assuming exists to avoid false positives", target_uri);
+        true
     };
 
     // Check forward sources (source() calls and @lsp-source directives)
