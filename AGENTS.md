@@ -49,6 +49,7 @@ Cross-file awareness enables Rlsp to understand symbol definitions and relations
 
 ### Module Structure (`crates/rlsp/src/cross_file/`)
 
+- `background_indexer.rs` - Background indexing queue for Priority 2/3 files
 - `types.rs` - Core types (CrossFileMetadata, BackwardDirective, ForwardSource, CallSiteSpec)
 - `directive.rs` - Directive parsing (@lsp-sourced-by, @lsp-source, etc.) with optional colon/quotes
 - `source_detect.rs` - Tree-sitter based source() call detection with UTF-16 columns
@@ -172,6 +173,34 @@ source("utils.r")
 - Cancellation of outdated pending revalidations
 - Freshness guards prevent stale diagnostic publishes
 - Monotonic publishing: never publish older version than last published
+
+### On-Demand Background Indexing
+
+The BackgroundIndexer handles asynchronous indexing of files not currently open in the editor:
+
+**Priority Levels**:
+- Priority 1: Files directly sourced by open documents (synchronous, before diagnostics)
+- Priority 2: Files referenced by backward directives (@lsp-run-by, @lsp-sourced-by)
+- Priority 3: Transitive dependencies (files sourced by Priority 2 files)
+
+**Architecture**:
+- Single worker thread processes queue sequentially (avoids resource contention)
+- Priority queue ensures important files indexed first
+- Depth tracking prevents infinite transitive chains
+- Duplicate detection avoids redundant work
+
+**Configuration** (via `crossFile.onDemandIndexing.*`):
+- `enabled`: Enable/disable on-demand indexing (default: true)
+- `maxTransitiveDepth`: Maximum depth for transitive indexing (default: 2)
+- `maxQueueSize`: Maximum queue size (default: 50)
+- `priority2Enabled`: Enable Priority 2 indexing (default: true)
+- `priority3Enabled`: Enable Priority 3 indexing (default: true)
+
+**Flow**:
+1. File opened with backward directive → Priority 2 task submitted
+2. Worker processes task → reads file, extracts metadata, computes artifacts
+3. Updates workspace index and dependency graph
+4. Queues transitive dependencies as Priority 3 tasks (if depth allows)
 
 ### Thread-Safety
 
