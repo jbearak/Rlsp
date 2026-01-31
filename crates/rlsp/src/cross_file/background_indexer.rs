@@ -78,8 +78,8 @@ impl BackgroundIndexer {
             .unwrap_or(50);
 
         if queue.len() >= max_size {
-            log::trace!(
-                "Skipping indexing task for {} - queue full ({}/{})",
+            log::warn!(
+                "Background indexing queue full, dropping task for {} ({}/{})",
                 uri,
                 queue.len(),
                 max_size
@@ -194,7 +194,7 @@ impl BackgroundIndexer {
                 }
             }
             Err(e) => {
-                log::trace!("Failed to index {}: {}", task.uri, e);
+                log::warn!("Failed to index {}: {}", task.uri, e);
             }
         }
     }
