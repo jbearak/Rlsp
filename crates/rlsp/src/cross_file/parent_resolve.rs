@@ -12,7 +12,9 @@ use tower_lsp::lsp_types::Url;
 use super::cache::{ParentCacheKey, ParentResolution};
 use super::config::{CallSiteDefault, CrossFileConfig};
 use super::dependency::DependencyGraph;
-use super::types::{byte_offset_to_utf16_column, BackwardDirective, CallSiteSpec, CrossFileMetadata};
+use super::types::{byte_offset_to_utf16_column, CallSiteSpec, CrossFileMetadata};
+#[cfg(test)]
+use super::types::BackwardDirective;
 
 /// Resolve the effective call site when a file is sourced multiple times.
 /// Returns the earliest call site position using lexicographic ordering.
