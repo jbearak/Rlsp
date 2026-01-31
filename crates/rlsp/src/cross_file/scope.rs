@@ -103,7 +103,7 @@ impl FunctionScopeInterval {
     /// let start = Position::new(1, 0);
     /// let end = Position::new(10, 0);
     /// let interval = FunctionScopeInterval::new(start, end);
-    /// assert_eq!(interval.to_tuple(), (1, 0, 10, 0));
+    /// assert_eq!(interval.as_tuple(), (1, 0, 10, 0));
     /// ```
     pub fn new(start: Position, end: Position) -> Self {
         Self { start, end }
@@ -133,7 +133,7 @@ impl FunctionScopeInterval {
     ///
     /// ```
     /// let iv = FunctionScopeInterval::from_tuple((1, 2, 3, 4));
-    /// assert_eq!(iv.to_tuple(), (1, 2, 3, 4));
+    /// assert_eq!(iv.as_tuple(), (1, 2, 3, 4));
     /// ```
     pub fn from_tuple(tuple: (u32, u32, u32, u32)) -> Self {
         Self {
@@ -152,9 +152,9 @@ impl FunctionScopeInterval {
     ///
     /// ```
     /// let interval = FunctionScopeInterval::new(Position::new(1, 2), Position::new(3, 4));
-    /// assert_eq!(interval.to_tuple(), (1, 2, 3, 4));
+    /// assert_eq!(interval.as_tuple(), (1, 2, 3, 4));
     /// ```
-    pub fn to_tuple(&self) -> (u32, u32, u32, u32) {
+    pub fn as_tuple(self) -> (u32, u32, u32, u32) {
         (
             self.start.line,
             self.start.column,
@@ -422,7 +422,7 @@ impl FunctionScopeTree {
     /// ]);
     /// let pos = Position::new(3, 0);
     /// let innermost = tree.query_innermost(pos).unwrap();
-    /// assert_eq!(innermost.to_tuple(), (2, 0, 5, 0));
+    /// assert_eq!(innermost.as_tuple(), (2, 0, 5, 0));
     /// ```
     pub fn query_innermost(&self, pos: Position) -> Option<FunctionScopeInterval> {
         if let Some(ref root) = self.root {
@@ -648,7 +648,7 @@ fn find_containing_function_scope(
     column: u32,
 ) -> Option<(u32, u32, u32, u32)> {
     tree.query_innermost(Position::new(line, column))
-        .map(|interval| interval.to_tuple())
+        .map(|interval| interval.as_tuple())
 }
 /// Remove the given symbols from a computed scope when the removal applies.
 ///
@@ -805,7 +805,7 @@ pub fn scope_at_position(
         artifacts.function_scope_tree
             .query_point(Position::new(line, column))
             .into_iter()
-            .map(|interval| interval.to_tuple())
+            .map(|interval| interval.as_tuple())
             .collect()
     };
 
@@ -818,7 +818,7 @@ pub fn scope_at_position(
                     // Use interval tree for O(log n) innermost scope lookup
                     let def_function_scope = artifacts.function_scope_tree
                         .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.to_tuple());
+                        .map(|interval| interval.as_tuple());
 
                     match def_function_scope {
                         None => {
@@ -916,6 +916,7 @@ where
 ///     &mut visited,
 /// );
 /// ```
+#[allow(clippy::too_many_arguments)]
 fn scope_at_position_recursive<F>(
     uri: &Url,
     line: u32,
@@ -954,7 +955,7 @@ where
         artifacts.function_scope_tree
             .query_point(Position::new(line, column))
             .into_iter()
-            .map(|interval| interval.to_tuple())
+            .map(|interval| interval.as_tuple())
             .collect()
     };
 
@@ -967,7 +968,7 @@ where
                     // Use interval tree for O(log n) innermost scope lookup
                     let def_function_scope = artifacts.function_scope_tree
                         .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.to_tuple());
+                        .map(|interval| interval.as_tuple());
                     
                     // Skip function-local definitions not in our scope
                     if let Some(def_scope) = def_function_scope {
@@ -994,7 +995,7 @@ where
                         // Use interval tree for O(log n) innermost scope lookup
                         let source_function_scope = artifacts.function_scope_tree
                             .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.to_tuple());
+                            .map(|interval| interval.as_tuple());
 
                         if let Some(src_scope) = source_function_scope {
                             if !active_function_scopes.contains(&src_scope) {
@@ -1449,6 +1450,7 @@ fn compute_interface_hash(interface: &HashMap<String, ScopedSymbol>) -> u64 {
 /// Property 19: Backward-First Resolution Order
 /// - Backward directives establish parent context (symbols available before this file runs)
 /// - Forward source() calls add symbols in document order
+#[allow(clippy::too_many_arguments)]
 pub fn scope_at_position_with_backward<F, G>(
     uri: &Url,
     line: u32,
@@ -1472,6 +1474,7 @@ where
 
 /// Extended scope resolution that also uses dependency graph edges.
 /// This is the preferred entry point when a DependencyGraph is available.
+#[allow(clippy::too_many_arguments)]
 pub fn scope_at_position_with_graph<F, G>(
     uri: &Url,
     line: u32,
@@ -1505,6 +1508,7 @@ where
 /// This recursively collects symbols visible at (line, column) in `uri` by:
 /// - Merging symbols from parent files indicated by dependency-graph edges (respecting local/sys.source/global rules and depth limits).
 /// - Applying the file's own timeline (definitions, function-parameter scopes, removals) and resolving forward `source()` calls through the provided `PathContext`.
+///
 /// The function guards against cycles and enforces `max_depth`; entries that would exceed `max_depth` are recorded in `ScopeAtPosition::depth_exceeded`.
 ///
 /// # Examples
@@ -1536,6 +1540,7 @@ where
 ///
 /// assert!(scope.symbols.is_empty());
 /// ```
+#[allow(clippy::too_many_arguments)]
 fn scope_at_position_with_graph_recursive<F, G>(
     uri: &Url,
     line: u32,
@@ -1629,14 +1634,14 @@ where
 
     // STEP 2: Process timeline events (local definitions and forward sources)
     // Use interval tree for O(log n) query instead of linear scan
-    let is_eof_position = line == u32::MAX || column == u32::MAX;
+    let is_eof_position = line == u32::MAX && column == u32::MAX;
     let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_eof_position {
         Vec::new()
     } else {
         artifacts.function_scope_tree
             .query_point(Position::new(line, column))
             .into_iter()
-            .map(|interval| interval.to_tuple())
+            .map(|interval| interval.as_tuple())
             .collect()
     };
     
@@ -1648,7 +1653,7 @@ where
                     // Use interval tree for O(log n) innermost scope lookup
                     let def_function_scope = artifacts.function_scope_tree
                         .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.to_tuple());
+                        .map(|interval| interval.as_tuple());
                     
                     match def_function_scope {
                         None => {
@@ -1673,7 +1678,7 @@ where
                         // Use interval tree for O(log n) innermost scope lookup
                         let source_function_scope = artifacts.function_scope_tree
                             .query_innermost(Position::new(*src_line, *src_col))
-                            .map(|interval| interval.to_tuple());
+                            .map(|interval| interval.as_tuple());
 
                         if let Some(src_scope) = source_function_scope {
                             if !active_function_scopes.contains(&src_scope) {
@@ -1747,7 +1752,7 @@ where
             ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
-                let is_eof_position = line == u32::MAX || column == u32::MAX;
+                let is_eof_position = line == u32::MAX && column == u32::MAX;
                 if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
@@ -1822,6 +1827,7 @@ where
 ///
 /// assert!(scope.symbols.is_empty());
 /// ```
+#[allow(clippy::too_many_arguments)]
 fn scope_at_position_with_backward_recursive<F, G>(
     uri: &Url,
     line: u32,
@@ -1908,7 +1914,7 @@ where
     } else {
         artifacts.function_scope_tree.query_point(query_pos)
             .into_iter()
-            .map(|interval| interval.to_tuple())
+            .map(|interval| interval.as_tuple())
             .collect()
     };
     
@@ -1920,7 +1926,7 @@ where
                     // Check if this definition is inside any function scope using interval tree
                     let def_function_scope = artifacts.function_scope_tree
                         .query_innermost(Position::new(*def_line, *def_col))
-                        .map(|interval| interval.to_tuple());
+                        .map(|interval| interval.as_tuple());
                     
                     match def_function_scope {
                         None => {
@@ -5165,7 +5171,7 @@ mod tests {
         assert_eq!(from_tuple.start, Position::new(10, 5));
         assert_eq!(from_tuple.end, Position::new(20, 15));
         
-        let back_to_tuple = from_tuple.to_tuple();
+        let back_to_tuple = from_tuple.as_tuple();
         assert_eq!(back_to_tuple, tuple, "Round-trip should preserve values");
     }
 

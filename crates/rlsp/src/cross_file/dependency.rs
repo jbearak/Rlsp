@@ -64,7 +64,7 @@ impl DependencyEdge {
         }
     }
 
-    fn from_to_pair(&self) -> FromToPair {
+    fn as_from_to_pair(&self) -> FromToPair {
         FromToPair {
             from: self.from.clone(),
             to: self.to.clone(),
@@ -165,7 +165,7 @@ impl DependencyGraph {
                         is_sys_source: source.is_sys_source,
                         is_directive: true,
                     };
-                    directive_from_to.insert(edge.from_to_pair());
+                    directive_from_to.insert(edge.as_from_to_pair());
                     directive_edges.push(edge);
                 }
             }
@@ -178,7 +178,7 @@ impl DependencyGraph {
             if let Some(parent_uri) = do_resolve_backward(&directive.path) {
                 // Extract child filename for inference
                 let child_filename = uri.path_segments()
-                    .and_then(|s| s.last())
+                    .and_then(|mut s| s.next_back())
                     .unwrap_or("");
                 
                 let (call_site_line, call_site_column) = match &directive.call_site {
@@ -218,7 +218,7 @@ impl DependencyGraph {
                     is_sys_source: false,
                     is_directive: true,
                 };
-                let pair = edge.from_to_pair();
+                let pair = edge.as_from_to_pair();
                 if !directive_from_to.contains(&pair) {
                     directive_from_to.insert(pair);
                     directive_edges.push(edge);
@@ -241,12 +241,12 @@ impl DependencyGraph {
                         is_sys_source: source.is_sys_source,
                         is_directive: false,
                     };
-                    let pair = edge.from_to_pair();
+                    let pair = edge.as_from_to_pair();
 
                     // Check for directive-vs-AST conflict (Requirement 6.8)
                     if directive_from_to.contains(&pair) {
                         // Find the directive edge for this (from, to) pair
-                        let directive_edge = directive_edges.iter().find(|e| e.from_to_pair() == pair);
+                        let directive_edge = directive_edges.iter().find(|e| e.as_from_to_pair() == pair);
 
                         if let Some(dir_edge) = directive_edge {
                             // Check if directive has a known call site
@@ -285,7 +285,7 @@ impl DependencyGraph {
                                     severity: Some(DiagnosticSeverity::WARNING),
                                     message: format!(
                                         "Directive without call site suppresses AST-detected source() call to '{}' at line {}. Consider adding line= or match= to the directive.",
-                                        to_uri.path_segments().and_then(|s| s.last()).unwrap_or(""),
+                                        to_uri.path_segments().and_then(|mut s| s.next_back()).unwrap_or(""),
                                         source.line + 1
                                     ),
                                     ..Default::default()

@@ -7184,8 +7184,8 @@ proptest! {
 
         // Verify the actual intervals match (not just count)
         // Sort both for comparison since order may differ
-        let mut tree_sorted: Vec<_> = tree_results.iter().map(|i| i.to_tuple()).collect();
-        let mut brute_sorted: Vec<_> = brute_force.iter().map(|i| i.to_tuple()).collect();
+        let mut tree_sorted: Vec<_> = tree_results.iter().map(|i| i.as_tuple()).collect();
+        let mut brute_sorted: Vec<_> = brute_force.iter().map(|i| i.as_tuple()).collect();
         tree_sorted.sort();
         brute_sorted.sort();
         prop_assert_eq!(
@@ -7398,7 +7398,7 @@ proptest! {
 
         // The result should be the nested interval (later start)
         prop_assert_eq!(
-            result.to_tuple(),
+            result.as_tuple(),
             nested,
             "Should select nested interval (later start) as innermost"
         );
@@ -7569,7 +7569,7 @@ proptest! {
             let tree_containing: Vec<_> = tree
                 .query_point(Position::new(line, column))
                 .into_iter()
-                .map(|i| i.to_tuple())
+                .map(|i| i.as_tuple())
                 .collect();
             let linear_containing = linear_scan_containing(&scopes, line, column);
 
@@ -7594,7 +7594,7 @@ proptest! {
             // We verify that the tree returns an interval with the correct maximum start position.
             let tree_innermost = tree
                 .query_innermost(Position::new(line, column))
-                .map(|i| i.to_tuple());
+                .map(|i| i.as_tuple());
             let max_start = find_max_start_position(&scopes, line, column);
 
             match (tree_innermost, max_start) {
@@ -7676,7 +7676,7 @@ proptest! {
         let tree_containing: Vec<_> = tree
             .query_point(Position::new(query_line, query_col))
             .into_iter()
-            .map(|i| i.to_tuple())
+            .map(|i| i.as_tuple())
             .collect();
         let linear_containing = linear_scan_containing(&all_scopes, query_line, query_col);
 
@@ -7697,7 +7697,7 @@ proptest! {
         // When multiple intervals have the same maximum start position, either one is valid.
         let tree_innermost = tree
             .query_innermost(Position::new(query_line, query_col))
-            .map(|i| i.to_tuple());
+            .map(|i| i.as_tuple());
         let max_start = find_max_start_position(&all_scopes, query_line, query_col);
 
         match (tree_innermost, max_start) {
@@ -7753,7 +7753,7 @@ proptest! {
             let tree_at_start: Vec<_> = tree
                 .query_point(Position::new(sl, sc))
                 .into_iter()
-                .map(|i| i.to_tuple())
+                .map(|i| i.as_tuple())
                 .collect();
             let linear_at_start = linear_scan_containing(&scopes, sl, sc);
 
@@ -7774,7 +7774,7 @@ proptest! {
             let tree_at_end: Vec<_> = tree
                 .query_point(Position::new(el, ec))
                 .into_iter()
-                .map(|i| i.to_tuple())
+                .map(|i| i.as_tuple())
                 .collect();
             let linear_at_end = linear_scan_containing(&scopes, el, ec);
 
@@ -7795,7 +7795,7 @@ proptest! {
             // When multiple intervals have the same maximum start position, either one is valid.
             let tree_innermost_start = tree
                 .query_innermost(Position::new(sl, sc))
-                .map(|i| i.to_tuple());
+                .map(|i| i.as_tuple());
             let max_start_at_start = find_max_start_position(&scopes, sl, sc);
 
             match (tree_innermost_start, max_start_at_start) {
@@ -7832,7 +7832,7 @@ proptest! {
             // Test innermost at end
             let tree_innermost_end = tree
                 .query_innermost(Position::new(el, ec))
-                .map(|i| i.to_tuple());
+                .map(|i| i.as_tuple());
             let max_start_at_end = find_max_start_position(&scopes, el, ec);
 
             match (tree_innermost_end, max_start_at_end) {
@@ -8008,7 +8008,6 @@ proptest! {
     }
 
     /// Feature: interval-tree-scope-lookup, Property 4: Position Lexicographic Ordering (Consistency)
-}
     ///
     /// The Ord implementation should be consistent with PartialOrd and Eq.
     /// Specifically: (a == b) implies (a.cmp(&b) == Ordering::Equal)

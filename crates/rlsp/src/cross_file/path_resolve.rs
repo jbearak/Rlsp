@@ -118,7 +118,7 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
         context.file_path.display()
     );
 
-    let resolved = if path.starts_with('/') {
+    let resolved = if let Some(stripped) = path.strip_prefix('/') {
         // Workspace-root-relative path
         let workspace_root = context.workspace_root.as_ref();
         if workspace_root.is_none() {
@@ -129,7 +129,7 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
             );
             return None;
         }
-        workspace_root.unwrap().join(&path[1..])
+        workspace_root.unwrap().join(stripped)
     } else {
         // File-relative or working-directory-relative path
         let base = context.effective_working_directory();
@@ -171,7 +171,7 @@ pub fn resolve_working_directory(path: &str, context: &PathContext) -> Option<Pa
         file_dir.as_ref().map(|p| p.display().to_string())
     );
 
-    let resolved = if path.starts_with('/') {
+    let resolved = if let Some(stripped) = path.strip_prefix('/') {
         // Workspace-root-relative
         let workspace_root = context.workspace_root.as_ref();
         if workspace_root.is_none() {
@@ -181,7 +181,7 @@ pub fn resolve_working_directory(path: &str, context: &PathContext) -> Option<Pa
             );
             return None;
         }
-        workspace_root.unwrap().join(&path[1..])
+        workspace_root.unwrap().join(stripped)
     } else {
         // File-relative
         let file_dir = context.file_path.parent();

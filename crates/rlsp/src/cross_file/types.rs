@@ -94,8 +94,10 @@ impl ForwardSource {
 
 /// Call site specification for backward directives
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CallSiteSpec {
     /// Use configuration default
+    #[default]
     Default,
     /// Explicit line number (0-based internally, converted from 1-based user input)
     Line(u32),
@@ -103,11 +105,6 @@ pub enum CallSiteSpec {
     Match(String),
 }
 
-impl Default for CallSiteSpec {
-    fn default() -> Self {
-        CallSiteSpec::Default
-    }
-}
 
 /// Convert a byte offset to UTF-16 column for a given line.
 /// Handles multi-byte UTF-8 characters correctly for LSP position conversion.

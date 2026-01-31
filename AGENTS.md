@@ -228,6 +228,21 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - Keep doc comments and markdown examples aligned with current behavior (e.g., list= string literals support).
 - Normalize markdown table spacing to match project lint expectations when adding spec tables.
 
+### Rust/Clippy Best Practices
+
+- Use `strip_prefix()` instead of manual `starts_with()` + slice indexing (e.g., `path[1..]`); clippy flags this as `manual_strip`.
+- On `DoubleEndedIterator`s, use `next_back()` instead of `last()` to avoid iterating the entire collection.
+- Name methods `as_*` (not `to_*`) when they return a cheap view/conversion on `Copy` types that take `self` by value.
+- Name methods `as_*` (not `from_*`) when they convert `&self` to another type; `from_*` conventionally takes no `self`.
+- Use `&Path` instead of `&PathBuf` in function parameters; `&PathBuf` coerces to `&Path` and avoids unnecessary type constraints.
+- Use `split_once()` instead of `splitn(2, ...).nth(1)` for cleaner single-split operations.
+- Prefer `for item in iter` over `while let Some(item) = iter.next()` unless you need to call other iterator methods mid-loop.
+- When a function legitimately needs many parameters (e.g., recursive scope resolution), add `#[allow(clippy::too_many_arguments)]` rather than forcing awkward refactors.
+- Mark test-only helper functions with `#[cfg(test)]` to avoid dead-code warnings in non-test builds.
+- For struct fields that are set but not yet read (future use), add `#[allow(dead_code)]` with a comment explaining the intent.
+- In doc comments, separate list items from following paragraphs with a blank line to avoid `doc_lazy_continuation` warnings.
+- Run `cargo clippy` before committing to catch style issues early; many have auto-fix suggestions via `cargo clippy --fix`.
+
 ### Thread-Safety
 
 - WorldState protected by Arc<tokio::sync::RwLock>

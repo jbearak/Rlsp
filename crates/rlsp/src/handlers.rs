@@ -278,7 +278,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     if let Some(cycle_edge) = state.cross_file_graph.detect_cycle(uri) {
         let line = cycle_edge.call_site_line.unwrap_or(0);
         let col = cycle_edge.call_site_column.unwrap_or(0);
-        let target = cycle_edge.to.path_segments().and_then(|s| s.last().map(|s| s.to_string())).unwrap_or_default();
+        let target = cycle_edge.to.path_segments().and_then(|mut s| s.next_back().map(|s| s.to_string())).unwrap_or_default();
         diagnostics.push(Diagnostic {
             range: Range {
                 start: Position::new(line, col),
@@ -525,11 +525,11 @@ fn collect_ambiguous_parent_diagnostics(
         let directive_line = meta.sourced_by.first().map(|d| d.directive_line).unwrap_or(0);
 
         let alt_list: Vec<String> = alternatives.iter()
-            .filter_map(|u| u.path_segments().and_then(|s| s.last().map(|s| s.to_string())))
+            .filter_map(|u| u.path_segments().and_then(|mut s| s.next_back().map(|s| s.to_string())))
             .collect();
 
         let selected_name = selected_uri.path_segments()
-            .and_then(|s| s.last().map(|s| s.to_string()))
+            .and_then(|mut s| s.next_back().map(|s| s.to_string()))
             .unwrap_or_else(|| selected_uri.to_string());
 
         diagnostics.push(Diagnostic {
@@ -699,48 +699,6 @@ fn collect_identifier_usages_utf16<'a>(node: Node<'a>, text: &str, usages: &mut 
     }
 }
 
-fn collect_identifier_usages<'a>(node: Node<'a>, text: &str, usages: &mut Vec<(String, u32, u32, Node<'a>)>) {
-    if node.kind() == "identifier" {
-        // Skip if this is the LHS of an assignment
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "binary_operator" {
-                let mut cursor = parent.walk();
-                let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 && children[0].id() == node.id() {
-                    let op = children[1];
-                    let op_text = &text[op.byte_range()];
-                    if matches!(op_text, "<-" | "=" | "<<-") {
-                        // Skip LHS of assignment, but recurse into children
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            collect_identifier_usages(child, text, usages);
-                        }
-                        return;
-                    }
-                }
-            }
-            // Skip named arguments
-            if parent.kind() == "argument" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return;
-                    }
-                }
-            }
-        }
-
-        let name = text[node.byte_range()].to_string();
-        let line = node.start_position().row as u32;
-        let col = node.start_position().column as u32;
-        usages.push((name, line, col, node));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_identifier_usages(child, text, usages);
-    }
-}
-
 fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
     if node.is_error() || node.is_missing() {
         let message = if node.is_missing() {
@@ -775,6 +733,7 @@ fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
 /// Position-aware undefined variable collection.
 /// Checks each usage against the cross-file scope at that specific position.
 /// Respects @lsp-ignore and @lsp-ignore-next directives.
+#[allow(clippy::too_many_arguments)]
 fn collect_undefined_variables_position_aware(
     state: &WorldState,
     uri: &Url,
@@ -1044,13 +1003,13 @@ fn collect_usages_with_context<'a>(
             // The first child is typically the operator
             let mut cursor = node.walk();
             let children: Vec<_> = node.children(&mut cursor).collect();
-            children.first().map_or(false, |op| node_text(*op, text) == "~")
+            children.first().is_some_and(|op| node_text(*op, text) == "~")
         }
         "binary_operator" => {
             // For binary operator, check if the operator (second child) is ~
             let mut cursor = node.walk();
             let children: Vec<_> = node.children(&mut cursor).collect();
-            children.get(1).map_or(false, |op| node_text(*op, text) == "~")
+            children.get(1).is_some_and(|op| node_text(*op, text) == "~")
         }
         _ => false,
     };
@@ -1254,6 +1213,7 @@ pub struct DefinitionInfo {
     pub statement: String,
     pub source_uri: Url,
     pub line: u32,
+    #[allow(dead_code)]
     pub column: u32,
 }
 
@@ -1444,6 +1404,7 @@ fn find_enclosing_function(mut node: tree_sitter::Node) -> Option<tree_sitter::N
     }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn extract_statement_text(stmt: StatementMatch, content: &str) -> String {
     let node = stmt.node;
     let lines: Vec<&str> = content.lines().collect();
@@ -1583,7 +1544,7 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
                         if !result.is_empty() {
                             result.push('\n');
                         }
-                        result.push_str(&line[..body_start.column.min(line.len())].trim_end());
+                        result.push_str(line[..body_start.column.min(line.len())].trim_end());
                     }
                 }
                 return result;
@@ -1677,7 +1638,7 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
 
     // Fallback to R help system for built-ins and undefined symbols
     // Check cache first to avoid repeated R subprocess calls
-    if let Some(cached) = state.help_cache.get(&name) {
+    if let Some(cached) = state.help_cache.get(name) {
         if let Some(help_text) = cached {
             return Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
@@ -1692,7 +1653,7 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     }
 
     // Try to get help from R subprocess
-    if let Some(help_text) = crate::help::get_help(&name, None) {
+    if let Some(help_text) = crate::help::get_help(name, None) {
         // Cache successful result
         state.help_cache.insert(name.to_string(), Some(help_text.clone()));
         
@@ -1840,8 +1801,8 @@ fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> 
             let op = children[1];
 
             let op_text = node_text(op, text);
-            if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
-                if node_text(lhs, text) == name {
+            if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier"
+                && node_text(lhs, text) == name {
                     return Some(Range {
                         start: Position::new(
                             lhs.start_position().row as u32,
@@ -1853,7 +1814,6 @@ fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> 
                         ),
                     });
                 }
-            }
         }
     }
 
@@ -1999,9 +1959,10 @@ fn node_text<'a>(node: Node<'a>, text: &'a str) -> &'a str {
 }
 
 // ============================================================================
-// Signature Extraction
+// Signature Extraction (used in tests)
 // ============================================================================
 
+#[cfg(test)]
 fn extract_parameters(params_node: Node, text: &str) -> Vec<String> {
     let mut parameters = Vec::new();
     let mut cursor = params_node.walk();
@@ -2033,6 +1994,7 @@ fn extract_parameters(params_node: Node, text: &str) -> Vec<String> {
     parameters
 }
 
+#[cfg(test)]
 fn extract_function_signature(func_node: Node, func_name: &str, text: &str) -> String {
     let mut cursor = func_node.walk();
     
@@ -2046,6 +2008,7 @@ fn extract_function_signature(func_node: Node, func_name: &str, text: &str) -> S
     format!("{}()", func_name)
 }
 
+#[cfg(test)]
 fn find_function_definition_node<'a>(node: Node<'a>, name: &str, text: &str) -> Option<Node<'a>> {
     if node.kind() == "binary_operator" {
         let mut cursor = node.walk();
@@ -2077,6 +2040,7 @@ fn find_function_definition_node<'a>(node: Node<'a>, name: &str, text: &str) -> 
     None
 }
 
+#[cfg(test)]
 fn find_user_function_signature(state: &WorldState, current_uri: &Url, name: &str) -> Option<String> {
     // 1. Search current document
     if let Some(doc) = state.get_document(current_uri) {
@@ -2123,21 +2087,21 @@ fn find_user_function_signature(state: &WorldState, current_uri: &Url, name: &st
 fn compute_relative_path(target_uri: &Url, workspace_root: Option<&Url>) -> String {
     let Some(workspace_root) = workspace_root else {
         return target_uri.path_segments()
-            .and_then(|segments| segments.last())
+            .and_then(|mut segments| segments.next_back())
             .unwrap_or("unknown")
             .to_string();
     };
 
     let Ok(workspace_path) = workspace_root.to_file_path() else {
         return target_uri.path_segments()
-            .and_then(|segments| segments.last())
+            .and_then(|mut segments| segments.next_back())
             .unwrap_or("unknown")
             .to_string();
     };
 
     let Ok(target_path) = target_uri.to_file_path() else {
         return target_uri.path_segments()
-            .and_then(|segments| segments.last())
+            .and_then(|mut segments| segments.next_back())
             .unwrap_or("unknown")
             .to_string();
     };
@@ -2145,7 +2109,7 @@ fn compute_relative_path(target_uri: &Url, workspace_root: Option<&Url>) -> Stri
     match target_path.strip_prefix(&workspace_path) {
         Ok(relative) => relative.to_string_lossy().to_string(),
         Err(_) => target_uri.path_segments()
-            .and_then(|segments| segments.last())
+            .and_then(|mut segments| segments.next_back())
             .unwrap_or("unknown")
             .to_string(),
     }

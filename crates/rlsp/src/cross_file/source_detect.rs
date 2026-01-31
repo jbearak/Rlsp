@@ -315,9 +315,11 @@ fn extract_bare_symbols(args_node: &Node, content: &str) -> Vec<String> {
 }
 
 /// Extract symbols from the list= argument in rm()/remove() calls.
+///
 /// Handles:
 /// - `list = "name"` (single string literal)
 /// - `list = c("a", "b", "c")` (character vector)
+///
 /// Skips non-literal expressions (variables, function calls other than c()).
 fn extract_list_symbols(args_node: &Node, content: &str) -> Vec<String> {
     let mut cursor = args_node.walk();

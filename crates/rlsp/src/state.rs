@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use ropey::Rope;
@@ -167,7 +167,7 @@ pub struct Package {
 
 impl Package {
     #[allow(dead_code)]
-    pub fn load(path: &PathBuf) -> Option<Self> {
+    pub fn load(path: &Path) -> Option<Self> {
         let description_path = path.join("DESCRIPTION");
         if !description_path.exists() {
             return None;
@@ -193,7 +193,7 @@ impl Package {
 
         Some(Self {
             name,
-            path: path.clone(),
+            path: path.to_path_buf(),
             exports: all_exports,
             description: title,
             version,
@@ -205,7 +205,7 @@ impl Package {
 fn parse_dcf_field(text: &str, field: &str) -> Option<String> {
     for line in text.lines() {
         if line.starts_with(field) && line.contains(':') {
-            let value = line.splitn(2, ':').nth(1)?.trim();
+            let value = line.split_once(':')?.1.trim();
             return Some(value.to_string());
         }
     }
@@ -268,6 +268,7 @@ fn parse_index(path: &PathBuf) -> Option<Vec<String>> {
     Some(symbols)
 }
 
+#[allow(dead_code)]
 fn parse_namespace_imports(path: &PathBuf, library: &Library) -> Vec<String> {
     let mut imports = Vec::new();
 
@@ -453,6 +454,7 @@ impl WorldState {
         self.documents.get(uri)
     }
 
+    #[allow(dead_code)]
     pub fn index_workspace(&mut self) {
         let folders = self.workspace_folders.clone();
         log::info!("Indexing {} workspace folders", folders.len());
@@ -485,6 +487,7 @@ impl WorldState {
             self.cross_file_workspace_index.uris().len());
     }
     
+    #[allow(dead_code)]
     fn load_workspace_namespace(&mut self) {
         for folder_url in &self.workspace_folders {
             if let Ok(folder_path) = folder_url.to_file_path() {
@@ -498,6 +501,7 @@ impl WorldState {
         }
     }
 
+    #[allow(dead_code)]
     fn index_directory(&mut self, dir: &std::path::Path) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;

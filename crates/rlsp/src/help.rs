@@ -51,7 +51,7 @@ pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
     };
 
     let output = Command::new("R")
-        .args(&["--slave", "--no-save", "-e", &r_code])
+        .args(["--slave", "--no-save", "-e", &r_code])
         .output()
         .ok()?;
 

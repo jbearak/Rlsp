@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut use_stdio = false;
 
-    while let Some(arg) = argv.next() {
+    for arg in argv {
         match arg.as_str() {
             "--stdio" => use_stdio = true,
             "--version" => {
