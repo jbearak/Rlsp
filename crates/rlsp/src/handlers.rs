@@ -752,48 +752,6 @@ fn collect_identifier_usages_utf16<'a>(node: Node<'a>, text: &str, usages: &mut 
     }
 }
 
-fn collect_identifier_usages<'a>(node: Node<'a>, text: &str, usages: &mut Vec<(String, u32, u32, Node<'a>)>) {
-    if node.kind() == "identifier" {
-        // Skip if this is the LHS of an assignment
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "binary_operator" {
-                let mut cursor = parent.walk();
-                let children: Vec<_> = parent.children(&mut cursor).collect();
-                if children.len() >= 2 && children[0].id() == node.id() {
-                    let op = children[1];
-                    let op_text = &text[op.byte_range()];
-                    if matches!(op_text, "<-" | "=" | "<<-") {
-                        // Skip LHS of assignment, but recurse into children
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            collect_identifier_usages(child, text, usages);
-                        }
-                        return;
-                    }
-                }
-            }
-            // Skip named arguments
-            if parent.kind() == "argument" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.id() == node.id() {
-                        return;
-                    }
-                }
-            }
-        }
-
-        let name = text[node.byte_range()].to_string();
-        let line = node.start_position().row as u32;
-        let col = node.start_position().column as u32;
-        usages.push((name, line, col, node));
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_identifier_usages(child, text, usages);
-    }
-}
-
 fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
     if node.is_error() || node.is_missing() {
         let message = if node.is_missing() {
