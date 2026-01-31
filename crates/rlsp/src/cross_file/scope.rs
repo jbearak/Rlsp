@@ -560,8 +560,8 @@ pub fn scope_at_position(
     let mut scope = ScopeAtPosition::default();
 
     // Use interval tree for O(log n) query instead of linear scan
-    let is_eof_position = line == u32::MAX || column == u32::MAX;
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_eof_position {
+    let is_full_eof_position = Position::new(line, column).is_full_eof();
+    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
         Vec::new()
     } else {
         artifacts.function_scope_tree
@@ -602,8 +602,7 @@ pub fn scope_at_position(
             ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
-                let is_eof_position = Position::new(line, column).is_full_eof();
-                if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                if !is_full_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
                     }
@@ -672,8 +671,8 @@ where
     };
 
     // Use interval tree for O(log n) query instead of linear scan
-    let is_eof_position = line == u32::MAX || column == u32::MAX;
-    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_eof_position {
+    let is_full_eof_position = Position::new(line, column).is_full_eof();
+    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
         Vec::new()
     } else {
         artifacts.function_scope_tree
@@ -761,8 +760,7 @@ where
             ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
-                let is_eof_position = line == u32::MAX || column == u32::MAX;
-                if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                if !is_full_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.entry(param.name.clone()).or_insert_with(|| param.clone());
                     }

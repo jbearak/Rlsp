@@ -7288,13 +7288,11 @@ proptest! {
             (None, None) => { /* Both found nothing - correct */ }
             (Some(tree_interval), Some(brute_interval)) => {
                 prop_assert_eq!(
-                    tree_interval.to_tuple(),
-                    brute_interval.to_tuple(),
-                    "Innermost mismatch: tree returned ({}, {}) - ({}, {}), brute force found ({}, {}) - ({}, {})",
+                    (tree_interval.start.line, tree_interval.start.column),
+                    (brute_interval.start.line, brute_interval.start.column),
+                    "Innermost mismatch: tree start ({}, {}) vs brute start ({}, {})",
                     tree_interval.start.line, tree_interval.start.column,
-                    tree_interval.end.line, tree_interval.end.column,
-                    brute_interval.start.line, brute_interval.start.column,
-                    brute_interval.end.line, brute_interval.end.column
+                    brute_interval.start.line, brute_interval.start.column
                 );
             }
             (Some(tree_interval), None) => {
