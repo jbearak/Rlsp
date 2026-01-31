@@ -1638,8 +1638,8 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
         let workspace_root = state.workspace_folders.first();
         match extract_definition_statement(symbol, state) {
             Some(def_info) => {
-                let escaped_statement = escape_markdown(&def_info.statement);
-                value.push_str(&format!("```r\n{}\n```\n\n", escaped_statement));
+                // Note: No escaping needed inside code blocks - markdown doesn't interpret special chars there
+                value.push_str(&format!("```r\n{}\n```\n\n", def_info.statement));
                 
                 // Add file location
                 if def_info.source_uri == *uri {
@@ -2151,6 +2151,9 @@ fn compute_relative_path(target_uri: &Url, workspace_root: Option<&Url>) -> Stri
     }
 }
 
+// Note: escape_markdown is only used in tests now.
+// Code blocks (```r ... ```) don't need escaping - markdown doesn't interpret special chars inside them.
+#[cfg(test)]
 /// Escape markdown special characters in text.
 /// Characters to escape: * _ [ ] ( ) # ` \
 fn escape_markdown(text: &str) -> String {
@@ -4020,8 +4023,9 @@ result <- helper_func(42)"#;
         let hover = hover_result.unwrap();
         
         if let HoverContents::Markup(content) = hover.contents {
-            assert!(content.value.contains("helper\\_func"));
-            assert!(content.value.contains("function\\(x\\)"));
+            // Code blocks don't need escaping - content should be unescaped
+            assert!(content.value.contains("helper_func"));
+            assert!(content.value.contains("function(x)"));
             assert!(content.value.contains("utils.R")); // Should show cross-file source
         } else {
             panic!("Expected markup content");
@@ -4058,8 +4062,9 @@ result <- my_func(1, 2)"#;
         let hover = hover_result.unwrap();
         
         if let HoverContents::Markup(content) = hover.contents {
-            assert!(content.value.contains("my\\_func"));
-            assert!(content.value.contains("\\(a, b\\)")); // Local signature, not (x)
+            // Code blocks don't need escaping - content should be unescaped
+            assert!(content.value.contains("my_func"));
+            assert!(content.value.contains("(a, b)")); // Local signature, not (x)
             assert!(content.value.contains("this file")); // Should be local, not cross-file
         } else {
             panic!("Expected markup content");
@@ -4299,12 +4304,12 @@ process_data <- function(data, threshold = 0.5, ...) {
                "Should not have undefined variable errors for loop iterators and function parameters: {:?}", 
                undefined_errors);
         
-        // Test hover shows definition statements
+        // Test hover shows definition statements (no escaping needed in code blocks)
         let hover_tests = vec![
-            (Position::new(4, 12), "i", "for \\(i in 1:10\\)"),
-            (Position::new(4, 18), "j", "for \\(j in 1:5\\)"),
-            (Position::new(12, 14), "item", "for \\(item in filtered\\)"),
-            (Position::new(2, 20), "data", "process_data <- function\\(data, threshold = 0.5, ...\\)"),
+            (Position::new(4, 12), "i", "for (i in 1:10)"),
+            (Position::new(4, 18), "j", "for (j in 1:5)"),
+            (Position::new(12, 14), "item", "for (item in filtered)"),
+            (Position::new(2, 20), "data", "process_data <- function(data, threshold = 0.5, ...)"),
         ];
         
         for (position, symbol_name, expected_statement) in hover_tests {
