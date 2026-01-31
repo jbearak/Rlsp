@@ -585,7 +585,7 @@ fn scan_directory(dir: &std::path::Path, index: &mut HashMap<Url, Document>, cro
                                 snapshot,
                                 metadata: cross_file_meta,
                                 artifacts,
-                                indexed_at_version: 0, // Will be updated when inserted
+                                indexed_at_version: 0, // Initial version; not modified by insert()
                             });
                         }
                     }
