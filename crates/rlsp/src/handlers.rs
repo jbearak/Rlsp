@@ -936,21 +936,12 @@ fn collect_parameters(node: Node, text: &str, defined: &mut std::collections::Ha
 }
 
 /// Context for tracking NSE-related state during AST traversal
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct UsageContext {
     /// True when inside a formula expression (~ operator)
     in_formula: bool,
     /// True when inside the arguments of a call-like node (call, subset, subset2)
     in_call_like_arguments: bool,
-}
-
-impl Default for UsageContext {
-    fn default() -> Self {
-        Self {
-            in_formula: false,
-            in_call_like_arguments: false,
-        }
-    }
 }
 
 /// Legacy version of collect_usages without NSE context tracking.
