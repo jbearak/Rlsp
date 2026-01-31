@@ -564,6 +564,37 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
     
     // Check operator
     let op_text = node_text(op, content);
+    
+    // Handle -> operator: RHS is the name, LHS is the value
+    if op_text == "->" {
+        if rhs.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(rhs, content).to_string();
+        
+        let (kind, signature) = if lhs.kind() == "function_definition" {
+            let sig = extract_function_signature(lhs, &name, content);
+            (SymbolKind::Function, Some(sig))
+        } else {
+            (SymbolKind::Variable, None)
+        };
+        
+        // Position is at RHS (the identifier being defined)
+        let start = rhs.start_position();
+        let line_text = content.lines().nth(start.row).unwrap_or("");
+        let column = byte_offset_to_utf16_column(line_text, start.column);
+        
+        return Some(ScopedSymbol {
+            name,
+            kind,
+            source_uri: uri.clone(),
+            defined_line: start.row as u32,
+            defined_column: column,
+            signature,
+        });
+    }
+    
+    // Handle <- = <<- operators: LHS is the name, RHS is the value
     if !matches!(op_text, "<-" | "=" | "<<-") {
         return None;
     }

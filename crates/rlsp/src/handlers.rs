@@ -1148,7 +1148,7 @@ pub fn extract_definition_statement(
     } else {
         // Parse content if not in documents
         let mut parser = tree_sitter::Parser::new();
-        parser.set_language(tree_sitter_r::language()).ok()?;
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok()?;
         let parsed = parser.parse(&content, None)?;
         // We can't store this tree, so we need to work with it immediately
         return extract_statement_from_tree(&parsed, symbol, &content);
@@ -1171,9 +1171,8 @@ fn extract_statement_from_tree(
     
     // Find the appropriate parent node based on symbol kind
     let statement_node = match symbol.kind {
-        tower_lsp::lsp_types::SymbolKind::VARIABLE => find_assignment_statement(node),
-        tower_lsp::lsp_types::SymbolKind::FUNCTION => find_function_statement(node),
-        _ => find_assignment_statement(node), // Default to assignment for other types
+        scope::SymbolKind::Variable => find_assignment_statement(node, content),
+        scope::SymbolKind::Function => find_function_statement(node, content),
     }?;
 
     let statement = extract_statement_text(statement_node, content);
@@ -1186,21 +1185,33 @@ fn extract_statement_from_tree(
     })
 }
 
-fn find_assignment_statement(mut node: tree_sitter::Node) -> Option<tree_sitter::Node> {
-    // Walk up to find binary_operator (assignment) or for_statement
+/// Result of finding a statement node - includes whether to extract header only
+struct StatementMatch<'a> {
+    node: tree_sitter::Node<'a>,
+    header_only: bool,
+}
+
+fn find_assignment_statement<'a>(mut node: tree_sitter::Node<'a>, content: &str) -> Option<StatementMatch<'a>> {
+    // Walk up to find binary_operator (assignment), for_statement, or parameter
     loop {
         match node.kind() {
             "binary_operator" => {
-                // Check if this is an assignment operator
                 let mut cursor = node.walk();
                 let children: Vec<_> = node.children(&mut cursor).collect();
                 if children.len() >= 2 {
-                    // We can't easily check the operator text without content, so assume it's assignment
-                    return Some(node);
+                    let op_text = node_text(children[1], content);
+                    if matches!(op_text, "<-" | "=" | "<<-" | "->") {
+                        return Some(StatementMatch { node, header_only: false });
+                    }
                 }
             }
-            "for_statement" => return Some(node), // For loop iterators
-            "parameter" => return Some(node),     // Function parameters
+            "for_statement" => return Some(StatementMatch { node, header_only: true }),
+            "parameter" => {
+                // For parameters, find enclosing function_definition
+                if let Some(func) = find_enclosing_function(node) {
+                    return Some(StatementMatch { node: func, header_only: true });
+                }
+            }
             _ => {}
         }
         
@@ -1213,7 +1224,7 @@ fn find_assignment_statement(mut node: tree_sitter::Node) -> Option<tree_sitter:
     None
 }
 
-fn find_function_statement(mut node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+fn find_function_statement<'a>(mut node: tree_sitter::Node<'a>, content: &str) -> Option<StatementMatch<'a>> {
     // Walk up to find function_definition or assignment containing function
     loop {
         match node.kind() {
@@ -1221,17 +1232,23 @@ fn find_function_statement(mut node: tree_sitter::Node) -> Option<tree_sitter::N
                 // Check if parent is assignment
                 if let Some(parent) = node.parent() {
                     if parent.kind() == "binary_operator" {
-                        return Some(parent);
+                        return Some(StatementMatch { node: parent, header_only: true });
                     }
                 }
-                return Some(node);
+                return Some(StatementMatch { node, header_only: true });
             }
             "binary_operator" => {
-                // Check if RHS is function_definition
                 let mut cursor = node.walk();
                 let children: Vec<_> = node.children(&mut cursor).collect();
-                if children.len() >= 3 && children[2].kind() == "function_definition" {
-                    return Some(node);
+                if children.len() >= 3 {
+                    let op_text = node_text(children[1], content);
+                    // Check for function on RHS (for <- = <<-) or LHS (for ->)
+                    if matches!(op_text, "<-" | "=" | "<<-") && children[2].kind() == "function_definition" {
+                        return Some(StatementMatch { node, header_only: true });
+                    }
+                    if op_text == "->" && children[0].kind() == "function_definition" {
+                        return Some(StatementMatch { node, header_only: true });
+                    }
                 }
             }
             _ => {}
@@ -1246,8 +1263,36 @@ fn find_function_statement(mut node: tree_sitter::Node) -> Option<tree_sitter::N
     None
 }
 
-fn extract_statement_text(node: tree_sitter::Node, content: &str) -> String {
+fn find_enclosing_function(mut node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    loop {
+        if node.kind() == "function_definition" {
+            // Check if parent is assignment
+            if let Some(parent) = node.parent() {
+                if parent.kind() == "binary_operator" {
+                    return Some(parent);
+                }
+            }
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn extract_statement_text(stmt: StatementMatch, content: &str) -> String {
+    let node = stmt.node;
+    let lines: Vec<&str> = content.lines().collect();
     let start_line = node.start_position().row;
+    
+    if start_line >= lines.len() {
+        return String::new();
+    }
+
+    if stmt.header_only {
+        // For for-loops: extract just the header (for (x in seq))
+        // For functions: extract signature up to body start
+        return extract_header(node, content);
+    }
+    
     let end_line = node.end_position().row;
     
     // Truncate to 10 lines maximum
@@ -1256,11 +1301,6 @@ fn extract_statement_text(node: tree_sitter::Node, content: &str) -> String {
     } else {
         end_line
     };
-    
-    let lines: Vec<&str> = content.lines().collect();
-    if start_line >= lines.len() {
-        return String::new();
-    }
     
     let mut result = String::new();
     for i in start_line..=actual_end_line.min(lines.len() - 1) {
@@ -1276,6 +1316,117 @@ fn extract_statement_text(node: tree_sitter::Node, content: &str) -> String {
     }
     
     result
+}
+
+fn extract_header(node: tree_sitter::Node, content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let start_line = node.start_position().row;
+    
+    match node.kind() {
+        "for_statement" => {
+            // For loop: extract "for (var in seq)"
+            // Find the body child and stop before it
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "brace_list" || child.kind() == "call" || 
+                   (child.kind() != "identifier" && child.kind() != "(" && 
+                    child.kind() != ")" && child.kind() != "in" && 
+                    child.start_position().row > start_line) {
+                    // Body starts - extract up to before body
+                    let body_start = child.start_position();
+                    if body_start.row == start_line {
+                        // Body on same line - extract up to body start column
+                        let line = lines.get(start_line).unwrap_or(&"");
+                        return line[..body_start.column.min(line.len())].trim_end().to_string();
+                    } else {
+                        // Body on different line - extract header lines
+                        let mut result = String::new();
+                        for i in start_line..body_start.row {
+                            if i > start_line {
+                                result.push('\n');
+                            }
+                            if let Some(line) = lines.get(i) {
+                                result.push_str(line);
+                            }
+                        }
+                        return result;
+                    }
+                }
+            }
+            // Fallback: just first line
+            lines.get(start_line).unwrap_or(&"").to_string()
+        }
+        "function_definition" | "binary_operator" => {
+            // Function: extract signature up to body
+            extract_function_header(node, content)
+        }
+        _ => lines.get(start_line).unwrap_or(&"").to_string()
+    }
+}
+
+fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let start_line = node.start_position().row;
+    
+    // Find the function_definition node
+    let func_node = if node.kind() == "function_definition" {
+        node
+    } else {
+        // binary_operator - find function_definition child
+        let mut cursor = node.walk();
+        let mut func = None;
+        for child in node.children(&mut cursor) {
+            if child.kind() == "function_definition" {
+                func = Some(child);
+                break;
+            }
+        }
+        match func {
+            Some(f) => f,
+            None => return lines.get(start_line).unwrap_or(&"").to_string(),
+        }
+    };
+    
+    // Find body in function_definition
+    let mut cursor = func_node.walk();
+    for child in func_node.children(&mut cursor) {
+        // Body is typically brace_list or any expression after parameters
+        if child.kind() == "brace_list" || 
+           (child.kind() != "function" && child.kind() != "parameters" && 
+            child.start_position().row >= start_line) {
+            let body_start = child.start_position();
+            
+            // Extract from node start to body start
+            if body_start.row == start_line {
+                let line = lines.get(start_line).unwrap_or(&"");
+                let end_col = body_start.column.min(line.len());
+                return line[..end_col].trim_end().to_string();
+            } else {
+                let mut result = String::new();
+                for i in start_line..body_start.row {
+                    if i > start_line {
+                        result.push('\n');
+                    }
+                    if let Some(line) = lines.get(i) {
+                        result.push_str(line);
+                    }
+                }
+                // Add partial last line if body starts mid-line
+                if body_start.column > 0 {
+                    if let Some(line) = lines.get(body_start.row) {
+                        if !result.is_empty() {
+                            result.push('\n');
+                        }
+                        result.push_str(&line[..body_start.column.min(line.len())].trim_end());
+                    }
+                }
+                return result;
+            }
+        }
+    }
+    
+    // Fallback: first line
+    lines.get(start_line).unwrap_or(&"").to_string()
 }
 
 // ============================================================================
@@ -1302,23 +1453,13 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
         end: Position::new(node.end_position().row as u32, node.end_position().column as u32),
     };
 
-    // Try user-defined function first (local scope takes precedence)
-    if let Some(signature) = find_user_function_signature(state, uri, name) {
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: format!("```r\n{}\n```", signature),
-            }),
-            range: Some(node_range),
-        });
-    }
-
-    // Try cross-file symbols (uses dependency graph and scope resolution)
+    // Try cross-file symbols (includes local scope with definition extraction)
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
     if let Some(symbol) = cross_file_symbols.get(name) {
         let mut value = String::new();
         
         // Try to extract definition statement
+        let workspace_root = state.workspace_folders.first();
         match extract_definition_statement(symbol, state) {
             Some(def_info) => {
                 let escaped_statement = escape_markdown(&def_info.statement);
@@ -1328,7 +1469,7 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
                 if def_info.source_uri == *uri {
                     value.push_str(&format!("this file, line {}", def_info.line + 1));
                 } else {
-                    let relative_path = compute_relative_path(&def_info.source_uri, state.workspace_root.as_ref());
+                    let relative_path = compute_relative_path(&def_info.source_uri, workspace_root);
                     let absolute_path = def_info.source_uri.as_str();
                     value.push_str(&format!("[{}]({}), line {}", relative_path, absolute_path, def_info.line + 1));
                 }
@@ -1343,7 +1484,7 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
                 
                 // Add source file info if cross-file
                 if symbol.source_uri != *uri {
-                    let relative_path = compute_relative_path(&symbol.source_uri, state.workspace_root.as_ref());
+                    let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
                     value.push_str(&format!("\n*Defined in {}*", relative_path));
                 }
             }
