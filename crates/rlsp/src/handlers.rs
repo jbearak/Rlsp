@@ -310,6 +310,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
 /// 3. Perform async existence checks
 /// 
 /// **Validates: Requirement 14 (async batched existence checks)**
+#[allow(dead_code)]
 pub async fn diagnostics_async(
     content_provider: &impl crate::content_provider::AsyncContentProvider,
     uri: &Url,
@@ -612,6 +613,7 @@ fn collect_missing_file_diagnostics(
 /// - Backward directives (@lsp-sourced-by): use PathContext::new (ignores @lsp-cd)
 /// 
 /// **Validates: Requirements 14.2, 14.5**
+#[allow(dead_code)]
 pub async fn collect_missing_file_diagnostics_async(
     content_provider: &impl crate::content_provider::AsyncContentProvider,
     uri: &Url,
