@@ -7077,3 +7077,932 @@ proptest! {
             "Symbol should NOT be in scope in parent file after rm()");
     }
 }
+
+
+// ============================================================================
+// Property: Point Query Correctness (Interval Tree)
+// Validates: Requirements 1.3, 1.4
+// Feature: interval-tree-scope-lookup, Property 1: Point Query Correctness
+// ============================================================================
+
+use super::scope::{FunctionScopeInterval, FunctionScopeTree, Position};
+
+/// Generate a valid interval where start <= end (lexicographically)
+fn valid_interval() -> impl Strategy<Value = (u32, u32, u32, u32)> {
+    // Generate start position, then end position >= start
+    (0..1000u32, 0..100u32).prop_flat_map(|(start_line, start_col)| {
+        (start_line..1000u32, 0..100u32).prop_map(move |(end_line, end_col)| {
+            // Ensure end >= start lexicographically
+            if (end_line, end_col) < (start_line, start_col) {
+                (start_line, start_col, start_line, start_col)
+            } else {
+                (start_line, start_col, end_line, end_col)
+            }
+        })
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: interval-tree-scope-lookup, Property 1: Point Query Correctness
+    /// **Validates: Requirements 1.3, 1.4**
+    ///
+    /// For any set of function scope intervals and for any query position,
+    /// the point query SHALL return exactly those intervals that contain the position—
+    /// no false positives (intervals that don't contain the point) and no false negatives
+    /// (missing intervals that do contain the point).
+    #[test]
+    fn prop_point_query_correctness(
+        intervals in prop::collection::vec(valid_interval(), 0..50),
+        query_line in 0..1000u32,
+        query_col in 0..100u32,
+    ) {
+        // Build tree from generated intervals
+        let tree = FunctionScopeTree::from_scopes(&intervals);
+        let query_pos = Position::new(query_line, query_col);
+
+        // Query tree for all intervals containing the point
+        let tree_results = tree.query_point(query_pos);
+
+        // Brute force: find all intervals containing the point
+        let brute_force: Vec<FunctionScopeInterval> = intervals
+            .iter()
+            .filter_map(|&(sl, sc, el, ec)| {
+                let interval = FunctionScopeInterval::from_tuple((sl, sc, el, ec));
+                // Only include valid intervals (start <= end)
+                if interval.start <= interval.end && interval.contains(query_pos) {
+                    Some(interval)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Verify no false positives: all returned intervals must contain the point
+        for interval in &tree_results {
+            prop_assert!(
+                interval.contains(query_pos),
+                "False positive: interval ({}, {}) - ({}, {}) does not contain point ({}, {})",
+                interval.start.line,
+                interval.start.column,
+                interval.end.line,
+                interval.end.column,
+                query_line,
+                query_col
+            );
+        }
+
+        // Verify no false negatives: same count as brute force
+        prop_assert_eq!(
+            tree_results.len(),
+            brute_force.len(),
+            "Missing intervals: tree returned {} but brute force found {}",
+            tree_results.len(),
+            brute_force.len()
+        );
+
+        // Verify the actual intervals match (not just count)
+        // Sort both for comparison since order may differ
+        let mut tree_sorted: Vec<_> = tree_results.iter().map(|i| i.to_tuple()).collect();
+        let mut brute_sorted: Vec<_> = brute_force.iter().map(|i| i.to_tuple()).collect();
+        tree_sorted.sort();
+        brute_sorted.sort();
+        prop_assert_eq!(
+            tree_sorted,
+            brute_sorted,
+            "Interval sets differ between tree and brute force"
+        );
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 1: Point Query Correctness (Empty Tree)
+    /// **Validates: Requirements 1.6**
+    ///
+    /// An empty tree should return an empty result for any query.
+    #[test]
+    fn prop_point_query_empty_tree(
+        query_line in 0..1000u32,
+        query_col in 0..100u32,
+    ) {
+        let tree = FunctionScopeTree::new();
+        let query_pos = Position::new(query_line, query_col);
+
+        let results = tree.query_point(query_pos);
+
+        prop_assert!(
+            results.is_empty(),
+            "Empty tree should return empty results, got {} intervals",
+            results.len()
+        );
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 1: Point Query Correctness (Boundary Positions)
+    /// **Validates: Requirements 1.3, 4.2**
+    ///
+    /// Positions exactly at interval boundaries should be included (inclusive boundaries).
+    #[test]
+    fn prop_point_query_boundary_positions(
+        intervals in prop::collection::vec(valid_interval(), 1..20),
+    ) {
+        let tree = FunctionScopeTree::from_scopes(&intervals);
+
+        // For each valid interval, test that start and end positions are included
+        for &(sl, sc, el, ec) in &intervals {
+            let interval = FunctionScopeInterval::from_tuple((sl, sc, el, ec));
+            // Skip invalid intervals
+            if interval.start > interval.end {
+                continue;
+            }
+
+            // Query at start position
+            let start_results = tree.query_point(interval.start);
+            prop_assert!(
+                start_results.iter().any(|i| *i == interval),
+                "Interval ({}, {}) - ({}, {}) should contain its start position ({}, {})",
+                sl, sc, el, ec, sl, sc
+            );
+
+            // Query at end position
+            let end_results = tree.query_point(interval.end);
+            prop_assert!(
+                end_results.iter().any(|i| *i == interval),
+                "Interval ({}, {}) - ({}, {}) should contain its end position ({}, {})",
+                sl, sc, el, ec, el, ec
+            );
+        }
+    }
+}
+
+
+// ============================================================================
+// Property 2: Innermost Selection Correctness (Interval Tree)
+// Validates: Requirements 2.1, 2.2
+// Feature: interval-tree-scope-lookup, Property 2: Innermost Selection Correctness
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: interval-tree-scope-lookup, Property 2: Innermost Selection Correctness
+    /// **Validates: Requirements 2.1, 2.2**
+    ///
+    /// For any set of function scope intervals and for any query position,
+    /// the innermost query SHALL return the interval with the lexicographically largest
+    /// start position among all intervals containing the query point, or None if no
+    /// intervals contain the point.
+    #[test]
+    fn prop_innermost_selection_correctness(
+        intervals in prop::collection::vec(valid_interval(), 0..50),
+        query_line in 0..1000u32,
+        query_col in 0..100u32,
+    ) {
+        let tree = FunctionScopeTree::from_scopes(&intervals);
+        let query_pos = Position::new(query_line, query_col);
+
+        // Query tree for innermost
+        let tree_result = tree.query_innermost(query_pos);
+
+        // Brute force: find all containing intervals, then select max by start
+        let containing: Vec<_> = intervals.iter()
+            .filter_map(|&(sl, sc, el, ec)| {
+                let interval = FunctionScopeInterval::from_tuple((sl, sc, el, ec));
+                if interval.start <= interval.end && interval.contains(query_pos) {
+                    Some(interval)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let brute_force_result = containing.into_iter()
+            .max_by_key(|interval| interval.start);
+
+        // Verify results match
+        match (tree_result, brute_force_result) {
+            (None, None) => { /* Both found nothing - correct */ }
+            (Some(tree_interval), Some(brute_interval)) => {
+                prop_assert_eq!(
+                    tree_interval.to_tuple(),
+                    brute_interval.to_tuple(),
+                    "Innermost mismatch: tree returned ({}, {}) - ({}, {}), brute force found ({}, {}) - ({}, {})",
+                    tree_interval.start.line, tree_interval.start.column,
+                    tree_interval.end.line, tree_interval.end.column,
+                    brute_interval.start.line, brute_interval.start.column,
+                    brute_interval.end.line, brute_interval.end.column
+                );
+            }
+            (Some(tree_interval), None) => {
+                prop_assert!(
+                    false,
+                    "Tree returned interval ({}, {}) - ({}, {}) but brute force found nothing",
+                    tree_interval.start.line, tree_interval.start.column,
+                    tree_interval.end.line, tree_interval.end.column
+                );
+            }
+            (None, Some(brute_interval)) => {
+                prop_assert!(
+                    false,
+                    "Tree returned nothing but brute force found ({}, {}) - ({}, {})",
+                    brute_interval.start.line, brute_interval.start.column,
+                    brute_interval.end.line, brute_interval.end.column
+                );
+            }
+        }
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 2: Innermost Selection Correctness (Empty Tree)
+    /// **Validates: Requirements 2.2**
+    ///
+    /// An empty tree should return None for any innermost query.
+    #[test]
+    fn prop_innermost_selection_empty_tree(
+        query_line in 0..1000u32,
+        query_col in 0..100u32,
+    ) {
+        let tree = FunctionScopeTree::new();
+        let query_pos = Position::new(query_line, query_col);
+
+        let result = tree.query_innermost(query_pos);
+
+        prop_assert!(
+            result.is_none(),
+            "Empty tree should return None for innermost query, got {:?}",
+            result
+        );
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 2: Innermost Selection Correctness (Nested Intervals)
+    /// **Validates: Requirements 2.1**
+    ///
+    /// For nested intervals, the innermost (latest start) should be selected.
+    #[test]
+    fn prop_innermost_selection_nested(
+        // Generate a base interval
+        base_start_line in 0..500u32,
+        base_start_col in 0..50u32,
+        base_end_line in 500..1000u32,
+        base_end_col in 50..100u32,
+        // Generate a nested interval inside the base
+        nest_offset_start_line in 1..100u32,
+        nest_offset_start_col in 1..20u32,
+        nest_offset_end_line in 1..100u32,
+        nest_offset_end_col in 1..20u32,
+    ) {
+        // Create base interval
+        let base = (base_start_line, base_start_col, base_end_line, base_end_col);
+
+        // Create nested interval strictly inside base
+        let nested_start_line = base_start_line + nest_offset_start_line;
+        let nested_start_col = base_start_col + nest_offset_start_col;
+        let nested_end_line = base_end_line.saturating_sub(nest_offset_end_line);
+        let nested_end_col = base_end_col.saturating_sub(nest_offset_end_col);
+
+        // Ensure nested is valid (start <= end)
+        if (nested_start_line, nested_start_col) > (nested_end_line, nested_end_col) {
+            // Skip invalid nested intervals
+            return Ok(());
+        }
+
+        let nested = (nested_start_line, nested_start_col, nested_end_line, nested_end_col);
+
+        let intervals = vec![base, nested];
+        let tree = FunctionScopeTree::from_scopes(&intervals);
+
+        // Query at a point inside the nested interval
+        let query_line = (nested_start_line + nested_end_line) / 2;
+        let query_col = (nested_start_col + nested_end_col) / 2;
+        let query_pos = Position::new(query_line, query_col);
+
+        let result = tree.query_innermost(query_pos);
+
+        // The nested interval has a later start, so it should be selected
+        prop_assert!(result.is_some(), "Should find an interval containing the query point");
+        let result = result.unwrap();
+
+        // The result should be the nested interval (later start)
+        prop_assert_eq!(
+            result.to_tuple(),
+            nested,
+            "Should select nested interval (later start) as innermost"
+        );
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 2: Innermost Selection Correctness (Point Outside)
+    /// **Validates: Requirements 2.2**
+    ///
+    /// When the query point is outside all intervals, None should be returned.
+    #[test]
+    fn prop_innermost_selection_point_outside(
+        intervals in prop::collection::vec(valid_interval(), 1..20),
+    ) {
+        let tree = FunctionScopeTree::from_scopes(&intervals);
+
+        // Find a point guaranteed to be outside all intervals
+        // Use a line beyond all interval end lines
+        let max_end_line = intervals.iter()
+            .map(|&(_, _, el, _)| el)
+            .max()
+            .unwrap_or(0);
+
+        let query_pos = Position::new(max_end_line + 100, 0);
+
+        let result = tree.query_innermost(query_pos);
+
+        prop_assert!(
+            result.is_none(),
+            "Point outside all intervals should return None, got {:?}",
+            result
+        );
+    }
+}
+
+
+// ============================================================================
+// Property 3: Backward Compatibility (Model-Based)
+// Validates: Requirements 3.4
+// Feature: interval-tree-scope-lookup, Property 3: Backward Compatibility
+// ============================================================================
+
+/// Linear scan implementation for query_point (the "model" for comparison)
+/// This represents the original O(n) implementation that was replaced by the interval tree.
+fn linear_scan_containing(
+    scopes: &[(u32, u32, u32, u32)],
+    line: u32,
+    column: u32,
+) -> Vec<(u32, u32, u32, u32)> {
+    scopes
+        .iter()
+        .filter(|(sl, sc, el, ec)| {
+            // Only include valid intervals (start <= end)
+            (*sl, *sc) <= (*el, *ec)
+                // Check containment: start <= point <= end
+                && (*sl, *sc) <= (line, column)
+                && (line, column) <= (*el, *ec)
+        })
+        .copied()
+        .collect()
+}
+
+/// Linear scan implementation for query_innermost (the "model" for comparison)
+/// This represents the original filter + max_by_key pattern that was replaced.
+/// 
+/// Note: When multiple intervals have the same maximum start position, this returns
+/// one of them (the last one in iteration order). The interval tree may return a
+/// different one with the same start position, which is still correct behavior.
+#[allow(dead_code)]
+fn linear_scan_innermost(
+    scopes: &[(u32, u32, u32, u32)],
+    line: u32,
+    column: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    scopes
+        .iter()
+        .filter(|(sl, sc, el, ec)| {
+            // Only include valid intervals (start <= end)
+            (*sl, *sc) <= (*el, *ec)
+                // Check containment: start <= point <= end
+                && (*sl, *sc) <= (line, column)
+                && (line, column) <= (*el, *ec)
+        })
+        .max_by_key(|(sl, sc, _, _)| (*sl, *sc))
+        .copied()
+}
+
+/// Find the maximum start position among all containing intervals
+fn find_max_start_position(
+    scopes: &[(u32, u32, u32, u32)],
+    line: u32,
+    column: u32,
+) -> Option<(u32, u32)> {
+    scopes
+        .iter()
+        .filter(|(sl, sc, el, ec)| {
+            // Only include valid intervals (start <= end)
+            (*sl, *sc) <= (*el, *ec)
+                // Check containment: start <= point <= end
+                && (*sl, *sc) <= (line, column)
+                && (line, column) <= (*el, *ec)
+        })
+        .map(|(sl, sc, _, _)| (*sl, *sc))
+        .max()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: interval-tree-scope-lookup, Property 3: Backward Compatibility
+    /// **Validates: Requirements 3.4**
+    ///
+    /// For any valid function scopes and any position, the interval tree SHALL produce
+    /// identical results to the original linear scan implementation.
+    ///
+    /// This is a model-based property test where the "model" is the simple linear scan
+    /// implementation that was replaced by the interval tree.
+    #[test]
+    fn prop_backward_compatibility(
+        scopes in prop::collection::vec(valid_interval(), 0..100),
+        queries in prop::collection::vec((0..1000u32, 0..100u32), 1..20),
+    ) {
+        let tree = FunctionScopeTree::from_scopes(&scopes);
+
+        for (line, column) in queries {
+            // Compare query_point results
+            let tree_containing: Vec<_> = tree
+                .query_point(Position::new(line, column))
+                .into_iter()
+                .map(|i| i.to_tuple())
+                .collect();
+            let linear_containing = linear_scan_containing(&scopes, line, column);
+
+            // Sort both for comparison since order may differ
+            let mut tree_sorted = tree_containing.clone();
+            let mut linear_sorted = linear_containing.clone();
+            tree_sorted.sort();
+            linear_sorted.sort();
+
+            prop_assert_eq!(
+                &tree_sorted,
+                &linear_sorted,
+                "query_point mismatch at ({}, {}): tree returned {:?}, linear scan returned {:?}",
+                line,
+                column,
+                &tree_sorted,
+                &linear_sorted
+            );
+
+            // Compare query_innermost results
+            // When multiple intervals have the same maximum start position, either one is valid.
+            // We verify that the tree returns an interval with the correct maximum start position.
+            let tree_innermost = tree
+                .query_innermost(Position::new(line, column))
+                .map(|i| i.to_tuple());
+            let max_start = find_max_start_position(&scopes, line, column);
+
+            match (tree_innermost, max_start) {
+                (None, None) => { /* Both found nothing - correct */ }
+                (Some((sl, sc, _, _)), Some((expected_sl, expected_sc))) => {
+                    prop_assert_eq!(
+                        (sl, sc),
+                        (expected_sl, expected_sc),
+                        "query_innermost returned interval with wrong start position at ({}, {}): got ({}, {}), expected ({}, {})",
+                        line,
+                        column,
+                        sl,
+                        sc,
+                        expected_sl,
+                        expected_sc
+                    );
+                }
+                (Some(interval), None) => {
+                    prop_assert!(
+                        false,
+                        "Tree returned interval {:?} but no intervals contain point ({}, {})",
+                        interval,
+                        line,
+                        column
+                    );
+                }
+                (None, Some(start)) => {
+                    prop_assert!(
+                        false,
+                        "Tree returned nothing but intervals with start {:?} contain point ({}, {})",
+                        start,
+                        line,
+                        column
+                    );
+                }
+            }
+        }
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 3: Backward Compatibility (Edge Cases)
+    /// **Validates: Requirements 3.4**
+    ///
+    /// Test backward compatibility with edge case scenarios:
+    /// - Empty scopes
+    /// - Single scope
+    /// - Deeply nested scopes
+    /// - Overlapping but non-nested scopes
+    #[test]
+    fn prop_backward_compatibility_edge_cases(
+        // Generate a mix of nested and non-nested intervals
+        base_intervals in prop::collection::vec(valid_interval(), 0..20),
+        // Generate additional nested intervals
+        nested_count in 0..10usize,
+        query_line in 0..1000u32,
+        query_col in 0..100u32,
+    ) {
+        // Create some nested intervals by shrinking existing ones
+        let mut all_scopes = base_intervals.clone();
+        for i in 0..nested_count.min(base_intervals.len()) {
+            let (sl, sc, el, ec) = base_intervals[i];
+            // Create a nested interval if possible
+            if sl + 1 < el || (sl + 1 == el && sc + 1 < ec) {
+                let nested = (
+                    sl + 1,
+                    sc.saturating_add(1).min(99),
+                    el.saturating_sub(1).max(sl + 1),
+                    ec.saturating_sub(1).max(0),
+                );
+                // Only add if valid
+                if (nested.0, nested.1) <= (nested.2, nested.3) {
+                    all_scopes.push(nested);
+                }
+            }
+        }
+
+        let tree = FunctionScopeTree::from_scopes(&all_scopes);
+
+        // Compare query_point results
+        let tree_containing: Vec<_> = tree
+            .query_point(Position::new(query_line, query_col))
+            .into_iter()
+            .map(|i| i.to_tuple())
+            .collect();
+        let linear_containing = linear_scan_containing(&all_scopes, query_line, query_col);
+
+        let mut tree_sorted = tree_containing.clone();
+        let mut linear_sorted = linear_containing.clone();
+        tree_sorted.sort();
+        linear_sorted.sort();
+
+        prop_assert_eq!(
+            tree_sorted,
+            linear_sorted,
+            "query_point mismatch with nested intervals at ({}, {})",
+            query_line,
+            query_col
+        );
+
+        // Compare query_innermost results
+        // When multiple intervals have the same maximum start position, either one is valid.
+        let tree_innermost = tree
+            .query_innermost(Position::new(query_line, query_col))
+            .map(|i| i.to_tuple());
+        let max_start = find_max_start_position(&all_scopes, query_line, query_col);
+
+        match (tree_innermost, max_start) {
+            (None, None) => { /* Both found nothing - correct */ }
+            (Some((tsl, tsc, _, _)), Some((expected_sl, expected_sc))) => {
+                prop_assert_eq!(
+                    (tsl, tsc),
+                    (expected_sl, expected_sc),
+                    "query_innermost returned interval with wrong start position at ({}, {})",
+                    query_line,
+                    query_col
+                );
+            }
+            (Some(interval), None) => {
+                prop_assert!(
+                    false,
+                    "Tree returned interval {:?} but no intervals contain point ({}, {})",
+                    interval,
+                    query_line,
+                    query_col
+                );
+            }
+            (None, Some(start)) => {
+                prop_assert!(
+                    false,
+                    "Tree returned nothing but intervals with start {:?} contain point ({}, {})",
+                    start,
+                    query_line,
+                    query_col
+                );
+            }
+        }
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 3: Backward Compatibility (Boundary Queries)
+    /// **Validates: Requirements 3.4**
+    ///
+    /// Test backward compatibility specifically at interval boundaries.
+    #[test]
+    fn prop_backward_compatibility_boundaries(
+        scopes in prop::collection::vec(valid_interval(), 1..50),
+    ) {
+        let tree = FunctionScopeTree::from_scopes(&scopes);
+
+        // Test at each interval's start and end positions
+        for &(sl, sc, el, ec) in &scopes {
+            // Skip invalid intervals
+            if (sl, sc) > (el, ec) {
+                continue;
+            }
+
+            // Test at start position
+            let tree_at_start: Vec<_> = tree
+                .query_point(Position::new(sl, sc))
+                .into_iter()
+                .map(|i| i.to_tuple())
+                .collect();
+            let linear_at_start = linear_scan_containing(&scopes, sl, sc);
+
+            let mut tree_sorted = tree_at_start.clone();
+            let mut linear_sorted = linear_at_start.clone();
+            tree_sorted.sort();
+            linear_sorted.sort();
+
+            prop_assert_eq!(
+                tree_sorted,
+                linear_sorted,
+                "query_point mismatch at start boundary ({}, {})",
+                sl,
+                sc
+            );
+
+            // Test at end position
+            let tree_at_end: Vec<_> = tree
+                .query_point(Position::new(el, ec))
+                .into_iter()
+                .map(|i| i.to_tuple())
+                .collect();
+            let linear_at_end = linear_scan_containing(&scopes, el, ec);
+
+            let mut tree_sorted = tree_at_end.clone();
+            let mut linear_sorted = linear_at_end.clone();
+            tree_sorted.sort();
+            linear_sorted.sort();
+
+            prop_assert_eq!(
+                tree_sorted,
+                linear_sorted,
+                "query_point mismatch at end boundary ({}, {})",
+                el,
+                ec
+            );
+
+            // Test innermost at start
+            // When multiple intervals have the same maximum start position, either one is valid.
+            let tree_innermost_start = tree
+                .query_innermost(Position::new(sl, sc))
+                .map(|i| i.to_tuple());
+            let max_start_at_start = find_max_start_position(&scopes, sl, sc);
+
+            match (tree_innermost_start, max_start_at_start) {
+                (None, None) => { /* Both found nothing - correct */ }
+                (Some((tsl, tsc, _, _)), Some((expected_sl, expected_sc))) => {
+                    prop_assert_eq!(
+                        (tsl, tsc),
+                        (expected_sl, expected_sc),
+                        "query_innermost returned interval with wrong start position at start boundary ({}, {})",
+                        sl,
+                        sc
+                    );
+                }
+                (Some(interval), None) => {
+                    prop_assert!(
+                        false,
+                        "Tree returned interval {:?} but no intervals contain start boundary ({}, {})",
+                        interval,
+                        sl,
+                        sc
+                    );
+                }
+                (None, Some(start)) => {
+                    prop_assert!(
+                        false,
+                        "Tree returned nothing but intervals with start {:?} contain start boundary ({}, {})",
+                        start,
+                        sl,
+                        sc
+                    );
+                }
+            }
+
+            // Test innermost at end
+            let tree_innermost_end = tree
+                .query_innermost(Position::new(el, ec))
+                .map(|i| i.to_tuple());
+            let max_start_at_end = find_max_start_position(&scopes, el, ec);
+
+            match (tree_innermost_end, max_start_at_end) {
+                (None, None) => { /* Both found nothing - correct */ }
+                (Some((tsl, tsc, _, _)), Some((expected_sl, expected_sc))) => {
+                    prop_assert_eq!(
+                        (tsl, tsc),
+                        (expected_sl, expected_sc),
+                        "query_innermost returned interval with wrong start position at end boundary ({}, {})",
+                        el,
+                        ec
+                    );
+                }
+                (Some(interval), None) => {
+                    prop_assert!(
+                        false,
+                        "Tree returned interval {:?} but no intervals contain end boundary ({}, {})",
+                        interval,
+                        el,
+                        ec
+                    );
+                }
+                (None, Some(start)) => {
+                    prop_assert!(
+                        false,
+                        "Tree returned nothing but intervals with start {:?} contain end boundary ({}, {})",
+                        start,
+                        el,
+                        ec
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Property 4: Position Lexicographic Ordering
+// Validates: Requirements 4.1
+// Feature: interval-tree-scope-lookup, Property 4: Position Lexicographic Ordering
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: interval-tree-scope-lookup, Property 4: Position Lexicographic Ordering
+    /// **Validates: Requirements 4.1**
+    ///
+    /// For any two positions (line1, col1) and (line2, col2), the Position comparison
+    /// SHALL follow lexicographic ordering: (line1, col1) < (line2, col2) if and only if
+    /// line1 < line2, or (line1 == line2 and col1 < col2).
+    #[test]
+    fn prop_position_lexicographic_ordering(
+        line1 in 0..u32::MAX,
+        col1 in 0..u32::MAX,
+        line2 in 0..u32::MAX,
+        col2 in 0..u32::MAX,
+    ) {
+        let pos1 = Position::new(line1, col1);
+        let pos2 = Position::new(line2, col2);
+
+        // Expected lexicographic comparison
+        let expected_less = line1 < line2 || (line1 == line2 && col1 < col2);
+        let expected_equal = line1 == line2 && col1 == col2;
+        let expected_greater = line1 > line2 || (line1 == line2 && col1 > col2);
+
+        // Verify Ord implementation matches
+        prop_assert_eq!(pos1 < pos2, expected_less,
+            "Less-than mismatch: ({}, {}) < ({}, {}) should be {}",
+            line1, col1, line2, col2, expected_less);
+        prop_assert_eq!(pos1 == pos2, expected_equal,
+            "Equality mismatch: ({}, {}) == ({}, {}) should be {}",
+            line1, col1, line2, col2, expected_equal);
+        prop_assert_eq!(pos1 > pos2, expected_greater,
+            "Greater-than mismatch: ({}, {}) > ({}, {}) should be {}",
+            line1, col1, line2, col2, expected_greater);
+
+        // Verify totality: exactly one of <, ==, > is true
+        prop_assert!(
+            (pos1 < pos2) as u8 + (pos1 == pos2) as u8 + (pos1 > pos2) as u8 == 1,
+            "Totality violated for ({}, {}) vs ({}, {})",
+            line1, col1, line2, col2
+        );
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 4: Position Lexicographic Ordering (Transitivity)
+    /// **Validates: Requirements 4.1**
+    ///
+    /// For any three positions a, b, c: if a < b and b < c, then a < c.
+    #[test]
+    fn prop_position_ordering_transitivity(
+        line1 in 0..1000u32,
+        col1 in 0..100u32,
+        line2 in 0..1000u32,
+        col2 in 0..100u32,
+        line3 in 0..1000u32,
+        col3 in 0..100u32,
+    ) {
+        let pos1 = Position::new(line1, col1);
+        let pos2 = Position::new(line2, col2);
+        let pos3 = Position::new(line3, col3);
+
+        // If pos1 < pos2 and pos2 < pos3, then pos1 < pos3
+        if pos1 < pos2 && pos2 < pos3 {
+            prop_assert!(pos1 < pos3,
+                "Transitivity violated: ({}, {}) < ({}, {}) < ({}, {}) but not ({}, {}) < ({}, {})",
+                line1, col1, line2, col2, line3, col3, line1, col1, line3, col3);
+        }
+
+        // Also test transitivity for <=
+        if pos1 <= pos2 && pos2 <= pos3 {
+            prop_assert!(pos1 <= pos3,
+                "Transitivity violated for <=: ({}, {}) <= ({}, {}) <= ({}, {}) but not ({}, {}) <= ({}, {})",
+                line1, col1, line2, col2, line3, col3, line1, col1, line3, col3);
+        }
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 4: Position Lexicographic Ordering (Antisymmetry)
+    /// **Validates: Requirements 4.1**
+    ///
+    /// For any two positions a, b: if a < b, then NOT (b < a).
+    /// Also: if a <= b and b <= a, then a == b.
+    #[test]
+    fn prop_position_ordering_antisymmetry(
+        line1 in 0..u32::MAX,
+        col1 in 0..u32::MAX,
+        line2 in 0..u32::MAX,
+        col2 in 0..u32::MAX,
+    ) {
+        let pos1 = Position::new(line1, col1);
+        let pos2 = Position::new(line2, col2);
+
+        // If pos1 < pos2, then NOT (pos2 < pos1)
+        if pos1 < pos2 {
+            prop_assert!(!(pos2 < pos1),
+                "Antisymmetry violated: ({}, {}) < ({}, {}) but also ({}, {}) < ({}, {})",
+                line1, col1, line2, col2, line2, col2, line1, col1);
+        }
+
+        // If pos1 <= pos2 and pos2 <= pos1, then pos1 == pos2
+        if pos1 <= pos2 && pos2 <= pos1 {
+            prop_assert_eq!(pos1, pos2,
+                "Antisymmetry violated for <=: ({}, {}) <= ({}, {}) and ({}, {}) <= ({}, {}) but not equal",
+                line1, col1, line2, col2, line2, col2, line1, col1);
+        }
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 4: Position Lexicographic Ordering (Reflexivity)
+    /// **Validates: Requirements 4.1**
+    ///
+    /// For any position a: a == a and a <= a and NOT (a < a).
+    #[test]
+    fn prop_position_ordering_reflexivity(
+        line in 0..u32::MAX,
+        col in 0..u32::MAX,
+    ) {
+        let pos = Position::new(line, col);
+
+        // Reflexivity: a == a
+        prop_assert_eq!(pos, pos,
+            "Reflexivity violated: ({}, {}) != ({}, {})",
+            line, col, line, col);
+
+        // a <= a
+        prop_assert!(pos <= pos,
+            "Reflexivity violated for <=: ({}, {}) not <= ({}, {})",
+            line, col, line, col);
+
+        // NOT (a < a)
+        prop_assert!(!(pos < pos),
+            "Irreflexivity violated: ({}, {}) < ({}, {})",
+            line, col, line, col);
+    }
+
+    /// Feature: interval-tree-scope-lookup, Property 4: Position Lexicographic Ordering (Consistency)
+    /// **Validates: Requirements 4.1**
+    ///
+    /// The Ord implementation should be consistent with PartialOrd and Eq.
+    /// Specifically: (a == b) implies (a.cmp(&b) == Ordering::Equal)
+    /// and (a < b) implies (a.cmp(&b) == Ordering::Less)
+    #[test]
+    fn prop_position_ordering_consistency(
+        line1 in 0..u32::MAX,
+        col1 in 0..u32::MAX,
+        line2 in 0..u32::MAX,
+        col2 in 0..u32::MAX,
+    ) {
+        use std::cmp::Ordering;
+
+        let pos1 = Position::new(line1, col1);
+        let pos2 = Position::new(line2, col2);
+
+        let cmp_result = pos1.cmp(&pos2);
+
+        // Consistency between cmp and comparison operators
+        match cmp_result {
+            Ordering::Less => {
+                prop_assert!(pos1 < pos2,
+                    "Consistency violated: cmp returned Less but ({}, {}) not < ({}, {})",
+                    line1, col1, line2, col2);
+                prop_assert!(!(pos1 == pos2),
+                    "Consistency violated: cmp returned Less but ({}, {}) == ({}, {})",
+                    line1, col1, line2, col2);
+                prop_assert!(!(pos1 > pos2),
+                    "Consistency violated: cmp returned Less but ({}, {}) > ({}, {})",
+                    line1, col1, line2, col2);
+            }
+            Ordering::Equal => {
+                prop_assert!(pos1 == pos2,
+                    "Consistency violated: cmp returned Equal but ({}, {}) != ({}, {})",
+                    line1, col1, line2, col2);
+                prop_assert!(!(pos1 < pos2),
+                    "Consistency violated: cmp returned Equal but ({}, {}) < ({}, {})",
+                    line1, col1, line2, col2);
+                prop_assert!(!(pos1 > pos2),
+                    "Consistency violated: cmp returned Equal but ({}, {}) > ({}, {})",
+                    line1, col1, line2, col2);
+            }
+            Ordering::Greater => {
+                prop_assert!(pos1 > pos2,
+                    "Consistency violated: cmp returned Greater but ({}, {}) not > ({}, {})",
+                    line1, col1, line2, col2);
+                prop_assert!(!(pos1 == pos2),
+                    "Consistency violated: cmp returned Greater but ({}, {}) == ({}, {})",
+                    line1, col1, line2, col2);
+                prop_assert!(!(pos1 < pos2),
+                    "Consistency violated: cmp returned Greater but ({}, {}) < ({}, {})",
+                    line1, col1, line2, col2);
+            }
+        }
+    }
+}

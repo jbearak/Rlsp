@@ -13,3 +13,4 @@ cc 7ac31d879f720400260efdcb7e667dc3c814aec839a8c98f0283bf7621f6fff3 # shrinks to
 cc 9a50f5f332557b107a6a02617b31fd0cf6cf0beb639a215669cf49ebb32487db # shrinks to symbol_a = "A", symbol_b = "if"
 cc 817ca493d00121ce8bea44aea9cc7c063b0f5a7cc399de37effdea50791820e8 # shrinks to outer_func = "a", inner_func = "i", outer_var = "b", inner_var = "a_"
 cc 4e9e42b84e810040a7902c0030441a611bc10cc792c428d9d1879a1e5193a0ad # shrinks to outer_func = "ab", inner_func = "b", outer_var = "a", inner_var = "a_"
+cc 0da9d2f3960ba778e2ae0332cf6976c9a45408c53f08aa20df61073a903a6811 # shrinks to scopes = [(39, 53, 40, 67), (39, 53, 954, 26)], queries = [(40, 67), (871, 10), (396, 81), (804, 48), (23, 65)]
