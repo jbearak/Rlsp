@@ -263,12 +263,36 @@ where
         }
     };
 
+    // First pass: collect all function scopes that contain the query position
+    let mut active_function_scopes = Vec::new();
+    for event in &artifacts.timeline {
+        if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = event {
+            if (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                active_function_scopes.push((*start_line, *start_column, *end_line, *end_column));
+            }
+        }
+    }
+
     // Process timeline events up to the requested position
     for event in &artifacts.timeline {
         match event {
             ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Local definitions take precedence (don't overwrite)
+                    // Check if this definition is inside any function scope
+                    let def_function_scope = artifacts.function_scopes.iter()
+                        .filter(|(start_line, start_column, end_line, end_column)| {
+                            (*start_line, *start_column) <= (*def_line, *def_col) && (*def_line, *def_col) <= (*end_line, *end_column)
+                        })
+                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
+                        .copied();
+                    
+                    // Skip function-local definitions not in our scope
+                    if let Some(def_scope) = def_function_scope {
+                        if !active_function_scopes.contains(&def_scope) {
+                            continue;
+                        }
+                    }
                     scope.symbols.entry(symbol.name.clone()).or_insert_with(|| {
                         log::trace!("  Found symbol: {} ({})", symbol.name, match symbol.kind {
                             SymbolKind::Function => "function",
