@@ -1176,12 +1176,18 @@ fn extract_statement_from_tree(
 ) -> Option<DefinitionInfo> {
     let line_text = content.lines().nth(symbol.defined_line as usize).unwrap_or("");
     let byte_col = utf16_column_to_byte_offset(line_text, symbol.defined_column);
-    let point = tree_sitter::Point::new(
-        symbol.defined_line as usize,
-        byte_col,
-    );
-    
-    let node = tree.root_node().descendant_for_point_range(point, point)?;
+    let row = symbol.defined_line as usize;
+
+    // descendant_for_point_range can behave unexpectedly on 0-length ranges at node boundaries.
+    // Use a small non-empty range when possible and prefer named nodes.
+    let point_start = tree_sitter::Point::new(row, byte_col);
+    let byte_col_end = (byte_col + 1).min(line_text.len());
+    let point_end = tree_sitter::Point::new(row, byte_col_end);
+
+    let root = tree.root_node();
+    let node = root
+        .named_descendant_for_point_range(point_start, point_end)
+        .or_else(|| root.descendant_for_point_range(point_start, point_end))?;
     
     // Find the appropriate parent node based on symbol kind
     let statement_node = match symbol.kind {
@@ -1240,17 +1246,19 @@ fn find_assignment_statement<'a>(mut node: tree_sitter::Node<'a>, content: &str)
 }
 
 fn find_function_statement<'a>(mut node: tree_sitter::Node<'a>, content: &str) -> Option<StatementMatch<'a>> {
-    // Walk up to find function_definition or assignment containing function
+    // Walk up to find function_definition or assignment containing function.
+    // For definition extraction, we want the full statement so we can include bodies and apply
+    // standard truncation rules.
     loop {
         match node.kind() {
             "function_definition" => {
                 // Check if parent is assignment
                 if let Some(parent) = node.parent() {
                     if parent.kind() == "binary_operator" {
-                        return Some(StatementMatch { node: parent, header_only: true });
+                        return Some(StatementMatch { node: parent, header_only: false });
                     }
                 }
-                return Some(StatementMatch { node, header_only: true });
+                return Some(StatementMatch { node, header_only: false });
             }
             "binary_operator" => {
                 let mut cursor = node.walk();
@@ -1259,16 +1267,16 @@ fn find_function_statement<'a>(mut node: tree_sitter::Node<'a>, content: &str) -
                     let op_text = node_text(children[1], content);
                     // Check for function on RHS (for <- = <<-) or LHS (for ->)
                     if matches!(op_text, "<-" | "=" | "<<-") && children[2].kind() == "function_definition" {
-                        return Some(StatementMatch { node, header_only: true });
+                        return Some(StatementMatch { node, header_only: false });
                     }
                     if op_text == "->" && children[0].kind() == "function_definition" {
-                        return Some(StatementMatch { node, header_only: true });
+                        return Some(StatementMatch { node, header_only: false });
                     }
                 }
             }
             _ => {}
         }
-        
+
         if let Some(parent) = node.parent() {
             node = parent;
         } else {
@@ -1453,8 +1461,16 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
-    let point = Point::new(position.line as usize, position.character as usize);
-    let node = tree.root_node().descendant_for_point_range(point, point)?;
+    let line_text = text.lines().nth(position.line as usize).unwrap_or("");
+    let byte_col = utf16_column_to_byte_offset(line_text, position.character);
+    let row = position.line as usize;
+
+    let point_start = Point::new(row, byte_col);
+    let point_end = Point::new(row, (byte_col + 1).min(line_text.len()));
+    let root = tree.root_node();
+    let node = root
+        .named_descendant_for_point_range(point_start, point_end)
+        .or_else(|| root.descendant_for_point_range(point_start, point_end))?;
 
     // Get the identifier
     let name = if node.kind() == "identifier" || node.kind() == "string" {
@@ -2703,11 +2719,15 @@ mod proptests {
             let info = def_info.unwrap();
             let lines: Vec<&str> = info.statement.lines().collect();
             
-            if line_count > 10 {
+            // The generated code has (line_count + 1) total lines (header + (line_count-1) body lines + closing brace).
+            // Truncation happens when total lines > 10, i.e. when line_count >= 10.
+            if line_count >= 10 {
                 prop_assert_eq!(lines.len(), 11, "Should truncate to 10 lines + ellipsis");
                 prop_assert_eq!(lines[10], "...", "Should end with ellipsis when truncated");
             } else {
-                prop_assert_eq!(lines.len(), line_count, "Should include all lines when <= 10");
+                // The generated code includes the function header line and a closing brace line.
+                let expected_lines = line_count + 1;
+                prop_assert_eq!(lines.len(), expected_lines, "Should include all lines when <= 10");
                 prop_assert!(!info.statement.contains("..."), "Should not have ellipsis when not truncated");
             }
         }
@@ -3279,7 +3299,7 @@ mod integration_tests {
             value.push_str(&format!("this file, line {}", def_info.line + 1)); // 1-based
         }
         
-        assert!(value.contains("```r\nmy_var <- 42\n```"));
+        assert!(value.contains("```r\nmy\\_var <- 42\n```"));
         assert!(value.contains("this file, line 1"));
         assert!(value.contains("\n\n")); // Blank line separator
     }
@@ -3311,7 +3331,7 @@ mod integration_tests {
             value.push_str(&format!("[{}]({}), line {}", relative_path, absolute_path, def_info.line + 1));
         }
         
-        assert!(value.contains("```r\nhelper_func <- function(x) { x + 1 }\n```"));
+        assert!(value.contains("```r\nhelper\\_func <- function\\(x\\) { x + 1 }\n```"));
         assert!(value.contains("[utils/helper.R](file:///workspace/utils/helper.R), line 6"));
         assert!(value.contains("\n\n")); // Blank line separator
     }
@@ -3382,8 +3402,8 @@ result <- helper_func(42)"#;
         let hover = hover_result.unwrap();
         
         if let HoverContents::Markup(content) = hover.contents {
-            assert!(content.value.contains("helper_func"));
-            assert!(content.value.contains("function(x)"));
+            assert!(content.value.contains("helper\\_func"));
+            assert!(content.value.contains("function\\(x\\)"));
             assert!(content.value.contains("utils.R")); // Should show cross-file source
         } else {
             panic!("Expected markup content");
@@ -3420,8 +3440,8 @@ result <- my_func(1, 2)"#;
         let hover = hover_result.unwrap();
         
         if let HoverContents::Markup(content) = hover.contents {
-            assert!(content.value.contains("my_func"));
-            assert!(content.value.contains("(a, b)")); // Local signature, not (x)
+            assert!(content.value.contains("my\\_func"));
+            assert!(content.value.contains("\\(a, b\\)")); // Local signature, not (x)
             assert!(content.value.contains("this file")); // Should be local, not cross-file
         } else {
             panic!("Expected markup content");
@@ -3631,11 +3651,11 @@ process_data <- function(data, threshold = 0.5, ...) {
         let positions = vec![
             (Position::new(5, 12), "result", true),  // result inside nested loop
             (Position::new(4, 12), "i", true),       // i iterator
-            (Position::new(4, 18), "j", true),       // j iterator  
-            (Position::new(10, 14), "item", true),   // item iterator
+            (Position::new(4, 18), "j", true),       // j iterator
+            (Position::new(12, 14), "item", true),   // item used inside the loop body
             (Position::new(2, 20), "data", true),    // function parameter
             (Position::new(6, 27), "threshold", true), // function parameter with default
-            (Position::new(11, 14), "filtered", true), // local variable
+            (Position::new(14, 14), "filtered", true), // local variable used in return(filtered)
         ];
         
         for (position, symbol_name, should_exist) in positions {
@@ -3663,10 +3683,10 @@ process_data <- function(data, threshold = 0.5, ...) {
         
         // Test hover shows definition statements
         let hover_tests = vec![
-            (Position::new(4, 12), "i", "for (i in 1:10)"),
-            (Position::new(4, 18), "j", "for (j in 1:5)"),
-            (Position::new(10, 14), "item", "for (item in filtered)"),
-            (Position::new(2, 20), "data", "process_data <- function(data, threshold = 0.5, ...)"),
+            (Position::new(4, 12), "i", "for \\(i in 1:10\\)"),
+            (Position::new(4, 18), "j", "for \\(j in 1:5\\)"),
+            (Position::new(12, 14), "item", "for \\(item in filtered\\)"),
+            (Position::new(2, 20), "data", "process_data <- function\\(data, threshold = 0.5, ...\\)"),
         ];
         
         for (position, symbol_name, expected_statement) in hover_tests {

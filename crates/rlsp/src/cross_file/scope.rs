@@ -112,17 +112,17 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // Collect definitions from AST
     collect_definitions(root, content, uri, &mut artifacts);
 
-    // Collect source() calls and add them to timeline
+    // Collect source() calls and add them to timeline.
+    // Note: even when local=TRUE (or sys.source targets a non-global env), the symbols can still
+    // be in-scope within a function body after the call site, so we keep these events and apply
+    // scoping rules later during resolution.
     let source_calls = detect_source_calls(tree, content);
     for source in source_calls {
-        // Skip sources that don't inherit symbols (local=TRUE or sys.source with non-global env)
-        if source.inherits_symbols() {
-            artifacts.timeline.push(ScopeEvent::Source {
-                line: source.line,
-                column: source.column,
-                source,
-            });
-        }
+        artifacts.timeline.push(ScopeEvent::Source {
+            line: source.line,
+            column: source.column,
+            source,
+        });
     }
 
     // Sort timeline by position for correct ordering
@@ -310,6 +310,26 @@ where
             ScopeEvent::Source { line: src_line, column: src_col, source } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
+                    // If this is a local-only source (or sys.source into a non-global env), only
+                    // make its symbols available within the containing function scope.
+                    if source.local || (source.is_sys_source && !source.sys_source_global_env) {
+                        let source_function_scope = artifacts.function_scopes.iter()
+                            .filter(|(start_line, start_column, end_line, end_column)| {
+                                (*start_line, *start_column) <= (*src_line, *src_col) && (*src_line, *src_col) <= (*end_line, *end_column)
+                            })
+                            .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
+                            .copied();
+
+                        if let Some(src_scope) = source_function_scope {
+                            if !active_function_scopes.contains(&src_scope) {
+                                continue;
+                            }
+                        } else {
+                            // local=TRUE at top-level doesn't contribute to global scope
+                            continue;
+                        }
+                    }
+
                     // Resolve the path and get symbols from sourced file
                     if let Some(child_uri) = resolve_path(&source.path, uri) {
                         // Check if we would exceed max depth
@@ -415,32 +435,50 @@ fn collect_definitions(
 /// Extract function parameter scope from function_definition nodes.
 /// Creates ScopedSymbol for each parameter and determines function body boundaries.
 fn try_extract_function_scope(node: Node, content: &str, uri: &Url) -> Option<ScopeEvent> {
-    // Get the parameters node
-    let params_node = node.child_by_field_name("parameters")?;
-    
-    // Get the body node to determine boundaries
-    let body_node = node.child_by_field_name("body")?;
-    
+    // tree-sitter-r node shapes have changed across versions; be robust by falling back
+    // to scanning children by kind if field lookups fail.
+    let params_node = node
+        .child_by_field_name("parameters")
+        .or_else(|| {
+            node.children(&mut node.walk())
+                .find(|c| c.is_named() && c.kind() == "parameters")
+        })?;
+
+    let body_node = node
+        .child_by_field_name("body")
+        .or_else(|| {
+            // Most common body node for function definitions.
+            node.children(&mut node.walk())
+                .find(|c| c.is_named() && c.kind() == "braced_expression")
+        })
+        .or_else(|| {
+            // Fallback: last named child that isn't the parameters list.
+            node.children(&mut node.walk())
+                .filter(|c| c.is_named() && c.id() != params_node.id())
+                .last()
+        })?;
+
     // Extract parameters
     let mut parameters = Vec::new();
     for child in params_node.children(&mut params_node.walk()) {
-        if child.kind() == "parameter" {
+        // Parameters may appear as parameter, default_parameter, identifier, dots, etc.
+        if matches!(child.kind(), "parameter" | "default_parameter" | "identifier" | "dots") {
             if let Some(param_symbol) = extract_parameter_symbol(child, content, uri) {
                 parameters.push(param_symbol);
             }
         }
     }
-    
+
     // Determine function body boundaries
     let body_start = body_node.start_position();
     let body_end = body_node.end_position();
-    
+
     // Convert to UTF-16 columns
     let start_line_text = content.lines().nth(body_start.row).unwrap_or("");
     let end_line_text = content.lines().nth(body_end.row).unwrap_or("");
     let start_column = byte_offset_to_utf16_column(start_line_text, body_start.column);
     let end_column = byte_offset_to_utf16_column(end_line_text, body_end.column);
-    
+
     Some(ScopeEvent::FunctionScope {
         start_line: body_start.row as u32,
         start_column,
@@ -454,17 +492,32 @@ fn try_extract_function_scope(node: Node, content: &str, uri: &Url) -> Option<Sc
 fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
     // Handle different parameter types
     match param_node.kind() {
-        "parameter" => {
-            // Look for identifier child
+        "parameter" | "default_parameter" => {
+            // Look for identifier/dots child.
             for child in param_node.children(&mut param_node.walk()) {
-                if child.kind() == "identifier" || child.kind() == "dots" {
+                if child.kind() == "identifier" {
                     let name = node_text(child, content).to_string();
                     let start = child.start_position();
                     let line_text = content.lines().nth(start.row).unwrap_or("");
                     let column = byte_offset_to_utf16_column(line_text, start.column);
-                    
+
                     return Some(ScopedSymbol {
                         name,
+                        kind: SymbolKind::Parameter,
+                        source_uri: uri.clone(),
+                        defined_line: start.row as u32,
+                        defined_column: column,
+                        signature: None,
+                    });
+                }
+
+                if child.kind() == "dots" {
+                    let start = child.start_position();
+                    let line_text = content.lines().nth(start.row).unwrap_or("");
+                    let column = byte_offset_to_utf16_column(line_text, start.column);
+
+                    return Some(ScopedSymbol {
+                        name: "...".to_string(),
                         kind: SymbolKind::Parameter,
                         source_uri: uri.clone(),
                         defined_line: start.row as u32,
@@ -475,12 +528,12 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
             }
         }
         "identifier" => {
-            // Direct identifier (for ellipsis or simple params)
+            // Direct identifier (some grammars may use this directly under parameters)
             let name = node_text(param_node, content).to_string();
             let start = param_node.start_position();
             let line_text = content.lines().nth(start.row).unwrap_or("");
             let column = byte_offset_to_utf16_column(line_text, start.column);
-            
+
             return Some(ScopedSymbol {
                 name,
                 kind: SymbolKind::Parameter,
@@ -495,7 +548,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
             let start = param_node.start_position();
             let line_text = content.lines().nth(start.row).unwrap_or("");
             let column = byte_offset_to_utf16_column(line_text, start.column);
-            
+
             return Some(ScopedSymbol {
                 name: "...".to_string(),
                 kind: SymbolKind::Parameter,
@@ -507,7 +560,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
         }
         _ => {}
     }
-    
+
     None
 }
 
@@ -902,6 +955,26 @@ where
             ScopeEvent::Source { line: src_line, column: src_col, source } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
+                    // If this is a local-only source (or sys.source into a non-global env), only
+                    // make its symbols available within the containing function scope.
+                    if source.local || (source.is_sys_source && !source.sys_source_global_env) {
+                        let source_function_scope = artifacts.function_scopes.iter()
+                            .filter(|(start_line, start_column, end_line, end_column)| {
+                                (*start_line, *start_column) <= (*src_line, *src_col) && (*src_line, *src_col) <= (*end_line, *end_column)
+                            })
+                            .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
+                            .copied();
+
+                        if let Some(src_scope) = source_function_scope {
+                            if !active_function_scopes.contains(&src_scope) {
+                                continue;
+                            }
+                        } else {
+                            // local=TRUE at top-level doesn't contribute to global scope
+                            continue;
+                        }
+                    }
+
                     // Resolve the path using PathContext
                     let child_uri = path_ctx.as_ref().and_then(|ctx| {
                         let resolved = super::path_resolve::resolve_path(&source.path, ctx)?;
@@ -1434,13 +1507,15 @@ mod tests {
 
     #[test]
     fn test_source_local_true_not_inherited() {
-        // Test that source() with local=TRUE does NOT make symbols available (inherits_symbols() returns false)
+        // source(local=TRUE) does not inherit symbols into the global scope, but the call site
+        // should still be represented in the timeline so scope resolution can make symbols
+        // available within the containing function scope.
         let source = ForwardSource {
             path: "child.R".to_string(),
             line: 0,
             column: 0,
             is_directive: false,
-            local: true,   // local=TRUE
+            local: true, // local=TRUE
             chdir: false,
             is_sys_source: false,
             sys_source_global_env: false,
@@ -1448,20 +1523,41 @@ mod tests {
 
         assert!(!source.inherits_symbols(), "source() with local=TRUE should NOT inherit symbols");
 
-        // Test that such sources are NOT included in timeline
+        // Local=TRUE sources are included in the timeline
         let code = "x <- 1\nsource(\"child.R\", local = TRUE)\ny <- 2";
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        // Should NOT have source event in timeline (filtered out by compute_artifacts)
         let source_events: Vec<_> = artifacts.timeline.iter()
             .filter_map(|e| match e {
-                ScopeEvent::Source { .. } => Some(e),
+                ScopeEvent::Source { source, .. } => Some(source),
                 _ => None,
             })
             .collect();
 
-        assert_eq!(source_events.len(), 0, "Should have no source events (local=TRUE filtered out)");
+        assert_eq!(source_events.len(), 1, "Should have one source event");
+        assert!(source_events[0].local, "Source should have local=TRUE");
+
+        // But local=TRUE at top-level should not make child symbols available in global scope.
+        let parent_uri = Url::parse("file:///parent.R").unwrap();
+        let child_uri = Url::parse("file:///child.R").unwrap();
+
+        let child_code = "child_var <- 42";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "child.R" { Some(child_uri.clone()) } else { None }
+        };
+
+        let scope = scope_at_position_with_deps(&parent_uri, 10, 0, &get_artifacts, &resolve_path, 10);
+        assert!(!scope.symbols.contains_key("child_var"), "local=TRUE should not leak symbols to global scope");
     }
 
     #[test]
@@ -1989,14 +2085,26 @@ mod tests {
         assert!(!scope_outside.symbols.contains_key("inner_var"), "Inner function variable should NOT be available outside");
 
         // Inside outer function but outside inner function
-        let scope_outer = scope_at_position(&artifacts, 0, 35);
+        let inner_def_needle = "inner <- function";
+        let col_in_outer_after_inner_def = code
+            .find(inner_def_needle)
+            .or_else(|| code.find("inner"))
+            .map(|i| (i + 1) as u32)
+            .unwrap_or(0);
+        let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def);
         assert!(scope_outer.symbols.contains_key("outer"), "Outer function should be available inside itself");
         assert!(scope_outer.symbols.contains_key("outer_var"), "Outer function variable should be available inside outer function");
         assert!(scope_outer.symbols.contains_key("inner"), "Inner function should be available inside outer function");
         assert!(!scope_outer.symbols.contains_key("inner_var"), "Inner function variable should NOT be available outside inner function");
 
         // Inside inner function
-        let scope_inner = scope_at_position(&artifacts, 0, 75);
+        let inner_var_def_needle = "inner_var <-";
+        let col_in_inner_after_inner_var_def = code
+            .rfind(inner_var_def_needle)
+            .or_else(|| code.rfind("inner_var"))
+            .map(|i| (i + 1) as u32)
+            .unwrap_or(0);
+        let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def);
         assert!(scope_inner.symbols.contains_key("outer"), "Outer function should be available inside inner function");
         assert!(scope_inner.symbols.contains_key("outer_var"), "Outer function variable should be available inside inner function");
         assert!(scope_inner.symbols.contains_key("inner"), "Inner function should be available inside itself");

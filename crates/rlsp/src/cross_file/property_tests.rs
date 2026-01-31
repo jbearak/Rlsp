@@ -1887,7 +1887,9 @@ proptest! {
             "Function-local variable should NOT be available outside function");
 
         // Inside function body, local variable SHOULD be available
-        let scope_inside = scope_at_position(&artifacts, 0, 35); // Position within function body
+        // Use a position derived from the generated code so it is always within the braces.
+        let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
+        let scope_inside = scope_at_position(&artifacts, 0, col_in_body);
         prop_assert!(scope_inside.symbols.contains_key(&func_name),
             "Function name should be available inside function");
         prop_assert!(scope_inside.symbols.contains_key(&local_var),
@@ -1931,7 +1933,16 @@ proptest! {
             "Inner function variable should NOT be available outside");
 
         // Inside outer function but outside inner function
-        let scope_outer = scope_at_position(&artifacts, 0, 25);
+        // Choose a position inside the outer body *after* the inner function definition begins.
+        // Use a more specific needle than `inner_func` alone, since very short names (e.g. "i")
+        // could match earlier substrings like "function".
+        let inner_def_needle = format!("{} <- function", inner_func);
+        let col_in_outer_after_inner_def = code
+            .find(&inner_def_needle)
+            .or_else(|| code.find(&inner_func))
+            .map(|i| (i + 1) as u32)
+            .unwrap_or(0);
+        let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def);
         prop_assert!(scope_outer.symbols.contains_key(&outer_func),
             "Outer function should be available inside itself");
         prop_assert!(scope_outer.symbols.contains_key(&outer_var),
@@ -1942,7 +1953,14 @@ proptest! {
             "Inner function variable should NOT be available outside inner function");
 
         // Inside inner function
-        let scope_inner = scope_at_position(&artifacts, 0, 65);
+        // Choose a position inside the inner body after the inner_var definition.
+        let inner_var_def_needle = format!("{} <-", inner_var);
+        let col_in_inner_after_inner_var_def = code
+            .rfind(&inner_var_def_needle)
+            .or_else(|| code.rfind(&inner_var))
+            .map(|i| (i + 1) as u32)
+            .unwrap_or(0);
+        let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def);
         prop_assert!(scope_inner.symbols.contains_key(&outer_func),
             "Outer function should be available inside inner function");
         prop_assert!(scope_inner.symbols.contains_key(&outer_var),
@@ -1996,7 +2014,9 @@ proptest! {
             "Function parameter 2 should NOT be available outside function");
 
         // Inside function - parameters SHOULD be available
-        let scope_inside = scope_at_position(&artifacts, 0, 40);
+        // Use a position derived from the generated code so it is always within the braces.
+        let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
+        let scope_inside = scope_at_position(&artifacts, 0, col_in_body);
         prop_assert!(scope_inside.symbols.contains_key(&func_name),
             "Function name should be available inside function");
         prop_assert!(scope_inside.symbols.contains_key(&param1),
@@ -2030,7 +2050,9 @@ proptest! {
             "Function parameter with default should NOT be available outside function");
 
         // Inside function - parameter SHOULD be available
-        let scope_inside = scope_at_position(&artifacts, 0, 40);
+        // Use a position derived from the generated code so it is always within the braces.
+        let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
+        let scope_inside = scope_at_position(&artifacts, 0, col_in_body);
         prop_assert!(scope_inside.symbols.contains_key(&param_name),
             "Function parameter with default should be available inside function");
     }
@@ -2059,7 +2081,9 @@ proptest! {
             "Ellipsis parameter should NOT be available outside function");
 
         // Inside function - parameters SHOULD be available
-        let scope_inside = scope_at_position(&artifacts, 0, 50);
+        // Use a position derived from the generated code so it is always within the braces.
+        let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
+        let scope_inside = scope_at_position(&artifacts, 0, col_in_body);
         prop_assert!(scope_inside.symbols.contains_key(&param_name),
             "Named parameter should be available inside function");
         prop_assert!(scope_inside.symbols.contains_key("..."),
@@ -4157,7 +4181,9 @@ proptest! {
         prop_assert!(has_function_scope, "Should have FunctionScope event with parameters");
 
         // Get scope within function body (should include parameters)
-        let scope_in_body = scope_at_position(&artifacts, 0, 50); // Position within function body
+        // Use a position derived from the generated code so it is always within the braces.
+        let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
+        let scope_in_body = scope_at_position(&artifacts, 0, col_in_body);
         prop_assert!(scope_in_body.symbols.contains_key(&param1),
             "Parameter 1 should be available within function body");
         prop_assert!(scope_in_body.symbols.contains_key(&param2),
@@ -4207,7 +4233,9 @@ proptest! {
         prop_assert!(has_function_scope, "Should have FunctionScope event with default parameter");
 
         // Parameter should be available within function body
-        let scope_in_body = scope_at_position(&artifacts, 0, 50);
+        // Use a position derived from the generated code so it is always within the braces.
+        let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
+        let scope_in_body = scope_at_position(&artifacts, 0, col_in_body);
         prop_assert!(scope_in_body.symbols.contains_key(&param_name),
             "Parameter with default value should be available within function body");
     }
@@ -4297,8 +4325,14 @@ proptest! {
         };
 
         // Get scope within function body (after source() call)
+        // Choose a position after the source() statement so the sourced symbols should be in scope.
+        let source_call_start = parent_code.find("source(\"child.R\"").unwrap_or(0);
+        let col_after_source = parent_code[source_call_start..]
+            .find(';')
+            .map(|j| (source_call_start + j + 1) as u32)
+            .unwrap_or((source_call_start + 1) as u32);
         let scope_in_function = scope_at_position_with_deps(
-            &parent_uri, 0, 60, &get_artifacts, &resolve_path, 10,
+            &parent_uri, 0, col_after_source, &get_artifacts, &resolve_path, 10,
         );
 
         // Symbol should be available within function scope (local=TRUE)
@@ -4503,7 +4537,9 @@ proptest! {
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
         // Get scope within function body
-        let scope_in_body = scope_at_position(&artifacts, 0, 60);
+        // Use a position derived from the generated code so it is always within the braces.
+        let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
+        let scope_in_body = scope_at_position(&artifacts, 0, col_in_body);
 
         // Both parameters should be recognized and included in function body scope
         prop_assert!(scope_in_body.symbols.contains_key(&param_with_default),

@@ -11,3 +11,4 @@ cc cead6597beeef48cc450e419ace396b6547bb66be9e65b66457770244641374a # shrinks to
 cc ad2793de38da2ac75613c3c4b22aaed92d0e568177f83fe740a910f88306ce2f # shrinks to symbol_name = "x"
 cc 7ac31d879f720400260efdcb7e667dc3c814aec839a8c98f0283bf7621f6fff3 # shrinks to symbol_before = "a", symbol_after = "x1", call_site_line = 2
 cc 9a50f5f332557b107a6a02617b31fd0cf6cf0beb639a215669cf49ebb32487db # shrinks to symbol_a = "A", symbol_b = "if"
+cc 817ca493d00121ce8bea44aea9cc7c063b0f5a7cc399de37effdea50791820e8 # shrinks to outer_func = "a", inner_func = "i", outer_var = "b", inner_var = "a_"
