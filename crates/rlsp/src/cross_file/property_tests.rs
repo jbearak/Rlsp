@@ -7087,7 +7087,21 @@ proptest! {
 
 use super::scope::{FunctionScopeInterval, FunctionScopeTree, Position};
 
-/// Generate a valid interval where start <= end (lexicographically)
+/// Produces a strategy yielding valid intervals as (start_line, start_col, end_line, end_col)
+/// where the end position is lexicographically greater than or equal to the start position.
+///
+/// # Examples
+///
+/// ```
+/// use proptest::prelude::*;
+///
+/// proptest! {
+///     |(iv in valid_interval())| {
+///         let (sl, sc, el, ec) = iv;
+///         assert!((el, ec) >= (sl, sc));
+///     }
+/// }
+/// ```
 fn valid_interval() -> impl Strategy<Value = (u32, u32, u32, u32)> {
     // Generate start position, then end position >= start
     (0..1000u32, 0..100u32).prop_flat_map(|(start_line, start_col)| {
@@ -7423,8 +7437,24 @@ proptest! {
 // Feature: interval-tree-scope-lookup, Property 3: Backward Compatibility
 // ============================================================================
 
-/// Linear scan implementation for query_point (the "model" for comparison)
-/// This represents the original O(n) implementation that was replaced by the interval tree.
+/// Return all intervals that contain a given position using a linear scan.
+///
+/// Scopes are tuples of the form `(start_line, start_col, end_line, end_col)`.
+/// Only intervals where the start is less than or equal to the end are considered,
+/// and an interval is included only if `start <= (line, column) <= end`.
+///
+/// # Returns
+///
+/// A `Vec` of the intervals from `scopes` that contain the specified position,
+/// preserving their original order.
+///
+/// # Examples
+///
+/// ```
+/// let scopes = vec![ (1, 0, 3, 10), (2, 0, 2, 5), (4, 0, 5, 0) ];
+/// let containing = linear_scan_containing(&scopes, 2, 3);
+/// assert_eq!(containing, vec![ (1, 0, 3, 10), (2, 0, 2, 5) ]);
+/// ```
 fn linear_scan_containing(
     scopes: &[(u32, u32, u32, u32)],
     line: u32,
@@ -7443,12 +7473,20 @@ fn linear_scan_containing(
         .collect()
 }
 
-/// Linear scan implementation for query_innermost (the "model" for comparison)
-/// This represents the original filter + max_by_key pattern that was replaced.
-/// 
-/// Note: When multiple intervals have the same maximum start position, this returns
-/// one of them (the last one in iteration order). The interval tree may return a
-/// different one with the same start position, which is still correct behavior.
+/// Selects the innermost interval that contains the given position using a linear scan.
+///
+/// Intervals are tuples (start_line, start_col, end_line, end_col) and are treated as
+/// inclusive: start <= position <= end. If multiple intervals share the same maximum
+/// start position, one of them (the last encountered in iteration order) is returned.
+/// Returns `None` if no interval contains the position.
+///
+/// # Examples
+///
+/// ```
+/// let scopes = vec![(1, 0, 3, 0), (2, 0, 2, 5)]; // second interval is nested inside the first
+/// let found = crate::linear_scan_innermost(&scopes, 2, 1).unwrap();
+/// assert_eq!(found, (2, 0, 2, 5));
+/// ```
 #[allow(dead_code)]
 fn linear_scan_innermost(
     scopes: &[(u32, u32, u32, u32)],
@@ -7468,7 +7506,25 @@ fn linear_scan_innermost(
         .copied()
 }
 
-/// Find the maximum start position among all containing intervals
+/// Finds the start position (line, column) of the containing interval with the greatest start.
+///
+/// Scans `scopes` for intervals that contain the point `(line, column)` and returns the start
+/// `(line, column)` pair of the interval whose start is maximal (lexicographic by line then column).
+///
+/// # Returns
+///
+/// `Some((start_line, start_column))` if at least one interval contains the point, `None` otherwise.
+///
+/// # Examples
+///
+/// ```
+/// let scopes = vec![
+///     (1, 0, 3, 5), // start (1,0) .. end (3,5)
+///     (2, 0, 2, 10), // start (2,0) .. end (2,10)
+/// ];
+/// assert_eq!(find_max_start_position(&scopes, 2, 3), Some((2, 0)));
+/// assert_eq!(find_max_start_position(&scopes, 4, 0), None);
+/// ```
 fn find_max_start_position(
     scopes: &[(u32, u32, u32, u32)],
     line: u32,

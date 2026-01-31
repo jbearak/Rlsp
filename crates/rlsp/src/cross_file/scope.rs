@@ -27,11 +27,30 @@ pub struct Position {
 }
 
 impl Position {
+    /// Creates a new Position with the specified line and column.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let p = Position::new(3, 5);
+    /// assert_eq!(p.line, 3);
+    /// assert_eq!(p.column, 5);
+    /// ```
     pub fn new(line: u32, column: u32) -> Self {
         Self { line, column }
     }
 
-    /// Create a position representing end-of-file
+    /// Create an EOF sentinel Position used to represent end-of-file.
+    ///
+    /// The returned Position has its line and column set to the maximum `u32` value
+    /// and is recognized by `Position::is_eof()`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let p = Position::eof();
+    /// assert!(p.is_eof());
+    /// ```
     pub fn eof() -> Self {
         Self {
             line: u32::MAX,
@@ -39,7 +58,23 @@ impl Position {
         }
     }
 
-    /// Check if this is an EOF sentinel position
+    /// Indicates whether this position is the EOF sentinel.
+    ///
+    /// The EOF sentinel is represented by either the line or column being set to `u32::MAX`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the position is the EOF sentinel, `false` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let p = Position::eof();
+    /// assert!(p.is_eof());
+    ///
+    /// let normal = Position::new(0, 0);
+    /// assert!(!normal.is_eof());
+    /// ```
     pub fn is_eof(&self) -> bool {
         self.line == u32::MAX || self.column == u32::MAX
     }
@@ -53,16 +88,48 @@ pub struct FunctionScopeInterval {
 }
 
 impl FunctionScopeInterval {
+    /// Creates a function scope interval from the given start and end positions.
+    ///
+    /// The interval is inclusive of both `start` and `end`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let start = Position::new(1, 0);
+    /// let end = Position::new(10, 0);
+    /// let interval = FunctionScopeInterval::new(start, end);
+    /// assert_eq!(interval.to_tuple(), (1, 0, 10, 0));
+    /// ```
     pub fn new(start: Position, end: Position) -> Self {
         Self { start, end }
     }
 
-    /// Check if this interval contains the given position (inclusive)
+    /// Checks whether the interval includes the given position (inclusive).
+    ///
+    /// Returns `true` if `pos` lies between `start` and `end` (inclusive), `false` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let interval = FunctionScopeInterval::new(Position::new(1, 0), Position::new(3, 5));
+    /// assert!(interval.contains(Position::new(1, 0)));
+    /// assert!(interval.contains(Position::new(2, 10)));
+    /// assert!(interval.contains(Position::new(3, 5)));
+    /// assert!(!interval.contains(Position::new(4, 0)));
+    /// ```
     pub fn contains(&self, pos: Position) -> bool {
         self.start <= pos && pos <= self.end
     }
 
-    /// Convert from tuple representation
+    /// Create a function-scope interval from a 4-tuple of positions:
+    /// (start_line, start_column, end_line, end_column).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let iv = FunctionScopeInterval::from_tuple((1, 2, 3, 4));
+    /// assert_eq!(iv.to_tuple(), (1, 2, 3, 4));
+    /// ```
     pub fn from_tuple(tuple: (u32, u32, u32, u32)) -> Self {
         Self {
             start: Position::new(tuple.0, tuple.1),
@@ -70,7 +137,18 @@ impl FunctionScopeInterval {
         }
     }
 
-    /// Convert to tuple representation for backward compatibility
+    /// Produce a 4-tuple representing the interval boundaries for backward compatibility.
+    ///
+    /// # Returns
+    ///
+    /// `(u32, u32, u32, u32)` where the elements are `(start_line, start_column, end_line, end_column)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let interval = FunctionScopeInterval::new(Position::new(1, 2), Position::new(3, 4));
+    /// assert_eq!(interval.to_tuple(), (1, 2, 3, 4));
+    /// ```
     pub fn to_tuple(&self) -> (u32, u32, u32, u32) {
         (
             self.start.line,
@@ -116,28 +194,53 @@ impl FunctionScopeTree {
         Self { root: None, count: 0 }
     }
 
-    /// Check if the tree is empty
+    /// Indicates whether the interval tree contains no intervals.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let empty = FunctionScopeTree::new();
+    /// assert!(empty.is_empty());
+    ///
+    /// let nonempty = FunctionScopeTree::from_scopes(&[(0, 0, 1, 0)]);
+    /// assert!(!nonempty.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
     }
 
-    /// Get the number of intervals in the tree
+    /// Number of intervals stored in the tree.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let tree = FunctionScopeTree::new();
+    /// assert_eq!(tree.len(), 0);
+    /// ```
     pub fn len(&self) -> usize {
         self.count
     }
 
-    /// Build a tree from a slice of function scope tuples.
-    /// 
-    /// Time complexity: O(n log n) for sorting + O(n) for tree construction.
-    /// 
-    /// Invalid intervals (where start > end) are filtered out with a warning log.
-    /// The tree is built using a recursive median-split approach for balance.
-    /// 
-    /// # Arguments
-    /// * `scopes` - Slice of tuples (start_line, start_column, end_line, end_column)
-    /// 
-    /// # Requirements
-    /// Implements Requirements 1.1 (interval storage) and 1.5 (O(n log n) construction)
+    /// Constructs a balanced FunctionScopeTree from a slice of function-scope tuples.
+    ///
+    /// Invalid intervals (where a start position is after its end) are omitted with a warning.
+    /// The input is sorted and organized to produce a tree that provides efficient point queries.
+    ///
+    /// Time complexity: O(n log n) for sorting plus O(n) for tree construction.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let scopes = &[ (0, 0, 10, 0), (2, 0, 5, 0), (6, 0, 9, 0) ];
+    /// let tree = FunctionScopeTree::from_scopes(scopes);
+    /// assert_eq!(tree.len(), 3);
+    /// // Query a point inside the second interval
+    /// let pos = Position::new(3, 0);
+    /// let matches = tree.query_point(pos);
+    /// assert!(matches.iter().any(|iv| iv.contains(pos)));
+    /// ```
+    ///
+    /// A balanced FunctionScopeTree containing the valid intervals from `scopes`.
     pub fn from_scopes(scopes: &[(u32, u32, u32, u32)]) -> Self {
         // Convert tuples to intervals and filter out invalid ones
         let mut intervals: Vec<FunctionScopeInterval> = scopes
@@ -174,14 +277,18 @@ impl FunctionScopeTree {
         Self { root, count }
     }
 
-    /// Recursively build a balanced tree from a sorted slice of intervals.
-    /// 
-    /// Uses median-split approach:
-    /// - Base case: empty slice returns None
-    /// - Pick median element as root
-    /// - Recursively build left subtree from elements before median
-    /// - Recursively build right subtree from elements after median
-    /// - Compute max_end as max of: node's end, left subtree max_end, right subtree max_end
+    /// Builds a balanced interval subtree from a sorted slice of function-scope intervals.
+    ///
+    /// Returns the root `IntervalNode` for the slice, or `None` when the slice is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Construct a tree from sorted scope tuples via the public constructor.
+    /// let tree = FunctionScopeTree::from_scopes(&[(0, 0, 1, 0), (2, 0, 3, 0)]);
+    /// assert!(!tree.is_empty());
+    /// assert_eq!(tree.len(), 2);
+    /// ```
     fn build_balanced_tree(intervals: &[FunctionScopeInterval]) -> Option<Box<IntervalNode>> {
         if intervals.is_empty() {
             return None;
@@ -216,23 +323,24 @@ impl FunctionScopeTree {
         }))
     }
 
-    /// Query all intervals containing the given position.
-    /// 
-    /// Time complexity: O(log n + k) where n is the number of intervals and k is the result count.
-    /// 
-    /// Uses max_end augmentation for efficient subtree pruning:
-    /// - Prune left subtree if its max_end < pos (no intervals there can contain pos)
-    /// - Prune right subtree if node's start > pos (all intervals there start after pos)
-    /// 
-    /// # Arguments
-    /// * `pos` - The position to query
-    /// 
+    /// Finds all function scope intervals that contain the given position (inclusive).
+    ///
+    /// The search returns every interval whose start <= `pos` <= end. If no intervals contain
+    /// `pos` an empty vector is returned.
+    ///
     /// # Returns
-    /// A vector of all intervals that contain the given position (inclusive boundaries).
-    /// Returns an empty vector if the tree is empty or no intervals contain the position.
-    /// 
-    /// # Requirements
-    /// Implements Requirements 1.3 (point queries), 1.4 (return all containing intervals), 1.6 (empty tree handling)
+    ///
+    /// A `Vec<FunctionScopeInterval>` with all intervals that contain `pos`; empty if none.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let tree = FunctionScopeTree::from_scopes(&[(0, 0, 2, 0), (1, 0, 3, 0)]);
+    /// let pos = Position::new(1, 5);
+    /// let mut intervals = tree.query_point(pos);
+    /// intervals.sort_by_key(|i| i.start.line); // order not guaranteed
+    /// assert_eq!(intervals.len(), 2);
+    /// ```
     pub fn query_point(&self, pos: Position) -> Vec<FunctionScopeInterval> {
         let mut results = Vec::new();
         if let Some(ref root) = self.root {
@@ -241,10 +349,22 @@ impl FunctionScopeTree {
         results
     }
 
-    /// Recursive helper for point query.
-    /// 
-    /// Traverses the tree and collects all intervals containing the given position.
-    /// Uses max_end augmentation to prune subtrees that cannot contain the position.
+    /// Collects all function-scope intervals that contain a given position by traversing the interval tree.
+    ///
+    /// This recursive helper visits the current node and, using the node `max_end` augmentation
+    /// and start-ordering invariants, prunes subtrees that cannot contain the query position
+    /// to avoid unnecessary work.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Build a tree from scope tuples and query for intervals containing a position.
+    /// let scopes = vec![(1, 0, 10, 0), (2, 0, 5, 0), (6, 0, 9, 0)];
+    /// let tree = FunctionScopeTree::from_scopes(&scopes);
+    /// let pos = Position::new(3, 0);
+    /// let intervals = tree.query_point(pos);
+    /// assert!(intervals.iter().any(|i| i.contains(pos)));
+    /// ```
     fn query_point_recursive(
         node: &IntervalNode,
         pos: Position,
@@ -275,24 +395,29 @@ impl FunctionScopeTree {
         }
     }
 
-    /// Query for the innermost (latest start) interval containing the position.
-    /// 
-    /// Time complexity: O(log n + k) where n is the number of intervals and k is the
-    /// number of containing intervals.
-    /// 
-    /// The "innermost" interval is defined as the one with the lexicographically largest
-    /// start position among all intervals containing the query point. This corresponds
-    /// to the most deeply nested function scope.
-    /// 
-    /// # Arguments
-    /// * `pos` - The position to query
-    /// 
+    /// Selects the innermost function-scope interval that contains a given position.
+    ///
+    /// The "innermost" interval is the containing interval whose `start` position is
+    /// lexicographically largest (latest start), corresponding to the most deeply
+    /// nested function scope. Time complexity is O(log n + k) where n is the number
+    /// of intervals and k is the number of intervals that contain the query point.
+    ///
     /// # Returns
-    /// The interval with the maximum start position among all containing intervals,
-    /// or None if no intervals contain the position.
-    /// 
-    /// # Requirements
-    /// Implements Requirements 2.1 (select interval with latest start), 2.2 (return None when empty)
+    ///
+    /// `Some(FunctionScopeInterval)` whose start is the lexicographically largest among
+    /// intervals containing `pos`, or `None` if no interval contains `pos`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let tree = FunctionScopeTree::from_scopes(&[
+    ///     (0, 0, 10, 0), // outer scope
+    ///     (2, 0, 5, 0),  // inner scope
+    /// ]);
+    /// let pos = Position::new(3, 0);
+    /// let innermost = tree.query_innermost(pos).unwrap();
+    /// assert_eq!(innermost.to_tuple(), (2, 0, 5, 0));
+    /// ```
     pub fn query_innermost(&self, pos: Position) -> Option<FunctionScopeInterval> {
         // Get all intervals containing the position
         let containing = self.query_point(pos);
@@ -304,6 +429,14 @@ impl FunctionScopeTree {
 }
 
 impl Default for FunctionScopeTree {
+    /// Creates an empty function scope interval tree.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let tree = FunctionScopeTree::default();
+    /// assert!(tree.is_empty());
+    /// ```
     fn default() -> Self {
         Self::new()
     }
@@ -390,6 +523,19 @@ pub struct ScopeArtifacts {
 }
 
 impl Default for ScopeArtifacts {
+    /// Creates an empty ScopeArtifacts with all fields set to their defaults.
+    ///
+    /// The produced value has an empty exported interface and timeline, an interface hash of `0`,
+    /// and a default `FunctionScopeTree`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let artifacts = ScopeArtifacts::default();
+    /// assert!(artifacts.exported_interface.is_empty());
+    /// assert!(artifacts.timeline.is_empty());
+    /// assert_eq!(artifacts.interface_hash, 0);
+    /// ```
     fn default() -> Self {
         Self {
             exported_interface: HashMap::new(),
@@ -409,11 +555,51 @@ pub struct ScopeAtPosition {
     pub depth_exceeded: Vec<(Url, u32, u32)>,
 }
 
-/// Determines if a source() call should apply local scoping rules.
-/// Returns true if the source is local=TRUE or sys.source into a non-global environment.
+/// Determine whether a `source()` call should use local scoping rules.
+///
+/// The function returns `true` when the `ForwardSource` explicitly requests local
+/// scoping (`local = true`) or when it represents a `sys.source` call that does
+/// not target the global environment (`is_sys_source = true` and
+/// `sys_source_global_env = false`).
+///
+/// # Examples
+///
+/// ```
+/// let s = ForwardSource {
+///     local: true,
+///     is_sys_source: false,
+///     sys_source_global_env: false,
+/// };
+/// assert!(should_apply_local_scoping(&s));
+///
+/// let t = ForwardSource {
+///     local: false,
+///     is_sys_source: true,
+///     sys_source_global_env: false,
+/// };
+/// assert!(should_apply_local_scoping(&t));
+///
+/// let u = ForwardSource {
+///     local: false,
+///     is_sys_source: true,
+///     sys_source_global_env: true,
+/// };
+/// assert!(!should_apply_local_scoping(&u));
+/// ```
 fn should_apply_local_scoping(source: &ForwardSource) -> bool {
     source.local || (source.is_sys_source && !source.sys_source_global_env)
 }
+/// Finds the innermost function-scope interval that contains the given position.
+///
+/// Given a 0-based (line, column) position, returns the containing function scope whose start is the latest (innermost) among all intervals that include the position.
+///
+/// # Examples
+///
+/// ```
+/// let tree = FunctionScopeTree::from_scopes(&[(0, 0, 10, 0), (2, 0, 5, 0)]);
+/// let tuple = find_containing_function_scope(&tree, 3, 1);
+/// assert_eq!(tuple, Some((2, 0, 5, 0)));
+/// ```
 fn find_containing_function_scope(
     tree: &FunctionScopeTree,
     line: u32,
@@ -422,6 +608,22 @@ fn find_containing_function_scope(
     tree.query_innermost(Position::new(line, column))
         .map(|interval| interval.to_tuple())
 }
+/// Remove the given symbols from a computed scope when the removal applies.
+///
+/// If `removal_scope` is `None`, this removes all listed `symbols` from `scope.symbols`.
+/// If `removal_scope` is `Some(scope)` the removal is applied only when that scope is
+/// present in `active_function_scopes`; otherwise the call is a no-op.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::collections::HashMap;
+/// // Illustrative example (types elided for brevity):
+/// // let mut scope = ScopeAtPosition { symbols: HashMap::new(), chain: vec![], depth_exceeded: vec![] };
+/// // scope.symbols.insert("x".to_string(), /* ScopedSymbol */);
+/// // apply_removal(&mut scope, &[], None, &["x".to_string()]);
+/// // assert!(!scope.symbols.contains_key("x"));
+/// ```
 fn apply_removal(
     scope: &mut ScopeAtPosition,
     active_function_scopes: &[(u32, u32, u32, u32)],
@@ -443,8 +645,28 @@ fn apply_removal(
     }
 }
 
-/// Compute scope artifacts for a file from its AST.
-/// This includes both definitions and source() calls in the timeline.
+/// Build scope artifacts for a source file by extracting definitions, source() calls, and removals.
+///
+/// The returned ScopeArtifacts contains a document-ordered timeline of scope events (definitions,
+/// source calls, function-scope entries, and removal events), an interval tree of function scopes
+/// for efficient position queries, and a deterministic hash of the file's exported interface.
+///
+/// The function:
+/// - collects symbol and function-scope definitions from the AST,
+/// - records detected `source()` and `rm()/remove()` calls as timeline events,
+/// - sorts the timeline by position,
+/// - constructs a FunctionScopeTree from discovered function scopes and annotates removal events
+///   with their containing function scope (if any),
+/// - computes the exported-interface hash.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Given a parser-produced `tree`, file `content`, and `uri`:
+/// let artifacts = compute_artifacts(&uri, &tree, content);
+/// // `artifacts.timeline` contains the extracted scope events in source order.
+/// assert!(artifacts.interface_hash != 0 || artifacts.exported_interface.is_empty());
+/// ```
 pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifacts {
     let mut artifacts = ScopeArtifacts::default();
     let root = tree.root_node();
@@ -508,7 +730,24 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     artifacts
 }
 
-/// Compute scope at a specific position (single file, no traversal)
+/// Compute the lexical scope for a single file at the given document position.
+///
+/// Returns the set of symbols that are visible at (line, column) within `artifacts`,
+/// without performing any cross-file traversal or dependency resolution.
+///
+/// Behaviour:
+/// - Includes global definitions that occur at or before the query position.
+/// - Includes function-local definitions only if the query position lies inside the same function scope as the definition.
+/// - Includes function parameters when the query position is inside the function body (EOF sentinel positions are ignored).
+/// - Applies removal events that occur strictly before the query position and respects function-scoped removals.
+///
+/// # Examples
+///
+/// ```
+/// let artifacts = ScopeArtifacts::default();
+/// let scope = scope_at_position(&artifacts, 0, 0);
+/// assert!(scope.symbols.is_empty());
+/// ```
 pub fn scope_at_position(
     artifacts: &ScopeArtifacts,
     line: u32,
@@ -598,6 +837,44 @@ where
     scope
 }
 
+/// Recursively computes the lexical scope at a position across sourced files.
+///
+/// Walks the timeline and function-scope intervals for `uri`, merging symbols from
+/// the current file and any transitive `source()` targets (up to `max_depth`),
+/// respecting local scoping, function-local definitions, removals, and cycle prevention.
+///
+/// Parameters:
+/// - `uri`: the file URI whose scope is being computed.
+/// - `line`, `column`: the query position (use `u32::MAX` for EOF / to include all symbols).
+/// - `get_artifacts`: callback that returns `ScopeArtifacts` for a given `Url`.
+/// - `resolve_path`: callback that resolves a source path relative to `uri` and returns a `Url`.
+/// - `max_depth`: maximum recursion depth for following `source()` chains.
+/// - `current_depth`: current recursion depth (start callers at 0).
+/// - `visited`: mutable set of already-visited `Url`s to prevent cycles.
+///
+/// Returns:
+/// A `ScopeAtPosition` containing the merged symbols, the chain of visited URIs,
+/// and any (uri, line, column) tuples where traversal was curtailed due to depth limits.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Example (conceptual): compute top-level scope for a file.
+/// let uri = Url::parse("file:///project/main.R").unwrap();
+/// let artifacts_db = |u: &Url| -> Option<ScopeArtifacts> { /* load or parse file */ None };
+/// let resolver = |path: &str, base: &Url| -> Option<Url> { /* resolve path */ None };
+/// let mut visited = std::collections::HashSet::new();
+/// let scope = scope_at_position_recursive(
+///     &uri,
+///     10, // line
+///     2,  // column
+///     &artifacts_db,
+///     &resolver,
+///     10, // max_depth
+///     0,  // current_depth
+///     &mut visited,
+/// );
+/// ```
 fn scope_at_position_recursive<F>(
     uri: &Url,
     line: u32,
@@ -1183,6 +1460,42 @@ where
     )
 }
 
+/// Resolve the effective scope at a position using the dependency graph to include parent (backward) and sourced (forward) symbols.
+///
+/// This recursively collects symbols visible at (line, column) in `uri` by:
+/// - Merging symbols from parent files indicated by dependency-graph edges (respecting local/sys.source/global rules and depth limits).
+/// - Applying the file's own timeline (definitions, function-parameter scopes, removals) and resolving forward `source()` calls through the provided `PathContext`.
+/// The function guards against cycles and enforces `max_depth`; entries that would exceed `max_depth` are recorded in `ScopeAtPosition::depth_exceeded`.
+///
+/// # Examples
+///
+/// ```
+/// use url::Url;
+/// use std::collections::HashSet;
+///
+/// // Call with minimal stubs: no artifacts, no metadata, and an empty graph.
+/// let uri = Url::parse("file:///example.R").unwrap();
+/// let get_artifacts = |_u: &Url| -> Option<super::ScopeArtifacts> { None };
+/// let get_metadata = |_u: &Url| -> Option<super::types::CrossFileMetadata> { None };
+/// let graph: super::dependency::DependencyGraph = Default::default();
+/// let mut visited: HashSet<Url> = HashSet::new();
+///
+/// let scope = super::scope_at_position_with_graph_recursive(
+///     &uri,
+///     1,
+///     1,
+///     &get_artifacts,
+///     &get_metadata,
+///     &graph,
+///     None,
+///     None,
+///     10,
+///     0,
+///     &mut visited,
+/// );
+///
+/// assert!(scope.symbols.is_empty());
+/// ```
 fn scope_at_position_with_graph_recursive<F, G>(
     uri: &Url,
     line: u32,
@@ -1413,6 +1726,62 @@ where
     scope
 }
 
+/// Compute the scope visible at a given position by first applying backward (parent) directives
+/// and then processing this file's timeline (local definitions, forward sources, function scopes,
+/// and removals), performing recursive cross-file traversal with cycle prevention and depth limits.
+///
+/// Parameters:
+/// - `uri`: URI of the file to compute scope for.
+/// - `line`, `column`: 0-based UTF-16 line and column of the query position (use `u32::MAX` to represent EOF sentinels when propagating full-file inclusion).
+/// - `get_artifacts`: function that returns `ScopeArtifacts` for a given `Url` (or `None` if unavailable).
+/// - `get_metadata`: function that returns cross-file metadata (backward directives) for a given `Url` (or `None`).
+/// - `resolve_path`: path resolution callback that maps a source path string and the current file `Url` to an optional target `Url`.
+/// - `max_depth`: maximum allowed recursion depth; when exceeded, the function records entries in `ScopeAtPosition::depth_exceeded`.
+/// - `current_depth`: current recursion depth (caller-managed).
+/// - `visited`: mutable set of visited URIs used to avoid cycles; the function inserts `uri` on entry.
+/// - `_parent_call_site`: reserved for future use; currently unused.
+///
+/// Behavior notes:
+/// - Backward directives (parents that source this file) are processed first and their symbols are treated
+///   as available at the start of this file but have lower precedence than local definitions.
+/// - Forward `source()` calls in the timeline are resolved and merged, respecting `max_depth` and visited cycles.
+/// - Function parameters are included only when the query position lies within the function body.
+/// - Removals are applied only for removal events that occur strictly before the query position and respect function-local scoping.
+/// - The function uses the file's `FunctionScopeTree` to determine function-local vs global definitions.
+///
+/// # Returns
+///
+/// A `ScopeAtPosition` describing symbols visible at the requested position, the chain of traversed URIs,
+/// and any depth-exceeded entries encountered during recursion.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+/// use url::Url;
+///
+/// // Minimal example: no artifacts or metadata available -> empty scope
+/// let uri = Url::parse("file:///example.R").unwrap();
+/// let get_artifacts = |_u: &Url| None;
+/// let get_metadata = |_u: &Url| None;
+/// let resolve = |_p: &str, _u: &Url| None;
+/// let mut visited = HashSet::new();
+///
+/// let scope = scope_at_position_with_backward_recursive(
+///     &uri,
+///     0,
+///     0,
+///     &get_artifacts,
+///     &get_metadata,
+///     &resolve,
+///     5,    // max_depth
+///     0,    // current_depth
+///     &mut visited,
+///     None, // parent call site
+/// );
+///
+/// assert!(scope.symbols.is_empty());
+/// ```
 fn scope_at_position_with_backward_recursive<F, G>(
     uri: &Url,
     line: u32,
@@ -4335,6 +4704,25 @@ mod tests {
         assert!(innermost_from_empty.is_none(), "query_innermost on tree from empty scopes should return None");
     }
 
+    /// Verifies that a FunctionScopeTree with a single interval reports containment correctly.
+    ///
+    /// This test constructs a tree containing one interval and asserts:
+    /// - query_point returns the interval for positions inside or at the start boundary and returns no intervals for positions before or after the interval (including after the end column).
+    /// - query_innermost returns the interval for an inside position and `None` for positions outside.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let scopes = vec![(5, 0, 10, 20)];
+    /// let tree = FunctionScopeTree::from_scopes(&scopes);
+    /// assert_eq!(tree.len(), 1);
+    /// let inside = tree.query_point(Position::new(7, 10));
+    /// assert_eq!(inside.len(), 1);
+    /// let none = tree.query_point(Position::new(3, 10));
+    /// assert!(none.is_empty());
+    /// let innermost = tree.query_innermost(Position::new(7, 10));
+    /// assert!(innermost.is_some());
+    /// ```
     #[test]
     fn test_single_interval_containment() {
         // Test basic containment check with one interval
@@ -4378,6 +4766,23 @@ mod tests {
         assert!(innermost_outside.is_none(), "query_innermost should return None for position outside");
     }
 
+    /// Verifies that function-scope intervals include their start and end positions.
+    ///
+    /// Constructs a tree with a single interval from (10,5) to (20,15) and asserts that
+    /// positions exactly at the start and end (and positions inside the interval) are
+    /// reported as contained, while positions just outside are not. Also checks that
+    /// `query_innermost` returns `Some` at the boundary positions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let scopes = vec![(10, 5, 20, 15)];
+    /// let tree = FunctionScopeTree::from_scopes(&scopes);
+    /// assert!(!tree.query_point(Position::new(10, 5)).is_empty());
+    /// assert!(!tree.query_point(Position::new(20, 15)).is_empty());
+    /// assert!(tree.query_point(Position::new(10, 4)).is_empty());
+    /// assert!(tree.query_point(Position::new(20, 16)).is_empty());
+    /// ```
     #[test]
     fn test_boundary_positions_inclusive() {
         // Test that positions exactly at start/end are included (inclusive boundaries)
@@ -4479,6 +4884,25 @@ mod tests {
         assert!(innermost_at_150.is_none(), "query_innermost should return None at line 150");
     }
 
+    /// Verifies interval-tree behavior with EOF sentinel and extreme Position values.
+    ///
+    /// This test asserts that Position::eof() and positions containing u32::MAX are
+    /// recognized as EOF sentinels, and that the interval tree performs pure
+    /// lexicographic comparisons when determining containment. It checks:
+    /// - EOF positions compare after all normal positions and do not match normal scopes.
+    /// - Positions with MAX column on an interior line compare inside the interval if the
+    ///   line is within the interval range.
+    /// - Positions with MAX column on the end line compare after the interval end.
+    /// - Position::is_eof() correctly identifies EOF sentinels.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let scopes = vec![(0,0,10,0), (20,0,30,0), (50,0,100,0)];
+    /// let tree = FunctionScopeTree::from_scopes(&scopes);
+    /// assert!(Position::eof().is_eof());
+    /// assert!(tree.query_point(Position::new(50, u32::MAX)).len() == 1);
+    /// ```
     #[test]
     fn test_eof_sentinel_positions() {
         // Test EOF positions (u32::MAX) behavior with interval tree
@@ -4546,6 +4970,36 @@ mod tests {
         assert!(Position::new(u32::MAX, u32::MAX).is_eof(), "Both MAX should be EOF");
     }
 
+    /// Verifies that a FunctionScopeTree correctly handles multiple disjoint (non-overlapping) intervals.
+    ///
+    /// Ensures that point queries return the single containing interval for positions inside each interval,
+    /// return no intervals for positions in the gaps (or before/after all intervals), and that `query_innermost`
+    /// returns the innermost interval when one exists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let scopes = vec![
+    ///     (0, 0, 10, 0),
+    ///     (20, 0, 30, 0),
+    ///     (50, 0, 60, 0),
+    ///     (100, 0, 110, 0),
+    /// ];
+    /// let tree = FunctionScopeTree::from_scopes(&scopes);
+    ///
+    /// // inside an interval
+    /// let in_first = tree.query_point(Position::new(5, 0));
+    /// assert_eq!(in_first.len(), 1);
+    /// assert_eq!(in_first[0].start.line, 0);
+    ///
+    /// // in a gap
+    /// let in_gap = tree.query_point(Position::new(15, 0));
+    /// assert!(in_gap.is_empty());
+    ///
+    /// // innermost query
+    /// let innermost = tree.query_innermost(Position::new(5, 0)).unwrap();
+    /// assert_eq!(innermost.start.line, 0);
+    /// ```
     #[test]
     fn test_non_overlapping_intervals() {
         // Test multiple disjoint intervals
