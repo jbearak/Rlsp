@@ -207,6 +207,19 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - When building a new struct from `&T`, avoid `..*ref`/`..ref` in struct update syntax; clone the base (`..ref.clone()`) or construct fields explicitly.
 - In tests that locate identifiers in generated code, avoid substring matches (e.g., `inner_func` inside `outer_func`). Prefer delimiter-aware search or node positions from the AST.
 - Don’t recurse on identifier nodes just to “keep traversal going” — they have no children and the extra recursion can be removed for clarity.
+- Avoid blocking filesystem I/O on LSP request threads; if a fallback check is needed, do it off-thread and revalidate via cache updates.
+- Guard against deadlocks by avoiding nested async lock acquisition (especially around background indexer/state access).
+- Use `saturating_add` (or equivalent) for sentinel end-of-line columns to prevent overflow.
+- Don’t “paper over” missing files: file-existence checks must preserve accurate diagnostics instead of always returning `true`.
+- Avoid `expect()` in long-lived server paths (e.g., parser init); propagate errors with `Option`/`Result` instead.
+- When adding new enum variants used in test match expressions, update all test helpers to keep matches exhaustive.
+- Avoid hard-coded line/column positions in property tests; compute stable positions from the generated code or parsed nodes.
+- When using `u32::MAX` as an EOF sentinel, ensure function-scope filtering treats it as “outside any function” to avoid leaking locals.
+- Convert UTF-16 columns to byte offsets before constructing tree-sitter `Point`s; avoid mixing column units.
+- When expanding point windows by a byte, advance to the next UTF-8 boundary to avoid mid-codepoint positions.
+- Watch for O(n²) scope detection or duplicate-detection paths in large files; prefer indexed lookups when possible.
+- Avoid duplicating local-scoping condition logic across functions; centralize to reduce drift.
+- Be careful with hover/definition range calculations at line boundaries to avoid off-by-one bugs or invalid points.
 
 ### Thread-Safety
 
