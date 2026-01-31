@@ -4559,3 +4559,2521 @@ proptest! {
             "Parameter without default should have Parameter kind");
     }
 }
+
+// ============================================================================
+// Feature: rm-remove-support, Property 1: Bare Symbol Extraction
+// Validates: Requirements 1.1, 1.2, 1.3
+// ============================================================================
+
+use super::source_detect::detect_rm_calls;
+
+/// Generate rm() calls with bare symbols
+fn rm_bare_symbols(symbols: &[String]) -> String {
+    format!("rm({})", symbols.join(", "))
+}
+
+/// Generate remove() calls with bare symbols
+fn remove_bare_symbols(symbols: &[String]) -> String {
+    format!("remove({})", symbols.join(", "))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: rm-remove-support, Property 1: Bare Symbol Extraction
+    /// **Validates: Requirements 1.1, 1.2, 1.3**
+    ///
+    /// For any rm() or remove() call containing bare symbol arguments, the resulting
+    /// Removal event SHALL contain exactly those symbol names, regardless of how many
+    /// symbols are specified or whether they are currently defined in scope.
+    #[test]
+    fn prop_rm_bare_symbol_extraction_single(symbol in r_identifier()) {
+        let code = rm_bare_symbols(&[symbol.clone()]);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+
+        // Should extract exactly the symbol we provided
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1, "Expected exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol, "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 1: Bare Symbol Extraction (multiple symbols)
+    /// **Validates: Requirements 1.1, 1.2, 1.3**
+    ///
+    /// For any rm() call with multiple bare symbol arguments, all symbols should be extracted.
+    #[test]
+    fn prop_rm_bare_symbol_extraction_multiple(
+        symbols in prop::collection::vec(r_identifier(), 2..=5)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            })
+    ) {
+        let code = rm_bare_symbols(&symbols);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+
+        // Should extract exactly the symbols we provided
+        prop_assert_eq!(rm_calls[0].symbols.len(), symbols.len(),
+            "Number of extracted symbols should match input");
+
+        // All symbols should be present in the same order
+        for (i, expected_symbol) in symbols.iter().enumerate() {
+            prop_assert_eq!(&rm_calls[0].symbols[i], expected_symbol,
+                "Symbol at position {} should match", i);
+        }
+    }
+
+    /// Feature: rm-remove-support, Property 1: Bare Symbol Extraction (remove() alias)
+    /// **Validates: Requirements 1.1, 1.2, 1.3**
+    ///
+    /// For any remove() call containing bare symbol arguments, the resulting
+    /// Removal event SHALL contain exactly those symbol names.
+    #[test]
+    fn prop_remove_bare_symbol_extraction_single(symbol in r_identifier()) {
+        let code = remove_bare_symbols(&[symbol.clone()]);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one remove() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one remove() call");
+
+        // Should extract exactly the symbol we provided
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1, "Expected exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol, "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 1: Bare Symbol Extraction (remove() with multiple)
+    /// **Validates: Requirements 1.1, 1.2, 1.3**
+    ///
+    /// For any remove() call with multiple bare symbol arguments, all symbols should be extracted.
+    #[test]
+    fn prop_remove_bare_symbol_extraction_multiple(
+        symbols in prop::collection::vec(r_identifier(), 2..=5)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            })
+    ) {
+        let code = remove_bare_symbols(&symbols);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one remove() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one remove() call");
+
+        // Should extract exactly the symbols we provided
+        prop_assert_eq!(rm_calls[0].symbols.len(), symbols.len(),
+            "Number of extracted symbols should match input");
+
+        // All symbols should be present in the same order
+        for (i, expected_symbol) in symbols.iter().enumerate() {
+            prop_assert_eq!(&rm_calls[0].symbols[i], expected_symbol,
+                "Symbol at position {} should match", i);
+        }
+    }
+
+    /// Feature: rm-remove-support, Property 1: Bare Symbol Extraction (undefined symbols)
+    /// **Validates: Requirements 1.1, 1.2, 1.3**
+    ///
+    /// Bare symbols in rm() should be extracted regardless of whether they are
+    /// currently defined in scope (no error should occur).
+    #[test]
+    fn prop_rm_bare_symbol_extraction_undefined(symbol in r_identifier()) {
+        // Symbol is not defined anywhere, just used in rm()
+        let code = rm_bare_symbols(&[symbol.clone()]);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should still detect the rm() call and extract the symbol
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1, "Expected exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol, "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 1: Bare Symbol Extraction (position tracking)
+    /// **Validates: Requirements 1.1, 1.2, 1.3**
+    ///
+    /// The rm() call should be detected at the correct line position.
+    #[test]
+    fn prop_rm_bare_symbol_extraction_position(
+        symbol in r_identifier(),
+        prefix_lines in 0..5usize
+    ) {
+        // Add some prefix lines before the rm() call
+        let prefix = "\n".repeat(prefix_lines);
+        let code = format!("{}rm({})", prefix, symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+
+        // Line should match the number of prefix newlines
+        prop_assert_eq!(rm_calls[0].line, prefix_lines as u32,
+            "rm() call should be on line {}", prefix_lines);
+
+        // Symbol should still be extracted correctly
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1, "Expected exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol, "Symbol should match input");
+    }
+}
+
+// ============================================================================
+// Feature: rm-remove-support, Property 2: remove() Equivalence
+// Validates: Requirements 2.1, 2.2, 2.3
+// ============================================================================
+
+/// Generate rm() call with list= argument containing a single string
+fn rm_list_single(symbol: &str) -> String {
+    format!(r#"rm(list = "{}")"#, symbol)
+}
+
+/// Generate remove() call with list= argument containing a single string
+fn remove_list_single(symbol: &str) -> String {
+    format!(r#"remove(list = "{}")"#, symbol)
+}
+
+/// Generate rm() call with list= argument containing c() with multiple strings
+fn rm_list_c(symbols: &[String]) -> String {
+    let quoted: Vec<_> = symbols.iter().map(|s| format!(r#""{}""#, s)).collect();
+    format!("rm(list = c({}))", quoted.join(", "))
+}
+
+/// Generate remove() call with list= argument containing c() with multiple strings
+fn remove_list_c(symbols: &[String]) -> String {
+    let quoted: Vec<_> = symbols.iter().map(|s| format!(r#""{}""#, s)).collect();
+    format!("remove(list = c({}))", quoted.join(", "))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: rm-remove-support, Property 2: remove() Equivalence
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    ///
+    /// For any R code using remove(), replacing remove with rm SHALL produce
+    /// an identical scope timeline (same Removal events with same symbols and positions).
+    /// Test case: Single bare symbol
+    #[test]
+    fn prop_remove_equivalence_bare_single(symbol in r_identifier()) {
+        let rm_code = rm_bare_symbols(&[symbol.clone()]);
+        let remove_code = remove_bare_symbols(&[symbol.clone()]);
+
+        let rm_tree = parse_r(&rm_code);
+        let remove_tree = parse_r(&remove_code);
+
+        let rm_calls = detect_rm_calls(&rm_tree, &rm_code);
+        let remove_calls = detect_rm_calls(&remove_tree, &remove_code);
+
+        // Both should detect exactly one call
+        prop_assert_eq!(rm_calls.len(), 1, "rm() should produce exactly one call");
+        prop_assert_eq!(remove_calls.len(), 1, "remove() should produce exactly one call");
+
+        // Both should extract the same symbols
+        prop_assert_eq!(&rm_calls[0].symbols, &remove_calls[0].symbols,
+            "rm() and remove() should extract identical symbols");
+
+        // Both should have the same line position (both start at line 0)
+        prop_assert_eq!(rm_calls[0].line, remove_calls[0].line,
+            "rm() and remove() should have the same line position");
+    }
+
+    /// Feature: rm-remove-support, Property 2: remove() Equivalence
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    ///
+    /// Test case: Multiple bare symbols
+    #[test]
+    fn prop_remove_equivalence_bare_multiple(
+        symbols in prop::collection::vec(r_identifier(), 2..=5)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            })
+    ) {
+        let rm_code = rm_bare_symbols(&symbols);
+        let remove_code = remove_bare_symbols(&symbols);
+
+        let rm_tree = parse_r(&rm_code);
+        let remove_tree = parse_r(&remove_code);
+
+        let rm_calls = detect_rm_calls(&rm_tree, &rm_code);
+        let remove_calls = detect_rm_calls(&remove_tree, &remove_code);
+
+        // Both should detect exactly one call
+        prop_assert_eq!(rm_calls.len(), 1, "rm() should produce exactly one call");
+        prop_assert_eq!(remove_calls.len(), 1, "remove() should produce exactly one call");
+
+        // Both should extract the same symbols in the same order
+        prop_assert_eq!(&rm_calls[0].symbols, &remove_calls[0].symbols,
+            "rm() and remove() should extract identical symbols");
+
+        // Both should have the same line position
+        prop_assert_eq!(rm_calls[0].line, remove_calls[0].line,
+            "rm() and remove() should have the same line position");
+    }
+
+    /// Feature: rm-remove-support, Property 2: remove() Equivalence
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    ///
+    /// Test case: list= argument with single string literal
+    #[test]
+    fn prop_remove_equivalence_list_single(symbol in r_identifier()) {
+        let rm_code = rm_list_single(&symbol);
+        let remove_code = remove_list_single(&symbol);
+
+        let rm_tree = parse_r(&rm_code);
+        let remove_tree = parse_r(&remove_code);
+
+        let rm_calls = detect_rm_calls(&rm_tree, &rm_code);
+        let remove_calls = detect_rm_calls(&remove_tree, &remove_code);
+
+        // Both should detect exactly one call
+        prop_assert_eq!(rm_calls.len(), 1, "rm(list=...) should produce exactly one call");
+        prop_assert_eq!(remove_calls.len(), 1, "remove(list=...) should produce exactly one call");
+
+        // Both should extract the same symbols
+        prop_assert_eq!(&rm_calls[0].symbols, &remove_calls[0].symbols,
+            "rm(list=...) and remove(list=...) should extract identical symbols");
+
+        // Both should have the same line position
+        prop_assert_eq!(rm_calls[0].line, remove_calls[0].line,
+            "rm(list=...) and remove(list=...) should have the same line position");
+    }
+
+    /// Feature: rm-remove-support, Property 2: remove() Equivalence
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    ///
+    /// Test case: list= argument with c() containing multiple strings
+    #[test]
+    fn prop_remove_equivalence_list_c(
+        symbols in prop::collection::vec(r_identifier(), 2..=5)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            })
+    ) {
+        let rm_code = rm_list_c(&symbols);
+        let remove_code = remove_list_c(&symbols);
+
+        let rm_tree = parse_r(&rm_code);
+        let remove_tree = parse_r(&remove_code);
+
+        let rm_calls = detect_rm_calls(&rm_tree, &rm_code);
+        let remove_calls = detect_rm_calls(&remove_tree, &remove_code);
+
+        // Both should detect exactly one call
+        prop_assert_eq!(rm_calls.len(), 1, "rm(list=c(...)) should produce exactly one call");
+        prop_assert_eq!(remove_calls.len(), 1, "remove(list=c(...)) should produce exactly one call");
+
+        // Both should extract the same symbols in the same order
+        prop_assert_eq!(&rm_calls[0].symbols, &remove_calls[0].symbols,
+            "rm(list=c(...)) and remove(list=c(...)) should extract identical symbols");
+
+        // Both should have the same line position
+        prop_assert_eq!(rm_calls[0].line, remove_calls[0].line,
+            "rm(list=c(...)) and remove(list=c(...)) should have the same line position");
+    }
+
+    /// Feature: rm-remove-support, Property 2: remove() Equivalence
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    ///
+    /// Test case: Mixed bare symbols and list= argument
+    #[test]
+    fn prop_remove_equivalence_mixed(
+        bare_symbols in prop::collection::vec(r_identifier(), 1..=3)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            }),
+        list_symbols in prop::collection::vec(r_identifier(), 1..=3)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            })
+    ) {
+        // Ensure bare_symbols and list_symbols don't overlap
+        let has_overlap = bare_symbols.iter().any(|s| list_symbols.contains(s));
+        prop_assume!(!has_overlap);
+
+        // Generate rm() and remove() calls with both bare symbols and list= argument
+        let bare_part = bare_symbols.join(", ");
+        let list_quoted: Vec<_> = list_symbols.iter().map(|s| format!(r#""{}""#, s)).collect();
+        let list_part = if list_symbols.len() == 1 {
+            format!(r#"list = "{}""#, list_symbols[0])
+        } else {
+            format!("list = c({})", list_quoted.join(", "))
+        };
+
+        let rm_code = format!("rm({}, {})", bare_part, list_part);
+        let remove_code = format!("remove({}, {})", bare_part, list_part);
+
+        let rm_tree = parse_r(&rm_code);
+        let remove_tree = parse_r(&remove_code);
+
+        let rm_calls = detect_rm_calls(&rm_tree, &rm_code);
+        let remove_calls = detect_rm_calls(&remove_tree, &remove_code);
+
+        // Both should detect exactly one call
+        prop_assert_eq!(rm_calls.len(), 1, "rm() with mixed args should produce exactly one call");
+        prop_assert_eq!(remove_calls.len(), 1, "remove() with mixed args should produce exactly one call");
+
+        // Both should extract the same symbols (bare symbols first, then list symbols)
+        prop_assert_eq!(&rm_calls[0].symbols, &remove_calls[0].symbols,
+            "rm() and remove() with mixed args should extract identical symbols");
+
+        // Both should have the same line position
+        prop_assert_eq!(rm_calls[0].line, remove_calls[0].line,
+            "rm() and remove() with mixed args should have the same line position");
+    }
+
+    /// Feature: rm-remove-support, Property 2: remove() Equivalence
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    ///
+    /// Test case: Verify column positions are relative to the call (both start at column 0)
+    #[test]
+    fn prop_remove_equivalence_column_position(symbol in r_identifier()) {
+        let rm_code = rm_bare_symbols(&[symbol.clone()]);
+        let remove_code = remove_bare_symbols(&[symbol.clone()]);
+
+        let rm_tree = parse_r(&rm_code);
+        let remove_tree = parse_r(&remove_code);
+
+        let rm_calls = detect_rm_calls(&rm_tree, &rm_code);
+        let remove_calls = detect_rm_calls(&remove_tree, &remove_code);
+
+        // Both should detect exactly one call
+        prop_assert_eq!(rm_calls.len(), 1, "rm() should produce exactly one call");
+        prop_assert_eq!(remove_calls.len(), 1, "remove() should produce exactly one call");
+
+        // Both should start at column 0 (beginning of line)
+        prop_assert_eq!(rm_calls[0].column, 0, "rm() should start at column 0");
+        prop_assert_eq!(remove_calls[0].column, 0, "remove() should start at column 0");
+    }
+}
+
+// ============================================================================
+// Feature: rm-remove-support, Property 3: list= String Literal Extraction
+// Validates: Requirements 3.1, 3.2
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: rm-remove-support, Property 3: list= String Literal Extraction
+    /// **Validates: Requirements 3.1, 3.2**
+    ///
+    /// For any rm() call with a list= argument containing string literals (either a
+    /// single string or a c() call with strings), the Removal event SHALL contain
+    /// exactly those string values as symbol names.
+    ///
+    /// Test case: Single string literal with double quotes
+    #[test]
+    fn prop_rm_list_single_string_extraction(symbol in r_identifier()) {
+        let code = format!(r#"rm(list = "{}")"#, symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+
+        // Should extract exactly the symbol from the string literal
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1, "Expected exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match the string literal content");
+    }
+
+    /// Feature: rm-remove-support, Property 3: list= String Literal Extraction
+    /// **Validates: Requirements 3.1, 3.2**
+    ///
+    /// Test case: Single string literal with single quotes
+    #[test]
+    fn prop_rm_list_single_string_single_quotes(symbol in r_identifier()) {
+        let code = format!("rm(list = '{}')", symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+
+        // Should extract exactly the symbol from the string literal
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1, "Expected exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match the string literal content (single quotes)");
+    }
+
+    /// Feature: rm-remove-support, Property 3: list= String Literal Extraction
+    /// **Validates: Requirements 3.1, 3.2**
+    ///
+    /// Test case: Multiple strings in c() call
+    #[test]
+    fn prop_rm_list_c_multiple_strings(
+        symbols in prop::collection::vec(r_identifier(), 2..=5)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            })
+    ) {
+        let quoted: Vec<_> = symbols.iter().map(|s| format!(r#""{}""#, s)).collect();
+        let code = format!("rm(list = c({}))", quoted.join(", "));
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+
+        // Should extract exactly the symbols from the c() call
+        prop_assert_eq!(rm_calls[0].symbols.len(), symbols.len(),
+            "Number of extracted symbols should match input");
+
+        // All symbols should be present in the same order
+        for (i, expected_symbol) in symbols.iter().enumerate() {
+            prop_assert_eq!(&rm_calls[0].symbols[i], expected_symbol,
+                "Symbol at position {} should match", i);
+        }
+    }
+
+    /// Feature: rm-remove-support, Property 3: list= String Literal Extraction
+    /// **Validates: Requirements 3.1, 3.2**
+    ///
+    /// Test case: Single string in c() call (edge case)
+    #[test]
+    fn prop_rm_list_c_single_string(symbol in r_identifier()) {
+        let code = format!(r#"rm(list = c("{}"))"#, symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+
+        // Should extract exactly the symbol from the c() call
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1, "Expected exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match the string literal content in c()");
+    }
+
+    /// Feature: rm-remove-support, Property 3: list= String Literal Extraction
+    /// **Validates: Requirements 3.1, 3.2**
+    ///
+    /// Test case: c() with mixed quote styles (double and single quotes)
+    #[test]
+    fn prop_rm_list_c_mixed_quotes(
+        symbols in prop::collection::vec(r_identifier(), 2..=4)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            })
+    ) {
+        // Alternate between double and single quotes
+        let quoted: Vec<_> = symbols.iter().enumerate()
+            .map(|(i, s)| {
+                if i % 2 == 0 {
+                    format!(r#""{}""#, s)
+                } else {
+                    format!("'{}'", s)
+                }
+            })
+            .collect();
+        let code = format!("rm(list = c({}))", quoted.join(", "));
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+
+        // Should extract exactly the symbols regardless of quote style
+        prop_assert_eq!(rm_calls[0].symbols.len(), symbols.len(),
+            "Number of extracted symbols should match input");
+
+        // All symbols should be present in the same order
+        for (i, expected_symbol) in symbols.iter().enumerate() {
+            prop_assert_eq!(&rm_calls[0].symbols[i], expected_symbol,
+                "Symbol at position {} should match (mixed quotes)", i);
+        }
+    }
+
+    /// Feature: rm-remove-support, Property 3: list= String Literal Extraction
+    /// **Validates: Requirements 3.1, 3.2**
+    ///
+    /// Test case: remove() with list= argument (should work identically to rm())
+    #[test]
+    fn prop_remove_list_single_string_extraction(symbol in r_identifier()) {
+        let code = format!(r#"remove(list = "{}")"#, symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one remove() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one remove() call");
+
+        // Should extract exactly the symbol from the string literal
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1, "Expected exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match the string literal content");
+    }
+
+    /// Feature: rm-remove-support, Property 3: list= String Literal Extraction
+    /// **Validates: Requirements 3.1, 3.2**
+    ///
+    /// Test case: remove() with list= c() argument
+    #[test]
+    fn prop_remove_list_c_multiple_strings(
+        symbols in prop::collection::vec(r_identifier(), 2..=5)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            })
+    ) {
+        let quoted: Vec<_> = symbols.iter().map(|s| format!(r#""{}""#, s)).collect();
+        let code = format!("remove(list = c({}))", quoted.join(", "));
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one remove() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one remove() call");
+
+        // Should extract exactly the symbols from the c() call
+        prop_assert_eq!(rm_calls[0].symbols.len(), symbols.len(),
+            "Number of extracted symbols should match input");
+
+        // All symbols should be present in the same order
+        for (i, expected_symbol) in symbols.iter().enumerate() {
+            prop_assert_eq!(&rm_calls[0].symbols[i], expected_symbol,
+                "Symbol at position {} should match", i);
+        }
+    }
+
+    /// Feature: rm-remove-support, Property 3: list= String Literal Extraction
+    /// **Validates: Requirements 3.1, 3.2**
+    ///
+    /// Test case: Position tracking for list= argument
+    #[test]
+    fn prop_rm_list_string_position(
+        symbol in r_identifier(),
+        prefix_lines in 0..5usize
+    ) {
+        // Add some prefix lines before the rm() call
+        let prefix = "\n".repeat(prefix_lines);
+        let code = format!(r#"{}rm(list = "{}")"#, prefix, symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1, "Expected exactly one rm() call");
+
+        // Line should match the number of prefix newlines
+        prop_assert_eq!(rm_calls[0].line, prefix_lines as u32,
+            "rm() call should be on line {}", prefix_lines);
+
+        // Symbol should still be extracted correctly
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1, "Expected exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol, "Symbol should match input");
+    }
+}
+
+// ============================================================================
+// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+// Validates: Requirements 3.3, 3.4
+// ============================================================================
+
+/// Generate a valid R function name for dynamic expressions
+fn r_function_name() -> impl Strategy<Value = String> {
+    prop::sample::select(vec![
+        "ls".to_string(),
+        "objects".to_string(),
+        "get".to_string(),
+        "paste0".to_string(),
+        "paste".to_string(),
+        "sprintf".to_string(),
+        "grep".to_string(),
+        "setdiff".to_string(),
+        "intersect".to_string(),
+        "union".to_string(),
+    ])
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// For any rm() call with a list= argument containing a non-literal expression
+    /// (variable reference, function call other than c() with literals, etc.),
+    /// no Removal event SHALL be created for that call.
+    ///
+    /// Test case: Variable reference in list= argument
+    #[test]
+    fn prop_rm_dynamic_variable_reference_filtered(varname in r_identifier()) {
+        let code = format!("rm(list = {})", varname);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call (no symbols extracted)
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list = {}) should not produce any RmCall since variable is dynamic", varname);
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: ls() function call in list= argument
+    #[test]
+    fn prop_rm_dynamic_ls_call_filtered(_dummy in Just(())) {
+        // Simple ls() call
+        let code = "rm(list = ls())";
+        let tree = parse_r(code);
+        let rm_calls = detect_rm_calls(&tree, code);
+
+        // Should NOT detect any rm() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list = ls()) should not produce any RmCall since ls() is dynamic");
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: ls() with pattern argument in list= argument
+    #[test]
+    fn prop_rm_dynamic_ls_pattern_filtered(pattern in "[a-z]{1,5}") {
+        let code = format!(r#"rm(list = ls(pattern = "^{}"))"#, pattern);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list = ls(pattern = ...)) should not produce any RmCall since ls() is dynamic");
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: Various function calls in list= argument
+    #[test]
+    fn prop_rm_dynamic_function_call_filtered(func_name in r_function_name()) {
+        let code = format!("rm(list = {}())", func_name);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list = {}()) should not produce any RmCall since function call is dynamic", func_name);
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: paste0() with variable in list= argument
+    #[test]
+    fn prop_rm_dynamic_paste0_filtered(
+        prefix in "[a-z]{1,5}",
+        varname in r_identifier()
+    ) {
+        let code = format!(r#"rm(list = paste0("{}", {}))"#, prefix, varname);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list = paste0(...)) should not produce any RmCall since paste0() is dynamic");
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: Expression with operators in list= argument
+    #[test]
+    fn prop_rm_dynamic_expression_filtered(
+        var1 in r_identifier(),
+        var2 in r_identifier()
+    ) {
+        // Ensure different variable names
+        prop_assume!(var1 != var2);
+
+        // Test with setdiff() expression
+        let code = format!("rm(list = setdiff({}, {}))", var1, var2);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list = setdiff(...)) should not produce any RmCall since expression is dynamic");
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: c() with variable (not all literals) in list= argument
+    #[test]
+    fn prop_rm_dynamic_c_with_variable_partial_extraction(
+        literal_symbol in r_identifier(),
+        varname in r_identifier()
+    ) {
+        // Ensure different names
+        prop_assume!(literal_symbol != varname);
+
+        // c() with mixed literals and variables - only literals should be extracted
+        let code = format!(r#"rm(list = c("{}", {}))"#, literal_symbol, varname);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should extract only the string literal, not the variable
+        // If no string literals are extracted, no RmCall is created
+        // If at least one string literal is extracted, RmCall is created with only those
+        if rm_calls.len() == 1 {
+            // Only the string literal should be extracted
+            prop_assert_eq!(rm_calls[0].symbols.len(), 1,
+                "Only string literals should be extracted from c() with mixed args");
+            prop_assert_eq!(&rm_calls[0].symbols[0], &literal_symbol,
+                "The extracted symbol should be the string literal");
+        }
+        // If no RmCall is created, that's also acceptable behavior
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: remove() with dynamic expression (should behave same as rm())
+    #[test]
+    fn prop_remove_dynamic_variable_reference_filtered(varname in r_identifier()) {
+        let code = format!("remove(list = {})", varname);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any remove() call (no symbols extracted)
+        prop_assert_eq!(rm_calls.len(), 0,
+            "remove(list = {}) should not produce any RmCall since variable is dynamic", varname);
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: remove() with ls() call (should behave same as rm())
+    #[test]
+    fn prop_remove_dynamic_ls_call_filtered(_dummy in Just(())) {
+        let code = "remove(list = ls())";
+        let tree = parse_r(code);
+        let rm_calls = detect_rm_calls(&tree, code);
+
+        // Should NOT detect any remove() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "remove(list = ls()) should not produce any RmCall since ls() is dynamic");
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: Numeric literal in list= argument (not a valid symbol name)
+    #[test]
+    fn prop_rm_dynamic_numeric_literal_filtered(num in 0..1000i32) {
+        let code = format!("rm(list = {})", num);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call (numeric is not a valid symbol)
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list = {}) should not produce any RmCall since numeric is not a symbol", num);
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: Binary expression in list= argument
+    #[test]
+    fn prop_rm_dynamic_binary_expression_filtered(
+        var1 in r_identifier(),
+        var2 in r_identifier()
+    ) {
+        // Ensure different variable names
+        prop_assume!(var1 != var2);
+
+        // Test with concatenation expression using c() with variables
+        let code = format!("rm(list = c({}, {}))", var1, var2);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call since c() contains only variables, not string literals
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list = c(var1, var2)) should not produce any RmCall since c() contains only variables");
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: Subscript expression in list= argument
+    #[test]
+    fn prop_rm_dynamic_subscript_filtered(
+        varname in r_identifier(),
+        index in 1..10i32
+    ) {
+        let code = format!("rm(list = {}[{}])", varname, index);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list = var[index]) should not produce any RmCall since subscript is dynamic");
+    }
+
+    /// Feature: rm-remove-support, Property 4: Dynamic Expression Filtering
+    /// **Validates: Requirements 3.3, 3.4**
+    ///
+    /// Test case: Bare symbols should still work even when list= has dynamic expression
+    #[test]
+    fn prop_rm_bare_symbols_with_dynamic_list(
+        bare_symbol in r_identifier(),
+        dynamic_var in r_identifier()
+    ) {
+        // Ensure different names
+        prop_assume!(bare_symbol != dynamic_var);
+
+        // rm() with both bare symbol and dynamic list= argument
+        let code = format!("rm({}, list = {})", bare_symbol, dynamic_var);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect the rm() call with only the bare symbol
+        prop_assert_eq!(rm_calls.len(), 1,
+            "rm() with bare symbol and dynamic list= should produce one RmCall");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1,
+            "Only the bare symbol should be extracted");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &bare_symbol,
+            "The extracted symbol should be the bare symbol");
+    }
+}
+
+
+// ============================================================================
+// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+// Validates: Requirements 4.1, 4.2, 4.3
+// ============================================================================
+
+/// Generate a non-global environment expression for envir= argument
+fn non_global_envir_expression() -> impl Strategy<Value = String> {
+    prop::sample::select(vec![
+        "my_env".to_string(),
+        "new.env()".to_string(),
+        "parent.frame()".to_string(),
+        "baseenv()".to_string(),
+        "emptyenv()".to_string(),
+        "as.environment(2)".to_string(),
+        "e".to_string(),
+        "env".to_string(),
+        "local_env".to_string(),
+        "custom_env".to_string(),
+    ])
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// For any rm() call with an envir= argument, a Removal event SHALL be created
+    /// if and only if the envir value is globalenv() or .GlobalEnv (or omitted entirely).
+    ///
+    /// Test case: rm() without envir= creates Removal events
+    #[test]
+    fn prop_rm_without_envir_creates_removal(symbol in r_identifier()) {
+        let code = format!("rm({})", symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call (envir= omitted means default global env)
+        prop_assert_eq!(rm_calls.len(), 1,
+            "rm() without envir= should create a Removal event");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1,
+            "Should extract exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: rm() with envir = globalenv() creates Removal events
+    #[test]
+    fn prop_rm_with_envir_globalenv_creates_removal(symbol in r_identifier()) {
+        let code = format!("rm({}, envir = globalenv())", symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call (globalenv() is equivalent to default)
+        prop_assert_eq!(rm_calls.len(), 1,
+            "rm() with envir = globalenv() should create a Removal event");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1,
+            "Should extract exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: rm() with envir = .GlobalEnv creates Removal events
+    #[test]
+    fn prop_rm_with_envir_dot_globalenv_creates_removal(symbol in r_identifier()) {
+        let code = format!("rm({}, envir = .GlobalEnv)", symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call (.GlobalEnv is equivalent to default)
+        prop_assert_eq!(rm_calls.len(), 1,
+            "rm() with envir = .GlobalEnv should create a Removal event");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1,
+            "Should extract exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: rm() with non-default envir= does NOT create Removal events
+    #[test]
+    fn prop_rm_with_non_default_envir_no_removal(
+        symbol in r_identifier(),
+        envir_expr in non_global_envir_expression()
+    ) {
+        let code = format!("rm({}, envir = {})", symbol, envir_expr);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call (non-default envir= means skip)
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm() with envir = {} should NOT create a Removal event", envir_expr);
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: remove() without envir= creates Removal events (same as rm())
+    #[test]
+    fn prop_remove_without_envir_creates_removal(symbol in r_identifier()) {
+        let code = format!("remove({})", symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one remove() call
+        prop_assert_eq!(rm_calls.len(), 1,
+            "remove() without envir= should create a Removal event");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1,
+            "Should extract exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: remove() with envir = globalenv() creates Removal events
+    #[test]
+    fn prop_remove_with_envir_globalenv_creates_removal(symbol in r_identifier()) {
+        let code = format!("remove({}, envir = globalenv())", symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one remove() call
+        prop_assert_eq!(rm_calls.len(), 1,
+            "remove() with envir = globalenv() should create a Removal event");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1,
+            "Should extract exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: remove() with envir = .GlobalEnv creates Removal events
+    #[test]
+    fn prop_remove_with_envir_dot_globalenv_creates_removal(symbol in r_identifier()) {
+        let code = format!("remove({}, envir = .GlobalEnv)", symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one remove() call
+        prop_assert_eq!(rm_calls.len(), 1,
+            "remove() with envir = .GlobalEnv should create a Removal event");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1,
+            "Should extract exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: remove() with non-default envir= does NOT create Removal events
+    #[test]
+    fn prop_remove_with_non_default_envir_no_removal(
+        symbol in r_identifier(),
+        envir_expr in non_global_envir_expression()
+    ) {
+        let code = format!("remove({}, envir = {})", symbol, envir_expr);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any remove() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "remove() with envir = {} should NOT create a Removal event", envir_expr);
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: Multiple symbols with envir = globalenv() creates Removal events
+    #[test]
+    fn prop_rm_multiple_symbols_with_envir_globalenv(
+        symbols in prop::collection::vec(r_identifier(), 2..=5)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            })
+    ) {
+        let code = format!("rm({}, envir = globalenv())", symbols.join(", "));
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call with all symbols
+        prop_assert_eq!(rm_calls.len(), 1,
+            "rm() with multiple symbols and envir = globalenv() should create a Removal event");
+        prop_assert_eq!(rm_calls[0].symbols.len(), symbols.len(),
+            "Should extract all symbols");
+
+        for (i, expected_symbol) in symbols.iter().enumerate() {
+            prop_assert_eq!(&rm_calls[0].symbols[i], expected_symbol,
+                "Symbol at position {} should match", i);
+        }
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: Multiple symbols with non-default envir= does NOT create Removal events
+    #[test]
+    fn prop_rm_multiple_symbols_with_non_default_envir_no_removal(
+        symbols in prop::collection::vec(r_identifier(), 2..=5)
+            .prop_filter("unique symbols", |v| {
+                let mut sorted = v.clone();
+                sorted.sort();
+                sorted.dedup();
+                sorted.len() == v.len()
+            }),
+        envir_expr in non_global_envir_expression()
+    ) {
+        let code = format!("rm({}, envir = {})", symbols.join(", "), envir_expr);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm() with multiple symbols and envir = {} should NOT create a Removal event", envir_expr);
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: list= argument with envir = globalenv() creates Removal events
+    #[test]
+    fn prop_rm_list_with_envir_globalenv_creates_removal(symbol in r_identifier()) {
+        let code = format!(r#"rm(list = "{}", envir = globalenv())"#, symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call
+        prop_assert_eq!(rm_calls.len(), 1,
+            "rm(list=...) with envir = globalenv() should create a Removal event");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 1,
+            "Should extract exactly one symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &symbol,
+            "Symbol should match input");
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: list= argument with non-default envir= does NOT create Removal events
+    #[test]
+    fn prop_rm_list_with_non_default_envir_no_removal(
+        symbol in r_identifier(),
+        envir_expr in non_global_envir_expression()
+    ) {
+        let code = format!(r#"rm(list = "{}", envir = {})"#, symbol, envir_expr);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm(list=...) with envir = {} should NOT create a Removal event", envir_expr);
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: Mixed bare symbols and list= with envir = .GlobalEnv creates Removal events
+    #[test]
+    fn prop_rm_mixed_with_envir_dot_globalenv_creates_removal(
+        bare_symbol in r_identifier(),
+        list_symbol in r_identifier()
+    ) {
+        // Ensure different symbols
+        prop_assume!(bare_symbol != list_symbol);
+
+        let code = format!(r#"rm({}, list = "{}", envir = .GlobalEnv)"#, bare_symbol, list_symbol);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should detect exactly one rm() call with both symbols
+        prop_assert_eq!(rm_calls.len(), 1,
+            "rm() with mixed args and envir = .GlobalEnv should create a Removal event");
+        prop_assert_eq!(rm_calls[0].symbols.len(), 2,
+            "Should extract both symbols");
+        prop_assert_eq!(&rm_calls[0].symbols[0], &bare_symbol,
+            "First symbol should be the bare symbol");
+        prop_assert_eq!(&rm_calls[0].symbols[1], &list_symbol,
+            "Second symbol should be from list=");
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: Mixed bare symbols and list= with non-default envir= does NOT create Removal events
+    #[test]
+    fn prop_rm_mixed_with_non_default_envir_no_removal(
+        bare_symbol in r_identifier(),
+        list_symbol in r_identifier(),
+        envir_expr in non_global_envir_expression()
+    ) {
+        // Ensure different symbols
+        prop_assume!(bare_symbol != list_symbol);
+
+        let code = format!(r#"rm({}, list = "{}", envir = {})"#, bare_symbol, list_symbol, envir_expr);
+        let tree = parse_r(&code);
+        let rm_calls = detect_rm_calls(&tree, &code);
+
+        // Should NOT detect any rm() call
+        prop_assert_eq!(rm_calls.len(), 0,
+            "rm() with mixed args and envir = {} should NOT create a Removal event", envir_expr);
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: Equivalence between globalenv() and .GlobalEnv
+    #[test]
+    fn prop_rm_envir_globalenv_equivalence(symbol in r_identifier()) {
+        let code_globalenv = format!("rm({}, envir = globalenv())", symbol);
+        let code_dot_globalenv = format!("rm({}, envir = .GlobalEnv)", symbol);
+
+        let tree_globalenv = parse_r(&code_globalenv);
+        let tree_dot_globalenv = parse_r(&code_dot_globalenv);
+
+        let rm_calls_globalenv = detect_rm_calls(&tree_globalenv, &code_globalenv);
+        let rm_calls_dot_globalenv = detect_rm_calls(&tree_dot_globalenv, &code_dot_globalenv);
+
+        // Both should produce exactly one rm() call
+        prop_assert_eq!(rm_calls_globalenv.len(), 1,
+            "rm() with envir = globalenv() should create a Removal event");
+        prop_assert_eq!(rm_calls_dot_globalenv.len(), 1,
+            "rm() with envir = .GlobalEnv should create a Removal event");
+
+        // Both should extract the same symbols
+        prop_assert_eq!(&rm_calls_globalenv[0].symbols, &rm_calls_dot_globalenv[0].symbols,
+            "globalenv() and .GlobalEnv should produce identical symbol extraction");
+    }
+
+    /// Feature: rm-remove-support, Property 5: envir= Argument Filtering
+    /// **Validates: Requirements 4.1, 4.2, 4.3**
+    ///
+    /// Test case: Equivalence between omitted envir= and explicit globalenv()
+    #[test]
+    fn prop_rm_envir_omitted_vs_explicit_globalenv(symbol in r_identifier()) {
+        let code_omitted = format!("rm({})", symbol);
+        let code_explicit = format!("rm({}, envir = globalenv())", symbol);
+
+        let tree_omitted = parse_r(&code_omitted);
+        let tree_explicit = parse_r(&code_explicit);
+
+        let rm_calls_omitted = detect_rm_calls(&tree_omitted, &code_omitted);
+        let rm_calls_explicit = detect_rm_calls(&tree_explicit, &code_explicit);
+
+        // Both should produce exactly one rm() call
+        prop_assert_eq!(rm_calls_omitted.len(), 1,
+            "rm() without envir= should create a Removal event");
+        prop_assert_eq!(rm_calls_explicit.len(), 1,
+            "rm() with envir = globalenv() should create a Removal event");
+
+        // Both should extract the same symbols
+        prop_assert_eq!(&rm_calls_omitted[0].symbols, &rm_calls_explicit[0].symbols,
+            "Omitted envir= and explicit globalenv() should produce identical symbol extraction");
+    }
+}
+
+
+// ============================================================================
+// Feature: rm-remove-support, Property 6: Function Scope Isolation
+// Validates: Requirements 5.1, 5.2, 5.3
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: rm-remove-support, Property 6: Function Scope Isolation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// For any rm() call inside a function body, the removal SHALL only affect scope
+    /// queries within that function body. Scope queries outside the function (before
+    /// or after) SHALL NOT be affected by the removal.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// x <- 1  # Global definition
+    /// my_func <- function() {
+    ///   y <- 2
+    ///   rm(y)  # Function-local removal
+    /// }
+    /// # After function: x should be in scope, y should NOT be in global scope
+    /// ```
+    #[test]
+    fn prop_rm_function_scope_isolation_global_unaffected(
+        global_var in r_identifier(),
+        func_name in r_identifier(),
+        local_var in r_identifier()
+    ) {
+        // Ensure all names are distinct
+        prop_assume!(global_var != func_name && global_var != local_var && func_name != local_var);
+
+        let uri = make_url("test");
+
+        // Code: global definition, function with local definition and rm() inside
+        let code = format!(
+            "{} <- 1\n{} <- function() {{\n  {} <- 2\n  rm({})\n}}",
+            global_var, func_name, local_var, local_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // At end of file (outside function), global variable should still be in scope
+        // The rm() inside the function should NOT affect global scope
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+            "Global variable should be available outside function (rm inside function should not affect it)");
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+            "Function-local variable should NOT be available outside function (never exported)");
+    }
+
+    /// Feature: rm-remove-support, Property 6: Function Scope Isolation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Test that rm() inside a function DOES affect scope within that function body.
+    /// After rm(y), y should not be in scope within the function.
+    #[test]
+    fn prop_rm_function_scope_isolation_affects_function_body(
+        func_name in r_identifier(),
+        local_var in r_identifier()
+    ) {
+        // Ensure names are distinct
+        prop_assume!(func_name != local_var);
+
+        let uri = make_url("test");
+
+        // Code: function with local definition, then rm() of that variable
+        // We need to query scope AFTER the rm() call within the function body
+        let code = format!(
+            "{} <- function() {{\n  {} <- 2\n  rm({})\n  # position after rm\n}}",
+            func_name, local_var, local_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Find position after rm() but still inside function body
+        // The rm() is on line 2 (0-indexed), so line 3 is after rm()
+        // We need to find a position inside the function body after the rm() call
+        let rm_line = code.lines().enumerate()
+            .find(|(_, line)| line.contains("rm("))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(2);
+
+        // Query scope at position after rm() but inside function
+        // Use the line after rm() which should be the comment line
+        let scope_after_rm = scope_at_position(&artifacts, rm_line + 1, 5);
+
+        prop_assert!(scope_after_rm.symbols.contains_key(&func_name),
+            "Function name should be available inside function");
+        prop_assert!(!scope_after_rm.symbols.contains_key(&local_var),
+            "Local variable should NOT be in scope after rm() within function body");
+    }
+
+    /// Feature: rm-remove-support, Property 6: Function Scope Isolation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Test that rm() at global level DOES affect global scope.
+    /// This contrasts with rm() inside a function which only affects function scope.
+    #[test]
+    fn prop_rm_global_level_affects_global_scope(
+        var_name in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: global definition, then rm() at global level
+        let code = format!(
+            "{} <- 1\nrm({})\n# position after rm",
+            var_name, var_name
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at position after rm() at global level
+        let scope_after_rm = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(!scope_after_rm.symbols.contains_key(&var_name),
+            "Variable should NOT be in scope after rm() at global level");
+    }
+
+    /// Feature: rm-remove-support, Property 6: Function Scope Isolation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Test that rm() of a global variable inside a function does NOT affect global scope.
+    /// Even if the variable name matches a global variable, the rm() inside a function
+    /// should only affect the function's local scope.
+    #[test]
+    fn prop_rm_global_var_name_inside_function_no_global_effect(
+        var_name in r_identifier(),
+        func_name in r_identifier()
+    ) {
+        // Ensure names are distinct
+        prop_assume!(var_name != func_name);
+
+        let uri = make_url("test");
+
+        // Code: global definition, function that tries to rm() the same-named variable
+        let code = format!(
+            "{} <- 1\n{} <- function() {{\n  rm({})\n}}\n# after function",
+            var_name, func_name, var_name
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at position after function definition (global scope)
+        let scope_after_func = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(scope_after_func.symbols.contains_key(&var_name),
+            "Global variable should still be in scope after function with rm() inside");
+        prop_assert!(scope_after_func.symbols.contains_key(&func_name),
+            "Function name should be available");
+    }
+
+    /// Feature: rm-remove-support, Property 6: Function Scope Isolation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Test that rm() inside nested functions only affects the innermost function scope.
+    #[test]
+    fn prop_rm_nested_function_scope_isolation(
+        outer_func in r_identifier(),
+        inner_func in r_identifier(),
+        outer_var in r_identifier(),
+        inner_var in r_identifier()
+    ) {
+        // Ensure all names are distinct
+        prop_assume!(outer_func != inner_func && outer_func != outer_var && outer_func != inner_var);
+        prop_assume!(inner_func != outer_var && inner_func != inner_var);
+        prop_assume!(outer_var != inner_var);
+
+        let uri = make_url("test");
+
+        // Code: nested functions where inner function has rm()
+        let code = format!(
+            "{} <- function() {{\n  {} <- 1\n  {} <- function() {{\n    {} <- 2\n    rm({})\n  }}\n  # after inner func\n}}",
+            outer_func, outer_var, inner_func, inner_var, inner_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at position after inner function definition but inside outer function
+        // This should be on the line with "# after inner func"
+        let comment_line = code.lines().enumerate()
+            .find(|(_, line)| line.contains("# after inner func"))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(6);
+
+        let scope_outer_after_inner = scope_at_position(&artifacts, comment_line, 5);
+
+        prop_assert!(scope_outer_after_inner.symbols.contains_key(&outer_func),
+            "Outer function should be available inside itself");
+        prop_assert!(scope_outer_after_inner.symbols.contains_key(&outer_var),
+            "Outer variable should still be in scope (rm in inner function should not affect it)");
+        prop_assert!(scope_outer_after_inner.symbols.contains_key(&inner_func),
+            "Inner function should be available inside outer function");
+        // inner_var is local to inner function, so it should NOT be available in outer function
+        prop_assert!(!scope_outer_after_inner.symbols.contains_key(&inner_var),
+            "Inner variable should NOT be available outside inner function");
+    }
+
+    /// Feature: rm-remove-support, Property 6: Function Scope Isolation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Test that rm() with remove() alias inside function also respects function scope isolation.
+    #[test]
+    fn prop_remove_function_scope_isolation(
+        global_var in r_identifier(),
+        func_name in r_identifier(),
+        local_var in r_identifier()
+    ) {
+        // Ensure all names are distinct
+        prop_assume!(global_var != func_name && global_var != local_var && func_name != local_var);
+
+        let uri = make_url("test");
+
+        // Code: global definition, function with local definition and remove() inside
+        let code = format!(
+            "{} <- 1\n{} <- function() {{\n  {} <- 2\n  remove({})\n}}",
+            global_var, func_name, local_var, local_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // At end of file (outside function), global variable should still be in scope
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+            "Global variable should be available outside function (remove inside function should not affect it)");
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+            "Function-local variable should NOT be available outside function");
+    }
+
+    /// Feature: rm-remove-support, Property 6: Function Scope Isolation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Test that rm(list=...) inside function also respects function scope isolation.
+    #[test]
+    fn prop_rm_list_function_scope_isolation(
+        global_var in r_identifier(),
+        func_name in r_identifier(),
+        local_var in r_identifier()
+    ) {
+        // Ensure all names are distinct
+        prop_assume!(global_var != func_name && global_var != local_var && func_name != local_var);
+
+        let uri = make_url("test");
+
+        // Code: global definition, function with local definition and rm(list=...) inside
+        let code = format!(
+            "{} <- 1\n{} <- function() {{\n  {} <- 2\n  rm(list = \"{}\")\n}}",
+            global_var, func_name, local_var, local_var
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // At end of file (outside function), global variable should still be in scope
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+            "Global variable should be available outside function (rm(list=...) inside function should not affect it)");
+        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+            "Function name should be available outside function");
+        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+            "Function-local variable should NOT be available outside function");
+    }
+}
+
+
+// ============================================================================
+// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+// Validates: Requirements 7.1, 7.2, 7.3, 7.4
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// For any sequence of definitions and removals of a symbol, scope at position P
+    /// SHALL include the symbol if and only if there exists a definition before P
+    /// with no removal between that definition and P.
+    ///
+    /// Test pattern: Define then remove - symbol NOT in scope after removal
+    /// ```r
+    /// x <- 1
+    /// rm(x)
+    /// # x NOT in scope here
+    /// ```
+    #[test]
+    fn prop_timeline_define_then_remove_not_in_scope(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: define symbol, then remove it
+        let code = format!(
+            "{} <- 1\nrm({})\n# after rm",
+            symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at position after rm() - symbol should NOT be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after rm() (define then remove)");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Remove then define - symbol IS in scope after definition
+    /// ```r
+    /// rm(x)  # removal of undefined symbol has no effect
+    /// x <- 1
+    /// # x IS in scope here
+    /// ```
+    #[test]
+    fn prop_timeline_remove_then_define_in_scope(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: remove symbol (before it's defined), then define it
+        let code = format!(
+            "rm({})\n{} <- 1\n# after define",
+            symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at position after definition - symbol SHOULD be in scope
+        let scope_after_define = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(scope_after_define.symbols.contains_key(&symbol),
+            "Symbol should be in scope after definition (remove then define)");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Define, remove, define - symbol IS in scope after second definition
+    /// ```r
+    /// x <- 1
+    /// rm(x)
+    /// x <- 2
+    /// # x IS in scope here
+    /// ```
+    #[test]
+    fn prop_timeline_define_remove_define_in_scope(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: define, remove, then define again
+        let code = format!(
+            "{} <- 1\nrm({})\n{} <- 2\n# after second define",
+            symbol, symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at position after second definition - symbol SHOULD be in scope
+        let scope_after_second_define = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(scope_after_second_define.symbols.contains_key(&symbol),
+            "Symbol should be in scope after second definition (define, remove, define)");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Position-aware queries - scope at position between definition and removal
+    /// ```r
+    /// x <- 1  # line 0
+    /// # x IS in scope here (line 1)
+    /// rm(x)   # line 2
+    /// # x NOT in scope here (line 3)
+    /// ```
+    #[test]
+    fn prop_timeline_position_aware_between_def_and_rm(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: define on line 0, rm on line 2
+        let code = format!(
+            "{} <- 1\n# between\nrm({})\n# after",
+            symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at line 1 (between definition and removal) - symbol SHOULD be in scope
+        let scope_between = scope_at_position(&artifacts, 1, 0);
+        prop_assert!(scope_between.symbols.contains_key(&symbol),
+            "Symbol should be in scope between definition and removal");
+
+        // Query scope at line 3 (after removal) - symbol should NOT be in scope
+        let scope_after = scope_at_position(&artifacts, 3, 0);
+        prop_assert!(!scope_after.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after removal");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Position-aware queries at different points in define-remove-define sequence
+    /// ```r
+    /// x <- 1  # line 0: first definition
+    /// # line 1: x IS in scope
+    /// rm(x)   # line 2: removal
+    /// # line 3: x NOT in scope
+    /// x <- 2  # line 4: second definition
+    /// # line 5: x IS in scope
+    /// ```
+    #[test]
+    fn prop_timeline_position_aware_define_remove_define_sequence(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code with clear line positions
+        let code = format!(
+            "{} <- 1\n# after first def\nrm({})\n# after rm\n{} <- 2\n# after second def",
+            symbol, symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Line 1: after first definition, before removal - symbol SHOULD be in scope
+        let scope_after_first_def = scope_at_position(&artifacts, 1, 0);
+        prop_assert!(scope_after_first_def.symbols.contains_key(&symbol),
+            "Symbol should be in scope after first definition");
+
+        // Line 3: after removal, before second definition - symbol should NOT be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 3, 0);
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after removal");
+
+        // Line 5: after second definition - symbol SHOULD be in scope
+        let scope_after_second_def = scope_at_position(&artifacts, 5, 0);
+        prop_assert!(scope_after_second_def.symbols.contains_key(&symbol),
+            "Symbol should be in scope after second definition");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Multiple symbols with interleaved definitions and removals
+    /// ```r
+    /// x <- 1
+    /// y <- 2
+    /// rm(x)
+    /// # x NOT in scope, y IS in scope
+    /// ```
+    #[test]
+    fn prop_timeline_multiple_symbols_interleaved(
+        symbol_x in r_identifier(),
+        symbol_y in r_identifier()
+    ) {
+        // Ensure different symbols
+        prop_assume!(symbol_x != symbol_y);
+
+        let uri = make_url("test");
+
+        // Code: define x, define y, remove x
+        let code = format!(
+            "{} <- 1\n{} <- 2\nrm({})\n# after rm",
+            symbol_x, symbol_y, symbol_x
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at end - x should NOT be in scope, y SHOULD be in scope
+        let scope_end = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(!scope_end.symbols.contains_key(&symbol_x),
+            "Symbol x should NOT be in scope after rm(x)");
+        prop_assert!(scope_end.symbols.contains_key(&symbol_y),
+            "Symbol y should still be in scope (not removed)");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Multiple removals of same symbol (idempotent)
+    /// ```r
+    /// x <- 1
+    /// rm(x)
+    /// rm(x)  # second removal has no effect (already removed)
+    /// # x NOT in scope
+    /// ```
+    #[test]
+    fn prop_timeline_multiple_removals_idempotent(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: define, remove, remove again
+        let code = format!(
+            "{} <- 1\nrm({})\nrm({})\n# after double rm",
+            symbol, symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at end - symbol should NOT be in scope
+        let scope_end = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after multiple removals");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Using remove() alias follows same timeline rules
+    /// ```r
+    /// x <- 1
+    /// remove(x)
+    /// # x NOT in scope
+    /// ```
+    #[test]
+    fn prop_timeline_remove_alias_same_behavior(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: define, then remove using remove() alias
+        let code = format!(
+            "{} <- 1\nremove({})\n# after remove",
+            symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at end - symbol should NOT be in scope
+        let scope_end = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after remove() (same as rm())");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Using rm(list=...) follows same timeline rules
+    /// ```r
+    /// x <- 1
+    /// rm(list = "x")
+    /// # x NOT in scope
+    /// ```
+    #[test]
+    fn prop_timeline_rm_list_same_behavior(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: define, then remove using rm(list=...)
+        let code = format!(
+            "{} <- 1\nrm(list = \"{}\")\n# after rm list",
+            symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at end - symbol should NOT be in scope
+        let scope_end = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after rm(list=...) (same as rm())");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: rm() with multiple symbols removes all of them
+    /// ```r
+    /// x <- 1
+    /// y <- 2
+    /// rm(x, y)
+    /// # neither x nor y in scope
+    /// ```
+    #[test]
+    fn prop_timeline_rm_multiple_symbols_at_once(
+        symbol_x in r_identifier(),
+        symbol_y in r_identifier()
+    ) {
+        // Ensure different symbols
+        prop_assume!(symbol_x != symbol_y);
+
+        let uri = make_url("test");
+
+        // Code: define both, then remove both at once
+        let code = format!(
+            "{} <- 1\n{} <- 2\nrm({}, {})\n# after rm",
+            symbol_x, symbol_y, symbol_x, symbol_y
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at end - neither symbol should be in scope
+        let scope_end = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(!scope_end.symbols.contains_key(&symbol_x),
+            "Symbol x should NOT be in scope after rm(x, y)");
+        prop_assert!(!scope_end.symbols.contains_key(&symbol_y),
+            "Symbol y should NOT be in scope after rm(x, y)");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Complex sequence with multiple definitions and removals
+    /// ```r
+    /// x <- 1  # line 0
+    /// y <- 2  # line 1
+    /// rm(x)   # line 2
+    /// x <- 3  # line 3: redefine x
+    /// rm(y)   # line 4
+    /// # line 5: x IS in scope, y NOT in scope
+    /// ```
+    #[test]
+    fn prop_timeline_complex_sequence(
+        symbol_x in r_identifier(),
+        symbol_y in r_identifier()
+    ) {
+        // Ensure different symbols
+        prop_assume!(symbol_x != symbol_y);
+
+        let uri = make_url("test");
+
+        // Complex sequence
+        let code = format!(
+            "{} <- 1\n{} <- 2\nrm({})\n{} <- 3\nrm({})\n# end",
+            symbol_x, symbol_y, symbol_x, symbol_x, symbol_y
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at end
+        let scope_end = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(scope_end.symbols.contains_key(&symbol_x),
+            "Symbol x should be in scope (redefined after removal)");
+        prop_assert!(!scope_end.symbols.contains_key(&symbol_y),
+            "Symbol y should NOT be in scope (removed and not redefined)");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Removal before any definition has no effect
+    /// ```r
+    /// rm(x)  # x was never defined
+    /// # x NOT in scope (was never defined)
+    /// ```
+    #[test]
+    fn prop_timeline_removal_of_undefined_no_effect(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: just rm() without any definition
+        let code = format!(
+            "rm({})\n# after rm of undefined",
+            symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at end - symbol should NOT be in scope (was never defined)
+        let scope_end = scope_at_position(&artifacts, 10, 0);
+
+        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope (was never defined, rm had no effect)");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Same-line definition and removal - position-aware
+    /// ```r
+    /// x <- 1; rm(x)
+    /// # x NOT in scope at end of line
+    /// ```
+    #[test]
+    fn prop_timeline_same_line_def_and_rm(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: define and remove on same line
+        let code = format!(
+            "{} <- 1; rm({})",
+            symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Query scope at end of line - symbol should NOT be in scope
+        let scope_end = scope_at_position(&artifacts, 0, 100);
+
+        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope at end of line after same-line rm()");
+    }
+
+    /// Feature: rm-remove-support, Property 8: Timeline-Based Scope Resolution
+    /// **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    ///
+    /// Test pattern: Position between same-line definition and removal
+    /// The symbol should be in scope after definition but before removal on same line.
+    #[test]
+    fn prop_timeline_same_line_position_between_def_and_rm(
+        symbol in r_identifier()
+    ) {
+        let uri = make_url("test");
+
+        // Code: define and remove on same line with space between
+        // x <- 1; rm(x)
+        // Position after definition (col ~7) but before rm() (col ~9)
+        let code = format!(
+            "{} <- 1; rm({})",
+            symbol, symbol
+        );
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Find the position of rm() call
+        let rm_pos = code.find("rm(").unwrap_or(0) as u32;
+
+        // Query scope just before rm() - symbol SHOULD be in scope
+        let scope_before_rm = scope_at_position(&artifacts, 0, rm_pos.saturating_sub(1));
+        prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
+            "Symbol should be in scope between definition and rm() on same line");
+
+        // Query scope after rm() - symbol should NOT be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 0, rm_pos + 10);
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after rm() on same line");
+    }
+}
+
+
+// ============================================================================
+// Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
+// Validates: Requirements 6.1, 6.2, 6.3
+// ============================================================================
+
+use super::scope::scope_at_position_with_graph;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
+    /// **Validates: Requirements 6.1, 6.2, 6.3**
+    ///
+    /// For any file that sources another file defining symbol `s` and then calls `rm(s)`,
+    /// scope queries after the `rm()` call SHALL NOT include `s`, while scope queries
+    /// between the `source()` and `rm()` calls SHALL include `s`.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # parent.R
+    /// source("child.R")  # child.R defines helper_func
+    /// # helper_func IS in scope here
+    /// rm(helper_func)
+    /// # helper_func is NOT in scope here
+    /// ```
+    #[test]
+    fn prop_cross_file_removal_propagation_basic(
+        symbol in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: sources child.R, then removes the symbol
+        let parent_code = format!("source(\"child.R\")\nrm({})", symbol);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: defines the symbol
+        let child_code = format!("{} <- function() {{ 1 }}", symbol);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // After source() but before rm() (line 0, after source call), symbol should be in scope
+        let scope_before_rm = scope_at_position_with_graph(
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
+            "Symbol from sourced file should be in scope after source() but before rm()");
+
+        // After rm() (line 1), symbol should NOT be in scope
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after rm()");
+
+        // At end of file, symbol should NOT be in scope
+        let scope_eof = scope_at_position_with_graph(
+            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(!scope_eof.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope at end of file after rm()");
+    }
+
+    /// Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
+    /// **Validates: Requirements 6.1, 6.2, 6.3**
+    ///
+    /// Test that rm() only removes the specified symbol, not others from the sourced file.
+    #[test]
+    fn prop_cross_file_removal_propagation_selective(
+        symbol_to_remove in r_identifier(),
+        symbol_to_keep in r_identifier()
+    ) {
+        // Ensure different symbols
+        prop_assume!(symbol_to_remove != symbol_to_keep);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: sources child.R, then removes only one symbol
+        let parent_code = format!("source(\"child.R\")\nrm({})", symbol_to_remove);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: defines both symbols
+        let child_code = format!(
+            "{} <- function() {{ 1 }}\n{} <- function() {{ 2 }}",
+            symbol_to_remove, symbol_to_keep
+        );
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // After rm(), only the removed symbol should be gone
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_to_remove),
+            "Removed symbol should NOT be in scope after rm()");
+        prop_assert!(scope_after_rm.symbols.contains_key(&symbol_to_keep),
+            "Non-removed symbol should still be in scope after rm()");
+    }
+
+    /// Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
+    /// **Validates: Requirements 6.1, 6.2, 6.3**
+    ///
+    /// Test that rm() with multiple symbols removes all specified symbols from sourced file.
+    #[test]
+    fn prop_cross_file_removal_propagation_multiple_symbols(
+        symbol_a in r_identifier(),
+        symbol_b in r_identifier(),
+        symbol_c in r_identifier()
+    ) {
+        // Ensure all symbols are different
+        prop_assume!(symbol_a != symbol_b && symbol_b != symbol_c && symbol_a != symbol_c);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: sources child.R, then removes symbol_a and symbol_b
+        let parent_code = format!("source(\"child.R\")\nrm({}, {})", symbol_a, symbol_b);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: defines all three symbols
+        let child_code = format!(
+            "{} <- function() {{ 1 }}\n{} <- function() {{ 2 }}\n{} <- function() {{ 3 }}",
+            symbol_a, symbol_b, symbol_c
+        );
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Before rm() (line 0), all three symbols should be in scope
+        let scope_before_rm = scope_at_position_with_graph(
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(scope_before_rm.symbols.contains_key(&symbol_a),
+            "symbol_a should be in scope before rm()");
+        prop_assert!(scope_before_rm.symbols.contains_key(&symbol_b),
+            "symbol_b should be in scope before rm()");
+        prop_assert!(scope_before_rm.symbols.contains_key(&symbol_c),
+            "symbol_c should be in scope before rm()");
+
+        // After rm() (line 1), symbol_a and symbol_b should NOT be in scope, but symbol_c should be
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_a),
+            "symbol_a should NOT be in scope after rm()");
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_b),
+            "symbol_b should NOT be in scope after rm()");
+        prop_assert!(scope_after_rm.symbols.contains_key(&symbol_c),
+            "symbol_c should still be in scope after rm()");
+    }
+
+    /// Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
+    /// **Validates: Requirements 6.1, 6.2, 6.3**
+    ///
+    /// Test that remove() alias works the same as rm() for cross-file removal.
+    #[test]
+    fn prop_cross_file_removal_propagation_remove_alias(
+        symbol in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: sources child.R, then removes the symbol using remove()
+        let parent_code = format!("source(\"child.R\")\nremove({})", symbol);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: defines the symbol
+        let child_code = format!("{} <- function() {{ 1 }}", symbol);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // After source() but before remove() (line 0), symbol should be in scope
+        let scope_before_remove = scope_at_position_with_graph(
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(scope_before_remove.symbols.contains_key(&symbol),
+            "Symbol from sourced file should be in scope after source() but before remove()");
+
+        // After remove() (line 1), symbol should NOT be in scope
+        let scope_after_remove = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(!scope_after_remove.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after remove()");
+    }
+
+    /// Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
+    /// **Validates: Requirements 6.1, 6.2, 6.3**
+    ///
+    /// Test that rm(list=...) works for cross-file removal.
+    #[test]
+    fn prop_cross_file_removal_propagation_list_arg(
+        symbol in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: sources child.R, then removes the symbol using rm(list=...)
+        let parent_code = format!("source(\"child.R\")\nrm(list = \"{}\")", symbol);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: defines the symbol
+        let child_code = format!("{} <- function() {{ 1 }}", symbol);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // After source() but before rm(list=...) (line 0), symbol should be in scope
+        let scope_before_rm = scope_at_position_with_graph(
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
+            "Symbol from sourced file should be in scope after source() but before rm(list=...)");
+
+        // After rm(list=...) (line 1), symbol should NOT be in scope
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after rm(list=...)");
+    }
+
+    /// Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
+    /// **Validates: Requirements 6.1, 6.2, 6.3**
+    ///
+    /// Test that rm(list=c(...)) works for cross-file removal of multiple symbols.
+    #[test]
+    fn prop_cross_file_removal_propagation_list_c_arg(
+        symbol_a in r_identifier(),
+        symbol_b in r_identifier(),
+        symbol_c in r_identifier()
+    ) {
+        // Ensure all symbols are different
+        prop_assume!(symbol_a != symbol_b && symbol_b != symbol_c && symbol_a != symbol_c);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: sources child.R, then removes symbol_a and symbol_b using rm(list=c(...))
+        let parent_code = format!(
+            "source(\"child.R\")\nrm(list = c(\"{}\", \"{}\"))",
+            symbol_a, symbol_b
+        );
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: defines all three symbols
+        let child_code = format!(
+            "{} <- function() {{ 1 }}\n{} <- function() {{ 2 }}\n{} <- function() {{ 3 }}",
+            symbol_a, symbol_b, symbol_c
+        );
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // After rm(list=c(...)) (line 1), symbol_a and symbol_b should NOT be in scope
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_a),
+            "symbol_a should NOT be in scope after rm(list=c(...))");
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_b),
+            "symbol_b should NOT be in scope after rm(list=c(...))");
+        prop_assert!(scope_after_rm.symbols.contains_key(&symbol_c),
+            "symbol_c should still be in scope after rm(list=c(...))");
+    }
+
+    /// Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
+    /// **Validates: Requirements 6.1, 6.2, 6.3**
+    ///
+    /// Test that rm() of a sourced symbol followed by redefinition works correctly.
+    #[test]
+    fn prop_cross_file_removal_then_redefine(
+        symbol in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: sources child.R, removes the symbol, then redefines it
+        let parent_code = format!(
+            "source(\"child.R\")\nrm({})\n{} <- function() {{ 99 }}",
+            symbol, symbol
+        );
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: defines the symbol
+        let child_code = format!("{} <- function() {{ 1 }}", symbol);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // After source() but before rm() (line 0), symbol should be in scope
+        let scope_after_source = scope_at_position_with_graph(
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(scope_after_source.symbols.contains_key(&symbol),
+            "Symbol should be in scope after source() but before rm()");
+
+        // After rm() but before redefinition (line 1), symbol should NOT be in scope
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope after rm() but before redefinition");
+
+        // After redefinition (line 2), symbol should be in scope again
+        let scope_after_redef = scope_at_position_with_graph(
+            &parent_uri, 2, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(scope_after_redef.symbols.contains_key(&symbol),
+            "Symbol should be in scope after redefinition");
+    }
+
+    /// Feature: rm-remove-support, Property 7: Cross-File Removal Propagation
+    /// **Validates: Requirements 6.1, 6.2, 6.3**
+    ///
+    /// Test that rm() in parent does NOT affect the child file's own scope.
+    /// The child file should still have its own definition available.
+    #[test]
+    fn prop_cross_file_removal_does_not_affect_child_scope(
+        symbol in r_identifier()
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: sources child.R, then removes the symbol
+        let parent_code = format!("source(\"child.R\")\nrm({})", symbol);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: defines the symbol
+        let child_code = format!("{} <- function() {{ 1 }}", symbol);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // In child file, the symbol should still be in scope (child's own definition)
+        let scope_in_child = scope_at_position_with_graph(
+            &child_uri, 0, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(scope_in_child.symbols.contains_key(&symbol),
+            "Symbol should still be in scope in child file (child's own definition)");
+
+        // In parent file after rm(), the symbol should NOT be in scope
+        let scope_in_parent = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        prop_assert!(!scope_in_parent.symbols.contains_key(&symbol),
+            "Symbol should NOT be in scope in parent file after rm()");
+    }
+}

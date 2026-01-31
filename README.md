@@ -123,6 +123,47 @@ The LSP recognizes the following R constructs as symbol definitions:
 
 Undefined variable diagnostics are only suppressed for symbols recognized by this model.
 
+### Symbol Removal Tracking (rm/remove)
+
+The LSP tracks when variables are removed from scope via `rm()` or `remove()` calls. This enables accurate undefined variable diagnostics when code uses `rm()` to delete variables.
+
+**Supported Patterns:**
+
+| Pattern | Extracted Symbols |
+|---------|-------------------|
+| `rm(x)` | `["x"]` |
+| `rm(x, y, z)` | `["x", "y", "z"]` |
+| `rm(list = "x")` | `["x"]` |
+| `rm(list = c("x", "y"))` | `["x", "y"]` |
+| `remove(x)` | `["x"]` |
+| `rm(x, list = c("y", "z"))` | `["x", "y", "z"]` |
+
+**Unsupported Patterns (No Symbols Extracted):**
+
+| Pattern | Reason |
+|---------|--------|
+| `rm(list = var)` | Dynamic variable - cannot determine symbols at static analysis time |
+| `rm(list = ls())` | Dynamic expression - result depends on runtime state |
+| `rm(list = ls(pattern = "..."))` | Pattern-based removal - cannot determine matching symbols statically |
+| `rm(x, envir = my_env)` | Non-default environment - removal doesn't affect global scope tracking |
+
+**Behavior:**
+- `rm()` and `remove()` are treated identically (they are aliases in R)
+- Removals inside functions only affect that function's local scope
+- Removals at the top level affect global scope
+- Symbols can be re-defined after removal and will be back in scope
+- The `envir=` argument is checked: calls with `envir = globalenv()` or `envir = .GlobalEnv` are processed normally, but any other `envir=` value causes the call to be ignored for scope tracking
+
+**Example:**
+```r
+x <- 1
+y <- 2
+rm(x)
+# x is no longer in scope here - using x would trigger undefined variable diagnostic
+# y is still in scope
+x <- 3  # x is back in scope after re-definition
+```
+
 ### Configuration Options
 
 Configure via VS Code settings or LSP initialization:

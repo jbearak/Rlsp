@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use tower_lsp::lsp_types::Url;
 use tree_sitter::{Node, Tree};
 
-use super::source_detect::detect_source_calls;
+use super::source_detect::{detect_rm_calls, detect_source_calls};
 use super::types::{byte_offset_to_utf16_column, ForwardSource};
 
 /// Symbol kind
@@ -67,6 +67,12 @@ pub enum ScopeEvent {
         end_line: u32,
         end_column: u32,
         parameters: Vec<ScopedSymbol>,
+    },
+    /// A removal of symbols from scope via rm()/remove()
+    Removal {
+        line: u32,
+        column: u32,
+        symbols: Vec<String>,
     },
 }
 
@@ -131,11 +137,23 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         });
     }
 
+    // Collect rm()/remove() calls and add them to timeline.
+    // These events will be processed during scope resolution to remove symbols from scope.
+    let rm_calls = detect_rm_calls(tree, content);
+    for rm_call in rm_calls {
+        artifacts.timeline.push(ScopeEvent::Removal {
+            line: rm_call.line,
+            column: rm_call.column,
+            symbols: rm_call.symbols,
+        });
+    }
+
     // Sort timeline by position for correct ordering
     artifacts.timeline.sort_by_key(|event| match event {
         ScopeEvent::Def { line, column, .. } => (*line, *column),
         ScopeEvent::Source { line, column, .. } => (*line, *column),
         ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+        ScopeEvent::Removal { line, column, .. } => (*line, *column),
     });
 
     // Populate function_scopes cache for O(1) lookup
@@ -213,6 +231,36 @@ pub fn scope_at_position(
                 if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
+                    }
+                }
+            }
+            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols } => {
+                // Only process if removal is before the query position
+                if (*rm_line, *rm_col) <= (line, column) {
+                    // Check function scope - removals inside functions only affect that function
+                    let rm_function_scope = artifacts.function_scopes.iter()
+                        .filter(|(start_line, start_column, end_line, end_column)| {
+                            (*start_line, *start_column) <= (*rm_line, *rm_col) 
+                            && (*rm_line, *rm_col) <= (*end_line, *end_column)
+                        })
+                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
+                        .copied();
+                    
+                    match rm_function_scope {
+                        None => {
+                            // Global removal - remove from scope
+                            for sym in symbols {
+                                scope.symbols.remove(sym);
+                            }
+                        }
+                        Some(rm_scope) => {
+                            // Function-local removal - only remove if we're in the same function
+                            if active_function_scopes.contains(&rm_scope) {
+                                for sym in symbols {
+                                    scope.symbols.remove(sym);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -370,6 +418,36 @@ where
                 if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.entry(param.name.clone()).or_insert_with(|| param.clone());
+                    }
+                }
+            }
+            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols } => {
+                // Only process if removal is before the query position
+                if (*rm_line, *rm_col) <= (line, column) {
+                    // Check function scope - removals inside functions only affect that function
+                    let rm_function_scope = artifacts.function_scopes.iter()
+                        .filter(|(start_line, start_column, end_line, end_column)| {
+                            (*start_line, *start_column) <= (*rm_line, *rm_col) 
+                            && (*rm_line, *rm_col) <= (*end_line, *end_column)
+                        })
+                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
+                        .copied();
+                    
+                    match rm_function_scope {
+                        None => {
+                            // Global removal - remove from scope
+                            for sym in symbols {
+                                scope.symbols.remove(sym);
+                            }
+                        }
+                        Some(rm_scope) => {
+                            // Function-local removal - only remove if we're in the same function
+                            if active_function_scopes.contains(&rm_scope) {
+                                for sym in symbols {
+                                    scope.symbols.remove(sym);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1048,6 +1126,36 @@ where
                     }
                 }
             }
+            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols } => {
+                // Only process if removal is before the query position
+                if (*rm_line, *rm_col) <= (line, column) {
+                    // Check function scope - removals inside functions only affect that function
+                    let rm_function_scope = artifacts.function_scopes.iter()
+                        .filter(|(start_line, start_column, end_line, end_column)| {
+                            (*start_line, *start_column) <= (*rm_line, *rm_col) 
+                            && (*rm_line, *rm_col) <= (*end_line, *end_column)
+                        })
+                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
+                        .copied();
+                    
+                    match rm_function_scope {
+                        None => {
+                            // Global removal - remove from scope
+                            for sym in symbols {
+                                scope.symbols.remove(sym);
+                            }
+                        }
+                        Some(rm_scope) => {
+                            // Function-local removal - only remove if we're in the same function
+                            if active_function_scopes.contains(&rm_scope) {
+                                for sym in symbols {
+                                    scope.symbols.remove(sym);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1217,6 +1325,36 @@ where
                 if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
+                    }
+                }
+            }
+            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols } => {
+                // Only process if removal is before the query position
+                if (*rm_line, *rm_col) <= (line, column) {
+                    // Check function scope - removals inside functions only affect that function
+                    let rm_function_scope = artifacts.function_scopes.iter()
+                        .filter(|(start_line, start_column, end_line, end_column)| {
+                            (*start_line, *start_column) <= (*rm_line, *rm_col) 
+                            && (*rm_line, *rm_col) <= (*end_line, *end_column)
+                        })
+                        .max_by_key(|(start_line, start_column, _, _)| (*start_line, *start_column))
+                        .copied();
+                    
+                    match rm_function_scope {
+                        None => {
+                            // Global removal - remove from scope
+                            for sym in symbols {
+                                scope.symbols.remove(sym);
+                            }
+                        }
+                        Some(rm_scope) => {
+                            // Function-local removal - only remove if we're in the same function
+                            if active_function_scopes.contains(&rm_scope) {
+                                for sym in symbols {
+                                    scope.symbols.remove(sym);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1851,6 +1989,7 @@ mod tests {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
         });
 
         // Child file: defines 'child_var'
@@ -2243,5 +2382,1636 @@ mod tests {
         // Should NOT have function-local variables
         assert!(!scope_eof.symbols.contains_key("var1"), "var1 should NOT be available at EOF");
         assert!(!scope_eof.symbols.contains_key("var2"), "var2 should NOT be available at EOF");
+    }
+
+    // ============================================================================
+    // Tests for ScopeEvent::Removal (Task 1.2)
+    // Validates: Requirements 1.1, 1.2
+    // ============================================================================
+
+    #[test]
+    fn test_removal_event_creation_single_symbol() {
+        // Test that Removal events can be created with line, column, and a single symbol
+        let removal = ScopeEvent::Removal {
+            line: 5,
+            column: 0,
+            symbols: vec!["x".to_string()],
+        };
+
+        match removal {
+            ScopeEvent::Removal { line, column, symbols } => {
+                assert_eq!(line, 5);
+                assert_eq!(column, 0);
+                assert_eq!(symbols.len(), 1);
+                assert_eq!(symbols[0], "x");
+            }
+            _ => panic!("Expected Removal event"),
+        }
+    }
+
+    #[test]
+    fn test_removal_event_creation_multiple_symbols() {
+        // Test that Removal events can be created with multiple symbols
+        let removal = ScopeEvent::Removal {
+            line: 10,
+            column: 4,
+            symbols: vec!["x".to_string(), "y".to_string(), "z".to_string()],
+        };
+
+        match removal {
+            ScopeEvent::Removal { line, column, symbols } => {
+                assert_eq!(line, 10);
+                assert_eq!(column, 4);
+                assert_eq!(symbols.len(), 3);
+                assert!(symbols.contains(&"x".to_string()));
+                assert!(symbols.contains(&"y".to_string()));
+                assert!(symbols.contains(&"z".to_string()));
+            }
+            _ => panic!("Expected Removal event"),
+        }
+    }
+
+    #[test]
+    fn test_removal_event_creation_empty_symbols() {
+        // Test that Removal events can be created with empty symbols list (edge case)
+        let removal = ScopeEvent::Removal {
+            line: 0,
+            column: 0,
+            symbols: vec![],
+        };
+
+        match removal {
+            ScopeEvent::Removal { line, column, symbols } => {
+                assert_eq!(line, 0);
+                assert_eq!(column, 0);
+                assert!(symbols.is_empty());
+            }
+            _ => panic!("Expected Removal event"),
+        }
+    }
+
+    #[test]
+    fn test_removal_event_sorting_by_position() {
+        // Test that Removal events are correctly sorted by (line, column) position
+        let mut events = vec![
+            ScopeEvent::Removal { line: 5, column: 10, symbols: vec!["c".to_string()] },
+            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["a".to_string()] },
+            ScopeEvent::Removal { line: 5, column: 5, symbols: vec!["b".to_string()] },
+            ScopeEvent::Removal { line: 10, column: 0, symbols: vec!["d".to_string()] },
+        ];
+
+        // Sort using the same key as compute_artifacts
+        events.sort_by_key(|event| match event {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        });
+
+        // Verify order: (2,0), (5,5), (5,10), (10,0)
+        let positions: Vec<(u32, u32)> = events.iter().map(|e| match e {
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            _ => panic!("Expected Removal event"),
+        }).collect();
+
+        assert_eq!(positions, vec![(2, 0), (5, 5), (5, 10), (10, 0)]);
+    }
+
+    #[test]
+    fn test_removal_event_sorting_same_line_different_columns() {
+        // Test that Removal events on the same line are sorted by column
+        let mut events = vec![
+            ScopeEvent::Removal { line: 3, column: 20, symbols: vec!["c".to_string()] },
+            ScopeEvent::Removal { line: 3, column: 5, symbols: vec!["a".to_string()] },
+            ScopeEvent::Removal { line: 3, column: 10, symbols: vec!["b".to_string()] },
+        ];
+
+        events.sort_by_key(|event| match event {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        });
+
+        // Verify order by column: 5, 10, 20
+        let columns: Vec<u32> = events.iter().map(|e| match e {
+            ScopeEvent::Removal { column, .. } => *column,
+            _ => panic!("Expected Removal event"),
+        }).collect();
+
+        assert_eq!(columns, vec![5, 10, 20]);
+    }
+
+    #[test]
+    fn test_removal_event_mixed_with_def_events() {
+        // Test that Removal events sort correctly when mixed with Def events
+        let uri = test_uri();
+        let mut events = vec![
+            ScopeEvent::Removal { line: 3, column: 0, symbols: vec!["x".to_string()] },
+            ScopeEvent::Def {
+                line: 1,
+                column: 0,
+                symbol: ScopedSymbol {
+                    name: "x".to_string(),
+                    kind: SymbolKind::Variable,
+                    source_uri: uri.clone(),
+                    defined_line: 1,
+                    defined_column: 0,
+                    signature: None,
+                },
+            },
+            ScopeEvent::Def {
+                line: 5,
+                column: 0,
+                symbol: ScopedSymbol {
+                    name: "y".to_string(),
+                    kind: SymbolKind::Variable,
+                    source_uri: uri.clone(),
+                    defined_line: 5,
+                    defined_column: 0,
+                    signature: None,
+                },
+            },
+        ];
+
+        events.sort_by_key(|event| match event {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        });
+
+        // Verify order: Def(1,0), Removal(3,0), Def(5,0)
+        let event_types: Vec<&str> = events.iter().map(|e| match e {
+            ScopeEvent::Def { .. } => "Def",
+            ScopeEvent::Removal { .. } => "Removal",
+            _ => "Other",
+        }).collect();
+
+        assert_eq!(event_types, vec!["Def", "Removal", "Def"]);
+
+        // Verify positions
+        let positions: Vec<(u32, u32)> = events.iter().map(|e| match e {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            _ => (0, 0),
+        }).collect();
+
+        assert_eq!(positions, vec![(1, 0), (3, 0), (5, 0)]);
+    }
+
+    #[test]
+    fn test_removal_event_mixed_with_source_events() {
+        // Test that Removal events sort correctly when mixed with Source events
+        use super::super::types::ForwardSource;
+
+        let mut events = vec![
+            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["x".to_string()] },
+            ScopeEvent::Source {
+                line: 1,
+                column: 0,
+                source: ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            },
+            ScopeEvent::Removal { line: 4, column: 0, symbols: vec!["y".to_string()] },
+        ];
+
+        events.sort_by_key(|event| match event {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        });
+
+        // Verify order: Source(1,0), Removal(2,0), Removal(4,0)
+        let event_types: Vec<&str> = events.iter().map(|e| match e {
+            ScopeEvent::Source { .. } => "Source",
+            ScopeEvent::Removal { .. } => "Removal",
+            _ => "Other",
+        }).collect();
+
+        assert_eq!(event_types, vec!["Source", "Removal", "Removal"]);
+    }
+
+    #[test]
+    fn test_removal_event_mixed_with_all_event_types() {
+        // Test that Removal events sort correctly when mixed with Def, Source, and FunctionScope events
+        use super::super::types::ForwardSource;
+
+        let uri = test_uri();
+        let mut events = vec![
+            ScopeEvent::Removal { line: 5, column: 0, symbols: vec!["z".to_string()] },
+            ScopeEvent::Def {
+                line: 1,
+                column: 0,
+                symbol: ScopedSymbol {
+                    name: "x".to_string(),
+                    kind: SymbolKind::Variable,
+                    source_uri: uri.clone(),
+                    defined_line: 1,
+                    defined_column: 0,
+                    signature: None,
+                },
+            },
+            ScopeEvent::Source {
+                line: 3,
+                column: 0,
+                source: ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 3,
+                    column: 0,
+                    is_directive: false,
+                    local: false,
+                    chdir: false,
+                    is_sys_source: false,
+                    sys_source_global_env: true,
+                },
+            },
+            ScopeEvent::FunctionScope {
+                start_line: 7,
+                start_column: 0,
+                end_line: 10,
+                end_column: 1,
+                parameters: vec![],
+            },
+            ScopeEvent::Removal { line: 9, column: 0, symbols: vec!["w".to_string()] },
+        ];
+
+        events.sort_by_key(|event| match event {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        });
+
+        // Verify order: Def(1,0), Source(3,0), Removal(5,0), FunctionScope(7,0), Removal(9,0)
+        let event_types: Vec<&str> = events.iter().map(|e| match e {
+            ScopeEvent::Def { .. } => "Def",
+            ScopeEvent::Source { .. } => "Source",
+            ScopeEvent::FunctionScope { .. } => "FunctionScope",
+            ScopeEvent::Removal { .. } => "Removal",
+        }).collect();
+
+        assert_eq!(event_types, vec!["Def", "Source", "Removal", "FunctionScope", "Removal"]);
+
+        // Verify positions
+        let positions: Vec<u32> = events.iter().map(|e| match e {
+            ScopeEvent::Def { line, .. } => *line,
+            ScopeEvent::Source { line, .. } => *line,
+            ScopeEvent::FunctionScope { start_line, .. } => *start_line,
+            ScopeEvent::Removal { line, .. } => *line,
+        }).collect();
+
+        assert_eq!(positions, vec![1, 3, 5, 7, 9]);
+    }
+
+    #[test]
+    fn test_removal_event_at_same_position_as_def() {
+        // Test sorting when Removal and Def events are at the same position
+        // (This is an edge case - in practice they would be at different positions)
+        let uri = test_uri();
+        let mut events = vec![
+            ScopeEvent::Removal { line: 2, column: 0, symbols: vec!["x".to_string()] },
+            ScopeEvent::Def {
+                line: 2,
+                column: 0,
+                symbol: ScopedSymbol {
+                    name: "y".to_string(),
+                    kind: SymbolKind::Variable,
+                    source_uri: uri.clone(),
+                    defined_line: 2,
+                    defined_column: 0,
+                    signature: None,
+                },
+            },
+        ];
+
+        events.sort_by_key(|event| match event {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        });
+
+        // Both events should be at position (2, 0) - order between them is stable but not guaranteed
+        // The important thing is that both are present and at the same position
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            let pos = match event {
+                ScopeEvent::Def { line, column, .. } => (*line, *column),
+                ScopeEvent::Removal { line, column, .. } => (*line, *column),
+                _ => panic!("Unexpected event type"),
+            };
+            assert_eq!(pos, (2, 0));
+        }
+    }
+
+    #[test]
+    fn test_removal_event_clone() {
+        // Test that Removal events can be cloned (derives Clone)
+        let original = ScopeEvent::Removal {
+            line: 5,
+            column: 10,
+            symbols: vec!["x".to_string(), "y".to_string()],
+        };
+
+        let cloned = original.clone();
+
+        match (original, cloned) {
+            (
+                ScopeEvent::Removal { line: l1, column: c1, symbols: s1 },
+                ScopeEvent::Removal { line: l2, column: c2, symbols: s2 },
+            ) => {
+                assert_eq!(l1, l2);
+                assert_eq!(c1, c2);
+                assert_eq!(s1, s2);
+            }
+            _ => panic!("Expected Removal events"),
+        }
+    }
+
+    // ============================================================================
+    // Integration tests for artifacts with removals (Task 4.2)
+    // Validates: Requirements 1.1, 7.1
+    // ============================================================================
+
+    #[test]
+    fn test_artifacts_define_then_remove() {
+        // Test: x <- 1; rm(x) - timeline should have Def then Removal
+        // Validates: Requirements 1.1, 7.1
+        let code = "x <- 1\nrm(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Should have both Def and Removal events in timeline
+        let def_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Def { line, symbol, .. } => Some((*line, symbol.name.clone())),
+                _ => None,
+            })
+            .collect();
+
+        let removal_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Removal { line, symbols, .. } => Some((*line, symbols.clone())),
+                _ => None,
+            })
+            .collect();
+
+        // Verify Def event for x on line 0
+        assert_eq!(def_events.len(), 1, "Should have one Def event");
+        assert_eq!(def_events[0].0, 0, "Def should be on line 0");
+        assert_eq!(def_events[0].1, "x", "Def should be for symbol 'x'");
+
+        // Verify Removal event for x on line 1
+        assert_eq!(removal_events.len(), 1, "Should have one Removal event");
+        assert_eq!(removal_events[0].0, 1, "Removal should be on line 1");
+        assert!(removal_events[0].1.contains(&"x".to_string()), "Removal should contain 'x'");
+
+        // Verify timeline order: Def comes before Removal
+        let timeline_order: Vec<(&str, u32)> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Def { line, .. } => Some(("Def", *line)),
+                ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(timeline_order.len(), 2);
+        assert_eq!(timeline_order[0], ("Def", 0), "Def should come first");
+        assert_eq!(timeline_order[1], ("Removal", 1), "Removal should come second");
+    }
+
+    #[test]
+    fn test_artifacts_remove_then_define() {
+        // Test: rm(x); x <- 1 - timeline should have Removal then Def
+        // Validates: Requirements 1.1, 7.1
+        let code = "rm(x)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Verify timeline order: Removal comes before Def
+        let timeline_order: Vec<(&str, u32)> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Def { line, .. } => Some(("Def", *line)),
+                ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(timeline_order.len(), 2);
+        assert_eq!(timeline_order[0], ("Removal", 0), "Removal should come first");
+        assert_eq!(timeline_order[1], ("Def", 1), "Def should come second");
+    }
+
+    #[test]
+    fn test_artifacts_multiple_definitions_and_removals() {
+        // Test: x <- 1; y <- 2; rm(x); z <- 3; rm(y, z)
+        // Timeline should have: Def(x), Def(y), Removal(x), Def(z), Removal(y,z)
+        // Validates: Requirements 1.1, 1.2, 7.1
+        let code = "x <- 1\ny <- 2\nrm(x)\nz <- 3\nrm(y, z)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Collect all events with their types and positions
+        let timeline_events: Vec<(&str, u32, Vec<String>)> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Def { line, symbol, .. } => Some(("Def", *line, vec![symbol.name.clone()])),
+                ScopeEvent::Removal { line, symbols, .. } => Some(("Removal", *line, symbols.clone())),
+                _ => None,
+            })
+            .collect();
+
+        // Should have 5 events total: 3 Defs and 2 Removals
+        assert_eq!(timeline_events.len(), 5, "Should have 5 events (3 Defs + 2 Removals)");
+
+        // Verify order and content
+        assert_eq!(timeline_events[0], ("Def", 0, vec!["x".to_string()]), "First: Def x on line 0");
+        assert_eq!(timeline_events[1], ("Def", 1, vec!["y".to_string()]), "Second: Def y on line 1");
+        assert_eq!(timeline_events[2].0, "Removal", "Third: Removal");
+        assert_eq!(timeline_events[2].1, 2, "Third: on line 2");
+        assert!(timeline_events[2].2.contains(&"x".to_string()), "Third: contains x");
+        assert_eq!(timeline_events[3], ("Def", 3, vec!["z".to_string()]), "Fourth: Def z on line 3");
+        assert_eq!(timeline_events[4].0, "Removal", "Fifth: Removal");
+        assert_eq!(timeline_events[4].1, 4, "Fifth: on line 4");
+        assert!(timeline_events[4].2.contains(&"y".to_string()), "Fifth: contains y");
+        assert!(timeline_events[4].2.contains(&"z".to_string()), "Fifth: contains z");
+    }
+
+    #[test]
+    fn test_artifacts_removal_with_source() {
+        // Test: source("utils.R"); rm(helper_func)
+        // Timeline should have: Source, Removal
+        // Validates: Requirements 1.1, 7.1
+        let code = "source(\"utils.R\")\nrm(helper_func)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Collect all events with their types and positions
+        let timeline_events: Vec<(&str, u32)> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Source { line, .. } => Some(("Source", *line)),
+                ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
+                _ => None,
+            })
+            .collect();
+
+        // Should have 2 events: Source and Removal
+        assert_eq!(timeline_events.len(), 2, "Should have 2 events (Source + Removal)");
+
+        // Verify order
+        assert_eq!(timeline_events[0], ("Source", 0), "First: Source on line 0");
+        assert_eq!(timeline_events[1], ("Removal", 1), "Second: Removal on line 1");
+
+        // Verify the removal contains the correct symbol
+        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(removal_symbols.len(), 1);
+        assert!(removal_symbols[0].contains(&"helper_func".to_string()), 
+            "Removal should contain 'helper_func'");
+    }
+
+    #[test]
+    fn test_artifacts_removal_with_remove_alias() {
+        // Test: x <- 1; remove(x) - using remove() alias
+        // Validates: Requirements 2.1, 2.2
+        let code = "x <- 1\nremove(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Verify timeline has both Def and Removal
+        let timeline_order: Vec<(&str, u32)> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Def { line, .. } => Some(("Def", *line)),
+                ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(timeline_order.len(), 2);
+        assert_eq!(timeline_order[0], ("Def", 0), "Def should come first");
+        assert_eq!(timeline_order[1], ("Removal", 1), "Removal should come second");
+
+        // Verify the removal contains the correct symbol
+        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(removal_symbols.len(), 1);
+        assert!(removal_symbols[0].contains(&"x".to_string()), 
+            "Removal via remove() should contain 'x'");
+    }
+
+    #[test]
+    fn test_artifacts_removal_with_list_argument() {
+        // Test: x <- 1; y <- 2; rm(list = c("x", "y"))
+        // Validates: Requirements 3.1, 3.2
+        let code = "x <- 1\ny <- 2\nrm(list = c(\"x\", \"y\"))";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Verify timeline has Defs and Removal
+        let timeline_events: Vec<(&str, u32)> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Def { line, .. } => Some(("Def", *line)),
+                ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(timeline_events.len(), 3, "Should have 3 events (2 Defs + 1 Removal)");
+        assert_eq!(timeline_events[0], ("Def", 0));
+        assert_eq!(timeline_events[1], ("Def", 1));
+        assert_eq!(timeline_events[2], ("Removal", 2));
+
+        // Verify the removal contains both symbols
+        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(removal_symbols.len(), 1);
+        assert!(removal_symbols[0].contains(&"x".to_string()), 
+            "Removal should contain 'x'");
+        assert!(removal_symbols[0].contains(&"y".to_string()), 
+            "Removal should contain 'y'");
+    }
+
+    #[test]
+    fn test_artifacts_removal_mixed_bare_and_list() {
+        // Test: rm(a, list = c("b", "c"))
+        // Validates: Requirements 1.1, 3.1, 3.2
+        let code = "a <- 1\nb <- 2\nc <- 3\nrm(a, list = c(\"b\", \"c\"))";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Verify the removal contains all three symbols
+        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(removal_symbols.len(), 1, "Should have one Removal event");
+        assert!(removal_symbols[0].contains(&"a".to_string()), 
+            "Removal should contain 'a' (bare symbol)");
+        assert!(removal_symbols[0].contains(&"b".to_string()), 
+            "Removal should contain 'b' (from list)");
+        assert!(removal_symbols[0].contains(&"c".to_string()), 
+            "Removal should contain 'c' (from list)");
+    }
+
+    #[test]
+    fn test_artifacts_removal_with_function_scope() {
+        // Test: rm() inside a function should still be in timeline
+        // Validates: Requirements 1.1, 5.1
+        let code = "my_func <- function() {\n  x <- 1\n  rm(x)\n}";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Verify timeline has FunctionScope, Def, and Removal
+        let has_function_scope = artifacts.timeline.iter().any(|e| matches!(e, ScopeEvent::FunctionScope { .. }));
+        let has_removal = artifacts.timeline.iter().any(|e| matches!(e, ScopeEvent::Removal { .. }));
+
+        assert!(has_function_scope, "Should have FunctionScope event");
+        assert!(has_removal, "Should have Removal event inside function");
+
+        // Verify the removal is for 'x'
+        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(removal_symbols.len(), 1);
+        assert!(removal_symbols[0].contains(&"x".to_string()), 
+            "Removal should contain 'x'");
+    }
+
+    #[test]
+    fn test_artifacts_no_removal_for_envir_argument() {
+        // Test: rm(x, envir = my_env) should NOT create a Removal event
+        // Validates: Requirements 4.1
+        let code = "x <- 1\nrm(x, envir = my_env)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Should have Def but no Removal (envir= filters it out)
+        let removal_count = artifacts.timeline.iter()
+            .filter(|e| matches!(e, ScopeEvent::Removal { .. }))
+            .count();
+
+        assert_eq!(removal_count, 0, "Should have no Removal events when envir= is non-default");
+    }
+
+    #[test]
+    fn test_artifacts_removal_with_globalenv() {
+        // Test: rm(x, envir = globalenv()) SHOULD create a Removal event
+        // Validates: Requirements 4.3
+        let code = "x <- 1\nrm(x, envir = globalenv())";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Should have both Def and Removal (globalenv() is default-equivalent)
+        let removal_count = artifacts.timeline.iter()
+            .filter(|e| matches!(e, ScopeEvent::Removal { .. }))
+            .count();
+
+        assert_eq!(removal_count, 1, "Should have one Removal event when envir=globalenv()");
+    }
+
+    #[test]
+    fn test_artifacts_timeline_sorting_with_removals() {
+        // Test that timeline is correctly sorted when mixing Def, Source, Removal, and FunctionScope
+        // Validates: Requirements 1.1, 7.1
+        let code = "a <- 1\nsource(\"utils.R\")\nb <- 2\nrm(a)\nc <- 3";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Collect all events with their types and line numbers
+        let timeline_events: Vec<(&str, u32)> = artifacts.timeline.iter()
+            .map(|e| match e {
+                ScopeEvent::Def { line, .. } => ("Def", *line),
+                ScopeEvent::Source { line, .. } => ("Source", *line),
+                ScopeEvent::FunctionScope { start_line, .. } => ("FunctionScope", *start_line),
+                ScopeEvent::Removal { line, .. } => ("Removal", *line),
+            })
+            .collect();
+
+        // Verify events are sorted by line number
+        let lines: Vec<u32> = timeline_events.iter().map(|(_, line)| *line).collect();
+        let mut sorted_lines = lines.clone();
+        sorted_lines.sort();
+        assert_eq!(lines, sorted_lines, "Timeline should be sorted by line number");
+
+        // Verify expected order: Def(0), Source(1), Def(2), Removal(3), Def(4)
+        assert_eq!(timeline_events[0], ("Def", 0), "First: Def a on line 0");
+        assert_eq!(timeline_events[1], ("Source", 1), "Second: Source on line 1");
+        assert_eq!(timeline_events[2], ("Def", 2), "Third: Def b on line 2");
+        assert_eq!(timeline_events[3], ("Removal", 3), "Fourth: Removal on line 3");
+        assert_eq!(timeline_events[4], ("Def", 4), "Fifth: Def c on line 4");
+    }
+
+    // ============================================================================
+    // Unit tests for scope resolution with removals (Task 5.4)
+    // Validates: Requirements 7.1, 7.2, 7.3, 7.4
+    // ============================================================================
+
+    #[test]
+    fn test_scope_define_then_remove() {
+        // Test: x <- 1; rm(x) - x should NOT be in scope after rm()
+        // Validates: Requirements 7.3, 7.4
+        let code = "x <- 1\nrm(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Before rm() (line 0, after definition), x should be in scope
+        let scope_before_rm = scope_at_position(&artifacts, 0, 10);
+        assert!(scope_before_rm.symbols.contains_key("x"), 
+            "x should be in scope after definition but before rm()");
+
+        // After rm() (line 1, after rm call), x should NOT be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        assert!(!scope_after_rm.symbols.contains_key("x"), 
+            "x should NOT be in scope after rm()");
+
+        // At end of file, x should NOT be in scope
+        let scope_eof = scope_at_position(&artifacts, 10, 0);
+        assert!(!scope_eof.symbols.contains_key("x"), 
+            "x should NOT be in scope at end of file after rm()");
+    }
+
+    #[test]
+    fn test_scope_remove_then_define() {
+        // Test: rm(x); x <- 1 - x should be in scope after definition
+        // Validates: Requirements 7.2
+        let code = "rm(x)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // After rm() but before definition (line 0), x should NOT be in scope
+        // (rm() on undefined symbol has no effect, but x is still not defined)
+        let scope_after_rm = scope_at_position(&artifacts, 0, 10);
+        assert!(!scope_after_rm.symbols.contains_key("x"), 
+            "x should NOT be in scope after rm() of undefined symbol");
+
+        // After definition (line 1), x should be in scope
+        let scope_after_def = scope_at_position(&artifacts, 1, 10);
+        assert!(scope_after_def.symbols.contains_key("x"), 
+            "x should be in scope after definition");
+
+        // At end of file, x should be in scope
+        let scope_eof = scope_at_position(&artifacts, 10, 0);
+        assert!(scope_eof.symbols.contains_key("x"), 
+            "x should be in scope at end of file after definition");
+    }
+
+    #[test]
+    fn test_scope_define_remove_define() {
+        // Test: x <- 1; rm(x); x <- 2 - x should be in scope after second definition
+        // Validates: Requirements 7.1
+        let code = "x <- 1\nrm(x)\nx <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // After first definition (line 0), x should be in scope
+        let scope_after_first_def = scope_at_position(&artifacts, 0, 10);
+        assert!(scope_after_first_def.symbols.contains_key("x"), 
+            "x should be in scope after first definition");
+
+        // After rm() (line 1), x should NOT be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        assert!(!scope_after_rm.symbols.contains_key("x"), 
+            "x should NOT be in scope after rm()");
+
+        // After second definition (line 2), x should be in scope again
+        let scope_after_second_def = scope_at_position(&artifacts, 2, 10);
+        assert!(scope_after_second_def.symbols.contains_key("x"), 
+            "x should be in scope after second definition");
+
+        // At end of file, x should be in scope
+        let scope_eof = scope_at_position(&artifacts, 10, 0);
+        assert!(scope_eof.symbols.contains_key("x"), 
+            "x should be in scope at end of file after re-definition");
+    }
+
+    #[test]
+    fn test_scope_position_aware_queries() {
+        // Test position-aware queries at different points in the code
+        // Validates: Requirements 7.3, 7.4
+        let code = "a <- 1\nb <- 2\nrm(a)\nc <- 3\nrm(b, c)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Line 0: only 'a' is defined
+        let scope_line0 = scope_at_position(&artifacts, 0, 10);
+        assert!(scope_line0.symbols.contains_key("a"), "a should be in scope on line 0");
+        assert!(!scope_line0.symbols.contains_key("b"), "b should NOT be in scope on line 0");
+        assert!(!scope_line0.symbols.contains_key("c"), "c should NOT be in scope on line 0");
+
+        // Line 1: 'a' and 'b' are defined
+        let scope_line1 = scope_at_position(&artifacts, 1, 10);
+        assert!(scope_line1.symbols.contains_key("a"), "a should be in scope on line 1");
+        assert!(scope_line1.symbols.contains_key("b"), "b should be in scope on line 1");
+        assert!(!scope_line1.symbols.contains_key("c"), "c should NOT be in scope on line 1");
+
+        // Line 2: 'a' is removed, only 'b' remains
+        let scope_line2 = scope_at_position(&artifacts, 2, 10);
+        assert!(!scope_line2.symbols.contains_key("a"), "a should NOT be in scope on line 2 (after rm)");
+        assert!(scope_line2.symbols.contains_key("b"), "b should be in scope on line 2");
+        assert!(!scope_line2.symbols.contains_key("c"), "c should NOT be in scope on line 2");
+
+        // Line 3: 'b' and 'c' are defined, 'a' is still removed
+        let scope_line3 = scope_at_position(&artifacts, 3, 10);
+        assert!(!scope_line3.symbols.contains_key("a"), "a should NOT be in scope on line 3");
+        assert!(scope_line3.symbols.contains_key("b"), "b should be in scope on line 3");
+        assert!(scope_line3.symbols.contains_key("c"), "c should be in scope on line 3");
+
+        // Line 4: 'b' and 'c' are removed, nothing remains
+        let scope_line4 = scope_at_position(&artifacts, 4, 10);
+        assert!(!scope_line4.symbols.contains_key("a"), "a should NOT be in scope on line 4");
+        assert!(!scope_line4.symbols.contains_key("b"), "b should NOT be in scope on line 4 (after rm)");
+        assert!(!scope_line4.symbols.contains_key("c"), "c should NOT be in scope on line 4 (after rm)");
+    }
+
+    #[test]
+    fn test_scope_removal_multiple_symbols() {
+        // Test: x <- 1; y <- 2; rm(x, y) - both should be removed
+        // Validates: Requirements 1.2, 7.4
+        let code = "x <- 1\ny <- 2\nrm(x, y)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Before rm() (line 1), both x and y should be in scope
+        let scope_before_rm = scope_at_position(&artifacts, 1, 10);
+        assert!(scope_before_rm.symbols.contains_key("x"), "x should be in scope before rm()");
+        assert!(scope_before_rm.symbols.contains_key("y"), "y should be in scope before rm()");
+
+        // After rm() (line 2), neither x nor y should be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 2, 10);
+        assert!(!scope_after_rm.symbols.contains_key("x"), "x should NOT be in scope after rm()");
+        assert!(!scope_after_rm.symbols.contains_key("y"), "y should NOT be in scope after rm()");
+    }
+
+    #[test]
+    fn test_scope_removal_with_list_argument() {
+        // Test: x <- 1; y <- 2; rm(list = c("x", "y")) - both should be removed
+        // Validates: Requirements 3.1, 3.2, 7.4
+        let code = "x <- 1\ny <- 2\nrm(list = c(\"x\", \"y\"))";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Before rm() (line 1), both x and y should be in scope
+        let scope_before_rm = scope_at_position(&artifacts, 1, 10);
+        assert!(scope_before_rm.symbols.contains_key("x"), "x should be in scope before rm()");
+        assert!(scope_before_rm.symbols.contains_key("y"), "y should be in scope before rm()");
+
+        // After rm() (line 2), neither x nor y should be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 2, 10);
+        assert!(!scope_after_rm.symbols.contains_key("x"), "x should NOT be in scope after rm(list=...)");
+        assert!(!scope_after_rm.symbols.contains_key("y"), "y should NOT be in scope after rm(list=...)");
+    }
+
+    #[test]
+    fn test_scope_removal_using_remove_alias() {
+        // Test: x <- 1; remove(x) - x should NOT be in scope after remove()
+        // Validates: Requirements 2.1, 2.2, 7.4
+        let code = "x <- 1\nremove(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Before remove() (line 0), x should be in scope
+        let scope_before_rm = scope_at_position(&artifacts, 0, 10);
+        assert!(scope_before_rm.symbols.contains_key("x"), 
+            "x should be in scope before remove()");
+
+        // After remove() (line 1), x should NOT be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        assert!(!scope_after_rm.symbols.contains_key("x"), 
+            "x should NOT be in scope after remove()");
+    }
+
+    #[test]
+    fn test_scope_removal_does_not_affect_other_symbols() {
+        // Test: x <- 1; y <- 2; rm(x) - y should still be in scope
+        // Validates: Requirements 7.3, 7.4
+        let code = "x <- 1\ny <- 2\nrm(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // After rm(x) (line 2), x should NOT be in scope but y should be
+        let scope_after_rm = scope_at_position(&artifacts, 2, 10);
+        assert!(!scope_after_rm.symbols.contains_key("x"), 
+            "x should NOT be in scope after rm(x)");
+        assert!(scope_after_rm.symbols.contains_key("y"), 
+            "y should still be in scope after rm(x)");
+    }
+
+    #[test]
+    fn test_scope_removal_inside_function_local_only() {
+        // Test: rm() inside a function should only affect that function's scope
+        // Validates: Requirements 5.1, 5.2, 5.3
+        let code = "x <- 1\nmy_func <- function() {\n  y <- 2\n  rm(y)\n  z <- 3\n}";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Outside function (after function definition), x should be in scope
+        let scope_outside = scope_at_position(&artifacts, 10, 0);
+        assert!(scope_outside.symbols.contains_key("x"), 
+            "x should be in scope outside function");
+        assert!(scope_outside.symbols.contains_key("my_func"), 
+            "my_func should be in scope outside function");
+        // y and z are function-local, should NOT be in global scope
+        assert!(!scope_outside.symbols.contains_key("y"), 
+            "y should NOT be in global scope (function-local)");
+        assert!(!scope_outside.symbols.contains_key("z"), 
+            "z should NOT be in global scope (function-local)");
+
+        // Inside function, after rm(y) but before z definition (line 3)
+        // Find position inside function body after rm(y)
+        let scope_inside_after_rm = scope_at_position(&artifacts, 3, 10);
+        assert!(!scope_inside_after_rm.symbols.contains_key("y"), 
+            "y should NOT be in scope inside function after rm(y)");
+
+        // Inside function, after z definition (line 4)
+        let scope_inside_after_z = scope_at_position(&artifacts, 4, 10);
+        assert!(scope_inside_after_z.symbols.contains_key("z"), 
+            "z should be in scope inside function after definition");
+        assert!(!scope_inside_after_z.symbols.contains_key("y"), 
+            "y should still NOT be in scope after rm(y)");
+    }
+
+    #[test]
+    fn test_scope_global_removal_does_not_affect_function_scope() {
+        // Test: Global rm() should not affect symbols inside functions
+        // Validates: Requirements 5.1, 5.2
+        let code = "x <- 1\nrm(x)\nmy_func <- function() {\n  y <- 2\n}";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // After rm(x) at global level, x should NOT be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        assert!(!scope_after_rm.symbols.contains_key("x"), 
+            "x should NOT be in scope after global rm(x)");
+
+        // Inside function, y should be in scope (unaffected by global rm)
+        let scope_inside_func = scope_at_position(&artifacts, 3, 10);
+        assert!(scope_inside_func.symbols.contains_key("y"), 
+            "y should be in scope inside function");
+        assert!(!scope_inside_func.symbols.contains_key("x"), 
+            "x should NOT be in scope inside function (removed globally before function)");
+    }
+
+    #[test]
+    fn test_scope_removal_with_envir_globalenv() {
+        // Test: rm(x, envir = globalenv()) should still remove x
+        // Validates: Requirements 4.2, 4.3
+        let code = "x <- 1\nrm(x, envir = globalenv())";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // After rm() with envir=globalenv(), x should NOT be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        assert!(!scope_after_rm.symbols.contains_key("x"), 
+            "x should NOT be in scope after rm(x, envir=globalenv())");
+    }
+
+    #[test]
+    fn test_scope_removal_with_envir_non_default_ignored() {
+        // Test: rm(x, envir = my_env) should NOT remove x from scope
+        // Validates: Requirements 4.1
+        let code = "x <- 1\nrm(x, envir = my_env)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // After rm() with non-default envir, x should still be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 1, 10);
+        assert!(scope_after_rm.symbols.contains_key("x"), 
+            "x should still be in scope after rm(x, envir=my_env) - non-default envir is ignored");
+    }
+
+    #[test]
+    fn test_scope_removal_complex_sequence() {
+        // Test a complex sequence of definitions and removals
+        // Validates: Requirements 7.1, 7.2, 7.3, 7.4
+        let code = "a <- 1\nb <- 2\nrm(a)\na <- 3\nc <- 4\nrm(b, c)\na <- 5";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Line 0: a defined
+        let scope_l0 = scope_at_position(&artifacts, 0, 10);
+        assert!(scope_l0.symbols.contains_key("a"));
+        assert!(!scope_l0.symbols.contains_key("b"));
+        assert!(!scope_l0.symbols.contains_key("c"));
+
+        // Line 1: a, b defined
+        let scope_l1 = scope_at_position(&artifacts, 1, 10);
+        assert!(scope_l1.symbols.contains_key("a"));
+        assert!(scope_l1.symbols.contains_key("b"));
+        assert!(!scope_l1.symbols.contains_key("c"));
+
+        // Line 2: a removed, b remains
+        let scope_l2 = scope_at_position(&artifacts, 2, 10);
+        assert!(!scope_l2.symbols.contains_key("a"));
+        assert!(scope_l2.symbols.contains_key("b"));
+        assert!(!scope_l2.symbols.contains_key("c"));
+
+        // Line 3: a re-defined, b remains
+        let scope_l3 = scope_at_position(&artifacts, 3, 10);
+        assert!(scope_l3.symbols.contains_key("a"));
+        assert!(scope_l3.symbols.contains_key("b"));
+        assert!(!scope_l3.symbols.contains_key("c"));
+
+        // Line 4: a, b, c defined
+        let scope_l4 = scope_at_position(&artifacts, 4, 10);
+        assert!(scope_l4.symbols.contains_key("a"));
+        assert!(scope_l4.symbols.contains_key("b"));
+        assert!(scope_l4.symbols.contains_key("c"));
+
+        // Line 5: b, c removed, a remains
+        let scope_l5 = scope_at_position(&artifacts, 5, 10);
+        assert!(scope_l5.symbols.contains_key("a"));
+        assert!(!scope_l5.symbols.contains_key("b"));
+        assert!(!scope_l5.symbols.contains_key("c"));
+
+        // Line 6: a re-defined again
+        let scope_l6 = scope_at_position(&artifacts, 6, 10);
+        assert!(scope_l6.symbols.contains_key("a"));
+        assert!(!scope_l6.symbols.contains_key("b"));
+        assert!(!scope_l6.symbols.contains_key("c"));
+    }
+
+    #[test]
+    fn test_scope_removal_at_exact_position() {
+        // Test scope at the exact position of the rm() call
+        // Validates: Requirements 7.3, 7.4
+        // Note: The scope resolution uses <= comparison, so at the exact position
+        // of the rm() call, the removal is already processed.
+        let code = "x <- 1\nrm(x)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // At position (0, 10) - after x definition on line 0, x should be in scope
+        let scope_before_rm_line = scope_at_position(&artifacts, 0, 10);
+        assert!(scope_before_rm_line.symbols.contains_key("x"), 
+            "x should be in scope on line 0 (before rm line)");
+
+        // At position (1, 0) - at the start of rm(x) line, the removal is processed
+        // because scope resolution uses <= comparison
+        let scope_at_rm_start = scope_at_position(&artifacts, 1, 0);
+        assert!(!scope_at_rm_start.symbols.contains_key("x"), 
+            "x should NOT be in scope at rm() position (removal is processed at <=)");
+
+        // At position (1, 5) - after rm(x), x should NOT be in scope
+        let scope_after_rm = scope_at_position(&artifacts, 1, 5);
+        assert!(!scope_after_rm.symbols.contains_key("x"), 
+            "x should NOT be in scope after rm(x) on the same line");
+    }
+
+    #[test]
+    fn test_scope_with_deps_define_then_remove() {
+        // Test scope_at_position_with_deps with define-then-remove
+        // Validates: Requirements 7.3, 7.4
+        let code = "x <- 1\nrm(x)";
+        let tree = parse_r(code);
+        let uri = test_uri();
+        let artifacts = compute_artifacts(&uri, &tree, code);
+
+        let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
+            if u == &uri { Some(artifacts.clone()) } else { None }
+        };
+
+        let resolve_path = |_path: &str, _from: &Url| -> Option<Url> { None };
+
+        // After rm(), x should NOT be in scope
+        let scope = scope_at_position_with_deps(&uri, 1, 10, &get_artifacts, &resolve_path, 10);
+        assert!(!scope.symbols.contains_key("x"), 
+            "x should NOT be in scope after rm() via scope_at_position_with_deps");
+    }
+
+    #[test]
+    fn test_scope_with_deps_define_remove_define() {
+        // Test scope_at_position_with_deps with define-remove-define sequence
+        // Validates: Requirements 7.1
+        let code = "x <- 1\nrm(x)\nx <- 2";
+        let tree = parse_r(code);
+        let uri = test_uri();
+        let artifacts = compute_artifacts(&uri, &tree, code);
+
+        let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
+            if u == &uri { Some(artifacts.clone()) } else { None }
+        };
+
+        let resolve_path = |_path: &str, _from: &Url| -> Option<Url> { None };
+
+        // After second definition, x should be in scope
+        let scope = scope_at_position_with_deps(&uri, 2, 10, &get_artifacts, &resolve_path, 10);
+        assert!(scope.symbols.contains_key("x"), 
+            "x should be in scope after re-definition via scope_at_position_with_deps");
+    }
+
+    // ============================================================================
+    // Cross-file integration tests for removals (Task 7.2)
+    // Validates: Requirements 6.1, 6.2
+    // ============================================================================
+
+    #[test]
+    fn test_cross_file_source_then_remove_symbol() {
+        // Test: Parent sources child that defines helper_func, then rm(helper_func)
+        // helper_func should NOT be in scope after rm()
+        // Validates: Requirements 6.1, 6.2
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // Parent code: sources child.R, then removes helper_func
+        let parent_code = "source(\"child.R\")\nrm(helper_func)";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: defines helper_func
+        let child_code = "helper_func <- function() { 42 }";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Before rm() (line 0, after source), helper_func should be in scope
+        let scope_before_rm = scope_at_position_with_graph(
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(scope_before_rm.symbols.contains_key("helper_func"), 
+            "helper_func should be in scope after source() but before rm()");
+
+        // After rm() (line 1), helper_func should NOT be in scope
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(!scope_after_rm.symbols.contains_key("helper_func"), 
+            "helper_func should NOT be in scope after rm()");
+
+        // At end of file, helper_func should NOT be in scope
+        let scope_eof = scope_at_position_with_graph(
+            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(!scope_eof.symbols.contains_key("helper_func"), 
+            "helper_func should NOT be in scope at end of file after rm()");
+    }
+
+    #[test]
+    fn test_cross_file_source_then_remove_multiple_symbols() {
+        // Test: Parent sources child that defines multiple symbols, then rm() some of them
+        // Validates: Requirements 6.1, 6.2
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // Parent code: sources child.R, then removes func_a and func_b
+        let parent_code = "source(\"child.R\")\nrm(func_a, func_b)";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: defines func_a, func_b, func_c
+        let child_code = "func_a <- function() { 1 }\nfunc_b <- function() { 2 }\nfunc_c <- function() { 3 }";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Before rm() (line 0, after source), all three functions should be in scope
+        let scope_before_rm = scope_at_position_with_graph(
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(scope_before_rm.symbols.contains_key("func_a"), "func_a should be in scope before rm()");
+        assert!(scope_before_rm.symbols.contains_key("func_b"), "func_b should be in scope before rm()");
+        assert!(scope_before_rm.symbols.contains_key("func_c"), "func_c should be in scope before rm()");
+
+        // After rm() (line 1), func_a and func_b should NOT be in scope, but func_c should be
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(!scope_after_rm.symbols.contains_key("func_a"), "func_a should NOT be in scope after rm()");
+        assert!(!scope_after_rm.symbols.contains_key("func_b"), "func_b should NOT be in scope after rm()");
+        assert!(scope_after_rm.symbols.contains_key("func_c"), "func_c should still be in scope after rm()");
+    }
+
+    #[test]
+    fn test_cross_file_backward_directive_with_removal_in_parent() {
+        // Test: Child file with backward directive sees parent's scope with removals applied
+        // Parent: defines x, sources child, then rm(x)
+        // Child: should see x in scope (because it's sourced before rm)
+        // Validates: Requirements 6.1, 6.2, 6.3
+        use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+
+        // Parent code: defines x, sources child at line 1, then rm(x) at line 2
+        let parent_code = "x <- 1\nsource(\"child.R\")\nrm(x)";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: uses x (has backward directive pointing to parent)
+        let child_code = "# @lsp-sourced-by parent.R line=2\ny <- x + 1";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Child metadata with backward directive
+        let child_metadata = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Line(1), // 0-based line 1 (source("child.R"))
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "parent.R" { Some(parent_uri.clone()) } else { None }
+        };
+
+        // In child file, x should be in scope (parent's scope at call site line 1)
+        // At line 1 in parent, x is defined but rm(x) hasn't happened yet
+        let scope_in_child = scope_at_position_with_backward(
+            &child_uri, 1, 10, &get_artifacts, &get_metadata, &resolve_path, 10, None
+        );
+
+        assert!(scope_in_child.symbols.contains_key("x"), 
+            "x should be in scope in child (parent's scope at call site before rm)");
+        assert!(scope_in_child.symbols.contains_key("y"), 
+            "y should be in scope in child (local definition)");
+    }
+
+    #[test]
+    fn test_cross_file_backward_directive_removal_before_call_site() {
+        // Test: Parent removes symbol BEFORE sourcing child
+        // Child should NOT see the removed symbol
+        // Validates: Requirements 6.1, 6.2, 6.3
+        use crate::cross_file::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+
+        // Parent code: defines x, rm(x), then sources child
+        let parent_code = "x <- 1\nrm(x)\nsource(\"child.R\")";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: has backward directive pointing to parent
+        let child_code = "# @lsp-sourced-by parent.R line=3\ny <- 1";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Child metadata with backward directive
+        let child_metadata = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Line(2), // 0-based line 2 (source("child.R"))
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
+            if path == "parent.R" { Some(parent_uri.clone()) } else { None }
+        };
+
+        // In child file, x should NOT be in scope (removed before call site)
+        let scope_in_child = scope_at_position_with_backward(
+            &child_uri, 1, 10, &get_artifacts, &get_metadata, &resolve_path, 10, None
+        );
+
+        assert!(!scope_in_child.symbols.contains_key("x"), 
+            "x should NOT be in scope in child (removed before call site in parent)");
+        assert!(scope_in_child.symbols.contains_key("y"), 
+            "y should be in scope in child (local definition)");
+    }
+
+    #[test]
+    fn test_cross_file_source_remove_redefine() {
+        // Test: Parent sources child, removes symbol, then redefines it locally
+        // The local redefinition should be in scope
+        // Validates: Requirements 6.1, 6.2, 7.1
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // Parent code: sources child.R, removes helper_func, then redefines it
+        let parent_code = "source(\"child.R\")\nrm(helper_func)\nhelper_func <- function() { 99 }";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: defines helper_func
+        let child_code = "helper_func <- function() { 42 }";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // After source() but before rm() (line 0), helper_func from child should be in scope
+        let scope_after_source = scope_at_position_with_graph(
+            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(scope_after_source.symbols.contains_key("helper_func"), 
+            "helper_func should be in scope after source()");
+
+        // After rm() but before redefinition (line 1), helper_func should NOT be in scope
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(!scope_after_rm.symbols.contains_key("helper_func"), 
+            "helper_func should NOT be in scope after rm()");
+
+        // After redefinition (line 2), helper_func should be in scope again
+        let scope_after_redef = scope_at_position_with_graph(
+            &parent_uri, 2, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(scope_after_redef.symbols.contains_key("helper_func"), 
+            "helper_func should be in scope after local redefinition");
+
+        // Verify the redefined symbol is from parent, not child
+        let symbol = scope_after_redef.symbols.get("helper_func").unwrap();
+        assert_eq!(symbol.source_uri, parent_uri, 
+            "helper_func should be from parent after redefinition");
+    }
+
+    #[test]
+    fn test_cross_file_removal_with_list_argument() {
+        // Test: Parent sources child, then removes symbols using list= argument
+        // Validates: Requirements 3.1, 3.2, 6.1, 6.2
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // Parent code: sources child.R, then removes symbols using list=
+        let parent_code = "source(\"child.R\")\nrm(list = c(\"func_a\", \"func_b\"))";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: defines func_a, func_b, func_c
+        let child_code = "func_a <- function() { 1 }\nfunc_b <- function() { 2 }\nfunc_c <- function() { 3 }";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // After rm(list=...) (line 1), func_a and func_b should NOT be in scope
+        let scope_after_rm = scope_at_position_with_graph(
+            &parent_uri, 1, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(!scope_after_rm.symbols.contains_key("func_a"), 
+            "func_a should NOT be in scope after rm(list=...)");
+        assert!(!scope_after_rm.symbols.contains_key("func_b"), 
+            "func_b should NOT be in scope after rm(list=...)");
+        assert!(scope_after_rm.symbols.contains_key("func_c"), 
+            "func_c should still be in scope after rm(list=...)");
+    }
+
+    #[test]
+    fn test_cross_file_removal_does_not_affect_child_scope() {
+        // Test: Parent removes symbol, but child file's own scope is unaffected
+        // Validates: Requirements 6.1, 6.2
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // Parent code: sources child.R, then removes helper_func
+        let parent_code = "source(\"child.R\")\nrm(helper_func)";
+        let parent_tree = parse_r(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: defines helper_func
+        let child_code = "helper_func <- function() { 42 }";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // In child file, helper_func should still be in scope (child's own definition)
+        let scope_in_child = scope_at_position_with_graph(
+            &child_uri, 0, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(scope_in_child.symbols.contains_key("helper_func"), 
+            "helper_func should be in scope in child file (its own definition)");
+
+        // In parent file after rm(), helper_func should NOT be in scope
+        let scope_in_parent = scope_at_position_with_graph(
+            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(!scope_in_parent.symbols.contains_key("helper_func"), 
+            "helper_func should NOT be in scope in parent after rm()");
+    }
+
+    #[test]
+    fn test_cross_file_chained_sources_with_removal() {
+        // Test: A sources B, B sources C, A removes symbol from C
+        // Validates: Requirements 6.1, 6.2
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let uri_a = Url::parse("file:///project/a.R").unwrap();
+        let uri_b = Url::parse("file:///project/b.R").unwrap();
+        let uri_c = Url::parse("file:///project/c.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // A: sources B, then removes deep_func
+        let code_a = "source(\"b.R\")\nrm(deep_func)";
+        let tree_a = parse_r(code_a);
+        let artifacts_a = compute_artifacts(&uri_a, &tree_a, code_a);
+
+        // B: sources C
+        let code_b = "source(\"c.R\")";
+        let tree_b = parse_r(code_b);
+        let artifacts_b = compute_artifacts(&uri_b, &tree_b, code_b);
+
+        // C: defines deep_func
+        let code_c = "deep_func <- function() { 42 }";
+        let tree_c = parse_r(code_c);
+        let artifacts_c = compute_artifacts(&uri_c, &tree_c, code_c);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let meta_a = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "b.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        let meta_b = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "c.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&uri_a, &meta_a, Some(&workspace_root), |_| None);
+        graph.update_file(&uri_b, &meta_b, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &uri_a { Some(artifacts_a.clone()) }
+            else if uri == &uri_b { Some(artifacts_b.clone()) }
+            else if uri == &uri_c { Some(artifacts_c.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &uri_a { Some(meta_a.clone()) }
+            else if uri == &uri_b { Some(meta_b.clone()) }
+            else { None }
+        };
+
+        // Before rm() in A (line 0), deep_func should be in scope (from C via B)
+        let scope_before_rm = scope_at_position_with_graph(
+            &uri_a, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(scope_before_rm.symbols.contains_key("deep_func"), 
+            "deep_func should be in scope in A after source(B) which sources C");
+
+        // After rm() in A (line 1), deep_func should NOT be in scope
+        let scope_after_rm = scope_at_position_with_graph(
+            &uri_a, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+        assert!(!scope_after_rm.symbols.contains_key("deep_func"), 
+            "deep_func should NOT be in scope in A after rm()");
     }
 }
