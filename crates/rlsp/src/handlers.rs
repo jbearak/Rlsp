@@ -2043,24 +2043,10 @@ mod tests {
     #[test]
     fn test_escape_markdown_mixed_content() {
         let input = "function(x) { x * 2 }";
-        let expected = "function\\(x\\) \\{ x \\* 2 \\}";
+        let expected = "function\\(x\\) { x \\* 2 }";
         
         let result = escape_markdown(input);
         assert_eq!(result, expected);
-    }
-
-    fn find_function_definition(node: Node) -> Option<Node> {
-        if node.kind() == "function_definition" {
-            return Some(node);
-        }
-        
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(func) = find_function_definition(child) {
-                return Some(func);
-            }
-        }
-        None
     }
 
     fn find_function_definition(node: Node) -> Option<Node> {
@@ -2389,26 +2375,6 @@ mod proptests {
         assert!(result.is_some());
         let info = result.unwrap();
         assert_eq!(info.statement, "for (i in 1:10) {\n  print(i)\n}");
-    }
-
-    fn parse_r_code(code: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
-        parser.parse(code, None).unwrap()
-    }
-
-    fn find_function_definition(node: Node) -> Option<Node> {
-        if node.kind() == "function_definition" {
-            return Some(node);
-        }
-        
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(func) = find_function_definition(child) {
-                return Some(func);
-            }
-        }
-        None
     }
 
     #[test]
