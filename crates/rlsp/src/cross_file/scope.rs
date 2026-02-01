@@ -2083,13 +2083,13 @@ where
                         // Requirements 5.1, 5.3: Collect packages loaded before this source() call
                         // to pass to the child file. The child will have access to these packages
                         // from position (0, 0).
-                        let mut packages_for_child: Vec<String> = scope.inherited_packages.clone();
-                        
                         // Get the function scope of the source() call for filtering function-scoped packages
                         let source_function_scope = artifacts.function_scope_tree
                             .query_innermost(Position::new(*src_line, *src_col))
                             .map(|interval| interval.as_tuple());
-                        
+
+                        let mut extra_packages: Vec<String> = Vec::new();
+
                         // Collect packages from this file's timeline that are loaded before the source() call
                         for pkg_event in &artifacts.timeline {
                             if let ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } = pkg_event {
@@ -2111,11 +2111,28 @@ where
                                         }
                                     };
                                     
-                                    if should_include && !packages_for_child.contains(package) {
-                                        packages_for_child.push(package.clone());
+                                    if should_include
+                                        && !scope.inherited_packages.contains(package)
+                                        && !extra_packages.contains(package) {
+                                        extra_packages.push(package.clone());
                                     }
                                 }
                             }
+                        }
+
+                        let mut packages_for_child: Vec<String>;
+                        let packages_slice: &[String];
+
+                        if extra_packages.is_empty() {
+                            packages_slice = scope.inherited_packages.as_slice();
+                        } else {
+                            packages_for_child = scope.inherited_packages.clone();
+                            for pkg in extra_packages {
+                                if !packages_for_child.contains(&pkg) {
+                                    packages_for_child.push(pkg);
+                                }
+                            }
+                            packages_slice = packages_for_child.as_slice();
                         }
 
                         // Build child PathContext, respecting chdir flag
@@ -2154,7 +2171,7 @@ where
                             max_depth,
                             current_depth + 1,
                             visited,
-                            &packages_for_child, // Pass inherited packages to child
+                            packages_slice, // Pass inherited packages to child
                         );
                         // Merge child symbols (local definitions take precedence)
                         for (name, symbol) in child_scope.symbols {

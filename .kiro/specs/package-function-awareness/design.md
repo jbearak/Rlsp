@@ -15,7 +15,7 @@ The package function awareness feature consists of four main components:
 3. **Package Scope Integration** - Integrates package loading into the scope timeline
 4. **R Subprocess Interface** - Queries R for package exports and library paths
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────┐
 │                           WorldState                                 │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -186,7 +186,7 @@ pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>>
 
 Package loads are tracked in the scope timeline alongside definitions and source() calls:
 
-```
+```text
 Timeline for file.R:
   Line 1: Def { x <- 1 }
   Line 2: PackageLoad { dplyr, global }
@@ -200,7 +200,7 @@ Timeline for file.R:
 
 When resolving scope for a child file sourced by a parent:
 
-```
+```text
 parent.R:
   library(dplyr)      # Line 1
   source("child.R")   # Line 5

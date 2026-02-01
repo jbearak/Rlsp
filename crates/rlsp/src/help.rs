@@ -50,22 +50,25 @@ impl Default for HelpCache {
 /// }
 /// ```
 pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
-    let r_code = if let Some(pkg) = package {
-        format!(
-            "cat(paste(capture.output(tools::Rd2txt(utils:::.getHelpFile(help('{}', package='{}')), options=list(underline_titles=FALSE))), collapse='\\n'))",
-            topic, pkg
-        )
-    } else {
-        format!(
-            "cat(paste(capture.output(tools::Rd2txt(utils:::.getHelpFile(help('{}')), options=list(underline_titles=FALSE))), collapse='\\n'))",
-            topic
-        )
-    };
+    let r_code = r#"
+args <- commandArgs(trailingOnly = TRUE)
+topic <- args[1]
+pkg <- if (length(args) >= 2 && nzchar(args[2])) args[2] else NULL
+txt <- capture.output(
+  tools::Rd2txt(
+    utils:::.getHelpFile(help(topic, package = pkg)),
+    options = list(underline_titles = FALSE)
+  )
+)
+cat(paste(txt, collapse = "\n"))
+"#;
 
-    let output = Command::new("R")
-        .args(["--slave", "--no-save", "-e", &r_code])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("R");
+    cmd.args(["--slave", "--no-save", "--no-restore", "-e", r_code, "--args", topic]);
+    if let Some(pkg) = package {
+        cmd.arg(pkg);
+    }
+    let output = cmd.output().ok()?;
 
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).to_string();

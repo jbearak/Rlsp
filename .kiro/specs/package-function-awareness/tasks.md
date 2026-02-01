@@ -276,8 +276,8 @@ This implementation plan breaks down the package function awareness feature into
     - Add `packages_enabled: bool` (default: true)
     - Add `packages_additional_library_paths: Vec<PathBuf>`
     - Add `packages_r_path: Option<PathBuf>`
-`    - Add `packages_missing_package_severity: DiagnosticSeverity`
-`    - _Requirements: 12.1, 12.2, 12.3, 15.4_
+    - Add `packages_missing_package_severity: DiagnosticSeverity`
+    - _Requirements: 12.1, 12.2, 12.3, 15.4_
 
   - [x] 14.2 Parse configuration from initialization options
     - Update `from_initialization_options()` to parse package settings
