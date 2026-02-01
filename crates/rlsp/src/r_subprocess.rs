@@ -103,7 +103,7 @@ impl RSubprocess {
         let common_paths = Self::get_common_r_paths();
         common_paths
             .into_iter()
-            .find(|path| Self::is_valid_r_executable(path))
+            .find(Self::is_valid_r_executable)
     }
 
     /// Get platform-specific common R installation paths

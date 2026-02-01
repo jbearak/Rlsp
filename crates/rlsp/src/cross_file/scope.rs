@@ -1866,11 +1866,12 @@ where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
-    let mut scope = ScopeAtPosition::default();
-
-    // Initialize inherited_packages from parameter
+    // Initialize scope with inherited_packages from parameter
     // Requirements 5.1, 5.2: Packages inherited from parent files are available from position (0, 0)
-    scope.inherited_packages = inherited_packages.to_vec();
+    let mut scope = ScopeAtPosition {
+        inherited_packages: inherited_packages.to_vec(),
+        ..Default::default()
+    };
 
     if current_depth >= max_depth || visited.contains(uri) {
         return scope;
@@ -1967,7 +1968,7 @@ where
                                         .query_innermost(Position::new(call_site_line, call_site_col))
                                         .map(|interval| interval.as_tuple());
                                     
-                                    call_site_scope.map_or(false, |cs_scope| {
+                                    call_site_scope.is_some_and(|cs_scope| {
                                         cs_scope.0 == pkg_scope.start.line &&
                                         cs_scope.1 == pkg_scope.start.column &&
                                         cs_scope.2 == pkg_scope.end.line &&
@@ -2089,7 +2090,7 @@ where
                                             // Function-scoped package load - only include if:
                                             // 1. The source() call is in the same function scope, OR
                                             // 2. The source() call is nested within the package's function scope
-                                            source_function_scope.map_or(false, |src_scope| {
+                                            source_function_scope.is_some_and(|src_scope| {
                                                 src_scope.0 == pkg_scope.start.line &&
                                                 src_scope.1 == pkg_scope.start.column &&
                                                 src_scope.2 == pkg_scope.end.line &&
