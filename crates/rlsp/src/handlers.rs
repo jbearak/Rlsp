@@ -2966,6 +2966,19 @@ fn escape_markdown(text: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
+fn hover_blocking(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(hover(state, uri, position))
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hover(state, uri, position))
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2974,17 +2987,6 @@ fn escape_markdown(text: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    fn hover_blocking(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(super::hover(state, uri, position))
-        } else {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(super::hover(state, uri, position))
-        }
-    }
 
     fn parse_r_code(code: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
