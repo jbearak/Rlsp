@@ -4523,27 +4523,33 @@ child_function <- function() {
         // Get the effective working directory
         let effective_wd = ctx.effective_working_directory();
 
-        // The effective WD should be /child/data (child's explicit @lsp-cd)
-        // NOT /parent/data (parent's @lsp-cd)
-        assert!(
-            effective_wd.to_string_lossy().ends_with("/child/data")
-                || effective_wd.to_string_lossy() == "/child/data",
-            "Child's effective working directory should be /child/data (NOT /parent/data). Got: {}",
+        // The effective WD should be workspace_root/child/data (child's explicit @lsp-cd)
+        // NOT workspace_root/parent/data (parent's @lsp-cd)
+        let expected_child_wd = workspace.root().join("child").join("data");
+        let expected_parent_wd = workspace.root().join("parent").join("data");
+        assert_eq!(
+            effective_wd,
+            expected_child_wd,
+            "Child's effective working directory should be {} (NOT {}). Got: {}",
+            expected_child_wd.display(),
+            expected_parent_wd.display(),
             effective_wd.display()
         );
-        println!("  ✓ effective_working_directory() returns /child/data");
+        println!("  ✓ effective_working_directory() returns {}", expected_child_wd.display());
 
         // Verify it's NOT the parent's working directory
-        assert!(
-            !effective_wd.to_string_lossy().contains("/parent/data"),
-            "Child's effective working directory should NOT be /parent/data. Got: {}",
+        assert_ne!(
+            effective_wd,
+            expected_parent_wd,
+            "Child's effective working directory should NOT be {}. Got: {}",
+            expected_parent_wd.display(),
             effective_wd.display()
         );
-        println!("  ✓ effective_working_directory() is NOT /parent/data");
+        println!("  ✓ effective_working_directory() is NOT {}", expected_parent_wd.display());
 
         println!("\nStep 5: Verify source() resolution uses child's explicit @lsp-cd");
 
-        // Verify that source("utils.r") resolves to /child/data/utils.r
+        // Verify that source("utils.r") resolves to workspace_root/child/data/utils.r
         use crate::cross_file::path_resolve::resolve_path;
         let resolved_path = resolve_path("utils.r", &ctx);
 
@@ -4553,22 +4559,27 @@ child_function <- function() {
         );
         let resolved = resolved_path.unwrap();
 
-        // The resolved path should be /child/data/utils.r
-        assert!(
-            resolved.to_string_lossy().ends_with("/child/data/utils.r")
-                || resolved.to_string_lossy() == "/child/data/utils.r",
-            "source('utils.r') should resolve to /child/data/utils.r. Got: {}",
+        // The resolved path should be workspace_root/child/data/utils.r
+        let expected_child_utils = expected_child_wd.join("utils.r");
+        let expected_parent_utils = expected_parent_wd.join("utils.r");
+        assert_eq!(
+            resolved,
+            expected_child_utils,
+            "source('utils.r') should resolve to {}. Got: {}",
+            expected_child_utils.display(),
             resolved.display()
         );
         println!("  ✓ source('utils.r') resolves to: {}", resolved.display());
 
-        // Verify it's NOT resolved to /parent/data/utils.r
-        assert!(
-            !resolved.to_string_lossy().contains("/parent/data"),
-            "source('utils.r') should NOT resolve to /parent/data/utils.r. Got: {}",
+        // Verify it's NOT resolved to workspace_root/parent/data/utils.r
+        assert_ne!(
+            resolved,
+            expected_parent_utils,
+            "source('utils.r') should NOT resolve to {}. Got: {}",
+            expected_parent_utils.display(),
             resolved.display()
         );
-        println!("  ✓ source('utils.r') does NOT resolve to /parent/data/utils.r");
+        println!("  ✓ source('utils.r') does NOT resolve to {}", expected_parent_utils.display());
 
         println!("\nStep 6: Verify precedence even when inherited_working_directory is set");
 
@@ -4583,11 +4594,9 @@ child_function <- function() {
         let effective_wd_with_both = ctx_with_both.effective_working_directory();
 
         // Even with inherited_working_directory set, explicit @lsp-cd should take precedence
-        assert!(
-            effective_wd_with_both
-                .to_string_lossy()
-                .ends_with("/child/data")
-                || effective_wd_with_both.to_string_lossy() == "/child/data",
+        assert_eq!(
+            effective_wd_with_both,
+            expected_child_wd,
             "Explicit @lsp-cd should take precedence over inherited_working_directory. Got: {}",
             effective_wd_with_both.display()
         );
@@ -4595,17 +4604,16 @@ child_function <- function() {
             "  ✓ Explicit @lsp-cd takes precedence even when inherited_working_directory is set"
         );
 
-        // Verify source() still resolves to /child/data/utils.r
+        // Verify source() still resolves to workspace_root/child/data/utils.r
         let resolved_with_both = resolve_path("utils.r", &ctx_with_both).unwrap();
-        assert!(
-            resolved_with_both
-                .to_string_lossy()
-                .ends_with("/child/data/utils.r")
-                || resolved_with_both.to_string_lossy() == "/child/data/utils.r",
-            "source('utils.r') should still resolve to /child/data/utils.r. Got: {}",
+        assert_eq!(
+            resolved_with_both,
+            expected_child_utils,
+            "source('utils.r') should still resolve to {}. Got: {}",
+            expected_child_utils.display(),
             resolved_with_both.display()
         );
-        println!("  ✓ source('utils.r') still resolves to /child/data/utils.r");
+        println!("  ✓ source('utils.r') still resolves to {}", expected_child_utils.display());
 
         println!("\n=== Test Passed ===");
         println!("Summary:");
