@@ -462,6 +462,9 @@ impl LanguageServer for Backend {
         let (work_items, debounce_ms, files_to_index, on_demand_enabled, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
             
+            // Capture old metadata before recomputing (for WD change detection)
+            let old_meta = state.get_enriched_metadata(&uri);
+            
             // Extract and enrich metadata with inherited working directory
             let mut meta = crate::cross_file::extract_metadata(&text);
             let uri_clone = uri.clone();
@@ -565,6 +568,15 @@ impl LanguageServer for Backend {
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
             
+            // Invalidate children affected by working directory change (Requirement 8)
+            let wd_affected = crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                &uri,
+                old_meta.as_ref(),
+                &meta,
+                &state.cross_file_graph,
+                &state.cross_file_meta,
+            );
+            
             // Emit any directive-vs-AST conflict diagnostics
             if !result.diagnostics.is_empty() {
                 log::trace!("Directive-vs-AST conflicts detected: {} diagnostics", result.diagnostics.len());
@@ -581,6 +593,13 @@ impl LanguageServer for Backend {
                 if state.documents.contains_key(&dep) {
                     state.diagnostics_gate.mark_force_republish(&dep);
                     affected.insert(dep);
+                }
+            }
+            // Include children affected by WD change (Requirement 8)
+            for child in wd_affected {
+                if state.documents.contains_key(&child) {
+                    state.diagnostics_gate.mark_force_republish(&child);
+                    affected.insert(child);
                 }
             }
             
@@ -820,6 +839,9 @@ impl LanguageServer for Backend {
         let (work_items, debounce_ms, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
             
+            // Capture old metadata before recomputing (for WD change detection)
+            let old_meta = state.get_enriched_metadata(&uri);
+            
             // Update legacy documents HashMap first (for migration compatibility)
             if let Some(doc) = state.documents.get_mut(&uri) {
                 doc.version = Some(version);
@@ -835,7 +857,7 @@ impl LanguageServer for Backend {
             let package_library = state.package_library.clone();
             
             // Extract and enrich metadata with inherited working directory
-            let (packages_to_prefetch, enriched_meta) = if let Some(doc) = state.documents.get(&uri) {
+            let (packages_to_prefetch, enriched_meta, wd_affected) = if let Some(doc) = state.documents.get(&uri) {
                 let text = doc.text();
                 let mut meta = crate::cross_file::extract_metadata(&text);
                 let uri_clone = uri.clone();
@@ -882,9 +904,18 @@ impl LanguageServer for Backend {
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
                 
-                (pkgs, Some(meta))
+                // Invalidate children affected by working directory change (Requirement 8)
+                let wd_children = crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                    &uri,
+                    old_meta.as_ref(),
+                    &meta,
+                    &state.cross_file_graph,
+                    &state.cross_file_meta,
+                );
+                
+                (pkgs, Some(meta), wd_children)
             } else {
-                (Vec::new(), None)
+                (Vec::new(), None, Vec::new())
             };
             
             // Update new DocumentStore with enriched metadata (Requirement 1.4)
@@ -907,6 +938,13 @@ impl LanguageServer for Backend {
                     // This allows same-version republish when dependency changes
                     state.diagnostics_gate.mark_force_republish(&dep);
                     affected.insert(dep);
+                }
+            }
+            // Include children affected by WD change (Requirement 8)
+            for child in wd_affected {
+                if state.documents.contains_key(&child) {
+                    state.diagnostics_gate.mark_force_republish(&child);
+                    affected.insert(child);
                 }
             }
             
@@ -1270,7 +1308,11 @@ impl LanguageServer for Backend {
         // Schedule async disk reads to update workspace index for changed files
         if !uris_to_update.is_empty() {
             let state_arc = self.state.clone();
+            let client = self.client.clone();
             tokio::spawn(async move {
+                // Collect children affected by WD changes for diagnostics
+                let mut wd_affected_children: Vec<Url> = Vec::new();
+                
                 for uri in uris_to_update {
                     // Read file content asynchronously
                     let path = match uri.to_file_path() {
@@ -1289,6 +1331,12 @@ impl LanguageServer for Backend {
                     let metadata = match tokio::fs::metadata(&path).await {
                         Ok(m) => m,
                         Err(_) => continue,
+                    };
+                    
+                    // Capture old metadata before recomputing (for WD change detection)
+                    let old_meta = {
+                        let state = state_arc.read().await;
+                        state.get_enriched_metadata(&uri)
                     };
                     
                     // Compute metadata and artifacts
@@ -1361,9 +1409,49 @@ impl LanguageServer for Backend {
                             workspace_root.as_ref(),
                             |parent_uri| parent_content.get(parent_uri).cloned(),
                         );
+                        
+                        // Invalidate children affected by working directory change (Requirement 8)
+                        let wd_children = crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                            &uri,
+                            old_meta.as_ref(),
+                            &cross_file_meta,
+                            &state.cross_file_graph,
+                            &state.cross_file_meta,
+                        );
+                        // Collect open children for diagnostics
+                        for child in wd_children {
+                            if state.documents.contains_key(&child) && !wd_affected_children.contains(&child) {
+                                state.diagnostics_gate.mark_force_republish(&child);
+                                wd_affected_children.push(child);
+                            }
+                        }
                     }
                     
                     log::trace!("Updated workspace index for: {}", uri);
+                }
+                
+                // Publish diagnostics for children affected by WD changes (outside the loop)
+                for child_uri in wd_affected_children {
+                    let diagnostics_data = {
+                        let state = state_arc.read().await;
+                        let sync_diagnostics = crate::handlers::diagnostics(&state, &child_uri);
+                        let directive_meta = state.documents.get(&child_uri)
+                            .map(|doc| crate::cross_file::directive::parse_directives(&doc.text()))
+                            .unwrap_or_default();
+                        let workspace_folder = state.workspace_folders.first().cloned();
+                        let missing_file_severity = state.cross_file_config.missing_file_severity;
+                        (sync_diagnostics, directive_meta, workspace_folder, missing_file_severity)
+                    };
+                    
+                    let diagnostics = crate::handlers::diagnostics_async_standalone(
+                        &child_uri,
+                        diagnostics_data.0,
+                        &diagnostics_data.1,
+                        diagnostics_data.2.as_ref(),
+                        diagnostics_data.3,
+                    ).await;
+                    
+                    client.publish_diagnostics(child_uri, diagnostics, None).await;
                 }
             });
         }

@@ -67,6 +67,31 @@ Path resolution:
 
 **Note:** Working directory directives only affect `source()` call path resolution. All other LSP directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-source`, etc.) always resolve paths relative to the file's directory, ignoring any `@lsp-cd` setting.
 
+### Working Directory Inheritance
+
+When a child file uses a backward directive (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`) without its own explicit `@lsp-cd`, it inherits the working directory from its parent file. This enables accurate `source()` path resolution in child files that are run from a parent's working directory context.
+
+**Precedence rules:**
+1. Explicit `@lsp-cd` in the child file takes precedence (no inheritance)
+2. If no explicit `@lsp-cd`, the child inherits from its parent's effective working directory
+3. Inheritance is transitive: if the parent also inherits, the chain is followed
+
+**Example:**
+```r
+# parent.R
+# @lsp-cd /data/project
+source("child.R")  # Resolves to /data/project/child.R
+```
+
+```r
+# child.R
+# @lsp-run-by ../parent.R
+# No explicit @lsp-cd, so inherits /data/project from parent
+source("utils.R")  # Resolves to /data/project/utils.R (not relative to child.R's directory)
+```
+
+**Effect on source() resolution:** The inherited working directory affects how `source()` calls in the child file resolve their paths. This matches R's runtime behavior when a parent script sets the working directory before sourcing a child.
+
 ### Diagnostic Suppression
 
 ```r
