@@ -4,5 +4,5 @@ dist/
 out/
 *.vsix
 .vscode-test/
-bin/rlsp
-bin/rlsp.exe
+bin/raven
+bin/raven.exe

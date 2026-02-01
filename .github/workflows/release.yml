@@ -54,31 +54,31 @@ jobs:
       - name: Build LSP
         run: |
           if [ "${{ matrix.use-zigbuild }}" = "true" ]; then
-            cargo zigbuild --release --target ${{ matrix.target }} --bin rlsp
+            cargo zigbuild --release --target ${{ matrix.target }} --bin raven
           elif [ "${{ contains(matrix.target, 'windows') }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --bin rlsp
+            cross build --release --target ${{ matrix.target }} --bin raven
           else
-            cargo build --release --target ${{ matrix.target }} --bin rlsp
+            cargo build --release --target ${{ matrix.target }} --bin raven
           fi
 
       - name: Create archive
         run: |
           mkdir -p dist
           if [[ "${{ matrix.platform }}" == *"windows"* ]]; then
-            cp target/${{ matrix.target }}/release/rlsp.exe dist/
+            cp target/${{ matrix.target }}/release/raven.exe dist/
             cp LICENSE dist/
-            cd dist && zip -r ../rlsp-${{ matrix.platform }}.zip .
+            cd dist && zip -r ../raven-${{ matrix.platform }}.zip .
           else
-            cp target/${{ matrix.target }}/release/rlsp dist/
+            cp target/${{ matrix.target }}/release/raven dist/
             cp LICENSE dist/
-            cd dist && zip -r ../rlsp-${{ matrix.platform }}.zip .
+            cd dist && zip -r ../raven-${{ matrix.platform }}.zip .
           fi
 
       - name: Upload LSP artifact
         uses: actions/upload-artifact@v4
         with:
           name: lsp-${{ matrix.platform }}
-          path: rlsp-${{ matrix.platform }}.zip
+          path: raven-${{ matrix.platform }}.zip
 
   build-vscode:
     needs: build-lsp
@@ -128,11 +128,11 @@ jobs:
           cd vscode-extension
           mkdir -p bin
           case "${{ matrix.target }}" in
-            darwin-arm64) cp ../lsp-binaries/lsp-macos-arm64/rlsp-macos-arm64.zip bin/ && cd bin && unzip rlsp-macos-arm64.zip && mv rlsp rlsp-server ;;
-            linux-x64) cp ../lsp-binaries/lsp-linux-x64/rlsp-linux-x64.zip bin/ && cd bin && unzip rlsp-linux-x64.zip && mv rlsp rlsp-server ;;
-            linux-arm64) cp ../lsp-binaries/lsp-linux-arm64/rlsp-linux-arm64.zip bin/ && cd bin && unzip rlsp-linux-arm64.zip && mv rlsp rlsp-server ;;
-            win32-x64) cp ../lsp-binaries/lsp-windows-x64/rlsp-windows-x64.zip bin/ && cd bin && unzip rlsp-windows-x64.zip && mv rlsp.exe rlsp-server.exe ;;
-            win32-arm64) cp ../lsp-binaries/lsp-windows-arm64/rlsp-windows-arm64.zip bin/ && cd bin && unzip rlsp-windows-arm64.zip && mv rlsp.exe rlsp-server.exe ;;
+            darwin-arm64) cp ../lsp-binaries/lsp-macos-arm64/raven-macos-arm64.zip bin/ && cd bin && unzip raven-macos-arm64.zip && mv raven raven-server ;;
+            linux-x64) cp ../lsp-binaries/lsp-linux-x64/raven-linux-x64.zip bin/ && cd bin && unzip raven-linux-x64.zip && mv raven raven-server ;;
+            linux-arm64) cp ../lsp-binaries/lsp-linux-arm64/raven-linux-arm64.zip bin/ && cd bin && unzip raven-linux-arm64.zip && mv raven raven-server ;;
+            win32-x64) cp ../lsp-binaries/lsp-windows-x64/raven-windows-x64.zip bin/ && cd bin && unzip raven-windows-x64.zip && mv raven.exe raven-server.exe ;;
+            win32-arm64) cp ../lsp-binaries/lsp-windows-arm64/raven-windows-arm64.zip bin/ && cd bin && unzip raven-windows-arm64.zip && mv raven.exe raven-server.exe ;;
           esac
 
       - name: Package extension
@@ -167,7 +167,7 @@ jobs:
         with:
           name: Release v${{ steps.version.outputs.version }}
           files: |
-            artifacts/lsp-*/rlsp-*.zip
+            artifacts/lsp-*/raven-*.zip
             artifacts/vscode-*/*.vsix
           generate_release_notes: true
         env:

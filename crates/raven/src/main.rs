@@ -1,8 +1,8 @@
 //
 // main.rs
 //
-// Copyright (C) 2025 Posit Software, PBC. All rights reserved.
-//
+// Copyright (C) 2024-2026 Posit Software, PBC. All rights reserved.
+// Modifications copyright (C) 2026 Jonathan Marc Bearak
 //
 
 mod backend;
@@ -23,10 +23,10 @@ mod workspace_index;
 use std::env;
 
 fn print_usage() {
-    println!("rlsp {}, a static R Language Server.", env!("CARGO_PKG_VERSION"));
+    println!("raven {}, a static R Language Server.", env!("CARGO_PKG_VERSION"));
     print!(
         r#"
-Usage: rlsp [OPTIONS]
+Usage: raven [OPTIONS]
 
 Available options:
 
@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         match arg.as_str() {
             "--stdio" => use_stdio = true,
             "--version" => {
-                println!("rlsp {}", env!("CARGO_PKG_VERSION"));
+                println!("raven {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             "--help" => {
