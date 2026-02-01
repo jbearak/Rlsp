@@ -410,7 +410,62 @@ where
     let parent_uri = path_to_uri(&parent_path)?;
 
     // Get parent's effective working directory with depth tracking and cycle detection
-    resolve_parent_working_directory_with_visited(&parent_uri, get_metadata, workspace_root, max_depth - 1, visited)
+    let inherited_wd = resolve_parent_working_directory_with_visited(
+        &parent_uri,
+        get_metadata,
+        workspace_root,
+        max_depth - 1,
+        visited,
+    );
+
+    // If multiple backward directives resolve to different working directories, log which one we used.
+    if meta.sourced_by.len() > 1 {
+        if let Some(ref first_wd) = inherited_wd {
+            let mut differing_parent: Option<(String, String)> = None;
+            let backward_ctx = PathContext::new(uri, workspace_root);
+            for directive in meta.sourced_by.iter().skip(1) {
+                let ctx = match backward_ctx.as_ref() {
+                    Some(ctx) => ctx,
+                    None => break,
+                };
+                let other_parent_path = match resolve_path(&directive.path, ctx) {
+                    Some(path) => path,
+                    None => continue,
+                };
+                let other_parent_uri = match path_to_uri(&other_parent_path) {
+                    Some(uri) => uri,
+                    None => continue,
+                };
+                let mut other_visited = HashSet::new();
+                let other_wd = resolve_parent_working_directory_with_visited(
+                    &other_parent_uri,
+                    get_metadata,
+                    workspace_root,
+                    max_depth - 1,
+                    &mut other_visited,
+                );
+                if let Some(other_wd) = other_wd {
+                    if &other_wd != first_wd {
+                        differing_parent = Some((directive.path.clone(), other_wd));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((other_parent, other_wd)) = differing_parent {
+                log::trace!(
+                    "Multiple backward directives for {} resolve to different working directories; using first parent '{}' with WD '{}', ignoring '{}' (WD '{}')",
+                    uri,
+                    first_directive.path,
+                    first_wd,
+                    other_parent,
+                    other_wd
+                );
+            }
+        }
+    }
+
+    inherited_wd
 }
 
 /// A dependency edge from parent (caller) to child (callee)
