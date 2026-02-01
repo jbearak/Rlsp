@@ -1,6 +1,15 @@
-# Rlsp
+# Raven - R Language Server
 
-A static R Language Server with workspace symbol indexing for fast, dependency-free R development support.
+An R Language Server with cross-file awareness for scientific research workflows.
+
+## Why Raven?
+
+R projects in scientific research often span dozens of files connected by `source()` calls. Existing language servers don't handle this well:
+
+- **R Language Server** only analyzes open files—it can't see symbols from files you've sourced but haven't opened
+- **Ark** (Positron's R support) scans the workspace for completions but doesn't track how `source()` calls affect scope—it can't tell you that `helper_func` is undefined because you're calling it *before* the `source("utils.R")` line
+
+**Raven tracks `source()` chains and understands scope.** It knows which symbols are available at each line based on which files have been sourced, and it follows the chain through parent files via directives. This means accurate diagnostics, completions, and go-to-definition across your entire project.
 
 ## Quick Start
 
@@ -10,19 +19,19 @@ A static R Language Server with workspace symbol indexing for fast, dependency-f
 
 ## Features
 
-- **Diagnostics** - Static code analysis and error detection
-- **Go-to-definition** - Navigate to symbol definitions
-- **Find references** - Locate all symbol usages
-- **Completions** - Intelligent code completion
+- **Cross-file awareness** - Symbol resolution across `source()` chains with position-aware scope
+- **Diagnostics** - Undefined variable detection that understands sourced files
+- **Go-to-definition** - Navigate to symbol definitions across file boundaries
+- **Find references** - Locate all symbol usages project-wide
+- **Completions** - Intelligent completion including symbols from sourced files
 - **Hover** - Symbol information on hover
 - **Document symbols** - Outline view for R files
-- **Workspace indexing** - Project-wide symbol resolution
-- **Package-aware analysis** - Understanding of R package structure
-- **Cross-file awareness** - Symbol resolution across `source()` chains
+- **Workspace indexing** - Background indexing of your entire project
+- **Package-aware analysis** - Recognition of `library()` calls and package exports
 
 ## Cross-File Awareness
 
-Rlsp understands relationships between R source files through `source()` calls and special comment directives, providing accurate symbol resolution, diagnostics, and navigation across file boundaries.
+Raven understands relationships between R source files through `source()` calls and special comment directives, providing accurate symbol resolution, diagnostics, and navigation across file boundaries.
 
 ### Automatic source() Detection
 
@@ -237,11 +246,11 @@ source("a.R")  # Creates cycle back to a.R
 
 ## Package Function Awareness
 
-Rlsp recognizes functions, variables, and datasets exported by R packages loaded via `library()`, `require()`, or `loadNamespace()` calls. This enables accurate diagnostics, completions, hover information, and go-to-definition for package symbols.
+Raven recognizes functions, variables, and datasets exported by R packages loaded via `library()`, `require()`, or `loadNamespace()` calls. This enables accurate diagnostics, completions, hover information, and go-to-definition for package symbols.
 
 ### How It Works
 
-When you load a package with `library(dplyr)`, Rlsp:
+When you load a package with `library(dplyr)`, Raven:
 1. Detects the library call and extracts the package name
 2. Queries R (via subprocess) to get the package's exported symbols
 3. Makes those symbols available for completions, hover, and diagnostics
@@ -258,7 +267,7 @@ Base R packages are always available without explicit `library()` calls:
 - **stats** - Statistical functions (`lm`, `t.test`, `cor`, etc.)
 - **datasets** - Built-in datasets (`mtcars`, `iris`, etc.)
 
-At startup, Rlsp queries R for the default search path using `.packages()`. If R is unavailable, it falls back to the hardcoded list above.
+At startup, Raven queries R for the default search path using `.packages()`. If R is unavailable, it falls back to the hardcoded list above.
 
 ### Position-Aware Loading
 
@@ -285,7 +294,7 @@ mutate(df, y = 2)  # Warning: dplyr not available at global scope
 
 ### Meta-Package Support
 
-Rlsp recognizes meta-packages that attach multiple packages:
+Raven recognizes meta-packages that attach multiple packages:
 
 **tidyverse** attaches:
 - dplyr, readr, forcats, stringr, ggplot2, tibble, lubridate, tidyr, purrr
@@ -322,7 +331,7 @@ Packages loaded in child files do NOT propagate back to parent files (forward-on
 
 ### Diagnostics
 
-Rlsp provides helpful diagnostics for package-related issues:
+Raven provides helpful diagnostics for package-related issues:
 
 | Diagnostic | Description |
 |------------|-------------|
@@ -352,28 +361,43 @@ Rlsp provides helpful diagnostics for package-related issues:
 
 Dynamic package names (variables, expressions, `character.only = TRUE`) are skipped gracefully.
 
-## Differences from Other R Language Servers
+## Comparison with Other R Language Servers
 
-### vs Ark LSP
-Rlsp is the extracted and focused LSP component from Ark. Ark includes additional features like Jupyter kernel support and Debug Adapter Protocol (DAP), while Rlsp focuses solely on language server functionality.
+| Feature | Raven | Ark | R Language Server |
+|---------|-------|-----|-------------------|
+| Cross-file `source()` tracking | ✓ | ✗ | ✗ |
+| Position-aware scope | ✓ | ✗ | ✗ |
+| Workspace symbol indexing | ✓ | ✓ (completions only) | ✗ (open files only) |
+| Works in VS Code | ✓ | ✗ (Positron only) | ✓ |
+| Package export awareness | ✓ | ✓ | ✓ |
+| Embedded R runtime | ✗ | ✓ | ✓ |
+| Jupyter kernel | ✗ | ✓ | ✗ |
+| Debug Adapter (DAP) | ✗ | ✓ | ✗ |
 
-### vs R Language Server
-Rlsp provides static analysis without requiring an R runtime, while the R Language Server uses dynamic introspection with a running R session. This makes Rlsp faster to start and more suitable for environments without R installed.
+### When to use Raven
 
-## Why Use Rlsp
+- Multi-file R projects with `source()` dependencies
+- Scientific research workflows where files build on each other
+- VS Code users who want cross-file intelligence
+- Environments where you want fast startup without loading R
 
-- **Fast startup** - No R runtime initialization required
-- **No R dependencies** - Works without R installation for basic features
-- **Workspace-wide symbol resolution** - Understands your entire project structure
-- **Package-aware diagnostics** - Intelligent analysis of R package code
-- **Cross-file awareness** - Understands source() chains and file relationships
+### When to use Ark
+
+- Positron IDE users
+- Need integrated Jupyter notebook support
+- Need debugging support
+
+### When to use R Language Server
+
+- Simple single-file scripts
+- Need dynamic introspection of runtime state
 
 ## Installation
 
 ### Building from Source
 ```bash
 git clone <repository-url>
-cd rlsp
+cd raven
 ./setup.sh
 ```
 
@@ -384,11 +408,18 @@ Pre-built binaries are available from the [releases page](../../releases).
 
 Releases use semantic versioning with git tags. Creating a tag in the format `vX.Y.Z` automatically triggers CI to build and publish a new release.
 
-## Attribution
+## Provenance
 
-**Rlsp is extracted from [Ark's](https://github.com/posit-dev/ark) static LSP implementation.** We gratefully acknowledge the Ark project for providing the foundation for this language server.
+Raven combines code from two sources:
 
-**Inspired by and complementary to the [R Language Server](https://github.com/REditorSupport/languageserver).** Both projects serve the R community with different approaches to language server functionality.
+**[Ark](https://github.com/posit-dev/ark)** (MIT License, Posit Software, PBC) — Raven began as a fork of Ark's LSP component, restructured for standalone use outside Positron. The core LSP infrastructure (`handlers.rs`, `backend.rs`, `state.rs`, `main.rs`, `r_env.rs`) derives from Ark. These files retain Posit's copyright notice with modifications noted.
+
+**[Sight](https://github.com/jbearak/sight)** (GPL-3.0) — The cross-file awareness system (the `cross_file/` module, directive parsing, scope resolution across `source()` chains) was ported from Sight, a Stata language server with similar goals.
+
+Both Sight and Raven were written by the same author to address the same problem—scientific research codebases that span many files—in different languages.
 
 ## License
-[GPLv3](LICENSE) - This project is open source software. You can use, modify, and distribute it with attribution, but any derivative works must also be open source under GPLv3.
+
+[GPL-3.0](LICENSE)
+
+The GPL-3.0 license applies to Raven as a whole. Files derived from Ark (MIT-licensed) retain their original copyright notices; the MIT license permits redistribution under GPL-3.0.
