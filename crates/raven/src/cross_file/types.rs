@@ -17,8 +17,13 @@ pub struct CrossFileMetadata {
     pub sourced_by: Vec<BackwardDirective>,
     /// Forward directives and detected source() calls
     pub sources: Vec<ForwardSource>,
-    /// Working directory override
+    /// Working directory override (explicit @lsp-cd)
     pub working_directory: Option<String>,
+    /// Working directory inherited from parent via backward directive.
+    /// This is populated when a file has a backward directive (@lsp-sourced-by, etc.)
+    /// pointing to a parent file, and the parent has an effective working directory.
+    /// Priority for path resolution: explicit working_directory > inherited > file's directory.
+    pub inherited_working_directory: Option<String>,
     /// Lines with @lsp-ignore (0-based)
     pub ignored_lines: HashSet<u32>,
     /// Lines following @lsp-ignore-next (0-based)
@@ -209,6 +214,7 @@ mod tests {
                 sys_source_global_env: true,
             }],
             working_directory: Some("/data".to_string()),
+            inherited_working_directory: None,
             ignored_lines: HashSet::from([10, 20]),
             ignored_next_lines: HashSet::from([15]),
             library_calls: vec![],
@@ -223,6 +229,103 @@ mod tests {
         assert_eq!(parsed.working_directory, Some("/data".to_string()));
         assert!(parsed.ignored_lines.contains(&10));
         assert!(parsed.ignored_next_lines.contains(&15));
+    }
+
+    #[test]
+    fn test_cross_file_metadata_default_inherited_working_directory_is_none() {
+        // Validates: Requirements 6.1
+        // The default value for inherited_working_directory should be None
+        let meta = CrossFileMetadata::default();
+        assert!(meta.inherited_working_directory.is_none());
+    }
+
+    #[test]
+    fn test_cross_file_metadata_serialization_with_inherited_working_directory() {
+        // Validates: Requirements 6.1
+        // Test serialization round-trip when inherited_working_directory has a value
+        let meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            sources: vec![],
+            working_directory: None,
+            inherited_working_directory: Some("/project/data".to_string()),
+            ignored_lines: HashSet::new(),
+            ignored_next_lines: HashSet::new(),
+            library_calls: vec![],
+        };
+
+        // Round-trip serialization
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: CrossFileMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            parsed.inherited_working_directory,
+            Some("/project/data".to_string())
+        );
+        assert!(parsed.working_directory.is_none());
+    }
+
+    #[test]
+    fn test_cross_file_metadata_serialization_both_working_directories() {
+        // Validates: Requirements 6.1
+        // Test serialization when both explicit and inherited working directories are set
+        // (This scenario represents a child file with its own @lsp-cd that also has a backward directive)
+        let meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../parent.R".to_string(),
+                call_site: CallSiteSpec::Match("source".to_string()),
+                directive_line: 1,
+            }],
+            sources: vec![ForwardSource {
+                path: "helper.R".to_string(),
+                line: 10,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            working_directory: Some("/child/explicit".to_string()),
+            inherited_working_directory: Some("/parent/inherited".to_string()),
+            ignored_lines: HashSet::new(),
+            ignored_next_lines: HashSet::new(),
+            library_calls: vec![],
+        };
+
+        // Round-trip serialization
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: CrossFileMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            parsed.working_directory,
+            Some("/child/explicit".to_string())
+        );
+        assert_eq!(
+            parsed.inherited_working_directory,
+            Some("/parent/inherited".to_string())
+        );
+        assert_eq!(parsed.sourced_by.len(), 1);
+        assert_eq!(parsed.sources.len(), 1);
+    }
+
+    #[test]
+    fn test_cross_file_metadata_json_field_presence() {
+        // Validates: Requirements 6.1
+        // Verify the JSON includes the inherited_working_directory field
+        let meta = CrossFileMetadata {
+            inherited_working_directory: Some("/test/path".to_string()),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&meta).unwrap();
+        
+        // Verify the field name appears in the JSON
+        assert!(json.contains("inherited_working_directory"));
+        assert!(json.contains("/test/path"));
     }
 
     #[test]

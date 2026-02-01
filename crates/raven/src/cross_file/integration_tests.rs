@@ -2996,3 +2996,1348 @@ mod activity_signal_tests {
         }
     }
 }
+
+
+// ============================================================================
+// Working Directory Inheritance Cache Invalidation Tests
+// ============================================================================
+
+#[cfg(test)]
+mod working_directory_cache_invalidation_tests {
+    use super::*;
+    use crate::cross_file::cache::MetadataCache;
+    use crate::cross_file::dependency::compute_inherited_working_directory;
+    use crate::cross_file::revalidation::invalidate_children_on_parent_wd_change;
+
+    /// Integration test for cache invalidation when parent's @lsp-cd changes.
+    ///
+    /// This test verifies the complete cache invalidation flow:
+    /// 1. Sets up a parent file with @lsp-cd and a child file with @lsp-sourced-by
+    /// 2. Caches the child's metadata with inherited_working_directory
+    /// 3. Changes the parent's @lsp-cd
+    /// 4. Calls `invalidate_children_on_parent_wd_change`
+    /// 5. Verifies the child's metadata cache was invalidated
+    /// 6. Verifies the child can re-compute its inherited_working_directory with the new value
+    ///
+    /// **Validates: Requirements 8.1, 8.2, 8.3**
+    #[test]
+    fn test_cache_invalidation_on_parent_wd_change() {
+        println!("\n=== Cache Invalidation Test: Parent @lsp-cd Change ===\n");
+
+        // Create a test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Create parent file with @lsp-cd directive
+        let parent_content = r#"
+# @lsp-cd: /original/data/path
+# Parent file that sources child
+main_function <- function() {
+    print("Running from parent")
+}
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Create child file with @lsp-sourced-by directive
+        let child_content = r#"
+# @lsp-sourced-by: parent.r
+# Child file that inherits working directory from parent
+child_function <- function() {
+    source("utils.r")  # This should resolve relative to parent's @lsp-cd
+}
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        // Get workspace root URI
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+
+        // Extract metadata for both files
+        let parent_meta = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+        let child_meta = extract_metadata_for_file(&workspace, "child.r").unwrap();
+
+        println!("Step 1: Verify initial metadata extraction");
+        assert_eq!(
+            parent_meta.working_directory,
+            Some("/original/data/path".to_string()),
+            "Parent should have explicit @lsp-cd"
+        );
+        assert_eq!(
+            child_meta.sourced_by.len(),
+            1,
+            "Child should have 1 backward directive"
+        );
+        assert_eq!(
+            child_meta.sourced_by[0].path,
+            "parent.r",
+            "Child's backward directive should point to parent.r"
+        );
+        println!("  ✓ Parent has @lsp-cd: /original/data/path");
+        println!("  ✓ Child has @lsp-sourced-by: parent.r");
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        // Create a content provider that returns file content from workspace
+        let content_provider = |requested_uri: &Url| -> Option<String> {
+            for path in workspace.list_files() {
+                let file_uri = workspace.get_uri(path);
+                if &file_uri == requested_uri {
+                    return workspace.get_content(path).map(|s| s.to_string());
+                }
+            }
+            None
+        };
+
+        // Update graph with parent file
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), content_provider);
+
+        // Update graph with child file (this creates the backward directive edge)
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), content_provider);
+
+        println!("\nStep 2: Compute initial inherited working directory for child");
+
+        // Create metadata getter that returns parent's metadata
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else if uri == &child_uri {
+                Some(child_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // Compute inherited working directory for child
+        let initial_inherited_wd = compute_inherited_working_directory(
+            &child_uri,
+            &child_meta,
+            Some(&workspace_root),
+            get_metadata,
+        );
+
+        // The inherited WD should be the parent's @lsp-cd value
+        assert!(
+            initial_inherited_wd.is_some(),
+            "Child should inherit working directory from parent"
+        );
+        let initial_wd = initial_inherited_wd.unwrap();
+        assert!(
+            initial_wd.contains("original") || initial_wd.contains("data") || initial_wd.contains("path"),
+            "Initial inherited WD should be based on parent's @lsp-cd. Got: {}",
+            initial_wd
+        );
+        println!("  ✓ Child's initial inherited_working_directory: {}", initial_wd);
+
+        println!("\nStep 3: Cache child's metadata with inherited_working_directory");
+
+        // Create metadata cache and store child's metadata
+        let metadata_cache = MetadataCache::new();
+        let mut cached_child_meta = child_meta.clone();
+        cached_child_meta.inherited_working_directory = Some(initial_wd.clone());
+        metadata_cache.insert(child_uri.clone(), cached_child_meta);
+
+        // Verify child is in cache
+        let cached = metadata_cache.get(&child_uri);
+        assert!(cached.is_some(), "Child metadata should be in cache");
+        assert_eq!(
+            cached.as_ref().unwrap().inherited_working_directory,
+            Some(initial_wd.clone()),
+            "Cached child should have inherited_working_directory"
+        );
+        println!("  ✓ Child metadata cached with inherited_working_directory");
+
+        println!("\nStep 4: Simulate parent's @lsp-cd change");
+
+        // Create new parent metadata with changed @lsp-cd
+        let new_parent_meta = CrossFileMetadata {
+            working_directory: Some("/new/updated/path".to_string()),
+            ..parent_meta.clone()
+        };
+
+        println!("  Old @lsp-cd: /original/data/path");
+        println!("  New @lsp-cd: /new/updated/path");
+
+        println!("\nStep 5: Call invalidate_children_on_parent_wd_change");
+
+        // Call the invalidation function
+        let affected = invalidate_children_on_parent_wd_change(
+            &parent_uri,
+            Some(&parent_meta),
+            &new_parent_meta,
+            &graph,
+            &metadata_cache,
+        );
+
+        // Verify child was affected
+        assert_eq!(
+            affected.len(),
+            1,
+            "One child should be affected by parent WD change"
+        );
+        assert_eq!(
+            affected[0], child_uri,
+            "The affected child should be child.r"
+        );
+        println!("  ✓ invalidate_children_on_parent_wd_change returned child.r as affected");
+
+        println!("\nStep 6: Verify child's metadata cache was invalidated");
+
+        // Verify child's cache entry was removed
+        let cached_after = metadata_cache.get(&child_uri);
+        assert!(
+            cached_after.is_none(),
+            "Child's metadata cache entry should be invalidated"
+        );
+        println!("  ✓ Child's metadata cache entry was invalidated");
+
+        println!("\nStep 7: Re-compute child's inherited_working_directory with new parent metadata");
+
+        // Create updated metadata getter with new parent metadata
+        let get_updated_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(new_parent_meta.clone())
+            } else if uri == &child_uri {
+                Some(child_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // Re-compute inherited working directory for child
+        let new_inherited_wd = compute_inherited_working_directory(
+            &child_uri,
+            &child_meta,
+            Some(&workspace_root),
+            get_updated_metadata,
+        );
+
+        // The new inherited WD should reflect the parent's new @lsp-cd
+        assert!(
+            new_inherited_wd.is_some(),
+            "Child should still inherit working directory from parent"
+        );
+        let new_wd = new_inherited_wd.unwrap();
+        assert!(
+            new_wd.contains("new") || new_wd.contains("updated"),
+            "New inherited WD should be based on parent's new @lsp-cd. Got: {}",
+            new_wd
+        );
+        assert_ne!(
+            new_wd, initial_wd,
+            "New inherited WD should be different from initial"
+        );
+        println!("  ✓ Child's new inherited_working_directory: {}", new_wd);
+
+        println!("\n=== Test Passed ===");
+        println!("Summary:");
+        println!("  - Parent @lsp-cd change was detected");
+        println!("  - Child with backward directive was identified as affected");
+        println!("  - Child's metadata cache was invalidated");
+        println!("  - Child can re-compute inherited_working_directory with new value");
+    }
+
+    /// Test that cache invalidation does NOT affect children connected via AST source() calls.
+    ///
+    /// Only children connected via backward directives should be invalidated when
+    /// the parent's @lsp-cd changes. Children connected via AST-detected source()
+    /// calls should NOT be affected because they don't inherit working directory
+    /// through backward directives.
+    ///
+    /// **Validates: Requirements 8.1, 8.2, 8.3**
+    #[test]
+    fn test_cache_invalidation_only_affects_directive_children() {
+        println!("\n=== Cache Invalidation Test: Only Directive Children Affected ===\n");
+
+        // Create a test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Create parent file with @lsp-cd and a source() call
+        let parent_content = r#"
+# @lsp-cd: /data/path
+source("ast_child.r")
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Create child connected via AST source() call (no backward directive)
+        let ast_child_content = r#"
+# This file is sourced by parent.r via source() call
+# It does NOT have a backward directive
+ast_function <- function() {}
+"#;
+        let ast_child_uri = workspace.add_file("ast_child.r", ast_child_content).unwrap();
+
+        // Create child connected via backward directive
+        let directive_child_content = r#"
+# @lsp-sourced-by: parent.r
+# This file has a backward directive
+directive_function <- function() {}
+"#;
+        let directive_child_uri = workspace.add_file("directive_child.r", directive_child_content).unwrap();
+
+        // Get workspace root URI
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+
+        // Extract metadata
+        let parent_meta = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+        let ast_child_meta = extract_metadata_for_file(&workspace, "ast_child.r").unwrap();
+        let directive_child_meta = extract_metadata_for_file(&workspace, "directive_child.r").unwrap();
+
+        println!("Step 1: Verify metadata extraction");
+        assert_eq!(
+            parent_meta.sources.len(),
+            1,
+            "Parent should have 1 source() call"
+        );
+        assert_eq!(
+            ast_child_meta.sourced_by.len(),
+            0,
+            "AST child should have no backward directives"
+        );
+        assert_eq!(
+            directive_child_meta.sourced_by.len(),
+            1,
+            "Directive child should have 1 backward directive"
+        );
+        println!("  ✓ Parent has source('ast_child.r')");
+        println!("  ✓ AST child has no backward directive");
+        println!("  ✓ Directive child has @lsp-sourced-by: parent.r");
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |requested_uri: &Url| -> Option<String> {
+            for path in workspace.list_files() {
+                let file_uri = workspace.get_uri(path);
+                if &file_uri == requested_uri {
+                    return workspace.get_content(path).map(|s| s.to_string());
+                }
+            }
+            None
+        };
+
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), content_provider);
+        graph.update_file(&ast_child_uri, &ast_child_meta, Some(&workspace_root), content_provider);
+        graph.update_file(&directive_child_uri, &directive_child_meta, Some(&workspace_root), content_provider);
+
+        println!("\nStep 2: Cache both children's metadata");
+
+        let metadata_cache = MetadataCache::new();
+        metadata_cache.insert(ast_child_uri.clone(), ast_child_meta.clone());
+        metadata_cache.insert(directive_child_uri.clone(), directive_child_meta.clone());
+
+        assert!(metadata_cache.get(&ast_child_uri).is_some());
+        assert!(metadata_cache.get(&directive_child_uri).is_some());
+        println!("  ✓ Both children's metadata cached");
+
+        println!("\nStep 3: Change parent's @lsp-cd and call invalidation");
+
+        let new_parent_meta = CrossFileMetadata {
+            working_directory: Some("/new/path".to_string()),
+            ..parent_meta.clone()
+        };
+
+        let affected = invalidate_children_on_parent_wd_change(
+            &parent_uri,
+            Some(&parent_meta),
+            &new_parent_meta,
+            &graph,
+            &metadata_cache,
+        );
+
+        println!("\nStep 4: Verify only directive child was affected");
+
+        // Only directive child should be affected
+        assert_eq!(
+            affected.len(),
+            1,
+            "Only one child should be affected"
+        );
+        assert_eq!(
+            affected[0], directive_child_uri,
+            "Only directive child should be affected"
+        );
+        println!("  ✓ Only directive_child.r was affected");
+
+        // AST child's cache should still be present
+        assert!(
+            metadata_cache.get(&ast_child_uri).is_some(),
+            "AST child's cache should NOT be invalidated"
+        );
+        println!("  ✓ AST child's cache was NOT invalidated");
+
+        // Directive child's cache should be invalidated
+        assert!(
+            metadata_cache.get(&directive_child_uri).is_none(),
+            "Directive child's cache should be invalidated"
+        );
+        println!("  ✓ Directive child's cache was invalidated");
+
+        println!("\n=== Test Passed ===");
+    }
+
+    /// Test cache invalidation when parent's @lsp-cd is added (from None to Some).
+    ///
+    /// **Validates: Requirements 8.1, 8.2, 8.3**
+    #[test]
+    fn test_cache_invalidation_on_parent_wd_added() {
+        println!("\n=== Cache Invalidation Test: Parent @lsp-cd Added ===\n");
+
+        // Create a test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Create parent file WITHOUT @lsp-cd initially
+        let parent_content = r#"
+# Parent file without @lsp-cd
+main_function <- function() {}
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Create child file with @lsp-sourced-by directive
+        let child_content = r#"
+# @lsp-sourced-by: parent.r
+child_function <- function() {}
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        // Get workspace root URI
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+
+        // Extract metadata
+        let parent_meta = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+        let child_meta = extract_metadata_for_file(&workspace, "child.r").unwrap();
+
+        assert!(
+            parent_meta.working_directory.is_none(),
+            "Parent should have no @lsp-cd initially"
+        );
+        println!("  ✓ Parent initially has no @lsp-cd");
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |requested_uri: &Url| -> Option<String> {
+            for path in workspace.list_files() {
+                let file_uri = workspace.get_uri(path);
+                if &file_uri == requested_uri {
+                    return workspace.get_content(path).map(|s| s.to_string());
+                }
+            }
+            None
+        };
+
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), content_provider);
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), content_provider);
+
+        // Cache child's metadata
+        let metadata_cache = MetadataCache::new();
+        metadata_cache.insert(child_uri.clone(), child_meta.clone());
+
+        // Simulate adding @lsp-cd to parent
+        let new_parent_meta = CrossFileMetadata {
+            working_directory: Some("/new/data/path".to_string()),
+            ..parent_meta.clone()
+        };
+
+        println!("  Simulating: Parent adds @lsp-cd: /new/data/path");
+
+        let affected = invalidate_children_on_parent_wd_change(
+            &parent_uri,
+            Some(&parent_meta),  // old: no @lsp-cd
+            &new_parent_meta,    // new: has @lsp-cd
+            &graph,
+            &metadata_cache,
+        );
+
+        // Child should be affected
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0], child_uri);
+        println!("  ✓ Child was affected when parent added @lsp-cd");
+
+        // Child's cache should be invalidated
+        assert!(metadata_cache.get(&child_uri).is_none());
+        println!("  ✓ Child's cache was invalidated");
+
+        println!("\n=== Test Passed ===");
+    }
+
+    /// Test cache invalidation when parent's @lsp-cd is removed (from Some to None).
+    ///
+    /// **Validates: Requirements 8.1, 8.2, 8.3**
+    #[test]
+    fn test_cache_invalidation_on_parent_wd_removed() {
+        println!("\n=== Cache Invalidation Test: Parent @lsp-cd Removed ===\n");
+
+        // Create a test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Create parent file WITH @lsp-cd initially
+        let parent_content = r#"
+# @lsp-cd: /data/path
+main_function <- function() {}
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Create child file with @lsp-sourced-by directive
+        let child_content = r#"
+# @lsp-sourced-by: parent.r
+child_function <- function() {}
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        // Get workspace root URI
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+
+        // Extract metadata
+        let parent_meta = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+        let child_meta = extract_metadata_for_file(&workspace, "child.r").unwrap();
+
+        assert!(
+            parent_meta.working_directory.is_some(),
+            "Parent should have @lsp-cd initially"
+        );
+        println!("  ✓ Parent initially has @lsp-cd: /data/path");
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |requested_uri: &Url| -> Option<String> {
+            for path in workspace.list_files() {
+                let file_uri = workspace.get_uri(path);
+                if &file_uri == requested_uri {
+                    return workspace.get_content(path).map(|s| s.to_string());
+                }
+            }
+            None
+        };
+
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), content_provider);
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), content_provider);
+
+        // Cache child's metadata with inherited WD
+        let metadata_cache = MetadataCache::new();
+        let mut cached_child = child_meta.clone();
+        cached_child.inherited_working_directory = Some("/data/path".to_string());
+        metadata_cache.insert(child_uri.clone(), cached_child);
+
+        // Simulate removing @lsp-cd from parent
+        let new_parent_meta = CrossFileMetadata {
+            working_directory: None,  // @lsp-cd removed
+            ..parent_meta.clone()
+        };
+
+        println!("  Simulating: Parent removes @lsp-cd");
+
+        let affected = invalidate_children_on_parent_wd_change(
+            &parent_uri,
+            Some(&parent_meta),  // old: has @lsp-cd
+            &new_parent_meta,    // new: no @lsp-cd
+            &graph,
+            &metadata_cache,
+        );
+
+        // Child should be affected
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0], child_uri);
+        println!("  ✓ Child was affected when parent removed @lsp-cd");
+
+        // Child's cache should be invalidated
+        assert!(metadata_cache.get(&child_uri).is_none());
+        println!("  ✓ Child's cache was invalidated");
+
+        println!("\n=== Test Passed ===");
+    }
+
+    /// Test that no invalidation occurs when parent's @lsp-cd doesn't change.
+    ///
+    /// **Validates: Requirements 8.1, 8.2, 8.3**
+    #[test]
+    fn test_no_invalidation_when_wd_unchanged() {
+        println!("\n=== Cache Invalidation Test: No Change When WD Unchanged ===\n");
+
+        // Create a test workspace
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Create parent file with @lsp-cd
+        let parent_content = r#"
+# @lsp-cd: /data/path
+main_function <- function() {}
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Create child file with @lsp-sourced-by directive
+        let child_content = r#"
+# @lsp-sourced-by: parent.r
+child_function <- function() {}
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        // Get workspace root URI
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+
+        // Extract metadata
+        let parent_meta = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+        let child_meta = extract_metadata_for_file(&workspace, "child.r").unwrap();
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |requested_uri: &Url| -> Option<String> {
+            for path in workspace.list_files() {
+                let file_uri = workspace.get_uri(path);
+                if &file_uri == requested_uri {
+                    return workspace.get_content(path).map(|s| s.to_string());
+                }
+            }
+            None
+        };
+
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), content_provider);
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), content_provider);
+
+        // Cache child's metadata
+        let metadata_cache = MetadataCache::new();
+        metadata_cache.insert(child_uri.clone(), child_meta.clone());
+
+        // Simulate parent update with SAME @lsp-cd
+        let new_parent_meta = CrossFileMetadata {
+            working_directory: Some("/data/path".to_string()),  // Same as before
+            ..parent_meta.clone()
+        };
+
+        println!("  Simulating: Parent updated but @lsp-cd unchanged");
+
+        let affected = invalidate_children_on_parent_wd_change(
+            &parent_uri,
+            Some(&parent_meta),
+            &new_parent_meta,
+            &graph,
+            &metadata_cache,
+        );
+
+        // No children should be affected
+        assert!(affected.is_empty(), "No children should be affected when WD unchanged");
+        println!("  ✓ No children affected");
+
+        // Child's cache should still be present
+        assert!(metadata_cache.get(&child_uri).is_some());
+        println!("  ✓ Child's cache was NOT invalidated");
+
+        println!("\n=== Test Passed ===");
+    }
+}
+
+
+// ============================================================================
+// Working Directory Inheritance Integration Tests
+// ============================================================================
+
+#[cfg(test)]
+mod working_directory_inheritance_tests {
+    use super::*;
+    use crate::cross_file::dependency::compute_inherited_working_directory;
+    use crate::cross_file::path_resolve::PathContext;
+
+    /// Integration test for basic working directory inheritance scenario.
+    ///
+    /// This test verifies the complete working directory inheritance flow:
+    /// 1. Parent file has `@lsp-cd: /data` directive
+    /// 2. Child file has `@lsp-sourced-by: parent.r` directive
+    /// 3. Child inherits the parent's working directory
+    /// 4. `source()` calls in the child resolve relative to the inherited working directory
+    ///
+    /// **Validates: Requirements 1.1, 1.2**
+    #[test]
+    fn test_basic_working_directory_inheritance() {
+        println!("\n=== Working Directory Inheritance Test: Basic Scenario ===\n");
+
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Create parent file with @lsp-cd directive
+        let parent_content = r#"
+# @lsp-cd: /data
+# Parent file that sources child
+main_function <- function() {
+    print("Running from parent")
+}
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Create child file with @lsp-sourced-by directive
+        // The child has a source() call that should resolve relative to the inherited /data directory
+        let child_content = r#"
+# @lsp-sourced-by: parent.r
+# Child file that inherits working directory from parent
+child_function <- function() {
+    source("utils.r")  # This should resolve to /data/utils.r
+}
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        // Get workspace root URI
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+
+        println!("Step 1: Extract metadata from both files");
+
+        // Extract metadata for both files
+        let parent_meta = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+        let child_meta = extract_metadata_for_file(&workspace, "child.r").unwrap();
+
+        // Verify parent has @lsp-cd directive
+        assert_eq!(
+            parent_meta.working_directory,
+            Some("/data".to_string()),
+            "Parent should have explicit @lsp-cd: /data"
+        );
+        println!("  ✓ Parent has @lsp-cd: /data");
+
+        // Verify child has backward directive
+        assert_eq!(
+            child_meta.sourced_by.len(),
+            1,
+            "Child should have 1 backward directive"
+        );
+        assert_eq!(
+            child_meta.sourced_by[0].path,
+            "parent.r",
+            "Child's backward directive should point to parent.r"
+        );
+        println!("  ✓ Child has @lsp-sourced-by: parent.r");
+
+        // Verify child has no explicit @lsp-cd
+        assert!(
+            child_meta.working_directory.is_none(),
+            "Child should NOT have explicit @lsp-cd"
+        );
+        println!("  ✓ Child has no explicit @lsp-cd");
+
+        // Verify child has a source() call
+        assert_eq!(
+            child_meta.sources.len(),
+            1,
+            "Child should have 1 source() call"
+        );
+        assert_eq!(
+            child_meta.sources[0].path,
+            "utils.r",
+            "Child's source() call should reference utils.r"
+        );
+        println!("  ✓ Child has source('utils.r')");
+
+        println!("\nStep 2: Build dependency graph");
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |requested_uri: &Url| -> Option<String> {
+            for path in workspace.list_files() {
+                let file_uri = workspace.get_uri(path);
+                if &file_uri == requested_uri {
+                    return workspace.get_content(path).map(|s| s.to_string());
+                }
+            }
+            None
+        };
+
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), content_provider);
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), content_provider);
+
+        // Verify dependency graph structure
+        let children_of_parent = get_children(&graph, &parent_uri);
+        assert!(
+            children_of_parent.contains(&child_uri),
+            "Parent should have child as dependency (via backward directive)"
+        );
+        println!("  ✓ Dependency graph: parent.r -> child.r");
+
+        println!("\nStep 3: Compute inherited working directory for child");
+
+        // Create metadata getter that returns parent's metadata
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else if uri == &child_uri {
+                Some(child_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // Compute inherited working directory for child
+        let inherited_wd = compute_inherited_working_directory(
+            &child_uri,
+            &child_meta,
+            Some(&workspace_root),
+            get_metadata,
+        );
+
+        // Verify child inherits parent's working directory
+        assert!(
+            inherited_wd.is_some(),
+            "Child should inherit working directory from parent"
+        );
+        let inherited_wd_value = inherited_wd.unwrap();
+        
+        // The inherited WD should be /data (the parent's @lsp-cd value)
+        assert!(
+            inherited_wd_value.ends_with("/data") || inherited_wd_value == "/data",
+            "Child's inherited working directory should be /data. Got: {}",
+            inherited_wd_value
+        );
+        println!("  ✓ Child's inherited_working_directory: {}", inherited_wd_value);
+
+        println!("\nStep 4: Verify source() resolution uses inherited working directory");
+
+        // Create child metadata with inherited working directory set
+        let mut child_meta_with_inheritance = child_meta.clone();
+        child_meta_with_inheritance.inherited_working_directory = Some(inherited_wd_value.clone());
+
+        // Build PathContext from child's metadata (with inherited WD)
+        let child_path_ctx = PathContext::from_metadata(
+            &child_uri,
+            &child_meta_with_inheritance,
+            Some(&workspace_root),
+        );
+
+        assert!(
+            child_path_ctx.is_some(),
+            "Should be able to create PathContext from child's metadata"
+        );
+        let ctx = child_path_ctx.unwrap();
+
+        // Get the effective working directory
+        let effective_wd = ctx.effective_working_directory();
+        
+        // The effective WD should be /data (inherited from parent)
+        assert!(
+            effective_wd.to_string_lossy().ends_with("/data") || effective_wd.to_string_lossy() == "/data",
+            "Child's effective working directory should be /data. Got: {}",
+            effective_wd.display()
+        );
+        println!("  ✓ Child's effective working directory: {}", effective_wd.display());
+
+        // Verify that source("utils.r") would resolve to /data/utils.r
+        // The resolve_path function uses the effective working directory
+        use crate::cross_file::path_resolve::resolve_path;
+        let resolved_path = resolve_path("utils.r", &ctx);
+        
+        assert!(
+            resolved_path.is_some(),
+            "Should be able to resolve utils.r path"
+        );
+        let resolved = resolved_path.unwrap();
+        
+        // The resolved path should be /data/utils.r
+        assert!(
+            resolved.to_string_lossy().ends_with("/data/utils.r") || resolved.to_string_lossy() == "/data/utils.r",
+            "source('utils.r') should resolve to /data/utils.r. Got: {}",
+            resolved.display()
+        );
+        println!("  ✓ source('utils.r') resolves to: {}", resolved.display());
+
+        println!("\n=== Test Passed ===");
+        println!("Summary:");
+        println!("  - Parent has @lsp-cd: /data");
+        println!("  - Child has @lsp-sourced-by: parent.r");
+        println!("  - Child inherits parent's working directory: {}", inherited_wd_value);
+        println!("  - source('utils.r') in child resolves to: {}", resolved.display());
+        println!("\nRequirements Validated:");
+        println!("  - 1.1: Child with backward directive inherits parent's explicit @lsp-cd");
+        println!("  - 1.2: source() calls in child resolve relative to inherited working directory");
+    }
+
+    /// Integration test for implicit working directory inheritance scenario.
+    ///
+    /// This test verifies working directory inheritance when the parent has NO explicit
+    /// `@lsp-cd` directive. In this case, the child should inherit the parent's directory
+    /// as the working directory.
+    ///
+    /// Scenario:
+    /// 1. Parent file is in `parent_dir/parent.r` with NO `@lsp-cd` directive
+    /// 2. Child file is in `child_dir/child.r` with `@lsp-sourced-by: ../parent_dir/parent.r`
+    /// 3. Child inherits the parent's directory (`parent_dir/`) as the working directory
+    /// 4. `source()` calls in the child resolve relative to the parent's directory
+    ///
+    /// **Validates: Requirements 2.1, 2.2**
+    #[test]
+    fn test_implicit_working_directory_inheritance() {
+        println!("\n=== Working Directory Inheritance Test: Implicit Scenario ===\n");
+
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Create parent file in a subdirectory WITHOUT @lsp-cd directive
+        let parent_content = r#"
+# Parent file without @lsp-cd directive
+# Its directory should be used as the implicit working directory
+main_function <- function() {
+    print("Running from parent")
+}
+"#;
+        let parent_uri = workspace.add_file("parent_dir/parent.r", parent_content).unwrap();
+
+        // Create child file in a different subdirectory with @lsp-sourced-by directive
+        // The child has a source() call that should resolve relative to the parent's directory
+        let child_content = r#"
+# @lsp-sourced-by: ../parent_dir/parent.r
+# Child file that inherits working directory from parent
+child_function <- function() {
+    source("utils.r")  # This should resolve to parent_dir/utils.r
+}
+"#;
+        let child_uri = workspace.add_file("child_dir/child.r", child_content).unwrap();
+
+        // Create a utils.r file in the parent's directory to verify resolution
+        let utils_content = r#"
+# Utils file in parent's directory
+helper_func <- function() { 42 }
+"#;
+        let _utils_uri = workspace.add_file("parent_dir/utils.r", utils_content).unwrap();
+
+        // Get workspace root URI
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+
+        println!("Step 1: Extract metadata from both files");
+
+        // Extract metadata for both files
+        let parent_meta = extract_metadata_for_file(&workspace, "parent_dir/parent.r").unwrap();
+        let child_meta = extract_metadata_for_file(&workspace, "child_dir/child.r").unwrap();
+
+        // Verify parent has NO @lsp-cd directive
+        assert!(
+            parent_meta.working_directory.is_none(),
+            "Parent should NOT have explicit @lsp-cd"
+        );
+        println!("  ✓ Parent has no @lsp-cd directive (implicit working directory)");
+
+        // Verify child has backward directive
+        assert_eq!(
+            child_meta.sourced_by.len(),
+            1,
+            "Child should have 1 backward directive"
+        );
+        assert_eq!(
+            child_meta.sourced_by[0].path,
+            "../parent_dir/parent.r",
+            "Child's backward directive should point to ../parent_dir/parent.r"
+        );
+        println!("  ✓ Child has @lsp-sourced-by: ../parent_dir/parent.r");
+
+        // Verify child has no explicit @lsp-cd
+        assert!(
+            child_meta.working_directory.is_none(),
+            "Child should NOT have explicit @lsp-cd"
+        );
+        println!("  ✓ Child has no explicit @lsp-cd");
+
+        // Verify child has a source() call
+        assert_eq!(
+            child_meta.sources.len(),
+            1,
+            "Child should have 1 source() call"
+        );
+        assert_eq!(
+            child_meta.sources[0].path,
+            "utils.r",
+            "Child's source() call should reference utils.r"
+        );
+        println!("  ✓ Child has source('utils.r')");
+
+        println!("\nStep 2: Build dependency graph");
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |requested_uri: &Url| -> Option<String> {
+            for path in workspace.list_files() {
+                let file_uri = workspace.get_uri(path);
+                if &file_uri == requested_uri {
+                    return workspace.get_content(path).map(|s| s.to_string());
+                }
+            }
+            None
+        };
+
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), content_provider);
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), content_provider);
+
+        // Verify dependency graph structure
+        let children_of_parent = get_children(&graph, &parent_uri);
+        assert!(
+            children_of_parent.contains(&child_uri),
+            "Parent should have child as dependency (via backward directive)"
+        );
+        println!("  ✓ Dependency graph: parent_dir/parent.r -> child_dir/child.r");
+
+        println!("\nStep 3: Compute inherited working directory for child");
+
+        // Create metadata getter that returns parent's metadata
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else if uri == &child_uri {
+                Some(child_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // Compute inherited working directory for child
+        let inherited_wd = compute_inherited_working_directory(
+            &child_uri,
+            &child_meta,
+            Some(&workspace_root),
+            get_metadata,
+        );
+
+        // Verify child inherits parent's directory as working directory
+        assert!(
+            inherited_wd.is_some(),
+            "Child should inherit working directory from parent"
+        );
+        let inherited_wd_value = inherited_wd.unwrap();
+        
+        // The inherited WD should be the parent's directory (parent_dir/)
+        // Since parent has no @lsp-cd, its effective WD is its own directory
+        assert!(
+            inherited_wd_value.contains("parent_dir"),
+            "Child's inherited working directory should be parent's directory (parent_dir/). Got: {}",
+            inherited_wd_value
+        );
+        println!("  ✓ Child's inherited_working_directory: {}", inherited_wd_value);
+
+        println!("\nStep 4: Verify source() resolution uses inherited working directory");
+
+        // Create child metadata with inherited working directory set
+        let mut child_meta_with_inheritance = child_meta.clone();
+        child_meta_with_inheritance.inherited_working_directory = Some(inherited_wd_value.clone());
+
+        // Build PathContext from child's metadata (with inherited WD)
+        let child_path_ctx = PathContext::from_metadata(
+            &child_uri,
+            &child_meta_with_inheritance,
+            Some(&workspace_root),
+        );
+
+        assert!(
+            child_path_ctx.is_some(),
+            "Should be able to create PathContext from child's metadata"
+        );
+        let ctx = child_path_ctx.unwrap();
+
+        // Get the effective working directory
+        let effective_wd = ctx.effective_working_directory();
+        
+        // The effective WD should be parent_dir/ (inherited from parent)
+        assert!(
+            effective_wd.to_string_lossy().contains("parent_dir"),
+            "Child's effective working directory should be parent_dir/. Got: {}",
+            effective_wd.display()
+        );
+        println!("  ✓ Child's effective working directory: {}", effective_wd.display());
+
+        // Verify that source("utils.r") would resolve to parent_dir/utils.r
+        use crate::cross_file::path_resolve::resolve_path;
+        let resolved_path = resolve_path("utils.r", &ctx);
+        
+        assert!(
+            resolved_path.is_some(),
+            "Should be able to resolve utils.r path"
+        );
+        let resolved = resolved_path.unwrap();
+        
+        // The resolved path should be parent_dir/utils.r
+        assert!(
+            resolved.to_string_lossy().contains("parent_dir") && resolved.to_string_lossy().ends_with("utils.r"),
+            "source('utils.r') should resolve to parent_dir/utils.r. Got: {}",
+            resolved.display()
+        );
+        println!("  ✓ source('utils.r') resolves to: {}", resolved.display());
+
+        // Verify the resolved path actually exists (we created utils.r in parent_dir)
+        assert!(
+            resolved.exists(),
+            "Resolved path should exist on disk: {}",
+            resolved.display()
+        );
+        println!("  ✓ Resolved path exists on disk");
+
+        println!("\nStep 5: Verify child's directory is NOT used for resolution");
+
+        // Create a utils.r in child's directory to verify it's NOT used
+        let child_utils_content = r#"
+# Utils file in child's directory (should NOT be used)
+wrong_func <- function() { "wrong" }
+"#;
+        let child_utils_uri = workspace.add_file("child_dir/utils.r", child_utils_content).unwrap();
+        let child_utils_path = child_utils_uri.to_file_path().unwrap();
+
+        // The resolved path should NOT be child_dir/utils.r
+        assert_ne!(
+            resolved, child_utils_path,
+            "source('utils.r') should NOT resolve to child_dir/utils.r"
+        );
+        println!("  ✓ source('utils.r') does NOT resolve to child_dir/utils.r");
+
+        println!("\n=== Test Passed ===");
+        println!("Summary:");
+        println!("  - Parent is in parent_dir/ with no @lsp-cd directive");
+        println!("  - Child is in child_dir/ with @lsp-sourced-by: ../parent_dir/parent.r");
+        println!("  - Child inherits parent's directory as working directory: {}", inherited_wd_value);
+        println!("  - source('utils.r') in child resolves to: {}", resolved.display());
+        println!("\nRequirements Validated:");
+        println!("  - 2.1: Child with backward directive inherits parent's directory when parent has no @lsp-cd");
+        println!("  - 2.2: Path resolution correctly uses parent's directory path for inheritance");
+    }
+
+    /// Integration test for precedence scenario.
+    ///
+    /// This test verifies that when a child has both `@lsp-sourced-by` AND `@lsp-cd`,
+    /// the child's explicit `@lsp-cd` takes precedence over any inherited working directory
+    /// from the parent.
+    ///
+    /// Scenario:
+    /// 1. Parent file has `@lsp-cd: /parent/data` directive
+    /// 2. Child file has BOTH `@lsp-sourced-by: parent.r` AND `@lsp-cd: /child/data` directives
+    /// 3. Child's explicit `@lsp-cd: /child/data` takes precedence
+    /// 4. `source()` calls in the child resolve relative to `/child/data` (NOT `/parent/data`)
+    ///
+    /// **Validates: Requirements 3.1**
+    #[test]
+    fn test_explicit_working_directory_precedence() {
+        println!("\n=== Working Directory Inheritance Test: Precedence Scenario ===\n");
+
+        let mut workspace = TestWorkspace::new().unwrap();
+
+        // Create parent file with @lsp-cd directive
+        let parent_content = r#"
+# @lsp-cd: /parent/data
+# Parent file with explicit working directory
+main_function <- function() {
+    print("Running from parent")
+}
+"#;
+        let parent_uri = workspace.add_file("parent.r", parent_content).unwrap();
+
+        // Create child file with BOTH @lsp-sourced-by AND @lsp-cd directives
+        // The child's explicit @lsp-cd should take precedence over inherited WD
+        let child_content = r#"
+# @lsp-sourced-by: parent.r
+# @lsp-cd: /child/data
+# Child file with both backward directive and explicit working directory
+child_function <- function() {
+    source("utils.r")  # This should resolve to /child/data/utils.r (NOT /parent/data/utils.r)
+}
+"#;
+        let child_uri = workspace.add_file("child.r", child_content).unwrap();
+
+        // Get workspace root URI
+        let workspace_root = Url::from_file_path(workspace.root()).unwrap();
+
+        println!("Step 1: Extract metadata from both files");
+
+        // Extract metadata for both files
+        let parent_meta = extract_metadata_for_file(&workspace, "parent.r").unwrap();
+        let child_meta = extract_metadata_for_file(&workspace, "child.r").unwrap();
+
+        // Verify parent has @lsp-cd directive
+        assert_eq!(
+            parent_meta.working_directory,
+            Some("/parent/data".to_string()),
+            "Parent should have explicit @lsp-cd: /parent/data"
+        );
+        println!("  ✓ Parent has @lsp-cd: /parent/data");
+
+        // Verify child has backward directive
+        assert_eq!(
+            child_meta.sourced_by.len(),
+            1,
+            "Child should have 1 backward directive"
+        );
+        assert_eq!(
+            child_meta.sourced_by[0].path,
+            "parent.r",
+            "Child's backward directive should point to parent.r"
+        );
+        println!("  ✓ Child has @lsp-sourced-by: parent.r");
+
+        // Verify child has explicit @lsp-cd
+        assert_eq!(
+            child_meta.working_directory,
+            Some("/child/data".to_string()),
+            "Child should have explicit @lsp-cd: /child/data"
+        );
+        println!("  ✓ Child has @lsp-cd: /child/data");
+
+        // Verify child has a source() call
+        assert_eq!(
+            child_meta.sources.len(),
+            1,
+            "Child should have 1 source() call"
+        );
+        assert_eq!(
+            child_meta.sources[0].path,
+            "utils.r",
+            "Child's source() call should reference utils.r"
+        );
+        println!("  ✓ Child has source('utils.r')");
+
+        println!("\nStep 2: Build dependency graph");
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        let content_provider = |requested_uri: &Url| -> Option<String> {
+            for path in workspace.list_files() {
+                let file_uri = workspace.get_uri(path);
+                if &file_uri == requested_uri {
+                    return workspace.get_content(path).map(|s| s.to_string());
+                }
+            }
+            None
+        };
+
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), content_provider);
+        graph.update_file(&child_uri, &child_meta, Some(&workspace_root), content_provider);
+
+        // Verify dependency graph structure
+        let children_of_parent = get_children(&graph, &parent_uri);
+        assert!(
+            children_of_parent.contains(&child_uri),
+            "Parent should have child as dependency (via backward directive)"
+        );
+        println!("  ✓ Dependency graph: parent.r -> child.r");
+
+        println!("\nStep 3: Verify compute_inherited_working_directory returns None");
+
+        // Create metadata getter that returns parent's metadata
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else if uri == &child_uri {
+                Some(child_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // Compute inherited working directory for child
+        // This should return None because child has explicit @lsp-cd
+        let inherited_wd = compute_inherited_working_directory(
+            &child_uri,
+            &child_meta,
+            Some(&workspace_root),
+            get_metadata,
+        );
+
+        // Verify compute_inherited_working_directory returns None
+        // because child has explicit @lsp-cd
+        assert!(
+            inherited_wd.is_none(),
+            "compute_inherited_working_directory should return None when child has explicit @lsp-cd"
+        );
+        println!("  ✓ compute_inherited_working_directory returns None (child has explicit @lsp-cd)");
+
+        println!("\nStep 4: Verify PathContext uses child's explicit @lsp-cd");
+
+        // Build PathContext from child's metadata
+        let child_path_ctx = PathContext::from_metadata(
+            &child_uri,
+            &child_meta,
+            Some(&workspace_root),
+        );
+
+        assert!(
+            child_path_ctx.is_some(),
+            "Should be able to create PathContext from child's metadata"
+        );
+        let ctx = child_path_ctx.unwrap();
+
+        // Get the effective working directory
+        let effective_wd = ctx.effective_working_directory();
+        
+        // The effective WD should be /child/data (child's explicit @lsp-cd)
+        // NOT /parent/data (parent's @lsp-cd)
+        assert!(
+            effective_wd.to_string_lossy().ends_with("/child/data") || effective_wd.to_string_lossy() == "/child/data",
+            "Child's effective working directory should be /child/data (NOT /parent/data). Got: {}",
+            effective_wd.display()
+        );
+        println!("  ✓ effective_working_directory() returns /child/data");
+
+        // Verify it's NOT the parent's working directory
+        assert!(
+            !effective_wd.to_string_lossy().contains("/parent/data"),
+            "Child's effective working directory should NOT be /parent/data. Got: {}",
+            effective_wd.display()
+        );
+        println!("  ✓ effective_working_directory() is NOT /parent/data");
+
+        println!("\nStep 5: Verify source() resolution uses child's explicit @lsp-cd");
+
+        // Verify that source("utils.r") resolves to /child/data/utils.r
+        use crate::cross_file::path_resolve::resolve_path;
+        let resolved_path = resolve_path("utils.r", &ctx);
+        
+        assert!(
+            resolved_path.is_some(),
+            "Should be able to resolve utils.r path"
+        );
+        let resolved = resolved_path.unwrap();
+        
+        // The resolved path should be /child/data/utils.r
+        assert!(
+            resolved.to_string_lossy().ends_with("/child/data/utils.r") || resolved.to_string_lossy() == "/child/data/utils.r",
+            "source('utils.r') should resolve to /child/data/utils.r. Got: {}",
+            resolved.display()
+        );
+        println!("  ✓ source('utils.r') resolves to: {}", resolved.display());
+
+        // Verify it's NOT resolved to /parent/data/utils.r
+        assert!(
+            !resolved.to_string_lossy().contains("/parent/data"),
+            "source('utils.r') should NOT resolve to /parent/data/utils.r. Got: {}",
+            resolved.display()
+        );
+        println!("  ✓ source('utils.r') does NOT resolve to /parent/data/utils.r");
+
+        println!("\nStep 6: Verify precedence even when inherited_working_directory is set");
+
+        // Even if we manually set inherited_working_directory, explicit @lsp-cd should win
+        let mut child_meta_with_both = child_meta.clone();
+        child_meta_with_both.inherited_working_directory = Some("/parent/data".to_string());
+
+        let ctx_with_both = PathContext::from_metadata(
+            &child_uri,
+            &child_meta_with_both,
+            Some(&workspace_root),
+        ).unwrap();
+
+        let effective_wd_with_both = ctx_with_both.effective_working_directory();
+        
+        // Even with inherited_working_directory set, explicit @lsp-cd should take precedence
+        assert!(
+            effective_wd_with_both.to_string_lossy().ends_with("/child/data") || effective_wd_with_both.to_string_lossy() == "/child/data",
+            "Explicit @lsp-cd should take precedence over inherited_working_directory. Got: {}",
+            effective_wd_with_both.display()
+        );
+        println!("  ✓ Explicit @lsp-cd takes precedence even when inherited_working_directory is set");
+
+        // Verify source() still resolves to /child/data/utils.r
+        let resolved_with_both = resolve_path("utils.r", &ctx_with_both).unwrap();
+        assert!(
+            resolved_with_both.to_string_lossy().ends_with("/child/data/utils.r") || resolved_with_both.to_string_lossy() == "/child/data/utils.r",
+            "source('utils.r') should still resolve to /child/data/utils.r. Got: {}",
+            resolved_with_both.display()
+        );
+        println!("  ✓ source('utils.r') still resolves to /child/data/utils.r");
+
+        println!("\n=== Test Passed ===");
+        println!("Summary:");
+        println!("  - Parent has @lsp-cd: /parent/data");
+        println!("  - Child has @lsp-sourced-by: parent.r");
+        println!("  - Child has @lsp-cd: /child/data");
+        println!("  - compute_inherited_working_directory returns None (child has explicit @lsp-cd)");
+        println!("  - effective_working_directory() returns /child/data (NOT /parent/data)");
+        println!("  - source('utils.r') resolves to /child/data/utils.r (NOT /parent/data/utils.r)");
+        println!("\nRequirements Validated:");
+        println!("  - 3.1: Child's explicit @lsp-cd takes precedence over inherited working directory");
+    }
+}

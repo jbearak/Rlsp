@@ -13,6 +13,7 @@ use tree_sitter::Point;
 
 use crate::content_provider::ContentProvider;
 use crate::cross_file::{scope, ScopedSymbol};
+use crate::cross_file::dependency::compute_inherited_working_directory;
 use crate::state::WorldState;
 
 use crate::builtins;
@@ -300,7 +301,49 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     // Parse directives to get ignored lines and cross-file metadata
-    let directive_meta = crate::cross_file::directive::parse_directives(&text);
+    let mut directive_meta = crate::cross_file::directive::parse_directives(&text);
+
+    // Compute inherited working directory for files with backward directives
+    // This enables child files to inherit the parent's working directory context
+    // for resolving paths in their own source() calls.
+    // _Requirements: 5.1, 5.2, 6.1_
+    if !directive_meta.sourced_by.is_empty() && directive_meta.working_directory.is_none() {
+        let workspace_root = state.workspace_folders.first();
+        let content_provider = state.content_provider();
+        
+        // Create a metadata getter that retrieves metadata from open documents,
+        // workspace index, or by parsing content from the file cache
+        let get_metadata_for_uri = |target_uri: &Url| -> Option<crate::cross_file::CrossFileMetadata> {
+            // First check open documents
+            if let Some(doc) = state.documents.get(target_uri) {
+                return Some(crate::cross_file::directive::parse_directives(&doc.text()));
+            }
+            // Then try workspace index
+            if let Some(meta) = state.cross_file_workspace_index.get_metadata(target_uri) {
+                return Some(meta);
+            }
+            // Finally try to read from file cache
+            if let Some(content) = content_provider.get_content(target_uri) {
+                return Some(crate::cross_file::extract_metadata(&content));
+            }
+            None
+        };
+        
+        directive_meta.inherited_working_directory = compute_inherited_working_directory(
+            uri,
+            &directive_meta,
+            workspace_root,
+            get_metadata_for_uri,
+        );
+        
+        if directive_meta.inherited_working_directory.is_some() {
+            log::trace!(
+                "Computed inherited working directory for {}: {:?}",
+                uri,
+                directive_meta.inherited_working_directory
+            );
+        }
+    }
 
     // Collect syntax errors (not suppressed by @lsp-ignore)
     collect_syntax_errors(tree.root_node(), &mut diagnostics);
