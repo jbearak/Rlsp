@@ -893,8 +893,10 @@ fn collect_ambiguous_parent_diagnostics(
     use crate::cross_file::cache::ParentResolution;
 
     // Build PathContext for proper path resolution
-    let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
-        uri, meta, state.workspace_folders.first()
+    // Use PathContext::new (not from_metadata) because backward directives should
+    // resolve relative to the file's directory, ignoring @lsp-cd
+    let path_ctx = crate::cross_file::path_resolve::PathContext::new(
+        uri, state.workspace_folders.first()
     );
     
     let resolve_path = |path: &str| -> Option<Url> {
@@ -3848,6 +3850,92 @@ x <- "#;
                 panic!("Expected CompletionResponse::Array");
             }
         });
+    }
+
+    // ========================================================================
+    // Backward Directive Path Resolution Tests
+    // Tests for fix-backward-directive-path-resolution spec
+    // Validates: Requirements 1.2, 3.2
+    // ========================================================================
+
+    /// Test that backward directive paths resolve relative to file's directory, ignoring @lsp-cd.
+    ///
+    /// This test reproduces a bug where `collect_ambiguous_parent_diagnostics` was using
+    /// `PathContext::from_metadata` (which respects @lsp-cd) instead of `PathContext::new`
+    /// (which ignores @lsp-cd) for backward directive resolution.
+    ///
+    /// Scenario:
+    /// - Child file at `subdir/child.r` contains:
+    ///   - `@lsp-cd ..` (sets working directory to parent/workspace root)
+    ///   - `@lsp-run-by: program.r` (declares parent file)
+    /// - The backward directive should resolve `program.r` relative to `subdir/` (file's directory)
+    ///   NOT relative to the workspace root (the @lsp-cd directory)
+    ///
+    /// Validates: Requirements 1.2, 3.2
+    #[test]
+    fn test_backward_directive_ignores_lsp_cd() {
+        use crate::cross_file::path_resolve::PathContext;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        // Simulate a child file at /project/subdir/child.r
+        let child_uri = Url::parse("file:///project/subdir/child.r").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // Metadata with @lsp-cd .. (points to /project, the workspace root)
+        let meta = CrossFileMetadata {
+            working_directory: Some("..".to_string()),
+            ..Default::default()
+        };
+
+        // PathContext::new should ignore @lsp-cd
+        let ctx_new = PathContext::new(&child_uri, Some(&workspace_root)).unwrap();
+        
+        // PathContext::from_metadata should respect @lsp-cd
+        let ctx_from_meta = PathContext::from_metadata(&child_uri, &meta, Some(&workspace_root)).unwrap();
+
+        // Verify that PathContext::new ignores @lsp-cd
+        // The effective working directory should be the file's directory: /project/subdir
+        assert_eq!(
+            ctx_new.effective_working_directory(),
+            std::path::PathBuf::from("/project/subdir"),
+            "PathContext::new should use file's directory, ignoring @lsp-cd"
+        );
+
+        // Verify that PathContext::from_metadata respects @lsp-cd
+        // The effective working directory should be /project (the @lsp-cd directory)
+        assert_eq!(
+            ctx_from_meta.effective_working_directory(),
+            std::path::PathBuf::from("/project"),
+            "PathContext::from_metadata should use @lsp-cd directory"
+        );
+
+        // Now test path resolution for a backward directive path "program.r"
+        let backward_path = "program.r";
+
+        // With PathContext::new (correct for backward directives):
+        // "program.r" should resolve to /project/subdir/program.r
+        let resolved_new = crate::cross_file::path_resolve::resolve_path(backward_path, &ctx_new);
+        assert_eq!(
+            resolved_new,
+            Some(std::path::PathBuf::from("/project/subdir/program.r")),
+            "Backward directive 'program.r' should resolve relative to file's directory"
+        );
+
+        // With PathContext::from_metadata (incorrect for backward directives):
+        // "program.r" would resolve to /project/program.r (wrong!)
+        let resolved_from_meta = crate::cross_file::path_resolve::resolve_path(backward_path, &ctx_from_meta);
+        assert_eq!(
+            resolved_from_meta,
+            Some(std::path::PathBuf::from("/project/program.r")),
+            "With @lsp-cd, 'program.r' would incorrectly resolve to workspace root"
+        );
+
+        // The key assertion: the two resolutions are DIFFERENT
+        // This demonstrates why using PathContext::new is essential for backward directives
+        assert_ne!(
+            resolved_new, resolved_from_meta,
+            "PathContext::new and PathContext::from_metadata should produce different results when @lsp-cd is present"
+        );
     }
 }
 
