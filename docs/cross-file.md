@@ -65,6 +65,8 @@ Path resolution:
 - Paths starting with `/` are workspace-root-relative (e.g., `/data` -> `<workspace>/data`)
 - Other paths are file-relative (e.g., `../shared` -> parent directory's `shared`)
 
+**Note:** Working directory directives only affect `source()` call path resolution. All other LSP directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-source`, etc.) always resolve paths relative to the file's directory, ignoring any `@lsp-cd` setting.
+
 ### Diagnostic Suppression
 
 ```r

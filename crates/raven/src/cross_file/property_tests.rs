@@ -937,6 +937,236 @@ proptest! {
 }
 
 // ============================================================================
+// Feature: fix-backward-directive-path-resolution
+// Property 1: Backward directive path resolution ignores @lsp-cd
+// Validates: Requirements 1.2, 1.3, 3.1
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: fix-backward-directive-path-resolution, Property 1: Backward directive path resolution ignores @lsp-cd
+    /// **Validates: Requirements 1.2, 1.3, 3.1**
+    ///
+    /// For any file with an @lsp-cd directive and any backward directive (@lsp-run-by,
+    /// @lsp-sourced-by, @lsp-included-by), the backward directive path SHALL be resolved
+    /// relative to the file's own directory, producing the same result as if @lsp-cd
+    /// were not present.
+    #[test]
+    fn prop_backward_directive_ignores_lsp_cd(
+        workspace in path_component(),
+        subdir in path_component(),
+        wd_dir in path_component(),
+        parent_path in relative_path_with_parents()
+    ) {
+        // Create file URI: /workspace/subdir/child.R
+        let file_uri = Url::parse(&format!("file:///{}/{}/child.R", workspace, subdir)).unwrap();
+        let workspace_uri = Url::parse(&format!("file:///{}", workspace)).unwrap();
+
+        // Create metadata with @lsp-cd pointing to a different directory
+        let meta_with_cd = CrossFileMetadata {
+            working_directory: Some(format!("/{}", wd_dir)),
+            ..Default::default()
+        };
+
+        // Create metadata without @lsp-cd
+        let meta_without_cd = CrossFileMetadata::default();
+
+        // PathContext::new ignores @lsp-cd (used for backward directives)
+        let ctx_new = PathContext::new(&file_uri, Some(&workspace_uri)).unwrap();
+
+        // PathContext::from_metadata with @lsp-cd (used for forward sources)
+        let ctx_from_meta_with_cd = PathContext::from_metadata(
+            &file_uri,
+            &meta_with_cd,
+            Some(&workspace_uri)
+        ).unwrap();
+
+        // PathContext::from_metadata without @lsp-cd
+        let ctx_from_meta_without_cd = PathContext::from_metadata(
+            &file_uri,
+            &meta_without_cd,
+            Some(&workspace_uri)
+        ).unwrap();
+
+        // Resolve the backward directive path using PathContext::new (correct behavior)
+        let resolved_with_new = resolve_path(&parent_path, &ctx_new);
+
+        // Resolve using from_metadata without @lsp-cd (should match PathContext::new)
+        let resolved_without_cd = resolve_path(&parent_path, &ctx_from_meta_without_cd);
+
+        // Property: PathContext::new should produce the same result as from_metadata without @lsp-cd
+        // This validates that backward directive resolution ignores @lsp-cd
+        prop_assert_eq!(
+            resolved_with_new, resolved_without_cd,
+            "PathContext::new should produce same result as from_metadata without @lsp-cd. \
+             Path: '{}', file: '/{}/{}/child.R'",
+            parent_path, workspace, subdir
+        );
+
+        // Additional check: PathContext::new should NOT use the working directory
+        prop_assert!(
+            ctx_new.working_directory.is_none(),
+            "PathContext::new should have no working_directory set"
+        );
+
+        // Verify that from_metadata WITH @lsp-cd has a different effective working directory
+        // (This confirms @lsp-cd is being applied to from_metadata)
+        if wd_dir != subdir {
+            prop_assert_ne!(
+                ctx_new.effective_working_directory(),
+                ctx_from_meta_with_cd.effective_working_directory(),
+                "from_metadata with @lsp-cd should have different effective_working_directory. \
+                 wd_dir: '{}', subdir: '{}'",
+                wd_dir, subdir
+            );
+        }
+    }
+
+    /// Feature: fix-backward-directive-path-resolution, Property 1 extended: All backward directive synonyms ignore @lsp-cd
+    /// **Validates: Requirements 1.2, 1.3**
+    ///
+    /// All backward directive synonyms (@lsp-sourced-by, @lsp-run-by, @lsp-included-by)
+    /// should resolve paths the same way, ignoring @lsp-cd.
+    #[test]
+    fn prop_all_backward_directive_synonyms_ignore_lsp_cd(
+        workspace in path_component(),
+        subdir in path_component(),
+        wd_dir in path_component(),
+        parent_file in path_component()
+    ) {
+        let file_uri = Url::parse(&format!("file:///{}/{}/child.R", workspace, subdir)).unwrap();
+        let workspace_uri = Url::parse(&format!("file:///{}", workspace)).unwrap();
+
+        // Create metadata with @lsp-cd
+        let meta_with_cd = CrossFileMetadata {
+            working_directory: Some(format!("/{}", wd_dir)),
+            ..Default::default()
+        };
+
+        // PathContext::new (correct for backward directives)
+        let ctx_new = PathContext::new(&file_uri, Some(&workspace_uri)).unwrap();
+
+        // PathContext::from_metadata with @lsp-cd (incorrect for backward directives)
+        let _ctx_from_meta = PathContext::from_metadata(
+            &file_uri,
+            &meta_with_cd,
+            Some(&workspace_uri)
+        ).unwrap();
+        // Test with parent directory navigation (common pattern for backward directives)
+        let parent_path = format!("../{}.R", parent_file);
+
+        let parent_path = format!("../{}.R", parent_file);
+
+        // Parse all backward directive synonyms to ensure synonym handling is exercised
+        let sourced_by = format!("# @lsp-sourced-by {}", parent_path);
+        let run_by = format!("# @lsp-run-by {}", parent_path);
+        let included_by = format!("# @lsp-included-by {}", parent_path);
+
+        let meta_sourced = parse_directives(&sourced_by);
+        let meta_run = parse_directives(&run_by);
+        let meta_included = parse_directives(&included_by);
+
+        prop_assert_eq!(meta_sourced.sourced_by.len(), 1);
+        prop_assert_eq!(meta_run.sourced_by.len(), 1);
+        prop_assert_eq!(meta_included.sourced_by.len(), 1);
+
+        prop_assert_eq!(&meta_sourced.sourced_by[0].path, &parent_path);
+        prop_assert_eq!(&meta_run.sourced_by[0].path, &parent_path);
+        prop_assert_eq!(&meta_included.sourced_by[0].path, &parent_path);
+
+        let resolved_new = resolve_path(&parent_path, &ctx_new);
+
+        // When @lsp-cd points to a different directory, from_metadata will resolve differently
+        // PathContext::new should always resolve relative to file's directory
+        prop_assert!(
+            resolved_new.is_some(),
+            "PathContext::new should resolve '../{}.R' from '/{}/{}/child.R'",
+            parent_file, workspace, subdir
+        );
+
+        // The resolved path from PathContext::new should be in the workspace directory
+        // (one level up from subdir)
+        let resolved = resolved_new.unwrap();
+        let expected_parent = format!("/{}/{}.R", workspace, parent_file);
+        prop_assert_eq!(
+            resolved, PathBuf::from(&expected_parent),
+            "Backward directive '../{}.R' should resolve to '{}' (relative to file's directory), \
+             not using @lsp-cd directory '/{}'",
+            parent_file, expected_parent, wd_dir
+        );
+    }
+
+    /// Feature: fix-backward-directive-path-resolution, Property 1 extended: Backward directive resolution ignores @lsp-cd
+    /// **Validates: Requirements 1.2, 1.3, 3.1**
+    ///
+    /// This test demonstrates that PathContext::new (used for backward directives) produces
+    /// results based solely on the file's directory, while PathContext::from_metadata
+    /// (used for source() calls) uses the @lsp-cd working directory.
+    #[test]
+    fn prop_backward_directive_resolution_deterministic(
+        workspace in path_component(),
+        subdir in path_component(),
+        wd_dir in path_component(),
+        filename in path_component()
+    ) {
+        // Ensure working directory differs from file's directory
+        prop_assume!(wd_dir != subdir);
+
+        let file_uri = Url::parse(&format!("file:///{}/{}/child.R", workspace, subdir)).unwrap();
+        let workspace_uri = Url::parse(&format!("file:///{}", workspace)).unwrap();
+
+        // Metadata with @lsp-cd pointing to a different directory
+        let meta = CrossFileMetadata {
+            working_directory: Some(format!("/{}", wd_dir)),
+            ..Default::default()
+        };
+
+        // PathContext::new (for backward directives) - ignores metadata entirely
+        let ctx_new = PathContext::new(&file_uri, Some(&workspace_uri)).unwrap();
+
+        // PathContext::from_metadata (for source() calls) - uses working_directory
+        let ctx_meta = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // Key assertion: effective_working_directory differs between the two contexts
+        // This is the fundamental difference that causes different path resolution
+        let wd_new = ctx_new.effective_working_directory();
+        let wd_meta = ctx_meta.effective_working_directory();
+
+        prop_assert_ne!(
+            wd_new.clone(), wd_meta.clone(),
+            "PathContext::new should use file's directory ({}), not @lsp-cd directory ({})",
+            wd_new.display(), wd_meta.display()
+        );
+
+        // Verify PathContext::new uses the file's parent directory
+        let expected_file_dir = PathBuf::from(format!("/{}/{}", workspace, subdir));
+        prop_assert_eq!(
+            wd_new, expected_file_dir,
+            "PathContext::new should use file's directory"
+        );
+
+        // Verify PathContext::from_metadata uses the @lsp-cd directory
+        let expected_wd = PathBuf::from(format!("/{}/{}", workspace, wd_dir));
+        prop_assert_eq!(
+            wd_meta, expected_wd,
+            "PathContext::from_metadata should use @lsp-cd directory"
+        );
+
+        // For a simple filename (no ..), resolution should differ
+        let simple_path = format!("{}.R", filename);
+        let resolved_new = resolve_path(&simple_path, &ctx_new);
+        let resolved_meta = resolve_path(&simple_path, &ctx_meta);
+
+        prop_assert_ne!(
+            resolved_new.clone(), resolved_meta.clone(),
+            "Simple path '{}' should resolve differently: new={:?}, meta={:?}",
+            simple_path, resolved_new, resolved_meta
+        );
+    }
+}
+
+// ============================================================================
 // Property 23: Dependency Graph Update on Change
 // Validates: Requirements 0.1, 0.2, 6.1, 6.2
 // ============================================================================
