@@ -2205,7 +2205,7 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
 /// ```
 ///
 /// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
-pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
@@ -2266,8 +2266,18 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
                 // Validates: Requirement 10.2
                 if let Some(pkg) = package_name {
                     // Try to get function signature from R help
-                    if let Some(signature) = crate::help::get_function_signature(name, pkg) {
-                        value.push_str(&format!("```r\n{}\n```\n", signature));
+                    let name_owned = name.to_string();
+                    let pkg_owned = pkg.to_string();
+                    if let Ok(signature) = tokio::task::spawn_blocking(move || {
+                        crate::help::get_function_signature(&name_owned, &pkg_owned)
+                    }).await {
+                        if let Some(signature) = signature {
+                            value.push_str(&format!("```r\n{}\n```\n", signature));
+                        } else if let Some(sig) = &symbol.signature {
+                            value.push_str(&format!("```r\n{}\n```\n", sig));
+                        } else {
+                            value.push_str(&format!("```r\n{}\n```\n", name));
+                        }
                     } else if let Some(sig) = &symbol.signature {
                         value.push_str(&format!("```r\n{}\n```\n", sig));
                     } else {
@@ -2314,8 +2324,16 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
             let mut value = String::new();
             
             // Try to get function signature from R help
-            if let Some(signature) = crate::help::get_function_signature(name, &pkg_name) {
-                value.push_str(&format!("```r\n{}\n```\n", signature));
+            let name_owned = name.to_string();
+            let pkg_owned = pkg_name.to_string();
+            if let Ok(signature) = tokio::task::spawn_blocking(move || {
+                crate::help::get_function_signature(&name_owned, &pkg_owned)
+            }).await {
+                if let Some(signature) = signature {
+                    value.push_str(&format!("```r\n{}\n```\n", signature));
+                } else {
+                    value.push_str(&format!("```r\n{}\n```\n", name));
+                }
             } else {
                 value.push_str(&format!("```r\n{}\n```\n", name));
             }
@@ -2348,17 +2366,22 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     }
 
     // Try to get help from R subprocess
-    if let Some(help_text) = crate::help::get_help(name, None) {
-        // Cache successful result
-        state.help_cache.insert(name.to_string(), Some(help_text.clone()));
-        
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: format!("```\n{}\n```", help_text),
-            }),
-            range: Some(node_range),
-        });
+    let name_owned = name.to_string();
+    if let Ok(help_text) = tokio::task::spawn_blocking(move || {
+        crate::help::get_help(&name_owned, None)
+    }).await {
+        if let Some(help_text) = help_text {
+            // Cache successful result
+            state.help_cache.insert(name.to_string(), Some(help_text.clone()));
+            
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("```\n{}\n```", help_text),
+                }),
+                range: Some(node_range),
+            });
+        }
     }
 
     // Cache negative result to avoid repeated failed lookups
@@ -2951,6 +2974,17 @@ fn escape_markdown(text: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    fn hover_blocking(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.block_on(super::hover(state, uri, position))
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::hover(state, uri, position))
+        }
+    }
 
     fn parse_r_code(code: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
@@ -4670,7 +4704,7 @@ mod proptests {
             state.documents.insert(uri.clone(), Document::new(&code, None));
             
             let position = Position::new(0, 5);
-            let hover_result = hover(&state, &uri, position);
+            let hover_result = hover_blocking(&state, &uri, position);
             
             if let Some(hover) = hover_result {
                 if let HoverContents::Markup(content) = hover.contents {
@@ -5138,7 +5172,7 @@ result <- helper_func(42)"#;
         
         // Test hover on helper_func in main.R (line 1, after source call)
         let position = Position::new(1, 10); // Position of "helper_func"
-        let hover_result = hover(&state, &main_uri, position);
+        let hover_result = hover_blocking(&state, &main_uri, position);
         
         assert!(hover_result.is_some());
         let hover = hover_result.unwrap();
@@ -5177,7 +5211,7 @@ result <- my_func(1, 2)"#;
         
         // Test hover on my_func usage (should show local definition, not utils.R)
         let position = Position::new(2, 10); // Position of "my_func" in usage
-        let hover_result = hover(&state, &main_uri, position);
+        let hover_result = hover_blocking(&state, &main_uri, position);
         
         assert!(hover_result.is_some());
         let hover = hover_result.unwrap();
@@ -5217,7 +5251,7 @@ result <- my_func(1, 2)"#;
         let mut test_state = state;
         test_state.documents.insert(uri.clone(), doc);
         
-        let hover_result = hover(&test_state, &uri, position);
+        let hover_result = hover_blocking(&test_state, &uri, position);
         
         // Should return hover info (either from help cache or R subprocess)
         // The exact content depends on R availability, but structure should be consistent
@@ -5245,7 +5279,7 @@ result <- my_func(1, 2)"#;
         
         // Test hover on undefined symbol
         let position = Position::new(0, 10); // Position of "undefined_symbol_that_does_not_exist"
-        let hover_result = hover(&state, &uri, position);
+        let hover_result = hover_blocking(&state, &uri, position);
         
         // Should return None for truly undefined symbols (after trying all fallbacks)
         // This tests the graceful handling when no definition is found anywhere
@@ -5434,7 +5468,7 @@ process_data <- function(data, threshold = 0.5, ...) {
         ];
         
         for (position, symbol_name, expected_statement) in hover_tests {
-            let hover_result = hover(&state, &uri, position);
+            let hover_result = hover_blocking(&state, &uri, position);
             if let Some(hover) = hover_result {
                 if let HoverContents::Markup(content) = hover.contents {
                     assert!(content.value.contains(expected_statement), 
@@ -5541,7 +5575,7 @@ helper_transform <- function(data) {
         
         // Test hover shows proper formatting for multi-line definitions
         let multi_line_func_position = Position::new(13, 0); // analyze_data function name
-        let hover_result = hover(&state, &main_uri, multi_line_func_position);
+        let hover_result = hover_blocking(&state, &main_uri, multi_line_func_position);
         
         if let Some(hover) = hover_result {
             if let HoverContents::Markup(content) = hover.contents {
@@ -5616,7 +5650,7 @@ local_var <- 200"#;
         
         // Test hover on global symbol shows cross-file location
         let hover_position = Position::new(5, 16); // "global_func" usage
-        let hover_result = hover(&state, &main_uri, hover_position);
+        let hover_result = hover_blocking(&state, &main_uri, hover_position);
         
         if let Some(hover) = hover_result {
             if let HoverContents::Markup(content) = hover.contents {
@@ -5653,7 +5687,7 @@ result <- helper_with_spaces(42)"#;
         
         // Test hover shows proper hyperlink formatting
         let position = Position::new(1, 10); // "helper_with_spaces"
-        let hover_result = hover(&state, &main_uri, position);
+        let hover_result = hover_blocking(&state, &main_uri, position);
         
         if let Some(hover) = hover_result {
             if let HoverContents::Markup(content) = hover.contents {
@@ -5877,7 +5911,7 @@ result <- mutate(1, 2)"#;
         
         // Test hover on "mutate" usage (line 2, position 10)
         let position = Position::new(2, 10);
-        let hover_result = hover(&state, &uri, position);
+        let hover_result = hover_blocking(&state, &uri, position);
         
         assert!(hover_result.is_some(), "Hover should return a result");
         let hover = hover_result.unwrap();

@@ -1392,7 +1392,7 @@ impl LanguageServer for Backend {
             &state,
             &params.text_document_position_params.text_document.uri,
             params.text_document_position_params.position,
-        ))
+        ).await)
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
