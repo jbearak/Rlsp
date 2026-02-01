@@ -646,7 +646,7 @@ pub type WorkspaceScanResult = (
     HashMap<Url, crate::workspace_index::IndexEntry>,
 );
 
-pub fn scan_workspace(folders: &[Url]) -> WorkspaceScanResult {
+pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanResult {
     let mut index = HashMap::new();
     let mut imports = Vec::new();
     let mut cross_file_entries = HashMap::new();
@@ -673,8 +673,7 @@ pub fn scan_workspace(folders: &[Url]) -> WorkspaceScanResult {
 
     // Second pass: iteratively enrich metadata with inherited_working_directory
     // Use bounded loop to propagate transitive inheritance (parent's inherited_wd to children)
-    let max_iterations = crate::cross_file::dependency::DEFAULT_MAX_INHERITANCE_DEPTH;
-    for iteration in 0..max_iterations {
+    for iteration in 0..max_chain_depth {
         // Build metadata map from current state (includes any enrichment from prior iterations)
         let metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> = new_index_entries
             .iter()
@@ -690,6 +689,7 @@ pub fn scan_workspace(folders: &[Url]) -> WorkspaceScanResult {
                 uri,
                 workspace_root.as_ref(),
                 |parent_uri| metadata_map.get(parent_uri).cloned(),
+                max_chain_depth,
             );
             if entry.metadata.inherited_working_directory != old_inherited {
                 changed = true;
@@ -703,6 +703,7 @@ pub fn scan_workspace(folders: &[Url]) -> WorkspaceScanResult {
                 uri,
                 workspace_root.as_ref(),
                 |parent_uri| metadata_map.get(parent_uri).cloned(),
+                max_chain_depth,
             );
             if entry.metadata.inherited_working_directory != old_inherited {
                 changed = true;

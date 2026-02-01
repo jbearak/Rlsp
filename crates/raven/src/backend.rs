@@ -364,15 +364,15 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         log::info!("ark-lsp initialized");
         
-        // Get workspace folders under brief lock
-        let folders: Vec<Url> = {
+        // Get workspace folders and config under brief lock
+        let (folders, max_chain_depth): (Vec<Url>, usize) = {
             let state = self.state.read().await;
-            state.workspace_folders.clone()
+            (state.workspace_folders.clone(), state.cross_file_config.max_chain_depth)
         };
         
         // Scan workspace without holding lock (Requirement 13a)
         let (index, imports, cross_file_entries, new_index_entries) = tokio::task::spawn_blocking(move || {
-            scan_workspace(&folders)
+            scan_workspace(&folders, max_chain_depth)
         }).await.unwrap_or_default();
         
         // Apply results under brief write lock
@@ -469,6 +469,7 @@ impl LanguageServer for Backend {
             let mut meta = crate::cross_file::extract_metadata(&text);
             let uri_clone = uri.clone();
             let workspace_root = state.workspace_folders.first().cloned();
+            let max_chain_depth = state.cross_file_config.max_chain_depth;
             
             // Enrich metadata with inherited working directory before any use
             // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
@@ -477,6 +478,7 @@ impl LanguageServer for Backend {
                 &uri_clone,
                 workspace_root.as_ref(),
                 |parent_uri| state.get_enriched_metadata(parent_uri),
+                max_chain_depth,
             );
             
             // Update new DocumentStore with enriched metadata (Requirement 1.3)
@@ -855,6 +857,7 @@ impl LanguageServer for Backend {
             // Capture package settings for background prefetch
             let packages_enabled = state.cross_file_config.packages_enabled;
             let package_library = state.package_library.clone();
+            let max_chain_depth = state.cross_file_config.max_chain_depth;
             
             // Extract and enrich metadata with inherited working directory
             let (packages_to_prefetch, enriched_meta, wd_affected) = if let Some(doc) = state.documents.get(&uri) {
@@ -870,6 +873,7 @@ impl LanguageServer for Backend {
                     &uri_clone,
                     workspace_root.as_ref(),
                     |parent_uri| state.get_enriched_metadata(parent_uri),
+                    max_chain_depth,
                 );
                 
                 // Collect package names for prefetch

@@ -147,6 +147,7 @@ pub fn enrich_metadata_with_inherited_wd<F>(
     uri: &Url,
     workspace_root: Option<&Url>,
     get_metadata: F,
+    max_depth: usize,
 ) where
     F: Fn(&Url) -> Option<CrossFileMetadata>,
 {
@@ -154,7 +155,7 @@ pub fn enrich_metadata_with_inherited_wd<F>(
         return;
     }
     meta.inherited_working_directory =
-        super::dependency::compute_inherited_working_directory(uri, meta, workspace_root, get_metadata);
+        super::dependency::compute_inherited_working_directory_with_depth(uri, meta, workspace_root, get_metadata, max_depth);
 }
 
 #[cfg(test)]

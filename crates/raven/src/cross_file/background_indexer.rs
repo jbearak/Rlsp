@@ -279,12 +279,14 @@ impl BackgroundIndexer {
         {
             let state_guard = state.read().await;
             let workspace_root = state_guard.workspace_folders.first().cloned();
+            let max_chain_depth = state_guard.cross_file_config.max_chain_depth;
             
             crate::cross_file::enrich_metadata_with_inherited_wd(
                 &mut cross_file_meta,
                 uri,
                 workspace_root.as_ref(),
                 |parent_uri| state_guard.get_enriched_metadata(parent_uri),
+                max_chain_depth,
             );
         }
 

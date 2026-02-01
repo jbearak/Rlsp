@@ -7,6 +7,9 @@ mod workspace_scan_tests {
     use tempfile::TempDir;
     use tower_lsp::lsp_types::Url;
 
+    // Use default max_chain_depth for tests
+    const TEST_MAX_CHAIN_DEPTH: usize = 20;
+
     #[test]
     fn test_scan_workspace_finds_uppercase_r_files() {
         let temp_dir = TempDir::new().unwrap();
@@ -14,7 +17,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url]);
+        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 1, "Should find 1 .R file");
         assert_eq!(cross_file_entries.len(), 1, "Should have 1 cross-file entry");
@@ -28,7 +31,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url]);
+        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 1, "Should find 1 .r file");
         assert_eq!(cross_file_entries.len(), 1, "Should have 1 cross-file entry");
@@ -44,7 +47,7 @@ mod workspace_scan_tests {
         fs::write(temp_dir.path().join("lowercase.r"), "y <- 2").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url]);
+        let (index, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 2, "Should find both .R and .r files");
         assert_eq!(cross_file_entries.len(), 2, "Should have 2 cross-file entries");
@@ -65,7 +68,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "my_func <- function() { 42 }").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (_, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url]);
+        let (_, _, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(cross_file_entries.len(), 1);
         assert_eq!(new_index_entries.len(), 1);
@@ -93,7 +96,7 @@ mod workspace_scan_tests {
         fs::write(subdir.join("nested.r"), "y <- 2").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, _, new_index_entries) = scan_workspace(&[workspace_url]);
+        let (index, _, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 2, "Should find files in root and subdirectory");
         assert_eq!(new_index_entries.len(), 2, "Should have 2 new index entries");
@@ -111,7 +114,7 @@ my_func <- function(x) { x + 1 }
 "#).unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (_, _, _, new_index_entries) = scan_workspace(&[workspace_url]);
+        let (_, _, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(new_index_entries.len(), 1);
         
