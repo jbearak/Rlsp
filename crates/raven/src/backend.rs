@@ -468,19 +468,12 @@ impl LanguageServer for Backend {
             let workspace_root = state.workspace_folders.first().cloned();
             
             // Enrich metadata with inherited working directory before any use
+            // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
             crate::cross_file::enrich_metadata_with_inherited_wd(
                 &mut meta,
                 &uri_clone,
                 workspace_root.as_ref(),
-                |parent_uri| {
-                    state.documents.get(parent_uri)
-                        .map(|doc| crate::cross_file::extract_metadata(&doc.text()))
-                        .or_else(|| state.cross_file_workspace_index.get_metadata(parent_uri))
-                        .or_else(|| {
-                            state.cross_file_file_cache.get(parent_uri)
-                                .map(|content| crate::cross_file::extract_metadata(&content))
-                        })
-                },
+                |parent_uri| state.get_enriched_metadata(parent_uri),
             );
             
             // Update new DocumentStore with enriched metadata (Requirement 1.3)
@@ -849,19 +842,12 @@ impl LanguageServer for Backend {
                 let workspace_root = state.workspace_folders.first().cloned();
                 
                 // Enrich metadata with inherited working directory before any use
+                // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
                 crate::cross_file::enrich_metadata_with_inherited_wd(
                     &mut meta,
                     &uri_clone,
                     workspace_root.as_ref(),
-                    |parent_uri| {
-                        state.documents.get(parent_uri)
-                            .map(|doc| crate::cross_file::extract_metadata(&doc.text()))
-                            .or_else(|| state.cross_file_workspace_index.get_metadata(parent_uri))
-                            .or_else(|| {
-                                state.cross_file_file_cache.get(parent_uri)
-                                    .map(|content| crate::cross_file::extract_metadata(&content))
-                            })
-                    },
+                    |parent_uri| state.get_enriched_metadata(parent_uri),
                 );
                 
                 // Collect package names for prefetch

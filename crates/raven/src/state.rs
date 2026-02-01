@@ -527,6 +527,23 @@ impl WorldState {
         self.documents.get(uri)
     }
 
+    /// Get enriched metadata for a URI, preferring already-enriched sources.
+    ///
+    /// Priority order:
+    /// 1. DocumentStore (open documents with enriched metadata)
+    /// 2. WorkspaceIndex (new unified index)
+    /// 3. Legacy cross_file_workspace_index
+    /// 4. Legacy documents HashMap (re-extract metadata)
+    /// 5. File cache (re-extract metadata)
+    pub fn get_enriched_metadata(&self, uri: &Url) -> Option<crate::cross_file::CrossFileMetadata> {
+        self.document_store.get_without_touch(uri)
+            .map(|doc| doc.metadata.clone())
+            .or_else(|| self.workspace_index_new.get_metadata(uri))
+            .or_else(|| self.cross_file_workspace_index.get_metadata(uri))
+            .or_else(|| self.documents.get(uri).map(|doc| crate::cross_file::extract_metadata(&doc.text())))
+            .or_else(|| self.cross_file_file_cache.get(uri).map(|content| crate::cross_file::extract_metadata(&content)))
+    }
+
     #[allow(dead_code)]
     pub fn index_workspace(&mut self) {
         let folders = self.workspace_folders.clone();
@@ -654,30 +671,48 @@ pub fn scan_workspace(folders: &[Url]) -> WorkspaceScanResult {
         }
     }
 
-    // Second pass: enrich metadata with inherited_working_directory
-    // Use scanned entries as the metadata source
-    // We need to collect metadata first to avoid borrow conflicts
-    let metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> = new_index_entries
-        .iter()
-        .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
-        .collect();
-    
-    for (uri, entry) in new_index_entries.iter_mut() {
-        crate::cross_file::enrich_metadata_with_inherited_wd(
-            &mut entry.metadata,
-            uri,
-            workspace_root.as_ref(),
-            |parent_uri| metadata_map.get(parent_uri).cloned(),
-        );
-    }
-    // Also update legacy cross_file_entries
-    for (uri, entry) in cross_file_entries.iter_mut() {
-        crate::cross_file::enrich_metadata_with_inherited_wd(
-            &mut entry.metadata,
-            uri,
-            workspace_root.as_ref(),
-            |parent_uri| metadata_map.get(parent_uri).cloned(),
-        );
+    // Second pass: iteratively enrich metadata with inherited_working_directory
+    // Use bounded loop to propagate transitive inheritance (parent's inherited_wd to children)
+    let max_iterations = crate::cross_file::dependency::DEFAULT_MAX_INHERITANCE_DEPTH;
+    for iteration in 0..max_iterations {
+        // Build metadata map from current state (includes any enrichment from prior iterations)
+        let metadata_map: HashMap<Url, crate::cross_file::CrossFileMetadata> = new_index_entries
+            .iter()
+            .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+            .collect();
+        
+        let mut changed = false;
+        
+        for (uri, entry) in new_index_entries.iter_mut() {
+            let old_inherited = entry.metadata.inherited_working_directory.clone();
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut entry.metadata,
+                uri,
+                workspace_root.as_ref(),
+                |parent_uri| metadata_map.get(parent_uri).cloned(),
+            );
+            if entry.metadata.inherited_working_directory != old_inherited {
+                changed = true;
+            }
+        }
+        // Also update legacy cross_file_entries
+        for (uri, entry) in cross_file_entries.iter_mut() {
+            let old_inherited = entry.metadata.inherited_working_directory.clone();
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut entry.metadata,
+                uri,
+                workspace_root.as_ref(),
+                |parent_uri| metadata_map.get(parent_uri).cloned(),
+            );
+            if entry.metadata.inherited_working_directory != old_inherited {
+                changed = true;
+            }
+        }
+        
+        if !changed {
+            log::trace!("Workspace scan enrichment converged after {} iteration(s)", iteration + 1);
+            break;
+        }
     }
 
     log::info!("Scanned {} workspace files ({} with cross-file metadata, {} new index entries)", 

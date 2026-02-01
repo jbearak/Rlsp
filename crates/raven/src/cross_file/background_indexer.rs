@@ -275,6 +275,7 @@ impl BackgroundIndexer {
         let mut cross_file_meta = extract_metadata(&content);
 
         // Enrich metadata with inherited working directory
+        // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
         {
             let state_guard = state.read().await;
             let workspace_root = state_guard.workspace_folders.first().cloned();
@@ -283,15 +284,7 @@ impl BackgroundIndexer {
                 &mut cross_file_meta,
                 uri,
                 workspace_root.as_ref(),
-                |parent_uri| {
-                    state_guard.documents.get(parent_uri)
-                        .map(|doc| extract_metadata(&doc.text()))
-                        .or_else(|| state_guard.cross_file_workspace_index.get_metadata(parent_uri))
-                        .or_else(|| {
-                            state_guard.cross_file_file_cache.get(parent_uri)
-                                .map(|content| extract_metadata(&content))
-                        })
-                },
+                |parent_uri| state_guard.get_enriched_metadata(parent_uri),
             );
         }
 
