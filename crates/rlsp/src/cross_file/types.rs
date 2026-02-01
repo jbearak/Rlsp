@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tower_lsp::lsp_types::Url;
 
+use super::source_detect::LibraryCall;
+
 /// Complete cross-file metadata for a document
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrossFileMetadata {
@@ -21,6 +23,8 @@ pub struct CrossFileMetadata {
     pub ignored_lines: HashSet<u32>,
     /// Lines following @lsp-ignore-next (0-based)
     pub ignored_next_lines: HashSet<u32>,
+    /// Detected library(), require(), loadNamespace() calls
+    pub library_calls: Vec<LibraryCall>,
 }
 
 /// A backward directive declaring this file is sourced by another
@@ -207,6 +211,7 @@ mod tests {
             working_directory: Some("/data".to_string()),
             ignored_lines: HashSet::from([10, 20]),
             ignored_next_lines: HashSet::from([15]),
+            library_calls: vec![],
         };
         
         // Round-trip serialization

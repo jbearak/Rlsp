@@ -1035,6 +1035,50 @@ mod helper_tests {
     }
 
     #[test]
+    fn test_extract_metadata_with_library_calls() {
+        // Validates: Requirement 1.8 - library calls processed in document order
+        let mut workspace = TestWorkspace::new().unwrap();
+        workspace.add_file("test.r", "library(dplyr)\nlibrary(ggplot2)\nrequire(tidyr)").unwrap();
+        
+        let metadata = extract_metadata_for_file(&workspace, "test.r").unwrap();
+        assert_eq!(metadata.library_calls.len(), 3);
+        assert_eq!(metadata.library_calls[0].package, "dplyr");
+        assert_eq!(metadata.library_calls[0].line, 0);
+        assert_eq!(metadata.library_calls[1].package, "ggplot2");
+        assert_eq!(metadata.library_calls[1].line, 1);
+        assert_eq!(metadata.library_calls[2].package, "tidyr");
+        assert_eq!(metadata.library_calls[2].line, 2);
+    }
+
+    #[test]
+    fn test_extract_metadata_library_calls_sorted_by_position() {
+        // Validates: Requirement 1.8 - library calls in document order
+        let mut workspace = TestWorkspace::new().unwrap();
+        // Multiple library calls on same line should be sorted by column
+        workspace.add_file("test.r", "library(a); library(b)").unwrap();
+        
+        let metadata = extract_metadata_for_file(&workspace, "test.r").unwrap();
+        assert_eq!(metadata.library_calls.len(), 2);
+        assert_eq!(metadata.library_calls[0].package, "a");
+        assert_eq!(metadata.library_calls[1].package, "b");
+        // First call ends at column 10, second at column 22
+        assert!(metadata.library_calls[0].column < metadata.library_calls[1].column);
+    }
+
+    #[test]
+    fn test_extract_metadata_mixed_source_and_library() {
+        let mut workspace = TestWorkspace::new().unwrap();
+        workspace.add_file("test.r", "library(dplyr)\nsource('utils.r')\nlibrary(ggplot2)").unwrap();
+        
+        let metadata = extract_metadata_for_file(&workspace, "test.r").unwrap();
+        assert_eq!(metadata.sources.len(), 1);
+        assert_eq!(metadata.sources[0].path, "utils.r");
+        assert_eq!(metadata.library_calls.len(), 2);
+        assert_eq!(metadata.library_calls[0].package, "dplyr");
+        assert_eq!(metadata.library_calls[1].package, "ggplot2");
+    }
+
+    #[test]
     fn test_build_dependency_graph_simple() {
         let mut workspace = TestWorkspace::new().unwrap();
         workspace.add_file("main.r", "source('utils.r')").unwrap();

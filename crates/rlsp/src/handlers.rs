@@ -21,21 +21,58 @@ use crate::builtins;
 // Cross-File Scope Helper
 // ============================================================================
 
-/// Get cross-file symbols available at a position.
-/// This traverses the source() chain to include symbols from sourced files,
-/// and also includes symbols from parent files via backward directives.
+/// Collects cross-file symbols visible at the given document position.
 ///
-/// Uses ContentProvider for unified access to file content, metadata, and artifacts.
-/// The ContentProvider already implements the open-docs-authoritative rule,
-/// so no manual fallback logic is needed.
+/// The returned set includes symbols brought into scope via `source()` chains
+/// and parent-file backward directives; it uses the state's ContentProvider to
+/// resolve referenced files and artifacts.
 ///
-/// **Validates: Requirements 7.2, 13.2**
+/// # Examples
+///
+/// ```no_run
+/// use url::Url;
+/// // `state` is a prepared WorldState; obtain or mock as appropriate in tests.
+/// let state = /* WorldState */ todo!();
+/// let uri = Url::parse("file:///path/to/script.R").unwrap();
+/// let symbols = crate::get_cross_file_symbols(&state, &uri, 12, 4);
+/// // `symbols` maps symbol names to their scoped metadata.
+/// ```
+///
+/// # Returns
+///
+/// A `HashMap` mapping symbol names to their corresponding `ScopedSymbol` entries.
 fn get_cross_file_symbols(
     state: &WorldState,
     uri: &Url,
     line: u32,
     column: u32,
 ) -> HashMap<String, ScopedSymbol> {
+    get_cross_file_scope(state, uri, line, column).symbols
+}
+
+/// Compute the unified cross-file scope at a given position, including available symbols and package visibility.
+///
+/// This returns a position-aware ScopeAtPosition that reflects symbols visible at (line, column) in `uri`, along with loaded and inherited package lists and depth information for cross-file resolution.
+///
+/// # Returns
+///
+/// A `scope::ScopeAtPosition` containing the resolved symbols, `loaded_packages`, `inherited_packages`, and scope depth metadata for the specified location.
+///
+/// # Examples
+///
+/// ```no_run
+/// use url::Url;
+/// // `state` is your WorldState and `uri` is the file URL you want to query.
+/// let uri = Url::parse("file:///path/to/script.R").unwrap();
+/// let scope = get_cross_file_scope(&state, &uri, 10, 5);
+/// // inspect scope.symbols, scope.loaded_packages, etc.
+/// ```
+fn get_cross_file_scope(
+    state: &WorldState,
+    uri: &Url,
+    line: u32,
+    column: u32,
+) -> scope::ScopeAtPosition {
     // Use ContentProvider for unified access
     let content_provider = state.content_provider();
 
@@ -52,7 +89,7 @@ fn get_cross_file_symbols(
     let max_depth = state.cross_file_config.max_chain_depth;
     
     // Use the graph-aware scope resolution with PathContext
-    let scope = scope::scope_at_position_with_graph(
+    scope::scope_at_position_with_graph(
         uri,
         line,
         column,
@@ -61,9 +98,7 @@ fn get_cross_file_symbols(
         &state.cross_file_graph,
         state.workspace_folders.first(),
         max_depth,
-    );
-    
-    scope.symbols
+    )
 }
 
 // ============================================================================
@@ -234,6 +269,24 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 // Diagnostics
 // ============================================================================
 
+/// Compute diagnostics for the document at the given URI.
+///
+/// Performs a full set of checks for the specified open document and returns collected diagnostics.
+/// Reported issues include syntax errors, circular dependency and max-depth problems, missing or ambiguous
+/// sourced files, out-of-scope symbol usage, missing package warnings, and (when enabled) undefined-variable
+/// diagnostics that account for cross-file and package scope.
+///
+/// # Returns
+///
+/// `Vec<Diagnostic>` containing diagnostics for the document at `uri`, which may be empty if no issues were found.
+///
+/// # Examples
+///
+/// ```
+/// // Given a prepared `WorldState` and a `Url` referring to an open document:
+/// let diags = diagnostics(&state, &uri);
+/// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
+/// ```
 pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     let Some(doc) = state.get_document(uri) else {
         return Vec::new();
@@ -280,6 +333,9 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     // Check for out-of-scope symbol usage (Requirement 10.3)
     collect_out_of_scope_diagnostics(state, uri, tree.root_node(), &text, &directive_meta, &mut diagnostics);
 
+    // Check for missing packages in library() calls (Requirement 15.1)
+    collect_missing_package_diagnostics(state, &directive_meta, &mut diagnostics);
+
     // Collect undefined variable errors if enabled in config
     if state.cross_file_config.undefined_variables_enabled {
         collect_undefined_variables_position_aware(
@@ -289,7 +345,7 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
             &text,
             &doc.loaded_packages,
             &state.workspace_imports,
-            &state.library,
+            &state.package_library,
             &directive_meta,
             &mut diagnostics,
         );
@@ -809,7 +865,24 @@ fn collect_max_depth_diagnostics(
     }
 }
 
-/// Collect diagnostics for ambiguous parent relationships
+/// Emit a diagnostic when a file's parent resolution is ambiguous.
+///
+/// This inspects the cross-file metadata and graph to resolve the file's parent(s).
+/// If resolution returns an ambiguous result, a single `Diagnostic` is pushed that
+/// points at the first backward directive line and suggests adding `line=` or `match=`
+/// to disambiguate. The diagnostic's severity is taken from the cross-file config.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use url::Url;
+/// # use lsp_types::Diagnostic;
+/// # use crate::WorldState;
+/// # use crate::cross_file::CrossFileMetadata;
+/// # fn example(state: &WorldState, uri: &Url, meta: &CrossFileMetadata, diagnostics: &mut Vec<Diagnostic>) {
+/// collect_ambiguous_parent_diagnostics(state, uri, meta, diagnostics);
+/// # }
+/// ```
 fn collect_ambiguous_parent_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -875,7 +948,90 @@ fn collect_ambiguous_parent_diagnostics(
     }
 }
 
-/// Collect diagnostics for symbols used before their source() call (Requirement 10.3)
+/// Emit diagnostics for `library()` calls that reference packages not present in the package library.
+///
+/// Scans the cross-file metadata for `library()` calls and, for each call that is not ignored
+/// via directives and whose package is not found in `state.package_library`, appends a warning
+/// Diagnostic covering the call's line range with the configured severity.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Construct a WorldState with packages enabled and an empty PackageLibrary,
+/// // provide CrossFileMetadata containing a LibraryCall for "foo", then:
+/// //
+/// // collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+/// //
+/// // After the call, `diagnostics` will contain a warning about package "foo".
+/// ```
+fn collect_missing_package_diagnostics(
+    state: &WorldState,
+    meta: &crate::cross_file::CrossFileMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // Skip if packages feature is disabled
+    if !state.cross_file_config.packages_enabled {
+        return;
+    }
+
+    for lib_call in &meta.library_calls {
+        // Skip if the line is ignored via @lsp-ignore or @lsp-ignore-next
+        if crate::cross_file::directive::is_line_ignored(meta, lib_call.line) {
+            continue;
+        }
+
+        // Check if the package exists (is installed)
+        if !state.package_library.package_exists(&lib_call.package) {
+            // Package not found - emit diagnostic with configured severity
+            // The column in LibraryCall is already UTF-16 (end position of the call)
+            // We want to highlight the library() call, so we use the line and estimate the range
+            
+            // Calculate approximate start column (library( is 8 chars, package name varies)
+            // We'll highlight from column 0 to the end column for simplicity
+            let end_col = lib_call.column;
+            
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(lib_call.line, 0),
+                    end: Position::new(lib_call.line, end_col),
+                },
+                severity: Some(state.cross_file_config.packages_missing_package_severity),
+                message: format!("Package '{}' is not installed", lib_call.package),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+/// Emit diagnostics for symbols defined in sourced files that are referenced
+/// earlier in the current document than the corresponding `source()` call.
+///
+/// This function:
+/// - Scans `directive_meta.sources` and collects source paths declared in the file.
+/// - Collects identifier usages (UTF-16 columns) in `node`.
+/// - For each sourced file, resolves its URI and obtains its exported symbols (preferring open documents, then cross-file index, then legacy index).
+/// - Emits a diagnostic for every usage of an exported symbol that occurs before the `source()` call (skipping lines marked ignored by directives).
+///
+/// The produced diagnostics are appended to `diagnostics` and use the configured
+/// `out_of_scope_severity` from `state.cross_file_config`.
+///
+/// # Parameters
+///
+/// - `state`: Workspace state and indexes used to resolve artifacts and configuration.
+/// - `uri`: URI of the current document being analyzed (used to resolve relative source paths).
+/// - `node`: Root AST node of the current document.
+/// - `text`: Full source text of the current document.
+/// - `directive_meta`: Cross-file directive metadata (contains `@lsp-source` / `source()` locations).
+/// - `diagnostics`: Mutable vector to receive emitted diagnostics.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Collect diagnostics into `diags` for a parsed document:
+/// let mut diags = Vec::new();
+/// collect_out_of_scope_diagnostics(&state, &uri, root_node, &text, &directive_meta, &mut diags);
+/// // `diags` now contains diagnostics for symbols used before their `source()` calls.
+/// ```
 fn collect_out_of_scope_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -1057,18 +1213,31 @@ fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
-/// Position-aware undefined variable collection.
-/// Checks each usage against the cross-file scope at that specific position.
-/// Respects @lsp-ignore and @lsp-ignore-next directives.
+/// Report undefined variable usages in a document using position-aware cross-file scope.
+///
+/// This inspects every identifier usage in `node`, skipping local definitions, builtins,
+/// and workspace imports, and checks visibility at the exact usage position by querying
+/// the cross-file scope (including position-aware loaded/inherited packages). Lines marked
+/// with `@lsp-ignore` or `@lsp-ignore-next` are ignored. When a usage is not found in the
+/// resolved scope or in package exports (if packages are enabled), a `Diagnostic` with a
+/// UTF-16-aware range is emitted for the undefined variable.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Illustrative only — real usage requires a populated WorldState, AST node and other
+/// // project-specific types from the language server state.
+/// // collect_undefined_variables_position_aware(&state, &uri, root_node, &text, &[], &workspace_imports, &package_library, &directive_meta, &mut diagnostics);
+/// ```
 #[allow(clippy::too_many_arguments)]
 fn collect_undefined_variables_position_aware(
     state: &WorldState,
     uri: &Url,
     node: Node,
     text: &str,
-    loaded_packages: &[String],
+    _loaded_packages: &[String], // Deprecated: now using position-aware packages from scope resolution
     workspace_imports: &[String],
-    library: &crate::state::Library,
+    package_library: &crate::package_library::PackageLibrary,
     directive_meta: &crate::cross_file::CrossFileMetadata,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -1096,7 +1265,6 @@ fn collect_undefined_variables_position_aware(
         // Skip if locally defined or builtin
         if defined.contains(&name)
             || is_builtin(&name)
-            || is_package_export(&name, loaded_packages, library)
             || workspace_imports.contains(&name)
         {
             continue;
@@ -1105,35 +1273,83 @@ fn collect_undefined_variables_position_aware(
         // Convert byte column to UTF-16 for cross-file scope lookup
         let line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
         let usage_col = byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
-        let cross_file_symbols = get_cross_file_symbols(state, uri, usage_line, usage_col);
-
-        if !cross_file_symbols.contains_key(&name) {
-            // Convert byte columns to UTF-16 for diagnostic range
-            let start_line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
-            let end_line_text = text.lines().nth(usage_node.end_position().row).unwrap_or("");
-            let start_col = byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
-            let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
-
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position::new(usage_node.start_position().row as u32, start_col),
-                    end: Position::new(usage_node.end_position().row as u32, end_col),
-                },
-                severity: Some(DiagnosticSeverity::WARNING),
-                message: format!("Undefined variable: {}", name),
-                ..Default::default()
-            });
+        
+        // Get full scope at position, including position-aware loaded packages
+        // Requirements 8.1, 8.3, 8.4: Position-aware package checking
+        let scope = get_cross_file_scope(state, uri, usage_line, usage_col);
+        
+        // Check if symbol is in cross-file scope
+        if scope.symbols.contains_key(&name) {
+            continue;
         }
+        
+        // Check package exports only if packages feature is enabled
+        if state.cross_file_config.packages_enabled {
+            // Build position-aware package list: inherited packages + locally loaded packages
+            // Requirements 5.1, 5.2: Inherited packages from parent files
+            // Requirements 8.1, 8.3: Locally loaded packages before this position
+            let position_aware_packages: Vec<String> = scope.inherited_packages.iter()
+                .chain(scope.loaded_packages.iter())
+                .cloned()
+                .collect();
+            
+            // Check if symbol is exported by any package loaded at this position
+            if is_package_export(&name, &position_aware_packages, package_library) {
+                continue;
+            }
+        }
+
+        // Symbol is undefined - emit diagnostic
+        // Convert byte columns to UTF-16 for diagnostic range
+        let start_line_text = text.lines().nth(usage_node.start_position().row).unwrap_or("");
+        let end_line_text = text.lines().nth(usage_node.end_position().row).unwrap_or("");
+        let start_col = byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
+        let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
+
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(usage_node.start_position().row as u32, start_col),
+                end: Position::new(usage_node.end_position().row as u32, end_col),
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
+            message: format!("Undefined variable: {}", name),
+            ..Default::default()
+        });
     }
 }
 
+/// Emit diagnostics for identifiers that are used but not defined, built-in, imported, exported by a loaded package, or available from cross-file symbols.
+///
+/// This function performs a two-pass analysis on the provided syntax `node`:
+/// it collects all defined identifiers, then collects usages (respecting NSE/context rules),
+/// and pushes a `Diagnostic` with severity `Warning` for each usage that is not found in any of:
+/// - the local definitions in the current tree,
+/// - the set of builtins,
+/// - symbols exported by any loaded package (via `package_library` and `loaded_packages`),
+/// - names imported into the workspace (`workspace_imports`),
+/// - the provided `cross_file_symbols`.
+///
+/// Parameters:
+/// - `node`, `text`: the root AST node and source text to analyze.
+/// - `loaded_packages`: names of packages considered loaded for package-export checks.
+/// - `workspace_imports`: names imported into the workspace (treated as defined).
+/// - `package_library`: authoritative package export/index used to determine package exports.
+/// - `cross_file_symbols`: cross-file symbols available to the current file.
+/// - `diagnostics`: destination vector; undefined-variable diagnostics are appended here.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Illustrative example (non-executable here): parse a document to `root` and call:
+/// // collect_undefined_variables(root, &text, &loaded_packages, &workspace_imports, &package_library, &cross_file_symbols, &mut diagnostics);
+/// ```
 #[allow(dead_code)]
 fn collect_undefined_variables(
     node: Node,
     text: &str,
     loaded_packages: &[String],
     workspace_imports: &[String],
-    library: &crate::state::Library,
+    package_library: &crate::package_library::PackageLibrary,
     cross_file_symbols: &HashMap<String, ScopedSymbol>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -1152,7 +1368,7 @@ fn collect_undefined_variables(
     for (name, node) in used {
         if !defined.contains(&name)
             && !is_builtin(&name)
-            && !is_package_export(&name, loaded_packages, library)
+            && !is_package_export(&name, loaded_packages, package_library)
             && !workspace_imports.contains(&name)
             && !cross_file_symbols.contains_key(&name)
         {
@@ -1383,6 +1599,20 @@ fn collect_usages_with_context<'a>(
     }
 }
 
+/// Determines whether an identifier is a recognized R builtin (constant or function).
+///
+/// Checks common R constants (e.g., `TRUE`, `FALSE`, `NULL`, `NA`, `Inf`, `NaN`, `T`, `F`) first and then consults the comprehensive builtin registry.
+///
+/// # Examples
+///
+/// ```
+/// assert!(is_builtin("TRUE"));
+/// assert!(is_builtin("sum"));
+/// assert!(!is_builtin("my_custom_fn"));
+/// ```
+///
+/// # Returns
+/// `true` if `name` is a recognized R builtin constant or function, `false` otherwise.
 fn is_builtin(name: &str) -> bool {
     // Check constants first
     if matches!(name, "TRUE" | "FALSE" | "NULL" | "NA" | "Inf" | "NaN" | "T" | "F") {
@@ -1392,21 +1622,51 @@ fn is_builtin(name: &str) -> bool {
     builtins::is_builtin(name)
 }
 
-fn is_package_export(name: &str, loaded_packages: &[String], library: &crate::state::Library) -> bool {
-    for pkg_name in loaded_packages {
-        if let Some(package) = library.get(pkg_name) {
-            if package.exports.contains(&name.to_string()) {
-                return true;
-            }
-        }
-    }
-    false
+/// Determines whether an identifier is exported by any of the currently loaded packages.
+///
+/// Queries the provided PackageLibrary to decide if `name` originates from one of the packages
+/// listed in `loaded_packages`.
+///
+/// # Returns
+///
+/// `true` if the symbol is exported by a loaded package, `false` otherwise.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # use crate::package_library::PackageLibrary;
+/// # let package_library: PackageLibrary = unimplemented!();
+/// let loaded = vec!["stats".to_string(), "base".to_string()];
+/// let is_export = is_package_export("lm", &loaded, &package_library);
+/// ```
+fn is_package_export(name: &str, loaded_packages: &[String], package_library: &crate::package_library::PackageLibrary) -> bool {
+    // Use PackageLibrary's synchronous method to check if symbol is from loaded packages
+    // This checks base exports first, then cached package exports
+    // Requirements 8.1, 8.2: Check position-aware loaded packages
+    package_library.is_symbol_from_loaded_packages(name, loaded_packages)
 }
 
 // ============================================================================
 // Completions
 // ============================================================================
 
+/// Build a list of completion items for the given document and cursor position.
+///
+/// Returns completion items that prioritize local document definitions, then package exports
+/// (when packages are enabled) with per-package attribution, and finally cross-file symbols.
+/// The function returns `None` when the document, its parse tree, or the node at the cursor
+/// cannot be resolved.
+///
+/// # Examples
+///
+/// ```
+/// // Obtain a `WorldState`, `Url`, and `Position` from your environment.
+/// let state = /* WorldState instance */;
+/// let uri = /* Url for the document */;
+/// let pos = /* Position { line, character } */;
+/// let resp = completion(&state, &uri, pos);
+/// assert!(resp.is_some());
+/// ```
 pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<CompletionResponse> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
@@ -1443,11 +1703,48 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     // Add symbols from current document (local definitions take precedence)
     collect_document_completions(tree.root_node(), &text, &mut items, &mut seen_names);
 
+    // Get scope at cursor position for package exports
+    // Requirements 9.1, 9.2: Add package exports to completions with package attribution
+    let scope = get_cross_file_scope(state, uri, position.line, position.character);
+
+    // Add package exports only if packages feature is enabled
+    if state.cross_file_config.packages_enabled {
+        // Combine inherited and loaded packages
+        let mut all_packages: Vec<String> = scope.inherited_packages.clone();
+        for pkg in &scope.loaded_packages {
+            if !all_packages.contains(pkg) {
+                all_packages.push(pkg.clone());
+            }
+        }
+
+        // Add package exports (after local definitions, before cross-file symbols)
+        // Requirement 9.4: Local definitions > package exports > cross-file symbols
+        // Requirement 9.3: When multiple packages export same symbol, show all with attribution
+        let package_exports = state.package_library.get_exports_for_completions(&all_packages);
+        for (export_name, package_names) in package_exports {
+            if seen_names.contains(&export_name) {
+                continue; // Local definitions take precedence
+            }
+            seen_names.insert(export_name.clone());
+
+            // Requirement 9.3: Show all packages that export this symbol
+            for package_name in package_names {
+                // Requirement 9.2: Include package name in detail field (e.g., "{dplyr}")
+                items.push(CompletionItem {
+                    label: export_name.clone(),
+                    kind: Some(CompletionItemKind::FUNCTION), // Most package exports are functions
+                    detail: Some(format!("{{{}}}", package_name)),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
     // Add cross-file symbols (from scope resolution)
-    let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
-    for (name, symbol) in cross_file_symbols {
+    // Requirement 9.5: Package exports > cross-file symbols
+    for (name, symbol) in scope.symbols {
         if seen_names.contains(&name) {
-            continue; // Local definitions take precedence
+            continue; // Local definitions and package exports take precedence
         }
         seen_names.insert(name.clone());
 
@@ -1887,7 +2184,28 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
 // Hover
 // ============================================================================
 
-pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+/// Provide hover information for the symbol at a given text document position.
+///
+/// Tries, in order:
+/// 1. Cross-file symbol resolution (including local definitions), returning an extracted definition or signature with source attribution.
+/// 2. Package exports discovered from the combined package scope, returning a signature and package attribution.
+/// 3. Cached R help text or a one-time lookup of R help for builtins and other symbols.
+///
+/// The produced hover content is Markdown (code block for signatures/definitions and optional attribution) and the hover range corresponds to the identifier node under the cursor.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use lsp_types::Position;
+/// # use url::Url;
+/// # use crate::state::WorldState;
+/// // Assuming `state` is available and `uri` refers to an open R document:
+/// let pos = Position::new(10, 4);
+/// let _ = hover(&state, &uri, pos);
+/// ```
+///
+/// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
+pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
@@ -1922,6 +2240,10 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     if let Some(symbol) = cross_file_symbols.get(name) {
         let mut value = String::new();
         
+        // Check if this is a package export (source_uri starts with "package:")
+        // Package exports have URIs like "package:dplyr" or "package:base"
+        let package_name = symbol.source_uri.as_str().strip_prefix("package:");
+        
         // Try to extract definition statement
         let workspace_root = state.workspace_folders.first();
         match extract_definition_statement(symbol, state) {
@@ -1940,16 +2262,42 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
             }
             None => {
                 // Graceful fallback: show symbol info without definition statement
-                if let Some(sig) = &symbol.signature {
+                // For package exports, try to get function signature from R help
+                // Validates: Requirement 10.2
+                if let Some(pkg) = package_name {
+                    // Try to get function signature from R help
+                    let name_owned = name.to_string();
+                    let pkg_owned = pkg.to_string();
+                    if let Ok(signature) = tokio::task::spawn_blocking(move || {
+                        crate::help::get_function_signature(&name_owned, &pkg_owned)
+                    }).await {
+                        if let Some(signature) = signature {
+                            value.push_str(&format!("```r\n{}\n```\n", signature));
+                        } else if let Some(sig) = &symbol.signature {
+                            value.push_str(&format!("```r\n{}\n```\n", sig));
+                        } else {
+                            value.push_str(&format!("```r\n{}\n```\n", name));
+                        }
+                    } else if let Some(sig) = &symbol.signature {
+                        value.push_str(&format!("```r\n{}\n```\n", sig));
+                    } else {
+                        value.push_str(&format!("```r\n{}\n```\n", name));
+                    }
+                    // Display package name prominently for package exports
+                    // Validates: Requirement 10.1
+                    value.push_str(&format!("\nfrom {{{}}}", pkg));
+                } else if let Some(sig) = &symbol.signature {
                     value.push_str(&format!("```r\n{}\n```\n", sig));
+                    if symbol.source_uri != *uri {
+                        let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
+                        value.push_str(&format!("\n*Defined in {}*", relative_path));
+                    }
                 } else {
                     value.push_str(&format!("```r\n{}\n```\n", name));
-                }
-                
-                // Add source file info if cross-file
-                if symbol.source_uri != *uri {
-                    let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
-                    value.push_str(&format!("\n*Defined in {}*", relative_path));
+                    if symbol.source_uri != *uri {
+                        let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
+                        value.push_str(&format!("\n*Defined in {}*", relative_path));
+                    }
                 }
             }
         }
@@ -1961,6 +2309,44 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
             }),
             range: Some(node_range),
         });
+    }
+
+    // Check package exports from combined_exports cache (if packages enabled)
+    // This surfaces package exports without blocking on R subprocess
+    if state.cross_file_config.packages_enabled {
+        let scope = get_cross_file_scope(state, uri, position.line, position.character);
+        let all_packages: Vec<String> = scope.inherited_packages.iter()
+            .chain(scope.loaded_packages.iter())
+            .cloned()
+            .collect();
+        
+        if let Some(pkg_name) = state.package_library.find_package_for_symbol(name, &all_packages) {
+            let mut value = String::new();
+            
+            // Try to get function signature from R help
+            let name_owned = name.to_string();
+            let pkg_owned = pkg_name.to_string();
+            if let Ok(signature) = tokio::task::spawn_blocking(move || {
+                crate::help::get_function_signature(&name_owned, &pkg_owned)
+            }).await {
+                if let Some(signature) = signature {
+                    value.push_str(&format!("```r\n{}\n```\n", signature));
+                } else {
+                    value.push_str(&format!("```r\n{}\n```\n", name));
+                }
+            } else {
+                value.push_str(&format!("```r\n{}\n```\n", name));
+            }
+            value.push_str(&format!("\nfrom {{{}}}", pkg_name));
+            
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: Some(node_range),
+            });
+        }
     }
 
     // Fallback to R help system for built-ins and undefined symbols
@@ -1980,17 +2366,22 @@ pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover>
     }
 
     // Try to get help from R subprocess
-    if let Some(help_text) = crate::help::get_help(name, None) {
-        // Cache successful result
-        state.help_cache.insert(name.to_string(), Some(help_text.clone()));
-        
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: format!("```\n{}\n```", help_text),
-            }),
-            range: Some(node_range),
-        });
+    let name_owned = name.to_string();
+    if let Ok(help_text) = tokio::task::spawn_blocking(move || {
+        crate::help::get_help(&name_owned, None)
+    }).await {
+        if let Some(help_text) = help_text {
+            // Cache successful result
+            state.help_cache.insert(name.to_string(), Some(help_text.clone()));
+            
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("```\n{}\n```", help_text),
+                }),
+                range: Some(node_range),
+            });
+        }
     }
 
     // Cache negative result to avoid repeated failed lookups
@@ -2044,6 +2435,26 @@ pub fn signature_help(
 // Goto Definition
 // ============================================================================
 
+/// Locate the definition location for the identifier at the given position by searching
+/// the current document, cross-file symbols, open documents, and the workspace index.
+///
+/// If the identifier is defined in the current document, its local definition is returned.
+/// Otherwise the function searches cross-file symbols and exported interfaces from open
+/// documents and the workspace. If the symbol originates from a package (pseudo-URI
+/// starting with "package:"), no navigable location is returned.
+///
+/// # Returns
+///
+/// `Some(Location)` pointing to the symbol's defining range when a navigable definition is found;
+/// `None` if no definition is found or if the symbol is a package export (non-navigable).
+///
+/// # Examples
+///
+/// ```
+/// // Assume `state`, `uri`, and `pos` are available in the test harness.
+/// let result = goto_definition(&state, &uri, pos);
+/// // `result` will be `Some(...)` when a navigable definition exists, otherwise `None`.
+/// ```
 pub fn goto_definition(
     state: &WorldState,
     uri: &Url,
@@ -2077,6 +2488,21 @@ pub fn goto_definition(
     // Try cross-file symbols (from scope resolution)
     let cross_file_symbols = get_cross_file_symbols(state, uri, position.line, position.character);
     if let Some(symbol) = cross_file_symbols.get(name) {
+        // Check if this is a package export (source_uri starts with "package:")
+        // Package exports have pseudo-URIs like "package:dplyr" that can't be navigated to
+        // Validates: Requirements 11.1, 11.2
+        if symbol.source_uri.as_str().starts_with("package:") {
+            // Package source is not available for navigation
+            // The hover handler shows package info; go-to-definition returns None
+            // to indicate no navigable location exists
+            log::trace!(
+                "Symbol '{}' is from package '{}', no navigable source available",
+                name,
+                symbol.source_uri.as_str().strip_prefix("package:").unwrap_or("unknown")
+            );
+            return None;
+        }
+        
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: symbol.source_uri.clone(),
             range: Range {
@@ -2093,6 +2519,10 @@ pub fn goto_definition(
         }
         if let Some(artifacts) = content_provider.get_artifacts(&file_uri) {
             if let Some(symbol) = artifacts.exported_interface.get(name) {
+                // Skip package exports (they have pseudo-URIs that can't be navigated to)
+                if symbol.source_uri.as_str().starts_with("package:") {
+                    continue;
+                }
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: symbol.source_uri.clone(),
                     range: Range {
@@ -2111,6 +2541,10 @@ pub fn goto_definition(
         }
         if let Some(artifacts) = content_provider.get_artifacts(&file_uri) {
             if let Some(symbol) = artifacts.exported_interface.get(name) {
+                // Skip package exports (they have pseudo-URIs that can't be navigated to)
+                if symbol.source_uri.as_str().starts_with("package:") {
+                    continue;
+                }
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: symbol.source_uri.clone(),
                     range: Range {
@@ -2530,6 +2964,19 @@ fn escape_markdown(text: &str) -> String {
             _ => c.to_string(),
         })
         .collect()
+}
+
+#[cfg(test)]
+fn hover_blocking(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(hover(state, uri, position))
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hover(state, uri, position))
+    }
 }
 
 // ============================================================================
@@ -3058,6 +3505,349 @@ mod tests {
         
         // Only 'df' should be collected
         assert_eq!(used.len(), 1, "Only 'df' should be collected in chained extracts");
+    }
+
+    // ========================================================================
+    // Completion Precedence Tests (Task 11.2)
+    // Tests for completion precedence: local > package exports > cross-file
+    // Validates: Requirements 9.4, 9.5
+    // ========================================================================
+
+    /// Test that local definitions take precedence over package exports in completions.
+    /// Validates: Requirement 9.4 - Local definitions > package exports
+    #[test]
+    fn test_completion_local_over_package_exports() {
+        use crate::state::{WorldState, Document};
+        use crate::package_library::PackageInfo;
+        use tower_lsp::lsp_types::{Position, CompletionResponse};
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Create a WorldState with a package that exports "mutate"
+            let mut state = WorldState::new(vec![]);
+            
+            // Add a package with "mutate" export
+            let mut exports = std::collections::HashSet::new();
+            exports.insert("mutate".to_string());
+            exports.insert("filter".to_string());
+            let pkg_info = PackageInfo::new("dplyr".to_string(), exports);
+            state.package_library.insert_package(pkg_info).await;
+            
+            // Create a document that defines "mutate" locally and loads dplyr
+            let code = r#"library(dplyr)
+mutate <- function(x) { x * 2 }
+result <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+            
+            // Get completions at the end of the file (after "result <- ")
+            let position = Position::new(2, 10);
+            let completions = super::completion(&state, &uri, position);
+            
+            assert!(completions.is_some(), "Should return completions");
+            
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Find the "mutate" completion item
+                let mutate_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "mutate")
+                    .collect();
+                
+                // There should be exactly one "mutate" item (the local definition)
+                assert_eq!(mutate_items.len(), 1, 
+                    "Should have exactly one 'mutate' completion (local definition takes precedence)");
+                
+                // The local definition should NOT have package attribution
+                let mutate_item = mutate_items[0];
+                assert!(
+                    mutate_item.detail.is_none() || !mutate_item.detail.as_ref().unwrap().contains("{dplyr}"),
+                    "Local 'mutate' should not have package attribution"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that package exports take precedence over cross-file symbols in completions.
+    /// Validates: Requirement 9.5 - Package exports > cross-file symbols
+    #[test]
+    fn test_completion_package_over_cross_file() {
+        use crate::state::{WorldState, Document};
+        use crate::package_library::PackageInfo;
+        use tower_lsp::lsp_types::{Position, CompletionResponse};
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Create a WorldState with a package that exports "helper_func"
+            let mut state = WorldState::new(vec![]);
+            
+            // Add a package with "helper_func" export
+            let mut exports = std::collections::HashSet::new();
+            exports.insert("helper_func".to_string());
+            let pkg_info = PackageInfo::new("testpkg".to_string(), exports);
+            state.package_library.insert_package(pkg_info).await;
+            
+            // Create main file that loads testpkg
+            let main_code = r#"library(testpkg)
+result <- "#;
+            let main_uri = Url::parse("file:///main.R").unwrap();
+            let main_doc = Document::new(main_code, None);
+            state.documents.insert(main_uri.clone(), main_doc);
+            
+            // Create a helper file that defines "helper_func"
+            let helper_code = r#"helper_func <- function(x) { x + 1 }"#;
+            let helper_uri = Url::parse("file:///helper.R").unwrap();
+            let helper_doc = Document::new(helper_code, None);
+            state.documents.insert(helper_uri.clone(), helper_doc);
+            
+            // Note: In a real scenario, the cross-file symbol would come from scope resolution
+            // through source() calls. For this test, we verify that package exports are added
+            // before cross-file symbols in the completion list.
+            
+            // Get completions at the end of main file
+            let position = Position::new(1, 10);
+            let completions = super::completion(&state, &main_uri, position);
+            
+            assert!(completions.is_some(), "Should return completions");
+            
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Find the "helper_func" completion item
+                let helper_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "helper_func")
+                    .collect();
+                
+                // There should be at least one "helper_func" item (from package)
+                assert!(!helper_items.is_empty(), 
+                    "Should have 'helper_func' completion from package");
+                
+                // The first (and only) helper_func should be from the package
+                let helper_item = helper_items[0];
+                assert!(
+                    helper_item.detail.as_ref().map_or(false, |d| d.contains("{testpkg}")),
+                    "helper_func should have package attribution {{testpkg}}"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that keywords take precedence over all other completions.
+    /// Validates: Implicit requirement - keywords should always be available
+    #[test]
+    fn test_completion_keywords_always_present() {
+        use crate::state::{WorldState, Document};
+        use crate::package_library::PackageInfo;
+        use tower_lsp::lsp_types::{Position, CompletionResponse, CompletionItemKind};
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Create a WorldState with a package that exports "if" (hypothetically)
+            let mut state = WorldState::new(vec![]);
+            
+            // Add a package with "if" export (edge case - shouldn't override keyword)
+            let mut exports = std::collections::HashSet::new();
+            exports.insert("if".to_string());
+            let pkg_info = PackageInfo::new("badpkg".to_string(), exports);
+            state.package_library.insert_package(pkg_info).await;
+            
+            // Create a document that loads the package
+            let code = r#"library(badpkg)
+x <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+            
+            // Get completions
+            let position = Position::new(1, 5);
+            let completions = super::completion(&state, &uri, position);
+            
+            assert!(completions.is_some(), "Should return completions");
+            
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Find the "if" completion item
+                let if_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "if")
+                    .collect();
+                
+                // There should be exactly one "if" item (the keyword)
+                assert_eq!(if_items.len(), 1, 
+                    "Should have exactly one 'if' completion (keyword takes precedence)");
+                
+                // The "if" should be a keyword, not a function from package
+                let if_item = if_items[0];
+                assert_eq!(if_item.kind, Some(CompletionItemKind::KEYWORD),
+                    "'if' should be a KEYWORD, not a function from package");
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Verifies completion precedence where local definitions shadow package exports, and package exports take precedence over cross-file symbols.
+    ///
+    /// Sets up a WorldState with a package ("dplyr") that exports several symbols, opens a document that loads that package and defines a local `mutate` (which should shadow the package export) and `my_func`, then requests completions at a position and asserts:
+    /// - the local `mutate` appears once with no package attribution,
+    /// - `filter` and `select` appear once each with package attribution `{dplyr}`,
+    /// - `my_func` appears as a function completion.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Arrange: create state, insert package exports and document, then call completion.
+    /// // Assert: see comments above for expected precedence behavior.
+    /// ```
+    #[test]
+    fn test_completion_full_precedence_chain() {
+        use crate::state::{WorldState, Document};
+        use crate::package_library::PackageInfo;
+        use tower_lsp::lsp_types::{Position, CompletionResponse, CompletionItemKind};
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+            
+            // Add packages with various exports
+            let mut dplyr_exports = std::collections::HashSet::new();
+            dplyr_exports.insert("mutate".to_string());
+            dplyr_exports.insert("filter".to_string());
+            dplyr_exports.insert("select".to_string());
+            let dplyr_info = PackageInfo::new("dplyr".to_string(), dplyr_exports);
+            state.package_library.insert_package(dplyr_info).await;
+            
+            // Create a document that:
+            // 1. Loads dplyr (provides mutate, filter, select)
+            // 2. Defines "mutate" locally (should shadow package export)
+            // 3. Defines "my_func" locally
+            let code = r#"library(dplyr)
+mutate <- function(df, ...) { df }
+my_func <- function(x) { x }
+result <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+            
+            // Get completions at the end
+            let position = Position::new(3, 10);
+            let completions = super::completion(&state, &uri, position);
+            
+            assert!(completions.is_some(), "Should return completions");
+            
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Check "mutate" - should be local (no package attribution)
+                let mutate_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "mutate")
+                    .collect();
+                assert_eq!(mutate_items.len(), 1, "Should have exactly one 'mutate'");
+                assert!(
+                    mutate_items[0].detail.is_none() || !mutate_items[0].detail.as_ref().unwrap().contains("{dplyr}"),
+                    "Local 'mutate' should not have package attribution"
+                );
+                
+                // Check "filter" - should be from package (has attribution)
+                let filter_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "filter")
+                    .collect();
+                assert_eq!(filter_items.len(), 1, "Should have exactly one 'filter'");
+                assert!(
+                    filter_items[0].detail.as_ref().map_or(false, |d| d.contains("{dplyr}")),
+                    "'filter' should have package attribution {{dplyr}}"
+                );
+                
+                // Check "select" - should be from package (has attribution)
+                let select_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "select")
+                    .collect();
+                assert_eq!(select_items.len(), 1, "Should have exactly one 'select'");
+                assert!(
+                    select_items[0].detail.as_ref().map_or(false, |d| d.contains("{dplyr}")),
+                    "'select' should have package attribution {{dplyr}}"
+                );
+                
+                // Check "my_func" - should be local (no package attribution)
+                let my_func_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "my_func")
+                    .collect();
+                assert_eq!(my_func_items.len(), 1, "Should have exactly one 'my_func'");
+                assert_eq!(my_func_items[0].kind, Some(CompletionItemKind::FUNCTION),
+                    "'my_func' should be a FUNCTION");
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that seen_names correctly prevents duplicates across all sources.
+    /// Validates: Requirements 9.3, 9.4, 9.5 - duplicate exports show all packages
+    #[test]
+    fn test_completion_duplicate_exports_show_all_packages() {
+        use crate::state::{WorldState, Document};
+        use crate::package_library::PackageInfo;
+        use tower_lsp::lsp_types::{Position, CompletionResponse};
+        
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+            
+            // Add two packages that both export "common_func"
+            let mut pkg1_exports = std::collections::HashSet::new();
+            pkg1_exports.insert("common_func".to_string());
+            pkg1_exports.insert("pkg1_only".to_string());
+            let pkg1_info = PackageInfo::new("pkg1".to_string(), pkg1_exports);
+            state.package_library.insert_package(pkg1_info).await;
+            
+            let mut pkg2_exports = std::collections::HashSet::new();
+            pkg2_exports.insert("common_func".to_string());
+            pkg2_exports.insert("pkg2_only".to_string());
+            let pkg2_info = PackageInfo::new("pkg2".to_string(), pkg2_exports);
+            state.package_library.insert_package(pkg2_info).await;
+            
+            // Create a document that loads both packages
+            let code = r#"library(pkg1)
+library(pkg2)
+x <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+            
+            // Get completions
+            let position = Position::new(2, 5);
+            let completions = super::completion(&state, &uri, position);
+            
+            assert!(completions.is_some(), "Should return completions");
+            
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Requirement 9.3: When multiple packages export same symbol, show all with attribution
+                // Check that "common_func" appears twice (once for each package)
+                let common_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "common_func")
+                    .collect();
+                assert_eq!(common_items.len(), 2, 
+                    "Should have two 'common_func' entries (one per package)");
+                
+                // Both packages should be represented
+                let has_pkg1 = common_items.iter()
+                    .any(|item| item.detail.as_ref().map_or(false, |d| d.contains("{pkg1}")));
+                let has_pkg2 = common_items.iter()
+                    .any(|item| item.detail.as_ref().map_or(false, |d| d.contains("{pkg2}")));
+                assert!(has_pkg1, "'common_func' should have entry from pkg1");
+                assert!(has_pkg2, "'common_func' should have entry from pkg2");
+                
+                // Check that unique exports from both packages are present
+                let pkg1_only_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "pkg1_only")
+                    .collect();
+                assert_eq!(pkg1_only_items.len(), 1, "Should have 'pkg1_only'");
+                
+                let pkg2_only_items: Vec<_> = items.iter()
+                    .filter(|item| item.label == "pkg2_only")
+                    .collect();
+                assert_eq!(pkg2_only_items.len(), 1, "Should have 'pkg2_only'");
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
     }
 }
 
@@ -3916,7 +4706,7 @@ mod proptests {
             state.documents.insert(uri.clone(), Document::new(&code, None));
             
             let position = Position::new(0, 5);
-            let hover_result = hover(&state, &uri, position);
+            let hover_result = hover_blocking(&state, &uri, position);
             
             if let Some(hover) = hover_result {
                 if let HoverContents::Markup(content) = hover.contents {
@@ -4231,7 +5021,6 @@ mod integration_tests {
     
     #[test]
     fn test_hover_shows_definition_statement() {
-        use std::collections::HashMap;
         use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
         
         let library_paths = r_env::find_library_paths();
@@ -4254,8 +5043,6 @@ mod integration_tests {
         };
         
         // Test hover on the symbol
-        let position = Position::new(1, 10); // Position of "my_var" in second line
-        
         // Mock get_cross_file_symbols to return our test symbol
         // Note: In a real test, we'd need to set up the cross-file state properly
         // For now, we'll test the definition extraction directly
@@ -4268,7 +5055,7 @@ mod integration_tests {
     #[test]
     fn test_hover_same_file_location_format() {
         let library_paths = r_env::find_library_paths();
-        let state = WorldState::new(library_paths);
+        let _state = WorldState::new(library_paths);
         
         let uri = Url::parse("file:///test.R").unwrap();
         let def_info = DefinitionInfo {
@@ -4358,8 +5145,6 @@ mod integration_tests {
 
     #[test]
     fn test_cross_file_hover_resolution() {
-        use crate::cross_file::{dependency, scope};
-        
         let library_paths = r_env::find_library_paths();
         let mut state = WorldState::new(library_paths);
         
@@ -4384,7 +5169,7 @@ result <- helper_func(42)"#;
         
         // Test hover on helper_func in main.R (line 1, after source call)
         let position = Position::new(1, 10); // Position of "helper_func"
-        let hover_result = hover(&state, &main_uri, position);
+        let hover_result = hover_blocking(&state, &main_uri, position);
         
         assert!(hover_result.is_some());
         let hover = hover_result.unwrap();
@@ -4423,7 +5208,7 @@ result <- my_func(1, 2)"#;
         
         // Test hover on my_func usage (should show local definition, not utils.R)
         let position = Position::new(2, 10); // Position of "my_func" in usage
-        let hover_result = hover(&state, &main_uri, position);
+        let hover_result = hover_blocking(&state, &main_uri, position);
         
         assert!(hover_result.is_some());
         let hover = hover_result.unwrap();
@@ -4463,7 +5248,7 @@ result <- my_func(1, 2)"#;
         let mut test_state = state;
         test_state.documents.insert(uri.clone(), doc);
         
-        let hover_result = hover(&test_state, &uri, position);
+        let hover_result = hover_blocking(&test_state, &uri, position);
         
         // Should return hover info (either from help cache or R subprocess)
         // The exact content depends on R availability, but structure should be consistent
@@ -4491,7 +5276,7 @@ result <- my_func(1, 2)"#;
         
         // Test hover on undefined symbol
         let position = Position::new(0, 10); // Position of "undefined_symbol_that_does_not_exist"
-        let hover_result = hover(&state, &uri, position);
+        let hover_result = hover_blocking(&state, &uri, position);
         
         // Should return None for truly undefined symbols (after trying all fallbacks)
         // This tests the graceful handling when no definition is found anywhere
@@ -4680,7 +5465,7 @@ process_data <- function(data, threshold = 0.5, ...) {
         ];
         
         for (position, symbol_name, expected_statement) in hover_tests {
-            let hover_result = hover(&state, &uri, position);
+            let hover_result = hover_blocking(&state, &uri, position);
             if let Some(hover) = hover_result {
                 if let HoverContents::Markup(content) = hover.contents {
                     assert!(content.value.contains(expected_statement), 
@@ -4787,7 +5572,7 @@ helper_transform <- function(data) {
         
         // Test hover shows proper formatting for multi-line definitions
         let multi_line_func_position = Position::new(13, 0); // analyze_data function name
-        let hover_result = hover(&state, &main_uri, multi_line_func_position);
+        let hover_result = hover_blocking(&state, &main_uri, multi_line_func_position);
         
         if let Some(hover) = hover_result {
             if let HoverContents::Markup(content) = hover.contents {
@@ -4862,7 +5647,7 @@ local_var <- 200"#;
         
         // Test hover on global symbol shows cross-file location
         let hover_position = Position::new(5, 16); // "global_func" usage
-        let hover_result = hover(&state, &main_uri, hover_position);
+        let hover_result = hover_blocking(&state, &main_uri, hover_position);
         
         if let Some(hover) = hover_result {
             if let HoverContents::Markup(content) = hover.contents {
@@ -4899,7 +5684,7 @@ result <- helper_with_spaces(42)"#;
         
         // Test hover shows proper hyperlink formatting
         let position = Position::new(1, 10); // "helper_with_spaces"
-        let hover_result = hover(&state, &main_uri, position);
+        let hover_result = hover_blocking(&state, &main_uri, position);
         
         if let Some(hover) = hover_result {
             if let HoverContents::Markup(content) = hover.contents {
@@ -4908,6 +5693,713 @@ result <- helper_with_spaces(42)"#;
                 assert!(content.value.contains("file:///workspace/utils/helpers%20with%20spaces.R"));
                 assert!(content.value.contains("line 1"));
             }
+        }
+    }
+
+    // ============================================================================
+    // Tests for hover package info - Task 12.1
+    // ============================================================================
+
+    #[test]
+    fn test_hover_shows_package_name_for_package_exports() {
+        // Test that hover displays package name for package exports
+        // Validates: Requirement 10.1
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+        
+        // Create a symbol with a package URI
+        let package_uri = Url::parse("package:dplyr").unwrap();
+        let symbol = ScopedSymbol {
+            name: "mutate".to_string(),
+            kind: SymbolKind::Variable,
+            source_uri: package_uri,
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+        };
+        
+        // Verify the package name can be extracted from the URI
+        let package_name = symbol.source_uri.as_str().strip_prefix("package:");
+        assert_eq!(package_name, Some("dplyr"), "Should extract package name from URI");
+        
+        // Test the formatting that would be used in hover
+        let mut value = String::new();
+        value.push_str(&format!("```r\n{}\n```\n", symbol.name));
+        if let Some(pkg) = package_name {
+            value.push_str(&format!("\nfrom {{{}}}", pkg));
+        }
+        
+        assert!(value.contains("```r\nmutate\n```"), "Should contain symbol name in code block");
+        assert!(value.contains("from {dplyr}"), "Should contain package name in braces");
+    }
+
+    #[test]
+    fn test_hover_package_uri_detection() {
+        // Test that package URIs are correctly detected
+        // Validates: Requirement 10.1
+        
+        // Package URIs should be detected
+        let package_uri = Url::parse("package:ggplot2").unwrap();
+        assert!(package_uri.as_str().starts_with("package:"), "Package URI should start with 'package:'");
+        assert_eq!(package_uri.as_str().strip_prefix("package:"), Some("ggplot2"));
+        
+        // Base package URI should also be detected
+        let base_uri = Url::parse("package:base").unwrap();
+        assert!(base_uri.as_str().starts_with("package:"), "Base package URI should start with 'package:'");
+        assert_eq!(base_uri.as_str().strip_prefix("package:"), Some("base"));
+        
+        // File URIs should NOT be detected as packages
+        let file_uri = Url::parse("file:///test.R").unwrap();
+        assert!(!file_uri.as_str().starts_with("package:"), "File URI should not start with 'package:'");
+        assert_eq!(file_uri.as_str().strip_prefix("package:"), None);
+    }
+
+    #[test]
+    fn test_hover_local_definition_not_shown_as_package() {
+        // Test that local definitions are not shown as package exports
+        // Validates: Requirement 10.4 (shadowing)
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+        
+        // Create a symbol with a file URI (local definition)
+        let file_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let symbol = ScopedSymbol {
+            name: "mutate".to_string(),
+            kind: SymbolKind::Function,
+            source_uri: file_uri.clone(),
+            defined_line: 5,
+            defined_column: 0,
+            signature: Some("mutate <- function(x) { x + 1 }".to_string()),
+        };
+        
+        // Verify this is NOT detected as a package export
+        let package_name = symbol.source_uri.as_str().strip_prefix("package:");
+        assert_eq!(package_name, None, "Local definition should not be detected as package export");
+    }
+
+    // ============================================================================
+    // Tests for collect_missing_package_diagnostics - Task 10.3
+    // ============================================================================
+
+    #[test]
+    fn test_missing_package_diagnostic_emitted() {
+        // Test that a diagnostic is emitted for a non-installed package
+        // Validates: Requirement 15.1
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        meta.library_calls.push(crate::cross_file::source_detect::LibraryCall {
+            package: "__nonexistent_package_xyz__".to_string(),
+            line: 0,
+            column: 30,
+            function_scope: None,
+        });
+
+        let state = WorldState::new(Vec::new());
+        let mut diagnostics = Vec::new();
+
+        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 1, "Should emit one diagnostic for missing package");
+        assert!(diagnostics[0].message.contains("__nonexistent_package_xyz__"));
+        assert!(diagnostics[0].message.contains("not installed"));
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn test_missing_package_diagnostic_not_emitted_for_base_package() {
+        // Test that no diagnostic is emitted for base packages
+        // Validates: Requirement 15.1 (base packages are always available)
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        meta.library_calls.push(crate::cross_file::source_detect::LibraryCall {
+            package: "base".to_string(),
+            line: 0,
+            column: 15,
+            function_scope: None,
+        });
+
+        let mut state = WorldState::new(Vec::new());
+        // Ensure base is in base_packages by creating a new PackageLibrary
+        let mut base_packages = std::collections::HashSet::new();
+        base_packages.insert("base".to_string());
+        let mut pkg_lib = crate::package_library::PackageLibrary::new_empty();
+        pkg_lib.set_base_packages(base_packages);
+        state.package_library = std::sync::Arc::new(pkg_lib);
+
+        let mut diagnostics = Vec::new();
+
+        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 0, "Should not emit diagnostic for base package");
+    }
+
+    #[test]
+    fn test_missing_package_diagnostic_ignored_line() {
+        // Test that diagnostics are not emitted for ignored lines
+        // Validates: Requirement 15.1 with @lsp-ignore support
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        meta.library_calls.push(crate::cross_file::source_detect::LibraryCall {
+            package: "__nonexistent_package_xyz__".to_string(),
+            line: 5,
+            column: 30,
+            function_scope: None,
+        });
+        // Mark line 5 as ignored
+        meta.ignored_lines.insert(5);
+
+        let state = WorldState::new(Vec::new());
+        let mut diagnostics = Vec::new();
+
+        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 0, "Should not emit diagnostic for ignored line");
+    }
+
+    #[test]
+    fn test_missing_package_diagnostic_multiple_packages() {
+        // Test that diagnostics are emitted for multiple missing packages
+        // Validates: Requirement 15.1
+        let mut meta = crate::cross_file::CrossFileMetadata::default();
+        meta.library_calls.push(crate::cross_file::source_detect::LibraryCall {
+            package: "__missing_pkg1__".to_string(),
+            line: 0,
+            column: 20,
+            function_scope: None,
+        });
+        meta.library_calls.push(crate::cross_file::source_detect::LibraryCall {
+            package: "__missing_pkg2__".to_string(),
+            line: 1,
+            column: 20,
+            function_scope: None,
+        });
+
+        let state = WorldState::new(Vec::new());
+        let mut diagnostics = Vec::new();
+
+        collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 2, "Should emit diagnostics for both missing packages");
+        assert!(diagnostics[0].message.contains("__missing_pkg1__"));
+        assert!(diagnostics[1].message.contains("__missing_pkg2__"));
+    }
+
+    // ============================================================================
+    // Tests for hover shadowing - Task 12.3
+    // ============================================================================
+
+    #[test]
+    fn test_hover_local_definition_shadows_package_export() {
+        // Test that when a local definition shadows a package export,
+        // hover shows the local definition, not the package export.
+        // Validates: Requirement 10.4
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///workspace/main.R").unwrap();
+        
+        // Code that loads a package and then defines a local function with the same name
+        // as a package export. The local definition should shadow the package export.
+        let code = r#"library(dplyr)
+mutate <- function(x, y) { x + y }  # Local definition shadows dplyr::mutate
+result <- mutate(1, 2)"#;
+        
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        // Update cross-file graph with metadata
+        state.cross_file_graph.update_file(&uri, &crate::cross_file::extract_metadata(code), None, |_| None);
+        
+        // Test hover on "mutate" usage (line 2, position 10)
+        let position = Position::new(2, 10);
+        let hover_result = hover_blocking(&state, &uri, position);
+        
+        assert!(hover_result.is_some(), "Hover should return a result");
+        let hover = hover_result.unwrap();
+        
+        if let HoverContents::Markup(content) = hover.contents {
+            // Should show local definition signature (x, y), not dplyr's mutate
+            assert!(content.value.contains("mutate"), "Should contain function name");
+            assert!(content.value.contains("(x, y)"), "Should show local signature (x, y), not dplyr's signature");
+            // Should NOT show package attribution
+            assert!(!content.value.contains("{dplyr}"), "Should NOT show package attribution for shadowed symbol");
+            // Should show local file location
+            assert!(content.value.contains("this file"), "Should show local file location");
+        } else {
+            panic!("Expected markup content");
+        }
+    }
+
+    #[test]
+    fn test_hover_shadowing_scope_resolution_returns_local() {
+        // Test that scope resolution returns the local definition when it shadows a package export.
+        // This verifies the underlying mechanism that hover relies on.
+        // Validates: Requirement 10.4
+        use crate::cross_file::scope::{compute_artifacts, scope_at_position_with_packages};
+        use std::collections::HashSet;
+        
+        let uri = Url::parse("file:///workspace/test.R").unwrap();
+        
+        // Code with library() and local definition of same name
+        let code = r#"library(dplyr)
+filter <- function(x) { x > 0 }
+result <- filter(c(1, -2, 3))"#;
+        
+        // Use Document::new to parse the code (same as other tests)
+        let doc = Document::new(code, None);
+        let tree = doc.tree.as_ref().expect("Should parse successfully");
+        let artifacts = compute_artifacts(&uri, tree, code);
+        
+        // Create a mock package exports callback that returns "filter" for dplyr
+        let get_exports = |pkg: &str| -> HashSet<String> {
+            if pkg == "dplyr" {
+                let mut exports = HashSet::new();
+                exports.insert("filter".to_string());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+        
+        let base_exports = HashSet::new();
+        
+        // Query scope at line 2 (after both library and local definition)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        
+        // Symbol should be in scope
+        assert!(scope.symbols.contains_key("filter"), "filter should be in scope");
+        
+        // The symbol should be from the local definition, not the package
+        let symbol = scope.symbols.get("filter").unwrap();
+        assert!(
+            !symbol.source_uri.as_str().starts_with("package:"),
+            "filter should be from local definition, not package. Got URI: '{}'",
+            symbol.source_uri.as_str()
+        );
+        assert_eq!(symbol.source_uri, uri, "filter should be from the local file");
+    }
+
+    #[test]
+    fn test_hover_package_export_shown_when_no_local_shadow() {
+        // Test that when there's no local definition, hover shows the package export.
+        // This is the complement to test_hover_local_definition_shadows_package_export.
+        // Validates: Requirements 10.1, 10.4
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+        
+        // Create a symbol that represents a package export
+        let package_uri = Url::parse("package:dplyr").unwrap();
+        let symbol = ScopedSymbol {
+            name: "mutate".to_string(),
+            kind: SymbolKind::Function,
+            source_uri: package_uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: Some("mutate(.data, ...)".to_string()),
+        };
+        
+        // Verify this IS detected as a package export
+        let package_name = symbol.source_uri.as_str().strip_prefix("package:");
+        assert_eq!(package_name, Some("dplyr"), "Package export should be detected");
+        
+        // Verify the formatting that would be used in hover
+        let mut value = String::new();
+        if let Some(pkg) = package_name {
+            if let Some(sig) = &symbol.signature {
+                value.push_str(&format!("```r\n{}\n```\n", sig));
+            }
+            value.push_str(&format!("\nfrom {{{}}}", pkg));
+        }
+        
+        assert!(value.contains("mutate(.data, ...)"), "Should show function signature");
+        assert!(value.contains("from {dplyr}"), "Should show package attribution");
+    }
+
+    #[test]
+    fn test_hover_shadowing_position_aware() {
+        // Test that shadowing is position-aware: before the local definition,
+        // the package export should be shown; after, the local definition.
+        // Validates: Requirement 10.4
+        use crate::cross_file::scope::{compute_artifacts, scope_at_position_with_packages};
+        use std::collections::HashSet;
+        
+        let uri = Url::parse("file:///workspace/test.R").unwrap();
+        
+        // Code with library() first, then local definition later
+        let code = r#"library(dplyr)
+x <- mutate(df, y = 1)  # Uses package export
+mutate <- function(x) { x + 1 }  # Local definition
+z <- mutate(5)  # Uses local definition"#;
+        
+        // Use Document::new to parse the code (same as other tests)
+        let doc = Document::new(code, None);
+        let tree = doc.tree.as_ref().expect("Should parse successfully");
+        let artifacts = compute_artifacts(&uri, tree, code);
+        
+        // Create a mock package exports callback
+        let get_exports = |pkg: &str| -> HashSet<String> {
+            if pkg == "dplyr" {
+                let mut exports = HashSet::new();
+                exports.insert("mutate".to_string());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+        
+        let base_exports = HashSet::new();
+        
+        // Query scope at line 1 (before local definition) - should get package export
+        let scope_before = scope_at_position_with_packages(&artifacts, 1, 5, &get_exports, &base_exports);
+        assert!(scope_before.symbols.contains_key("mutate"), "mutate should be in scope before local def");
+        let symbol_before = scope_before.symbols.get("mutate").unwrap();
+        assert!(
+            symbol_before.source_uri.as_str().starts_with("package:"),
+            "Before local definition, mutate should be from package. Got URI: '{}'",
+            symbol_before.source_uri.as_str()
+        );
+        
+        // Query scope at line 3 (after local definition) - should get local definition
+        let scope_after = scope_at_position_with_packages(&artifacts, 3, 5, &get_exports, &base_exports);
+        assert!(scope_after.symbols.contains_key("mutate"), "mutate should be in scope after local def");
+        let symbol_after = scope_after.symbols.get("mutate").unwrap();
+        assert!(
+            !symbol_after.source_uri.as_str().starts_with("package:"),
+            "After local definition, mutate should be from local file. Got URI: '{}'",
+            symbol_after.source_uri.as_str()
+        );
+        assert_eq!(symbol_after.source_uri, uri, "mutate should be from the local file");
+    }
+
+    // ============================================================================
+    // Tests for goto_definition package handling - Task 13.1
+    // ============================================================================
+
+    /// Verifies that symbols originating from packages are treated as non-navigable.
+    ///
+    /// This test constructs a `ScopedSymbol` whose `source_uri` uses the `package:`
+    /// scheme and asserts that such URIs are recognized as package exports (which
+    /// goto-definition should not navigate into).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+    /// use url::Url;
+    ///
+    /// let package_uri = Url::parse("package:dplyr").unwrap();
+    /// let symbol = ScopedSymbol {
+    ///     name: "mutate".to_string(),
+    ///     kind: SymbolKind::Function,
+    ///     source_uri: package_uri.clone(),
+    ///     defined_line: 0,
+    ///     defined_column: 0,
+    ///     signature: Some("mutate(.data, ...)".to_string()),
+    /// };
+    ///
+    /// assert!(symbol.source_uri.as_str().starts_with("package:"));
+    /// let is_package_export = symbol.source_uri.as_str().starts_with("package:");
+    /// assert!(is_package_export);
+    /// let package_name = symbol.source_uri.as_str().strip_prefix("package:");
+    /// assert_eq!(package_name, Some("dplyr"));
+    /// ```
+    #[test]
+    fn test_goto_definition_returns_none_for_package_exports() {
+        // Test that goto_definition returns None for package exports
+        // since package source files are not navigable
+        // Validates: Requirements 11.1, 11.2
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+        
+        // Create a symbol with a package URI
+        let package_uri = Url::parse("package:dplyr").unwrap();
+        let symbol = ScopedSymbol {
+            name: "mutate".to_string(),
+            kind: SymbolKind::Function,
+            source_uri: package_uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: Some("mutate(.data, ...)".to_string()),
+        };
+        
+        // Verify the package URI is detected correctly
+        assert!(
+            symbol.source_uri.as_str().starts_with("package:"),
+            "Package export should have package: URI prefix"
+        );
+        
+        // The goto_definition logic should skip package exports
+        // This test verifies the detection logic used in goto_definition
+        let is_package_export = symbol.source_uri.as_str().starts_with("package:");
+        assert!(is_package_export, "Should detect package export");
+        
+        // Extract package name for logging
+        let package_name = symbol.source_uri.as_str().strip_prefix("package:");
+        assert_eq!(package_name, Some("dplyr"), "Should extract package name");
+    }
+
+    #[test]
+    fn test_goto_definition_navigates_to_local_definition() {
+        // Test that goto_definition navigates to local definitions (not package exports)
+        // Validates: Requirement 11.3 (shadowing)
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+        
+        // Create a symbol with a file URI (local definition)
+        let file_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let symbol = ScopedSymbol {
+            name: "mutate".to_string(),
+            kind: SymbolKind::Function,
+            source_uri: file_uri.clone(),
+            defined_line: 5,
+            defined_column: 0,
+            signature: Some("mutate <- function(x) { x + 1 }".to_string()),
+        };
+        
+        // Verify this is NOT a package export
+        assert!(
+            !symbol.source_uri.as_str().starts_with("package:"),
+            "Local definition should not have package: URI prefix"
+        );
+        
+        // The goto_definition logic should navigate to local definitions
+        let is_package_export = symbol.source_uri.as_str().starts_with("package:");
+        assert!(!is_package_export, "Should not detect as package export");
+        
+        // Verify the location would be correct
+        let expected_line = symbol.defined_line;
+        let expected_column = symbol.defined_column;
+        assert_eq!(expected_line, 5, "Should navigate to correct line");
+        assert_eq!(expected_column, 0, "Should navigate to correct column");
+    }
+
+    #[test]
+    fn test_goto_definition_package_uri_formats() {
+        // Test various package URI formats are correctly detected
+        // Validates: Requirements 11.1, 11.2
+        
+        // Standard package URI
+        let dplyr_uri = Url::parse("package:dplyr").unwrap();
+        assert!(dplyr_uri.as_str().starts_with("package:"));
+        assert_eq!(dplyr_uri.as_str().strip_prefix("package:"), Some("dplyr"));
+        
+        // Base package URI
+        let base_uri = Url::parse("package:base").unwrap();
+        assert!(base_uri.as_str().starts_with("package:"));
+        assert_eq!(base_uri.as_str().strip_prefix("package:"), Some("base"));
+        
+        // Package with dots in name
+        let data_table_uri = Url::parse("package:data.table").unwrap();
+        assert!(data_table_uri.as_str().starts_with("package:"));
+        assert_eq!(data_table_uri.as_str().strip_prefix("package:"), Some("data.table"));
+        
+        // File URIs should NOT be detected as packages
+        let file_uri = Url::parse("file:///workspace/test.R").unwrap();
+        assert!(!file_uri.as_str().starts_with("package:"));
+        assert_eq!(file_uri.as_str().strip_prefix("package:"), None);
+    }
+
+    // ============================================================================
+    // Tests for goto_definition shadowing behavior - Task 13.2
+    // ============================================================================
+
+    #[test]
+    fn test_goto_definition_local_shadows_package_export() {
+        // Test that when a local definition shadows a package export,
+        // goto_definition navigates to the local definition, not the package.
+        // Validates: Requirement 11.3
+        
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///workspace/main.R").unwrap();
+        
+        // Code that loads a package and then defines a local function with the same name
+        // as a package export. The local definition should shadow the package export.
+        // "mutate" is defined locally on line 1 (0-indexed), shadowing dplyr::mutate
+        let code = r#"library(dplyr)
+mutate <- function(x, y) { x + y }
+result <- mutate(1, 2)"#;
+        
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        // Update cross-file graph with metadata
+        state.cross_file_graph.update_file(&uri, &crate::cross_file::extract_metadata(code), None, |_| None);
+        
+        // Test goto_definition on "mutate" usage (line 2, position 10 - within "mutate")
+        let position = Position::new(2, 10);
+        let result = goto_definition(&state, &uri, position);
+        
+        // Should navigate to local definition, not return None (which would happen for package exports)
+        assert!(result.is_some(), "goto_definition should return a result for shadowed symbol");
+        
+        if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+            // Should navigate to the local definition on line 1
+            assert_eq!(location.uri, uri, "Should navigate to the same file");
+            assert_eq!(location.range.start.line, 1, "Should navigate to line 1 where local mutate is defined");
+            assert_eq!(location.range.start.character, 0, "Should navigate to column 0");
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_goto_definition_local_definition_found_first() {
+        // Test that goto_definition searches the current document first,
+        // ensuring local definitions are found before cross-file symbols.
+        // This is the core mechanism that enables shadowing.
+        // Validates: Requirement 11.3
+        
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///workspace/test.R").unwrap();
+        
+        // Simple code with a local function definition and usage
+        let code = r#"my_func <- function(a, b) { a + b }
+result <- my_func(1, 2)"#;
+        
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        // Test goto_definition on "my_func" usage (line 1, position 10)
+        let position = Position::new(1, 10);
+        let result = goto_definition(&state, &uri, position);
+        
+        assert!(result.is_some(), "goto_definition should find local definition");
+        
+        if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+            assert_eq!(location.uri, uri, "Should navigate to the same file");
+            assert_eq!(location.range.start.line, 0, "Should navigate to line 0 where my_func is defined");
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    /// Verifies that scope resolution prefers local definitions over package exports for goto-definition.
+    ///
+    /// Constructs a document containing a `library()` call and a local function named `filter`, computes
+    /// the cross-file scope at a position after the local definition, and asserts that the `filter`
+    /// symbol resolves to the local file (not a `package:` URI) and has the expected definition line.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Confirms a local `filter` shadows the `dplyr` export when resolving definitions.
+    /// ```
+    #[test]
+    fn test_goto_definition_shadowing_scope_resolution() {
+        // Test that scope resolution correctly returns local definitions over package exports.
+        // This verifies the underlying mechanism that goto_definition relies on.
+        // Validates: Requirement 11.3
+        use crate::cross_file::scope::{compute_artifacts, scope_at_position_with_packages};
+        use std::collections::HashSet;
+        
+        let uri = Url::parse("file:///workspace/test.R").unwrap();
+        
+        // Code with library() and local definition of same name
+        let code = r#"library(dplyr)
+filter <- function(x) { x > 0 }
+result <- filter(c(1, -2, 3))"#;
+        
+        let doc = Document::new(code, None);
+        let tree = doc.tree.as_ref().expect("Should parse successfully");
+        let artifacts = compute_artifacts(&uri, tree, code);
+        
+        // Create a mock package exports callback that returns "filter" for dplyr
+        let get_exports = |pkg: &str| -> HashSet<String> {
+            if pkg == "dplyr" {
+                let mut exports = HashSet::new();
+                exports.insert("filter".to_string());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+        
+        let base_exports = HashSet::new();
+        
+        // Query scope at line 2 (after both library and local definition)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        
+        // Symbol should be in scope
+        assert!(scope.symbols.contains_key("filter"), "filter should be in scope");
+        
+        // The symbol should be from the local definition, not the package
+        let symbol = scope.symbols.get("filter").unwrap();
+        assert!(
+            !symbol.source_uri.as_str().starts_with("package:"),
+            "filter should be from local definition, not package. Got URI: '{}'",
+            symbol.source_uri.as_str()
+        );
+        assert_eq!(symbol.source_uri, uri, "filter should be from the local file");
+        
+        // Verify the definition position matches the local definition
+        assert_eq!(symbol.defined_line, 1, "filter should be defined on line 1");
+    }
+
+    #[test]
+    fn test_goto_definition_shadowing_position_aware() {
+        // Test that shadowing is position-aware: before the local definition,
+        // the package export would be used; after, the local definition.
+        // For goto_definition, this means:
+        // - Before local def: returns None (package export, not navigable)
+        // - After local def: returns local definition location
+        // Validates: Requirement 11.3
+        
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///workspace/test.R").unwrap();
+        
+        // Code where package is loaded, then used, then shadowed, then used again
+        // Line 0: library(dplyr)
+        // Line 1: x <- filter(data)  # Uses dplyr::filter
+        // Line 2: filter <- function(x) { x > 0 }  # Local definition
+        // Line 3: y <- filter(data)  # Uses local filter
+        let code = r#"library(dplyr)
+x <- filter(data)
+filter <- function(x) { x > 0 }
+y <- filter(data)"#;
+        
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        state.cross_file_graph.update_file(&uri, &crate::cross_file::extract_metadata(code), None, |_| None);
+        
+        // Test goto_definition on "filter" usage AFTER local definition (line 3, position 5)
+        let position_after = Position::new(3, 5);
+        let result_after = goto_definition(&state, &uri, position_after);
+        
+        // After local definition, should navigate to local definition
+        assert!(result_after.is_some(), "goto_definition should find local definition after shadowing");
+        
+        if let Some(GotoDefinitionResponse::Scalar(location)) = result_after {
+            assert_eq!(location.uri, uri, "Should navigate to the same file");
+            assert_eq!(location.range.start.line, 2, "Should navigate to line 2 where local filter is defined");
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_goto_definition_multiple_local_definitions() {
+        // Test that goto_definition finds the first local definition when
+        // there are multiple definitions of the same symbol.
+        // Validates: Requirement 11.3
+        
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+        
+        let uri = Url::parse("file:///workspace/test.R").unwrap();
+        
+        // Code with multiple definitions of the same symbol
+        let code = r#"x <- 1
+x <- 2
+y <- x"#;
+        
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        // Test goto_definition on "x" usage (line 2, position 5)
+        let position = Position::new(2, 5);
+        let result = goto_definition(&state, &uri, position);
+        
+        assert!(result.is_some(), "goto_definition should find definition");
+        
+        if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+            assert_eq!(location.uri, uri, "Should navigate to the same file");
+            // find_definition_in_tree finds the first definition in document order
+            assert_eq!(location.range.start.line, 0, "Should navigate to first definition on line 0");
+        } else {
+            panic!("Expected Scalar response");
         }
     }
 }

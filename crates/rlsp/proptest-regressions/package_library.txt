@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b0b88f39cf7bae451700ecb4afe2a05cfa6036e3f6b586793ccc785083ab4487 # shrinks to packages = [("a0", {"a"}, ["aa3"]), ("aa", {"a"}, ["a02"]), ("a02", {"a"}, ["aa"]), ("aa3", {"aA"}, ["a0"])]
+cc 94bd18aa62e219cf83758a5c46878d9e83ee0c942c9640fb738f6bfacacb5cd4 # shrinks to packages = [("aa", {"a"}, ["aa1"]), ("aa1", {"a"}, ["aa"]), ("a0", {"a0"}, ["aa"])]

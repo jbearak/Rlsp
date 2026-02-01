@@ -229,6 +229,8 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - In hot scope-resolution paths, avoid repeated scans over large lists (e.g., function scopes per event); precompute mappings or cache lookups to prevent O(R·F) regressions.
 - Keep doc comments and markdown examples aligned with current behavior (e.g., list= string literals support).
 - Normalize markdown table spacing to match project lint expectations when adding spec tables.
+- Avoid interpolating user-controlled strings into R code; pass help topics/packages as command args instead.
+- Add language identifiers (e.g., `text`) to ASCII diagram/timeline fences to satisfy markdownlint (MD040).
 - `tree_sitter::Tree` implements `Clone`; preserve ASTs in cloned index entries when reference searches depend on them.
 - For intentionally-unused public APIs, either wire them into a caller or add a localized `#[allow(dead_code)]` with a brief comment to avoid warning noise.
 

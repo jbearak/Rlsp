@@ -4,13 +4,6 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 31ed90d1f7c0270051a8a27452837ab8f22ddf2224059a93894e244374d20b78 # shrinks to symbol_name = "A", local_value = 1, sourced_value = 100
-cc 0dbb93c682f146e747e877769953329dcc48e709073c47f47b4f43de9613c7f5 # shrinks to symbol_name = "x1", source_line = 2
-cc fdcf3715654de9f8771d4361fc184dee0bbe1e081f65cd67db6f2116e2fb5d49 # shrinks to func_name = "NA", var_name = "A", assign_name = "a"
-cc cead6597beeef48cc450e419ace396b6547bb66be9e65b66457770244641374a # shrinks to symbol_before = "a", symbol_after = "y", call_site_line = 2
-cc ad2793de38da2ac75613c3c4b22aaed92d0e568177f83fe740a910f88306ce2f # shrinks to symbol_name = "x"
-cc 7ac31d879f720400260efdcb7e667dc3c814aec839a8c98f0283bf7621f6fff3 # shrinks to symbol_before = "a", symbol_after = "x1", call_site_line = 2
-cc 9a50f5f332557b107a6a02617b31fd0cf6cf0beb639a215669cf49ebb32487db # shrinks to symbol_a = "A", symbol_b = "if"
-cc 817ca493d00121ce8bea44aea9cc7c063b0f5a7cc399de37effdea50791820e8 # shrinks to outer_func = "a", inner_func = "i", outer_var = "b", inner_var = "a_"
-cc 4e9e42b84e810040a7902c0030441a611bc10cc792c428d9d1879a1e5193a0ad # shrinks to outer_func = "ab", inner_func = "b", outer_var = "a", inner_var = "a_"
-cc 0da9d2f3960ba778e2ae0332cf6976c9a45408c53f08aa20df61073a903a6811 # shrinks to scopes = [(39, 53, 40, 67), (39, 53, 954, 26)], queries = [(40, 67), (871, 10), (396, 81), (804, 48), (23, 65)]
+cc 3fd469e658912adada5a798ff3c931c73f19a1d9f97e05707fb17718441f7d59 # shrinks to package = "a", func = "library", export1 = "a", export2 = "aa", export3 = "x0", lines_before = 1
+cc 299729e4c56f393e7ba74e75b7639292cbce32f1c1ff4a47ff6412c5cf4ec4ef # shrinks to package = "a", export_name = "x0", lines_before = 2
+cc 3ee8dab8418b546fb721d52e050e644834a03e5a1210d737ec97852cd07c16e4 # shrinks to package = "a", func_name = "q", export_name = "q"

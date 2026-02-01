@@ -4,6 +4,7 @@
 // Configuration for cross-file awareness
 //
 
+use std::path::PathBuf;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
 /// Default call site assumption when not specified
@@ -55,9 +56,34 @@ pub struct CrossFileConfig {
     pub on_demand_indexing_priority_2_enabled: bool,
     /// Whether Priority 3 (transitive dependency) indexing is enabled
     pub on_demand_indexing_priority_3_enabled: bool,
+    /// Whether package function awareness is enabled
+    pub packages_enabled: bool,
+    /// Additional R library paths for package discovery
+    pub packages_additional_library_paths: Vec<PathBuf>,
+    /// Path to R executable for subprocess calls
+    pub packages_r_path: Option<PathBuf>,
+    /// Severity for missing package diagnostics
+    pub packages_missing_package_severity: DiagnosticSeverity,
 }
 
 impl Default for CrossFileConfig {
+    /// Creates a CrossFileConfig populated with sensible defaults used by the cross-file awareness subsystem.
+    ///
+    /// The defaults enable workspace indexing, on-demand indexing, package awareness, and conservative traversal limits
+    /// (backward/forward depth: 10, chain depth: 20). Diagnostic severities and debounce/revalidation limits are
+    /// initialized to typical values for editor integrations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = CrossFileConfig::default();
+    /// assert!(cfg.index_workspace);
+    /// assert_eq!(cfg.max_chain_depth, 20);
+    /// assert_eq!(cfg.max_backward_depth, 10);
+    /// assert_eq!(cfg.max_forward_depth, 10);
+    /// assert!(cfg.on_demand_indexing_enabled);
+    /// assert!(cfg.packages_enabled);
+    /// ```
     fn default() -> Self {
         Self {
             max_backward_depth: 10,
@@ -78,6 +104,10 @@ impl Default for CrossFileConfig {
             on_demand_indexing_max_queue_size: 50,
             on_demand_indexing_priority_2_enabled: true,
             on_demand_indexing_priority_3_enabled: true,
+            packages_enabled: true,
+            packages_additional_library_paths: Vec::new(),
+            packages_r_path: None,
+            packages_missing_package_severity: DiagnosticSeverity::WARNING,
         }
     }
 }
@@ -113,6 +143,14 @@ mod tests {
         assert_eq!(config.on_demand_indexing_max_queue_size, 50);
         assert!(config.on_demand_indexing_priority_2_enabled);
         assert!(config.on_demand_indexing_priority_3_enabled);
+        // Package awareness defaults
+        assert!(config.packages_enabled);
+        assert!(config.packages_additional_library_paths.is_empty());
+        assert!(config.packages_r_path.is_none());
+        assert_eq!(
+            config.packages_missing_package_severity,
+            DiagnosticSeverity::WARNING
+        );
     }
 
     #[test]

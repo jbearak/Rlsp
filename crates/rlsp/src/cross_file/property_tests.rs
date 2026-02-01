@@ -1003,8 +1003,6 @@ proptest! {
 
         let mut graph = DependencyGraph::new();
         let parent_uri = make_url(&parent);
-        let child1_uri = make_url(&child1);
-        let child2_uri = make_url(&child2);
 
         let meta = make_meta_with_sources(vec![
             (&format!("{}.R", child1), 5),
@@ -1158,7 +1156,6 @@ proptest! {
     ) {
         let mut graph = DependencyGraph::new();
         let parent_uri = make_url(&parent);
-        let child_uri = make_url(&child);
 
         // Create metadata with duplicate sources (directive and AST)
         let meta = CrossFileMetadata {
@@ -1204,7 +1201,6 @@ proptest! {
     ) {
         let mut graph = DependencyGraph::new();
         let parent_uri = make_url(&parent);
-        let child_uri = make_url(&child);
 
         let meta = CrossFileMetadata {
             sources: vec![
@@ -1259,7 +1255,6 @@ proptest! {
     ) {
         let mut graph = DependencyGraph::new();
         let parent_uri = make_url(&parent);
-        let child_uri = make_url(&child);
 
         // Directive comes first in the list
         let meta = CrossFileMetadata {
@@ -7080,6 +7075,604 @@ proptest! {
 
 
 // ============================================================================
+// Property 3: Position-Aware Package Scope
+// Feature: package-function-awareness
+// **Validates: Requirements 2.1, 2.2, 2.3**
+//
+// For any R source file with a library() call at position P, and any symbol S
+// exported by that package:
+// - Scope resolution at any position before P SHALL NOT include S
+// - Scope resolution at any position after P SHALL include S
+//
+// Note: Since package exports are not yet integrated into scope resolution (task 7),
+// this test verifies that:
+// - PackageLoad events are correctly positioned in the timeline
+// - The package name is correctly captured
+// - The position ordering is correct
+// ============================================================================
+
+use super::scope::ScopeEvent;
+
+/// R reserved words that cannot be used as package names
+const R_RESERVED_PKG: &[&str] = &[
+    "if", "else", "for", "in", "while", "repeat", "next", "break", "function",
+    "NA", "NaN", "Inf", "NULL", "TRUE", "FALSE", "T", "F",
+    "na", "nan", "inf", "null", "true", "false",
+];
+
+/// Check if a name is a valid R package name (not reserved)
+fn is_valid_pkg_name(name: &str) -> bool {
+    !R_RESERVED_PKG.contains(&name) && !name.is_empty()
+}
+
+/// Generate a valid R package name (lowercase letters and dots, starting with letter)
+fn pkg_name() -> impl Strategy<Value = String> {
+    "[a-z][a-z0-9\\.]{0,8}".prop_filter("not reserved", |s| is_valid_pkg_name(s))
+}
+
+/// Generate a library call function name
+fn library_func() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("library"),
+        Just("require"),
+        Just("loadNamespace"),
+    ]
+}
+
+/// Quote style for package names
+#[derive(Debug, Clone, Copy)]
+enum PkgQuoteStyle {
+    None,       // library(dplyr)
+    Double,     // library("dplyr")
+    Single,     // library('dplyr')
+}
+
+fn pkg_quote_style() -> impl Strategy<Value = PkgQuoteStyle> {
+    prop_oneof![
+        Just(PkgQuoteStyle::None),
+        Just(PkgQuoteStyle::Double),
+        Just(PkgQuoteStyle::Single),
+    ]
+}
+
+/// Generate R code for a library call
+fn generate_library_call(func: &str, package: &str, quote_style: PkgQuoteStyle) -> String {
+    let quoted_pkg = match quote_style {
+        PkgQuoteStyle::None => package.to_string(),
+        PkgQuoteStyle::Double => format!("\"{}\"", package),
+        PkgQuoteStyle::Single => format!("'{}'", package),
+    };
+    format!("{}({})", func, quoted_pkg)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 3: Position-Aware Package Scope
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    ///
+    /// For any R source file with a library() call at position P:
+    /// - PackageLoad events SHALL appear in the timeline at position P
+    /// - PackageLoad events SHALL have the correct package name
+    /// - Timeline SHALL be sorted by position (PackageLoad at correct position relative to other events)
+    #[test]
+    fn prop_position_aware_package_scope(
+        package in pkg_name(),
+        func in library_func(),
+        quote_style in pkg_quote_style(),
+        lines_before in 0..5usize,
+        lines_after in 0..5usize,
+    ) {
+        let uri = make_url("test_pkg_scope");
+
+        // Build code with library call at a specific position
+        let mut code_lines = Vec::new();
+
+        // Add filler lines before library call
+        for i in 0..lines_before {
+            code_lines.push(format!("x{} <- {}", i, i));
+        }
+
+        // Add library call
+        let library_line = lines_before;
+        code_lines.push(generate_library_call(func, &package, quote_style));
+
+        // Add filler lines after library call
+        for i in 0..lines_after {
+            code_lines.push(format!("y{} <- {}", i, i));
+        }
+
+        let code = code_lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Extract PackageLoad events from timeline
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { line, column, package: pkg, function_scope } = e {
+                    Some((*line, *column, pkg.clone(), function_scope.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // 1. Should have exactly one PackageLoad event
+        prop_assert_eq!(
+            package_load_events.len(), 1,
+            "Expected exactly one PackageLoad event, got {}. Code:\n{}",
+            package_load_events.len(), code
+        );
+
+        let (event_line, _event_column, event_package, event_function_scope) = &package_load_events[0];
+
+        // 2. PackageLoad should be on the correct line
+        prop_assert_eq!(
+            *event_line, library_line as u32,
+            "PackageLoad event on wrong line. Expected {}, got {}. Code:\n{}",
+            library_line, event_line, code
+        );
+
+        // 3. Package name should be correctly captured
+        prop_assert_eq!(
+            event_package, &package,
+            "Package name mismatch. Expected '{}', got '{}'. Code:\n{}",
+            package, event_package, code
+        );
+
+        // 4. Global library call should have function_scope=None
+        prop_assert!(
+            event_function_scope.is_none(),
+            "Global library() call should have function_scope=None. Code:\n{}",
+            code
+        );
+
+        // 5. Timeline should be sorted by position
+        let mut prev_pos = (0u32, 0u32);
+        for event in &artifacts.timeline {
+            let pos = match event {
+                ScopeEvent::Def { line, column, .. } => (*line, *column),
+                ScopeEvent::Source { line, column, .. } => (*line, *column),
+                ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+                ScopeEvent::Removal { line, column, .. } => (*line, *column),
+                ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            };
+            prop_assert!(
+                pos >= prev_pos,
+                "Timeline not sorted: event at ({}, {}) comes after ({}, {}). Code:\n{}",
+                pos.0, pos.1, prev_pos.0, prev_pos.1, code
+            );
+            prev_pos = pos;
+        }
+
+        // 6. Verify position-aware property: PackageLoad should come AFTER definitions on earlier lines
+        //    and BEFORE definitions on later lines
+        for event in &artifacts.timeline {
+            if let ScopeEvent::Def { line, .. } = event {
+                if *line < library_line as u32 {
+                    // Definitions before library call should come before PackageLoad in timeline
+                    // (This is implicitly verified by the sorted check above)
+                }
+            }
+        }
+    }
+
+    /// Property 3 extended: Multiple library calls should create multiple PackageLoad events in order
+    /// **Validates: Requirements 2.1, 2.2, 2.3**
+    #[test]
+    fn prop_multiple_library_calls_ordered(
+        pkg1 in pkg_name(),
+        pkg2 in pkg_name(),
+        pkg3 in pkg_name(),
+    ) {
+        // Ensure packages are distinct for clearer testing
+        prop_assume!(pkg1 != pkg2 && pkg2 != pkg3 && pkg1 != pkg3);
+
+        let uri = make_url("test_multi_pkg");
+
+        let code = format!(
+            "x <- 1\nlibrary({})\ny <- 2\nlibrary({})\nz <- 3\nlibrary({})\nw <- 4",
+            pkg1, pkg2, pkg3
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Extract PackageLoad events
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { line, package, .. } = e {
+                    Some((*line, package.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Should have exactly 3 PackageLoad events
+        prop_assert_eq!(
+            package_load_events.len(), 3,
+            "Expected 3 PackageLoad events, got {}. Code:\n{}",
+            package_load_events.len(), code
+        );
+
+        // Events should be in document order with correct packages
+        prop_assert_eq!(&package_load_events[0], &(1, pkg1.clone()),
+            "First PackageLoad should be {} on line 1", pkg1);
+        prop_assert_eq!(&package_load_events[1], &(3, pkg2.clone()),
+            "Second PackageLoad should be {} on line 3", pkg2);
+        prop_assert_eq!(&package_load_events[2], &(5, pkg3.clone()),
+            "Third PackageLoad should be {} on line 5", pkg3);
+
+        // Verify strict ordering: each PackageLoad should be after the previous
+        for i in 1..package_load_events.len() {
+            let (prev_line, _) = &package_load_events[i - 1];
+            let (curr_line, _) = &package_load_events[i];
+            prop_assert!(
+                curr_line > prev_line,
+                "PackageLoad events not in strict order: line {} not > line {}",
+                curr_line, prev_line
+            );
+        }
+    }
+
+    /// Property 3 extended: PackageLoad position should be at the END of the library() call
+    /// **Validates: Requirements 2.2, 2.3**
+    ///
+    /// This ensures that symbols from the package are only available AFTER the call completes,
+    /// not during the call itself.
+    #[test]
+    fn prop_package_load_position_at_call_end(
+        package in pkg_name(),
+        func in library_func(),
+    ) {
+        let uri = make_url("test_pkg_pos");
+
+        let code = format!("{}({})", func, package);
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { line, column, package: pkg, .. } = e {
+                    Some((*line, *column, pkg.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        prop_assert_eq!(package_load_events.len(), 1);
+        let (line, column, pkg) = &package_load_events[0];
+
+        // Should be on line 0
+        prop_assert_eq!(*line, 0);
+
+        // Package name should match
+        prop_assert_eq!(pkg, &package);
+
+        // Column should be at or after the end of the call (after the closing paren)
+        // The call is: func(package) or func("package") or func('package')
+        // Minimum length is func.len() + 1 (open paren) + package.len() + 1 (close paren)
+        let min_end_column = (func.len() + 1 + package.len() + 1) as u32;
+        prop_assert!(
+            *column >= min_end_column - 1, // Allow for 0-based indexing variations
+            "PackageLoad column {} should be at or near end of call (min expected: {}). Code: {}",
+            column, min_end_column, code
+        );
+    }
+}
+
+// ============================================================================
+// Property 4: Function-Scoped Package Loading
+// Feature: package-function-awareness
+// **Validates: Requirements 2.4, 2.5**
+//
+// For any R source file with a library() call inside a function body, the package
+// exports SHALL only be available within that function's scope, not at the global
+// level or in other functions.
+//
+// This test verifies that:
+// - PackageLoad events inside functions have the correct function_scope set (not None)
+// - The function_scope interval matches the containing function
+// - library() calls at global scope have function_scope=None
+// - Nested functions capture the innermost function scope
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 4: Function-Scoped Package Loading
+    /// **Validates: Requirements 2.4, 2.5**
+    ///
+    /// For any R source file with a library() call inside a function body:
+    /// - The PackageLoad event SHALL have function_scope set to the containing function
+    /// - The function_scope interval SHALL match the containing function's boundaries
+    #[test]
+    fn prop_function_scoped_package_loading(
+        package in pkg_name(),
+        func_name in r_identifier(),
+        lines_before_lib in 0..3usize,
+        lines_after_lib in 0..3usize,
+    ) {
+        let uri = make_url("test_func_pkg_scope");
+
+        // Build code with library call inside a function
+        let mut func_body_lines = Vec::new();
+
+        // Add filler lines before library call inside function
+        for i in 0..lines_before_lib {
+            func_body_lines.push(format!("    x{} <- {}", i, i));
+        }
+
+        // Add library call inside function
+        func_body_lines.push(format!("    library({})", package));
+
+        // Add filler lines after library call inside function
+        for i in 0..lines_after_lib {
+            func_body_lines.push(format!("    y{} <- {}", i, i));
+        }
+
+        let func_body = func_body_lines.join("\n");
+        let code = format!("{} <- function() {{\n{}\n}}", func_name, func_body);
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Extract PackageLoad events from timeline
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { line, column, package: pkg, function_scope } = e {
+                    Some((*line, *column, pkg.clone(), function_scope.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // 1. Should have exactly one PackageLoad event
+        prop_assert_eq!(
+            package_load_events.len(), 1,
+            "Expected exactly one PackageLoad event, got {}. Code:\n{}",
+            package_load_events.len(), code
+        );
+
+        let (event_line, _event_column, event_package, event_function_scope) = &package_load_events[0];
+
+        // 2. Package name should be correctly captured
+        prop_assert_eq!(
+            event_package, &package,
+            "Package name mismatch. Expected '{}', got '{}'. Code:\n{}",
+            package, event_package, code
+        );
+
+        // 3. Library call inside function should have function_scope=Some(...)
+        prop_assert!(
+            event_function_scope.is_some(),
+            "Library call inside function should have function_scope=Some(...), got None. Code:\n{}",
+            code
+        );
+
+        let function_scope = event_function_scope.as_ref().unwrap();
+
+        // 4. Function scope should start at line 0 (where the function definition starts)
+        prop_assert_eq!(
+            function_scope.start.line, 0,
+            "Function scope should start at line 0. Got start line {}. Code:\n{}",
+            function_scope.start.line, code
+        );
+
+        // 5. Function scope should end at the last line (where the closing brace is)
+        let last_line = code.lines().count() as u32 - 1;
+        prop_assert_eq!(
+            function_scope.end.line, last_line,
+            "Function scope should end at line {}. Got end line {}. Code:\n{}",
+            last_line, function_scope.end.line, code
+        );
+
+        // 6. The library call line should be within the function scope
+        prop_assert!(
+            function_scope.contains(super::scope::Position::new(*event_line, 0)),
+            "Library call at line {} should be within function scope ({}, {}) to ({}, {}). Code:\n{}",
+            event_line,
+            function_scope.start.line, function_scope.start.column,
+            function_scope.end.line, function_scope.end.column,
+            code
+        );
+    }
+
+    /// Property 4 extended: Global library() calls should have function_scope=None
+    /// **Validates: Requirements 2.4, 2.5**
+    #[test]
+    fn prop_global_library_call_no_function_scope(
+        package in pkg_name(),
+        func in library_func(),
+        quote_style in pkg_quote_style(),
+    ) {
+        let uri = make_url("test_global_pkg");
+
+        // Global library call (not inside any function)
+        let code = generate_library_call(func, &package, quote_style);
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Extract PackageLoad events
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { function_scope, package: pkg, .. } = e {
+                    Some((pkg.clone(), function_scope.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        prop_assert_eq!(package_load_events.len(), 1);
+        let (pkg, function_scope) = &package_load_events[0];
+
+        prop_assert_eq!(pkg, &package);
+        prop_assert!(
+            function_scope.is_none(),
+            "Global library() call should have function_scope=None, got {:?}. Code:\n{}",
+            function_scope, code
+        );
+    }
+
+    /// Property 4 extended: Nested functions should capture innermost function scope
+    /// **Validates: Requirements 2.4, 2.5**
+    #[test]
+    fn prop_nested_function_innermost_scope(
+        package in pkg_name(),
+        outer_func in r_identifier(),
+        inner_func in r_identifier(),
+    ) {
+        // Ensure function names are distinct
+        prop_assume!(outer_func != inner_func);
+
+        let uri = make_url("test_nested_pkg");
+
+        // Code with library() call inside nested function
+        let code = format!(
+            "{} <- function() {{\n    {} <- function() {{\n        library({})\n    }}\n}}",
+            outer_func, inner_func, package
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Extract PackageLoad events
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { line, function_scope, package: pkg, .. } = e {
+                    Some((*line, pkg.clone(), function_scope.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        prop_assert_eq!(
+            package_load_events.len(), 1,
+            "Expected exactly one PackageLoad event. Code:\n{}", code
+        );
+
+        let (event_line, event_package, event_function_scope) = &package_load_events[0];
+
+        prop_assert_eq!(event_package, &package);
+
+        // Should have function_scope (inside nested function)
+        prop_assert!(
+            event_function_scope.is_some(),
+            "Library call in nested function should have function_scope. Code:\n{}",
+            code
+        );
+
+        let function_scope = event_function_scope.as_ref().unwrap();
+
+        // The function scope should be the INNER function (line 1 to line 3)
+        // Outer function: lines 0-4
+        // Inner function: lines 1-3
+        prop_assert_eq!(
+            function_scope.start.line, 1,
+            "Function scope should start at inner function (line 1). Got {}. Code:\n{}",
+            function_scope.start.line, code
+        );
+
+        prop_assert_eq!(
+            function_scope.end.line, 3,
+            "Function scope should end at inner function closing brace (line 3). Got {}. Code:\n{}",
+            function_scope.end.line, code
+        );
+
+        // Library call is on line 2, which should be within the inner function scope
+        prop_assert_eq!(
+            *event_line, 2,
+            "Library call should be on line 2. Got {}. Code:\n{}",
+            event_line, code
+        );
+
+        prop_assert!(
+            function_scope.contains(super::scope::Position::new(*event_line, 0)),
+            "Library call should be within inner function scope. Code:\n{}",
+            code
+        );
+    }
+
+    /// Property 4 extended: Multiple library calls in different scopes
+    /// **Validates: Requirements 2.4, 2.5**
+    #[test]
+    fn prop_multiple_library_calls_different_scopes(
+        pkg_global in pkg_name(),
+        pkg_func in pkg_name(),
+        func_name in r_identifier(),
+    ) {
+        // Ensure packages are distinct
+        prop_assume!(pkg_global != pkg_func);
+
+        let uri = make_url("test_multi_scope_pkg");
+
+        // Code with library() at global scope and inside a function
+        let code = format!(
+            "library({})\n{} <- function() {{\n    library({})\n}}",
+            pkg_global, func_name, pkg_func
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Extract PackageLoad events
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { line, package, function_scope, .. } = e {
+                    Some((*line, package.clone(), function_scope.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        prop_assert_eq!(
+            package_load_events.len(), 2,
+            "Expected 2 PackageLoad events. Code:\n{}", code
+        );
+
+        // First event: global library call (line 0, no function scope)
+        let (line0, pkg0, scope0) = &package_load_events[0];
+        prop_assert_eq!(*line0, 0, "First library call should be on line 0");
+        prop_assert_eq!(pkg0, &pkg_global, "First package should be {}", pkg_global);
+        prop_assert!(
+            scope0.is_none(),
+            "Global library call should have function_scope=None. Code:\n{}",
+            code
+        );
+
+        // Second event: function-scoped library call (line 2, with function scope)
+        let (line2, pkg2, scope2) = &package_load_events[1];
+        prop_assert_eq!(*line2, 2, "Second library call should be on line 2");
+        prop_assert_eq!(pkg2, &pkg_func, "Second package should be {}", pkg_func);
+        prop_assert!(
+            scope2.is_some(),
+            "Function library call should have function_scope=Some(...). Code:\n{}",
+            code
+        );
+
+        // Verify the function scope boundaries
+        let func_scope = scope2.as_ref().unwrap();
+        prop_assert_eq!(
+            func_scope.start.line, 1,
+            "Function scope should start at line 1. Code:\n{}",
+            code
+        );
+        prop_assert_eq!(
+            func_scope.end.line, 3,
+            "Function scope should end at line 3. Code:\n{}",
+            code
+        );
+    }
+}
+
+// ============================================================================
 // Property: Point Query Correctness (Interval Tree)
 // Validates: Requirements 1.3, 1.4
 // Feature: interval-tree-scope-lookup, Property 1: Point Query Correctness
@@ -8062,5 +8655,2984 @@ proptest! {
                     line1, col1, line2, col2);
             }
         }
+    }
+}
+
+
+// ============================================================================
+// Property 10: Base Package Universal Availability
+// Feature: package-function-awareness
+// **Validates: Requirements 6.2, 6.3, 6.4**
+//
+// For any R source file and any position within that file, exports from base
+// packages (base, methods, utils, grDevices, graphics, stats, datasets) SHALL
+// be available in scope.
+//
+// This test verifies that:
+// - Base exports are available at the very beginning of a file (position 0, 0)
+// - Base exports are available at any random position within the file
+// - Base exports are available even when no library() calls exist
+// - Base exports are available before any library() calls
+// - Base exports are available inside function scopes
+// - Base exports are available at the end of the file
+// ============================================================================
+
+use super::scope::scope_at_position_with_packages;
+use std::collections::HashSet;
+
+/// Generate a random R code structure for testing base package availability
+fn r_code_structure() -> impl Strategy<Value = RCodeStructure> {
+    (
+        // Number of top-level statements (0-5)
+        0..6usize,
+        // Whether to include a function definition
+        any::<bool>(),
+        // Whether to include library calls
+        any::<bool>(),
+        // Number of library calls (0-3)
+        0..4usize,
+    ).prop_flat_map(|(num_statements, include_function, include_library, num_library_calls)| {
+        let statements = prop::collection::vec(r_identifier(), num_statements);
+        let func_name = r_identifier();
+        let func_body_statements = prop::collection::vec(r_identifier(), 0..3usize);
+        let library_packages = prop::collection::vec(pkg_name(), num_library_calls);
+        
+        (
+            Just(num_statements),
+            Just(include_function),
+            Just(include_library),
+            statements,
+            func_name,
+            func_body_statements,
+            library_packages,
+        )
+    }).prop_map(|(num_statements, include_function, include_library, statements, func_name, func_body_statements, library_packages)| {
+        RCodeStructure {
+            num_statements,
+            include_function,
+            include_library,
+            statements,
+            func_name,
+            func_body_statements,
+            library_packages,
+        }
+    })
+}
+
+/// Structure representing generated R code for testing
+#[derive(Debug, Clone)]
+struct RCodeStructure {
+    num_statements: usize,
+    include_function: bool,
+    include_library: bool,
+    statements: Vec<String>,
+    func_name: String,
+    func_body_statements: Vec<String>,
+    library_packages: Vec<String>,
+}
+
+impl RCodeStructure {
+    /// Generate the R code string from this structure
+    fn to_code(&self) -> String {
+        let mut lines = Vec::new();
+        
+        // Add some initial statements
+        for (i, stmt) in self.statements.iter().enumerate() {
+            lines.push(format!("{} <- {}", stmt, i));
+        }
+        
+        // Optionally add library calls
+        if self.include_library {
+            for pkg in &self.library_packages {
+                lines.push(format!("library({})", pkg));
+            }
+        }
+        
+        // Optionally add a function definition
+        if self.include_function {
+            let mut func_lines = vec![format!("{} <- function() {{", self.func_name)];
+            for (i, stmt) in self.func_body_statements.iter().enumerate() {
+                func_lines.push(format!("    {} <- {}", stmt, i + 100));
+            }
+            func_lines.push("}".to_string());
+            lines.extend(func_lines);
+        }
+        
+        // Add a final statement
+        lines.push("final_result <- 42".to_string());
+        
+        lines.join("\n")
+    }
+    
+    /// Get the total number of lines in the generated code
+    fn line_count(&self) -> u32 {
+        self.to_code().lines().count() as u32
+    }
+}
+
+/// Generate a set of base exports for testing
+fn base_exports_set() -> HashSet<String> {
+    // Representative exports from base packages
+    // These are common functions from base, methods, utils, grDevices, graphics, stats, datasets
+    let exports = vec![
+        // base package
+        "print", "cat", "sum", "mean", "length", "c", "list", "data.frame",
+        "paste", "paste0", "sprintf", "format", "as.character", "as.numeric",
+        "is.null", "is.na", "is.numeric", "is.character", "is.logical",
+        "if", "for", "while", "function", "return", "stop", "warning", "message",
+        "tryCatch", "try", "invisible", "suppressWarnings", "suppressMessages",
+        // utils package
+        "head", "tail", "str", "help", "example", "install.packages",
+        // stats package
+        "lm", "glm", "t.test", "cor", "var", "sd", "median", "quantile",
+        // grDevices package
+        "pdf", "png", "jpeg", "dev.off", "rgb", "col2rgb",
+        // graphics package
+        "plot", "lines", "points", "abline", "hist", "barplot", "boxplot",
+        // methods package
+        "setClass", "setMethod", "setGeneric", "new", "show",
+        // datasets package (common datasets)
+        "iris", "mtcars", "airquality", "faithful",
+    ];
+    exports.into_iter().map(String::from).collect()
+}
+
+/// Generate a set of base exports that are unlikely to be shadowed by generated variable names.
+/// The r_identifier() generator produces names matching [a-z][a-z0-9_]{0,5}, so we use
+/// exports with dots, uppercase letters, or longer names that won't match.
+fn base_exports_set_unlikely_shadowed() -> HashSet<String> {
+    let exports = vec![
+        // Names with dots (can't be generated by r_identifier)
+        "data.frame", "as.character", "as.numeric", "is.null", "is.na",
+        "is.numeric", "is.character", "is.logical", "paste0", "dev.off",
+        "col2rgb", "t.test", "install.packages",
+        // Names with uppercase (can't be generated by r_identifier)
+        "TRUE", "FALSE", "NULL", "NA", "NaN", "Inf",
+        // Longer names (> 6 chars, unlikely to match [a-z][a-z0-9_]{0,5})
+        "suppressWarnings", "suppressMessages", "tryCatch", "invisible",
+        "setClass", "setMethod", "setGeneric", "quantile", "airquality",
+        "faithful", "barplot", "boxplot", "abline", "sprintf", "message",
+        "warning", "example", "install", "median", "format", "length",
+        "function", "return",
+    ];
+    exports.into_iter().map(String::from).collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: package-function-awareness, Property 10: Base Package Universal Availability
+    /// **Validates: Requirements 6.2, 6.3, 6.4**
+    ///
+    /// For any R source file and any position within that file, exports from base
+    /// packages SHALL be available in scope without requiring explicit library() calls,
+    /// UNLESS they are shadowed by local definitions.
+    ///
+    /// This test verifies that base exports are present in scope (either from base
+    /// or from a local definition that shadows them).
+    #[test]
+    fn prop_base_package_availability(
+        code_structure in r_code_structure(),
+        query_line_offset in 0..10u32,
+        query_column in 0..50u32,
+    ) {
+        let uri = make_url("test_base_pkg_availability");
+        let code = code_structure.to_code();
+        let line_count = code_structure.line_count();
+        
+        // Ensure query position is within the file
+        let query_line = query_line_offset % line_count.max(1);
+        
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+        
+        // Create a mock package exports callback (returns empty for all packages)
+        let get_exports = |_pkg: &str| -> HashSet<String> {
+            HashSet::new()
+        };
+        
+        // Create base exports set - use exports that are unlikely to be shadowed
+        // by generated variable names (which use r_identifier() pattern [a-z][a-z0-9_]{0,5})
+        let base_exports = base_exports_set_unlikely_shadowed();
+        
+        // Query scope at the generated position
+        let scope = scope_at_position_with_packages(&artifacts, query_line, query_column, &get_exports, &base_exports);
+        
+        // Verify that base exports are available at this position
+        // (either from base package or shadowed by local definition)
+        for export in &base_exports {
+            prop_assert!(
+                scope.symbols.contains_key(export),
+                "Base export '{}' should be available at position ({}, {}) in code:\n{}",
+                export, query_line, query_column, code
+            );
+            
+            // Verify the symbol has the correct package:base URI
+            // (since we use exports unlikely to be shadowed)
+            let symbol = scope.symbols.get(export).unwrap();
+            prop_assert_eq!(
+                symbol.source_uri.as_str(), "package:base",
+                "Base export '{}' should have package:base URI, got '{}'. Code:\n{}",
+                export, symbol.source_uri.as_str(), code
+            );
+        }
+    }
+
+    /// Feature: package-function-awareness, Property 10 extended: Base exports at file start
+    /// **Validates: Requirements 6.3, 6.4**
+    ///
+    /// Base exports SHALL be available at the very beginning of any file (position 0, 0).
+    #[test]
+    fn prop_base_package_available_at_file_start(
+        code_structure in r_code_structure(),
+    ) {
+        let uri = make_url("test_base_pkg_start");
+        let code = code_structure.to_code();
+        
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+        
+        let get_exports = |_pkg: &str| -> HashSet<String> {
+            HashSet::new()
+        };
+        let base_exports = base_exports_set();
+        
+        // Query at the very start of the file
+        let scope = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+        
+        // All base exports should be available
+        for export in &base_exports {
+            prop_assert!(
+                scope.symbols.contains_key(export),
+                "Base export '{}' should be available at file start (0, 0). Code:\n{}",
+                export, code
+            );
+        }
+    }
+
+    /// Feature: package-function-awareness, Property 10 extended: Base exports at file end
+    /// **Validates: Requirements 6.3, 6.4**
+    ///
+    /// Base exports SHALL be available at the end of any file.
+    #[test]
+    fn prop_base_package_available_at_file_end(
+        code_structure in r_code_structure(),
+    ) {
+        let uri = make_url("test_base_pkg_end");
+        let code = code_structure.to_code();
+        let last_line = code.lines().count().saturating_sub(1) as u32;
+        let last_line_len = code.lines().last().map(|l| l.len()).unwrap_or(0) as u32;
+        
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+        
+        let get_exports = |_pkg: &str| -> HashSet<String> {
+            HashSet::new()
+        };
+        let base_exports = base_exports_set();
+        
+        // Query at the end of the file
+        let scope = scope_at_position_with_packages(&artifacts, last_line, last_line_len, &get_exports, &base_exports);
+        
+        // All base exports should be available
+        for export in &base_exports {
+            prop_assert!(
+                scope.symbols.contains_key(export),
+                "Base export '{}' should be available at file end ({}, {}). Code:\n{}",
+                export, last_line, last_line_len, code
+            );
+        }
+    }
+
+    /// Feature: package-function-awareness, Property 10 extended: Base exports inside functions
+    /// **Validates: Requirements 6.3, 6.4**
+    ///
+    /// Base exports SHALL be available inside function scopes.
+    #[test]
+    fn prop_base_package_available_inside_function(
+        func_name in r_identifier(),
+        body_statements in prop::collection::vec(r_identifier(), 1..4usize),
+    ) {
+        let uri = make_url("test_base_pkg_func");
+        
+        // Create code with a function
+        let mut func_body = Vec::new();
+        for (i, stmt) in body_statements.iter().enumerate() {
+            func_body.push(format!("    {} <- {}", stmt, i));
+        }
+        let code = format!(
+            "{} <- function() {{\n{}\n}}",
+            func_name,
+            func_body.join("\n")
+        );
+        
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+        
+        let get_exports = |_pkg: &str| -> HashSet<String> {
+            HashSet::new()
+        };
+        let base_exports = base_exports_set();
+        
+        // Query inside the function body (line 1, which is inside the function)
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        
+        // All base exports should be available inside the function
+        for export in &base_exports {
+            prop_assert!(
+                scope.symbols.contains_key(export),
+                "Base export '{}' should be available inside function. Code:\n{}",
+                export, code
+            );
+        }
+    }
+
+    /// Feature: package-function-awareness, Property 10 extended: Base exports before library calls
+    /// **Validates: Requirements 6.3, 6.4**
+    ///
+    /// Base exports SHALL be available even before any library() calls in the file.
+    #[test]
+    fn prop_base_package_available_before_library_calls(
+        pkg in pkg_name(),
+        statements_before in prop::collection::vec(r_identifier(), 1..4usize),
+    ) {
+        let uri = make_url("test_base_pkg_before_lib");
+        
+        // Create code with statements before a library call
+        let mut lines = Vec::new();
+        for (i, stmt) in statements_before.iter().enumerate() {
+            lines.push(format!("{} <- {}", stmt, i));
+        }
+        lines.push(format!("library({})", pkg));
+        lines.push("final <- 1".to_string());
+        let code = lines.join("\n");
+        
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+        
+        let get_exports = |_pkg: &str| -> HashSet<String> {
+            HashSet::new()
+        };
+        let base_exports = base_exports_set();
+        
+        // Query at line 0 (before the library call)
+        let scope = scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports);
+        
+        // All base exports should be available before library()
+        for export in &base_exports {
+            prop_assert!(
+                scope.symbols.contains_key(export),
+                "Base export '{}' should be available before library() call. Code:\n{}",
+                export, code
+            );
+        }
+    }
+
+    /// Feature: package-function-awareness, Property 10 extended: Base exports not overridden by empty packages
+    /// **Validates: Requirements 6.3, 6.4**
+    ///
+    /// Base exports SHALL remain available even when library() calls load packages
+    /// that don't export the same symbols.
+    #[test]
+    fn prop_base_package_not_overridden_by_empty_packages(
+        pkg in pkg_name(),
+    ) {
+        let uri = make_url("test_base_pkg_not_overridden");
+        
+        let code = format!("library({})\nx <- print(1)", pkg);
+        
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+        
+        // Package exports callback returns empty (package has no exports)
+        let get_exports = |_pkg: &str| -> HashSet<String> {
+            HashSet::new()
+        };
+        let base_exports = base_exports_set();
+        
+        // Query after the library call
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        
+        // Base exports should still be available
+        for export in &base_exports {
+            prop_assert!(
+                scope.symbols.contains_key(export),
+                "Base export '{}' should still be available after loading package '{}'. Code:\n{}",
+                export, pkg, code
+            );
+        }
+    }
+
+    /// Feature: package-function-awareness, Property 10 extended: Package exports override base exports
+    /// **Validates: Requirements 6.3, 6.4**
+    ///
+    /// When a loaded package exports a symbol with the same name as a base export,
+    /// the package export SHALL take precedence (override the base export).
+    #[test]
+    fn prop_package_export_overrides_base_export(
+        pkg in pkg_name(),
+    ) {
+        let uri = make_url("test_pkg_overrides_base");
+        
+        let code = format!("library({})\nx <- print(1)", pkg);
+        
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+        
+        // Package exports callback returns "print" (same as base export)
+        let get_exports = |p: &str| -> HashSet<String> {
+            if p == pkg {
+                let mut exports = HashSet::new();
+                exports.insert("print".to_string());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+        
+        let mut base_exports = HashSet::new();
+        base_exports.insert("print".to_string());
+        base_exports.insert("cat".to_string());
+        
+        // Query after the library call
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        
+        // "print" should be from the loaded package, not base
+        let print_symbol = scope.symbols.get("print").unwrap();
+        prop_assert_eq!(
+            print_symbol.source_uri.as_str(), &format!("package:{}", pkg),
+            "print should be from package '{}' after library() call, not base. Code:\n{}",
+            pkg, code
+        );
+        
+        // "cat" should still be from base (not exported by the package)
+        let cat_symbol = scope.symbols.get("cat").unwrap();
+        prop_assert_eq!(
+            cat_symbol.source_uri.as_str(), "package:base",
+            "cat should still be from base. Code:\n{}",
+            code
+        );
+    }
+}
+
+// ============================================================================
+// Feature: package-function-awareness, Property 8: Cross-File Package Propagation
+// **Validates: Requirements 5.1, 5.2, 5.3**
+//
+// For any parent file that loads package P before a source() call to child file C,
+// scope resolution in C SHALL include exports from P.
+//
+// This test verifies that:
+// - Packages loaded BEFORE source() call are propagated to child files
+// - Packages loaded AFTER source() call are NOT propagated to child files
+// - Multiple packages loaded before source() are all propagated
+// - Package propagation respects call-site positions
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: package-function-awareness, Property 8: Cross-File Package Propagation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// For any parent file that loads package P before a source() call to child file C,
+    /// scope resolution in C SHALL include exports from P in inherited_packages.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # parent.R
+    /// library(dplyr)      # Line 0
+    /// source("child.R")   # Line 1
+    /// ```
+    /// Child file should have "dplyr" in inherited_packages.
+    #[test]
+    fn prop_cross_file_package_propagation_basic(
+        package in pkg_name(),
+        func in library_func(),
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: library call at line 0, source() at line 1
+        let parent_code = format!("{}({})\nsource(\"child.R\")", func, package);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 1)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Child should have inherited the package from parent
+        prop_assert!(
+            scope.inherited_packages.contains(&package),
+            "Child should inherit package '{}' from parent. Got inherited_packages: {:?}. Parent code:\n{}",
+            package, scope.inherited_packages, parent_code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 8: Cross-File Package Propagation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Packages loaded AFTER source() call should NOT be propagated to child files.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # parent.R
+    /// source("child.R")   # Line 0
+    /// library(dplyr)      # Line 1
+    /// ```
+    /// Child file should NOT have "dplyr" in inherited_packages.
+    #[test]
+    fn prop_cross_file_package_propagation_after_source_not_propagated(
+        package in pkg_name(),
+        func in library_func(),
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: source() at line 0, library call at line 1
+        let parent_code = format!("source(\"child.R\")\n{}({})", func, package);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Child should NOT have the package (loaded after source() call)
+        prop_assert!(
+            !scope.inherited_packages.contains(&package),
+            "Child should NOT inherit package '{}' (loaded after source() call). Got inherited_packages: {:?}. Parent code:\n{}",
+            package, scope.inherited_packages, parent_code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 8: Cross-File Package Propagation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Multiple packages loaded before source() should all be propagated.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # parent.R
+    /// library(pkg1)       # Line 0
+    /// library(pkg2)       # Line 1
+    /// source("child.R")   # Line 2
+    /// ```
+    /// Child file should have both "pkg1" and "pkg2" in inherited_packages.
+    #[test]
+    fn prop_cross_file_package_propagation_multiple_packages(
+        pkg1 in pkg_name(),
+        pkg2 in pkg_name(),
+    ) {
+        // Ensure packages are distinct
+        prop_assume!(pkg1 != pkg2);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: two library calls before source()
+        let parent_code = format!("library({})\nlibrary({})\nsource(\"child.R\")", pkg1, pkg2);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 2)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Child should have inherited both packages from parent
+        prop_assert!(
+            scope.inherited_packages.contains(&pkg1),
+            "Child should inherit package '{}' from parent. Got inherited_packages: {:?}. Parent code:\n{}",
+            pkg1, scope.inherited_packages, parent_code
+        );
+        prop_assert!(
+            scope.inherited_packages.contains(&pkg2),
+            "Child should inherit package '{}' from parent. Got inherited_packages: {:?}. Parent code:\n{}",
+            pkg2, scope.inherited_packages, parent_code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 8: Cross-File Package Propagation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Only packages loaded BEFORE source() should be propagated, not those loaded after.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # parent.R
+    /// library(pkg_before) # Line 0
+    /// source("child.R")   # Line 1
+    /// library(pkg_after)  # Line 2
+    /// ```
+    /// Child file should have "pkg_before" but NOT "pkg_after" in inherited_packages.
+    #[test]
+    fn prop_cross_file_package_propagation_respects_call_site(
+        pkg_before in pkg_name(),
+        pkg_after in pkg_name(),
+    ) {
+        // Ensure packages are distinct
+        prop_assume!(pkg_before != pkg_after);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: library before source(), library after source()
+        let parent_code = format!(
+            "library({})\nsource(\"child.R\")\nlibrary({})",
+            pkg_before, pkg_after
+        );
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 1)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Child should have inherited pkg_before (loaded before source())
+        prop_assert!(
+            scope.inherited_packages.contains(&pkg_before),
+            "Child should inherit package '{}' (loaded before source()). Got inherited_packages: {:?}. Parent code:\n{}",
+            pkg_before, scope.inherited_packages, parent_code
+        );
+
+        // Child should NOT have pkg_after (loaded after source())
+        prop_assert!(
+            !scope.inherited_packages.contains(&pkg_after),
+            "Child should NOT inherit package '{}' (loaded after source()). Got inherited_packages: {:?}. Parent code:\n{}",
+            pkg_after, scope.inherited_packages, parent_code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 8: Cross-File Package Propagation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Function-scoped package loads should NOT be propagated to child files
+    /// (unless the source() call is within the same function scope).
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # parent.R
+    /// f <- function() {
+    ///     library(dplyr)
+    /// }
+    /// source("child.R")
+    /// ```
+    /// Child file should NOT have "dplyr" in inherited_packages.
+    #[test]
+    fn prop_cross_file_package_propagation_function_scoped_not_propagated(
+        package in pkg_name(),
+        func_name in r_identifier(),
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: library inside function, source() outside
+        let parent_code = format!(
+            "{} <- function() {{\n    library({})\n}}\nsource(\"child.R\")",
+            func_name, package
+        );
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 3)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Child should NOT have the package (it's function-scoped in parent)
+        prop_assert!(
+            !scope.inherited_packages.contains(&package),
+            "Child should NOT inherit function-scoped package '{}'. Got inherited_packages: {:?}. Parent code:\n{}",
+            package, scope.inherited_packages, parent_code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 8: Cross-File Package Propagation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Packages should propagate through multiple levels of source() chains.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # grandparent.R
+    /// library(dplyr)
+    /// source("parent.R")
+    ///
+    /// # parent.R
+    /// source("child.R")
+    ///
+    /// # child.R
+    /// x <- 1
+    /// ```
+    /// Child file should have "dplyr" in inherited_packages (propagated through parent).
+    #[test]
+    fn prop_cross_file_package_propagation_transitive(
+        package in pkg_name(),
+    ) {
+        let grandparent_uri = make_url("grandparent");
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Grandparent code: library call, then source parent
+        let grandparent_code = format!("library({})\nsource(\"parent.R\")", package);
+        let grandparent_tree = parse_r_tree(&grandparent_code);
+        let grandparent_artifacts = compute_artifacts(&grandparent_uri, &grandparent_tree, &grandparent_code);
+
+        // Parent code: source child
+        let parent_code = "source(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let grandparent_meta = make_meta_with_sources(vec![("parent.R", 1)]);
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&grandparent_uri, &grandparent_meta, Some(&workspace_root), |_| None);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &grandparent_uri { Some(grandparent_artifacts.clone()) }
+            else if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &grandparent_uri { Some(grandparent_meta.clone()) }
+            else if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Child should have inherited the package from grandparent (through parent)
+        prop_assert!(
+            scope.inherited_packages.contains(&package),
+            "Child should inherit package '{}' from grandparent (transitive). Got inherited_packages: {:?}. Grandparent code:\n{}",
+            package, scope.inherited_packages, grandparent_code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 8: Cross-File Package Propagation
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    ///
+    /// Packages inherited from parent should be available at any position in child file.
+    #[test]
+    fn prop_cross_file_package_propagation_available_at_any_position(
+        package in pkg_name(),
+        query_line in 0..10u32,
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: library call at line 0, source() at line 1
+        let parent_code = format!("library({})\nsource(\"child.R\")", package);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: multiple lines
+        let child_code = "x <- 1\ny <- 2\nz <- 3\na <- 4\nb <- 5\nc <- 6\nd <- 7\ne <- 8\nf <- 9\ng <- 10";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 1)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at various positions
+        let scope = scope_at_position_with_graph(
+            &child_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Child should have inherited the package at any position
+        prop_assert!(
+            scope.inherited_packages.contains(&package),
+            "Child should inherit package '{}' at line {}. Got inherited_packages: {:?}. Parent code:\n{}",
+            package, query_line, scope.inherited_packages, parent_code
+        );
+    }
+}
+
+
+// ============================================================================
+// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
+// **Validates: Requirement 5.4**
+//
+// For any child file C that loads package P, scope resolution in the parent file
+// SHALL NOT include exports from P (packages do not propagate backward).
+//
+// This test verifies that:
+// - Packages loaded in child files do NOT appear in parent's inherited_packages
+// - Packages loaded in deeply nested files do NOT propagate back through the chain
+// - While symbols from child files ARE merged into parent scope, packages are NOT
+// - Parent's packages propagate forward to child, but child's packages don't propagate back
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
+    /// **Validates: Requirement 5.4**
+    ///
+    /// For any child file C that loads package P, scope resolution in the parent file
+    /// SHALL NOT include exports from P in inherited_packages.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # parent.R
+    /// source("child.R")   # Line 0
+    /// x <- 1              # Line 1
+    ///
+    /// # child.R
+    /// library(dplyr)      # Line 0
+    /// ```
+    /// Parent file should NOT have "dplyr" in inherited_packages.
+    #[test]
+    fn prop_forward_only_package_propagation_basic(
+        package in pkg_name(),
+        func in library_func(),
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: source() at line 0, then some code
+        let parent_code = "source(\"child.R\")\nx <- 1";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: library call
+        let child_code = format!("{}({})\ny <- 2", func, package);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query parent's scope AFTER the source() call
+        let scope = scope_at_position_with_graph(
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Parent should NOT have the package (it was loaded in child, not parent)
+        // Requirement 5.4: Forward-only propagation
+        prop_assert!(
+            !scope.inherited_packages.contains(&package),
+            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}. Child code:\n{}",
+            package, scope.inherited_packages, child_code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
+    /// **Validates: Requirement 5.4**
+    ///
+    /// Packages loaded in deeply nested files should NOT propagate back through the chain.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # grandparent.R
+    /// source("parent.R")
+    ///
+    /// # parent.R
+    /// source("child.R")
+    ///
+    /// # child.R
+    /// library(stringr)
+    /// ```
+    /// Neither grandparent nor parent should have "stringr" in inherited_packages.
+    #[test]
+    fn prop_forward_only_package_propagation_deep_chain(
+        package in pkg_name(),
+    ) {
+        let grandparent_uri = make_url("grandparent");
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Grandparent code: source parent
+        let grandparent_code = "source(\"parent.R\")\nz <- 1";
+        let grandparent_tree = parse_r_tree(grandparent_code);
+        let grandparent_artifacts = compute_artifacts(&grandparent_uri, &grandparent_tree, grandparent_code);
+
+        // Parent code: source child
+        let parent_code = "source(\"child.R\")\ny <- 1";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: loads package
+        let child_code = format!("library({})\nx <- 1", package);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let grandparent_meta = make_meta_with_sources(vec![("parent.R", 0)]);
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&grandparent_uri, &grandparent_meta, Some(&workspace_root), |_| None);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &grandparent_uri { Some(grandparent_artifacts.clone()) }
+            else if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &grandparent_uri { Some(grandparent_meta.clone()) }
+            else if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query grandparent's scope after source() call
+        let grandparent_scope = scope_at_position_with_graph(
+            &grandparent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Grandparent should NOT have the package (loaded in grandchild)
+        // Requirement 5.4: Forward-only propagation
+        prop_assert!(
+            !grandparent_scope.inherited_packages.contains(&package),
+            "Grandparent should NOT inherit package '{}' from grandchild (forward-only propagation). Got inherited_packages: {:?}",
+            package, grandparent_scope.inherited_packages
+        );
+
+        // Query parent's scope after source() call
+        let parent_scope = scope_at_position_with_graph(
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Parent should also NOT have the package (loaded in child)
+        prop_assert!(
+            !parent_scope.inherited_packages.contains(&package),
+            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            package, parent_scope.inherited_packages
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
+    /// **Validates: Requirement 5.4**
+    ///
+    /// While symbols from child files ARE merged into parent scope, packages are NOT.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # parent.R
+    /// source("child.R")
+    /// y <- helper_func()
+    ///
+    /// # child.R
+    /// library(ggplot2)
+    /// helper_func <- function() { 1 }
+    /// ```
+    /// Parent should have "helper_func" symbol but NOT "ggplot2" in inherited_packages.
+    #[test]
+    fn prop_forward_only_package_propagation_symbols_propagate_packages_dont(
+        package in pkg_name(),
+        func_name in r_identifier(),
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: source child, then use function from child
+        let parent_code = format!("source(\"child.R\")\ny <- {}()", func_name);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: loads package and defines function
+        let child_code = format!("library({})\n{} <- function() {{ 1 }}", package, func_name);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query parent's scope after source() call
+        let scope = scope_at_position_with_graph(
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Symbols from child SHOULD be available in parent
+        prop_assert!(
+            scope.symbols.contains_key(&func_name),
+            "Parent should have '{}' symbol from child (symbols propagate). Got symbols: {:?}",
+            func_name, scope.symbols.keys().collect::<Vec<_>>()
+        );
+
+        // But packages from child should NOT be in parent's inherited_packages
+        // Requirement 5.4: Forward-only propagation
+        prop_assert!(
+            !scope.inherited_packages.contains(&package),
+            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            package, scope.inherited_packages
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
+    /// **Validates: Requirement 5.4**
+    ///
+    /// Parent's packages propagate forward to child, but child's packages don't propagate back.
+    ///
+    /// Test pattern:
+    /// ```r
+    /// # parent.R
+    /// library(dplyr)
+    /// source("child.R")
+    /// z <- 1
+    ///
+    /// # child.R
+    /// library(ggplot2)
+    /// x <- 1
+    /// ```
+    /// Child should have "dplyr" in inherited_packages.
+    /// Parent should NOT have "ggplot2" in inherited_packages.
+    #[test]
+    fn prop_forward_only_package_propagation_asymmetric(
+        parent_pkg in pkg_name(),
+        child_pkg in pkg_name(),
+    ) {
+        // Ensure packages are distinct
+        prop_assume!(parent_pkg != child_pkg);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: library call, then source child
+        let parent_code = format!("library({})\nsource(\"child.R\")\nz <- 1", parent_pkg);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, &parent_code);
+
+        // Child code: loads different package
+        let child_code = format!("library({})\nx <- 1", child_pkg);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 1)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query child's scope - should have parent's package
+        let child_scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Child SHOULD have parent's package (forward propagation works)
+        prop_assert!(
+            child_scope.inherited_packages.contains(&parent_pkg),
+            "Child should inherit package '{}' from parent (forward propagation). Got inherited_packages: {:?}",
+            parent_pkg, child_scope.inherited_packages
+        );
+
+        // Query parent's scope after source() call
+        let parent_scope = scope_at_position_with_graph(
+            &parent_uri, 2, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Parent should NOT have child's package (forward-only propagation)
+        // Requirement 5.4: Forward-only propagation
+        prop_assert!(
+            !parent_scope.inherited_packages.contains(&child_pkg),
+            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            child_pkg, parent_scope.inherited_packages
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
+    /// **Validates: Requirement 5.4**
+    ///
+    /// Packages loaded in child should not appear in parent at any query position.
+    #[test]
+    fn prop_forward_only_package_propagation_any_parent_position(
+        package in pkg_name(),
+        query_line in 0..5u32,
+    ) {
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: source child at line 0, then multiple lines
+        let parent_code = "source(\"child.R\")\na <- 1\nb <- 2\nc <- 3\nd <- 4\ne <- 5";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: loads package
+        let child_code = format!("library({})\nx <- 1", package);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query parent's scope at various positions
+        let scope = scope_at_position_with_graph(
+            &parent_uri, query_line, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Parent should NOT have the package at any position
+        // Requirement 5.4: Forward-only propagation
+        prop_assert!(
+            !scope.inherited_packages.contains(&package),
+            "Parent should NOT inherit package '{}' from child at line {} (forward-only propagation). Got inherited_packages: {:?}",
+            package, query_line, scope.inherited_packages
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 9: Forward-Only Package Propagation
+    /// **Validates: Requirement 5.4**
+    ///
+    /// Multiple packages loaded in child should all NOT propagate to parent.
+    #[test]
+    fn prop_forward_only_package_propagation_multiple_packages(
+        pkg1 in pkg_name(),
+        pkg2 in pkg_name(),
+        pkg3 in pkg_name(),
+    ) {
+        // Ensure packages are distinct
+        prop_assume!(pkg1 != pkg2 && pkg2 != pkg3 && pkg1 != pkg3);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: source child
+        let parent_code = "source(\"child.R\")\nx <- 1";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child code: loads multiple packages
+        let child_code = format!("library({})\nlibrary({})\nlibrary({})\ny <- 1", pkg1, pkg2, pkg3);
+        let child_tree = parse_r_tree(&child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, &child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = make_meta_with_sources(vec![("child.R", 0)]);
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta.clone()) }
+            else { None }
+        };
+
+        // Query parent's scope after source() call
+        let scope = scope_at_position_with_graph(
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+        );
+
+        // Parent should NOT have any of the child's packages
+        // Requirement 5.4: Forward-only propagation
+        prop_assert!(
+            !scope.inherited_packages.contains(&pkg1),
+            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            pkg1, scope.inherited_packages
+        );
+        prop_assert!(
+            !scope.inherited_packages.contains(&pkg2),
+            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            pkg2, scope.inherited_packages
+        );
+        prop_assert!(
+            !scope.inherited_packages.contains(&pkg3),
+            "Parent should NOT inherit package '{}' from child (forward-only propagation). Got inherited_packages: {:?}",
+            pkg3, scope.inherited_packages
+        );
+    }
+}
+
+// ============================================================================
+// Property 11: Package Export Diagnostic Suppression
+// Feature: package-function-awareness
+// **Validates: Requirements 8.1, 8.2**
+//
+// For any symbol S that is exported by a package P loaded before position X,
+// the Diagnostic_Engine SHALL NOT emit an "undefined variable" warning for S
+// at position X.
+//
+// This test verifies that:
+// - Symbols from loaded packages are available in scope after the library() call
+// - Symbols from loaded packages are NOT available before the library() call
+// - The scope resolution correctly includes package exports at the usage position
+// - Multiple packages can provide exports that suppress diagnostics
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: package-function-awareness, Property 11: Package Export Diagnostic Suppression
+    /// **Validates: Requirements 8.1, 8.2**
+    ///
+    /// For any symbol S that is exported by a package P loaded before position X,
+    /// the scope at position X SHALL contain S, which means the Diagnostic_Engine
+    /// SHALL NOT emit an "undefined variable" warning for S at position X.
+    ///
+    /// This test verifies that package exports are available in scope after the
+    /// library() call, which is the mechanism by which diagnostics are suppressed.
+    #[test]
+    fn prop_package_export_diagnostic_suppression(
+        package in pkg_name(),
+        func in library_func(),
+        export_name in r_identifier(),
+        lines_before in 0..3usize,
+        lines_after in 1..4usize,
+    ) {
+        let uri = make_url("test_pkg_diag_suppression");
+
+        // Build code with library call and usage of package export
+        let mut code_lines = Vec::new();
+
+        // Add filler lines before library call
+        for i in 0..lines_before {
+            code_lines.push(format!("x{} <- {}", i, i));
+        }
+
+        // Add library call
+        let library_line = lines_before;
+        code_lines.push(format!("{}({})", func, package));
+
+        // Add lines after library call, including usage of package export
+        for i in 0..lines_after {
+            if i == 0 {
+                // Use the package export on the first line after library()
+                code_lines.push(format!("result <- {}(1)", export_name));
+            } else {
+                code_lines.push(format!("y{} <- {}", i, i));
+            }
+        }
+
+        let code = code_lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback that returns the export_name for our package
+        let pkg_clone = package.clone();
+        let export_clone = export_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        // Empty base exports (we're testing package exports, not base)
+        let base_exports = HashSet::new();
+
+        // Query scope at the usage position (line after library call)
+        let usage_line = (library_line + 1) as u32;
+        let scope = scope_at_position_with_packages(&artifacts, usage_line, 10, &get_exports, &base_exports);
+
+        // Requirement 8.1, 8.2: The symbol should be in scope after the library() call
+        // This means the Diagnostic_Engine would NOT emit an "undefined variable" warning
+        prop_assert!(
+            scope.symbols.contains_key(&export_name),
+            "Package export '{}' from package '{}' should be in scope at line {} (after library() on line {}). \
+             This means no 'undefined variable' warning would be emitted. Code:\n{}",
+            export_name, package, usage_line, library_line, code
+        );
+
+        // Verify the symbol has the correct package URI
+        let symbol = scope.symbols.get(&export_name).unwrap();
+        let expected_uri = format!("package:{}", package);
+        prop_assert_eq!(
+            symbol.source_uri.as_str(), expected_uri.as_str(),
+            "Package export '{}' should have URI '{}', got '{}'. Code:\n{}",
+            export_name, expected_uri, symbol.source_uri.as_str(), code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 11 extended: Multiple package exports
+    /// **Validates: Requirements 8.1, 8.2**
+    ///
+    /// When multiple packages are loaded, exports from ALL loaded packages should
+    /// be available in scope and suppress diagnostics.
+    #[test]
+    fn prop_package_export_diagnostic_suppression_multiple_packages(
+        pkg1 in pkg_name(),
+        pkg2 in pkg_name(),
+        export1 in r_identifier(),
+        export2 in r_identifier(),
+    ) {
+        // Ensure packages and exports are distinct
+        prop_assume!(pkg1 != pkg2);
+        prop_assume!(export1 != export2);
+
+        let uri = make_url("test_multi_pkg_diag_suppression");
+
+        // Code with two library calls and usage of both exports
+        let code = format!(
+            "library({})\nlibrary({})\nresult1 <- {}(1)\nresult2 <- {}(2)",
+            pkg1, pkg2, export1, export2
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg1_clone = pkg1.clone();
+        let pkg2_clone = pkg2.clone();
+        let export1_clone = export1.clone();
+        let export2_clone = export2.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg1_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export1_clone.clone());
+                exports
+            } else if p == pkg2_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export2_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 2 (after both library calls)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+
+        // Both exports should be in scope
+        prop_assert!(
+            scope.symbols.contains_key(&export1),
+            "Export '{}' from package '{}' should be in scope. Code:\n{}",
+            export1, pkg1, code
+        );
+        prop_assert!(
+            scope.symbols.contains_key(&export2),
+            "Export '{}' from package '{}' should be in scope. Code:\n{}",
+            export2, pkg2, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 11 extended: Export NOT available before library()
+    /// **Validates: Requirements 8.1, 8.2 (inverse)**
+    ///
+    /// Symbols from a package should NOT be in scope BEFORE the library() call.
+    /// This verifies the position-aware nature of diagnostic suppression.
+    #[test]
+    fn prop_package_export_not_available_before_library(
+        package in pkg_name(),
+        export_name in r_identifier(),
+        lines_before in 1..4usize,
+    ) {
+        let uri = make_url("test_pkg_export_before_lib");
+
+        // Build code with usage BEFORE library call
+        let mut code_lines = Vec::new();
+
+        // Add lines before library call, including usage of package export
+        for i in 0..lines_before {
+            if i == 0 {
+                // Use the package export on the first line (before library)
+                code_lines.push(format!("result <- {}(1)", export_name));
+            } else {
+                code_lines.push(format!("x{} <- {}", i, i));
+            }
+        }
+
+        // Add library call after the usage
+        code_lines.push(format!("library({})", package));
+
+        let code = code_lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg_clone = package.clone();
+        let export_clone = export_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 0 (before library call)
+        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports);
+
+        // The export should NOT be in scope before the library() call
+        // This means the Diagnostic_Engine WOULD emit an "undefined variable" warning
+        prop_assert!(
+            !scope.symbols.contains_key(&export_name),
+            "Package export '{}' from package '{}' should NOT be in scope at line 0 (before library()). \
+             This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+            export_name, package, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 11 extended: Function-scoped package exports
+    /// **Validates: Requirements 8.1, 8.2, 2.4, 2.5**
+    ///
+    /// When a library() call is inside a function, its exports should only suppress
+    /// diagnostics within that function scope, not outside.
+    #[test]
+    fn prop_package_export_diagnostic_suppression_function_scoped(
+        package in pkg_name(),
+        func_name in r_identifier(),
+        export_name in r_identifier(),
+    ) {
+        // Ensure func_name and export_name are different to avoid shadowing
+        // (the function definition would shadow the package export)
+        prop_assume!(func_name != export_name);
+
+        let uri = make_url("test_func_scoped_pkg_diag");
+
+        // Code with library() inside a function
+        let code = format!(
+            "{} <- function() {{\n    library({})\n    result <- {}(1)\n}}\noutside <- {}(2)",
+            func_name, package, export_name, export_name
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg_clone = package.clone();
+        let export_clone = export_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope inside the function (line 2, after library call inside function)
+        let scope_inside = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+
+        // Export should be in scope inside the function
+        prop_assert!(
+            scope_inside.symbols.contains_key(&export_name),
+            "Package export '{}' should be in scope inside function after library(). Code:\n{}",
+            export_name, code
+        );
+
+        // Query scope outside the function (line 4)
+        let scope_outside = scope_at_position_with_packages(&artifacts, 4, 10, &get_exports, &base_exports);
+
+        // Export should NOT be in scope outside the function
+        // (function-scoped library() doesn't affect global scope)
+        prop_assert!(
+            !scope_outside.symbols.contains_key(&export_name),
+            "Package export '{}' should NOT be in scope outside function (function-scoped library). Code:\n{}",
+            export_name, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 11 extended: Local definition shadows package export
+    /// **Validates: Requirements 8.1, 8.2**
+    ///
+    /// When a local definition shadows a package export, the local definition should
+    /// take precedence in scope (and thus also suppress diagnostics).
+    #[test]
+    fn prop_package_export_shadowed_by_local_definition(
+        package in pkg_name(),
+        symbol_name in r_identifier(),
+    ) {
+        let uri = make_url("test_local_shadows_pkg");
+
+        // Code with library() and local definition of same name
+        let code = format!(
+            "library({})\n{} <- function(x) x + 1\nresult <- {}(1)",
+            package, symbol_name, symbol_name
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg_clone = package.clone();
+        let symbol_clone = symbol_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(symbol_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 2 (after both library and local definition)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+
+        // Symbol should be in scope (either from package or local definition)
+        prop_assert!(
+            scope.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should be in scope (from local definition or package). Code:\n{}",
+            symbol_name, code
+        );
+
+        // The symbol should be from the local definition, not the package
+        // (local definitions take precedence)
+        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        prop_assert!(
+            !symbol.source_uri.as_str().starts_with("package:"),
+            "Symbol '{}' should be from local definition, not package. Got URI: '{}'. Code:\n{}",
+            symbol_name, symbol.source_uri.as_str(), code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 11 extended: Same export from multiple packages
+    /// **Validates: Requirements 8.1, 8.2**
+    ///
+    /// When multiple packages export the same symbol, the first loaded package's
+    /// export should be used (but either way, diagnostics are suppressed).
+    #[test]
+    fn prop_package_export_first_loaded_wins(
+        pkg1 in pkg_name(),
+        pkg2 in pkg_name(),
+        export_name in r_identifier(),
+    ) {
+        // Ensure packages are distinct
+        prop_assume!(pkg1 != pkg2);
+
+        let uri = make_url("test_first_pkg_wins");
+
+        // Code with two library calls, both packages export same symbol
+        let code = format!(
+            "library({})\nlibrary({})\nresult <- {}(1)",
+            pkg1, pkg2, export_name
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback - both packages export the same symbol
+        let pkg1_clone = pkg1.clone();
+        let pkg2_clone = pkg2.clone();
+        let export_clone = export_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg1_clone || p == pkg2_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 2 (after both library calls)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+
+        // Symbol should be in scope (diagnostics suppressed)
+        prop_assert!(
+            scope.symbols.contains_key(&export_name),
+            "Export '{}' should be in scope (from either package). Code:\n{}",
+            export_name, code
+        );
+
+        // The symbol should be from pkg1 (first loaded) since pkg2's export
+        // doesn't override non-base exports
+        let symbol = scope.symbols.get(&export_name).unwrap();
+        let expected_uri = format!("package:{}", pkg1);
+        prop_assert_eq!(
+            symbol.source_uri.as_str(), expected_uri.as_str(),
+            "Export '{}' should be from first loaded package '{}', got '{}'. Code:\n{}",
+            export_name, pkg1, symbol.source_uri.as_str(), code
+        );
+    }
+}
+
+// ============================================================================
+// Property 12: Pre-Load Diagnostic Emission
+// Feature: package-function-awareness
+// **Validates: Requirement 8.3**
+//
+// For any symbol S that is exported by a package P loaded at position X,
+// the Diagnostic_Engine SHALL emit an "undefined variable" warning for S
+// at any position before X.
+//
+// This test verifies that:
+// - Symbols from packages are NOT available in scope BEFORE the library() call
+// - The scope resolution correctly excludes package exports at positions before loading
+// - This is the inverse of Property 11 - we verify diagnostics WOULD be emitted
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: package-function-awareness, Property 12: Pre-Load Diagnostic Emission
+    /// **Validates: Requirement 8.3**
+    ///
+    /// For any symbol S that is exported by a package P loaded at position X,
+    /// the scope at any position before X SHALL NOT contain S, which means the
+    /// Diagnostic_Engine SHALL emit an "undefined variable" warning for S.
+    ///
+    /// This test verifies that package exports are NOT available in scope before
+    /// the library() call, which means diagnostics WOULD be emitted.
+    #[test]
+    fn prop_pre_load_diagnostic_emission(
+        package in pkg_name(),
+        func in library_func(),
+        export_name in r_identifier(),
+        lines_before in 1..5usize,
+        lines_after in 0..3usize,
+    ) {
+        let uri = make_url("test_pre_load_diag");
+
+        // Build code with usage BEFORE library call
+        let mut code_lines = Vec::new();
+
+        // Add lines before library call, including usage of package export
+        for i in 0..lines_before {
+            if i == 0 {
+                // Use the package export on the first line (before library)
+                code_lines.push(format!("result <- {}(1)", export_name));
+            } else {
+                code_lines.push(format!("x{} <- {}", i, i));
+            }
+        }
+
+        // Add library call after the usage
+        let library_line = lines_before;
+        code_lines.push(generate_library_call(func, &package, PkgQuoteStyle::None));
+
+        // Add filler lines after library call
+        for i in 0..lines_after {
+            code_lines.push(format!("y{} <- {}", i, i));
+        }
+
+        let code = code_lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback that returns the export_name for our package
+        let pkg_clone = package.clone();
+        let export_clone = export_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        // Empty base exports (we're testing package exports, not base)
+        let base_exports = HashSet::new();
+
+        // Query scope at line 0 (before library call)
+        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports);
+
+        // Requirement 8.3: The symbol should NOT be in scope before the library() call
+        // This means the Diagnostic_Engine WOULD emit an "undefined variable" warning
+        prop_assert!(
+            !scope.symbols.contains_key(&export_name),
+            "Package export '{}' from package '{}' should NOT be in scope at line 0 (before library() on line {}). \
+             This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+            export_name, package, library_line, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 12 extended: Multiple positions before library
+    /// **Validates: Requirement 8.3**
+    ///
+    /// Verifies that the symbol is NOT in scope at ANY position before the library() call,
+    /// not just at line 0.
+    #[test]
+    fn prop_pre_load_diagnostic_emission_all_positions(
+        package in pkg_name(),
+        export_name in r_identifier(),
+        lines_before in 2..6usize,
+    ) {
+        // Ensure export_name doesn't collide with filler variable names (x0, x1, etc.)
+        // which would create local definitions that shadow the package export
+        let filler_names: Vec<String> = (0..lines_before).map(|i| format!("x{}", i)).collect();
+        prop_assume!(!filler_names.contains(&export_name));
+
+        let uri = make_url("test_pre_load_all_pos");
+
+        // Build code with multiple lines before library call
+        let mut code_lines = Vec::new();
+
+        // Add lines before library call
+        for i in 0..lines_before {
+            code_lines.push(format!("x{} <- {}", i, i));
+        }
+
+        // Add library call
+        let library_line = lines_before;
+        code_lines.push(format!("library({})", package));
+
+        // Add usage after library call
+        code_lines.push(format!("result <- {}(1)", export_name));
+
+        let code = code_lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg_clone = package.clone();
+        let export_clone = export_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Check ALL positions before the library call
+        for check_line in 0..library_line {
+            let scope = scope_at_position_with_packages(&artifacts, check_line as u32, 10, &get_exports, &base_exports);
+
+            // Requirement 8.3: Symbol should NOT be in scope at any position before library()
+            prop_assert!(
+                !scope.symbols.contains_key(&export_name),
+                "Package export '{}' should NOT be in scope at line {} (before library() on line {}). \
+                 This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+                export_name, check_line, library_line, code
+            );
+        }
+
+        // Verify it IS in scope after the library call (sanity check)
+        let scope_after = scope_at_position_with_packages(&artifacts, (library_line + 1) as u32, 10, &get_exports, &base_exports);
+        prop_assert!(
+            scope_after.symbols.contains_key(&export_name),
+            "Package export '{}' SHOULD be in scope at line {} (after library() on line {}). Code:\n{}",
+            export_name, library_line + 1, library_line, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 12 extended: Same line before call position
+    /// **Validates: Requirement 8.3**
+    ///
+    /// When a symbol usage is on the same line as the library() call but BEFORE the call,
+    /// the symbol should NOT be in scope (diagnostic should be emitted).
+    #[test]
+    fn prop_pre_load_diagnostic_same_line_before_call(
+        package in pkg_name(),
+        export_name in r_identifier(),
+    ) {
+        let uri = make_url("test_pre_load_same_line");
+
+        // Code with usage before library call on same line (using semicolon)
+        // Note: In R, this is unusual but valid syntax
+        let code = format!("result <- {}(1); library({})", export_name, package);
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg_clone = package.clone();
+        let export_clone = export_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at column 0 (before the library call on the same line)
+        // The usage `result <- export_name(1)` starts at column 0
+        let scope = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+
+        // Requirement 8.3: Symbol should NOT be in scope before the library() call
+        // even on the same line
+        prop_assert!(
+            !scope.symbols.contains_key(&export_name),
+            "Package export '{}' should NOT be in scope at column 0 (before library() call on same line). \
+             This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+            export_name, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 12 extended: Function-scoped pre-load
+    /// **Validates: Requirement 8.3, 2.4**
+    ///
+    /// When a library() call is inside a function, symbols should NOT be in scope
+    /// before the library() call within that function.
+    #[test]
+    fn prop_pre_load_diagnostic_function_scoped(
+        package in pkg_name(),
+        func_name in r_identifier(),
+        export_name in r_identifier(),
+    ) {
+        // Ensure func_name and export_name are different to avoid shadowing
+        // (the function definition would shadow the package export)
+        prop_assume!(func_name != export_name);
+
+        let uri = make_url("test_pre_load_func_scoped");
+
+        // Code with usage before library() inside a function
+        let code = format!(
+            "{} <- function() {{\n    result <- {}(1)\n    library({})\n    result2 <- {}(2)\n}}",
+            func_name, export_name, package, export_name
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg_clone = package.clone();
+        let export_clone = export_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 1 (before library() inside function)
+        let scope_before = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+
+        // Requirement 8.3: Symbol should NOT be in scope before library() inside function
+        prop_assert!(
+            !scope_before.symbols.contains_key(&export_name),
+            "Package export '{}' should NOT be in scope at line 1 (before library() inside function). \
+             This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+            export_name, code
+        );
+
+        // Query scope at line 3 (after library() inside function)
+        let scope_after = scope_at_position_with_packages(&artifacts, 3, 10, &get_exports, &base_exports);
+
+        // Sanity check: Symbol SHOULD be in scope after library() inside function
+        prop_assert!(
+            scope_after.symbols.contains_key(&export_name),
+            "Package export '{}' SHOULD be in scope at line 3 (after library() inside function). Code:\n{}",
+            export_name, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 12 extended: Multiple packages pre-load
+    /// **Validates: Requirement 8.3**
+    ///
+    /// When multiple packages are loaded at different positions, symbols from each
+    /// package should NOT be in scope before their respective library() calls.
+    #[test]
+    fn prop_pre_load_diagnostic_multiple_packages(
+        pkg1 in pkg_name(),
+        pkg2 in pkg_name(),
+        export1 in r_identifier(),
+        export2 in r_identifier(),
+    ) {
+        // Ensure packages and exports are distinct
+        prop_assume!(pkg1 != pkg2);
+        prop_assume!(export1 != export2);
+
+        let uri = make_url("test_pre_load_multi_pkg");
+
+        // Code with two library calls at different positions
+        let code = format!(
+            "# Line 0: before both\nlibrary({})\n# Line 2: after pkg1, before pkg2\nlibrary({})\n# Line 4: after both",
+            pkg1, pkg2
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg1_clone = pkg1.clone();
+        let pkg2_clone = pkg2.clone();
+        let export1_clone = export1.clone();
+        let export2_clone = export2.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg1_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export1_clone.clone());
+                exports
+            } else if p == pkg2_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export2_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Line 0: Before both library calls - neither export should be in scope
+        let scope_0 = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+        prop_assert!(
+            !scope_0.symbols.contains_key(&export1),
+            "Export '{}' from pkg1 should NOT be in scope at line 0 (before library(pkg1)). Code:\n{}",
+            export1, code
+        );
+        prop_assert!(
+            !scope_0.symbols.contains_key(&export2),
+            "Export '{}' from pkg2 should NOT be in scope at line 0 (before library(pkg2)). Code:\n{}",
+            export2, code
+        );
+
+        // Line 2: After pkg1, before pkg2 - only export1 should be in scope
+        let scope_2 = scope_at_position_with_packages(&artifacts, 2, 0, &get_exports, &base_exports);
+        prop_assert!(
+            scope_2.symbols.contains_key(&export1),
+            "Export '{}' from pkg1 SHOULD be in scope at line 2 (after library(pkg1)). Code:\n{}",
+            export1, code
+        );
+        prop_assert!(
+            !scope_2.symbols.contains_key(&export2),
+            "Export '{}' from pkg2 should NOT be in scope at line 2 (before library(pkg2)). Code:\n{}",
+            export2, code
+        );
+
+        // Line 4: After both library calls - both exports should be in scope
+        let scope_4 = scope_at_position_with_packages(&artifacts, 4, 0, &get_exports, &base_exports);
+        prop_assert!(
+            scope_4.symbols.contains_key(&export1),
+            "Export '{}' from pkg1 SHOULD be in scope at line 4 (after both library calls). Code:\n{}",
+            export1, code
+        );
+        prop_assert!(
+            scope_4.symbols.contains_key(&export2),
+            "Export '{}' from pkg2 SHOULD be in scope at line 4 (after both library calls). Code:\n{}",
+            export2, code
+        );
+    }
+}
+
+// ============================================================================
+// Property 13: Non-Export Diagnostic Emission
+// Feature: package-function-awareness
+// **Validates: Requirement 8.4**
+//
+// For any symbol S that is NOT exported by any loaded package at position X,
+// the Diagnostic_Engine SHALL emit an "undefined variable" warning for S at
+// position X.
+//
+// This test verifies that:
+// - Symbols NOT in a package's exports are NOT available in scope
+// - Loading a package does NOT make non-exported symbols available
+// - The scope resolution correctly excludes non-exported symbols
+// - Multiple packages being loaded does not affect non-exported symbols
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: package-function-awareness, Property 13: Non-Export Diagnostic Emission
+    /// **Validates: Requirement 8.4**
+    ///
+    /// For any symbol S that is NOT exported by any loaded package at position X,
+    /// the scope at position X SHALL NOT contain S, which means the Diagnostic_Engine
+    /// SHALL emit an "undefined variable" warning for S at position X.
+    ///
+    /// This test verifies that symbols NOT in a package's exports are NOT available
+    /// in scope, even after the library() call.
+    #[test]
+    fn prop_non_export_diagnostic_emission(
+        package in pkg_name(),
+        func in library_func(),
+        exported_name in r_identifier(),
+        non_exported_name in r_identifier(),
+        lines_before in 0..3usize,
+        lines_after in 1..4usize,
+    ) {
+        // Ensure the exported and non-exported names are different
+        prop_assume!(exported_name != non_exported_name);
+
+        let uri = make_url("test_non_export_diag");
+
+        // Build code with library call and usage of a NON-exported symbol
+        let mut code_lines = Vec::new();
+
+        // Add filler lines before library call
+        for i in 0..lines_before {
+            code_lines.push(format!("x{} <- {}", i, i));
+        }
+
+        // Add library call
+        let library_line = lines_before;
+        code_lines.push(format!("{}({})", func, package));
+
+        // Add lines after library call, including usage of NON-exported symbol
+        for i in 0..lines_after {
+            if i == 0 {
+                // Use the NON-exported symbol on the first line after library()
+                code_lines.push(format!("result <- {}(1)", non_exported_name));
+            } else {
+                code_lines.push(format!("y{} <- {}", i, i));
+            }
+        }
+
+        let code = code_lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback that returns ONLY the exported_name
+        // (NOT the non_exported_name)
+        let pkg_clone = package.clone();
+        let export_clone = exported_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        // Empty base exports (we're testing package exports, not base)
+        let base_exports = HashSet::new();
+
+        // Query scope at the usage position (line after library call)
+        let usage_line = (library_line + 1) as u32;
+        let scope = scope_at_position_with_packages(&artifacts, usage_line, 10, &get_exports, &base_exports);
+
+        // Requirement 8.4: The NON-exported symbol should NOT be in scope
+        // This means the Diagnostic_Engine WOULD emit an "undefined variable" warning
+        prop_assert!(
+            !scope.symbols.contains_key(&non_exported_name),
+            "Non-exported symbol '{}' should NOT be in scope at line {} (after library({}) on line {}). \
+             Package '{}' only exports '{}'. \
+             This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+            non_exported_name, usage_line, package, library_line, package, exported_name, code
+        );
+
+        // Sanity check: The exported symbol SHOULD be in scope
+        prop_assert!(
+            scope.symbols.contains_key(&exported_name),
+            "Exported symbol '{}' SHOULD be in scope at line {} (after library({}) on line {}). Code:\n{}",
+            exported_name, usage_line, package, library_line, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 13 extended: Multiple packages, symbol not in any
+    /// **Validates: Requirement 8.4**
+    ///
+    /// When multiple packages are loaded, a symbol that is NOT exported by ANY of them
+    /// should NOT be in scope.
+    #[test]
+    fn prop_non_export_diagnostic_multiple_packages(
+        pkg1 in pkg_name(),
+        pkg2 in pkg_name(),
+        export1 in r_identifier(),
+        export2 in r_identifier(),
+        non_exported in r_identifier(),
+    ) {
+        // Ensure all names are distinct
+        prop_assume!(pkg1 != pkg2);
+        prop_assume!(export1 != export2);
+        prop_assume!(non_exported != export1);
+        prop_assume!(non_exported != export2);
+
+        let uri = make_url("test_non_export_multi_pkg");
+
+        // Code with two library calls and usage of non-exported symbol
+        let code = format!(
+            "library({})\nlibrary({})\nresult <- {}(1)",
+            pkg1, pkg2, non_exported
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback - neither package exports non_exported
+        let pkg1_clone = pkg1.clone();
+        let pkg2_clone = pkg2.clone();
+        let export1_clone = export1.clone();
+        let export2_clone = export2.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg1_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export1_clone.clone());
+                exports
+            } else if p == pkg2_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export2_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 2 (after both library calls)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+
+        // Requirement 8.4: Non-exported symbol should NOT be in scope
+        prop_assert!(
+            !scope.symbols.contains_key(&non_exported),
+            "Non-exported symbol '{}' should NOT be in scope even after loading packages '{}' and '{}'. \
+             Package '{}' exports '{}', package '{}' exports '{}'. \
+             This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+            non_exported, pkg1, pkg2, pkg1, export1, pkg2, export2, code
+        );
+
+        // Sanity check: Both exported symbols SHOULD be in scope
+        prop_assert!(
+            scope.symbols.contains_key(&export1),
+            "Exported symbol '{}' from package '{}' SHOULD be in scope. Code:\n{}",
+            export1, pkg1, code
+        );
+        prop_assert!(
+            scope.symbols.contains_key(&export2),
+            "Exported symbol '{}' from package '{}' SHOULD be in scope. Code:\n{}",
+            export2, pkg2, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 13 extended: Package with empty exports
+    /// **Validates: Requirement 8.4**
+    ///
+    /// When a package has no exports (empty export list), no symbols from that package
+    /// should be available in scope.
+    #[test]
+    fn prop_non_export_diagnostic_empty_exports(
+        package in pkg_name(),
+        symbol_name in r_identifier(),
+    ) {
+        let uri = make_url("test_empty_exports");
+
+        // Code with library call and usage of a symbol
+        let code = format!(
+            "library({})\nresult <- {}(1)",
+            package, symbol_name
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback that returns EMPTY exports
+        let pkg_clone = package.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                HashSet::new() // Empty exports!
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 1 (after library call)
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+
+        // Requirement 8.4: Symbol should NOT be in scope (package has no exports)
+        prop_assert!(
+            !scope.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should NOT be in scope after loading package '{}' with empty exports. \
+             This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+            symbol_name, package, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 13 extended: Function-scoped non-export
+    /// **Validates: Requirement 8.4, 2.4**
+    ///
+    /// When a library() call is inside a function, non-exported symbols should NOT
+    /// be in scope either inside or outside the function.
+    #[test]
+    fn prop_non_export_diagnostic_function_scoped(
+        package in pkg_name(),
+        func_name in r_identifier(),
+        exported_name in r_identifier(),
+        non_exported_name in r_identifier(),
+    ) {
+        // Ensure names are distinct
+        prop_assume!(exported_name != non_exported_name);
+        prop_assume!(func_name != exported_name);
+        prop_assume!(func_name != non_exported_name);
+
+        let uri = make_url("test_func_scoped_non_export");
+
+        // Code with library() inside a function, using non-exported symbol
+        let code = format!(
+            "{} <- function() {{\n    library({})\n    result <- {}(1)\n}}\noutside <- {}(2)",
+            func_name, package, non_exported_name, non_exported_name
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback - only exports exported_name
+        let pkg_clone = package.clone();
+        let export_clone = exported_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope inside the function (line 2, after library call inside function)
+        let scope_inside = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+
+        // Requirement 8.4: Non-exported symbol should NOT be in scope inside function
+        prop_assert!(
+            !scope_inside.symbols.contains_key(&non_exported_name),
+            "Non-exported symbol '{}' should NOT be in scope inside function after library({}). \
+             Package only exports '{}'. Code:\n{}",
+            non_exported_name, package, exported_name, code
+        );
+
+        // Query scope outside the function (line 4)
+        let scope_outside = scope_at_position_with_packages(&artifacts, 4, 10, &get_exports, &base_exports);
+
+        // Non-exported symbol should NOT be in scope outside function either
+        prop_assert!(
+            !scope_outside.symbols.contains_key(&non_exported_name),
+            "Non-exported symbol '{}' should NOT be in scope outside function. Code:\n{}",
+            non_exported_name, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 13 extended: Similar but different symbol names
+    /// **Validates: Requirement 8.4**
+    ///
+    /// Verifies that symbols with similar names (e.g., "mutate" vs "mutate2") are
+    /// correctly distinguished - only exact matches should be in scope.
+    #[test]
+    fn prop_non_export_diagnostic_similar_names(
+        package in pkg_name(),
+        base_name in r_identifier(),
+    ) {
+        let uri = make_url("test_similar_names");
+
+        // Create similar but different names
+        let exported_name = base_name.clone();
+        let similar_name = format!("{}2", base_name);
+
+        // Code with library call and usage of similar-but-different symbol
+        let code = format!(
+            "library({})\nresult <- {}(1)",
+            package, similar_name
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback - only exports base_name, not similar_name
+        let pkg_clone = package.clone();
+        let export_clone = exported_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 1 (after library call)
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+
+        // Requirement 8.4: Similar-but-different symbol should NOT be in scope
+        prop_assert!(
+            !scope.symbols.contains_key(&similar_name),
+            "Similar symbol '{}' should NOT be in scope (only '{}' is exported by '{}'). \
+             This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+            similar_name, exported_name, package, code
+        );
+
+        // Sanity check: The exact exported name SHOULD be in scope
+        prop_assert!(
+            scope.symbols.contains_key(&exported_name),
+            "Exported symbol '{}' SHOULD be in scope. Code:\n{}",
+            exported_name, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 13 extended: Non-export not affected by base packages
+    /// **Validates: Requirement 8.4**
+    ///
+    /// Verifies that non-exported symbols are NOT in scope even when base packages
+    /// are available (base packages don't magically make all symbols available).
+    #[test]
+    fn prop_non_export_diagnostic_with_base_packages(
+        package in pkg_name(),
+        exported_name in r_identifier(),
+        non_exported_name in r_identifier(),
+        base_export in r_identifier(),
+    ) {
+        // Ensure all names are distinct
+        prop_assume!(exported_name != non_exported_name);
+        prop_assume!(non_exported_name != base_export);
+        prop_assume!(exported_name != base_export);
+
+        let uri = make_url("test_non_export_with_base");
+
+        // Code with library call and usage of non-exported symbol
+        let code = format!(
+            "library({})\nresult <- {}(1)",
+            package, non_exported_name
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg_clone = package.clone();
+        let export_clone = exported_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        // Add some base exports (but NOT the non_exported_name)
+        let mut base_exports = HashSet::new();
+        base_exports.insert(base_export.clone());
+
+        // Query scope at line 1 (after library call)
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+
+        // Requirement 8.4: Non-exported symbol should NOT be in scope
+        // (even though base packages are available)
+        prop_assert!(
+            !scope.symbols.contains_key(&non_exported_name),
+            "Non-exported symbol '{}' should NOT be in scope (not in package '{}' exports or base). \
+             This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
+            non_exported_name, package, code
+        );
+
+        // Sanity checks
+        prop_assert!(
+            scope.symbols.contains_key(&exported_name),
+            "Exported symbol '{}' from package '{}' SHOULD be in scope. Code:\n{}",
+            exported_name, package, code
+        );
+        prop_assert!(
+            scope.symbols.contains_key(&base_export),
+            "Base export '{}' SHOULD be in scope. Code:\n{}",
+            base_export, code
+        );
+    }
+}
+
+// ============================================================================
+// Property 14: Package Completion Inclusion
+// Validates: Requirements 9.1, 9.2
+//
+// For any position X after a library(P) call, completions at X SHALL include
+// all exports from package P with package attribution.
+//
+// This test verifies that:
+// - All exports from a loaded package are available in scope after the library() call
+// - Each export has the correct package attribution (source_uri contains package name)
+// - Multiple packages can provide exports that appear in completions
+// - Package attribution is preserved for each export
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: package-function-awareness, Property 14: Package Completion Inclusion
+    /// **Validates: Requirements 9.1, 9.2**
+    ///
+    /// For any position X after a library(P) call, completions at X SHALL include
+    /// all exports from package P with package attribution.
+    ///
+    /// This test verifies that package exports are available in scope after the
+    /// library() call with correct package attribution, which is the mechanism
+    /// by which completions include package exports with package names in the detail field.
+    #[test]
+    fn prop_package_completion_inclusion(
+        package in pkg_name(),
+        func in library_func(),
+        export1 in r_identifier(),
+        export2 in r_identifier(),
+        export3 in r_identifier(),
+        lines_before in 0..3usize,
+    ) {
+        // Ensure exports are distinct
+        prop_assume!(export1 != export2 && export2 != export3 && export1 != export3);
+        // Ensure exports don't conflict with filler variable names (filler0, filler1, filler2)
+        prop_assume!(!export1.starts_with("filler") && !export2.starts_with("filler") && !export3.starts_with("filler"));
+
+        let uri = make_url("test_pkg_completion_inclusion");
+
+        // Build code with library call
+        let mut code_lines = Vec::new();
+
+        // Add filler lines before library call (using "filler" prefix to avoid conflicts with exports)
+        for i in 0..lines_before {
+            code_lines.push(format!("filler{} <- {}", i, i));
+        }
+
+        // Add library call
+        let library_line = lines_before;
+        code_lines.push(format!("{}({})", func, package));
+
+        // Add a line after library call
+        code_lines.push("# cursor position here".to_string());
+
+        let code = code_lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback that returns multiple exports for our package
+        let pkg_clone = package.clone();
+        let export1_clone = export1.clone();
+        let export2_clone = export2.clone();
+        let export3_clone = export3.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export1_clone.clone());
+                exports.insert(export2_clone.clone());
+                exports.insert(export3_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        // Empty base exports (we're testing package exports, not base)
+        let base_exports = HashSet::new();
+
+        // Query scope at the position after library call (where completions would be requested)
+        let query_line = (library_line + 1) as u32;
+        let scope = scope_at_position_with_packages(&artifacts, query_line, 0, &get_exports, &base_exports);
+
+        // Requirement 9.1: All exports from the loaded package should be in scope
+        prop_assert!(
+            scope.symbols.contains_key(&export1),
+            "Package export '{}' from package '{}' should be in scope at line {} (after library() on line {}). \
+             This means it would appear in completions. Code:\n{}",
+            export1, package, query_line, library_line, code
+        );
+        prop_assert!(
+            scope.symbols.contains_key(&export2),
+            "Package export '{}' from package '{}' should be in scope at line {} (after library() on line {}). \
+             This means it would appear in completions. Code:\n{}",
+            export2, package, query_line, library_line, code
+        );
+        prop_assert!(
+            scope.symbols.contains_key(&export3),
+            "Package export '{}' from package '{}' should be in scope at line {} (after library() on line {}). \
+             This means it would appear in completions. Code:\n{}",
+            export3, package, query_line, library_line, code
+        );
+
+        // Requirement 9.2: Each export should have the correct package attribution
+        let expected_uri = format!("package:{}", package);
+        
+        let symbol1 = scope.symbols.get(&export1).unwrap();
+        prop_assert_eq!(
+            symbol1.source_uri.as_str(), expected_uri.as_str(),
+            "Package export '{}' should have URI '{}' for package attribution, got '{}'. Code:\n{}",
+            export1, expected_uri, symbol1.source_uri.as_str(), code
+        );
+
+        let symbol2 = scope.symbols.get(&export2).unwrap();
+        prop_assert_eq!(
+            symbol2.source_uri.as_str(), expected_uri.as_str(),
+            "Package export '{}' should have URI '{}' for package attribution, got '{}'. Code:\n{}",
+            export2, expected_uri, symbol2.source_uri.as_str(), code
+        );
+
+        let symbol3 = scope.symbols.get(&export3).unwrap();
+        prop_assert_eq!(
+            symbol3.source_uri.as_str(), expected_uri.as_str(),
+            "Package export '{}' should have URI '{}' for package attribution, got '{}'. Code:\n{}",
+            export3, expected_uri, symbol3.source_uri.as_str(), code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 14 extended: Multiple packages
+    /// **Validates: Requirements 9.1, 9.2, 9.3**
+    ///
+    /// When multiple packages are loaded, completions should include exports from
+    /// ALL loaded packages, each with correct package attribution.
+    #[test]
+    fn prop_package_completion_inclusion_multiple_packages(
+        pkg1 in pkg_name(),
+        pkg2 in pkg_name(),
+        export1 in r_identifier(),
+        export2 in r_identifier(),
+    ) {
+        // Ensure packages and exports are distinct
+        prop_assume!(pkg1 != pkg2);
+        prop_assume!(export1 != export2);
+
+        let uri = make_url("test_multi_pkg_completion");
+
+        // Code with two library calls
+        let code = format!(
+            "library({})\nlibrary({})\n# cursor position here",
+            pkg1, pkg2
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg1_clone = pkg1.clone();
+        let pkg2_clone = pkg2.clone();
+        let export1_clone = export1.clone();
+        let export2_clone = export2.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg1_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export1_clone.clone());
+                exports
+            } else if p == pkg2_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export2_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 2 (after both library calls)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 0, &get_exports, &base_exports);
+
+        // Requirement 9.1: Both exports should be in scope
+        prop_assert!(
+            scope.symbols.contains_key(&export1),
+            "Export '{}' from package '{}' should be in scope. Code:\n{}",
+            export1, pkg1, code
+        );
+        prop_assert!(
+            scope.symbols.contains_key(&export2),
+            "Export '{}' from package '{}' should be in scope. Code:\n{}",
+            export2, pkg2, code
+        );
+
+        // Requirement 9.2: Each export should have correct package attribution
+        let symbol1 = scope.symbols.get(&export1).unwrap();
+        let expected_uri1 = format!("package:{}", pkg1);
+        prop_assert_eq!(
+            symbol1.source_uri.as_str(), expected_uri1.as_str(),
+            "Export '{}' should have URI '{}', got '{}'. Code:\n{}",
+            export1, expected_uri1, symbol1.source_uri.as_str(), code
+        );
+
+        let symbol2 = scope.symbols.get(&export2).unwrap();
+        let expected_uri2 = format!("package:{}", pkg2);
+        prop_assert_eq!(
+            symbol2.source_uri.as_str(), expected_uri2.as_str(),
+            "Export '{}' should have URI '{}', got '{}'. Code:\n{}",
+            export2, expected_uri2, symbol2.source_uri.as_str(), code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 14 extended: Duplicate exports
+    /// **Validates: Requirements 9.2, 9.3**
+    ///
+    /// When multiple packages export the same symbol, the first loaded package's
+    /// export should be used (but both would be shown in completions with attribution).
+    /// This test verifies the scope resolution behavior for duplicate exports.
+    #[test]
+    fn prop_package_completion_duplicate_exports(
+        pkg1 in pkg_name(),
+        pkg2 in pkg_name(),
+        shared_export in r_identifier(),
+    ) {
+        // Ensure packages are distinct
+        prop_assume!(pkg1 != pkg2);
+
+        let uri = make_url("test_duplicate_export_completion");
+
+        // Code with two library calls, both packages export the same symbol
+        let code = format!(
+            "library({})\nlibrary({})\n# cursor position here",
+            pkg1, pkg2
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback where both packages export the same symbol
+        let pkg1_clone = pkg1.clone();
+        let pkg2_clone = pkg2.clone();
+        let export_clone = shared_export.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg1_clone || p == pkg2_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 2 (after both library calls)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 0, &get_exports, &base_exports);
+
+        // The symbol should be in scope
+        prop_assert!(
+            scope.symbols.contains_key(&shared_export),
+            "Shared export '{}' should be in scope. Code:\n{}",
+            shared_export, code
+        );
+
+        // The first loaded package (pkg1) should win for the symbol attribution
+        // This is because scope_at_position_with_packages processes PackageLoad events
+        // in order and only overrides base package exports, not other package exports
+        let symbol = scope.symbols.get(&shared_export).unwrap();
+        let expected_uri = format!("package:{}", pkg1);
+        prop_assert_eq!(
+            symbol.source_uri.as_str(), expected_uri.as_str(),
+            "Shared export '{}' should have URI '{}' (first loaded package), got '{}'. Code:\n{}",
+            shared_export, expected_uri, symbol.source_uri.as_str(), code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 14 extended: Position-aware completions
+    /// **Validates: Requirements 9.1, 2.1, 2.2**
+    ///
+    /// Package exports should NOT be available in completions before the library() call.
+    #[test]
+    fn prop_package_completion_position_aware(
+        package in pkg_name(),
+        export_name in r_identifier(),
+        lines_before in 1..4usize,
+    ) {
+        // Ensure export doesn't conflict with filler variable names
+        prop_assume!(!export_name.starts_with("filler"));
+
+        let uri = make_url("test_pkg_completion_position");
+
+        // Build code with library call in the middle
+        let mut code_lines = Vec::new();
+
+        // Add filler lines before library call (using "filler" prefix to avoid conflicts)
+        for i in 0..lines_before {
+            code_lines.push(format!("filler{} <- {}", i, i));
+        }
+
+        // Add library call
+        let library_line = lines_before;
+        code_lines.push(format!("library({})", package));
+
+        // Add a line after library call
+        code_lines.push("# after library".to_string());
+
+        let code = code_lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg_clone = package.clone();
+        let export_clone = export_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(export_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope BEFORE the library call (line 0)
+        let scope_before = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+
+        // Export should NOT be in scope before library() call
+        prop_assert!(
+            !scope_before.symbols.contains_key(&export_name),
+            "Package export '{}' should NOT be in scope at line 0 (before library() on line {}). \
+             This means it would NOT appear in completions before the library call. Code:\n{}",
+            export_name, library_line, code
+        );
+
+        // Query scope AFTER the library call
+        let scope_after = scope_at_position_with_packages(&artifacts, (library_line + 1) as u32, 0, &get_exports, &base_exports);
+
+        // Export SHOULD be in scope after library() call
+        prop_assert!(
+            scope_after.symbols.contains_key(&export_name),
+            "Package export '{}' should be in scope at line {} (after library() on line {}). \
+             This means it would appear in completions after the library call. Code:\n{}",
+            export_name, library_line + 1, library_line, code
+        );
+    }
+
+    /// Feature: package-function-awareness, Property 14 extended: Local definitions shadow package exports
+    /// **Validates: Requirements 9.4**
+    ///
+    /// Local definitions should take precedence over package exports in completions.
+    #[test]
+    fn prop_package_completion_local_precedence(
+        package in pkg_name(),
+        symbol_name in r_identifier(),
+    ) {
+        let uri = make_url("test_pkg_completion_local_precedence");
+
+        // Code with library call followed by local definition of same symbol
+        let code = format!(
+            "library({})\n{} <- 42\n# cursor position here",
+            package, symbol_name
+        );
+
+        let tree = parse_r_tree(&code);
+        let artifacts = compute_artifacts(&uri, &tree, &code);
+
+        // Create a package exports callback
+        let pkg_clone = package.clone();
+        let symbol_clone = symbol_name.clone();
+        let get_exports = move |p: &str| -> HashSet<String> {
+            if p == pkg_clone {
+                let mut exports = HashSet::new();
+                exports.insert(symbol_clone.clone());
+                exports
+            } else {
+                HashSet::new()
+            }
+        };
+
+        let base_exports = HashSet::new();
+
+        // Query scope at line 2 (after both library call and local definition)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 0, &get_exports, &base_exports);
+
+        // Symbol should be in scope
+        prop_assert!(
+            scope.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should be in scope. Code:\n{}",
+            symbol_name, code
+        );
+
+        // Requirement 9.4: Local definition should take precedence
+        // The symbol should have the file URI, not the package URI
+        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        prop_assert_eq!(
+            &symbol.source_uri, &uri,
+            "Symbol '{}' should have local file URI (local definition takes precedence), got '{}'. Code:\n{}",
+            symbol_name, symbol.source_uri.as_str(), code
+        );
     }
 }

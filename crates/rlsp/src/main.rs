@@ -12,8 +12,11 @@ mod cross_file;
 mod document_store;
 mod handlers;
 mod help;
+mod namespace_parser;
+mod package_library;
 mod parser_pool;
 mod r_env;
+mod r_subprocess;
 mod state;
 mod workspace_index;
 

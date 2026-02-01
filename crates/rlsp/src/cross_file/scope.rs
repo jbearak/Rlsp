@@ -8,10 +8,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::Url;
 use tree_sitter::{Node, Tree};
 
-use super::source_detect::{detect_rm_calls, detect_source_calls};
+use super::source_detect::{detect_library_calls, detect_rm_calls, detect_source_calls};
 use super::types::{byte_offset_to_utf16_column, ForwardSource};
 
 // ============================================================================
@@ -20,7 +21,7 @@ use super::types::{byte_offset_to_utf16_column, ForwardSource};
 
 /// A 2D position in a document (line, column)
 /// Uses lexicographic ordering: line first, then column (Requirement 4.1)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Position {
     pub line: u32,
     pub column: u32,
@@ -86,7 +87,7 @@ impl Position {
 }
 
 /// A function scope interval with start and end positions
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionScopeInterval {
     pub start: Position,
     pub end: Position,
@@ -549,6 +550,15 @@ pub enum ScopeEvent {
         symbols: Vec<String>,
         function_scope: Option<(u32, u32, u32, u32)>,
     },
+    /// A package load that introduces symbols from a package
+    PackageLoad {
+        line: u32,
+        column: u32,
+        /// Package name
+        package: String,
+        /// Function scope if inside a function (None = global)
+        function_scope: Option<FunctionScopeInterval>,
+    },
 }
 
 /// Per-file scope artifacts
@@ -595,6 +605,14 @@ pub struct ScopeAtPosition {
     pub chain: Vec<Url>,
     /// URIs where max depth was exceeded, with the source call position (line, col)
     pub depth_exceeded: Vec<(Url, u32, u32)>,
+    /// Packages inherited from parent files (loaded before the source() call site)
+    /// These packages are available from position (0, 0) in the child file.
+    /// Requirements 5.1, 5.2, 5.3: Cross-file package propagation
+    pub inherited_packages: Vec<String>,
+    /// Packages loaded locally in the current file before the query position.
+    /// Combined with inherited_packages, this gives all packages available at the position.
+    /// Requirements 8.1, 8.3: Position-aware package loading for diagnostics
+    pub loaded_packages: Vec<String>,
 }
 
 /// Determine whether a `source()` call should use local scoping rules.
@@ -741,12 +759,18 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         });
     }
 
+    // Collect library()/require()/loadNamespace() calls for later processing.
+    // We need to wait until the function scope tree is built to determine function_scope.
+    // (Requirements 14.2, 14.4)
+    let library_calls = detect_library_calls(tree, content);
+
     // Sort timeline by position for correct ordering
     artifacts.timeline.sort_by_key(|event| match event {
         ScopeEvent::Def { line, column, .. } => (*line, *column),
         ScopeEvent::Source { line, column, .. } => (*line, *column),
         ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
         ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
     });
 
     // Build interval tree from function scopes for O(log n) queries
@@ -766,22 +790,60 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         }
     }
 
-    // Compute interface hash
-    artifacts.interface_hash = compute_interface_hash(&artifacts.exported_interface);
+    // Add PackageLoad events for library calls with function_scope determined from the tree.
+    // (Requirements 14.2, 14.4)
+    for lib_call in library_calls {
+        let function_scope = find_containing_function_scope(
+            &artifacts.function_scope_tree,
+            lib_call.line,
+            lib_call.column,
+        ).map(FunctionScopeInterval::from_tuple);
+
+        artifacts.timeline.push(ScopeEvent::PackageLoad {
+            line: lib_call.line,
+            column: lib_call.column,
+            package: lib_call.package,
+            function_scope,
+        });
+    }
+
+    // Re-sort timeline to include PackageLoad events in correct position
+    artifacts.timeline.sort_by_key(|event| match event {
+        ScopeEvent::Def { line, column, .. } => (*line, *column),
+        ScopeEvent::Source { line, column, .. } => (*line, *column),
+        ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+        ScopeEvent::Removal { line, column, .. } => (*line, *column),
+        ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+    });
+
+    // Extract package names from PackageLoad events for interface hash computation
+    // (Requirement 14.5: interface hash must include loaded packages for cache invalidation)
+    let loaded_packages: Vec<String> = artifacts
+        .timeline
+        .iter()
+        .filter_map(|event| {
+            if let ScopeEvent::PackageLoad { package, .. } = event {
+                Some(package.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Compute interface hash including both symbols and loaded packages
+    artifacts.interface_hash = compute_interface_hash(&artifacts.exported_interface, &loaded_packages);
 
     artifacts
 }
 
-/// Compute the lexical scope for a single file at the given document position.
+/// Compute the lexical scope at the given document position within a single file.
 ///
-/// Returns the set of symbols that are visible at (line, column) within `artifacts`,
-/// without performing any cross-file traversal or dependency resolution.
-///
-/// Behaviour:
-/// - Includes global definitions that occur at or before the query position.
-/// - Includes function-local definitions only if the query position lies inside the same function scope as the definition.
-/// - Includes function parameters when the query position is inside the function body (EOF sentinel positions are ignored).
-/// - Applies removal events that occur strictly before the query position and respects function-scoped removals.
+/// The returned ScopeAtPosition reflects only local, in-file visibility at (line, column):
+/// - Global definitions that occur at or before the query position are included.
+/// - Function-local definitions are included only when the query position lies inside the same function scope as the definition.
+/// - Function parameters are included when the query position is inside the function body (EOF sentinel positions are ignored).
+/// - Removal events that occur strictly before the query position are applied, respecting function-scoped removals.
+/// - Package load events from the same file are recorded in `loaded_packages` when they occur at or before the query position and match function-scoping rules.
 ///
 /// # Examples
 ///
@@ -852,6 +914,205 @@ pub fn scope_at_position(
                     apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
                 }
             }
+            ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } => {
+                // Requirements 8.1, 8.3: Position-aware package loading
+                // Populate loaded_packages for callers to check package exports
+                if (*pkg_line, *pkg_col) <= (line, column) {
+                    // Check function scope compatibility
+                    let should_include = match function_scope {
+                        None => true, // Global package load - always include
+                        Some(pkg_scope) => {
+                            // Function-scoped package load - only include if query is in same function
+                            active_function_scopes.iter().any(|active_scope| {
+                                active_scope.0 == pkg_scope.start.line &&
+                                active_scope.1 == pkg_scope.start.column &&
+                                active_scope.2 == pkg_scope.end.line &&
+                                active_scope.3 == pkg_scope.end.column
+                            })
+                        }
+                    };
+                    
+                    if should_include && !scope.loaded_packages.contains(package) {
+                        scope.loaded_packages.push(package.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    scope
+}
+
+/// Compute the lexical scope at a document position, including package exports
+/// loaded before that position.
+///
+/// This function returns the set of symbols visible at (line, column) in a
+/// single file by processing the file's timeline (definitions, function
+/// scopes, removals, and PackageLoad events). Package exports are injected
+/// using the provided `get_package_exports` callback for each package loaded
+/// at or before the query position; `base_exports` are seeded with lowest
+/// precedence and may be overridden by local definitions or explicit package
+/// loads. Function-scoped package loads are only visible when the query
+/// position lies inside the corresponding function scope.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+/// let artifacts = crate::cross_file::scope::ScopeArtifacts::default();
+/// let get_exports = |_pkg: &str| -> HashSet<String> { HashSet::new() };
+/// let base_exports = HashSet::new();
+/// let scope = crate::cross_file::scope::scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+/// assert!(scope.symbols.is_empty());
+/// ```
+pub fn scope_at_position_with_packages<F>(
+    artifacts: &ScopeArtifacts,
+    line: u32,
+    column: u32,
+    get_package_exports: &F,
+    base_exports: &HashSet<String>,
+) -> ScopeAtPosition
+where
+    F: Fn(&str) -> HashSet<String>,
+{
+    let mut scope = ScopeAtPosition::default();
+
+    // Requirements 6.3, 6.4: Base packages are always available at all positions
+    // without requiring explicit library() calls and without position-aware loading.
+    // Add base exports first with lowest precedence - they will be overridden by
+    // local definitions and explicit package loads via entry().or_insert_with().
+    let base_uri = Url::parse("package:base").unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
+    for export_name in base_exports {
+        scope.symbols.insert(
+            export_name.clone(),
+            ScopedSymbol {
+                name: export_name.clone(),
+                kind: SymbolKind::Variable, // Base exports are treated as variables
+                source_uri: base_uri.clone(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+            },
+        );
+    }
+
+    // Use interval tree for O(log n) query instead of linear scan
+    let is_full_eof_position = Position::new(line, column).is_full_eof();
+    let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
+        Vec::new()
+    } else {
+        artifacts.function_scope_tree
+            .query_point(Position::new(line, column))
+            .into_iter()
+            .map(|interval| interval.as_tuple())
+            .collect()
+    };
+
+    // Process events and apply function scope filtering
+    // Note: Local definitions and explicit package loads will override base exports
+    // because we use insert() for definitions (which overwrites) and entry().or_insert_with()
+    // for package loads (which preserves existing entries including local definitions).
+    for event in &artifacts.timeline {
+        match event {
+            ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
+                // Include if definition is before or at the position
+                if (*def_line, *def_col) <= (line, column) {
+                    // Use interval tree for O(log n) innermost scope lookup
+                    let def_function_scope = artifacts.function_scope_tree
+                        .query_innermost(Position::new(*def_line, *def_col))
+                        .map(|interval| interval.as_tuple());
+
+                    match def_function_scope {
+                        None => {
+                            // Global definition - always include
+                            scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                        }
+                        Some(def_scope) => {
+                            // Function-local definition - only include if we're inside the same function
+                            if active_function_scopes.contains(&def_scope) {
+                                scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            ScopeEvent::Source { .. } => {
+                // Source events are handled by scope_at_position_with_deps
+            }
+            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+                // Include function parameters if position is within function body
+                // Skip EOF sentinel positions to avoid matching all functions
+                if !is_full_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                    for param in parameters {
+                        scope.symbols.insert(param.name.clone(), param.clone());
+                    }
+                }
+            }
+            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
+                // Only process if removal is strictly before the query position
+                if (*rm_line, *rm_col) < (line, column) {
+                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
+                }
+            }
+            ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } => {
+                // Process PackageLoad events for position-aware package loading
+                // Requirements 2.1, 2.2: Only include if package is loaded before query position
+                if (*pkg_line, *pkg_col) <= (line, column) {
+                    // Requirements 2.4, 2.5: Check function scope compatibility
+                    let should_include = match function_scope {
+                        None => {
+                            // Global package load - always available after the load position
+                            true
+                        }
+                        Some(pkg_scope) => {
+                            // Function-scoped package load - only available within that function
+                            // Check if query position is inside the same function scope
+                            active_function_scopes.iter().any(|active_scope| {
+                                active_scope.0 == pkg_scope.start.line &&
+                                active_scope.1 == pkg_scope.start.column &&
+                                active_scope.2 == pkg_scope.end.line &&
+                                active_scope.3 == pkg_scope.end.column
+                            })
+                        }
+                    };
+
+                    if should_include {
+                        // Get package exports and add them to scope
+                        let exports = get_package_exports(package);
+                        
+                        // Create a pseudo-URI for the package source
+                        // This allows hover/definition to identify package symbols
+                        let package_uri = Url::parse(&format!("package:{}", package))
+                            .unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
+                        
+                        for export_name in exports {
+                            // Check if symbol already exists
+                            let should_insert = match scope.symbols.get(&export_name) {
+                                None => true, // No existing symbol, insert
+                                Some(existing) => {
+                                    // Only override if existing is from base package
+                                    // Local definitions (non-package URIs) take precedence
+                                    existing.source_uri.as_str() == "package:base"
+                                }
+                            };
+                            
+                            if should_insert {
+                                scope.symbols.insert(
+                                    export_name.clone(),
+                                    ScopedSymbol {
+                                        name: export_name,
+                                        kind: SymbolKind::Variable, // Package exports are treated as variables
+                                        source_uri: package_uri.clone(),
+                                        defined_line: 0,
+                                        defined_column: 0,
+                                        signature: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -878,39 +1139,44 @@ where
     scope
 }
 
-/// Recursively computes the lexical scope at a position across sourced files.
+/// Compute the lexical scope at a given position for `uri`, merging symbols from the file
+/// and any transitive `source()` targets up to `max_depth`, while respecting local
+/// scoping, function-local definitions, removals, and cycle prevention.
 ///
-/// Walks the timeline and function-scope intervals for `uri`, merging symbols from
-/// the current file and any transitive `source()` targets (up to `max_depth`),
-/// respecting local scoping, function-local definitions, removals, and cycle prevention.
+/// Only `source()` targets whose calls occur before the query position are followed.
+/// Function-scoped sources and definitions are visible only when the query position is
+/// inside the same function scope. Traversal stops when `max_depth` would be exceeded;
+/// locations where traversal was curtailed are recorded in the result.
 ///
-/// Parameters:
-/// - `uri`: the file URI whose scope is being computed.
-/// - `line`, `column`: the query position (use `u32::MAX` for EOF / to include all symbols).
-/// - `get_artifacts`: callback that returns `ScopeArtifacts` for a given `Url`.
+/// Parameters with non-obvious behavior:
+/// - `get_artifacts`: callback that returns `ScopeArtifacts` for a `Url`.
 /// - `resolve_path`: callback that resolves a source path relative to `uri` and returns a `Url`.
-/// - `max_depth`: maximum recursion depth for following `source()` chains.
-/// - `current_depth`: current recursion depth (start callers at 0).
-/// - `visited`: mutable set of already-visited `Url`s to prevent cycles.
+/// - `max_depth`: maximum number of recursive `source()` hops to follow (root call counts as depth 0).
+/// - `visited`: mutable set used to prevent cycles across recursion; callers should provide an empty set.
 ///
-/// Returns:
-/// A `ScopeAtPosition` containing the merged symbols, the chain of visited URIs,
-/// and any (uri, line, column) tuples where traversal was curtailed due to depth limits.
+/// # Returns
+///
+/// A `ScopeAtPosition` whose `symbols` are the merged, precedence-resolved symbols available at the
+/// queried position; `chain` is the sequence of visited URIs (root first); `depth_exceeded` lists
+/// (uri, line, column) tuples where traversal was stopped due to `max_depth`.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// // Example (conceptual): compute top-level scope for a file.
+/// use lsp_types::Url;
+/// use std::collections::HashSet;
+///
 /// let uri = Url::parse("file:///project/main.R").unwrap();
-/// let artifacts_db = |u: &Url| -> Option<ScopeArtifacts> { /* load or parse file */ None };
-/// let resolver = |path: &str, base: &Url| -> Option<Url> { /* resolve path */ None };
-/// let mut visited = std::collections::HashSet::new();
+/// let get_artifacts = |_u: &Url| -> Option<ScopeArtifacts> { None };
+/// let resolve_path = |_path: &str, _base: &Url| -> Option<Url> { None };
+/// let mut visited = HashSet::new();
+///
 /// let scope = scope_at_position_recursive(
 ///     &uri,
 ///     10, // line
 ///     2,  // column
-///     &artifacts_db,
-///     &resolver,
+///     &get_artifacts,
+///     &resolve_path,
 ///     10, // max_depth
 ///     0,  // current_depth
 ///     &mut visited,
@@ -1048,6 +1314,9 @@ where
                 if (*rm_line, *rm_col) < (line, column) {
                     apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
                 }
+            }
+            ScopeEvent::PackageLoad { .. } => {
+                // PackageLoad events are handled by scope resolution with package library access
             }
         }
     }
@@ -1427,13 +1696,49 @@ fn extract_function_signature(func_node: Node, name: &str, content: &str) -> Str
     format!("{}()", name)
 }
 
+/// Get the source slice corresponding to a tree-sitter `Node`.
+///
+/// The returned string slice borrows from `content` and spans the byte range reported by `node.byte_range()`.
+///
+/// # Examples
+///
+/// ```
+/// // Given a `node: tree_sitter::Node` and `source: &str`:
+/// // let text = node_text(node, source);
+/// // `text` will be the substring of `source` that corresponds to `node`.
+/// ```
 fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
     &content[node.byte_range()]
 }
 
-fn compute_interface_hash(interface: &HashMap<String, ScopedSymbol>) -> u64 {
+/// Compute a deterministic hash of the exported interface and loaded packages.
+///
+/// Symbols are incorporated deterministically by sorting the interface keys before hashing each
+/// ScopedSymbol; package names are included sorted as well. The resulting hash is suitable for
+/// cache invalidation when a file's exported symbols or loaded packages change.
+///
+/// # Returns
+///
+/// `u64` hash of the provided `interface` and `packages`.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// // Use an empty interface and no packages as the simplest example.
+/// let interface: HashMap<String, crate::ScopedSymbol> = HashMap::new();
+/// let packages: Vec<String> = Vec::new();
+/// let h1 = crate::compute_interface_hash(&interface, &packages);
+/// let h2 = crate::compute_interface_hash(&interface, &packages);
+/// assert_eq!(h1, h2);
+/// ```
+fn compute_interface_hash(
+    interface: &HashMap<String, ScopedSymbol>,
+    packages: &[String],
+) -> u64 {
     let mut hasher = DefaultHasher::new();
-    // Sort keys for deterministic hashing
+
+    // Sort keys for deterministic hashing of symbols
     let mut keys: Vec<_> = interface.keys().collect();
     keys.sort();
     for key in keys {
@@ -1441,6 +1746,15 @@ fn compute_interface_hash(interface: &HashMap<String, ScopedSymbol>) -> u64 {
             symbol.hash(&mut hasher);
         }
     }
+
+    // Include loaded packages in the hash (sorted for determinism)
+    // This ensures cache invalidation when packages change (Requirement 14.5)
+    let mut sorted_packages: Vec<_> = packages.iter().collect();
+    sorted_packages.sort();
+    for package in sorted_packages {
+        package.hash(&mut hasher);
+    }
+
     hasher.finish()
 }
 
@@ -1499,17 +1813,22 @@ where
     
     scope_at_position_with_graph_recursive(
         uri, line, column, get_artifacts, get_metadata, graph, workspace_root,
-        path_ctx, max_depth, 0, &mut visited,
+        path_ctx, max_depth, 0, &mut visited, &[],
     )
 }
 
-/// Resolve the effective scope at a position using the dependency graph to include parent (backward) and sourced (forward) symbols.
+/// Compute the lexical and cross-file scope visible at a position using the dependency graph.
 ///
-/// This recursively collects symbols visible at (line, column) in `uri` by:
-/// - Merging symbols from parent files indicated by dependency-graph edges (respecting local/sys.source/global rules and depth limits).
-/// - Applying the file's own timeline (definitions, function-parameter scopes, removals) and resolving forward `source()` calls through the provided `PathContext`.
+/// This collects symbols visible at (line, column) in `uri` by merging parent (backward) symbols
+/// from dependency-graph edges, applying the file's own timeline (definitions, parameters,
+/// removals) and resolving forward `source()` calls (including propagated package loads).
+/// Function-scoped visibility, sys.source/local scoping rules, cycle prevention, and `max_depth`
+/// are respected; entries that would exceed `max_depth` are recorded in `ScopeAtPosition::depth_exceeded`.
 ///
-/// The function guards against cycles and enforces `max_depth`; entries that would exceed `max_depth` are recorded in `ScopeAtPosition::depth_exceeded`.
+/// # Returns
+///
+/// A `ScopeAtPosition` containing the merged symbols, provenance chain, recorded depth-exceeded
+/// entries, and package information applicable at the queried position.
 ///
 /// # Examples
 ///
@@ -1517,7 +1836,7 @@ where
 /// use url::Url;
 /// use std::collections::HashSet;
 ///
-/// // Call with minimal stubs: no artifacts, no metadata, and an empty graph.
+/// // Minimal stubs: no artifacts, no metadata, and an empty graph.
 /// let uri = Url::parse("file:///example.R").unwrap();
 /// let get_artifacts = |_u: &Url| -> Option<super::ScopeArtifacts> { None };
 /// let get_metadata = |_u: &Url| -> Option<super::types::CrossFileMetadata> { None };
@@ -1536,6 +1855,7 @@ where
 ///     10,
 ///     0,
 ///     &mut visited,
+///     &[], // no inherited packages
 /// );
 ///
 /// assert!(scope.symbols.is_empty());
@@ -1553,12 +1873,18 @@ fn scope_at_position_with_graph_recursive<F, G>(
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<Url>,
+    inherited_packages: &[String],
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<ScopeArtifacts>,
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
-    let mut scope = ScopeAtPosition::default();
+    // Initialize scope with inherited_packages from parameter
+    // Requirements 5.1, 5.2: Packages inherited from parent files are available from position (0, 0)
+    let mut scope = ScopeAtPosition {
+        inherited_packages: inherited_packages.to_vec(),
+        ..Default::default()
+    };
 
     if current_depth >= max_depth || visited.contains(uri) {
         return scope;
@@ -1610,6 +1936,8 @@ where
             .or_else(|| super::path_resolve::PathContext::new(&edge.from, workspace_root));
 
         // Get parent's scope at the call site
+        // Note: We pass empty inherited_packages here because the parent will collect
+        // its own inherited packages from its parents via the dependency graph
         let parent_scope = scope_at_position_with_graph_recursive(
             &edge.from,
             call_site_line,
@@ -1622,6 +1950,7 @@ where
             max_depth,
             current_depth + 1,
             visited,
+            &[], // Parent collects its own inherited packages
         );
 
         // Merge parent symbols (they are available at the START of this file)
@@ -1630,6 +1959,55 @@ where
         }
         scope.chain.extend(parent_scope.chain);
         scope.depth_exceeded.extend(parent_scope.depth_exceeded);
+
+        // Requirements 5.1, 5.2, 5.3: Propagate PackageLoad events from parent files
+        // Collect packages loaded in parent before the source() call site
+        // These packages are available in the child file from position (0, 0)
+        if let Some(parent_artifacts) = get_artifacts(&edge.from) {
+            for event in &parent_artifacts.timeline {
+                if let ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } = event {
+                    // Only propagate packages loaded before the call site
+                    // Requirement 5.1: Package loaded before source() call is available in sourced file
+                    if (*pkg_line, *pkg_col) <= (call_site_line, call_site_col) {
+                        // Requirement 5.3: Respect function scope - only propagate global packages
+                        // or packages in the same function scope as the source() call
+                        let should_propagate = match function_scope {
+                            None => true, // Global package load - always propagate
+                            Some(pkg_scope) => {
+                                // Function-scoped package load - only propagate if the source() call
+                                // is within the same function scope
+                                if let Some(parent_artifacts_ref) = get_artifacts(&edge.from) {
+                                    let call_site_scope = parent_artifacts_ref.function_scope_tree
+                                        .query_innermost(Position::new(call_site_line, call_site_col))
+                                        .map(|interval| interval.as_tuple());
+                                    
+                                    call_site_scope.is_some_and(|cs_scope| {
+                                        cs_scope.0 == pkg_scope.start.line &&
+                                        cs_scope.1 == pkg_scope.start.column &&
+                                        cs_scope.2 == pkg_scope.end.line &&
+                                        cs_scope.3 == pkg_scope.end.column
+                                    })
+                                } else {
+                                    false
+                                }
+                            }
+                        };
+
+                        if should_propagate && !scope.inherited_packages.contains(package) {
+                            scope.inherited_packages.push(package.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also propagate packages that the parent inherited from its parents
+        // Requirement 5.2: Inherit loaded packages from parent up to call site
+        for pkg in &parent_scope.inherited_packages {
+            if !scope.inherited_packages.contains(pkg) {
+                scope.inherited_packages.push(pkg.clone());
+            }
+        }
     }
 
     // STEP 2: Process timeline events (local definitions and forward sources)
@@ -1703,6 +2081,61 @@ where
                             continue;
                         }
 
+                        // Requirements 5.1, 5.3: Collect packages loaded before this source() call
+                        // to pass to the child file. The child will have access to these packages
+                        // from position (0, 0).
+                        // Get the function scope of the source() call for filtering function-scoped packages
+                        let source_function_scope = artifacts.function_scope_tree
+                            .query_innermost(Position::new(*src_line, *src_col))
+                            .map(|interval| interval.as_tuple());
+
+                        let mut extra_packages: Vec<String> = Vec::new();
+
+                        // Collect packages from this file's timeline that are loaded before the source() call
+                        for pkg_event in &artifacts.timeline {
+                            if let ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } = pkg_event {
+                                // Only include packages loaded before the source() call
+                                if (*pkg_line, *pkg_col) < (*src_line, *src_col) {
+                                    // Check function scope compatibility
+                                    let should_include = match function_scope {
+                                        None => true, // Global package load - always include
+                                        Some(pkg_scope) => {
+                                            // Function-scoped package load - only include if:
+                                            // 1. The source() call is in the same function scope, OR
+                                            // 2. The source() call is nested within the package's function scope
+                                            source_function_scope.is_some_and(|src_scope| {
+                                                src_scope.0 == pkg_scope.start.line &&
+                                                src_scope.1 == pkg_scope.start.column &&
+                                                src_scope.2 == pkg_scope.end.line &&
+                                                src_scope.3 == pkg_scope.end.column
+                                            })
+                                        }
+                                    };
+                                    
+                                    if should_include
+                                        && !scope.inherited_packages.contains(package)
+                                        && !extra_packages.contains(package) {
+                                        extra_packages.push(package.clone());
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut packages_for_child: Vec<String>;
+                        let packages_slice: &[String];
+
+                        if extra_packages.is_empty() {
+                            packages_slice = scope.inherited_packages.as_slice();
+                        } else {
+                            packages_for_child = scope.inherited_packages.clone();
+                            for pkg in extra_packages {
+                                if !packages_for_child.contains(&pkg) {
+                                    packages_for_child.push(pkg);
+                                }
+                            }
+                            packages_slice = packages_for_child.as_slice();
+                        }
+
                         // Build child PathContext, respecting chdir flag
                         let child_path = child_uri.to_file_path().ok();
                         let child_ctx = child_path.as_ref().and_then(|cp| {
@@ -1739,6 +2172,7 @@ where
                             max_depth,
                             current_depth + 1,
                             visited,
+                            packages_slice, // Pass inherited packages to child
                         );
                         // Merge child symbols (local definitions take precedence)
                         for (name, symbol) in child_scope.symbols {
@@ -1763,6 +2197,29 @@ where
                 // Only process if removal is strictly before the query position
                 if (*rm_line, *rm_col) < (line, column) {
                     apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
+                }
+            }
+            ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } => {
+                // Requirements 8.1, 8.3: Position-aware package loading
+                // Only include packages loaded before the query position
+                if (*pkg_line, *pkg_col) <= (line, column) {
+                    // Check function scope compatibility
+                    let should_include = match function_scope {
+                        None => true, // Global package load - always include
+                        Some(pkg_scope) => {
+                            // Function-scoped package load - only include if query is in same function
+                            active_function_scopes.iter().any(|active_scope| {
+                                active_scope.0 == pkg_scope.start.line &&
+                                active_scope.1 == pkg_scope.start.column &&
+                                active_scope.2 == pkg_scope.end.line &&
+                                active_scope.3 == pkg_scope.end.column
+                            })
+                        }
+                    };
+                    
+                    if should_include && !scope.loaded_packages.contains(package) {
+                        scope.loaded_packages.push(package.clone());
+                    }
                 }
             }
         }
@@ -1988,6 +2445,29 @@ where
                 // Only process if removal is strictly before the query position
                 if (*rm_line, *rm_col) < (line, column) {
                     apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
+                }
+            }
+            ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } => {
+                // Requirements 8.1, 8.3: Position-aware package loading
+                // Only include packages loaded before the query position
+                if (*pkg_line, *pkg_col) <= (line, column) {
+                    // Check function scope compatibility
+                    let should_include = match function_scope {
+                        None => true, // Global package load - always include
+                        Some(pkg_scope) => {
+                            // Function-scoped package load - only include if query is in same function
+                            active_function_scopes.iter().any(|active_scope| {
+                                active_scope.0 == pkg_scope.start.line &&
+                                active_scope.1 == pkg_scope.start.column &&
+                                active_scope.2 == pkg_scope.end.line &&
+                                active_scope.3 == pkg_scope.end.column
+                            })
+                        }
+                    };
+                    
+                    if should_include && !scope.loaded_packages.contains(package) {
+                        scope.loaded_packages.push(package.clone());
+                    }
                 }
             }
         }
@@ -2594,7 +3074,6 @@ mod tests {
 
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let child_uri = Url::parse("file:///project/child.R").unwrap();
-        let workspace_root = Url::parse("file:///project").unwrap();
 
         // Parent file: has @lsp-source directive on line 2 (0-based: line 1)
         // The directive is parsed into sources with is_directive=true
@@ -2622,6 +3101,7 @@ mod tests {
             ScopeEvent::Source { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Child file: defines 'child_var'
@@ -3121,6 +3601,7 @@ mod tests {
             ScopeEvent::Source { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order: (2,0), (5,5), (5,10), (10,0)
@@ -3161,6 +3642,7 @@ mod tests {
             ScopeEvent::Source { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order by column: 5, 10, 20
@@ -3214,6 +3696,7 @@ mod tests {
             ScopeEvent::Source { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order: Def(1,0), Removal(3,0), Def(5,0)
@@ -3274,6 +3757,7 @@ mod tests {
             ScopeEvent::Source { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order: Source(1,0), Removal(2,0), Removal(4,0)
@@ -3345,6 +3829,7 @@ mod tests {
             ScopeEvent::Source { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order: Def(1,0), Source(3,0), Removal(5,0), FunctionScope(7,0), Removal(9,0)
@@ -3353,6 +3838,7 @@ mod tests {
             ScopeEvent::Source { .. } => "Source",
             ScopeEvent::FunctionScope { .. } => "FunctionScope",
             ScopeEvent::Removal { .. } => "Removal",
+            ScopeEvent::PackageLoad { .. } => "PackageLoad",
         }).collect();
 
         assert_eq!(event_types, vec!["Def", "Source", "Removal", "FunctionScope", "Removal"]);
@@ -3363,6 +3849,7 @@ mod tests {
             ScopeEvent::Source { line, .. } => *line,
             ScopeEvent::FunctionScope { start_line, .. } => *start_line,
             ScopeEvent::Removal { line, .. } => *line,
+            ScopeEvent::PackageLoad { line, .. } => *line,
         }).collect();
 
         assert_eq!(positions, vec![1, 3, 5, 7, 9]);
@@ -3399,6 +3886,7 @@ mod tests {
             ScopeEvent::Source { line, column, .. } => (*line, *column),
             ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Both events should be at position (2, 0) - order between them is stable but not guaranteed
@@ -3756,6 +4244,7 @@ mod tests {
                 ScopeEvent::Source { line, .. } => ("Source", *line),
                 ScopeEvent::FunctionScope { start_line, .. } => ("FunctionScope", *start_line),
                 ScopeEvent::Removal { line, .. } => ("Removal", *line),
+                ScopeEvent::PackageLoad { line, .. } => ("PackageLoad", *line),
             })
             .collect();
 
@@ -5244,5 +5733,1449 @@ mod tests {
         
         let in_invalid_2 = tree.query_point(Position::new(60, 7));
         assert!(in_invalid_2.is_empty(), "Should not find invalid interval");
+    }
+
+    // ============================================================================
+    // Tests for PackageLoad events in compute_artifacts (Task 6.2)
+    // Validates: Requirements 14.2, 14.4
+    // ============================================================================
+
+    #[test]
+    fn test_package_load_event_global_scope() {
+        // Test that library() calls at global scope create PackageLoad events with function_scope=None
+        let code = "library(dplyr)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Find PackageLoad event
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { line, column, package, function_scope } = e {
+                    Some((line, column, package, function_scope))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(package_load_events.len(), 1, "Should have exactly one PackageLoad event");
+        let (line, _column, package, function_scope) = package_load_events[0];
+        assert_eq!(*line, 0, "PackageLoad should be on line 0");
+        assert_eq!(package, "dplyr", "Package name should be dplyr");
+        assert!(function_scope.is_none(), "Global library() call should have function_scope=None");
+    }
+
+    #[test]
+    fn test_package_load_event_inside_function() {
+        // Test that library() calls inside a function create PackageLoad events with function_scope set
+        let code = "my_func <- function() {\n  library(dplyr)\n  x <- 1\n}";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Find PackageLoad event
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { line, column, package, function_scope } = e {
+                    Some((*line, *column, package.clone(), function_scope.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(package_load_events.len(), 1, "Should have exactly one PackageLoad event");
+        let (line, _column, package, function_scope) = &package_load_events[0];
+        assert_eq!(*line, 1, "PackageLoad should be on line 1");
+        assert_eq!(package, "dplyr", "Package name should be dplyr");
+        assert!(function_scope.is_some(), "library() inside function should have function_scope set");
+    }
+
+    #[test]
+    fn test_package_load_multiple_calls() {
+        // Test that multiple library() calls create multiple PackageLoad events in document order
+        let code = "library(dplyr)\nlibrary(ggplot2)\nlibrary(tidyr)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Find PackageLoad events
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { line, package, .. } = e {
+                    Some((*line, package.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(package_load_events.len(), 3, "Should have three PackageLoad events");
+        assert_eq!(package_load_events[0], (0, "dplyr".to_string()));
+        assert_eq!(package_load_events[1], (1, "ggplot2".to_string()));
+        assert_eq!(package_load_events[2], (2, "tidyr".to_string()));
+    }
+
+    #[test]
+    fn test_package_load_require_call() {
+        // Test that require() calls also create PackageLoad events
+        let code = "require(dplyr)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { package, .. } = e {
+                    Some(package.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(package_load_events.len(), 1, "Should have one PackageLoad event");
+        assert_eq!(package_load_events[0], "dplyr");
+    }
+
+    #[test]
+    fn test_package_load_loadnamespace_call() {
+        // Test that loadNamespace() calls also create PackageLoad events
+        let code = r#"loadNamespace("dplyr")"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { package, .. } = e {
+                    Some(package.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(package_load_events.len(), 1, "Should have one PackageLoad event");
+        assert_eq!(package_load_events[0], "dplyr");
+    }
+
+    #[test]
+    fn test_package_load_timeline_sorted() {
+        // Test that PackageLoad events are sorted correctly in the timeline with other events
+        let code = "x <- 1\nlibrary(dplyr)\ny <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Extract event positions in order
+        let event_positions: Vec<(u32, &str)> = artifacts.timeline.iter()
+            .filter_map(|e| match e {
+                ScopeEvent::Def { line, symbol, .. } => Some((*line, symbol.name.as_str())),
+                ScopeEvent::PackageLoad { line, package, .. } => Some((*line, package.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        // Should be in document order: x (line 0), dplyr (line 0), y (line 2)
+        assert!(event_positions.len() >= 3, "Should have at least 3 events");
+        
+        // Verify ordering
+        let mut prev_line = 0;
+        for (line, _) in &event_positions {
+            assert!(*line >= prev_line, "Events should be in document order");
+            prev_line = *line;
+        }
+    }
+
+    /// Verifies that a `library()` call inside a nested function is associated with the innermost function scope.
+    ///
+    /// This test parses a snippet with an outer and inner function, computes scope artifacts,
+    /// locates the `PackageLoad` event for `library(dplyr)`, and asserts its `function_scope`
+    /// is set and corresponds to the inner function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Parses code with nested functions and ensures the package load is scoped to the inner function.
+    /// let code = "outer <- function() {\n  inner <- function() {\n    library(dplyr)\n  }\n}";
+    /// let tree = parse_r(code);
+    /// let artifacts = compute_artifacts(&test_uri(), &tree, code);
+    /// let package_load_events: Vec<_> = artifacts.timeline.iter()
+    ///     .filter_map(|e| {
+    ///         if let ScopeEvent::PackageLoad { function_scope, .. } = e {
+    ///             Some(function_scope.clone())
+    ///         } else {
+    ///             None
+    ///         }
+    ///     })
+    ///     .collect();
+    /// assert_eq!(package_load_events.len(), 1);
+    /// assert!(package_load_events[0].is_some());
+    /// ```
+    #[test]
+    fn test_package_load_nested_function_scope() {
+        // Test that library() in nested function gets the innermost function scope
+        let code = "outer <- function() {\n  inner <- function() {\n    library(dplyr)\n  }\n}";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Find PackageLoad event
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { function_scope, .. } = e {
+                    Some(function_scope.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(package_load_events.len(), 1, "Should have one PackageLoad event");
+        let function_scope = &package_load_events[0];
+        assert!(function_scope.is_some(), "library() in nested function should have function_scope set");
+        
+        // The function_scope should be the inner function, not the outer one
+        // We can verify this by checking that the scope interval is within the inner function
+        if let Some(scope) = function_scope {
+            // Inner function starts on line 1 and ends on line 3
+            assert!(scope.start.line >= 1, "Function scope should start at or after inner function definition");
+        }
+    }
+
+    #[test]
+    fn test_package_load_mixed_global_and_function() {
+        // Test that global and function-scoped library() calls are handled correctly
+        let code = "library(dplyr)\nmy_func <- function() {\n  library(ggplot2)\n}";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Find PackageLoad events
+        let package_load_events: Vec<_> = artifacts.timeline.iter()
+            .filter_map(|e| {
+                if let ScopeEvent::PackageLoad { package, function_scope, .. } = e {
+                    Some((package.clone(), function_scope.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(package_load_events.len(), 2, "Should have two PackageLoad events");
+        
+        // First should be global (dplyr)
+        let (pkg1, scope1) = &package_load_events[0];
+        assert_eq!(pkg1, "dplyr");
+        assert!(scope1.is_none(), "Global library(dplyr) should have function_scope=None");
+        
+        // Second should be function-scoped (ggplot2)
+        let (pkg2, scope2) = &package_load_events[1];
+        assert_eq!(pkg2, "ggplot2");
+        assert!(scope2.is_some(), "library(ggplot2) inside function should have function_scope set");
+    }
+
+    // ============================================================================
+    // Tests for scope_at_position_with_packages (Task 7.2)
+    // Validates: Requirements 2.1, 2.2, 2.4, 2.5
+    // ============================================================================
+
+    /// Creates a lookup closure that returns a package's exported symbols.
+    ///
+    /// The returned closure maps a package name to a `HashSet<String>` containing
+    /// the package's exports given by `packages`. If the package is not present,
+    /// the closure returns an empty set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashSet;
+    ///
+    /// let packages = [("pkgA", &["a", "b"][..]), ("pkgB", &["x"][..])];
+    /// let get_exports = mock_package_exports(&packages);
+    ///
+    /// let a_exports: HashSet<String> = get_exports("pkgA");
+    /// assert!(a_exports.contains("a"));
+    /// assert!(a_exports.contains("b"));
+    ///
+    /// let missing: HashSet<String> = get_exports("unknown");
+    /// assert!(missing.is_empty());
+    /// ```
+    fn mock_package_exports<'a>(packages: &'a [(&'a str, &'a [&'a str])]) -> impl Fn(&str) -> HashSet<String> + 'a {
+        move |pkg: &str| {
+            packages.iter()
+                .find(|(name, _)| *name == pkg)
+                .map(|(_, exports)| exports.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    /// Helper function to create an empty base exports set for tests
+    fn empty_base_exports() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    #[test]
+    fn test_scope_with_packages_before_library_call() {
+        // Requirement 2.1: Scope at position before library() call SHALL NOT include package exports
+        let code = "x <- 1\nlibrary(dplyr)\ny <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter", "select"])]);
+        let base_exports = empty_base_exports();
+
+        // Query at line 0 (before library call on line 1)
+        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports);
+
+        // Should have x but NOT package exports
+        assert!(scope.symbols.contains_key("x"), "x should be in scope");
+        assert!(!scope.symbols.contains_key("mutate"), "mutate should NOT be in scope before library()");
+        assert!(!scope.symbols.contains_key("filter"), "filter should NOT be in scope before library()");
+    }
+
+    #[test]
+    fn test_scope_with_packages_after_library_call() {
+        // Requirement 2.2: Scope at position after library() call SHALL include package exports
+        let code = "x <- 1\nlibrary(dplyr)\ny <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter", "select"])]);
+        let base_exports = empty_base_exports();
+
+        // Query at line 2 (after library call on line 1)
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+
+        // Should have x, y, and package exports
+        assert!(scope.symbols.contains_key("x"), "x should be in scope");
+        assert!(scope.symbols.contains_key("y"), "y should be in scope");
+        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope after library()");
+        assert!(scope.symbols.contains_key("filter"), "filter should be in scope after library()");
+        assert!(scope.symbols.contains_key("select"), "select should be in scope after library()");
+    }
+
+    #[test]
+    fn test_scope_with_packages_at_library_call_line() {
+        // Requirement 2.2: Package exports available at or after the library() call position
+        let code = "library(dplyr)\nx <- mutate";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
+        let base_exports = empty_base_exports();
+
+        // Query at line 0, after the library call ends
+        let scope = scope_at_position_with_packages(&artifacts, 0, 20, &get_exports, &base_exports);
+
+        // Package exports should be available
+        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope at library() line");
+        assert!(scope.symbols.contains_key("filter"), "filter should be in scope at library() line");
+    }
+
+    #[test]
+    fn test_scope_with_packages_function_scoped_inside_function() {
+        // Requirement 2.4: Function-scoped library() calls only available within that function
+        let code = "my_func <- function() {\n  library(dplyr)\n  x <- mutate\n}\ny <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
+        let base_exports = empty_base_exports();
+
+        // Query inside the function (line 2, after library call)
+        let scope_inside = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+
+        // Package exports should be available inside the function
+        assert!(scope_inside.symbols.contains_key("mutate"), 
+            "mutate should be in scope inside function after library()");
+        assert!(scope_inside.symbols.contains_key("filter"), 
+            "filter should be in scope inside function after library()");
+    }
+
+    #[test]
+    fn test_scope_with_packages_function_scoped_outside_function() {
+        // Requirement 2.4: Function-scoped library() calls NOT available outside that function
+        let code = "my_func <- function() {\n  library(dplyr)\n  x <- mutate\n}\ny <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
+        let base_exports = empty_base_exports();
+
+        // Query outside the function (line 4)
+        let scope_outside = scope_at_position_with_packages(&artifacts, 4, 10, &get_exports, &base_exports);
+
+        // Package exports should NOT be available outside the function
+        assert!(!scope_outside.symbols.contains_key("mutate"), 
+            "mutate should NOT be in scope outside function");
+        assert!(!scope_outside.symbols.contains_key("filter"), 
+            "filter should NOT be in scope outside function");
+        // But y should be available
+        assert!(scope_outside.symbols.contains_key("y"), "y should be in scope");
+    }
+
+    #[test]
+    fn test_scope_with_packages_global_library_call() {
+        // Requirement 2.5: Top-level library() calls available globally from that point forward
+        let code = "library(dplyr)\nmy_func <- function() {\n  x <- mutate\n}\ny <- filter";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
+        let base_exports = empty_base_exports();
+
+        // Query inside the function
+        let scope_inside = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        assert!(scope_inside.symbols.contains_key("mutate"), 
+            "Global package exports should be available inside function");
+
+        // Query outside the function
+        let scope_outside = scope_at_position_with_packages(&artifacts, 3, 10, &get_exports, &base_exports);
+        assert!(scope_outside.symbols.contains_key("filter"), 
+            "Global package exports should be available outside function");
+    }
+
+    #[test]
+    fn test_scope_with_packages_multiple_packages() {
+        // Test that multiple library() calls accumulate exports
+        let code = "library(dplyr)\nlibrary(ggplot2)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[
+            ("dplyr", &["mutate", "filter"]),
+            ("ggplot2", &["ggplot", "aes"]),
+        ]);
+        let base_exports = empty_base_exports();
+
+        // Query after both library calls
+        let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+
+        // Should have exports from both packages
+        assert!(scope.symbols.contains_key("mutate"), "dplyr exports should be in scope");
+        assert!(scope.symbols.contains_key("filter"), "dplyr exports should be in scope");
+        assert!(scope.symbols.contains_key("ggplot"), "ggplot2 exports should be in scope");
+        assert!(scope.symbols.contains_key("aes"), "ggplot2 exports should be in scope");
+    }
+
+    #[test]
+    fn test_scope_with_packages_local_definition_takes_precedence() {
+        // Test that local definitions take precedence over package exports
+        let code = "library(dplyr)\nmutate <- function(x) x + 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
+        let base_exports = empty_base_exports();
+
+        // Query after local definition
+        let scope = scope_at_position_with_packages(&artifacts, 1, 50, &get_exports, &base_exports);
+
+        // mutate should be the local definition, not the package export
+        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope");
+        let mutate_symbol = scope.symbols.get("mutate").unwrap();
+        assert_eq!(mutate_symbol.kind, SymbolKind::Function, 
+            "mutate should be a function (local definition)");
+        assert!(!mutate_symbol.source_uri.as_str().starts_with("package:"), 
+            "mutate should be from local file, not package");
+
+        // filter should still be from the package
+        assert!(scope.symbols.contains_key("filter"), "filter should be in scope");
+    }
+
+    #[test]
+    fn test_scope_with_packages_package_uri_format() {
+        // Test that package symbols have the correct source URI format
+        let code = "library(dplyr)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
+        let base_exports = empty_base_exports();
+
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+
+        let mutate_symbol = scope.symbols.get("mutate").unwrap();
+        assert_eq!(mutate_symbol.source_uri.as_str(), "package:dplyr", 
+            "Package symbol should have package:name URI");
+    }
+
+    #[test]
+    fn test_scope_with_packages_empty_exports() {
+        // Test that packages with no exports don't cause issues
+        let code = "library(emptypackage)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("emptypackage", &[])]);
+        let base_exports = empty_base_exports();
+
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+
+        // Should just have x, no package exports
+        assert!(scope.symbols.contains_key("x"), "x should be in scope");
+        assert_eq!(scope.symbols.len(), 1, "Should only have x in scope");
+    }
+
+    #[test]
+    fn test_scope_with_packages_unknown_package() {
+        // Test that unknown packages (not in callback) don't cause issues
+        let code = "library(unknownpkg)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Callback returns empty for unknown packages
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
+        let base_exports = empty_base_exports();
+
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+
+        // Should just have x, no package exports
+        assert!(scope.symbols.contains_key("x"), "x should be in scope");
+        assert!(!scope.symbols.contains_key("mutate"), "mutate should NOT be in scope");
+    }
+
+    #[test]
+    fn test_scope_with_packages_require_call() {
+        // Test that require() calls also make package exports available
+        let code = "require(dplyr)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
+        let base_exports = empty_base_exports();
+
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+
+        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope after require()");
+        assert!(scope.symbols.contains_key("filter"), "filter should be in scope after require()");
+    }
+
+    #[test]
+    fn test_scope_with_packages_loadnamespace_call() {
+        // Test that loadNamespace() calls also make package exports available
+        let code = r#"loadNamespace("dplyr")
+x <- 1"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate", "filter"])]);
+        let base_exports = empty_base_exports();
+
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+
+        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope after loadNamespace()");
+        assert!(scope.symbols.contains_key("filter"), "filter should be in scope after loadNamespace()");
+    }
+
+    // ============================================================================
+    // Tests for base package exports (Task 7.3)
+    // Validates: Requirements 6.3, 6.4
+    // ============================================================================
+
+    #[test]
+    fn test_base_exports_always_available() {
+        // Requirement 6.3: Base packages SHALL be available at all positions
+        // Requirement 6.4: Base packages SHALL NOT require position-aware loading
+        let code = "x <- 1\ny <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[]);
+        let mut base_exports = HashSet::new();
+        base_exports.insert("print".to_string());
+        base_exports.insert("cat".to_string());
+        base_exports.insert("sum".to_string());
+
+        // Query at the very beginning of the file
+        let scope_start = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+        assert!(scope_start.symbols.contains_key("print"), "print should be in scope at start");
+        assert!(scope_start.symbols.contains_key("cat"), "cat should be in scope at start");
+        assert!(scope_start.symbols.contains_key("sum"), "sum should be in scope at start");
+
+        // Query at the end of the file
+        let scope_end = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        assert!(scope_end.symbols.contains_key("print"), "print should be in scope at end");
+        assert!(scope_end.symbols.contains_key("cat"), "cat should be in scope at end");
+        assert!(scope_end.symbols.contains_key("sum"), "sum should be in scope at end");
+    }
+
+    /// Ensures base package exports are available in scope before any explicit `library()` call.
+    ///
+    /// This test verifies that symbols from the base environment (e.g., `print`) are present
+    /// at a position earlier in the file than a subsequent `library()` invocation, while
+    /// symbols provided by the later-loaded package (e.g., `mutate` from `dplyr`) are not.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // given code with a base call and a later library() call
+    /// let code = "x <- print(1)\nlibrary(dplyr)\ny <- 2";
+    /// let tree = parse_r(code);
+    /// let artifacts = compute_artifacts(&test_uri(), &tree, code);
+    ///
+    /// let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
+    /// let mut base_exports = std::collections::HashSet::new();
+    /// base_exports.insert("print".to_string());
+    ///
+    /// let scope = scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports);
+    /// assert!(scope.symbols.contains_key("print"));
+    /// assert!(!scope.symbols.contains_key("mutate"));
+    /// ```
+    #[test]
+    fn test_base_exports_available_before_any_library_call() {
+        // Base exports should be available even before any library() call
+        let code = "x <- print(1)\nlibrary(dplyr)\ny <- 2";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
+        let mut base_exports = HashSet::new();
+        base_exports.insert("print".to_string());
+
+        // Query at line 0 (before library call)
+        let scope = scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports);
+        assert!(scope.symbols.contains_key("print"), "print should be in scope before library()");
+        assert!(!scope.symbols.contains_key("mutate"), "mutate should NOT be in scope before library()");
+    }
+
+    #[test]
+    fn test_base_exports_have_package_base_uri() {
+        // Base exports should have package:base URI
+        let code = "x <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[]);
+        let mut base_exports = HashSet::new();
+        base_exports.insert("print".to_string());
+
+        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports);
+        let print_symbol = scope.symbols.get("print").unwrap();
+        assert_eq!(print_symbol.source_uri.as_str(), "package:base", 
+            "Base export should have package:base URI");
+    }
+
+    #[test]
+    fn test_local_definition_overrides_base_export() {
+        // Local definitions should take precedence over base exports
+        let code = "print <- function(x) x + 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[]);
+        let mut base_exports = HashSet::new();
+        base_exports.insert("print".to_string());
+
+        // Query after local definition
+        let scope = scope_at_position_with_packages(&artifacts, 0, 50, &get_exports, &base_exports);
+        
+        let print_symbol = scope.symbols.get("print").unwrap();
+        assert_eq!(print_symbol.kind, SymbolKind::Function, 
+            "print should be a function (local definition)");
+        assert!(!print_symbol.source_uri.as_str().starts_with("package:"), 
+            "print should be from local file, not base package");
+    }
+
+    #[test]
+    fn test_package_export_overrides_base_export() {
+        // Explicit package exports should take precedence over base exports
+        // (This tests the case where a package re-exports or shadows a base function)
+        let code = "library(mypkg)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[("mypkg", &["print"])]);
+        let mut base_exports = HashSet::new();
+        base_exports.insert("print".to_string());
+
+        // Query after library call
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        
+        let print_symbol = scope.symbols.get("print").unwrap();
+        // The package export should override the base export
+        assert_eq!(print_symbol.source_uri.as_str(), "package:mypkg", 
+            "print should be from mypkg, not base package");
+    }
+
+    #[test]
+    fn test_base_exports_available_inside_function() {
+        // Base exports should be available inside function bodies
+        let code = "my_func <- function() {\n  x <- print(1)\n}";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[]);
+        let mut base_exports = HashSet::new();
+        base_exports.insert("print".to_string());
+
+        // Query inside the function
+        let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        assert!(scope.symbols.contains_key("print"), "print should be in scope inside function");
+    }
+
+    #[test]
+    fn test_empty_base_exports() {
+        // Test that empty base exports don't cause issues
+        let code = "x <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let get_exports = mock_package_exports(&[]);
+        let base_exports = empty_base_exports();
+
+        let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports);
+        assert!(scope.symbols.contains_key("x"), "x should be in scope");
+        assert_eq!(scope.symbols.len(), 1, "Should only have x in scope");
+    }
+
+    // ============================================================================
+    // Tests for cross-file package propagation (Task 9.1)
+    // Validates: Requirements 5.1, 5.2, 5.3
+    // ============================================================================
+
+    #[test]
+    fn test_cross_file_package_propagation_via_source() {
+        // Requirement 5.1: Parent file loads package before source() call,
+        // package exports should be available in sourced file from the start
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        
+        // Parent file: library(dplyr) at line 0, source("child.R") at line 1
+        let parent_code = "library(dplyr)\nsource(\"child.R\")";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        
+        // Child file: just uses mutate
+        let child_code = "x <- mutate(df, y = 1)";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+        
+        let workspace_root = Url::parse("file:///project").unwrap();
+        
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        
+        // Create artifacts lookup
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+        
+        // Query child's scope at position (0, 0) - should have inherited packages
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Child should have inherited dplyr from parent
+        assert!(scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should inherit dplyr package from parent");
+    }
+
+    #[test]
+    fn test_cross_file_package_propagation_respects_call_site() {
+        // Requirement 5.1: Only packages loaded BEFORE source() call are propagated
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        
+        // Parent file: source("child.R") at line 0, library(dplyr) at line 1
+        let parent_code = "source(\"child.R\")\nlibrary(dplyr)";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        
+        // Child file
+        let child_code = "x <- 1";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+        
+        let workspace_root = Url::parse("file:///project").unwrap();
+        
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+        
+        // Query child's scope - should NOT have dplyr (loaded after source())
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Child should NOT have dplyr (it was loaded after source() call)
+        assert!(!scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should NOT inherit dplyr (loaded after source() call)");
+    }
+
+    #[test]
+    fn test_cross_file_package_propagation_multiple_packages() {
+        // Requirement 5.3: Multiple packages loaded before source() are all propagated
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        
+        // Parent file: library(dplyr) at line 0, library(ggplot2) at line 1, source() at line 2
+        let parent_code = "library(dplyr)\nlibrary(ggplot2)\nsource(\"child.R\")";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        
+        // Child file
+        let child_code = "x <- 1";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+        
+        let workspace_root = Url::parse("file:///project").unwrap();
+        
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 2,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+        
+        // Query child's scope
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Child should have both packages
+        assert!(scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should inherit dplyr from parent");
+        assert!(scope.inherited_packages.contains(&"ggplot2".to_string()),
+            "Child should inherit ggplot2 from parent");
+    }
+
+    #[test]
+    fn test_cross_file_package_propagation_function_scoped_not_propagated() {
+        // Function-scoped package loads should NOT be propagated to child files
+        // unless the source() call is within the same function
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        
+        // Parent file: function with library(dplyr) inside, source() outside
+        let parent_code = "f <- function() {\n  library(dplyr)\n}\nsource(\"child.R\")";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        
+        // Child file
+        let child_code = "x <- 1";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+        
+        let workspace_root = Url::parse("file:///project").unwrap();
+        
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 3,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+        
+        // Query child's scope
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Child should NOT have dplyr (it's function-scoped in parent)
+        assert!(!scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should NOT inherit function-scoped dplyr from parent");
+    }
+
+    // ============================================================================
+    // Tests for forward-only package propagation (Task 9.2)
+    // Validates: Requirement 5.4
+    // ============================================================================
+
+    #[test]
+    fn test_forward_only_package_propagation_child_packages_not_in_parent() {
+        // Requirement 5.4: Packages loaded in a sourced file should NOT propagate
+        // back to the parent file.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        
+        // Parent file: source("child.R") at line 0, then uses mutate at line 1
+        let parent_code = "source(\"child.R\")\nmutate(df, y = 1)";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        
+        // Child file: loads dplyr
+        let child_code = "library(dplyr)\nx <- 1";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+        
+        let workspace_root = Url::parse("file:///project").unwrap();
+        
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+        
+        // Query parent's scope AFTER the source() call
+        // The parent should NOT have dplyr in inherited_packages because
+        // packages don't propagate backward from child to parent
+        let scope = scope_at_position_with_graph(
+            &parent_uri,
+            1,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Parent should NOT have dplyr (it was loaded in child, not parent)
+        // Requirement 5.4: Forward-only propagation
+        assert!(!scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Parent should NOT inherit dplyr from child (forward-only propagation)");
+    }
+
+    #[test]
+    fn test_forward_only_package_propagation_child_symbols_available_but_not_packages() {
+        // Requirement 5.4: While symbols from child files ARE merged into parent scope,
+        // packages loaded in child files should NOT be propagated back.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        
+        // Parent file: source("child.R") at line 0
+        let parent_code = "source(\"child.R\")\ny <- helper_func()";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        
+        // Child file: loads ggplot2 and defines helper_func
+        let child_code = "library(ggplot2)\nhelper_func <- function() { 1 }";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+        
+        let workspace_root = Url::parse("file:///project").unwrap();
+        
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+        
+        // Query parent's scope after source() call
+        let scope = scope_at_position_with_graph(
+            &parent_uri,
+            1,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Symbols from child SHOULD be available in parent
+        assert!(scope.symbols.contains_key("helper_func"),
+            "Parent should have helper_func from child (symbols propagate)");
+        
+        // But packages from child should NOT be in parent's inherited_packages
+        // Requirement 5.4: Forward-only propagation
+        assert!(!scope.inherited_packages.contains(&"ggplot2".to_string()),
+            "Parent should NOT inherit ggplot2 from child (forward-only propagation)");
+    }
+
+    #[test]
+    fn test_forward_only_package_propagation_grandchild_packages_not_in_grandparent() {
+        // Requirement 5.4: Packages loaded in deeply nested sourced files
+        // should NOT propagate back through the chain.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        
+        // Grandparent file: source("parent.R")
+        let grandparent_code = "source(\"parent.R\")\nz <- 1";
+        let grandparent_tree = parse_r(grandparent_code);
+        let grandparent_uri = Url::parse("file:///project/grandparent.R").unwrap();
+        let grandparent_artifacts = compute_artifacts(&grandparent_uri, &grandparent_tree, grandparent_code);
+        
+        // Parent file: source("child.R")
+        let parent_code = "source(\"child.R\")\ny <- 1";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        
+        // Child file: loads stringr
+        let child_code = "library(stringr)\nx <- 1";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+        
+        let workspace_root = Url::parse("file:///project").unwrap();
+        
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        
+        let grandparent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "parent.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&grandparent_uri, &grandparent_meta, Some(&workspace_root), |_| None);
+        
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &grandparent_uri {
+                Some(grandparent_artifacts.clone())
+            } else if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &grandparent_uri {
+                Some(grandparent_meta.clone())
+            } else if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+        
+        // Query grandparent's scope after source() call
+        let grandparent_scope = scope_at_position_with_graph(
+            &grandparent_uri,
+            1,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Grandparent should NOT have stringr (loaded in grandchild)
+        // Requirement 5.4: Forward-only propagation
+        assert!(!grandparent_scope.inherited_packages.contains(&"stringr".to_string()),
+            "Grandparent should NOT inherit stringr from grandchild (forward-only propagation)");
+        
+        // Query parent's scope after source() call
+        let parent_scope = scope_at_position_with_graph(
+            &parent_uri,
+            1,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Parent should also NOT have stringr (loaded in child)
+        assert!(!parent_scope.inherited_packages.contains(&"stringr".to_string()),
+            "Parent should NOT inherit stringr from child (forward-only propagation)");
+    }
+
+    #[test]
+    fn test_forward_only_package_propagation_parent_packages_propagate_child_packages_dont() {
+        // Combined test: Parent's packages propagate to child, but child's packages
+        // don't propagate back to parent.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        
+        // Parent file: library(dplyr), source("child.R")
+        let parent_code = "library(dplyr)\nsource(\"child.R\")\nz <- 1";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+        
+        // Child file: loads ggplot2
+        let child_code = "library(ggplot2)\nx <- 1";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+        
+        let workspace_root = Url::parse("file:///project").unwrap();
+        
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+        
+        // Query child's scope - should have dplyr from parent
+        let child_scope = scope_at_position_with_graph(
+            &child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Child SHOULD have dplyr (propagated from parent)
+        assert!(child_scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should inherit dplyr from parent (forward propagation works)");
+        
+        // Query parent's scope after source() call
+        let parent_scope = scope_at_position_with_graph(
+            &parent_uri,
+            2,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+        );
+        
+        // Parent should NOT have ggplot2 (loaded in child)
+        // Requirement 5.4: Forward-only propagation
+        assert!(!parent_scope.inherited_packages.contains(&"ggplot2".to_string()),
+            "Parent should NOT inherit ggplot2 from child (forward-only propagation)");
+    }
+
+    // ============================================================================
+    // Tests for loaded_packages field in ScopeAtPosition (Task 10.2)
+    // Validates: Requirements 8.1, 8.3, 8.4
+    // ============================================================================
+
+    #[test]
+    fn test_loaded_packages_position_aware() {
+        // Requirement 8.3: Symbol used BEFORE package is loaded should be flagged
+        // This test verifies that loaded_packages is populated correctly based on position
+        let code = "x <- mutate(df)\nlibrary(dplyr)\ny <- filter(df)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Query at line 0 (before library call) - should NOT have dplyr in loaded_packages
+        let scope_before = scope_at_position(&artifacts, 0, 10);
+        assert!(!scope_before.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should NOT be in loaded_packages before library() call");
+
+        // Query at line 2 (after library call) - should have dplyr in loaded_packages
+        let scope_after = scope_at_position(&artifacts, 2, 10);
+        assert!(scope_after.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages after library() call");
+    }
+
+    #[test]
+    fn test_loaded_packages_multiple_packages() {
+        // Test that multiple packages are tracked correctly
+        let code = "library(dplyr)\nlibrary(ggplot2)\nx <- 1";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Query at line 0 (after first library, before second)
+        let scope_mid = scope_at_position(&artifacts, 0, 20);
+        assert!(scope_mid.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages after first library() call");
+        assert!(!scope_mid.loaded_packages.contains(&"ggplot2".to_string()),
+            "ggplot2 should NOT be in loaded_packages before second library() call");
+
+        // Query at line 2 (after both library calls)
+        let scope_end = scope_at_position(&artifacts, 2, 10);
+        assert!(scope_end.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages");
+        assert!(scope_end.loaded_packages.contains(&"ggplot2".to_string()),
+            "ggplot2 should be in loaded_packages");
+    }
+
+    #[test]
+    fn test_loaded_packages_function_scoped() {
+        // Requirement 2.4: library() inside function should only affect that function's scope
+        let code = r#"my_func <- function() {
+    library(dplyr)
+    x <- mutate(df)
+}
+y <- filter(df)"#;
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        // Query inside the function (line 2) - should have dplyr
+        let scope_inside = scope_at_position(&artifacts, 2, 10);
+        assert!(scope_inside.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages inside function");
+
+        // Query outside the function (line 4) - should NOT have dplyr
+        let scope_outside = scope_at_position(&artifacts, 4, 10);
+        assert!(!scope_outside.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should NOT be in loaded_packages outside function (function-scoped)");
+    }
+
+    #[test]
+    fn test_loaded_packages_with_require() {
+        // Test that require() is also tracked
+        let code = "require(dplyr)\nx <- mutate(df)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 1, 10);
+        assert!(scope.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages after require() call");
+    }
+
+    #[test]
+    fn test_loaded_packages_with_loadnamespace() {
+        // Test that loadNamespace() is also tracked
+        let code = "loadNamespace(\"dplyr\")\nx <- mutate(df)";
+        let tree = parse_r(code);
+        let artifacts = compute_artifacts(&test_uri(), &tree, code);
+
+        let scope = scope_at_position(&artifacts, 1, 10);
+        assert!(scope.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages after loadNamespace() call");
     }
 }

@@ -722,7 +722,6 @@ mod tests {
     fn test_edge_deduplication() {
         let mut graph = DependencyGraph::new();
         let main = url("main.R");
-        let utils = url("utils.R");
 
         // Two sources to same file at same position should deduplicate
         use super::super::types::ForwardSource;
@@ -864,7 +863,6 @@ mod tests {
 
         let mut graph = DependencyGraph::new();
         let main = url("main.R");
-        let utils = url("utils.R");
 
         // Directive at line 5 with known call site, AST at line 10
         // Per spec: directive with known call site only overrides AST at same call site
@@ -910,7 +908,6 @@ mod tests {
         use super::super::types::{BackwardDirective, ForwardSource};
 
         let mut graph = DependencyGraph::new();
-        let main = url("main.R");
         let utils = url("utils.R");
 
         // Backward directive without call site (Default), plus AST edge
@@ -950,7 +947,6 @@ mod tests {
 
         let mut graph = DependencyGraph::new();
         let main = url("main.R");
-        let utils = url("utils.R");
 
         // Both directive and AST at same call site
         let meta = CrossFileMetadata {
@@ -993,8 +989,6 @@ mod tests {
 
         let mut graph = DependencyGraph::new();
         let main = url("main.R");
-        let utils = url("utils.R");
-        let helpers = url("helpers.R");
 
         // Directive to utils, AST to helpers (different targets)
         let meta = CrossFileMetadata {
@@ -1075,8 +1069,6 @@ z <- 3
         use super::super::types::{BackwardDirective, CallSiteSpec};
 
         let mut graph = DependencyGraph::new();
-        let parent = url("parent.R");
-        let child = url("child.R");
 
         // Child declares it's sourced by parent with Default (triggers inference)
         // Use subdirectory structure for backward directive test
@@ -1114,8 +1106,6 @@ z <- 3
     fn test_dump_state() {
         let mut graph = DependencyGraph::new();
         let main = url("main.R");
-        let utils = url("utils.R");
-        let helpers = url("helpers.R");
 
         // Add edges: main sources utils and helpers
         let meta = CrossFileMetadata {

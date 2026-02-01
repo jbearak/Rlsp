@@ -91,7 +91,7 @@ pub trait AsyncContentProvider: ContentProvider {
     /// Convenience method that wraps check_existence_batch for a single URI.
     /// Default implementation provided.
     async fn exists(&self, uri: &Url) -> bool {
-        let result = self.check_existence_batch(&[uri.clone()]).await;
+        let result = self.check_existence_batch(std::slice::from_ref(uri)).await;
         result.get(uri).copied().unwrap_or(false)
     }
 }
@@ -320,10 +320,10 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// **Validates: Requirements 14.3**
     fn exists_cached(&self, uri: &Url) -> bool {
         self.document_store.contains(uri)
-            || self.legacy_documents.map_or(false, |docs: &HashMap<Url, Document>| docs.contains_key(uri))
+            || self.legacy_documents.is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
             || self.workspace_index.contains(uri)
-            || self.legacy_workspace_index.map_or(false, |ws: &HashMap<Url, Document>| ws.contains_key(uri))
-            || self.legacy_cross_file_workspace_index.map_or(false, |cf_ws| cf_ws.contains(uri))
+            || self.legacy_workspace_index.is_some_and(|ws: &HashMap<Url, Document>| ws.contains_key(uri))
+            || self.legacy_cross_file_workspace_index.is_some_and(|cf_ws| cf_ws.contains(uri))
             || self.file_cache.get(uri).is_some()
     }
 
@@ -334,7 +334,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// **Validates: Requirements 3.3, 7.1**
     fn is_open(&self, uri: &Url) -> bool {
         self.document_store.contains(uri)
-            || self.legacy_documents.map_or(false, |docs: &HashMap<Url, Document>| docs.contains_key(uri))
+            || self.legacy_documents.is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
     }
 }
 

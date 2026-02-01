@@ -22,6 +22,7 @@ use crate::cross_file::{
     CrossFileRevalidationState, CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
     ParentSelectionCache,
 };
+use crate::package_library::PackageLibrary;
 use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
 use crate::document_store::DocumentStore;
 use crate::workspace_index::WorkspaceIndex;
@@ -388,6 +389,12 @@ pub struct WorldState {
     pub workspace_folders: Vec<Url>,
     pub library: Library,
     
+    // Package function awareness
+    // Manages installed packages, their exports, and caching for package-aware scope resolution
+    // Requirement 13.4: THE Package_Cache SHALL support concurrent read access from multiple LSP handlers
+    // Arc allows sharing across async tasks without holding WorldState lock
+    pub package_library: Arc<PackageLibrary>,
+    
     // Caches
     pub help_cache: crate::help::HelpCache,
     pub cross_file_file_cache: CrossFileFileCache,
@@ -406,6 +413,24 @@ pub struct WorldState {
 }
 
 impl WorldState {
+    /// Creates a new WorldState initialized with default cross-file configuration and empty caches.
+    ///
+    /// The returned state is populated with:
+    /// - default CrossFileConfig (logged at initialization),
+    /// - empty document and workspace indexes (legacy and new),
+    /// - a Library constructed from `library_paths`,
+    /// - an empty, concurrently accessible PackageLibrary,
+    /// - all cross-file caches and auxiliary structures in their default state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// let ws = WorldState::new(vec![PathBuf::from("/usr/lib/R/library")]);
+    /// // newly created state has no opened documents or workspace folders by default
+    /// assert!(ws.documents.is_empty());
+    /// assert!(ws.workspace_folders.is_empty());
+    /// ```
     pub fn new(library_paths: Vec<PathBuf>) -> Self {
         let config = CrossFileConfig::default();
         
@@ -439,6 +464,11 @@ impl WorldState {
             // Workspace configuration
             workspace_folders: Vec::new(),
             library: Library::new(library_paths),
+            
+            // Package function awareness
+            // Initialize with empty state - will be populated via initialize() or async initialization
+            // Requirement 13.4: THE Package_Cache SHALL support concurrent read access
+            package_library: Arc::new(PackageLibrary::new_empty()),
             
             // Caches
             help_cache: crate::help::HelpCache::new(),
@@ -592,12 +622,14 @@ impl WorldState {
 /// - `HashMap<Url, crate::workspace_index::IndexEntry>` - New unified WorkspaceIndex entries
 /// 
 /// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
-pub fn scan_workspace(folders: &[Url]) -> (
+pub type WorkspaceScanResult = (
     HashMap<Url, Document>, 
     Vec<String>, 
     HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
     HashMap<Url, crate::workspace_index::IndexEntry>,
-) {
+);
+
+pub fn scan_workspace(folders: &[Url]) -> WorkspaceScanResult {
     let mut index = HashMap::new();
     let mut imports = Vec::new();
     let mut cross_file_entries = HashMap::new();

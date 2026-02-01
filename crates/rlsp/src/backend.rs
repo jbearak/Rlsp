@@ -89,7 +89,50 @@ struct ActiveDocumentsChangedParams {
     timestamp_ms: u64,
 }
 
-/// Parse cross-file configuration from LSP settings
+/// Parse cross-file configuration from LSP settings.
+///
+/// Reads the top-level `crossFile` section (and related `diagnostics` and `packages`
+/// settings) from a serde_json::Value and constructs a populated `CrossFileConfig`.
+/// Only fields present in the provided JSON are applied; absent fields retain their
+/// defaults from `CrossFileConfig::default()`.
+///
+/// Supported top-level keys read:
+/// - `crossFile`: core cross-file behavior and diagnostic severities.
+/// - `diagnostics.undefinedVariables`: enables undefined variable diagnostics.
+/// - `packages`: package-related settings (`enabled`, `additionalLibraryPaths`, `rPath`, `missingPackageSeverity`).
+///
+/// # Returns
+///
+/// `Some(CrossFileConfig)` populated from `settings` when the top-level `crossFile`
+/// section is present; `None` if `crossFile` is missing.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// let settings = json!({
+///     "crossFile": {
+///         "maxBackwardDepth": 5,
+///         "indexWorkspace": true,
+///         "missingFileSeverity": "warning",
+///         "onDemandIndexing": { "enabled": true, "priority2Enabled": false }
+///     },
+///     "packages": {
+///         "enabled": true,
+///         "additionalLibraryPaths": ["/usr/local/lib/R/site-library"],
+///         "rPath": "/usr/bin/R",
+///         "missingPackageSeverity": "information"
+///     },
+///     "diagnostics": { "undefinedVariables": false }
+/// });
+///
+/// let cfg = crate::backend::parse_cross_file_config(&settings);
+/// assert!(cfg.is_some());
+/// let cfg = cfg.unwrap();
+/// assert_eq!(cfg.max_backward_depth, 5);
+/// assert!(cfg.index_workspace);
+/// assert!(cfg.packages_enabled);
+/// ```
 fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_file::CrossFileConfig> {
     use crate::cross_file::{CallSiteDefault, CrossFileConfig};
 
@@ -166,6 +209,29 @@ fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_
         }
     }
     
+    // Parse package settings (Requirement 12, Task 14.2)
+    if let Some(packages) = settings.get("packages") {
+        if let Some(v) = packages.get("enabled").and_then(|v| v.as_bool()) {
+            config.packages_enabled = v;
+        }
+        if let Some(paths) = packages.get("additionalLibraryPaths").and_then(|v| v.as_array()) {
+            config.packages_additional_library_paths = paths
+                .iter()
+                .filter_map(|p| p.as_str())
+                .filter(|s| !s.is_empty() && !s.contains('\0'))
+                .map(std::path::PathBuf::from)
+                .collect();
+        }
+        if let Some(v) = packages.get("rPath").and_then(|v| v.as_str()) {
+            if !v.is_empty() && !v.contains('\0') {
+                config.packages_r_path = Some(std::path::PathBuf::from(v));
+            }
+        }
+        if let Some(sev) = packages.get("missingPackageSeverity").and_then(|v| v.as_str()) {
+            config.packages_missing_package_severity = parse_severity(sev);
+        }
+    }
+    
     log::info!("Cross-file configuration loaded from LSP settings:");
     log::info!("  max_backward_depth: {}", config.max_backward_depth);
     log::info!("  max_forward_depth: {}", config.max_forward_depth);
@@ -187,6 +253,11 @@ fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_
     log::info!("    out_of_scope: {:?}", config.out_of_scope_severity);
     log::info!("    ambiguous_parent: {:?}", config.ambiguous_parent_severity);
     log::info!("    max_chain_depth: {:?}", config.max_chain_depth_severity);
+    log::info!("  Package settings:");
+    log::info!("    enabled: {}", config.packages_enabled);
+    log::info!("    additional_library_paths: {:?}", config.packages_additional_library_paths);
+    log::info!("    r_path: {:?}", config.packages_r_path);
+    log::info!("    missing_package_severity: {:?}", config.packages_missing_package_severity);
     
     Some(config)
 }
@@ -278,6 +349,18 @@ impl LanguageServer for Backend {
         })
     }
 
+    /// Performs post-initialization work for the language server.
+    ///
+    /// This method performs workspace startup tasks: it scans configured workspace folders and applies the discovered workspace index to shared state, and it initializes or replaces the in-memory PackageLibrary according to the current cross-file configuration (enabling package-aware features when configured). All long-running or blocking operations are performed without holding the main WorldState write lock so startup does not block other LSP activity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Assuming `backend` is an initialized `Backend` and a Tokio runtime is available:
+    /// // tokio::spawn(async move {
+    /// //     backend.initialized(lsp_types::InitializedParams {}).await;
+    /// // });
+    /// ```
     async fn initialized(&self, _: InitializedParams) {
         log::info!("ark-lsp initialized");
         
@@ -296,6 +379,44 @@ impl LanguageServer for Backend {
         {
             let mut state = self.state.write().await;
             state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
+        }
+        
+        // Initialize PackageLibrary without holding WorldState lock
+        // Get config values under brief read lock
+        let (packages_enabled, packages_r_path, additional_paths) = {
+            let state = self.state.read().await;
+            (
+                state.cross_file_config.packages_enabled,
+                state.cross_file_config.packages_r_path.clone(),
+                state.cross_file_config.packages_additional_library_paths.clone(),
+            )
+        };
+        
+        let new_package_library = if packages_enabled {
+            // Create RSubprocess and initialize PackageLibrary
+            let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+            let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
+            if let Err(e) = lib.initialize().await {
+                log::warn!("Failed to initialize PackageLibrary: {}", e);
+            }
+            // Add additional library paths (dedup)
+            lib.add_library_paths(&additional_paths);
+            log::info!(
+                "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
+                lib.lib_paths().len(),
+                lib.base_packages().len(),
+                lib.base_exports().len()
+            );
+            std::sync::Arc::new(lib)
+        } else {
+            log::info!("Package function awareness disabled");
+            std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty())
+        };
+        
+        // Replace package_library under brief write lock
+        {
+            let mut state = self.state.write().await;
+            state.package_library = new_package_library;
         }
         
         log::info!("Workspace initialization complete");
@@ -338,7 +459,7 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
 
         // Compute affected files while holding write lock
-        let (work_items, debounce_ms, files_to_index, on_demand_enabled) = {
+        let (work_items, debounce_ms, files_to_index, on_demand_enabled, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
             
             // Update new DocumentStore (Requirement 1.3)
@@ -355,6 +476,15 @@ impl LanguageServer for Backend {
             let workspace_root = state.workspace_folders.first().cloned();
             
             let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
+            let packages_enabled = state.cross_file_config.packages_enabled;
+            
+            // Collect package names from library calls for background prefetch
+            let packages_to_prefetch: Vec<String> = if packages_enabled {
+                meta.library_calls.iter().map(|c| c.package.clone()).collect()
+            } else {
+                Vec::new()
+            };
+            let package_library = state.package_library.clone();
             
             // On-demand indexing: Collect sourced files that need indexing
             // Priority 1: Files directly sourced by this open document
@@ -478,8 +608,17 @@ impl LanguageServer for Backend {
                 .collect();
             
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
-            (work_items, debounce_ms, files_to_index, on_demand_enabled)
+            (work_items, debounce_ms, files_to_index, on_demand_enabled, packages_to_prefetch, packages_enabled, package_library)
         };
+        
+        // Background prefetch package exports (without holding WorldState lock)
+        if packages_enabled && !packages_to_prefetch.is_empty() {
+            let pkg_lib = package_library;
+            tokio::spawn(async move {
+                log::trace!("Background prefetching {} packages", packages_to_prefetch.len());
+                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+            });
+        }
         
         // Only perform on-demand indexing if enabled
         if on_demand_enabled {
@@ -647,12 +786,28 @@ impl LanguageServer for Backend {
         }
     }
 
+    /// Handle a text-document change: update in-memory state, compute affected documents, and schedule debounced diagnostics and optional package prefetching.
+    ///
+    /// This method processes an LSP `textDocument/didChange` notification by updating the server's document store and dependency graph, determining which open documents are affected by the change, and scheduling debounced asynchronous diagnostics for those documents. If package indexing is enabled and package references are found, it also triggers background prefetching of package exports.
+    ///
+    /// Key observable behaviors:
+    /// - Updates the server's document store and legacy open-document map with the incoming changes.
+    /// - Recomputes cross-file dependencies and selects affected open documents to revalidate (subject to configured caps and activity-based prioritization).
+    /// - Schedules debounced diagnostic runs for each affected document; each scheduled run performs freshness checks before and after asynchronous work and respects the server's monotonic publishing gate.
+    /// - If packages are enabled and package names were discovered, initiates background prefetch of referenced package exports without holding the main state lock.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Typical invocation occurs inside the LSP runtime:
+    /// // backend.did_change(params).await;
+    /// ```
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
         // Compute affected files and debounce config while holding write lock
-        let (work_items, debounce_ms) = {
+        let (work_items, debounce_ms, packages_to_prefetch, packages_enabled, package_library) = {
             let mut state = self.state.write().await;
             
             // Update new DocumentStore (Requirement 1.4)
@@ -668,12 +823,23 @@ impl LanguageServer for Backend {
             // Record as recently changed for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
             
+            // Capture package settings for background prefetch
+            let packages_enabled = state.cross_file_config.packages_enabled;
+            let package_library = state.package_library.clone();
+            
             // Update dependency graph with new cross-file metadata
-            if let Some(doc) = state.documents.get(&uri) {
+            let packages_to_prefetch: Vec<String> = if let Some(doc) = state.documents.get(&uri) {
                 let text = doc.text();
                 let meta = crate::cross_file::extract_metadata(&text);
                 let uri_clone = uri.clone();
                 let workspace_root = state.workspace_folders.first().cloned();
+                
+                // Collect package names for prefetch
+                let pkgs: Vec<String> = if packages_enabled {
+                    meta.library_calls.iter().map(|c| c.package.clone()).collect()
+                } else {
+                    Vec::new()
+                };
                 
                 // Pre-collect content for potential parent files to avoid borrow conflicts
                 // IMPORTANT: Use PathContext WITHOUT @lsp-cd for backward directives
@@ -699,7 +865,11 @@ impl LanguageServer for Backend {
                     workspace_root.as_ref(),
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
-            }
+                
+                pkgs
+            } else {
+                Vec::new()
+            };
             
             // Compute affected files from dependency graph using HashSet for O(1) deduplication
             let mut affected: std::collections::HashSet<Url> = std::collections::HashSet::from([uri.clone()]);
@@ -750,8 +920,17 @@ impl LanguageServer for Backend {
                 .collect();
             
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
-            (work_items, debounce_ms)
+            (work_items, debounce_ms, packages_to_prefetch, packages_enabled, package_library)
         };
+
+        // Background prefetch package exports (without holding WorldState lock)
+        if packages_enabled && !packages_to_prefetch.is_empty() {
+            let pkg_lib = package_library;
+            tokio::spawn(async move {
+                log::trace!("Background prefetching {} packages", packages_to_prefetch.len());
+                pkg_lib.prefetch_packages(&packages_to_prefetch).await;
+            });
+        }
 
         // Schedule debounced diagnostics for all affected files (Requirement 0.5)
         for (affected_uri, trigger_version, trigger_revision) in work_items {
@@ -874,6 +1053,22 @@ impl LanguageServer for Backend {
         state.close_document(uri);
     }
 
+    /// Apply updated workspace configuration, invalidate caches that affect name-resolution scope, and re-run diagnostics for all open documents.
+    ///
+    /// This handles parsing the new cross-file configuration from the provided LSP settings, applies it to shared state if valid, invalidates cross-file resolution caches, marks open documents for force republish, optionally reinitializes the PackageLibrary when package-related settings change, and schedules diagnostics publication for every open document.
+    ///
+    /// # Parameters
+    ///
+    /// - `params`: LSP DidChangeConfigurationParams containing the new settings to parse and apply.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// // Called from an async context when the client sends updated configuration.
+    /// # async fn example(backend: &crate::backend::Backend, params: lsp_types::DidChangeConfigurationParams) {
+    /// backend.did_change_configuration(params).await;
+    /// # }
+    /// ```
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         // Requirement 11.11: When configuration changes, re-resolve scope chains for open documents
         log::trace!("Configuration changed, parsing new config and scheduling revalidation");
@@ -886,13 +1081,33 @@ impl LanguageServer for Backend {
             log::warn!("Failed to parse cross-file configuration from settings, using existing configuration");
         }
         
-        let (open_uris, scope_changed) = {
+        let (open_uris, scope_changed, package_settings_changed, packages_enabled, packages_r_path, additional_paths) = {
             let mut state = self.state.write().await;
             
             // Check if scope-affecting settings changed
             let scope_changed = new_config.as_ref()
                 .map(|c| state.cross_file_config.scope_settings_changed(c))
                 .unwrap_or(false);
+            
+            // Check if package settings changed
+            let package_settings_changed = new_config.as_ref()
+                .map(|c| {
+                    c.packages_enabled != state.cross_file_config.packages_enabled
+                        || c.packages_r_path != state.cross_file_config.packages_r_path
+                        || c.packages_additional_library_paths != state.cross_file_config.packages_additional_library_paths
+                })
+                .unwrap_or(false);
+            
+            // Capture new package settings before applying config
+            let packages_enabled = new_config.as_ref()
+                .map(|c| c.packages_enabled)
+                .unwrap_or(state.cross_file_config.packages_enabled);
+            let packages_r_path = new_config.as_ref()
+                .and_then(|c| c.packages_r_path.clone())
+                .or_else(|| state.cross_file_config.packages_r_path.clone());
+            let additional_paths = new_config.as_ref()
+                .map(|c| c.packages_additional_library_paths.clone())
+                .unwrap_or_else(|| state.cross_file_config.packages_additional_library_paths.clone());
             
             // Apply new config if parsed
             if let Some(config) = new_config {
@@ -909,8 +1124,31 @@ impl LanguageServer for Backend {
                 state.diagnostics_gate.mark_force_republish(uri);
             }
             
-            (open_uris, scope_changed)
+            (open_uris, scope_changed, package_settings_changed, packages_enabled, packages_r_path, additional_paths)
         };
+        
+        // Reinitialize PackageLibrary if package settings changed
+        if package_settings_changed {
+            log::info!("Package settings changed, reinitializing PackageLibrary");
+            
+            let new_package_library = if packages_enabled {
+                let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+                let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
+                if let Err(e) = lib.initialize().await {
+                    log::warn!("Failed to reinitialize PackageLibrary: {}", e);
+                }
+                lib.add_library_paths(&additional_paths);
+                std::sync::Arc::new(lib)
+            } else {
+                std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty())
+            };
+            
+            // Replace under brief write lock
+            {
+                let mut state = self.state.write().await;
+                state.package_library = new_package_library;
+            }
+        }
         
         if scope_changed {
             log::trace!("Scope-affecting settings changed, revalidating {} open documents", open_uris.len());
@@ -1157,7 +1395,7 @@ impl LanguageServer for Backend {
             &state,
             &params.text_document_position_params.text_document.uri,
             params.text_document_position_params.position,
-        ))
+        ).await)
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
