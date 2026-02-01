@@ -10279,6 +10279,10 @@ proptest! {
         func_name in r_identifier(),
         export_name in r_identifier(),
     ) {
+        // Ensure func_name and export_name are different to avoid shadowing
+        // (the function definition would shadow the package export)
+        prop_assume!(func_name != export_name);
+
         let uri = make_url("test_func_scoped_pkg_diag");
 
         // Code with library() inside a function
@@ -10549,6 +10553,11 @@ proptest! {
         export_name in r_identifier(),
         lines_before in 2..6usize,
     ) {
+        // Ensure export_name doesn't collide with filler variable names (x0, x1, etc.)
+        // which would create local definitions that shadow the package export
+        let filler_names: Vec<String> = (0..lines_before).map(|i| format!("x{}", i)).collect();
+        prop_assume!(!filler_names.contains(&export_name));
+
         let uri = make_url("test_pre_load_all_pos");
 
         // Build code with multiple lines before library call
@@ -10666,6 +10675,10 @@ proptest! {
         func_name in r_identifier(),
         export_name in r_identifier(),
     ) {
+        // Ensure func_name and export_name are different to avoid shadowing
+        // (the function definition would shadow the package export)
+        prop_assume!(func_name != export_name);
+
         let uri = make_url("test_pre_load_func_scoped");
 
         // Code with usage before library() inside a function
