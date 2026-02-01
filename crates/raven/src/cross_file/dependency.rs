@@ -381,11 +381,21 @@ where
         return None;
     }
 
-    // Get first backward directive (document order) (Requirement 7.1)
+    // Get first backward directive (document order) (Requirement 7.1, 7.2)
     let first_directive = meta.sourced_by.first()?;
 
+    // Log when multiple backward directives exist (Requirement 7.3)
+    if meta.sourced_by.len() > 1 {
+        log::trace!(
+            "File {} has {} backward directives; using first parent '{}' for WD inheritance",
+            uri,
+            meta.sourced_by.len(),
+            first_directive.path
+        );
+    }
+
     log::trace!(
-        "Computing inherited WD for {} from first backward directive: {} (depth remaining: {})",
+        "Computing inherited WD for {} from backward directive: {} (depth remaining: {})",
         uri,
         first_directive.path,
         max_depth
