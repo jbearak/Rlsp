@@ -80,7 +80,7 @@ fn extract_loaded_packages_from_tree(tree: &Option<tree_sitter::Tree>, text: &st
     packages
 }
 
-/// Parameters for the rlsp/activeDocumentsChanged notification
+/// Parameters for the raven/activeDocumentsChanged notification
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ActiveDocumentsChangedParams {
@@ -1660,7 +1660,7 @@ impl Backend {
         self.client.publish_diagnostics(uri.clone(), diagnostics, None).await;
     }
 
-    /// Handle the rlsp/activeDocumentsChanged notification (Requirement 15)
+    /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
     async fn handle_active_documents_changed(&self, params: ActiveDocumentsChangedParams) {
         log::trace!(
             "Received activeDocumentsChanged: active={:?}, visible={}, timestamp={}",
@@ -1686,7 +1686,7 @@ pub async fn start_lsp() -> anyhow::Result<()> {
     let stdout = tokio::io::stdout();
 
     let (service, socket) = LspService::build(Backend::new)
-        .custom_method("rlsp/activeDocumentsChanged", Backend::handle_active_documents_changed)
+        .custom_method("raven/activeDocumentsChanged", Backend::handle_active_documents_changed)
         .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 

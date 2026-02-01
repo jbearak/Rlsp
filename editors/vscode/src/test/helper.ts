@@ -11,7 +11,7 @@ export function getFixtureUri(name: string): vscode.Uri {
 }
 
 export async function activate(): Promise<void> {
-    const ext = vscode.extensions.getExtension('jbearak.rlsp');
+    const ext = vscode.extensions.getExtension('jbearak.raven');
     if (ext && !ext.isActive) {
         await ext.activate();
     }

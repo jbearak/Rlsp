@@ -9,7 +9,7 @@ import {
 let client: LanguageClient;
 
 function getServerPath(context: vscode.ExtensionContext): string {
-    const config = vscode.workspace.getConfiguration('rlsp');
+    const config = vscode.workspace.getConfiguration('raven');
     const configPath = config.get<string>('server.path');
     
     if (configPath) {
@@ -18,7 +18,7 @@ function getServerPath(context: vscode.ExtensionContext): string {
 
     // Use bundled binary
     const platform = process.platform;
-    const binaryName = platform === 'win32' ? 'rlsp.exe' : 'rlsp';
+    const binaryName = platform === 'win32' ? 'raven.exe' : 'raven';
     return path.join(context.extensionPath, 'bin', binaryName);
 }
 
@@ -47,7 +47,7 @@ function sendActivityNotification() {
         .filter(isRFile)
         .map(uri => uri.toString());
 
-    client.sendNotification('rlsp/activeDocumentsChanged', {
+    client.sendNotification('raven/activeDocumentsChanged', {
         activeUri: activeUriStr,
         visibleUris: visibleUris,
         timestampMs: Date.now(),
@@ -63,7 +63,7 @@ export function activate(context: vscode.ExtensionContext) {
     };
 
     // Create output channel for server logs
-    const outputChannel = vscode.window.createOutputChannel('Rlsp');
+    const outputChannel = vscode.window.createOutputChannel('Raven');
 
     const clientOptions: LanguageClientOptions = {
         documentSelector: [
@@ -77,8 +77,8 @@ export function activate(context: vscode.ExtensionContext) {
     };
 
     client = new LanguageClient(
-        'rlsp',
-        'Rlsp - Static R Language Server',
+        'raven',
+        'Raven - R Language Server',
         serverOptions,
         clientOptions
     );

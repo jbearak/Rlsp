@@ -1,13 +1,13 @@
 {
-  "name": "rlsp",
-  "displayName": "Rlsp - Static R Language Server",
+  "name": "raven",
+  "displayName": "Raven - R Language Server",
   "description": "Static R language support with workspace symbol indexing",
   "version": "0.1.0",
   "publisher": "jbearak",
   "license": "GPL-3.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jbearak/Rlsp"
+    "url": "https://github.com/jbearak/Raven"
   },
   "engines": {
     "vscode": "^1.75.0"
@@ -28,12 +28,12 @@
     ],
     "configuration": {
       "type": "object",
-      "title": "Rlsp",
+      "title": "Raven",
       "properties": {
-        "rlsp.server.path": {
+        "raven.server.path": {
           "type": "string",
           "default": "",
-          "description": "Path to rlsp binary. If empty, uses bundled binary."
+          "description": "Path to raven binary. If empty, uses bundled binary."
         }
       }
     }

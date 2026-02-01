@@ -1,15 +1,15 @@
 [package]
-name = "rlsp"
+name = "raven"
 version.workspace = true
 description = "Static R Language Server with workspace symbol indexing"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-repository = "https://github.com/jbearak/Rlsp"
+repository = "https://github.com/jbearak/Raven"
 
 [[bin]]
-name = "rlsp"
+name = "raven"
 path = "src/main.rs"
 
 [dependencies]
