@@ -50,30 +50,15 @@ impl PathContext {
             ctx.working_directory = resolve_working_directory(wd_path, &ctx);
         }
 
-        // Apply inherited working directory if no explicit one
-        // This handles working directory inheritance from backward directives
+        // Apply inherited working directory if no explicit one.
+        // Inherited working directories are stored as absolute paths, so use directly
+        // when absolute. Only resolve if relative (legacy/edge case).
         if ctx.working_directory.is_none() {
             if let Some(ref inherited_wd) = metadata.inherited_working_directory {
-                // Check if the inherited WD is already an absolute path that starts with
-                // the workspace root. This happens during transitive inheritance where
-                // the parent's effective WD is stored as an absolute path string.
                 let inherited_path = PathBuf::from(inherited_wd);
-                let is_already_resolved = if let Some(ref ws_root) = ctx.workspace_root {
-                    // If the path starts with the workspace root, it's already resolved
-                    inherited_path.starts_with(ws_root)
-                } else {
-                    // Without workspace root, check if it's an absolute path that doesn't
-                    // look like a workspace-relative path (workspace-relative paths are
-                    // typically short like "/data", not full paths like "/workspace/data")
-                    inherited_path.is_absolute() && inherited_path.components().count() > 2
-                };
-
-                if is_already_resolved {
-                    // Already resolved - use directly without re-resolution
-                    // This prevents double-resolution during transitive inheritance
+                if inherited_path.is_absolute() {
                     ctx.inherited_working_directory = Some(inherited_path);
                 } else {
-                    // Workspace-relative or file-relative path - resolve it
                     ctx.inherited_working_directory = resolve_working_directory(inherited_wd, &ctx);
                 }
             }
@@ -415,7 +400,8 @@ mod tests {
     fn test_from_metadata_with_inherited_working_directory() {
         // Validates: Requirements 6.2, 6.3
         // When metadata has inherited_working_directory and no explicit working_directory,
-        // the PathContext should use the inherited working directory
+        // the PathContext should use the inherited working directory.
+        // Inherited working directories are stored as absolute paths.
         use super::super::types::CrossFileMetadata;
 
         let file_uri = Url::parse("file:///project/src/child.R").unwrap();
@@ -423,13 +409,13 @@ mod tests {
 
         let meta = CrossFileMetadata {
             working_directory: None,
-            inherited_working_directory: Some("/data".to_string()),
+            inherited_working_directory: Some("/project/data".to_string()),
             ..Default::default()
         };
 
         let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
         
-        // The inherited working directory should be resolved and set
+        // Absolute inherited paths are used directly
         assert!(ctx.working_directory.is_none());
         assert_eq!(ctx.inherited_working_directory, Some(PathBuf::from("/project/data")));
         // Effective working directory should use inherited
@@ -510,7 +496,8 @@ mod tests {
     #[test]
     fn test_from_metadata_inherited_working_directory_absolute_path() {
         // Validates: Requirements 6.2, 6.3
-        // Inherited working directory with absolute path should be used directly
+        // Inherited working directories are stored as absolute paths, so absolute
+        // paths should be used directly without re-resolution
         use super::super::types::CrossFileMetadata;
 
         let file_uri = Url::parse("file:///project/src/child.R").unwrap();
@@ -524,10 +511,9 @@ mod tests {
 
         let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
         
-        // Note: The path "/absolute/path" is treated as workspace-relative (starts with /)
-        // so it resolves to /project/absolute/path
-        assert_eq!(ctx.inherited_working_directory, Some(PathBuf::from("/project/absolute/path")));
-        assert_eq!(ctx.effective_working_directory(), PathBuf::from("/project/absolute/path"));
+        // Absolute inherited paths are used directly (not re-resolved as workspace-relative)
+        assert_eq!(ctx.inherited_working_directory, Some(PathBuf::from("/absolute/path")));
+        assert_eq!(ctx.effective_working_directory(), PathBuf::from("/absolute/path"));
     }
 
     #[test]
