@@ -271,7 +271,7 @@ This implementation plan breaks down the package function awareness feature into
     - Navigate to local definition if it shadows package function
     - _Requirements: 11.3_
 
-- [ ] 14. Add Configuration Options
+- [x] 14. Add Configuration Options
   - [x] 14.1 Add package configuration to CrossFileConfig
     - Add `packages_enabled: bool` (default: true)
     - Add `packages_additional_library_paths: Vec<PathBuf>`
