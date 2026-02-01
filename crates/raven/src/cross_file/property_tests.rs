@@ -1079,49 +1079,72 @@ proptest! {
         );
     }
 
-    /// Feature: fix-backward-directive-path-resolution, Property 1 extended: Backward directive resolution is deterministic
+    /// Feature: fix-backward-directive-path-resolution, Property 1 extended: Backward directive resolution ignores @lsp-cd
     /// **Validates: Requirements 1.2, 1.3, 3.1**
     ///
-    /// Backward directive resolution should be deterministic regardless of @lsp-cd value.
+    /// This test demonstrates that PathContext::new (used for backward directives) produces
+    /// results based solely on the file's directory, while PathContext::from_metadata
+    /// (used for source() calls) uses the @lsp-cd working directory.
     #[test]
     fn prop_backward_directive_resolution_deterministic(
         workspace in path_component(),
         subdir in path_component(),
-        wd_dir1 in path_component(),
-        wd_dir2 in path_component(),
-        parent_path in relative_path_with_parents()
+        wd_dir in path_component(),
+        filename in path_component()
     ) {
+        // Ensure working directory differs from file's directory
+        prop_assume!(wd_dir != subdir);
+
         let file_uri = Url::parse(&format!("file:///{}/{}/child.R", workspace, subdir)).unwrap();
         let workspace_uri = Url::parse(&format!("file:///{}", workspace)).unwrap();
 
-        // Two different @lsp-cd values
-        let meta1 = CrossFileMetadata {
-            working_directory: Some(format!("/{}", wd_dir1)),
-            ..Default::default()
-        };
-        let meta2 = CrossFileMetadata {
-            working_directory: Some(format!("/{}", wd_dir2)),
+        // Metadata with @lsp-cd pointing to a different directory
+        let meta = CrossFileMetadata {
+            working_directory: Some(format!("/{}", wd_dir)),
             ..Default::default()
         };
 
-        // PathContext::new should produce the same result regardless of metadata
+        // PathContext::new (for backward directives) - ignores metadata entirely
         let ctx_new = PathContext::new(&file_uri, Some(&workspace_uri)).unwrap();
 
-        // Resolve the same path multiple times
-        let resolved1 = resolve_path(&parent_path, &ctx_new);
-        let resolved2 = resolve_path(&parent_path, &ctx_new);
+        // PathContext::from_metadata (for source() calls) - uses working_directory
+        let ctx_meta = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
 
-        // Results should be identical (deterministic)
-        prop_assert_eq!(
-            resolved1, resolved2,
-            "PathContext::new resolution should be deterministic for path '{}'",
-            parent_path
+        // Key assertion: effective_working_directory differs between the two contexts
+        // This is the fundamental difference that causes different path resolution
+        let wd_new = ctx_new.effective_working_directory();
+        let wd_meta = ctx_meta.effective_working_directory();
+
+        prop_assert_ne!(
+            wd_new.clone(), wd_meta.clone(),
+            "PathContext::new should use file's directory ({}), not @lsp-cd directory ({})",
+            wd_new.display(), wd_meta.display()
         );
 
-        // PathContext::new should not be affected by different metadata values
-        // (since it doesn't take metadata as input)
-        let _ = meta1; // Acknowledge we're testing that metadata doesn't affect PathContext::new
-        let _ = meta2;
+        // Verify PathContext::new uses the file's parent directory
+        let expected_file_dir = PathBuf::from(format!("/{}/{}", workspace, subdir));
+        prop_assert_eq!(
+            wd_new, expected_file_dir,
+            "PathContext::new should use file's directory"
+        );
+
+        // Verify PathContext::from_metadata uses the @lsp-cd directory
+        let expected_wd = PathBuf::from(format!("/{}/{}", workspace, wd_dir));
+        prop_assert_eq!(
+            wd_meta, expected_wd,
+            "PathContext::from_metadata should use @lsp-cd directory"
+        );
+
+        // For a simple filename (no ..), resolution should differ
+        let simple_path = format!("{}.R", filename);
+        let resolved_new = resolve_path(&simple_path, &ctx_new);
+        let resolved_meta = resolve_path(&simple_path, &ctx_meta);
+
+        prop_assert_ne!(
+            resolved_new.clone(), resolved_meta.clone(),
+            "Simple path '{}' should resolve differently: new={:?}, meta={:?}",
+            simple_path, resolved_new, resolved_meta
+        );
     }
 }
 
