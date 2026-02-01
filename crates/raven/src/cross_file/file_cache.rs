@@ -4,8 +4,8 @@
 // Disk file cache for cross-file awareness
 //
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::RwLock;
@@ -194,7 +194,10 @@ mod tests {
         cache.insert(uri.clone(), snapshot.clone(), "content".to_string());
 
         // Same snapshot should return content
-        assert_eq!(cache.get_if_fresh(&uri, &snapshot), Some("content".to_string()));
+        assert_eq!(
+            cache.get_if_fresh(&uri, &snapshot),
+            Some("content".to_string())
+        );
 
         // Different snapshot should return None
         let new_snapshot = FileSnapshot {

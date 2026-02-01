@@ -68,7 +68,10 @@ pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
     let mut sources = Vec::new();
     let root = tree.root_node();
     visit_node(root, content, &mut sources);
-    log::trace!("Completed source() call detection, found {} calls", sources.len());
+    log::trace!(
+        "Completed source() call detection, found {} calls",
+        sources.len()
+    );
     for source in &sources {
         log::trace!(
             "  Detected source() call: path='{}' at line {} column {} (is_sys_source={}, local={}, chdir={})",
@@ -713,7 +716,9 @@ mod tests {
 
     fn parse_r(code: &str) -> Tree {
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
         parser.parse(code, None).unwrap()
     }
 
@@ -1632,14 +1637,16 @@ mod property_tests {
     /// ```
     fn parse_r(code: &str) -> Tree {
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
         parser.parse(code, None).unwrap()
     }
 
     /// R reserved words that cannot be used as package names
     const R_RESERVED: &[&str] = &[
-        "if", "else", "for", "in", "while", "repeat", "next", "break", "function",
-        "NA", "NaN", "Inf", "NULL", "TRUE", "FALSE", "T", "F",
+        "if", "else", "for", "in", "while", "repeat", "next", "break", "function", "NA", "NaN",
+        "Inf", "NULL", "TRUE", "FALSE", "T", "F",
     ];
 
     /// Determine whether a string is a valid R package name (non-empty and not an R reserved word).
@@ -1694,19 +1701,15 @@ mod property_tests {
     /// assert!(value == "library" || value == "require" || value == "loadNamespace");
     /// ```
     fn library_function() -> impl Strategy<Value = &'static str> {
-        prop_oneof![
-            Just("library"),
-            Just("require"),
-            Just("loadNamespace"),
-        ]
+        prop_oneof![Just("library"), Just("require"), Just("loadNamespace"),]
     }
 
     /// Generate a quote style for package names
     #[derive(Debug, Clone, Copy)]
     enum QuoteStyle {
-        None,       // library(dplyr)
-        Double,     // library("dplyr")
-        Single,     // library('dplyr')
+        None,   // library(dplyr)
+        Double, // library("dplyr")
+        Single, // library('dplyr')
     }
 
     /// Produces a proptest Strategy that yields one of the `QuoteStyle` variants.
@@ -1742,43 +1745,53 @@ mod property_tests {
     }
 
     /// Generates an arbitrary `LibraryCallSpec` strategy for property-based tests.
-    
+
     ///
-    
+
     /// The strategy produces tuples describing a library-like call: the function name (`library`, `require`, or `loadNamespace`),
-    
+
     /// a package name, the string quote style to use (none, single, or double), and a boolean indicating whether the package
-    
+
     /// is supplied with a named `package=` argument.
-    
+
     ///
-    
+
     /// # Examples
-    
+
     ///
-    
+
     /// ```
-    
+
     /// use proptest::prelude::*;
-    
+
     ///
-    
+
     /// let mut runner = proptest::test_runner::TestRunner::default();
-    
+
     /// let tree = library_call_spec().new_tree(&mut runner).unwrap();
-    
+
     /// let spec = tree.current();
-    
+
     /// // `spec` contains generated fields: `func`, `package`, `quote_style`, and `use_named_arg`.
-    
+
     /// assert!(!spec.package.is_empty());
-    
+
     /// ```
     fn library_call_spec() -> impl Strategy<Value = LibraryCallSpec> {
-        (library_function(), package_name(), quote_style(), any::<bool>())
-            .prop_map(|(func, package, quote_style, use_named_arg)| {
-                LibraryCallSpec { func, package, quote_style, use_named_arg }
-            })
+        (
+            library_function(),
+            package_name(),
+            quote_style(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(func, package, quote_style, use_named_arg)| LibraryCallSpec {
+                    func,
+                    package,
+                    quote_style,
+                    use_named_arg,
+                },
+            )
     }
 
     /// Render an R library-like call from a specification.
@@ -1841,16 +1854,16 @@ mod property_tests {
             })
             .prop_map(|(specs, filler_counts)| {
                 let mut lines = Vec::new();
-                
+
                 // Add filler before first call
                 for _ in 0..filler_counts[0] {
                     lines.push("x <- 1".to_string());
                 }
-                
+
                 // Add library calls with fillers between them
                 for (i, spec) in specs.iter().enumerate() {
                     lines.push(generate_library_call_code(spec));
-                    
+
                     // Add filler after this call
                     if i + 1 < filler_counts.len() {
                         for _ in 0..filler_counts[i + 1] {
@@ -1858,7 +1871,7 @@ mod property_tests {
                         }
                     }
                 }
-                
+
                 let code = lines.join("\n");
                 (code, specs)
             })
@@ -2355,10 +2368,13 @@ mod property_tests {
     /// });
     /// ```
     fn dynamic_library_call_spec() -> impl Strategy<Value = DynamicLibraryCallSpec> {
-        (library_function(), package_name(), dynamic_call_type())
-            .prop_map(|(func, package, call_type)| {
-                DynamicLibraryCallSpec { func, package, call_type }
-            })
+        (library_function(), package_name(), dynamic_call_type()).prop_map(
+            |(func, package, call_type)| DynamicLibraryCallSpec {
+                func,
+                package,
+                call_type,
+            },
+        )
     }
 
     /// Generate R source code containing dynamic library calls that should not be detected.
@@ -2378,7 +2394,8 @@ mod property_tests {
     /// assert!(!code.is_empty());
     /// assert!(!specs.is_empty());
     /// ```
-    fn r_code_with_dynamic_library_calls() -> impl Strategy<Value = (String, Vec<DynamicLibraryCallSpec>)> {
+    fn r_code_with_dynamic_library_calls(
+    ) -> impl Strategy<Value = (String, Vec<DynamicLibraryCallSpec>)> {
         // Generate 1-5 dynamic library calls
         prop::collection::vec(dynamic_library_call_spec(), 1..=5)
             .prop_flat_map(|specs| {
@@ -2389,16 +2406,20 @@ mod property_tests {
             })
             .prop_map(|(specs, filler_counts)| {
                 let mut lines = Vec::new();
-                
+
                 // Add filler before first call
                 for _ in 0..filler_counts[0] {
                     lines.push("x <- 1".to_string());
                 }
-                
+
                 // Add dynamic library calls with fillers between them
                 for (i, spec) in specs.iter().enumerate() {
-                    lines.push(generate_dynamic_library_call(&spec.call_type, &spec.package, spec.func));
-                    
+                    lines.push(generate_dynamic_library_call(
+                        &spec.call_type,
+                        &spec.package,
+                        spec.func,
+                    ));
+
                     // Add filler after this call
                     if i + 1 < filler_counts.len() {
                         for _ in 0..filler_counts[i + 1] {
@@ -2406,7 +2427,7 @@ mod property_tests {
                         }
                     }
                 }
-                
+
                 let code = lines.join("\n");
                 (code, specs)
             })
@@ -2428,14 +2449,15 @@ mod property_tests {
     /// // `strat` is a `Strategy` that generates `(String, Vec<LibraryCallSpec>, Vec<DynamicLibraryCallSpec>)`.
     /// let _ = strat;
     /// ```
-    fn r_code_with_mixed_library_calls() -> impl Strategy<Value = (String, Vec<LibraryCallSpec>, Vec<DynamicLibraryCallSpec>)> {
+    fn r_code_with_mixed_library_calls(
+    ) -> impl Strategy<Value = (String, Vec<LibraryCallSpec>, Vec<DynamicLibraryCallSpec>)> {
         (
             prop::collection::vec(library_call_spec(), 1..=3),
             prop::collection::vec(dynamic_library_call_spec(), 1..=3),
         )
             .prop_map(|(static_specs, dynamic_specs)| {
                 let mut lines = Vec::new();
-                
+
                 // Interleave static and dynamic calls
                 let max_len = static_specs.len().max(dynamic_specs.len());
                 for i in 0..max_len {
@@ -2450,7 +2472,7 @@ mod property_tests {
                         ));
                     }
                 }
-                
+
                 let code = lines.join("\n");
                 (code, static_specs, dynamic_specs)
             })

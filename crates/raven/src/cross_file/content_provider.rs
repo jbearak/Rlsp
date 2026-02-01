@@ -128,9 +128,7 @@ impl<'a, D: DocumentContent> ContentProvider for CrossFileContentProvider<'a, D>
 /// Check if a file exists on disk.
 /// Converts URI to file path and checks filesystem existence.
 pub fn file_exists(uri: &Url) -> bool {
-    uri.to_file_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    uri.to_file_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 /// Check if a path exists on disk.
@@ -163,9 +161,12 @@ mod tests {
     fn test_open_doc_is_authoritative() {
         let mut open_docs = HashMap::new();
         let uri = test_uri("test.R");
-        open_docs.insert(uri.clone(), MockDocument {
-            content: "open content".to_string(),
-        });
+        open_docs.insert(
+            uri.clone(),
+            MockDocument {
+                content: "open content".to_string(),
+            },
+        );
 
         let index = CrossFileWorkspaceIndex::new();
         let cache = CrossFileFileCache::new();
@@ -180,9 +181,12 @@ mod tests {
     fn test_is_open() {
         let mut open_docs = HashMap::new();
         let uri = test_uri("test.R");
-        open_docs.insert(uri.clone(), MockDocument {
-            content: "content".to_string(),
-        });
+        open_docs.insert(
+            uri.clone(),
+            MockDocument {
+                content: "content".to_string(),
+            },
+        );
 
         let index = CrossFileWorkspaceIndex::new();
         let cache = CrossFileFileCache::new();

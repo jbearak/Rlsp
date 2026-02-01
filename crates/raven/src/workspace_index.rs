@@ -175,7 +175,7 @@ impl WorkspaceIndex {
     pub fn get(&self, uri: &Url) -> Option<IndexEntry> {
         let guard = self.inner.read().ok()?;
         let entry = guard.get(uri).cloned();
-        
+
         // Update metrics
         if let Ok(mut metrics) = self.metrics.write() {
             if entry.is_some() {
@@ -184,7 +184,7 @@ impl WorkspaceIndex {
                 metrics.cache_misses += 1;
             }
         }
-        
+
         entry
     }
 
@@ -873,7 +873,7 @@ mod tests {
 
         assert!(index.insert(uri1.clone(), make_test_entry(0)));
         assert!(index.insert(uri2.clone(), make_test_entry(1)));
-        
+
         // Third insert should be rejected
         assert!(!index.insert(uri3.clone(), make_test_entry(2)));
         assert_eq!(index.len(), 2);
@@ -894,14 +894,14 @@ mod tests {
 
         assert!(index.insert(uri1.clone(), make_test_entry(0)));
         assert!(index.insert(uri2.clone(), make_test_entry(1)));
-        
+
         // Updating existing entry should succeed even at limit
         let updated_entry = IndexEntry {
             contents: Rope::from_str("y <- 2"),
             ..make_test_entry(2)
         };
         assert!(index.insert(uri1.clone(), updated_entry));
-        
+
         let retrieved = index.get(&uri1).unwrap();
         assert_eq!(retrieved.contents.to_string(), "y <- 2");
     }
@@ -1275,7 +1275,9 @@ mod tests {
     }
 
     /// Strategy to generate a sequence of index operations
-    fn index_operation_sequence_strategy(max_uri_idx: usize) -> impl Strategy<Value = Vec<IndexOperation>> {
+    fn index_operation_sequence_strategy(
+        max_uri_idx: usize,
+    ) -> impl Strategy<Value = Vec<IndexOperation>> {
         prop::collection::vec(
             prop_oneof![
                 // Insert operations: generate URI indices
@@ -1324,7 +1326,9 @@ mod tests {
 
     /// Strategy to generate a sequence of debounce operations
     /// Generates sequences that include rapid updates to the same URI
-    fn debounce_operation_sequence_strategy(max_uri_idx: usize) -> impl Strategy<Value = Vec<DebounceOperation>> {
+    fn debounce_operation_sequence_strategy(
+        max_uri_idx: usize,
+    ) -> impl Strategy<Value = Vec<DebounceOperation>> {
         prop::collection::vec(
             prop_oneof![
                 // Schedule update operations (weighted higher for more rapid updates)

@@ -36,6 +36,8 @@ impl PathContext {
     }
 
     /// Create a context from a file URI and its metadata
+    ///
+    /// Priority for path resolution: explicit working_directory > inherited > file's directory
     pub fn from_metadata(
         file_uri: &Url,
         metadata: &CrossFileMetadata,
@@ -43,9 +45,29 @@ impl PathContext {
     ) -> Option<Self> {
         let mut ctx = Self::new(file_uri, workspace_root)?;
 
-        // Apply working directory from metadata if present
+        // Apply explicit working directory from metadata if present
         if let Some(ref wd_path) = metadata.working_directory {
             ctx.working_directory = resolve_working_directory(wd_path, &ctx);
+        }
+
+        // Apply inherited working directory if no explicit one.
+        // Inherited working directories are stored as absolute paths, so use directly
+        // when absolute. Only resolve if relative (legacy/edge case).
+        if ctx.working_directory.is_none() {
+            if let Some(ref inherited_wd) = metadata.inherited_working_directory {
+                let inherited_path = PathBuf::from(inherited_wd);
+                if inherited_path.is_absolute() {
+                    ctx.inherited_working_directory = Some(inherited_path);
+                } else {
+                    // Relative inherited paths should not occur in normal operation
+                    log::trace!(
+                        "Inherited WD is relative '{}' for {}, resolving relative to file directory",
+                        inherited_wd,
+                        file_uri
+                    );
+                    ctx.inherited_working_directory = resolve_working_directory(inherited_wd, &ctx);
+                }
+            }
         }
 
         Some(ctx)
@@ -109,7 +131,7 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
 
     let base_dir = context.effective_working_directory();
     let working_dir = context.working_directory.as_ref();
-    
+
     log::trace!(
         "Resolving path '{}' with base_dir='{}', working_dir={:?}, file_path='{}'",
         path,
@@ -139,7 +161,11 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
     // Normalize the path (resolve .. and .)
     match normalize_path(&resolved) {
         Some(canonical) => {
-            log::trace!("Resolved path '{}' to canonical path: '{}'", path, canonical.display());
+            log::trace!(
+                "Resolved path '{}' to canonical path: '{}'",
+                path,
+                canonical.display()
+            );
             Some(canonical)
         }
         None => {
@@ -163,7 +189,7 @@ pub fn resolve_working_directory(path: &str, context: &PathContext) -> Option<Pa
     }
 
     let file_dir = context.file_path.parent();
-    
+
     log::trace!(
         "Resolving working directory '{}' with file_path='{}', file_dir={:?}",
         path,
@@ -198,7 +224,11 @@ pub fn resolve_working_directory(path: &str, context: &PathContext) -> Option<Pa
 
     match normalize_path(&resolved) {
         Some(canonical) => {
-            log::trace!("Resolved working directory '{}' to canonical path: '{}'", path, canonical.display());
+            log::trace!(
+                "Resolved working directory '{}' to canonical path: '{}'",
+                path,
+                canonical.display()
+            );
             Some(canonical)
         }
         None => {
@@ -299,28 +329,40 @@ mod tests {
     #[test]
     fn test_effective_working_directory_default() {
         let ctx = make_context("/project/src/main.R", Some("/project"));
-        assert_eq!(ctx.effective_working_directory(), PathBuf::from("/project/src"));
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/project/src")
+        );
     }
 
     #[test]
     fn test_effective_working_directory_explicit() {
         let mut ctx = make_context("/project/src/main.R", Some("/project"));
         ctx.working_directory = Some(PathBuf::from("/project/data"));
-        assert_eq!(ctx.effective_working_directory(), PathBuf::from("/project/data"));
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/project/data")
+        );
     }
 
     #[test]
     fn test_effective_working_directory_inherited() {
         let mut ctx = make_context("/project/src/main.R", Some("/project"));
         ctx.inherited_working_directory = Some(PathBuf::from("/project/scripts"));
-        assert_eq!(ctx.effective_working_directory(), PathBuf::from("/project/scripts"));
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/project/scripts")
+        );
     }
 
     #[test]
     fn test_child_context_with_chdir() {
         let ctx = make_context("/project/src/main.R", Some("/project"));
         let child = ctx.child_context_with_chdir(Path::new("/project/data/utils.R"));
-        assert_eq!(child.effective_working_directory(), PathBuf::from("/project/data"));
+        assert_eq!(
+            child.effective_working_directory(),
+            PathBuf::from("/project/data")
+        );
     }
 
     #[test]
@@ -328,7 +370,10 @@ mod tests {
         let ctx = make_context("/project/src/main.R", Some("/project"));
         let child = ctx.child_context(Path::new("/project/data/utils.R"));
         // Inherits parent's effective working directory
-        assert_eq!(child.effective_working_directory(), PathBuf::from("/project/src"));
+        assert_eq!(
+            child.effective_working_directory(),
+            PathBuf::from("/project/src")
+        );
     }
 
     #[test]
@@ -358,7 +403,10 @@ mod tests {
         };
 
         let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
-        assert_eq!(ctx.effective_working_directory(), PathBuf::from("/project/data"));
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/project/data")
+        );
     }
 
     #[test]
@@ -374,21 +422,180 @@ mod tests {
         };
 
         let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
-        assert_eq!(ctx.effective_working_directory(), PathBuf::from("/project/data"));
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/project/data")
+        );
+    }
+
+    // Tests for inherited_working_directory in from_metadata
+    // Validates: Requirements 6.2, 6.3, 3.1
+
+    #[test]
+    fn test_from_metadata_with_inherited_working_directory() {
+        // Validates: Requirements 6.2, 6.3
+        // When metadata has inherited_working_directory and no explicit working_directory,
+        // the PathContext should use the inherited working directory.
+        // Inherited working directories are stored as absolute paths.
+        use super::super::types::CrossFileMetadata;
+
+        let file_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let workspace_uri = Url::parse("file:///project").unwrap();
+
+        let meta = CrossFileMetadata {
+            working_directory: None,
+            inherited_working_directory: Some("/project/data".to_string()),
+            ..Default::default()
+        };
+
+        let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // Absolute inherited paths are used directly
+        assert!(ctx.working_directory.is_none());
+        assert_eq!(
+            ctx.inherited_working_directory,
+            Some(PathBuf::from("/project/data"))
+        );
+        // Effective working directory should use inherited
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/project/data")
+        );
+    }
+
+    #[test]
+    fn test_from_metadata_inherited_working_directory_relative_path() {
+        // Validates: Requirements 6.2, 6.3
+        // Inherited working directory with relative path should resolve relative to file's directory
+        use super::super::types::CrossFileMetadata;
+
+        let file_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let workspace_uri = Url::parse("file:///project").unwrap();
+
+        let meta = CrossFileMetadata {
+            working_directory: None,
+            inherited_working_directory: Some("../data".to_string()),
+            ..Default::default()
+        };
+
+        let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        assert!(ctx.working_directory.is_none());
+        assert_eq!(
+            ctx.inherited_working_directory,
+            Some(PathBuf::from("/project/data"))
+        );
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/project/data")
+        );
+    }
+
+    #[test]
+    fn test_from_metadata_explicit_working_directory_takes_precedence() {
+        // Validates: Requirements 3.1
+        // When both explicit and inherited working directories are present,
+        // explicit should take precedence
+        use super::super::types::CrossFileMetadata;
+
+        let file_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let workspace_uri = Url::parse("file:///project").unwrap();
+
+        let meta = CrossFileMetadata {
+            working_directory: Some("/explicit".to_string()),
+            inherited_working_directory: Some("/inherited".to_string()),
+            ..Default::default()
+        };
+
+        let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // Explicit working directory should be set
+        assert_eq!(
+            ctx.working_directory,
+            Some(PathBuf::from("/project/explicit"))
+        );
+        // Inherited should NOT be set when explicit is present
+        assert!(ctx.inherited_working_directory.is_none());
+        // Effective should use explicit
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/project/explicit")
+        );
+    }
+
+    #[test]
+    fn test_from_metadata_no_working_directories() {
+        // When neither explicit nor inherited working directory is set,
+        // effective working directory should be file's directory
+        use super::super::types::CrossFileMetadata;
+
+        let file_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let workspace_uri = Url::parse("file:///project").unwrap();
+
+        let meta = CrossFileMetadata {
+            working_directory: None,
+            inherited_working_directory: None,
+            ..Default::default()
+        };
+
+        let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        assert!(ctx.working_directory.is_none());
+        assert!(ctx.inherited_working_directory.is_none());
+        // Effective should fall back to file's directory
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/project/src")
+        );
+    }
+
+    #[test]
+    fn test_from_metadata_inherited_working_directory_absolute_path() {
+        // Validates: Requirements 6.2, 6.3
+        // Inherited working directories are stored as absolute paths, so absolute
+        // paths should be used directly without re-resolution
+        use super::super::types::CrossFileMetadata;
+
+        let file_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let workspace_uri = Url::parse("file:///project").unwrap();
+
+        let meta = CrossFileMetadata {
+            working_directory: None,
+            inherited_working_directory: Some("/absolute/path".to_string()),
+            ..Default::default()
+        };
+
+        let ctx = PathContext::from_metadata(&file_uri, &meta, Some(&workspace_uri)).unwrap();
+
+        // Absolute inherited paths are used directly (not re-resolved as workspace-relative)
+        assert_eq!(
+            ctx.inherited_working_directory,
+            Some(PathBuf::from("/absolute/path"))
+        );
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/absolute/path")
+        );
     }
 
     #[test]
     fn test_child_context_for_source_with_chdir() {
         let ctx = make_context("/project/src/main.R", Some("/project"));
         let child = ctx.child_context_for_source(Path::new("/project/data/utils.R"), true);
-        assert_eq!(child.effective_working_directory(), PathBuf::from("/project/data"));
+        assert_eq!(
+            child.effective_working_directory(),
+            PathBuf::from("/project/data")
+        );
     }
 
     #[test]
     fn test_child_context_for_source_without_chdir() {
         let ctx = make_context("/project/src/main.R", Some("/project"));
         let child = ctx.child_context_for_source(Path::new("/project/data/utils.R"), false);
-        assert_eq!(child.effective_working_directory(), PathBuf::from("/project/src"));
+        assert_eq!(
+            child.effective_working_directory(),
+            PathBuf::from("/project/src")
+        );
     }
 
     // Tests for normalize_path ParentDir handling (Requirements 4.1-4.4)
@@ -488,7 +695,7 @@ mod property_tests {
 
             prop_assert!(result.is_some());
             let normalized = result.unwrap();
-            
+
             // The result should have one fewer segment than prefix + suffix
             let expected_segments = prefix_segments.len() - 1 + suffix_segments.len();
             let actual_segments = normalized.components()

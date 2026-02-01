@@ -12,9 +12,9 @@ use tower_lsp::lsp_types::Url;
 use super::cache::{ParentCacheKey, ParentResolution};
 use super::config::{CallSiteDefault, CrossFileConfig};
 use super::dependency::DependencyGraph;
-use super::types::{byte_offset_to_utf16_column, CallSiteSpec, CrossFileMetadata};
 #[cfg(test)]
 use super::types::BackwardDirective;
+use super::types::{byte_offset_to_utf16_column, CallSiteSpec, CrossFileMetadata};
 
 /// Resolve the effective call site when a file is sourced multiple times.
 /// Returns the earliest call site position using lexicographic ordering.
@@ -89,10 +89,7 @@ pub fn resolve_match_pattern(
 /// Infer call site by scanning parent content for source()/sys.source() calls to child.
 /// Used when call_site is Default and no reverse edge exists.
 /// Returns (line, utf16_column) of the first matching source() call.
-pub fn infer_call_site_from_parent(
-    parent_content: &str,
-    child_path: &str,
-) -> Option<(u32, u32)> {
+pub fn infer_call_site_from_parent(parent_content: &str, child_path: &str) -> Option<(u32, u32)> {
     let child_filename = std::path::Path::new(child_path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -158,14 +155,16 @@ pub fn compute_reverse_edges_hash(graph: &DependencyGraph, child_uri: &Url) -> u
     let mut edges: Vec<_> = graph
         .get_dependents(child_uri)
         .iter()
-        .map(|e| (
-            e.from.as_str(),
-            e.call_site_line,
-            e.call_site_column,
-            e.local,
-            e.chdir,
-            e.is_sys_source,
-        ))
+        .map(|e| {
+            (
+                e.from.as_str(),
+                e.call_site_line,
+                e.call_site_column,
+                e.local,
+                e.chdir,
+                e.is_sys_source,
+            )
+        })
         .collect();
     edges.sort();
     edges.hash(&mut hasher);
@@ -197,23 +196,28 @@ where
 
     // Derive child_path from child_uri for match pattern and call-site inference
     // Try to produce a relative path when possible (e.g., "subdir/child.R"), falling back to just filename
-    let child_path = child_uri.to_file_path().ok().map(|full_path| {
-        // Try to extract a meaningful relative path by finding the filename and potentially one parent dir
-        // This helps match source("subdir/child.R") calls
-        let filename = full_path.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
+    let child_path = child_uri
+        .to_file_path()
+        .ok()
+        .map(|full_path| {
+            // Try to extract a meaningful relative path by finding the filename and potentially one parent dir
+            // This helps match source("subdir/child.R") calls
+            let filename = full_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
 
-        // Try to get parent directory name for relative path matching
-        if let Some(parent) = full_path.parent() {
-            if let Some(parent_name) = parent.file_name() {
-                let parent_str = parent_name.to_string_lossy();
-                // Return "parent/filename" format for better matching
-                return format!("{}/{}", parent_str, filename);
+            // Try to get parent directory name for relative path matching
+            if let Some(parent) = full_path.parent() {
+                if let Some(parent_name) = parent.file_name() {
+                    let parent_str = parent_name.to_string_lossy();
+                    // Return "parent/filename" format for better matching
+                    return format!("{}/{}", parent_str, filename);
+                }
             }
-        }
-        filename
-    }).unwrap_or_default();
+            filename
+        })
+        .unwrap_or_default();
 
     // From backward directives
     for directive in &metadata.sourced_by {
@@ -226,7 +230,9 @@ where
                 CallSiteSpec::Match(pattern) => {
                     // Resolve match pattern in parent content
                     if let Some(parent_content) = get_content(&parent_uri) {
-                        if let Some((line, col)) = resolve_match_pattern(&parent_content, pattern, &child_path) {
+                        if let Some((line, col)) =
+                            resolve_match_pattern(&parent_content, pattern, &child_path)
+                        {
                             (Some(line), Some(col), 0) // Same precedence as line=
                         } else {
                             // Pattern not found, fall back to config default
@@ -245,9 +251,10 @@ where
                 }
                 CallSiteSpec::Default => {
                     // Check if there's a reverse edge with known call site
-                    let has_reverse_edge = graph.get_dependents(child_uri).iter().any(|e| {
-                        e.from == parent_uri && e.call_site_line.is_some()
-                    });
+                    let has_reverse_edge = graph
+                        .get_dependents(child_uri)
+                        .iter()
+                        .any(|e| e.from == parent_uri && e.call_site_line.is_some());
 
                     if has_reverse_edge {
                         // Will be handled by reverse edge processing below
@@ -256,7 +263,9 @@ where
                     } else {
                         // Try text-inference: scan parent for source() call to child
                         if let Some(parent_content) = get_content(&parent_uri) {
-                            if let Some((line, col)) = infer_call_site_from_parent(&parent_content, &child_path) {
+                            if let Some((line, col)) =
+                                infer_call_site_from_parent(&parent_content, &child_path)
+                            {
                                 (Some(line), Some(col), 1) // Precedence 1: inferred
                             } else {
                                 // Fall back to config default
@@ -285,11 +294,16 @@ where
 
     // From reverse dependency edges
     for edge in graph.get_dependents(child_uri) {
-        let (call_site_line, call_site_column) = match (edge.call_site_line, edge.call_site_column) {
+        let (call_site_line, call_site_column) = match (edge.call_site_line, edge.call_site_column)
+        {
             (Some(line), Some(col)) => (Some(line), Some(col)),
             _ => (None, None),
         };
-        let precedence = if call_site_line.is_some() && call_site_column.is_some() { 2 } else { 3 };
+        let precedence = if call_site_line.is_some() && call_site_column.is_some() {
+            2
+        } else {
+            3
+        };
 
         // Avoid duplicates by parent URI
         if let Some(existing) = candidates.iter_mut().find(|c| c.parent == edge.from) {
@@ -313,12 +327,11 @@ where
     }
 
     // Deterministic selection with precedence, then URI tiebreak
-    candidates.sort_by(|a, b| {
-        (a.precedence, a.parent.as_str()).cmp(&(b.precedence, b.parent.as_str()))
-    });
+    candidates
+        .sort_by(|a, b| (a.precedence, a.parent.as_str()).cmp(&(b.precedence, b.parent.as_str())));
 
     let selected = candidates.remove(0);
-    
+
     // Filter out alternatives that point to the same parent as selected
     // This prevents false ambiguity when the same parent appears from multiple sources
     let unique_alternatives: Vec<Url> = candidates
@@ -326,7 +339,7 @@ where
         .filter(|c| c.parent != selected.parent)
         .map(|c| c.parent)
         .collect();
-    
+
     if unique_alternatives.is_empty() {
         return ParentResolution::Single {
             parent_uri: selected.parent,
@@ -433,11 +446,19 @@ mod tests {
         let parent = url("main.R");
 
         let result = resolve_parent(&meta, &graph, &child, &config, |p| {
-            if p == "../main.R" { Some(parent.clone()) } else { None }
+            if p == "../main.R" {
+                Some(parent.clone())
+            } else {
+                None
+            }
         });
 
         match result {
-            ParentResolution::Single { parent_uri, call_site_line, .. } => {
+            ParentResolution::Single {
+                parent_uri,
+                call_site_line,
+                ..
+            } => {
                 assert_eq!(parent_uri, parent);
                 assert_eq!(call_site_line, Some(10));
             }
@@ -468,16 +489,18 @@ mod tests {
         let main = url("main.R");
         let other = url("other.R");
 
-        let result = resolve_parent(&meta, &graph, &child, &config, |p| {
-            match p {
-                "../main.R" => Some(main.clone()),
-                "../other.R" => Some(other.clone()),
-                _ => None,
-            }
+        let result = resolve_parent(&meta, &graph, &child, &config, |p| match p {
+            "../main.R" => Some(main.clone()),
+            "../other.R" => Some(other.clone()),
+            _ => None,
         });
 
         match result {
-            ParentResolution::Ambiguous { selected_uri, alternatives, .. } => {
+            ParentResolution::Ambiguous {
+                selected_uri,
+                alternatives,
+                ..
+            } => {
                 // Deterministic: main.R comes before other.R alphabetically
                 assert_eq!(selected_uri, main);
                 assert_eq!(alternatives.len(), 1);
@@ -629,12 +652,22 @@ y <- 2"#;
             &graph,
             &child,
             &config,
-            |p| if p == "../main.R" { Some(parent.clone()) } else { None },
+            |p| {
+                if p == "../main.R" {
+                    Some(parent.clone())
+                } else {
+                    None
+                }
+            },
             |_| Some(parent_content.to_string()),
         );
 
         match result {
-            ParentResolution::Single { parent_uri, call_site_line, call_site_column } => {
+            ParentResolution::Single {
+                parent_uri,
+                call_site_line,
+                call_site_column,
+            } => {
                 assert_eq!(parent_uri, parent);
                 assert_eq!(call_site_line, Some(1));
                 assert_eq!(call_site_column, Some(0));
@@ -666,12 +699,22 @@ y <- 2"#;
             &graph,
             &child,
             &config,
-            |p| if p == "../main.R" { Some(parent.clone()) } else { None },
+            |p| {
+                if p == "../main.R" {
+                    Some(parent.clone())
+                } else {
+                    None
+                }
+            },
             |_| Some(parent_content.to_string()),
         );
 
         match result {
-            ParentResolution::Single { parent_uri, call_site_line, call_site_column } => {
+            ParentResolution::Single {
+                parent_uri,
+                call_site_line,
+                call_site_column,
+            } => {
                 assert_eq!(parent_uri, parent);
                 // Should infer call site from source("child.R") call
                 assert_eq!(call_site_line, Some(1));
@@ -701,7 +744,7 @@ y <- 2"#;
         let mut graph = DependencyGraph::new();
         let child = url("subdir/collate.r");
         let parent = url("oos.r");
-        
+
         // Simulate that the parent has a forward edge to the child
         let parent_meta = CrossFileMetadata {
             sources: vec![ForwardSource {
@@ -725,7 +768,13 @@ y <- 2"#;
             &graph,
             &child,
             &config,
-            |p| if p == "../oos.r" { Some(parent.clone()) } else { None },
+            |p| {
+                if p == "../oos.r" {
+                    Some(parent.clone())
+                } else {
+                    None
+                }
+            },
             |_| None,
         );
 
@@ -734,7 +783,11 @@ y <- 2"#;
             ParentResolution::Single { parent_uri, .. } => {
                 assert_eq!(parent_uri, parent);
             }
-            ParentResolution::Ambiguous { selected_uri, alternatives, .. } => {
+            ParentResolution::Ambiguous {
+                selected_uri,
+                alternatives,
+                ..
+            } => {
                 panic!(
                     "Expected Single resolution, got Ambiguous with selected={} and alternatives={:?}",
                     selected_uri, alternatives
@@ -770,12 +823,22 @@ y <- 2"#;
             &graph,
             &child,
             &config,
-            |p| if p == "../main.R" { Some(parent.clone()) } else { None },
+            |p| {
+                if p == "../main.R" {
+                    Some(parent.clone())
+                } else {
+                    None
+                }
+            },
             |_| Some(parent_content.to_string()),
         );
 
         match result {
-            ParentResolution::Single { parent_uri, call_site_line, call_site_column } => {
+            ParentResolution::Single {
+                parent_uri,
+                call_site_line,
+                call_site_column,
+            } => {
                 assert_eq!(parent_uri, parent);
                 // Should find the source() call to child.R at line 1
                 assert_eq!(call_site_line, Some(1));
@@ -810,12 +873,22 @@ y <- 2"#;
             &graph,
             &child,
             &config,
-            |p| if p == "../main.R" { Some(parent.clone()) } else { None },
+            |p| {
+                if p == "../main.R" {
+                    Some(parent.clone())
+                } else {
+                    None
+                }
+            },
             |_| Some(parent_content.to_string()),
         );
 
         match result {
-            ParentResolution::Single { parent_uri, call_site_line, call_site_column } => {
+            ParentResolution::Single {
+                parent_uri,
+                call_site_line,
+                call_site_column,
+            } => {
                 assert_eq!(parent_uri, parent);
                 // Should infer call site from source("child.R") at line 1
                 assert_eq!(call_site_line, Some(1));

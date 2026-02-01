@@ -101,10 +101,7 @@ impl RSubprocess {
     fn find_r_in_path() -> Option<PathBuf> {
         #[cfg(unix)]
         {
-            let output = std::process::Command::new("which")
-                .arg("R")
-                .output()
-                .ok()?;
+            let output = std::process::Command::new("which").arg("R").output().ok()?;
 
             if output.status.success() {
                 let path_str = String::from_utf8_lossy(&output.stdout);
@@ -117,10 +114,7 @@ impl RSubprocess {
 
         #[cfg(windows)]
         {
-            let output = std::process::Command::new("where")
-                .arg("R")
-                .output()
-                .ok()?;
+            let output = std::process::Command::new("where").arg("R").output().ok()?;
 
             if output.status.success() {
                 let path_str = String::from_utf8_lossy(&output.stdout);
@@ -147,9 +141,7 @@ impl RSubprocess {
     /// ```
     fn find_r_in_common_locations() -> Option<PathBuf> {
         let common_paths = Self::get_common_r_paths();
-        common_paths
-            .into_iter()
-            .find(Self::is_valid_r_executable)
+        common_paths.into_iter().find(Self::is_valid_r_executable)
     }
 
     /// Lists common filesystem locations where an R executable is typically installed for the current target OS.
@@ -318,7 +310,10 @@ impl RSubprocess {
                 }
             }
             Err(e) => {
-                log::trace!("Failed to get .libPaths() from R: {}, using fallback paths", e);
+                log::trace!(
+                    "Failed to get .libPaths() from R: {}, using fallback paths",
+                    e
+                );
                 Ok(get_fallback_lib_paths())
             }
         }
@@ -419,12 +414,16 @@ impl RSubprocess {
         // Check if R returned an error
         if output.starts_with("__RLSP_ERROR__:") {
             let error_msg = output.trim_start_matches("__RLSP_ERROR__:").trim();
-            return Err(anyhow!("Failed to get exports for package '{}': {}", package, error_msg));
+            return Err(anyhow!(
+                "Failed to get exports for package '{}': {}",
+                package,
+                error_msg
+            ));
         }
 
         // Parse the output - one export name per line
         let exports = parse_packages_output(&output);
-        
+
         log::trace!(
             "Got {} exports for package '{}': {:?}",
             exports.len(),
@@ -625,7 +624,7 @@ fn is_valid_package_name(name: &str) -> bool {
     }
 
     let chars: Vec<char> = name.chars().collect();
-    
+
     // Check first character: must be a letter or dot
     let first = chars[0];
     if !first.is_ascii_alphabetic() && first != '.' {
@@ -744,8 +743,14 @@ pub fn get_fallback_lib_paths() -> Vec<PathBuf> {
         paths.push(PathBuf::from("/usr/lib64/R/library"));
         // User library
         if let Ok(home) = std::env::var("HOME") {
-            paths.push(PathBuf::from(format!("{}/R/x86_64-pc-linux-gnu-library/4.4", home)));
-            paths.push(PathBuf::from(format!("{}/R/x86_64-pc-linux-gnu-library/4.3", home)));
+            paths.push(PathBuf::from(format!(
+                "{}/R/x86_64-pc-linux-gnu-library/4.4",
+                home
+            )));
+            paths.push(PathBuf::from(format!(
+                "{}/R/x86_64-pc-linux-gnu-library/4.3",
+                home
+            )));
         }
     }
 
@@ -911,13 +916,14 @@ mod tests {
         let result = subprocess.get_lib_paths().await;
         assert!(result.is_ok());
         let paths = result.unwrap();
-        
+
         // At least one path should contain a "base" package directory
         // (this is the system library where base R packages are installed)
-        let has_base = paths.iter().any(|p| {
-            p.join("base").exists()
-        });
-        assert!(has_base, "Should have at least one library path containing base package");
+        let has_base = paths.iter().any(|p| p.join("base").exists());
+        assert!(
+            has_base,
+            "Should have at least one library path containing base package"
+        );
     }
 
     #[test]
@@ -1132,17 +1138,25 @@ mod tests {
         let result = subprocess.get_package_exports("base").await;
         assert!(result.is_ok(), "Should succeed for base package");
         let exports = result.unwrap();
-        
+
         // base package should have many exports
         assert!(!exports.is_empty(), "base package should have exports");
-        
+
         // Should contain common base functions
-        assert!(exports.contains(&"print".to_string()), "Should contain 'print'");
+        assert!(
+            exports.contains(&"print".to_string()),
+            "Should contain 'print'"
+        );
         assert!(exports.contains(&"cat".to_string()), "Should contain 'cat'");
         assert!(exports.contains(&"c".to_string()), "Should contain 'c'");
-        assert!(exports.contains(&"list".to_string()), "Should contain 'list'");
-        assert!(exports.contains(&"function".to_string()) || exports.contains(&"length".to_string()), 
-            "Should contain common base functions");
+        assert!(
+            exports.contains(&"list".to_string()),
+            "Should contain 'list'"
+        );
+        assert!(
+            exports.contains(&"function".to_string()) || exports.contains(&"length".to_string()),
+            "Should contain common base functions"
+        );
     }
 
     #[tokio::test]
@@ -1156,14 +1170,17 @@ mod tests {
         let result = subprocess.get_package_exports("stats").await;
         assert!(result.is_ok(), "Should succeed for stats package");
         let exports = result.unwrap();
-        
+
         // stats package should have many exports
         assert!(!exports.is_empty(), "stats package should have exports");
-        
+
         // Should contain common stats functions
         assert!(exports.contains(&"lm".to_string()), "Should contain 'lm'");
         assert!(exports.contains(&"glm".to_string()), "Should contain 'glm'");
-        assert!(exports.contains(&"t.test".to_string()), "Should contain 't.test'");
+        assert!(
+            exports.contains(&"t.test".to_string()),
+            "Should contain 't.test'"
+        );
     }
 
     #[tokio::test]
@@ -1177,13 +1194,19 @@ mod tests {
         let result = subprocess.get_package_exports("utils").await;
         assert!(result.is_ok(), "Should succeed for utils package");
         let exports = result.unwrap();
-        
+
         // utils package should have many exports
         assert!(!exports.is_empty(), "utils package should have exports");
-        
+
         // Should contain common utils functions
-        assert!(exports.contains(&"head".to_string()), "Should contain 'head'");
-        assert!(exports.contains(&"tail".to_string()), "Should contain 'tail'");
+        assert!(
+            exports.contains(&"head".to_string()),
+            "Should contain 'head'"
+        );
+        assert!(
+            exports.contains(&"tail".to_string()),
+            "Should contain 'tail'"
+        );
         assert!(exports.contains(&"str".to_string()), "Should contain 'str'");
     }
 
@@ -1195,9 +1218,11 @@ mod tests {
             None => return,
         };
 
-        let result = subprocess.get_package_exports("nonexistent_package_xyz_123").await;
+        let result = subprocess
+            .get_package_exports("nonexistent_package_xyz_123")
+            .await;
         assert!(result.is_err(), "Should fail for non-existent package");
-        
+
         let error_msg = result.unwrap_err().to_string();
         assert!(
             error_msg.contains("nonexistent_package_xyz_123"),
@@ -1217,7 +1242,7 @@ mod tests {
         // Test with injection attempt
         let result = subprocess.get_package_exports("pkg; system('ls')").await;
         assert!(result.is_err(), "Should reject invalid package name");
-        
+
         let error_msg = result.unwrap_err().to_string();
         assert!(
             error_msg.contains("Invalid package name"),
@@ -1352,7 +1377,9 @@ mod tests {
             None => return,
         };
 
-        let result = subprocess.get_package_depends("nonexistent_package_xyz_123").await;
+        let result = subprocess
+            .get_package_depends("nonexistent_package_xyz_123")
+            .await;
         assert!(result.is_err(), "Should fail for non-existent package");
 
         let error_msg = result.unwrap_err().to_string();
@@ -1574,12 +1601,18 @@ mod tests {
     async fn test_get_base_packages_fallback_completeness() {
         // Verify fallback base packages match the requirement specification
         let fallback = get_fallback_base_packages();
-        
+
         // Requirement 6.2: base, methods, utils, grDevices, graphics, stats, datasets
         let required = vec![
-            "base", "methods", "utils", "grDevices", "graphics", "stats", "datasets"
+            "base",
+            "methods",
+            "utils",
+            "grDevices",
+            "graphics",
+            "stats",
+            "datasets",
         ];
-        
+
         for pkg in &required {
             assert!(
                 fallback.contains(&pkg.to_string()),
@@ -1602,14 +1635,21 @@ mod tests {
         let results = vec![
             subprocess.get_package_exports("").await,
             subprocess.get_package_exports("invalid;name").await,
-            subprocess.get_package_exports("nonexistent_pkg_12345").await,
+            subprocess
+                .get_package_exports("nonexistent_pkg_12345")
+                .await,
             subprocess.get_package_depends("").await,
             subprocess.get_package_depends("invalid;name").await,
-            subprocess.get_package_depends("nonexistent_pkg_12345").await,
+            subprocess
+                .get_package_depends("nonexistent_pkg_12345")
+                .await,
         ];
 
         for result in results {
-            assert!(result.is_err(), "Invalid operations should return Err, not panic");
+            assert!(
+                result.is_err(),
+                "Invalid operations should return Err, not panic"
+            );
         }
     }
 

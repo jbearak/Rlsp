@@ -183,7 +183,7 @@ struct IntervalNode {
 }
 
 /// Interval tree for efficient function scope queries
-/// 
+///
 /// This data structure enables O(log n + k) point queries where n is the number
 /// of intervals and k is the number of results, compared to O(n) for linear scans.
 #[derive(Debug, Clone)]
@@ -197,7 +197,10 @@ pub struct FunctionScopeTree {
 impl FunctionScopeTree {
     /// Create an empty tree
     pub fn new() -> Self {
-        Self { root: None, count: 0 }
+        Self {
+            root: None,
+            count: 0,
+        }
     }
 
     /// Indicates whether the interval tree contains no intervals.
@@ -768,15 +771,28 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     artifacts.timeline.sort_by_key(|event| match event {
         ScopeEvent::Def { line, column, .. } => (*line, *column),
         ScopeEvent::Source { line, column, .. } => (*line, *column),
-        ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+        ScopeEvent::FunctionScope {
+            start_line,
+            start_column,
+            ..
+        } => (*start_line, *start_column),
         ScopeEvent::Removal { line, column, .. } => (*line, *column),
         ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
     });
 
     // Build interval tree from function scopes for O(log n) queries
-    let function_scope_tuples: Vec<(u32, u32, u32, u32)> = artifacts.timeline.iter()
+    let function_scope_tuples: Vec<(u32, u32, u32, u32)> = artifacts
+        .timeline
+        .iter()
         .filter_map(|e| {
-            if let ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, .. } = e {
+            if let ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                ..
+            } = e
+            {
                 Some((*start_line, *start_column, *end_line, *end_column))
             } else {
                 None
@@ -785,8 +801,15 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         .collect();
     artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
     for event in &mut artifacts.timeline {
-        if let ScopeEvent::Removal { line, column, function_scope, .. } = event {
-            *function_scope = find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+        if let ScopeEvent::Removal {
+            line,
+            column,
+            function_scope,
+            ..
+        } = event
+        {
+            *function_scope =
+                find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
         }
     }
 
@@ -797,7 +820,8 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
             &artifacts.function_scope_tree,
             lib_call.line,
             lib_call.column,
-        ).map(FunctionScopeInterval::from_tuple);
+        )
+        .map(FunctionScopeInterval::from_tuple);
 
         artifacts.timeline.push(ScopeEvent::PackageLoad {
             line: lib_call.line,
@@ -811,7 +835,11 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     artifacts.timeline.sort_by_key(|event| match event {
         ScopeEvent::Def { line, column, .. } => (*line, *column),
         ScopeEvent::Source { line, column, .. } => (*line, *column),
-        ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+        ScopeEvent::FunctionScope {
+            start_line,
+            start_column,
+            ..
+        } => (*start_line, *start_column),
         ScopeEvent::Removal { line, column, .. } => (*line, *column),
         ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
     });
@@ -831,7 +859,8 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         .collect();
 
     // Compute interface hash including both symbols and loaded packages
-    artifacts.interface_hash = compute_interface_hash(&artifacts.exported_interface, &loaded_packages);
+    artifacts.interface_hash =
+        compute_interface_hash(&artifacts.exported_interface, &loaded_packages);
 
     artifacts
 }
@@ -852,11 +881,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
 /// let scope = scope_at_position(&artifacts, 0, 0);
 /// assert!(scope.symbols.is_empty());
 /// ```
-pub fn scope_at_position(
-    artifacts: &ScopeArtifacts,
-    line: u32,
-    column: u32,
-) -> ScopeAtPosition {
+pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> ScopeAtPosition {
     let mut scope = ScopeAtPosition::default();
 
     // Use interval tree for O(log n) query instead of linear scan
@@ -864,7 +889,8 @@ pub fn scope_at_position(
     let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
         Vec::new()
     } else {
-        artifacts.function_scope_tree
+        artifacts
+            .function_scope_tree
             .query_point(Position::new(line, column))
             .into_iter()
             .map(|interval| interval.as_tuple())
@@ -874,11 +900,16 @@ pub fn scope_at_position(
     // Process events and apply function scope filtering
     for event in &artifacts.timeline {
         match event {
-            ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
+            ScopeEvent::Def {
+                line: def_line,
+                column: def_col,
+                symbol,
+            } => {
                 // Include if definition is before or at the position
                 if (*def_line, *def_col) <= (line, column) {
                     // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts.function_scope_tree
+                    let def_function_scope = artifacts
+                        .function_scope_tree
                         .query_innermost(Position::new(*def_line, *def_col))
                         .map(|interval| interval.as_tuple());
 
@@ -899,22 +930,46 @@ pub fn scope_at_position(
             ScopeEvent::Source { .. } => {
                 // Source events are handled by scope_at_position_with_deps
             }
-            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                parameters,
+            } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
-                if !is_full_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                if !is_full_eof_position
+                    && (*start_line, *start_column) <= (line, column)
+                    && (line, column) <= (*end_line, *end_column)
+                {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
                     }
                 }
             }
-            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
+            ScopeEvent::Removal {
+                line: rm_line,
+                column: rm_col,
+                symbols,
+                function_scope,
+            } => {
                 // Only process if removal is strictly before the query position
                 if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
+                    apply_removal(
+                        &mut scope,
+                        &active_function_scopes,
+                        *function_scope,
+                        symbols,
+                    );
                 }
             }
-            ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } => {
+            ScopeEvent::PackageLoad {
+                line: pkg_line,
+                column: pkg_col,
+                package,
+                function_scope,
+            } => {
                 // Requirements 8.1, 8.3: Position-aware package loading
                 // Populate loaded_packages for callers to check package exports
                 if (*pkg_line, *pkg_col) <= (line, column) {
@@ -924,14 +979,14 @@ pub fn scope_at_position(
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if query is in same function
                             active_function_scopes.iter().any(|active_scope| {
-                                active_scope.0 == pkg_scope.start.line &&
-                                active_scope.1 == pkg_scope.start.column &&
-                                active_scope.2 == pkg_scope.end.line &&
-                                active_scope.3 == pkg_scope.end.column
+                                active_scope.0 == pkg_scope.start.line
+                                    && active_scope.1 == pkg_scope.start.column
+                                    && active_scope.2 == pkg_scope.end.line
+                                    && active_scope.3 == pkg_scope.end.column
                             })
                         }
                     };
-                    
+
                     if should_include && !scope.loaded_packages.contains(package) {
                         scope.loaded_packages.push(package.clone());
                     }
@@ -981,7 +1036,8 @@ where
     // without requiring explicit library() calls and without position-aware loading.
     // Add base exports first with lowest precedence - they will be overridden by
     // local definitions and explicit package loads via entry().or_insert_with().
-    let base_uri = Url::parse("package:base").unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
+    let base_uri =
+        Url::parse("package:base").unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
     for export_name in base_exports {
         scope.symbols.insert(
             export_name.clone(),
@@ -1001,7 +1057,8 @@ where
     let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
         Vec::new()
     } else {
-        artifacts.function_scope_tree
+        artifacts
+            .function_scope_tree
             .query_point(Position::new(line, column))
             .into_iter()
             .map(|interval| interval.as_tuple())
@@ -1014,11 +1071,16 @@ where
     // for package loads (which preserves existing entries including local definitions).
     for event in &artifacts.timeline {
         match event {
-            ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
+            ScopeEvent::Def {
+                line: def_line,
+                column: def_col,
+                symbol,
+            } => {
                 // Include if definition is before or at the position
                 if (*def_line, *def_col) <= (line, column) {
                     // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts.function_scope_tree
+                    let def_function_scope = artifacts
+                        .function_scope_tree
                         .query_innermost(Position::new(*def_line, *def_col))
                         .map(|interval| interval.as_tuple());
 
@@ -1039,22 +1101,46 @@ where
             ScopeEvent::Source { .. } => {
                 // Source events are handled by scope_at_position_with_deps
             }
-            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                parameters,
+            } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
-                if !is_full_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                if !is_full_eof_position
+                    && (*start_line, *start_column) <= (line, column)
+                    && (line, column) <= (*end_line, *end_column)
+                {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
                     }
                 }
             }
-            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
+            ScopeEvent::Removal {
+                line: rm_line,
+                column: rm_col,
+                symbols,
+                function_scope,
+            } => {
                 // Only process if removal is strictly before the query position
                 if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
+                    apply_removal(
+                        &mut scope,
+                        &active_function_scopes,
+                        *function_scope,
+                        symbols,
+                    );
                 }
             }
-            ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } => {
+            ScopeEvent::PackageLoad {
+                line: pkg_line,
+                column: pkg_col,
+                package,
+                function_scope,
+            } => {
                 // Process PackageLoad events for position-aware package loading
                 // Requirements 2.1, 2.2: Only include if package is loaded before query position
                 if (*pkg_line, *pkg_col) <= (line, column) {
@@ -1068,10 +1154,10 @@ where
                             // Function-scoped package load - only available within that function
                             // Check if query position is inside the same function scope
                             active_function_scopes.iter().any(|active_scope| {
-                                active_scope.0 == pkg_scope.start.line &&
-                                active_scope.1 == pkg_scope.start.column &&
-                                active_scope.2 == pkg_scope.end.line &&
-                                active_scope.3 == pkg_scope.end.column
+                                active_scope.0 == pkg_scope.start.line
+                                    && active_scope.1 == pkg_scope.start.column
+                                    && active_scope.2 == pkg_scope.end.line
+                                    && active_scope.3 == pkg_scope.end.column
                             })
                         }
                     };
@@ -1079,12 +1165,12 @@ where
                     if should_include {
                         // Get package exports and add them to scope
                         let exports = get_package_exports(package);
-                        
+
                         // Create a pseudo-URI for the package source
                         // This allows hover/definition to identify package symbols
                         let package_uri = Url::parse(&format!("package:{}", package))
                             .unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
-                        
+
                         for export_name in exports {
                             // Check if symbol already exists
                             let should_insert = match scope.symbols.get(&export_name) {
@@ -1095,7 +1181,7 @@ where
                                     existing.source_uri.as_str() == "package:base"
                                 }
                             };
-                            
+
                             if should_insert {
                                 scope.symbols.insert(
                                     export_name.clone(),
@@ -1134,7 +1220,16 @@ where
 {
     log::trace!("Resolving scope at {}:{}:{}", uri, line, column);
     let mut visited = HashSet::new();
-    let scope = scope_at_position_recursive(uri, line, column, get_artifacts, resolve_path, max_depth, 0, &mut visited);
+    let scope = scope_at_position_recursive(
+        uri,
+        line,
+        column,
+        get_artifacts,
+        resolve_path,
+        max_depth,
+        0,
+        &mut visited,
+    );
     log::trace!("Found {} symbols in scope", scope.symbols.len());
     scope
 }
@@ -1218,7 +1313,8 @@ where
     let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_full_eof_position {
         Vec::new()
     } else {
-        artifacts.function_scope_tree
+        artifacts
+            .function_scope_tree
             .query_point(Position::new(line, column))
             .into_iter()
             .map(|interval| interval.as_tuple())
@@ -1228,14 +1324,19 @@ where
     // Process timeline events up to the requested position
     for event in &artifacts.timeline {
         match event {
-            ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
+            ScopeEvent::Def {
+                line: def_line,
+                column: def_col,
+                symbol,
+            } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Local definitions take precedence (don't overwrite)
                     // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts.function_scope_tree
+                    let def_function_scope = artifacts
+                        .function_scope_tree
                         .query_innermost(Position::new(*def_line, *def_col))
                         .map(|interval| interval.as_tuple());
-                    
+
                     // Skip function-local definitions not in our scope
                     if let Some(def_scope) = def_function_scope {
                         if !active_function_scopes.contains(&def_scope) {
@@ -1243,23 +1344,32 @@ where
                         }
                     }
                     scope.symbols.entry(symbol.name.clone()).or_insert_with(|| {
-                        log::trace!("  Found symbol: {} ({})", symbol.name, match symbol.kind {
-                            SymbolKind::Function => "function",
-                            SymbolKind::Variable => "variable",
-                            SymbolKind::Parameter => "parameter",
-                        });
+                        log::trace!(
+                            "  Found symbol: {} ({})",
+                            symbol.name,
+                            match symbol.kind {
+                                SymbolKind::Function => "function",
+                                SymbolKind::Variable => "variable",
+                                SymbolKind::Parameter => "parameter",
+                            }
+                        );
                         symbol.clone()
                     });
                 }
             }
-            ScopeEvent::Source { line: src_line, column: src_col, source } => {
+            ScopeEvent::Source {
+                line: src_line,
+                column: src_col,
+                source,
+            } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) {
                         // Use interval tree for O(log n) innermost scope lookup
-                        let source_function_scope = artifacts.function_scope_tree
+                        let source_function_scope = artifacts
+                            .function_scope_tree
                             .query_innermost(Position::new(*src_line, *src_col))
                             .map(|interval| interval.as_tuple());
 
@@ -1277,7 +1387,9 @@ where
                     if let Some(child_uri) = resolve_path(&source.path, uri) {
                         // Check if we would exceed max depth
                         if current_depth + 1 >= max_depth {
-                            scope.depth_exceeded.push((uri.clone(), *src_line, *src_col));
+                            scope
+                                .depth_exceeded
+                                .push((uri.clone(), *src_line, *src_col));
                             continue;
                         }
 
@@ -1300,19 +1412,41 @@ where
                     }
                 }
             }
-            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                parameters,
+            } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
-                if !is_full_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                if !is_full_eof_position
+                    && (*start_line, *start_column) <= (line, column)
+                    && (line, column) <= (*end_line, *end_column)
+                {
                     for param in parameters {
-                        scope.symbols.entry(param.name.clone()).or_insert_with(|| param.clone());
+                        scope
+                            .symbols
+                            .entry(param.name.clone())
+                            .or_insert_with(|| param.clone());
                     }
                 }
             }
-            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
+            ScopeEvent::Removal {
+                line: rm_line,
+                column: rm_col,
+                symbols,
+                function_scope,
+            } => {
                 // Only process if removal is strictly before the query position
                 if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
+                    apply_removal(
+                        &mut scope,
+                        &active_function_scopes,
+                        *function_scope,
+                        symbols,
+                    );
                 }
             }
             ScopeEvent::PackageLoad { .. } => {
@@ -1325,12 +1459,7 @@ where
     scope
 }
 
-fn collect_definitions(
-    node: Node,
-    content: &str,
-    uri: &Url,
-    artifacts: &mut ScopeArtifacts,
-) {
+fn collect_definitions(node: Node, content: &str, uri: &Url, artifacts: &mut ScopeArtifacts) {
     // Check for assignment expressions
     if node.kind() == "binary_operator" {
         if let Some(symbol) = try_extract_assignment(node, content, uri) {
@@ -1340,10 +1469,12 @@ fn collect_definitions(
                 symbol: symbol.clone(),
             };
             artifacts.timeline.push(event);
-            artifacts.exported_interface.insert(symbol.name.clone(), symbol);
+            artifacts
+                .exported_interface
+                .insert(symbol.name.clone(), symbol);
         }
     }
-    
+
     // Check for assign() calls (Requirement 17.4)
     if node.kind() == "call" {
         if let Some(symbol) = try_extract_assign_call(node, content, uri) {
@@ -1353,7 +1484,9 @@ fn collect_definitions(
                 symbol: symbol.clone(),
             };
             artifacts.timeline.push(event);
-            artifacts.exported_interface.insert(symbol.name.clone(), symbol);
+            artifacts
+                .exported_interface
+                .insert(symbol.name.clone(), symbol);
         }
     }
 
@@ -1366,7 +1499,9 @@ fn collect_definitions(
                 symbol: symbol.clone(),
             };
             artifacts.timeline.push(event);
-            artifacts.exported_interface.insert(symbol.name.clone(), symbol);
+            artifacts
+                .exported_interface
+                .insert(symbol.name.clone(), symbol);
         }
     }
 
@@ -1388,12 +1523,10 @@ fn collect_definitions(
 fn try_extract_function_scope(node: Node, content: &str, uri: &Url) -> Option<ScopeEvent> {
     // tree-sitter-r node shapes have changed across versions; be robust by falling back
     // to scanning children by kind if field lookups fail.
-    let params_node = node
-        .child_by_field_name("parameters")
-        .or_else(|| {
-            node.children(&mut node.walk())
-                .find(|c| c.is_named() && c.kind() == "parameters")
-        })?;
+    let params_node = node.child_by_field_name("parameters").or_else(|| {
+        node.children(&mut node.walk())
+            .find(|c| c.is_named() && c.kind() == "parameters")
+    })?;
 
     let body_node = node
         .child_by_field_name("body")
@@ -1413,7 +1546,10 @@ fn try_extract_function_scope(node: Node, content: &str, uri: &Url) -> Option<Sc
     let mut parameters = Vec::new();
     for child in params_node.children(&mut params_node.walk()) {
         // Parameters may appear as parameter, default_parameter, identifier, dots, etc.
-        if matches!(child.kind(), "parameter" | "default_parameter" | "identifier" | "dots") {
+        if matches!(
+            child.kind(),
+            "parameter" | "default_parameter" | "identifier" | "dots"
+        ) {
             if let Some(param_symbol) = extract_parameter_symbol(child, content, uri) {
                 parameters.push(param_symbol);
             }
@@ -1519,14 +1655,14 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
     // Get function name
     let func_node = node.child_by_field_name("function")?;
     let func_name = node_text(func_node, content);
-    
+
     if func_name != "assign" {
         return None;
     }
-    
+
     // Get arguments
     let args_node = node.child_by_field_name("arguments")?;
-    
+
     // Find the first argument (the name)
     let mut name_arg = None;
     for child in args_node.children(&mut args_node.walk()) {
@@ -1546,27 +1682,29 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
             }
         }
     }
-    
+
     let name_node = name_arg?;
-    
+
     // Only handle string literals
     if name_node.kind() != "string" {
         return None;
     }
-    
+
     // Extract the string content (remove quotes)
     let name_text = node_text(name_node, content);
-    let name = name_text.trim_matches(|c| c == '"' || c == '\'').to_string();
-    
+    let name = name_text
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_string();
+
     if name.is_empty() {
         return None;
     }
-    
+
     // Get position with UTF-16 column
     let start = node.start_position();
     let line_text = content.lines().nth(start.row).unwrap_or("");
     let column = byte_offset_to_utf16_column(line_text, start.column);
-    
+
     Some(ScopedSymbol {
         name,
         kind: SymbolKind::Variable,
@@ -1582,19 +1720,19 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
 fn try_extract_for_loop_iterator(node: Node, content: &str, uri: &Url) -> Option<ScopedSymbol> {
     // Get the variable field (iterator)
     let var_node = node.child_by_field_name("variable")?;
-    
+
     // Only handle identifier nodes
     if var_node.kind() != "identifier" {
         return None;
     }
-    
+
     let name = node_text(var_node, content).to_string();
-    
+
     // Get position with UTF-16 column
     let start = var_node.start_position();
     let line_text = content.lines().nth(start.row).unwrap_or("");
     let column = byte_offset_to_utf16_column(line_text, start.column);
-    
+
     Some(ScopedSymbol {
         name,
         kind: SymbolKind::Variable,
@@ -1609,37 +1747,37 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
     // Check if this is an assignment operator - the operator is a direct child, not a field
     let mut cursor = node.walk();
     let children: Vec<_> = node.children(&mut cursor).collect();
-    
+
     if children.len() != 3 {
         return None;
     }
-    
+
     let lhs = children[0];
     let op = children[1];
     let rhs = children[2];
-    
+
     // Check operator
     let op_text = node_text(op, content);
-    
+
     // Handle -> operator: RHS is the name, LHS is the value
     if op_text == "->" {
         if rhs.kind() != "identifier" {
             return None;
         }
         let name = node_text(rhs, content).to_string();
-        
+
         let (kind, signature) = if lhs.kind() == "function_definition" {
             let sig = extract_function_signature(lhs, &name, content);
             (SymbolKind::Function, Some(sig))
         } else {
             (SymbolKind::Variable, None)
         };
-        
+
         // Position is at RHS (the identifier being defined)
         let start = rhs.start_position();
         let line_text = content.lines().nth(start.row).unwrap_or("");
         let column = byte_offset_to_utf16_column(line_text, start.column);
-        
+
         return Some(ScopedSymbol {
             name,
             kind,
@@ -1649,7 +1787,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
             signature,
         });
     }
-    
+
     // Handle <- = <<- operators: LHS is the name, RHS is the value
     if !matches!(op_text, "<-" | "=" | "<<-") {
         return None;
@@ -1732,10 +1870,7 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 /// let h2 = crate::compute_interface_hash(&interface, &packages);
 /// assert_eq!(h1, h2);
 /// ```
-fn compute_interface_hash(
-    interface: &HashMap<String, ScopedSymbol>,
-    packages: &[String],
-) -> u64 {
+fn compute_interface_hash(interface: &HashMap<String, ScopedSymbol>, packages: &[String]) -> u64 {
     let mut hasher = DefaultHasher::new();
 
     // Sort keys for deterministic hashing of symbols
@@ -1760,7 +1895,7 @@ fn compute_interface_hash(
 
 /// Compute scope at a position with backward directive support.
 /// This processes backward directives FIRST (parent context), then forward sources.
-/// 
+///
 /// Property 19: Backward-First Resolution Order
 /// - Backward directives establish parent context (symbols available before this file runs)
 /// - Forward source() calls add symbols in document order
@@ -1781,8 +1916,16 @@ where
 {
     let mut visited = HashSet::new();
     scope_at_position_with_backward_recursive(
-        uri, line, column, get_artifacts, get_metadata, resolve_path,
-        max_depth, 0, &mut visited, parent_call_site,
+        uri,
+        line,
+        column,
+        get_artifacts,
+        get_metadata,
+        resolve_path,
+        max_depth,
+        0,
+        &mut visited,
+        parent_call_site,
     )
 }
 
@@ -1804,16 +1947,27 @@ where
     G: Fn(&Url) -> Option<super::types::CrossFileMetadata>,
 {
     let mut visited = HashSet::new();
-    
+
     // Build initial PathContext for the root file
     let meta = get_metadata(uri);
-    let path_ctx = meta.as_ref()
+    let path_ctx = meta
+        .as_ref()
         .and_then(|m| super::path_resolve::PathContext::from_metadata(uri, m, workspace_root))
         .or_else(|| super::path_resolve::PathContext::new(uri, workspace_root));
-    
+
     scope_at_position_with_graph_recursive(
-        uri, line, column, get_artifacts, get_metadata, graph, workspace_root,
-        path_ctx, max_depth, 0, &mut visited, &[],
+        uri,
+        line,
+        column,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        path_ctx,
+        max_depth,
+        0,
+        &mut visited,
+        &[],
     )
 }
 
@@ -1910,8 +2064,9 @@ where
             // The edge doesn't store this directly, so we check metadata
             if let Some(meta) = get_metadata(&edge.from) {
                 let is_global = meta.sources.iter().any(|s| {
-                    s.is_sys_source && s.sys_source_global_env && 
-                    s.line == edge.call_site_line.unwrap_or(u32::MAX)
+                    s.is_sys_source
+                        && s.sys_source_global_env
+                        && s.line == edge.call_site_line.unwrap_or(u32::MAX)
                 });
                 if !is_global {
                     continue;
@@ -1925,14 +2080,19 @@ where
 
         // Check if we would exceed max depth
         if current_depth + 1 >= max_depth {
-            scope.depth_exceeded.push((uri.clone(), call_site_line, call_site_col));
+            scope
+                .depth_exceeded
+                .push((uri.clone(), call_site_line, call_site_col));
             continue;
         }
 
         // Build PathContext for parent
         let parent_meta = get_metadata(&edge.from);
-        let parent_ctx = parent_meta.as_ref()
-            .and_then(|m| super::path_resolve::PathContext::from_metadata(&edge.from, m, workspace_root))
+        let parent_ctx = parent_meta
+            .as_ref()
+            .and_then(|m| {
+                super::path_resolve::PathContext::from_metadata(&edge.from, m, workspace_root)
+            })
             .or_else(|| super::path_resolve::PathContext::new(&edge.from, workspace_root));
 
         // Get parent's scope at the call site
@@ -1965,7 +2125,13 @@ where
         // These packages are available in the child file from position (0, 0)
         if let Some(parent_artifacts) = get_artifacts(&edge.from) {
             for event in &parent_artifacts.timeline {
-                if let ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } = event {
+                if let ScopeEvent::PackageLoad {
+                    line: pkg_line,
+                    column: pkg_col,
+                    package,
+                    function_scope,
+                } = event
+                {
                     // Only propagate packages loaded before the call site
                     // Requirement 5.1: Package loaded before source() call is available in sourced file
                     if (*pkg_line, *pkg_col) <= (call_site_line, call_site_col) {
@@ -1977,15 +2143,19 @@ where
                                 // Function-scoped package load - only propagate if the source() call
                                 // is within the same function scope
                                 if let Some(parent_artifacts_ref) = get_artifacts(&edge.from) {
-                                    let call_site_scope = parent_artifacts_ref.function_scope_tree
-                                        .query_innermost(Position::new(call_site_line, call_site_col))
+                                    let call_site_scope = parent_artifacts_ref
+                                        .function_scope_tree
+                                        .query_innermost(Position::new(
+                                            call_site_line,
+                                            call_site_col,
+                                        ))
                                         .map(|interval| interval.as_tuple());
-                                    
+
                                     call_site_scope.is_some_and(|cs_scope| {
-                                        cs_scope.0 == pkg_scope.start.line &&
-                                        cs_scope.1 == pkg_scope.start.column &&
-                                        cs_scope.2 == pkg_scope.end.line &&
-                                        cs_scope.3 == pkg_scope.end.column
+                                        cs_scope.0 == pkg_scope.start.line
+                                            && cs_scope.1 == pkg_scope.start.column
+                                            && cs_scope.2 == pkg_scope.end.line
+                                            && cs_scope.3 == pkg_scope.end.column
                                     })
                                 } else {
                                     false
@@ -2016,23 +2186,29 @@ where
     let active_function_scopes: Vec<(u32, u32, u32, u32)> = if is_eof_position {
         Vec::new()
     } else {
-        artifacts.function_scope_tree
+        artifacts
+            .function_scope_tree
             .query_point(Position::new(line, column))
             .into_iter()
             .map(|interval| interval.as_tuple())
             .collect()
     };
-    
+
     // Second pass: process events and apply function scope filtering
     for event in &artifacts.timeline {
         match event {
-            ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
+            ScopeEvent::Def {
+                line: def_line,
+                column: def_col,
+                symbol,
+            } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Use interval tree for O(log n) innermost scope lookup
-                    let def_function_scope = artifacts.function_scope_tree
+                    let def_function_scope = artifacts
+                        .function_scope_tree
                         .query_innermost(Position::new(*def_line, *def_col))
                         .map(|interval| interval.as_tuple());
-                    
+
                     match def_function_scope {
                         None => {
                             // Global definition - always include (local definitions take precedence over inherited symbols)
@@ -2047,14 +2223,19 @@ where
                     }
                 }
             }
-            ScopeEvent::Source { line: src_line, column: src_col, source } => {
+            ScopeEvent::Source {
+                line: src_line,
+                column: src_col,
+                source,
+            } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
                     // If this is a local-only source (or sys.source into a non-global env), only
                     // make its symbols available within the containing function scope.
                     if should_apply_local_scoping(source) {
                         // Use interval tree for O(log n) innermost scope lookup
-                        let source_function_scope = artifacts.function_scope_tree
+                        let source_function_scope = artifacts
+                            .function_scope_tree
                             .query_innermost(Position::new(*src_line, *src_col))
                             .map(|interval| interval.as_tuple());
 
@@ -2073,11 +2254,13 @@ where
                         let resolved = super::path_resolve::resolve_path(&source.path, ctx)?;
                         super::path_resolve::path_to_uri(&resolved)
                     });
-                    
+
                     if let Some(child_uri) = child_uri {
                         // Check if we would exceed max depth
                         if current_depth + 1 >= max_depth {
-                            scope.depth_exceeded.push((uri.clone(), *src_line, *src_col));
+                            scope
+                                .depth_exceeded
+                                .push((uri.clone(), *src_line, *src_col));
                             continue;
                         }
 
@@ -2085,7 +2268,8 @@ where
                         // to pass to the child file. The child will have access to these packages
                         // from position (0, 0).
                         // Get the function scope of the source() call for filtering function-scoped packages
-                        let source_function_scope = artifacts.function_scope_tree
+                        let source_function_scope = artifacts
+                            .function_scope_tree
                             .query_innermost(Position::new(*src_line, *src_col))
                             .map(|interval| interval.as_tuple());
 
@@ -2093,7 +2277,13 @@ where
 
                         // Collect packages from this file's timeline that are loaded before the source() call
                         for pkg_event in &artifacts.timeline {
-                            if let ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } = pkg_event {
+                            if let ScopeEvent::PackageLoad {
+                                line: pkg_line,
+                                column: pkg_col,
+                                package,
+                                function_scope,
+                            } = pkg_event
+                            {
                                 // Only include packages loaded before the source() call
                                 if (*pkg_line, *pkg_col) < (*src_line, *src_col) {
                                     // Check function scope compatibility
@@ -2104,17 +2294,18 @@ where
                                             // 1. The source() call is in the same function scope, OR
                                             // 2. The source() call is nested within the package's function scope
                                             source_function_scope.is_some_and(|src_scope| {
-                                                src_scope.0 == pkg_scope.start.line &&
-                                                src_scope.1 == pkg_scope.start.column &&
-                                                src_scope.2 == pkg_scope.end.line &&
-                                                src_scope.3 == pkg_scope.end.column
+                                                src_scope.0 == pkg_scope.start.line
+                                                    && src_scope.1 == pkg_scope.start.column
+                                                    && src_scope.2 == pkg_scope.end.line
+                                                    && src_scope.3 == pkg_scope.end.column
                                             })
                                         }
                                     };
-                                    
+
                                     if should_include
                                         && !scope.inherited_packages.contains(package)
-                                        && !extra_packages.contains(package) {
+                                        && !extra_packages.contains(package)
+                                    {
                                         extra_packages.push(package.clone());
                                     }
                                 }
@@ -2144,7 +2335,12 @@ where
                             let child_meta = get_metadata(&child_uri);
                             if let Some(cm) = child_meta {
                                 // Child has its own metadata - use it, but inherit working dir if no explicit one
-                                let mut child_ctx = super::path_resolve::PathContext::from_metadata(&child_uri, &cm, workspace_root)?;
+                                let mut child_ctx =
+                                    super::path_resolve::PathContext::from_metadata(
+                                        &child_uri,
+                                        &cm,
+                                        workspace_root,
+                                    )?;
                                 if child_ctx.working_directory.is_none() {
                                     // Inherit from parent based on chdir flag
                                     child_ctx.inherited_working_directory = if source.chdir {
@@ -2183,23 +2379,47 @@ where
                     }
                 }
             }
-            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                parameters,
+            } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
                 let is_eof_position = line == u32::MAX && column == u32::MAX;
-                if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                if !is_eof_position
+                    && (*start_line, *start_column) <= (line, column)
+                    && (line, column) <= (*end_line, *end_column)
+                {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
                     }
                 }
             }
-            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
+            ScopeEvent::Removal {
+                line: rm_line,
+                column: rm_col,
+                symbols,
+                function_scope,
+            } => {
                 // Only process if removal is strictly before the query position
                 if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
+                    apply_removal(
+                        &mut scope,
+                        &active_function_scopes,
+                        *function_scope,
+                        symbols,
+                    );
                 }
             }
-            ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } => {
+            ScopeEvent::PackageLoad {
+                line: pkg_line,
+                column: pkg_col,
+                package,
+                function_scope,
+            } => {
                 // Requirements 8.1, 8.3: Position-aware package loading
                 // Only include packages loaded before the query position
                 if (*pkg_line, *pkg_col) <= (line, column) {
@@ -2209,14 +2429,14 @@ where
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if query is in same function
                             active_function_scopes.iter().any(|active_scope| {
-                                active_scope.0 == pkg_scope.start.line &&
-                                active_scope.1 == pkg_scope.start.column &&
-                                active_scope.2 == pkg_scope.end.line &&
-                                active_scope.3 == pkg_scope.end.column
+                                active_scope.0 == pkg_scope.start.line
+                                    && active_scope.1 == pkg_scope.start.column
+                                    && active_scope.2 == pkg_scope.end.line
+                                    && active_scope.3 == pkg_scope.end.column
                             })
                         }
                     };
-                    
+
                     if should_include && !scope.loaded_packages.contains(package) {
                         scope.loaded_packages.push(package.clone());
                     }
@@ -2333,7 +2553,9 @@ where
                 if let Some((call_line, call_col)) = call_site {
                     // Check if we would exceed max depth
                     if current_depth + 1 >= max_depth {
-                        scope.depth_exceeded.push((uri.clone(), directive.directive_line, 0));
+                        scope
+                            .depth_exceeded
+                            .push((uri.clone(), directive.directive_line, 0));
                         continue;
                     }
 
@@ -2369,22 +2591,29 @@ where
     let active_function_scopes: Vec<(u32, u32, u32, u32)> = if query_pos.is_full_eof() {
         Vec::new()
     } else {
-        artifacts.function_scope_tree.query_point(query_pos)
+        artifacts
+            .function_scope_tree
+            .query_point(query_pos)
             .into_iter()
             .map(|interval| interval.as_tuple())
             .collect()
     };
-    
+
     // Second pass: process events and apply function scope filtering
     for event in &artifacts.timeline {
         match event {
-            ScopeEvent::Def { line: def_line, column: def_col, symbol } => {
+            ScopeEvent::Def {
+                line: def_line,
+                column: def_col,
+                symbol,
+            } => {
                 if (*def_line, *def_col) <= (line, column) {
                     // Check if this definition is inside any function scope using interval tree
-                    let def_function_scope = artifacts.function_scope_tree
+                    let def_function_scope = artifacts
+                        .function_scope_tree
                         .query_innermost(Position::new(*def_line, *def_col))
                         .map(|interval| interval.as_tuple());
-                    
+
                     match def_function_scope {
                         None => {
                             // Global definition - local definitions take precedence over inherited symbols
@@ -2399,14 +2628,20 @@ where
                     }
                 }
             }
-            ScopeEvent::Source { line: src_line, column: src_col, source } => {
+            ScopeEvent::Source {
+                line: src_line,
+                column: src_col,
+                source,
+            } => {
                 // Only include if source() call is before the position
                 if (*src_line, *src_col) < (line, column) {
                     // Resolve the path and get symbols from sourced file
                     if let Some(child_uri) = resolve_path(&source.path, uri) {
                         // Check if we would exceed max depth
                         if current_depth + 1 >= max_depth {
-                            scope.depth_exceeded.push((uri.clone(), *src_line, *src_col));
+                            scope
+                                .depth_exceeded
+                                .push((uri.clone(), *src_line, *src_col));
                             continue;
                         }
 
@@ -2431,23 +2666,47 @@ where
                     }
                 }
             }
-            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters } => {
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                parameters,
+            } => {
                 // Include function parameters if position is within function body
                 // Skip EOF sentinel positions to avoid matching all functions
                 let is_eof_position = line == u32::MAX || column == u32::MAX;
-                if !is_eof_position && (*start_line, *start_column) <= (line, column) && (line, column) <= (*end_line, *end_column) {
+                if !is_eof_position
+                    && (*start_line, *start_column) <= (line, column)
+                    && (line, column) <= (*end_line, *end_column)
+                {
                     for param in parameters {
                         scope.symbols.insert(param.name.clone(), param.clone());
                     }
                 }
             }
-            ScopeEvent::Removal { line: rm_line, column: rm_col, symbols, function_scope } => {
+            ScopeEvent::Removal {
+                line: rm_line,
+                column: rm_col,
+                symbols,
+                function_scope,
+            } => {
                 // Only process if removal is strictly before the query position
                 if (*rm_line, *rm_col) < (line, column) {
-                    apply_removal(&mut scope, &active_function_scopes, *function_scope, symbols);
+                    apply_removal(
+                        &mut scope,
+                        &active_function_scopes,
+                        *function_scope,
+                        symbols,
+                    );
                 }
             }
-            ScopeEvent::PackageLoad { line: pkg_line, column: pkg_col, package, function_scope } => {
+            ScopeEvent::PackageLoad {
+                line: pkg_line,
+                column: pkg_col,
+                package,
+                function_scope,
+            } => {
                 // Requirements 8.1, 8.3: Position-aware package loading
                 // Only include packages loaded before the query position
                 if (*pkg_line, *pkg_col) <= (line, column) {
@@ -2457,14 +2716,14 @@ where
                         Some(pkg_scope) => {
                             // Function-scoped package load - only include if query is in same function
                             active_function_scopes.iter().any(|active_scope| {
-                                active_scope.0 == pkg_scope.start.line &&
-                                active_scope.1 == pkg_scope.start.column &&
-                                active_scope.2 == pkg_scope.end.line &&
-                                active_scope.3 == pkg_scope.end.column
+                                active_scope.0 == pkg_scope.start.line
+                                    && active_scope.1 == pkg_scope.start.column
+                                    && active_scope.2 == pkg_scope.end.line
+                                    && active_scope.3 == pkg_scope.end.column
                             })
                         }
                     };
-                    
+
                     if should_include && !scope.loaded_packages.contains(package) {
                         scope.loaded_packages.push(package.clone());
                     }
@@ -2483,7 +2742,9 @@ mod tests {
 
     fn parse_r(code: &str) -> Tree {
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
         parser.parse(code, None).unwrap()
     }
 
@@ -2568,7 +2829,6 @@ mod tests {
         let scope = scope_at_position(&artifacts, 2, 10);
         assert_eq!(scope.symbols.len(), 3);
     }
-
 
     #[test]
     fn test_interface_hash_deterministic() {
@@ -2676,7 +2936,11 @@ mod tests {
         println!("Parent timeline:");
         for event in &parent_artifacts.timeline {
             match event {
-                ScopeEvent::Def { line, column, symbol } => {
+                ScopeEvent::Def {
+                    line,
+                    column,
+                    symbol,
+                } => {
                     println!("  Def: {} at ({}, {})", symbol.name, line, column);
                 }
                 _ => {}
@@ -2698,32 +2962,65 @@ mod tests {
         };
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &child_uri { Some(child_metadata.clone()) }
-            else { None }
+            if uri == &child_uri {
+                Some(child_metadata.clone())
+            } else {
+                None
+            }
         };
 
         let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "../parent.R" { Some(parent_uri.clone()) } else { None }
+            if path == "../parent.R" {
+                Some(parent_uri.clone())
+            } else {
+                None
+            }
         };
 
         // Test scope at end of child file (line 0, after z definition)
         let scope = scope_at_position_with_backward(
-            &child_uri, 0, 10, &get_artifacts, &get_metadata, &resolve_path, 10, None
+            &child_uri,
+            0,
+            10,
+            &get_artifacts,
+            &get_metadata,
+            &resolve_path,
+            10,
+            None,
         );
 
         // Should have: a (from parent line 0), x1 (from parent line 1), z (local)
         // Should NOT have: x2 (parent line 2), y (parent line 3) - after call site
-        assert!(scope.symbols.contains_key("a"), "Should have 'a' from parent");
-        assert!(scope.symbols.contains_key("x1"), "Should have 'x1' from parent");
-        assert!(scope.symbols.contains_key("z"), "Should have 'z' from local");
-        assert!(!scope.symbols.contains_key("x2"), "Should NOT have 'x2' - after call site");
-        assert!(!scope.symbols.contains_key("y"), "Should NOT have 'y' - after call site");
+        assert!(
+            scope.symbols.contains_key("a"),
+            "Should have 'a' from parent"
+        );
+        assert!(
+            scope.symbols.contains_key("x1"),
+            "Should have 'x1' from parent"
+        );
+        assert!(
+            scope.symbols.contains_key("z"),
+            "Should have 'z' from local"
+        );
+        assert!(
+            !scope.symbols.contains_key("x2"),
+            "Should NOT have 'x2' - after call site"
+        );
+        assert!(
+            !scope.symbols.contains_key("y"),
+            "Should NOT have 'y' - after call site"
+        );
     }
 
     #[test]
@@ -2734,13 +3031,16 @@ mod tests {
             line: 0,
             column: 0,
             is_directive: false,
-            local: false,  // local=FALSE
+            local: false, // local=FALSE
             chdir: false,
             is_sys_source: false,
             sys_source_global_env: false,
         };
 
-        assert!(source.inherits_symbols(), "source() with local=FALSE should inherit symbols");
+        assert!(
+            source.inherits_symbols(),
+            "source() with local=FALSE should inherit symbols"
+        );
 
         // Test that such sources are included in timeline
         let code = "x <- 1\nsource(\"child.R\", local = FALSE)\ny <- 2";
@@ -2748,7 +3048,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Should have source event in timeline
-        let source_events: Vec<_> = artifacts.timeline.iter()
+        let source_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Source { source, .. } => Some(source),
                 _ => None,
@@ -2757,7 +3059,10 @@ mod tests {
 
         assert_eq!(source_events.len(), 1, "Should have one source event");
         assert!(!source_events[0].local, "Source should have local=FALSE");
-        assert!(source_events[0].inherits_symbols(), "Source should inherit symbols");
+        assert!(
+            source_events[0].inherits_symbols(),
+            "Source should inherit symbols"
+        );
     }
 
     #[test]
@@ -2776,14 +3081,19 @@ mod tests {
             sys_source_global_env: false,
         };
 
-        assert!(!source.inherits_symbols(), "source() with local=TRUE should NOT inherit symbols");
+        assert!(
+            !source.inherits_symbols(),
+            "source() with local=TRUE should NOT inherit symbols"
+        );
 
         // Local=TRUE sources are included in the timeline
         let code = "x <- 1\nsource(\"child.R\", local = TRUE)\ny <- 2";
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        let source_events: Vec<_> = artifacts.timeline.iter()
+        let source_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Source { source, .. } => Some(source),
                 _ => None,
@@ -2802,17 +3112,29 @@ mod tests {
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
+            if path == "child.R" {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
         };
 
-        let scope = scope_at_position_with_deps(&parent_uri, 10, 0, &get_artifacts, &resolve_path, 10);
-        assert!(!scope.symbols.contains_key("child_var"), "local=TRUE should not leak symbols to global scope");
+        let scope =
+            scope_at_position_with_deps(&parent_uri, 10, 0, &get_artifacts, &resolve_path, 10);
+        assert!(
+            !scope.symbols.contains_key("child_var"),
+            "local=TRUE should not leak symbols to global scope"
+        );
     }
 
     #[test]
@@ -2823,7 +3145,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Should have source event in timeline (defaults to local=FALSE)
-        let source_events: Vec<_> = artifacts.timeline.iter()
+        let source_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Source { source, .. } => Some(source),
                 _ => None,
@@ -2831,8 +3155,14 @@ mod tests {
             .collect();
 
         assert_eq!(source_events.len(), 1, "Should have one source event");
-        assert!(!source_events[0].local, "Source should default to local=FALSE");
-        assert!(source_events[0].inherits_symbols(), "Source should inherit symbols by default");
+        assert!(
+            !source_events[0].local,
+            "Source should default to local=FALSE"
+        );
+        assert!(
+            source_events[0].inherits_symbols(),
+            "Source should inherit symbols by default"
+        );
     }
 
     #[test]
@@ -2872,23 +3202,40 @@ mod tests {
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &parent_uri { Some(parent_meta.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
         };
 
         // At end of parent file, both 'a' and 'b' should be available
         let scope = scope_at_position_with_graph(
-            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            10,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
 
         assert!(scope.symbols.contains_key("a"), "a should be available");
-        assert!(scope.symbols.contains_key("b"), "b should be available from sourced file");
+        assert!(
+            scope.symbols.contains_key("b"),
+            "b should be available from sourced file"
+        );
     }
 
     #[test]
@@ -2928,23 +3275,43 @@ mod tests {
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &parent_uri { Some(parent_meta.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
         };
 
         // In child file, parent_var should be available via dependency graph edge
         let scope = scope_at_position_with_graph(
-            &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri,
+            10,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
 
-        assert!(scope.symbols.contains_key("parent_var"), "parent_var should be available from parent");
-        assert!(scope.symbols.contains_key("child_var"), "child_var should be available locally");
+        assert!(
+            scope.symbols.contains_key("parent_var"),
+            "parent_var should be available from parent"
+        );
+        assert!(
+            scope.symbols.contains_key("child_var"),
+            "child_var should be available locally"
+        );
     }
 
     #[test]
@@ -2968,25 +3335,46 @@ mod tests {
         let artifacts_c = compute_artifacts(&uri_c, &tree_c, code_c);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &uri_a { Some(artifacts_a.clone()) }
-            else if uri == &uri_b { Some(artifacts_b.clone()) }
-            else if uri == &uri_c { Some(artifacts_c.clone()) }
-            else { None }
+            if uri == &uri_a {
+                Some(artifacts_a.clone())
+            } else if uri == &uri_b {
+                Some(artifacts_b.clone())
+            } else if uri == &uri_c {
+                Some(artifacts_c.clone())
+            } else {
+                None
+            }
         };
 
         let resolve_path = |path: &str, from: &Url| -> Option<Url> {
-            if from == &uri_a && path == "b.R" { Some(uri_b.clone()) }
-            else if from == &uri_b && path == "c.R" { Some(uri_c.clone()) }
-            else { None }
+            if from == &uri_a && path == "b.R" {
+                Some(uri_b.clone())
+            } else if from == &uri_b && path == "c.R" {
+                Some(uri_c.clone())
+            } else {
+                None
+            }
         };
 
         // With max_depth=2, traversing a->b->c should exceed at b->c
-        let scope = scope_at_position_with_deps(&uri_a, u32::MAX, u32::MAX, &get_artifacts, &resolve_path, 2);
+        let scope = scope_at_position_with_deps(
+            &uri_a,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &resolve_path,
+            2,
+        );
 
         // Should have depth_exceeded entry for b.R at the source("c.R") call
-        assert!(!scope.depth_exceeded.is_empty(), "depth_exceeded should not be empty");
-        assert!(scope.depth_exceeded.iter().any(|(uri, _, _)| uri == &uri_b), 
-            "depth_exceeded should contain b.R");
+        assert!(
+            !scope.depth_exceeded.is_empty(),
+            "depth_exceeded should not be empty"
+        );
+        assert!(
+            scope.depth_exceeded.iter().any(|(uri, _, _)| uri == &uri_b),
+            "depth_exceeded should contain b.R"
+        );
     }
 
     #[test]
@@ -3046,25 +3434,44 @@ mod tests {
         graph.update_file(&uri_b, &meta_b, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &uri_a { Some(artifacts_a.clone()) }
-            else if uri == &uri_b { Some(artifacts_b.clone()) }
-            else if uri == &uri_c { Some(artifacts_c.clone()) }
-            else { None }
+            if uri == &uri_a {
+                Some(artifacts_a.clone())
+            } else if uri == &uri_b {
+                Some(artifacts_b.clone())
+            } else if uri == &uri_c {
+                Some(artifacts_c.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &uri_a { Some(meta_a.clone()) }
-            else if uri == &uri_b { Some(meta_b.clone()) }
-            else { None }
+            if uri == &uri_a {
+                Some(meta_a.clone())
+            } else if uri == &uri_b {
+                Some(meta_b.clone())
+            } else {
+                None
+            }
         };
 
         // With max_depth=2, traversing c->b->a should exceed
         let scope = scope_at_position_with_graph(
-            &uri_c, u32::MAX, u32::MAX, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 2,
+            &uri_c,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            2,
         );
 
         // Should have depth_exceeded entry
-        assert!(!scope.depth_exceeded.is_empty(), "depth_exceeded should not be empty with max_depth=2");
+        assert!(
+            !scope.depth_exceeded.is_empty(),
+            "depth_exceeded should not be empty with max_depth=2"
+        );
     }
 
     #[test]
@@ -3080,7 +3487,7 @@ mod tests {
         let parent_code = "x <- 1\n# @lsp-source child.R\ny <- 2";
         let parent_tree = parse_r(parent_code);
         let mut parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-        
+
         // Manually add the directive source (normally done by directive parsing)
         parent_artifacts.timeline.push(ScopeEvent::Source {
             line: 1,
@@ -3089,7 +3496,7 @@ mod tests {
                 path: "child.R".to_string(),
                 line: 1,
                 column: 0,
-                is_directive: true,  // This is the key - it's a directive
+                is_directive: true, // This is the key - it's a directive
                 local: false,
                 chdir: false,
                 is_sys_source: false,
@@ -3099,7 +3506,11 @@ mod tests {
         parent_artifacts.timeline.sort_by_key(|e| match e {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                ..
+            } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
@@ -3110,24 +3521,38 @@ mod tests {
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "child.R" { Some(child_uri.clone()) } else { None }
+            if path == "child.R" {
+                Some(child_uri.clone())
+            } else {
+                None
+            }
         };
 
         // Before the @lsp-source directive (line 0), child_var should NOT be in scope
-        let scope_before = scope_at_position_with_deps(&parent_uri, 0, 10, &get_artifacts, &resolve_path, 10);
-        assert!(!scope_before.symbols.contains_key("child_var"), 
-            "child_var should NOT be in scope before @lsp-source directive");
+        let scope_before =
+            scope_at_position_with_deps(&parent_uri, 0, 10, &get_artifacts, &resolve_path, 10);
+        assert!(
+            !scope_before.symbols.contains_key("child_var"),
+            "child_var should NOT be in scope before @lsp-source directive"
+        );
 
         // After the @lsp-source directive (line 2), child_var SHOULD be in scope
-        let scope_after = scope_at_position_with_deps(&parent_uri, 2, 0, &get_artifacts, &resolve_path, 10);
-        assert!(scope_after.symbols.contains_key("child_var"), 
-            "child_var SHOULD be in scope after @lsp-source directive");
+        let scope_after =
+            scope_at_position_with_deps(&parent_uri, 2, 0, &get_artifacts, &resolve_path, 10);
+        assert!(
+            scope_after.symbols.contains_key("child_var"),
+            "child_var SHOULD be in scope after @lsp-source directive"
+        );
     }
 
     #[test]
@@ -3193,16 +3618,25 @@ mod tests {
         graph.update_file(&loader_uri, &loader_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &main_uri { Some(main_artifacts.clone()) }
-            else if uri == &loader_uri { Some(loader_artifacts.clone()) }
-            else if uri == &helpers_uri { Some(helpers_artifacts.clone()) }
-            else { None }
+            if uri == &main_uri {
+                Some(main_artifacts.clone())
+            } else if uri == &loader_uri {
+                Some(loader_artifacts.clone())
+            } else if uri == &helpers_uri {
+                Some(helpers_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &main_uri { Some(main_meta.clone()) }
-            else if uri == &loader_uri { Some(loader_meta.clone()) }
-            else { None }
+            if uri == &main_uri {
+                Some(main_meta.clone())
+            } else if uri == &loader_uri {
+                Some(loader_meta.clone())
+            } else {
+                None
+            }
         };
 
         // At end of main.R, helper_func should be available because:
@@ -3210,12 +3644,25 @@ mod tests {
         // 2. loader.R's working directory becomes /project/data/
         // 3. loader.R sources "helpers.R" which resolves to /project/data/helpers.R
         let scope = scope_at_position_with_graph(
-            &main_uri, u32::MAX, u32::MAX, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
 
         assert!(scope.symbols.contains_key("x"), "x should be available");
-        assert!(scope.symbols.contains_key("loader_var"), "loader_var should be available from loader.R");
-        assert!(scope.symbols.contains_key("helper_func"), "helper_func should be available from helpers.R via chdir");
+        assert!(
+            scope.symbols.contains_key("loader_var"),
+            "loader_var should be available from loader.R"
+        );
+        assert!(
+            scope.symbols.contains_key("helper_func"),
+            "helper_func should be available from helpers.R via chdir"
+        );
     }
 
     #[test]
@@ -3261,24 +3708,41 @@ mod tests {
         graph.update_file(&main_uri, &main_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &main_uri { Some(main_artifacts.clone()) }
-            else if uri == &helpers_uri { Some(helpers_artifacts.clone()) }
-            else { None }
+            if uri == &main_uri {
+                Some(main_artifacts.clone())
+            } else if uri == &helpers_uri {
+                Some(helpers_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &main_uri { Some(main_meta.clone()) }
-            else { None }
+            if uri == &main_uri {
+                Some(main_meta.clone())
+            } else {
+                None
+            }
         };
 
         // At end of main.R, helper_func should be available because:
         // 1. main.R has @lsp-working-directory /data
         // 2. source("helpers.R") resolves to /project/data/helpers.R
         let scope = scope_at_position_with_graph(
-            &main_uri, u32::MAX, u32::MAX, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &main_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
 
-        assert!(scope.symbols.contains_key("helper_func"), "helper_func should be available via working directory directive");
+        assert!(
+            scope.symbols.contains_key("helper_func"),
+            "helper_func should be available via working directory directive"
+        );
     }
 
     #[test]
@@ -3289,9 +3753,18 @@ mod tests {
 
         // Inside function body, parameters should be available
         let scope_inside = scope_at_position(&artifacts, 0, 30); // Position within function body
-        assert!(scope_inside.symbols.contains_key("x"), "Parameter x should be available inside function");
-        assert!(scope_inside.symbols.contains_key("y"), "Parameter y should be available inside function");
-        assert!(scope_inside.symbols.contains_key("my_func"), "Function name should be available inside function");
+        assert!(
+            scope_inside.symbols.contains_key("x"),
+            "Parameter x should be available inside function"
+        );
+        assert!(
+            scope_inside.symbols.contains_key("y"),
+            "Parameter y should be available inside function"
+        );
+        assert!(
+            scope_inside.symbols.contains_key("my_func"),
+            "Function name should be available inside function"
+        );
     }
 
     #[test]
@@ -3302,10 +3775,22 @@ mod tests {
 
         // Outside function, parameters should NOT be available
         let scope_outside = scope_at_position(&artifacts, 1, 10); // Position on second line
-        assert!(scope_outside.symbols.contains_key("my_func"), "Function name should be available outside function");
-        assert!(scope_outside.symbols.contains_key("result"), "Global variable should be available outside function");
-        assert!(!scope_outside.symbols.contains_key("x"), "Parameter x should NOT be available outside function");
-        assert!(!scope_outside.symbols.contains_key("y"), "Parameter y should NOT be available outside function");
+        assert!(
+            scope_outside.symbols.contains_key("my_func"),
+            "Function name should be available outside function"
+        );
+        assert!(
+            scope_outside.symbols.contains_key("result"),
+            "Global variable should be available outside function"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("x"),
+            "Parameter x should NOT be available outside function"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("y"),
+            "Parameter y should NOT be available outside function"
+        );
     }
 
     #[test]
@@ -3316,15 +3801,33 @@ mod tests {
 
         // Outside function, local variable should NOT be available
         let scope_outside = scope_at_position(&artifacts, 1, 10);
-        assert!(scope_outside.symbols.contains_key("my_func"), "Function name should be available outside function");
-        assert!(scope_outside.symbols.contains_key("global_var"), "Global variable should be available outside function");
-        assert!(!scope_outside.symbols.contains_key("local_var"), "Function-local variable should NOT be available outside function");
+        assert!(
+            scope_outside.symbols.contains_key("my_func"),
+            "Function name should be available outside function"
+        );
+        assert!(
+            scope_outside.symbols.contains_key("global_var"),
+            "Global variable should be available outside function"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("local_var"),
+            "Function-local variable should NOT be available outside function"
+        );
 
         // Inside function, local variable SHOULD be available
         let scope_inside = scope_at_position(&artifacts, 0, 40);
-        assert!(scope_inside.symbols.contains_key("my_func"), "Function name should be available inside function");
-        assert!(scope_inside.symbols.contains_key("local_var"), "Function-local variable should be available inside function");
-        assert!(!scope_inside.symbols.contains_key("global_var"), "Global variable defined after function should NOT be available inside function");
+        assert!(
+            scope_inside.symbols.contains_key("my_func"),
+            "Function name should be available inside function"
+        );
+        assert!(
+            scope_inside.symbols.contains_key("local_var"),
+            "Function-local variable should be available inside function"
+        );
+        assert!(
+            !scope_inside.symbols.contains_key("global_var"),
+            "Global variable defined after function should NOT be available inside function"
+        );
     }
 
     #[test]
@@ -3335,10 +3838,22 @@ mod tests {
 
         // Outside all functions
         let scope_outside = scope_at_position(&artifacts, 10, 0);
-        assert!(scope_outside.symbols.contains_key("outer"), "Outer function should be available outside");
-        assert!(!scope_outside.symbols.contains_key("inner"), "Inner function should NOT be available outside outer function");
-        assert!(!scope_outside.symbols.contains_key("outer_var"), "Outer function variable should NOT be available outside");
-        assert!(!scope_outside.symbols.contains_key("inner_var"), "Inner function variable should NOT be available outside");
+        assert!(
+            scope_outside.symbols.contains_key("outer"),
+            "Outer function should be available outside"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("inner"),
+            "Inner function should NOT be available outside outer function"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("outer_var"),
+            "Outer function variable should NOT be available outside"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("inner_var"),
+            "Inner function variable should NOT be available outside"
+        );
 
         // Inside outer function but outside inner function
         let inner_def_needle = "inner <- function";
@@ -3348,10 +3863,22 @@ mod tests {
             .map(|i| (i + 1) as u32)
             .unwrap_or(0);
         let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def);
-        assert!(scope_outer.symbols.contains_key("outer"), "Outer function should be available inside itself");
-        assert!(scope_outer.symbols.contains_key("outer_var"), "Outer function variable should be available inside outer function");
-        assert!(scope_outer.symbols.contains_key("inner"), "Inner function should be available inside outer function");
-        assert!(!scope_outer.symbols.contains_key("inner_var"), "Inner function variable should NOT be available outside inner function");
+        assert!(
+            scope_outer.symbols.contains_key("outer"),
+            "Outer function should be available inside itself"
+        );
+        assert!(
+            scope_outer.symbols.contains_key("outer_var"),
+            "Outer function variable should be available inside outer function"
+        );
+        assert!(
+            scope_outer.symbols.contains_key("inner"),
+            "Inner function should be available inside outer function"
+        );
+        assert!(
+            !scope_outer.symbols.contains_key("inner_var"),
+            "Inner function variable should NOT be available outside inner function"
+        );
 
         // Inside inner function
         let inner_var_def_needle = "inner_var <-";
@@ -3361,10 +3888,22 @@ mod tests {
             .map(|i| (i + 1) as u32)
             .unwrap_or(0);
         let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def);
-        assert!(scope_inner.symbols.contains_key("outer"), "Outer function should be available inside inner function");
-        assert!(scope_inner.symbols.contains_key("outer_var"), "Outer function variable should be available inside inner function");
-        assert!(scope_inner.symbols.contains_key("inner"), "Inner function should be available inside itself");
-        assert!(scope_inner.symbols.contains_key("inner_var"), "Inner function variable should be available inside inner function");
+        assert!(
+            scope_inner.symbols.contains_key("outer"),
+            "Outer function should be available inside inner function"
+        );
+        assert!(
+            scope_inner.symbols.contains_key("outer_var"),
+            "Outer function variable should be available inside inner function"
+        );
+        assert!(
+            scope_inner.symbols.contains_key("inner"),
+            "Inner function should be available inside itself"
+        );
+        assert!(
+            scope_inner.symbols.contains_key("inner_var"),
+            "Inner function variable should be available inside inner function"
+        );
     }
 
     #[test]
@@ -3375,30 +3914,84 @@ mod tests {
 
         // Inside first function
         let scope_func1 = scope_at_position(&artifacts, 0, 25);
-        assert!(scope_func1.symbols.contains_key("func1"), "Function 1 should be available inside itself");
-        assert!(scope_func1.symbols.contains_key("a"), "Parameter a should be available inside function 1");
-        assert!(scope_func1.symbols.contains_key("var1"), "Variable 1 should be available inside function 1");
-        assert!(!scope_func1.symbols.contains_key("func2"), "Function 2 should NOT be available inside function 1 (defined later)");
-        assert!(!scope_func1.symbols.contains_key("b"), "Parameter b should NOT be available inside function 1");
-        assert!(!scope_func1.symbols.contains_key("var2"), "Variable 2 should NOT be available inside function 1");
+        assert!(
+            scope_func1.symbols.contains_key("func1"),
+            "Function 1 should be available inside itself"
+        );
+        assert!(
+            scope_func1.symbols.contains_key("a"),
+            "Parameter a should be available inside function 1"
+        );
+        assert!(
+            scope_func1.symbols.contains_key("var1"),
+            "Variable 1 should be available inside function 1"
+        );
+        assert!(
+            !scope_func1.symbols.contains_key("func2"),
+            "Function 2 should NOT be available inside function 1 (defined later)"
+        );
+        assert!(
+            !scope_func1.symbols.contains_key("b"),
+            "Parameter b should NOT be available inside function 1"
+        );
+        assert!(
+            !scope_func1.symbols.contains_key("var2"),
+            "Variable 2 should NOT be available inside function 1"
+        );
 
         // Inside second function
         let scope_func2 = scope_at_position(&artifacts, 1, 25);
-        assert!(scope_func2.symbols.contains_key("func1"), "Function 1 should be available inside function 2");
-        assert!(scope_func2.symbols.contains_key("func2"), "Function 2 should be available inside itself");
-        assert!(scope_func2.symbols.contains_key("b"), "Parameter b should be available inside function 2");
-        assert!(scope_func2.symbols.contains_key("var2"), "Variable 2 should be available inside function 2");
-        assert!(!scope_func2.symbols.contains_key("a"), "Parameter a should NOT be available inside function 2");
-        assert!(!scope_func2.symbols.contains_key("var1"), "Variable 1 should NOT be available inside function 2");
+        assert!(
+            scope_func2.symbols.contains_key("func1"),
+            "Function 1 should be available inside function 2"
+        );
+        assert!(
+            scope_func2.symbols.contains_key("func2"),
+            "Function 2 should be available inside itself"
+        );
+        assert!(
+            scope_func2.symbols.contains_key("b"),
+            "Parameter b should be available inside function 2"
+        );
+        assert!(
+            scope_func2.symbols.contains_key("var2"),
+            "Variable 2 should be available inside function 2"
+        );
+        assert!(
+            !scope_func2.symbols.contains_key("a"),
+            "Parameter a should NOT be available inside function 2"
+        );
+        assert!(
+            !scope_func2.symbols.contains_key("var1"),
+            "Variable 1 should NOT be available inside function 2"
+        );
 
         // Outside both functions
         let scope_outside = scope_at_position(&artifacts, 10, 0);
-        assert!(scope_outside.symbols.contains_key("func1"), "Function 1 should be available outside");
-        assert!(scope_outside.symbols.contains_key("func2"), "Function 2 should be available outside");
-        assert!(!scope_outside.symbols.contains_key("a"), "Parameter a should NOT be available outside");
-        assert!(!scope_outside.symbols.contains_key("b"), "Parameter b should NOT be available outside");
-        assert!(!scope_outside.symbols.contains_key("var1"), "Variable 1 should NOT be available outside");
-        assert!(!scope_outside.symbols.contains_key("var2"), "Variable 2 should NOT be available outside");
+        assert!(
+            scope_outside.symbols.contains_key("func1"),
+            "Function 1 should be available outside"
+        );
+        assert!(
+            scope_outside.symbols.contains_key("func2"),
+            "Function 2 should be available outside"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("a"),
+            "Parameter a should NOT be available outside"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("b"),
+            "Parameter b should NOT be available outside"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("var1"),
+            "Variable 1 should NOT be available outside"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("var2"),
+            "Variable 2 should NOT be available outside"
+        );
     }
 
     #[test]
@@ -3408,9 +4001,10 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Should have FunctionScope event with parameters
-        let function_scope_event = artifacts.timeline.iter().find(|event| {
-            matches!(event, ScopeEvent::FunctionScope { .. })
-        });
+        let function_scope_event = artifacts
+            .timeline
+            .iter()
+            .find(|event| matches!(event, ScopeEvent::FunctionScope { .. }));
         assert!(function_scope_event.is_some());
 
         if let Some(ScopeEvent::FunctionScope { parameters, .. }) = function_scope_event {
@@ -3433,9 +4027,10 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Should have FunctionScope event with parameters including ellipsis
-        let function_scope_event = artifacts.timeline.iter().find(|event| {
-            matches!(event, ScopeEvent::FunctionScope { .. })
-        });
+        let function_scope_event = artifacts
+            .timeline
+            .iter()
+            .find(|event| matches!(event, ScopeEvent::FunctionScope { .. }));
         assert!(function_scope_event.is_some());
 
         if let Some(ScopeEvent::FunctionScope { parameters, .. }) = function_scope_event {
@@ -3458,9 +4053,10 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Should have FunctionScope event with empty parameters
-        let function_scope_event = artifacts.timeline.iter().find(|event| {
-            matches!(event, ScopeEvent::FunctionScope { .. })
-        });
+        let function_scope_event = artifacts
+            .timeline
+            .iter()
+            .find(|event| matches!(event, ScopeEvent::FunctionScope { .. }));
         assert!(function_scope_event.is_some());
 
         if let Some(ScopeEvent::FunctionScope { parameters, .. }) = function_scope_event {
@@ -3481,19 +4077,40 @@ mod tests {
 
         // Query at EOF position
         let scope_eof = scope_at_position(&artifacts, u32::MAX, u32::MAX);
-        
+
         // Should have global symbols
-        assert!(scope_eof.symbols.contains_key("func1"), "func1 should be available at EOF");
-        assert!(scope_eof.symbols.contains_key("func2"), "func2 should be available at EOF");
-        assert!(scope_eof.symbols.contains_key("global_var"), "global_var should be available at EOF");
-        
+        assert!(
+            scope_eof.symbols.contains_key("func1"),
+            "func1 should be available at EOF"
+        );
+        assert!(
+            scope_eof.symbols.contains_key("func2"),
+            "func2 should be available at EOF"
+        );
+        assert!(
+            scope_eof.symbols.contains_key("global_var"),
+            "global_var should be available at EOF"
+        );
+
         // Should NOT have function parameters (this was the bug)
-        assert!(!scope_eof.symbols.contains_key("param1"), "param1 should NOT be available at EOF");
-        assert!(!scope_eof.symbols.contains_key("param2"), "param2 should NOT be available at EOF");
-        
+        assert!(
+            !scope_eof.symbols.contains_key("param1"),
+            "param1 should NOT be available at EOF"
+        );
+        assert!(
+            !scope_eof.symbols.contains_key("param2"),
+            "param2 should NOT be available at EOF"
+        );
+
         // Should NOT have function-local variables
-        assert!(!scope_eof.symbols.contains_key("var1"), "var1 should NOT be available at EOF");
-        assert!(!scope_eof.symbols.contains_key("var2"), "var2 should NOT be available at EOF");
+        assert!(
+            !scope_eof.symbols.contains_key("var1"),
+            "var1 should NOT be available at EOF"
+        );
+        assert!(
+            !scope_eof.symbols.contains_key("var2"),
+            "var2 should NOT be available at EOF"
+        );
     }
 
     // ============================================================================
@@ -3512,7 +4129,12 @@ mod tests {
         };
 
         match removal {
-            ScopeEvent::Removal { line, column, symbols, .. } => {
+            ScopeEvent::Removal {
+                line,
+                column,
+                symbols,
+                ..
+            } => {
                 assert_eq!(line, 5);
                 assert_eq!(column, 0);
                 assert_eq!(symbols.len(), 1);
@@ -3533,7 +4155,12 @@ mod tests {
         };
 
         match removal {
-            ScopeEvent::Removal { line, column, symbols, .. } => {
+            ScopeEvent::Removal {
+                line,
+                column,
+                symbols,
+                ..
+            } => {
                 assert_eq!(line, 10);
                 assert_eq!(column, 4);
                 assert_eq!(symbols.len(), 3);
@@ -3556,7 +4183,12 @@ mod tests {
         };
 
         match removal {
-            ScopeEvent::Removal { line, column, symbols, .. } => {
+            ScopeEvent::Removal {
+                line,
+                column,
+                symbols,
+                ..
+            } => {
                 assert_eq!(line, 0);
                 assert_eq!(column, 0);
                 assert!(symbols.is_empty());
@@ -3599,16 +4231,23 @@ mod tests {
         events.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                ..
+            } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order: (2,0), (5,5), (5,10), (10,0)
-        let positions: Vec<(u32, u32)> = events.iter().map(|e| match e {
-            ScopeEvent::Removal { line, column, .. } => (*line, *column),
-            _ => panic!("Expected Removal event"),
-        }).collect();
+        let positions: Vec<(u32, u32)> = events
+            .iter()
+            .map(|e| match e {
+                ScopeEvent::Removal { line, column, .. } => (*line, *column),
+                _ => panic!("Expected Removal event"),
+            })
+            .collect();
 
         assert_eq!(positions, vec![(2, 0), (5, 5), (5, 10), (10, 0)]);
     }
@@ -3640,16 +4279,23 @@ mod tests {
         events.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                ..
+            } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order by column: 5, 10, 20
-        let columns: Vec<u32> = events.iter().map(|e| match e {
-            ScopeEvent::Removal { column, .. } => *column,
-            _ => panic!("Expected Removal event"),
-        }).collect();
+        let columns: Vec<u32> = events
+            .iter()
+            .map(|e| match e {
+                ScopeEvent::Removal { column, .. } => *column,
+                _ => panic!("Expected Removal event"),
+            })
+            .collect();
 
         assert_eq!(columns, vec![5, 10, 20]);
     }
@@ -3694,26 +4340,36 @@ mod tests {
         events.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                ..
+            } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order: Def(1,0), Removal(3,0), Def(5,0)
-        let event_types: Vec<&str> = events.iter().map(|e| match e {
-            ScopeEvent::Def { .. } => "Def",
-            ScopeEvent::Removal { .. } => "Removal",
-            _ => "Other",
-        }).collect();
+        let event_types: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                ScopeEvent::Def { .. } => "Def",
+                ScopeEvent::Removal { .. } => "Removal",
+                _ => "Other",
+            })
+            .collect();
 
         assert_eq!(event_types, vec!["Def", "Removal", "Def"]);
 
         // Verify positions
-        let positions: Vec<(u32, u32)> = events.iter().map(|e| match e {
-            ScopeEvent::Def { line, column, .. } => (*line, *column),
-            ScopeEvent::Removal { line, column, .. } => (*line, *column),
-            _ => (0, 0),
-        }).collect();
+        let positions: Vec<(u32, u32)> = events
+            .iter()
+            .map(|e| match e {
+                ScopeEvent::Def { line, column, .. } => (*line, *column),
+                ScopeEvent::Removal { line, column, .. } => (*line, *column),
+                _ => (0, 0),
+            })
+            .collect();
 
         assert_eq!(positions, vec![(1, 0), (3, 0), (5, 0)]);
     }
@@ -3755,17 +4411,24 @@ mod tests {
         events.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                ..
+            } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order: Source(1,0), Removal(2,0), Removal(4,0)
-        let event_types: Vec<&str> = events.iter().map(|e| match e {
-            ScopeEvent::Source { .. } => "Source",
-            ScopeEvent::Removal { .. } => "Removal",
-            _ => "Other",
-        }).collect();
+        let event_types: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                ScopeEvent::Source { .. } => "Source",
+                ScopeEvent::Removal { .. } => "Removal",
+                _ => "Other",
+            })
+            .collect();
 
         assert_eq!(event_types, vec!["Source", "Removal", "Removal"]);
     }
@@ -3827,30 +4490,43 @@ mod tests {
         events.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                ..
+            } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
 
         // Verify order: Def(1,0), Source(3,0), Removal(5,0), FunctionScope(7,0), Removal(9,0)
-        let event_types: Vec<&str> = events.iter().map(|e| match e {
-            ScopeEvent::Def { .. } => "Def",
-            ScopeEvent::Source { .. } => "Source",
-            ScopeEvent::FunctionScope { .. } => "FunctionScope",
-            ScopeEvent::Removal { .. } => "Removal",
-            ScopeEvent::PackageLoad { .. } => "PackageLoad",
-        }).collect();
+        let event_types: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                ScopeEvent::Def { .. } => "Def",
+                ScopeEvent::Source { .. } => "Source",
+                ScopeEvent::FunctionScope { .. } => "FunctionScope",
+                ScopeEvent::Removal { .. } => "Removal",
+                ScopeEvent::PackageLoad { .. } => "PackageLoad",
+            })
+            .collect();
 
-        assert_eq!(event_types, vec!["Def", "Source", "Removal", "FunctionScope", "Removal"]);
+        assert_eq!(
+            event_types,
+            vec!["Def", "Source", "Removal", "FunctionScope", "Removal"]
+        );
 
         // Verify positions
-        let positions: Vec<u32> = events.iter().map(|e| match e {
-            ScopeEvent::Def { line, .. } => *line,
-            ScopeEvent::Source { line, .. } => *line,
-            ScopeEvent::FunctionScope { start_line, .. } => *start_line,
-            ScopeEvent::Removal { line, .. } => *line,
-            ScopeEvent::PackageLoad { line, .. } => *line,
-        }).collect();
+        let positions: Vec<u32> = events
+            .iter()
+            .map(|e| match e {
+                ScopeEvent::Def { line, .. } => *line,
+                ScopeEvent::Source { line, .. } => *line,
+                ScopeEvent::FunctionScope { start_line, .. } => *start_line,
+                ScopeEvent::Removal { line, .. } => *line,
+                ScopeEvent::PackageLoad { line, .. } => *line,
+            })
+            .collect();
 
         assert_eq!(positions, vec![1, 3, 5, 7, 9]);
     }
@@ -3884,7 +4560,11 @@ mod tests {
         events.sort_by_key(|event| match event {
             ScopeEvent::Def { line, column, .. } => (*line, *column),
             ScopeEvent::Source { line, column, .. } => (*line, *column),
-            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                ..
+            } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
         });
@@ -3916,8 +4596,18 @@ mod tests {
 
         match (original, cloned) {
             (
-                ScopeEvent::Removal { line: l1, column: c1, symbols: s1, .. },
-                ScopeEvent::Removal { line: l2, column: c2, symbols: s2, .. },
+                ScopeEvent::Removal {
+                    line: l1,
+                    column: c1,
+                    symbols: s1,
+                    ..
+                },
+                ScopeEvent::Removal {
+                    line: l2,
+                    column: c2,
+                    symbols: s2,
+                    ..
+                },
             ) => {
                 assert_eq!(l1, l2);
                 assert_eq!(c1, c2);
@@ -3941,14 +4631,18 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Should have both Def and Removal events in timeline
-        let def_events: Vec<_> = artifacts.timeline.iter()
+        let def_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Def { line, symbol, .. } => Some((*line, symbol.name.clone())),
                 _ => None,
             })
             .collect();
 
-        let removal_events: Vec<_> = artifacts.timeline.iter()
+        let removal_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Removal { line, symbols, .. } => Some((*line, symbols.clone())),
                 _ => None,
@@ -3963,10 +4657,15 @@ mod tests {
         // Verify Removal event for x on line 1
         assert_eq!(removal_events.len(), 1, "Should have one Removal event");
         assert_eq!(removal_events[0].0, 1, "Removal should be on line 1");
-        assert!(removal_events[0].1.contains(&"x".to_string()), "Removal should contain 'x'");
+        assert!(
+            removal_events[0].1.contains(&"x".to_string()),
+            "Removal should contain 'x'"
+        );
 
         // Verify timeline order: Def comes before Removal
-        let timeline_order: Vec<(&str, u32)> = artifacts.timeline.iter()
+        let timeline_order: Vec<(&str, u32)> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Def { line, .. } => Some(("Def", *line)),
                 ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
@@ -3976,7 +4675,11 @@ mod tests {
 
         assert_eq!(timeline_order.len(), 2);
         assert_eq!(timeline_order[0], ("Def", 0), "Def should come first");
-        assert_eq!(timeline_order[1], ("Removal", 1), "Removal should come second");
+        assert_eq!(
+            timeline_order[1],
+            ("Removal", 1),
+            "Removal should come second"
+        );
     }
 
     #[test]
@@ -3988,7 +4691,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Verify timeline order: Removal comes before Def
-        let timeline_order: Vec<(&str, u32)> = artifacts.timeline.iter()
+        let timeline_order: Vec<(&str, u32)> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Def { line, .. } => Some(("Def", *line)),
                 ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
@@ -3997,7 +4702,11 @@ mod tests {
             .collect();
 
         assert_eq!(timeline_order.len(), 2);
-        assert_eq!(timeline_order[0], ("Removal", 0), "Removal should come first");
+        assert_eq!(
+            timeline_order[0],
+            ("Removal", 0),
+            "Removal should come first"
+        );
         assert_eq!(timeline_order[1], ("Def", 1), "Def should come second");
     }
 
@@ -4011,28 +4720,59 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Collect all events with their types and positions
-        let timeline_events: Vec<(&str, u32, Vec<String>)> = artifacts.timeline.iter()
+        let timeline_events: Vec<(&str, u32, Vec<String>)> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
-                ScopeEvent::Def { line, symbol, .. } => Some(("Def", *line, vec![symbol.name.clone()])),
-                ScopeEvent::Removal { line, symbols, .. } => Some(("Removal", *line, symbols.clone())),
+                ScopeEvent::Def { line, symbol, .. } => {
+                    Some(("Def", *line, vec![symbol.name.clone()]))
+                }
+                ScopeEvent::Removal { line, symbols, .. } => {
+                    Some(("Removal", *line, symbols.clone()))
+                }
                 _ => None,
             })
             .collect();
 
         // Should have 5 events total: 3 Defs and 2 Removals
-        assert_eq!(timeline_events.len(), 5, "Should have 5 events (3 Defs + 2 Removals)");
+        assert_eq!(
+            timeline_events.len(),
+            5,
+            "Should have 5 events (3 Defs + 2 Removals)"
+        );
 
         // Verify order and content
-        assert_eq!(timeline_events[0], ("Def", 0, vec!["x".to_string()]), "First: Def x on line 0");
-        assert_eq!(timeline_events[1], ("Def", 1, vec!["y".to_string()]), "Second: Def y on line 1");
+        assert_eq!(
+            timeline_events[0],
+            ("Def", 0, vec!["x".to_string()]),
+            "First: Def x on line 0"
+        );
+        assert_eq!(
+            timeline_events[1],
+            ("Def", 1, vec!["y".to_string()]),
+            "Second: Def y on line 1"
+        );
         assert_eq!(timeline_events[2].0, "Removal", "Third: Removal");
         assert_eq!(timeline_events[2].1, 2, "Third: on line 2");
-        assert!(timeline_events[2].2.contains(&"x".to_string()), "Third: contains x");
-        assert_eq!(timeline_events[3], ("Def", 3, vec!["z".to_string()]), "Fourth: Def z on line 3");
+        assert!(
+            timeline_events[2].2.contains(&"x".to_string()),
+            "Third: contains x"
+        );
+        assert_eq!(
+            timeline_events[3],
+            ("Def", 3, vec!["z".to_string()]),
+            "Fourth: Def z on line 3"
+        );
         assert_eq!(timeline_events[4].0, "Removal", "Fifth: Removal");
         assert_eq!(timeline_events[4].1, 4, "Fifth: on line 4");
-        assert!(timeline_events[4].2.contains(&"y".to_string()), "Fifth: contains y");
-        assert!(timeline_events[4].2.contains(&"z".to_string()), "Fifth: contains z");
+        assert!(
+            timeline_events[4].2.contains(&"y".to_string()),
+            "Fifth: contains y"
+        );
+        assert!(
+            timeline_events[4].2.contains(&"z".to_string()),
+            "Fifth: contains z"
+        );
     }
 
     #[test]
@@ -4045,7 +4785,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Collect all events with their types and positions
-        let timeline_events: Vec<(&str, u32)> = artifacts.timeline.iter()
+        let timeline_events: Vec<(&str, u32)> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Source { line, .. } => Some(("Source", *line)),
                 ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
@@ -4054,14 +4796,24 @@ mod tests {
             .collect();
 
         // Should have 2 events: Source and Removal
-        assert_eq!(timeline_events.len(), 2, "Should have 2 events (Source + Removal)");
+        assert_eq!(
+            timeline_events.len(),
+            2,
+            "Should have 2 events (Source + Removal)"
+        );
 
         // Verify order
         assert_eq!(timeline_events[0], ("Source", 0), "First: Source on line 0");
-        assert_eq!(timeline_events[1], ("Removal", 1), "Second: Removal on line 1");
+        assert_eq!(
+            timeline_events[1],
+            ("Removal", 1),
+            "Second: Removal on line 1"
+        );
 
         // Verify the removal contains the correct symbol
-        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+        let removal_symbols: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
                 _ => None,
@@ -4069,8 +4821,10 @@ mod tests {
             .collect();
 
         assert_eq!(removal_symbols.len(), 1);
-        assert!(removal_symbols[0].contains(&"helper_func".to_string()), 
-            "Removal should contain 'helper_func'");
+        assert!(
+            removal_symbols[0].contains(&"helper_func".to_string()),
+            "Removal should contain 'helper_func'"
+        );
     }
 
     #[test]
@@ -4082,7 +4836,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Verify timeline has both Def and Removal
-        let timeline_order: Vec<(&str, u32)> = artifacts.timeline.iter()
+        let timeline_order: Vec<(&str, u32)> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Def { line, .. } => Some(("Def", *line)),
                 ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
@@ -4092,10 +4848,16 @@ mod tests {
 
         assert_eq!(timeline_order.len(), 2);
         assert_eq!(timeline_order[0], ("Def", 0), "Def should come first");
-        assert_eq!(timeline_order[1], ("Removal", 1), "Removal should come second");
+        assert_eq!(
+            timeline_order[1],
+            ("Removal", 1),
+            "Removal should come second"
+        );
 
         // Verify the removal contains the correct symbol
-        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+        let removal_symbols: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
                 _ => None,
@@ -4103,8 +4865,10 @@ mod tests {
             .collect();
 
         assert_eq!(removal_symbols.len(), 1);
-        assert!(removal_symbols[0].contains(&"x".to_string()), 
-            "Removal via remove() should contain 'x'");
+        assert!(
+            removal_symbols[0].contains(&"x".to_string()),
+            "Removal via remove() should contain 'x'"
+        );
     }
 
     #[test]
@@ -4116,7 +4880,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Verify timeline has Defs and Removal
-        let timeline_events: Vec<(&str, u32)> = artifacts.timeline.iter()
+        let timeline_events: Vec<(&str, u32)> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Def { line, .. } => Some(("Def", *line)),
                 ScopeEvent::Removal { line, .. } => Some(("Removal", *line)),
@@ -4124,13 +4890,19 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(timeline_events.len(), 3, "Should have 3 events (2 Defs + 1 Removal)");
+        assert_eq!(
+            timeline_events.len(),
+            3,
+            "Should have 3 events (2 Defs + 1 Removal)"
+        );
         assert_eq!(timeline_events[0], ("Def", 0));
         assert_eq!(timeline_events[1], ("Def", 1));
         assert_eq!(timeline_events[2], ("Removal", 2));
 
         // Verify the removal contains both symbols
-        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+        let removal_symbols: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
                 _ => None,
@@ -4138,10 +4910,14 @@ mod tests {
             .collect();
 
         assert_eq!(removal_symbols.len(), 1);
-        assert!(removal_symbols[0].contains(&"x".to_string()), 
-            "Removal should contain 'x'");
-        assert!(removal_symbols[0].contains(&"y".to_string()), 
-            "Removal should contain 'y'");
+        assert!(
+            removal_symbols[0].contains(&"x".to_string()),
+            "Removal should contain 'x'"
+        );
+        assert!(
+            removal_symbols[0].contains(&"y".to_string()),
+            "Removal should contain 'y'"
+        );
     }
 
     #[test]
@@ -4153,7 +4929,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Verify the removal contains all three symbols
-        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+        let removal_symbols: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
                 _ => None,
@@ -4161,12 +4939,18 @@ mod tests {
             .collect();
 
         assert_eq!(removal_symbols.len(), 1, "Should have one Removal event");
-        assert!(removal_symbols[0].contains(&"a".to_string()), 
-            "Removal should contain 'a' (bare symbol)");
-        assert!(removal_symbols[0].contains(&"b".to_string()), 
-            "Removal should contain 'b' (from list)");
-        assert!(removal_symbols[0].contains(&"c".to_string()), 
-            "Removal should contain 'c' (from list)");
+        assert!(
+            removal_symbols[0].contains(&"a".to_string()),
+            "Removal should contain 'a' (bare symbol)"
+        );
+        assert!(
+            removal_symbols[0].contains(&"b".to_string()),
+            "Removal should contain 'b' (from list)"
+        );
+        assert!(
+            removal_symbols[0].contains(&"c".to_string()),
+            "Removal should contain 'c' (from list)"
+        );
     }
 
     #[test]
@@ -4178,14 +4962,22 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Verify timeline has FunctionScope, Def, and Removal
-        let has_function_scope = artifacts.timeline.iter().any(|e| matches!(e, ScopeEvent::FunctionScope { .. }));
-        let has_removal = artifacts.timeline.iter().any(|e| matches!(e, ScopeEvent::Removal { .. }));
+        let has_function_scope = artifacts
+            .timeline
+            .iter()
+            .any(|e| matches!(e, ScopeEvent::FunctionScope { .. }));
+        let has_removal = artifacts
+            .timeline
+            .iter()
+            .any(|e| matches!(e, ScopeEvent::Removal { .. }));
 
         assert!(has_function_scope, "Should have FunctionScope event");
         assert!(has_removal, "Should have Removal event inside function");
 
         // Verify the removal is for 'x'
-        let removal_symbols: Vec<_> = artifacts.timeline.iter()
+        let removal_symbols: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Removal { symbols, .. } => Some(symbols.clone()),
                 _ => None,
@@ -4193,8 +4985,10 @@ mod tests {
             .collect();
 
         assert_eq!(removal_symbols.len(), 1);
-        assert!(removal_symbols[0].contains(&"x".to_string()), 
-            "Removal should contain 'x'");
+        assert!(
+            removal_symbols[0].contains(&"x".to_string()),
+            "Removal should contain 'x'"
+        );
     }
 
     #[test]
@@ -4206,11 +5000,16 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Should have Def but no Removal (envir= filters it out)
-        let removal_count = artifacts.timeline.iter()
+        let removal_count = artifacts
+            .timeline
+            .iter()
             .filter(|e| matches!(e, ScopeEvent::Removal { .. }))
             .count();
 
-        assert_eq!(removal_count, 0, "Should have no Removal events when envir= is non-default");
+        assert_eq!(
+            removal_count, 0,
+            "Should have no Removal events when envir= is non-default"
+        );
     }
 
     #[test]
@@ -4222,11 +5021,16 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Should have both Def and Removal (globalenv() is default-equivalent)
-        let removal_count = artifacts.timeline.iter()
+        let removal_count = artifacts
+            .timeline
+            .iter()
             .filter(|e| matches!(e, ScopeEvent::Removal { .. }))
             .count();
 
-        assert_eq!(removal_count, 1, "Should have one Removal event when envir=globalenv()");
+        assert_eq!(
+            removal_count, 1,
+            "Should have one Removal event when envir=globalenv()"
+        );
     }
 
     #[test]
@@ -4238,7 +5042,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Collect all events with their types and line numbers
-        let timeline_events: Vec<(&str, u32)> = artifacts.timeline.iter()
+        let timeline_events: Vec<(&str, u32)> = artifacts
+            .timeline
+            .iter()
             .map(|e| match e {
                 ScopeEvent::Def { line, .. } => ("Def", *line),
                 ScopeEvent::Source { line, .. } => ("Source", *line),
@@ -4252,13 +5058,24 @@ mod tests {
         let lines: Vec<u32> = timeline_events.iter().map(|(_, line)| *line).collect();
         let mut sorted_lines = lines.clone();
         sorted_lines.sort();
-        assert_eq!(lines, sorted_lines, "Timeline should be sorted by line number");
+        assert_eq!(
+            lines, sorted_lines,
+            "Timeline should be sorted by line number"
+        );
 
         // Verify expected order: Def(0), Source(1), Def(2), Removal(3), Def(4)
         assert_eq!(timeline_events[0], ("Def", 0), "First: Def a on line 0");
-        assert_eq!(timeline_events[1], ("Source", 1), "Second: Source on line 1");
+        assert_eq!(
+            timeline_events[1],
+            ("Source", 1),
+            "Second: Source on line 1"
+        );
         assert_eq!(timeline_events[2], ("Def", 2), "Third: Def b on line 2");
-        assert_eq!(timeline_events[3], ("Removal", 3), "Fourth: Removal on line 3");
+        assert_eq!(
+            timeline_events[3],
+            ("Removal", 3),
+            "Fourth: Removal on line 3"
+        );
         assert_eq!(timeline_events[4], ("Def", 4), "Fifth: Def c on line 4");
     }
 
@@ -4277,18 +5094,24 @@ mod tests {
 
         // Before rm() (line 0, after definition), x should be in scope
         let scope_before_rm = scope_at_position(&artifacts, 0, 10);
-        assert!(scope_before_rm.symbols.contains_key("x"), 
-            "x should be in scope after definition but before rm()");
+        assert!(
+            scope_before_rm.symbols.contains_key("x"),
+            "x should be in scope after definition but before rm()"
+        );
 
         // After rm() (line 1, after rm call), x should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 1, 10);
-        assert!(!scope_after_rm.symbols.contains_key("x"), 
-            "x should NOT be in scope after rm()");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after rm()"
+        );
 
         // At end of file, x should NOT be in scope
         let scope_eof = scope_at_position(&artifacts, 10, 0);
-        assert!(!scope_eof.symbols.contains_key("x"), 
-            "x should NOT be in scope at end of file after rm()");
+        assert!(
+            !scope_eof.symbols.contains_key("x"),
+            "x should NOT be in scope at end of file after rm()"
+        );
     }
 
     #[test]
@@ -4302,18 +5125,24 @@ mod tests {
         // After rm() but before definition (line 0), x should NOT be in scope
         // (rm() on undefined symbol has no effect, but x is still not defined)
         let scope_after_rm = scope_at_position(&artifacts, 0, 10);
-        assert!(!scope_after_rm.symbols.contains_key("x"), 
-            "x should NOT be in scope after rm() of undefined symbol");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after rm() of undefined symbol"
+        );
 
         // After definition (line 1), x should be in scope
         let scope_after_def = scope_at_position(&artifacts, 1, 10);
-        assert!(scope_after_def.symbols.contains_key("x"), 
-            "x should be in scope after definition");
+        assert!(
+            scope_after_def.symbols.contains_key("x"),
+            "x should be in scope after definition"
+        );
 
         // At end of file, x should be in scope
         let scope_eof = scope_at_position(&artifacts, 10, 0);
-        assert!(scope_eof.symbols.contains_key("x"), 
-            "x should be in scope at end of file after definition");
+        assert!(
+            scope_eof.symbols.contains_key("x"),
+            "x should be in scope at end of file after definition"
+        );
     }
 
     #[test]
@@ -4326,23 +5155,31 @@ mod tests {
 
         // After first definition (line 0), x should be in scope
         let scope_after_first_def = scope_at_position(&artifacts, 0, 10);
-        assert!(scope_after_first_def.symbols.contains_key("x"), 
-            "x should be in scope after first definition");
+        assert!(
+            scope_after_first_def.symbols.contains_key("x"),
+            "x should be in scope after first definition"
+        );
 
         // After rm() (line 1), x should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 1, 10);
-        assert!(!scope_after_rm.symbols.contains_key("x"), 
-            "x should NOT be in scope after rm()");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after rm()"
+        );
 
         // After second definition (line 2), x should be in scope again
         let scope_after_second_def = scope_at_position(&artifacts, 2, 10);
-        assert!(scope_after_second_def.symbols.contains_key("x"), 
-            "x should be in scope after second definition");
+        assert!(
+            scope_after_second_def.symbols.contains_key("x"),
+            "x should be in scope after second definition"
+        );
 
         // At end of file, x should be in scope
         let scope_eof = scope_at_position(&artifacts, 10, 0);
-        assert!(scope_eof.symbols.contains_key("x"), 
-            "x should be in scope at end of file after re-definition");
+        assert!(
+            scope_eof.symbols.contains_key("x"),
+            "x should be in scope at end of file after re-definition"
+        );
     }
 
     #[test]
@@ -4355,33 +5192,78 @@ mod tests {
 
         // Line 0: only 'a' is defined
         let scope_line0 = scope_at_position(&artifacts, 0, 10);
-        assert!(scope_line0.symbols.contains_key("a"), "a should be in scope on line 0");
-        assert!(!scope_line0.symbols.contains_key("b"), "b should NOT be in scope on line 0");
-        assert!(!scope_line0.symbols.contains_key("c"), "c should NOT be in scope on line 0");
+        assert!(
+            scope_line0.symbols.contains_key("a"),
+            "a should be in scope on line 0"
+        );
+        assert!(
+            !scope_line0.symbols.contains_key("b"),
+            "b should NOT be in scope on line 0"
+        );
+        assert!(
+            !scope_line0.symbols.contains_key("c"),
+            "c should NOT be in scope on line 0"
+        );
 
         // Line 1: 'a' and 'b' are defined
         let scope_line1 = scope_at_position(&artifacts, 1, 10);
-        assert!(scope_line1.symbols.contains_key("a"), "a should be in scope on line 1");
-        assert!(scope_line1.symbols.contains_key("b"), "b should be in scope on line 1");
-        assert!(!scope_line1.symbols.contains_key("c"), "c should NOT be in scope on line 1");
+        assert!(
+            scope_line1.symbols.contains_key("a"),
+            "a should be in scope on line 1"
+        );
+        assert!(
+            scope_line1.symbols.contains_key("b"),
+            "b should be in scope on line 1"
+        );
+        assert!(
+            !scope_line1.symbols.contains_key("c"),
+            "c should NOT be in scope on line 1"
+        );
 
         // Line 2: 'a' is removed, only 'b' remains
         let scope_line2 = scope_at_position(&artifacts, 2, 10);
-        assert!(!scope_line2.symbols.contains_key("a"), "a should NOT be in scope on line 2 (after rm)");
-        assert!(scope_line2.symbols.contains_key("b"), "b should be in scope on line 2");
-        assert!(!scope_line2.symbols.contains_key("c"), "c should NOT be in scope on line 2");
+        assert!(
+            !scope_line2.symbols.contains_key("a"),
+            "a should NOT be in scope on line 2 (after rm)"
+        );
+        assert!(
+            scope_line2.symbols.contains_key("b"),
+            "b should be in scope on line 2"
+        );
+        assert!(
+            !scope_line2.symbols.contains_key("c"),
+            "c should NOT be in scope on line 2"
+        );
 
         // Line 3: 'b' and 'c' are defined, 'a' is still removed
         let scope_line3 = scope_at_position(&artifacts, 3, 10);
-        assert!(!scope_line3.symbols.contains_key("a"), "a should NOT be in scope on line 3");
-        assert!(scope_line3.symbols.contains_key("b"), "b should be in scope on line 3");
-        assert!(scope_line3.symbols.contains_key("c"), "c should be in scope on line 3");
+        assert!(
+            !scope_line3.symbols.contains_key("a"),
+            "a should NOT be in scope on line 3"
+        );
+        assert!(
+            scope_line3.symbols.contains_key("b"),
+            "b should be in scope on line 3"
+        );
+        assert!(
+            scope_line3.symbols.contains_key("c"),
+            "c should be in scope on line 3"
+        );
 
         // Line 4: 'b' and 'c' are removed, nothing remains
         let scope_line4 = scope_at_position(&artifacts, 4, 10);
-        assert!(!scope_line4.symbols.contains_key("a"), "a should NOT be in scope on line 4");
-        assert!(!scope_line4.symbols.contains_key("b"), "b should NOT be in scope on line 4 (after rm)");
-        assert!(!scope_line4.symbols.contains_key("c"), "c should NOT be in scope on line 4 (after rm)");
+        assert!(
+            !scope_line4.symbols.contains_key("a"),
+            "a should NOT be in scope on line 4"
+        );
+        assert!(
+            !scope_line4.symbols.contains_key("b"),
+            "b should NOT be in scope on line 4 (after rm)"
+        );
+        assert!(
+            !scope_line4.symbols.contains_key("c"),
+            "c should NOT be in scope on line 4 (after rm)"
+        );
     }
 
     #[test]
@@ -4394,13 +5276,25 @@ mod tests {
 
         // Before rm() (line 1), both x and y should be in scope
         let scope_before_rm = scope_at_position(&artifacts, 1, 10);
-        assert!(scope_before_rm.symbols.contains_key("x"), "x should be in scope before rm()");
-        assert!(scope_before_rm.symbols.contains_key("y"), "y should be in scope before rm()");
+        assert!(
+            scope_before_rm.symbols.contains_key("x"),
+            "x should be in scope before rm()"
+        );
+        assert!(
+            scope_before_rm.symbols.contains_key("y"),
+            "y should be in scope before rm()"
+        );
 
         // After rm() (line 2), neither x nor y should be in scope
         let scope_after_rm = scope_at_position(&artifacts, 2, 10);
-        assert!(!scope_after_rm.symbols.contains_key("x"), "x should NOT be in scope after rm()");
-        assert!(!scope_after_rm.symbols.contains_key("y"), "y should NOT be in scope after rm()");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after rm()"
+        );
+        assert!(
+            !scope_after_rm.symbols.contains_key("y"),
+            "y should NOT be in scope after rm()"
+        );
     }
 
     #[test]
@@ -4413,13 +5307,25 @@ mod tests {
 
         // Before rm() (line 1), both x and y should be in scope
         let scope_before_rm = scope_at_position(&artifacts, 1, 10);
-        assert!(scope_before_rm.symbols.contains_key("x"), "x should be in scope before rm()");
-        assert!(scope_before_rm.symbols.contains_key("y"), "y should be in scope before rm()");
+        assert!(
+            scope_before_rm.symbols.contains_key("x"),
+            "x should be in scope before rm()"
+        );
+        assert!(
+            scope_before_rm.symbols.contains_key("y"),
+            "y should be in scope before rm()"
+        );
 
         // After rm() (line 2), neither x nor y should be in scope
         let scope_after_rm = scope_at_position(&artifacts, 2, 10);
-        assert!(!scope_after_rm.symbols.contains_key("x"), "x should NOT be in scope after rm(list=...)");
-        assert!(!scope_after_rm.symbols.contains_key("y"), "y should NOT be in scope after rm(list=...)");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after rm(list=...)"
+        );
+        assert!(
+            !scope_after_rm.symbols.contains_key("y"),
+            "y should NOT be in scope after rm(list=...)"
+        );
     }
 
     #[test]
@@ -4432,13 +5338,17 @@ mod tests {
 
         // Before remove() (line 0), x should be in scope
         let scope_before_rm = scope_at_position(&artifacts, 0, 10);
-        assert!(scope_before_rm.symbols.contains_key("x"), 
-            "x should be in scope before remove()");
+        assert!(
+            scope_before_rm.symbols.contains_key("x"),
+            "x should be in scope before remove()"
+        );
 
         // After remove() (line 1), x should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 1, 10);
-        assert!(!scope_after_rm.symbols.contains_key("x"), 
-            "x should NOT be in scope after remove()");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after remove()"
+        );
     }
 
     #[test]
@@ -4451,10 +5361,14 @@ mod tests {
 
         // After rm(x) (line 2), x should NOT be in scope but y should be
         let scope_after_rm = scope_at_position(&artifacts, 2, 10);
-        assert!(!scope_after_rm.symbols.contains_key("x"), 
-            "x should NOT be in scope after rm(x)");
-        assert!(scope_after_rm.symbols.contains_key("y"), 
-            "y should still be in scope after rm(x)");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after rm(x)"
+        );
+        assert!(
+            scope_after_rm.symbols.contains_key("y"),
+            "y should still be in scope after rm(x)"
+        );
     }
 
     #[test]
@@ -4467,28 +5381,42 @@ mod tests {
 
         // Outside function (after function definition), x should be in scope
         let scope_outside = scope_at_position(&artifacts, 10, 0);
-        assert!(scope_outside.symbols.contains_key("x"), 
-            "x should be in scope outside function");
-        assert!(scope_outside.symbols.contains_key("my_func"), 
-            "my_func should be in scope outside function");
+        assert!(
+            scope_outside.symbols.contains_key("x"),
+            "x should be in scope outside function"
+        );
+        assert!(
+            scope_outside.symbols.contains_key("my_func"),
+            "my_func should be in scope outside function"
+        );
         // y and z are function-local, should NOT be in global scope
-        assert!(!scope_outside.symbols.contains_key("y"), 
-            "y should NOT be in global scope (function-local)");
-        assert!(!scope_outside.symbols.contains_key("z"), 
-            "z should NOT be in global scope (function-local)");
+        assert!(
+            !scope_outside.symbols.contains_key("y"),
+            "y should NOT be in global scope (function-local)"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("z"),
+            "z should NOT be in global scope (function-local)"
+        );
 
         // Inside function, after rm(y) but before z definition (line 3)
         // Find position inside function body after rm(y)
         let scope_inside_after_rm = scope_at_position(&artifacts, 3, 10);
-        assert!(!scope_inside_after_rm.symbols.contains_key("y"), 
-            "y should NOT be in scope inside function after rm(y)");
+        assert!(
+            !scope_inside_after_rm.symbols.contains_key("y"),
+            "y should NOT be in scope inside function after rm(y)"
+        );
 
         // Inside function, after z definition (line 4)
         let scope_inside_after_z = scope_at_position(&artifacts, 4, 10);
-        assert!(scope_inside_after_z.symbols.contains_key("z"), 
-            "z should be in scope inside function after definition");
-        assert!(!scope_inside_after_z.symbols.contains_key("y"), 
-            "y should still NOT be in scope after rm(y)");
+        assert!(
+            scope_inside_after_z.symbols.contains_key("z"),
+            "z should be in scope inside function after definition"
+        );
+        assert!(
+            !scope_inside_after_z.symbols.contains_key("y"),
+            "y should still NOT be in scope after rm(y)"
+        );
     }
 
     #[test]
@@ -4501,15 +5429,21 @@ mod tests {
 
         // After rm(x) at global level, x should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 1, 10);
-        assert!(!scope_after_rm.symbols.contains_key("x"), 
-            "x should NOT be in scope after global rm(x)");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after global rm(x)"
+        );
 
         // Inside function, y should be in scope (unaffected by global rm)
         let scope_inside_func = scope_at_position(&artifacts, 3, 10);
-        assert!(scope_inside_func.symbols.contains_key("y"), 
-            "y should be in scope inside function");
-        assert!(!scope_inside_func.symbols.contains_key("x"), 
-            "x should NOT be in scope inside function (removed globally before function)");
+        assert!(
+            scope_inside_func.symbols.contains_key("y"),
+            "y should be in scope inside function"
+        );
+        assert!(
+            !scope_inside_func.symbols.contains_key("x"),
+            "x should NOT be in scope inside function (removed globally before function)"
+        );
     }
 
     #[test]
@@ -4522,8 +5456,10 @@ mod tests {
 
         // After rm() with envir=globalenv(), x should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 1, 10);
-        assert!(!scope_after_rm.symbols.contains_key("x"), 
-            "x should NOT be in scope after rm(x, envir=globalenv())");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after rm(x, envir=globalenv())"
+        );
     }
 
     #[test]
@@ -4536,8 +5472,10 @@ mod tests {
 
         // After rm() with non-default envir, x should still be in scope
         let scope_after_rm = scope_at_position(&artifacts, 1, 10);
-        assert!(scope_after_rm.symbols.contains_key("x"), 
-            "x should still be in scope after rm(x, envir=my_env) - non-default envir is ignored");
+        assert!(
+            scope_after_rm.symbols.contains_key("x"),
+            "x should still be in scope after rm(x, envir=my_env) - non-default envir is ignored"
+        );
     }
 
     #[test]
@@ -4603,19 +5541,25 @@ mod tests {
 
         // At position (0, 10) - after x definition on line 0, x should be in scope
         let scope_before_rm_line = scope_at_position(&artifacts, 0, 10);
-        assert!(scope_before_rm_line.symbols.contains_key("x"), 
-            "x should be in scope on line 0 (before rm line)");
+        assert!(
+            scope_before_rm_line.symbols.contains_key("x"),
+            "x should be in scope on line 0 (before rm line)"
+        );
 
         // At position (1, 0) - at the start of rm(x) line, the removal is not processed
         // because scope resolution uses strict-before comparison
         let scope_at_rm_start = scope_at_position(&artifacts, 1, 0);
-        assert!(scope_at_rm_start.symbols.contains_key("x"),
-            "x should be in scope at rm() position (removal is processed strictly before)");
+        assert!(
+            scope_at_rm_start.symbols.contains_key("x"),
+            "x should be in scope at rm() position (removal is processed strictly before)"
+        );
 
         // At position (1, 5) - after rm(x), x should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 1, 5);
-        assert!(!scope_after_rm.symbols.contains_key("x"), 
-            "x should NOT be in scope after rm(x) on the same line");
+        assert!(
+            !scope_after_rm.symbols.contains_key("x"),
+            "x should NOT be in scope after rm(x) on the same line"
+        );
     }
 
     #[test]
@@ -4628,15 +5572,21 @@ mod tests {
         let artifacts = compute_artifacts(&uri, &tree, code);
 
         let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
-            if u == &uri { Some(artifacts.clone()) } else { None }
+            if u == &uri {
+                Some(artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let resolve_path = |_path: &str, _from: &Url| -> Option<Url> { None };
 
         // After rm(), x should NOT be in scope
         let scope = scope_at_position_with_deps(&uri, 1, 10, &get_artifacts, &resolve_path, 10);
-        assert!(!scope.symbols.contains_key("x"), 
-            "x should NOT be in scope after rm() via scope_at_position_with_deps");
+        assert!(
+            !scope.symbols.contains_key("x"),
+            "x should NOT be in scope after rm() via scope_at_position_with_deps"
+        );
     }
 
     #[test]
@@ -4649,15 +5599,21 @@ mod tests {
         let artifacts = compute_artifacts(&uri, &tree, code);
 
         let get_artifacts = |u: &Url| -> Option<ScopeArtifacts> {
-            if u == &uri { Some(artifacts.clone()) } else { None }
+            if u == &uri {
+                Some(artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let resolve_path = |_path: &str, _from: &Url| -> Option<Url> { None };
 
         // After second definition, x should be in scope
         let scope = scope_at_position_with_deps(&uri, 2, 10, &get_artifacts, &resolve_path, 10);
-        assert!(scope.symbols.contains_key("x"), 
-            "x should be in scope after re-definition via scope_at_position_with_deps");
+        assert!(
+            scope.symbols.contains_key("x"),
+            "x should be in scope after re-definition via scope_at_position_with_deps"
+        );
     }
 
     // ============================================================================
@@ -4705,36 +5661,70 @@ mod tests {
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &parent_uri { Some(parent_meta.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
         };
 
         // Before rm() (line 0, after source), helper_func should be in scope
         let scope_before_rm = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            0,
+            20,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(scope_before_rm.symbols.contains_key("helper_func"), 
-            "helper_func should be in scope after source() but before rm()");
+        assert!(
+            scope_before_rm.symbols.contains_key("helper_func"),
+            "helper_func should be in scope after source() but before rm()"
+        );
 
         // After rm() (line 1), helper_func should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            1,
+            20,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(!scope_after_rm.symbols.contains_key("helper_func"), 
-            "helper_func should NOT be in scope after rm()");
+        assert!(
+            !scope_after_rm.symbols.contains_key("helper_func"),
+            "helper_func should NOT be in scope after rm()"
+        );
 
         // At end of file, helper_func should NOT be in scope
         let scope_eof = scope_at_position_with_graph(
-            &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            10,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(!scope_eof.symbols.contains_key("helper_func"), 
-            "helper_func should NOT be in scope at end of file after rm()");
+        assert!(
+            !scope_eof.symbols.contains_key("helper_func"),
+            "helper_func should NOT be in scope at end of file after rm()"
+        );
     }
 
     #[test]
@@ -4754,7 +5744,8 @@ mod tests {
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
 
         // Child code: defines func_a, func_b, func_c
-        let child_code = "func_a <- function() { 1 }\nfunc_b <- function() { 2 }\nfunc_c <- function() { 3 }";
+        let child_code =
+            "func_a <- function() { 1 }\nfunc_b <- function() { 2 }\nfunc_c <- function() { 3 }";
         let child_tree = parse_r(child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
@@ -4776,31 +5767,70 @@ mod tests {
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &parent_uri { Some(parent_meta.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
         };
 
         // Before rm() (line 0, after source), all three functions should be in scope
         let scope_before_rm = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            0,
+            20,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(scope_before_rm.symbols.contains_key("func_a"), "func_a should be in scope before rm()");
-        assert!(scope_before_rm.symbols.contains_key("func_b"), "func_b should be in scope before rm()");
-        assert!(scope_before_rm.symbols.contains_key("func_c"), "func_c should be in scope before rm()");
+        assert!(
+            scope_before_rm.symbols.contains_key("func_a"),
+            "func_a should be in scope before rm()"
+        );
+        assert!(
+            scope_before_rm.symbols.contains_key("func_b"),
+            "func_b should be in scope before rm()"
+        );
+        assert!(
+            scope_before_rm.symbols.contains_key("func_c"),
+            "func_c should be in scope before rm()"
+        );
 
         // After rm() (line 1), func_a and func_b should NOT be in scope, but func_c should be
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            1,
+            20,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(!scope_after_rm.symbols.contains_key("func_a"), "func_a should NOT be in scope after rm()");
-        assert!(!scope_after_rm.symbols.contains_key("func_b"), "func_b should NOT be in scope after rm()");
-        assert!(scope_after_rm.symbols.contains_key("func_c"), "func_c should still be in scope after rm()");
+        assert!(
+            !scope_after_rm.symbols.contains_key("func_a"),
+            "func_a should NOT be in scope after rm()"
+        );
+        assert!(
+            !scope_after_rm.symbols.contains_key("func_b"),
+            "func_b should NOT be in scope after rm()"
+        );
+        assert!(
+            scope_after_rm.symbols.contains_key("func_c"),
+            "func_c should still be in scope after rm()"
+        );
     }
 
     #[test]
@@ -4835,30 +5865,52 @@ mod tests {
         };
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &child_uri { Some(child_metadata.clone()) }
-            else { None }
+            if uri == &child_uri {
+                Some(child_metadata.clone())
+            } else {
+                None
+            }
         };
 
         let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "parent.R" { Some(parent_uri.clone()) } else { None }
+            if path == "parent.R" {
+                Some(parent_uri.clone())
+            } else {
+                None
+            }
         };
 
         // In child file, x should be in scope (parent's scope at call site line 1)
         // At line 1 in parent, x is defined but rm(x) hasn't happened yet
         let scope_in_child = scope_at_position_with_backward(
-            &child_uri, 1, 10, &get_artifacts, &get_metadata, &resolve_path, 10, None
+            &child_uri,
+            1,
+            10,
+            &get_artifacts,
+            &get_metadata,
+            &resolve_path,
+            10,
+            None,
         );
 
-        assert!(scope_in_child.symbols.contains_key("x"), 
-            "x should be in scope in child (parent's scope at call site before rm)");
-        assert!(scope_in_child.symbols.contains_key("y"), 
-            "y should be in scope in child (local definition)");
+        assert!(
+            scope_in_child.symbols.contains_key("x"),
+            "x should be in scope in child (parent's scope at call site before rm)"
+        );
+        assert!(
+            scope_in_child.symbols.contains_key("y"),
+            "y should be in scope in child (local definition)"
+        );
     }
 
     #[test]
@@ -4892,29 +5944,51 @@ mod tests {
         };
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &child_uri { Some(child_metadata.clone()) }
-            else { None }
+            if uri == &child_uri {
+                Some(child_metadata.clone())
+            } else {
+                None
+            }
         };
 
         let resolve_path = |path: &str, _from: &Url| -> Option<Url> {
-            if path == "parent.R" { Some(parent_uri.clone()) } else { None }
+            if path == "parent.R" {
+                Some(parent_uri.clone())
+            } else {
+                None
+            }
         };
 
         // In child file, x should NOT be in scope (removed before call site)
         let scope_in_child = scope_at_position_with_backward(
-            &child_uri, 1, 10, &get_artifacts, &get_metadata, &resolve_path, 10, None
+            &child_uri,
+            1,
+            10,
+            &get_artifacts,
+            &get_metadata,
+            &resolve_path,
+            10,
+            None,
         );
 
-        assert!(!scope_in_child.symbols.contains_key("x"), 
-            "x should NOT be in scope in child (removed before call site in parent)");
-        assert!(scope_in_child.symbols.contains_key("y"), 
-            "y should be in scope in child (local definition)");
+        assert!(
+            !scope_in_child.symbols.contains_key("x"),
+            "x should NOT be in scope in child (removed before call site in parent)"
+        );
+        assert!(
+            scope_in_child.symbols.contains_key("y"),
+            "y should be in scope in child (local definition)"
+        );
     }
 
     #[test]
@@ -4957,41 +6031,77 @@ mod tests {
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &parent_uri { Some(parent_meta.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
         };
 
         // After source() but before rm() (line 0), helper_func from child should be in scope
         let scope_after_source = scope_at_position_with_graph(
-            &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            0,
+            20,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(scope_after_source.symbols.contains_key("helper_func"), 
-            "helper_func should be in scope after source()");
+        assert!(
+            scope_after_source.symbols.contains_key("helper_func"),
+            "helper_func should be in scope after source()"
+        );
 
         // After rm() but before redefinition (line 1), helper_func should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            1,
+            20,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(!scope_after_rm.symbols.contains_key("helper_func"), 
-            "helper_func should NOT be in scope after rm()");
+        assert!(
+            !scope_after_rm.symbols.contains_key("helper_func"),
+            "helper_func should NOT be in scope after rm()"
+        );
 
         // After redefinition (line 2), helper_func should be in scope again
         let scope_after_redef = scope_at_position_with_graph(
-            &parent_uri, 2, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            2,
+            40,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(scope_after_redef.symbols.contains_key("helper_func"), 
-            "helper_func should be in scope after local redefinition");
+        assert!(
+            scope_after_redef.symbols.contains_key("helper_func"),
+            "helper_func should be in scope after local redefinition"
+        );
 
         // Verify the redefined symbol is from parent, not child
         let symbol = scope_after_redef.symbols.get("helper_func").unwrap();
-        assert_eq!(symbol.source_uri, parent_uri, 
-            "helper_func should be from parent after redefinition");
+        assert_eq!(
+            symbol.source_uri, parent_uri,
+            "helper_func should be from parent after redefinition"
+        );
     }
 
     #[test]
@@ -5011,7 +6121,8 @@ mod tests {
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
 
         // Child code: defines func_a, func_b, func_c
-        let child_code = "func_a <- function() { 1 }\nfunc_b <- function() { 2 }\nfunc_c <- function() { 3 }";
+        let child_code =
+            "func_a <- function() { 1 }\nfunc_b <- function() { 2 }\nfunc_c <- function() { 3 }";
         let child_tree = parse_r(child_code);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
 
@@ -5033,26 +6144,46 @@ mod tests {
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &parent_uri { Some(parent_meta.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
         };
 
         // After rm(list=...) (line 1), func_a and func_b should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &parent_uri, 1, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            1,
+            40,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(!scope_after_rm.symbols.contains_key("func_a"), 
-            "func_a should NOT be in scope after rm(list=...)");
-        assert!(!scope_after_rm.symbols.contains_key("func_b"), 
-            "func_b should NOT be in scope after rm(list=...)");
-        assert!(scope_after_rm.symbols.contains_key("func_c"), 
-            "func_c should still be in scope after rm(list=...)");
+        assert!(
+            !scope_after_rm.symbols.contains_key("func_a"),
+            "func_a should NOT be in scope after rm(list=...)"
+        );
+        assert!(
+            !scope_after_rm.symbols.contains_key("func_b"),
+            "func_b should NOT be in scope after rm(list=...)"
+        );
+        assert!(
+            scope_after_rm.symbols.contains_key("func_c"),
+            "func_c should still be in scope after rm(list=...)"
+        );
     }
 
     #[test]
@@ -5094,29 +6225,54 @@ mod tests {
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &parent_uri { Some(parent_artifacts.clone()) }
-            else if uri == &child_uri { Some(child_artifacts.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &parent_uri { Some(parent_meta.clone()) }
-            else { None }
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
         };
 
         // In child file, helper_func should still be in scope (child's own definition)
         let scope_in_child = scope_at_position_with_graph(
-            &child_uri, 0, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &child_uri,
+            0,
+            40,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(scope_in_child.symbols.contains_key("helper_func"), 
-            "helper_func should be in scope in child file (its own definition)");
+        assert!(
+            scope_in_child.symbols.contains_key("helper_func"),
+            "helper_func should be in scope in child file (its own definition)"
+        );
 
         // In parent file after rm(), helper_func should NOT be in scope
         let scope_in_parent = scope_at_position_with_graph(
-            &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &parent_uri,
+            1,
+            20,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(!scope_in_parent.symbols.contains_key("helper_func"), 
-            "helper_func should NOT be in scope in parent after rm()");
+        assert!(
+            !scope_in_parent.symbols.contains_key("helper_func"),
+            "helper_func should NOT be in scope in parent after rm()"
+        );
     }
 
     #[test]
@@ -5178,31 +6334,58 @@ mod tests {
         graph.update_file(&uri_b, &meta_b, Some(&workspace_root), |_| None);
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            if uri == &uri_a { Some(artifacts_a.clone()) }
-            else if uri == &uri_b { Some(artifacts_b.clone()) }
-            else if uri == &uri_c { Some(artifacts_c.clone()) }
-            else { None }
+            if uri == &uri_a {
+                Some(artifacts_a.clone())
+            } else if uri == &uri_b {
+                Some(artifacts_b.clone())
+            } else if uri == &uri_c {
+                Some(artifacts_c.clone())
+            } else {
+                None
+            }
         };
 
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            if uri == &uri_a { Some(meta_a.clone()) }
-            else if uri == &uri_b { Some(meta_b.clone()) }
-            else { None }
+            if uri == &uri_a {
+                Some(meta_a.clone())
+            } else if uri == &uri_b {
+                Some(meta_b.clone())
+            } else {
+                None
+            }
         };
 
         // Before rm() in A (line 0), deep_func should be in scope (from C via B)
         let scope_before_rm = scope_at_position_with_graph(
-            &uri_a, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &uri_a,
+            0,
+            20,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(scope_before_rm.symbols.contains_key("deep_func"), 
-            "deep_func should be in scope in A after source(B) which sources C");
+        assert!(
+            scope_before_rm.symbols.contains_key("deep_func"),
+            "deep_func should be in scope in A after source(B) which sources C"
+        );
 
         // After rm() in A (line 1), deep_func should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
-            &uri_a, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10,
+            &uri_a,
+            1,
+            20,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
         );
-        assert!(!scope_after_rm.symbols.contains_key("deep_func"), 
-            "deep_func should NOT be in scope in A after rm()");
+        assert!(
+            !scope_after_rm.symbols.contains_key("deep_func"),
+            "deep_func should NOT be in scope in A after rm()"
+        );
     }
 
     // ============================================================================
@@ -5215,28 +6398,47 @@ mod tests {
         // Test that query_point and query_innermost on empty tree return empty/None
         // Validates: Requirements 1.6 (empty tree handling)
         let tree = FunctionScopeTree::new();
-        
+
         assert!(tree.is_empty(), "New tree should be empty");
         assert_eq!(tree.len(), 0, "New tree should have length 0");
-        
+
         // query_point on empty tree should return empty Vec
         let results = tree.query_point(Position::new(5, 10));
-        assert!(results.is_empty(), "query_point on empty tree should return empty Vec");
-        
+        assert!(
+            results.is_empty(),
+            "query_point on empty tree should return empty Vec"
+        );
+
         // query_innermost on empty tree should return None
         let innermost = tree.query_innermost(Position::new(5, 10));
-        assert!(innermost.is_none(), "query_innermost on empty tree should return None");
-        
+        assert!(
+            innermost.is_none(),
+            "query_innermost on empty tree should return None"
+        );
+
         // Also test with from_scopes with empty slice
         let tree_from_empty = FunctionScopeTree::from_scopes(&[]);
-        assert!(tree_from_empty.is_empty(), "Tree from empty scopes should be empty");
-        assert_eq!(tree_from_empty.len(), 0, "Tree from empty scopes should have length 0");
-        
+        assert!(
+            tree_from_empty.is_empty(),
+            "Tree from empty scopes should be empty"
+        );
+        assert_eq!(
+            tree_from_empty.len(),
+            0,
+            "Tree from empty scopes should have length 0"
+        );
+
         let results_from_empty = tree_from_empty.query_point(Position::new(0, 0));
-        assert!(results_from_empty.is_empty(), "query_point on tree from empty scopes should return empty Vec");
-        
+        assert!(
+            results_from_empty.is_empty(),
+            "query_point on tree from empty scopes should return empty Vec"
+        );
+
         let innermost_from_empty = tree_from_empty.query_innermost(Position::new(0, 0));
-        assert!(innermost_from_empty.is_none(), "query_innermost on tree from empty scopes should return None");
+        assert!(
+            innermost_from_empty.is_none(),
+            "query_innermost on tree from empty scopes should return None"
+        );
     }
 
     /// Verifies that a FunctionScopeTree with a single interval reports containment correctly.
@@ -5262,42 +6464,65 @@ mod tests {
     fn test_single_interval_containment() {
         // Test basic containment check with one interval
         // Validates: Requirements 1.3 (point queries), 1.4 (return all containing intervals)
-        
+
         // Create a tree with a single interval: lines 5-10, columns 0-20
         let scopes = vec![(5, 0, 10, 20)]; // (start_line, start_col, end_line, end_col)
         let tree = FunctionScopeTree::from_scopes(&scopes);
-        
+
         assert!(!tree.is_empty(), "Tree should not be empty");
         assert_eq!(tree.len(), 1, "Tree should have 1 interval");
-        
+
         // Position inside the interval
         let inside = tree.query_point(Position::new(7, 10));
-        assert_eq!(inside.len(), 1, "Should find 1 interval for position inside");
+        assert_eq!(
+            inside.len(),
+            1,
+            "Should find 1 interval for position inside"
+        );
         assert_eq!(inside[0].start, Position::new(5, 0));
         assert_eq!(inside[0].end, Position::new(10, 20));
         // Position before the interval (line 3)
         let before = tree.query_point(Position::new(3, 10));
-        assert!(before.is_empty(), "Should find no intervals for position before");
-        
+        assert!(
+            before.is_empty(),
+            "Should find no intervals for position before"
+        );
+
         // Position after the interval (line 15)
         let after = tree.query_point(Position::new(15, 10));
-        assert!(after.is_empty(), "Should find no intervals for position after");
-        
+        assert!(
+            after.is_empty(),
+            "Should find no intervals for position after"
+        );
+
         // Position on same line as start but before start column
         let same_line_before = tree.query_point(Position::new(5, 0)); // At start - should be included
-        assert_eq!(same_line_before.len(), 1, "Position at start should be included (inclusive)");
-        
+        assert_eq!(
+            same_line_before.len(),
+            1,
+            "Position at start should be included (inclusive)"
+        );
+
         // Position on same line as end but after end column
         let same_line_after = tree.query_point(Position::new(10, 25));
-        assert!(same_line_after.is_empty(), "Position after end column should not be included");
-        
+        assert!(
+            same_line_after.is_empty(),
+            "Position after end column should not be included"
+        );
+
         // Test query_innermost with single interval
         let innermost_inside = tree.query_innermost(Position::new(7, 10));
-        assert!(innermost_inside.is_some(), "query_innermost should return Some for position inside");
+        assert!(
+            innermost_inside.is_some(),
+            "query_innermost should return Some for position inside"
+        );
         assert_eq!(innermost_inside.unwrap().start, Position::new(5, 0));
-        
+
         let innermost_outside = tree.query_innermost(Position::new(3, 10));
-        assert!(innermost_outside.is_none(), "query_innermost should return None for position outside");
+        assert!(
+            innermost_outside.is_none(),
+            "query_innermost should return None for position outside"
+        );
     }
 
     /// Verifies that function-scope intervals include their start and end positions.
@@ -5321,101 +6546,148 @@ mod tests {
     fn test_boundary_positions_inclusive() {
         // Test that positions exactly at start/end are included (inclusive boundaries)
         // Validates: Requirements 4.2 (inclusive boundaries)
-        
+
         // Create interval from (10, 5) to (20, 15)
         let scopes = vec![(10, 5, 20, 15)];
         let tree = FunctionScopeTree::from_scopes(&scopes);
-        
+
         // Test exact start position - should be included
         let at_start = tree.query_point(Position::new(10, 5));
-        assert_eq!(at_start.len(), 1, "Position at exact start should be included");
-        
+        assert_eq!(
+            at_start.len(),
+            1,
+            "Position at exact start should be included"
+        );
+
         // Test exact end position - should be included
         let at_end = tree.query_point(Position::new(20, 15));
         assert_eq!(at_end.len(), 1, "Position at exact end should be included");
-        
+
         // Test one position before start (same line, column - 1)
         let before_start = tree.query_point(Position::new(10, 4));
-        assert!(before_start.is_empty(), "Position just before start should not be included");
-        
+        assert!(
+            before_start.is_empty(),
+            "Position just before start should not be included"
+        );
+
         // Test one position after end (same line, column + 1)
         let after_end = tree.query_point(Position::new(20, 16));
-        assert!(after_end.is_empty(), "Position just after end should not be included");
-        
+        assert!(
+            after_end.is_empty(),
+            "Position just after end should not be included"
+        );
+
         // Test start line but different column (inside)
         let start_line_inside = tree.query_point(Position::new(10, 10));
-        assert_eq!(start_line_inside.len(), 1, "Position on start line with column inside should be included");
-        
+        assert_eq!(
+            start_line_inside.len(),
+            1,
+            "Position on start line with column inside should be included"
+        );
+
         // Test end line but different column (inside)
         let end_line_inside = tree.query_point(Position::new(20, 10));
-        assert_eq!(end_line_inside.len(), 1, "Position on end line with column inside should be included");
-        
+        assert_eq!(
+            end_line_inside.len(),
+            1,
+            "Position on end line with column inside should be included"
+        );
+
         // Test middle of interval
         let middle = tree.query_point(Position::new(15, 10));
         assert_eq!(middle.len(), 1, "Position in middle should be included");
-        
+
         // Test query_innermost at boundaries
         let innermost_at_start = tree.query_innermost(Position::new(10, 5));
-        assert!(innermost_at_start.is_some(), "query_innermost at start should return Some");
-        
+        assert!(
+            innermost_at_start.is_some(),
+            "query_innermost at start should return Some"
+        );
+
         let innermost_at_end = tree.query_innermost(Position::new(20, 15));
-        assert!(innermost_at_end.is_some(), "query_innermost at end should return Some");
+        assert!(
+            innermost_at_end.is_some(),
+            "query_innermost at end should return Some"
+        );
     }
 
     #[test]
     fn test_nested_intervals_innermost() {
         // Test innermost selection with nested scopes
         // Validates: Requirements 2.1 (select interval with latest start), 2.2 (return None when empty)
-        
+
         // Create nested intervals:
         // Outer: lines 0-100
         // Middle: lines 10-50
         // Inner: lines 20-30
         let scopes = vec![
-            (0, 0, 100, 0),   // Outer function
-            (10, 0, 50, 0),   // Middle function (nested in outer)
-            (20, 0, 30, 0),   // Inner function (nested in middle)
+            (0, 0, 100, 0), // Outer function
+            (10, 0, 50, 0), // Middle function (nested in outer)
+            (20, 0, 30, 0), // Inner function (nested in middle)
         ];
         let tree = FunctionScopeTree::from_scopes(&scopes);
-        
+
         assert_eq!(tree.len(), 3, "Tree should have 3 intervals");
-        
+
         // Query at position inside all three (line 25)
         let all_containing = tree.query_point(Position::new(25, 0));
-        assert_eq!(all_containing.len(), 3, "Should find all 3 nested intervals");
-        
+        assert_eq!(
+            all_containing.len(),
+            3,
+            "Should find all 3 nested intervals"
+        );
+
         // query_innermost should return the innermost (latest start = line 20)
         let innermost = tree.query_innermost(Position::new(25, 0));
         assert!(innermost.is_some(), "Should find innermost interval");
         let innermost_interval = innermost.unwrap();
-        assert_eq!(innermost_interval.start, Position::new(20, 0), 
-            "Innermost should have start at line 20 (latest start)");
+        assert_eq!(
+            innermost_interval.start,
+            Position::new(20, 0),
+            "Innermost should have start at line 20 (latest start)"
+        );
         assert_eq!(innermost_interval.end, Position::new(30, 0));
-        
+
         // Query at position inside outer and middle but not inner (line 15)
         let two_containing = tree.query_point(Position::new(15, 0));
-        assert_eq!(two_containing.len(), 2, "Should find 2 intervals at line 15");
-        
+        assert_eq!(
+            two_containing.len(),
+            2,
+            "Should find 2 intervals at line 15"
+        );
+
         let innermost_at_15 = tree.query_innermost(Position::new(15, 0));
         assert!(innermost_at_15.is_some());
-        assert_eq!(innermost_at_15.unwrap().start, Position::new(10, 0),
-            "Innermost at line 15 should be middle function (start line 10)");
-        
+        assert_eq!(
+            innermost_at_15.unwrap().start,
+            Position::new(10, 0),
+            "Innermost at line 15 should be middle function (start line 10)"
+        );
+
         // Query at position inside only outer (line 5)
         let one_containing = tree.query_point(Position::new(5, 0));
         assert_eq!(one_containing.len(), 1, "Should find 1 interval at line 5");
-        
+
         let innermost_at_5 = tree.query_innermost(Position::new(5, 0));
         assert!(innermost_at_5.is_some());
-        assert_eq!(innermost_at_5.unwrap().start, Position::new(0, 0),
-            "Innermost at line 5 should be outer function (start line 0)");
-        
+        assert_eq!(
+            innermost_at_5.unwrap().start,
+            Position::new(0, 0),
+            "Innermost at line 5 should be outer function (start line 0)"
+        );
+
         // Query at position outside all (line 150)
         let none_containing = tree.query_point(Position::new(150, 0));
-        assert!(none_containing.is_empty(), "Should find no intervals at line 150");
-        
+        assert!(
+            none_containing.is_empty(),
+            "Should find no intervals at line 150"
+        );
+
         let innermost_at_150 = tree.query_innermost(Position::new(150, 0));
-        assert!(innermost_at_150.is_none(), "query_innermost should return None at line 150");
+        assert!(
+            innermost_at_150.is_none(),
+            "query_innermost should return None at line 150"
+        );
     }
 
     /// Verifies interval-tree behavior with EOF sentinel and extreme Position values.
@@ -5441,73 +6713,122 @@ mod tests {
     fn test_eof_sentinel_positions() {
         // Test EOF positions (u32::MAX) behavior with interval tree
         // Validates: Requirements 4.4 (EOF sentinel handling)
-        // 
+        //
         // Note: The interval tree itself uses pure lexicographic comparison.
         // EOF sentinel handling (skipping function scope matching for EOF positions)
         // is done at the scope resolution level, not in the interval tree.
         // This test verifies the interval tree's behavior with extreme positions.
-        
+
         // Create some normal function scopes
-        let scopes = vec![
-            (0, 0, 10, 0),
-            (20, 0, 30, 0),
-            (50, 0, 100, 0),
-        ];
+        let scopes = vec![(0, 0, 10, 0), (20, 0, 30, 0), (50, 0, 100, 0)];
         let tree = FunctionScopeTree::from_scopes(&scopes);
-        
+
         // Query at full EOF position (u32::MAX, u32::MAX)
         let eof_pos = Position::eof();
-        assert!(eof_pos.is_eof(), "Position::eof() should be recognized as EOF");
-        assert!(eof_pos.is_full_eof(), "Position::eof() should be recognized as full EOF");
-        
+        assert!(
+            eof_pos.is_eof(),
+            "Position::eof() should be recognized as EOF"
+        );
+        assert!(
+            eof_pos.is_full_eof(),
+            "Position::eof() should be recognized as full EOF"
+        );
+
         // EOF position is lexicographically after all normal scopes
         let results_at_eof = tree.query_point(eof_pos);
-        assert!(results_at_eof.is_empty(), 
-            "Full EOF position should not match any normal function scopes (lexicographically after all)");
-        
+        assert!(
+            results_at_eof.is_empty(),
+            "Full EOF position should not match any normal function scopes (lexicographically after all)"
+        );
+
         let innermost_at_eof = tree.query_innermost(eof_pos);
-        assert!(innermost_at_eof.is_none(),
-            "query_innermost at full EOF should return None");
-        
+        assert!(
+            innermost_at_eof.is_none(),
+            "query_innermost at full EOF should return None"
+        );
+
         // Test with just MAX line
         let max_line_pos = Position::new(u32::MAX, 0);
-        assert!(max_line_pos.is_eof(), "Position with MAX line should be recognized as EOF");
-        assert!(!max_line_pos.is_full_eof(), "Position with MAX line only should not be full EOF");
-        
+        assert!(
+            max_line_pos.is_eof(),
+            "Position with MAX line should be recognized as EOF"
+        );
+        assert!(
+            !max_line_pos.is_full_eof(),
+            "Position with MAX line only should not be full EOF"
+        );
+
         let results_max_line = tree.query_point(max_line_pos);
-        assert!(results_max_line.is_empty(),
-            "Position with MAX line should not match normal scopes (line is after all scope ends)");
-        
+        assert!(
+            results_max_line.is_empty(),
+            "Position with MAX line should not match normal scopes (line is after all scope ends)"
+        );
+
         // Test with MAX column on a line that's inside a scope
         // Position (50, u32::MAX) is lexicographically between (50, 0) and (100, 0)
         // because line 50 < line 100, so it IS inside the interval (50, 0) to (100, 0)
         let max_col_pos = Position::new(50, u32::MAX);
-        assert!(max_col_pos.is_eof(), "Position with MAX column should be recognized as EOF");
-        assert!(!max_col_pos.is_full_eof(), "Position with MAX column only should not be full EOF");
-        
+        assert!(
+            max_col_pos.is_eof(),
+            "Position with MAX column should be recognized as EOF"
+        );
+        assert!(
+            !max_col_pos.is_full_eof(),
+            "Position with MAX column only should not be full EOF"
+        );
+
         // The interval tree correctly includes this position because lexicographically:
         // (50, 0) <= (50, MAX) <= (100, 0) is true (50 < 100 for line comparison)
         let results_max_col = tree.query_point(max_col_pos);
-        assert_eq!(results_max_col.len(), 1,
-            "Position (50, MAX) is lexicographically inside interval (50,0)-(100,0)");
+        assert_eq!(
+            results_max_col.len(),
+            1,
+            "Position (50, MAX) is lexicographically inside interval (50,0)-(100,0)"
+        );
         assert_eq!(results_max_col[0].start.line, 50);
-        
+
         // Test MAX column on a line that's at the end of a scope
         // Position (100, u32::MAX) is lexicographically AFTER (100, 0)
         let max_col_at_end = Position::new(100, u32::MAX);
         let results_max_col_at_end = tree.query_point(max_col_at_end);
-        assert!(results_max_col_at_end.is_empty(),
-            "Position (100, MAX) is after interval end (100, 0)");
-        
+        assert!(
+            results_max_col_at_end.is_empty(),
+            "Position (100, MAX) is after interval end (100, 0)"
+        );
+
         // Verify Position::is_eof() works correctly
-        assert!(!Position::new(0, 0).is_eof(), "Normal position should not be EOF");
-        assert!(!Position::new(100, 50).is_eof(), "Normal position should not be EOF");
-        assert!(Position::new(u32::MAX, 0).is_eof(), "MAX line should be EOF");
-        assert!(Position::new(0, u32::MAX).is_eof(), "MAX column should be EOF");
-        assert!(Position::new(u32::MAX, u32::MAX).is_eof(), "Both MAX should be EOF");
-        assert!(!Position::new(u32::MAX, 0).is_full_eof(), "MAX line only should not be full EOF");
-        assert!(!Position::new(0, u32::MAX).is_full_eof(), "MAX column only should not be full EOF");
-        assert!(Position::new(u32::MAX, u32::MAX).is_full_eof(), "Both MAX should be full EOF");
+        assert!(
+            !Position::new(0, 0).is_eof(),
+            "Normal position should not be EOF"
+        );
+        assert!(
+            !Position::new(100, 50).is_eof(),
+            "Normal position should not be EOF"
+        );
+        assert!(
+            Position::new(u32::MAX, 0).is_eof(),
+            "MAX line should be EOF"
+        );
+        assert!(
+            Position::new(0, u32::MAX).is_eof(),
+            "MAX column should be EOF"
+        );
+        assert!(
+            Position::new(u32::MAX, u32::MAX).is_eof(),
+            "Both MAX should be EOF"
+        );
+        assert!(
+            !Position::new(u32::MAX, 0).is_full_eof(),
+            "MAX line only should not be full EOF"
+        );
+        assert!(
+            !Position::new(0, u32::MAX).is_full_eof(),
+            "MAX column only should not be full EOF"
+        );
+        assert!(
+            Position::new(u32::MAX, u32::MAX).is_full_eof(),
+            "Both MAX should be full EOF"
+        );
     }
 
     /// Verifies that a FunctionScopeTree correctly handles multiple disjoint (non-overlapping) intervals.
@@ -5544,7 +6865,7 @@ mod tests {
     fn test_non_overlapping_intervals() {
         // Test multiple disjoint intervals
         // Validates: Requirements 1.3 (point queries), 1.4 (return all containing intervals)
-        
+
         // Create non-overlapping intervals
         let scopes = vec![
             (0, 0, 10, 0),    // First function: lines 0-10
@@ -5553,52 +6874,69 @@ mod tests {
             (100, 0, 110, 0), // Fourth function: lines 100-110
         ];
         let tree = FunctionScopeTree::from_scopes(&scopes);
-        
+
         assert_eq!(tree.len(), 4, "Tree should have 4 intervals");
-        
+
         // Query inside first interval
         let in_first = tree.query_point(Position::new(5, 0));
         assert_eq!(in_first.len(), 1, "Should find exactly 1 interval in first");
         assert_eq!(in_first[0].start.line, 0);
-        
+
         // Query inside second interval
         let in_second = tree.query_point(Position::new(25, 0));
-        assert_eq!(in_second.len(), 1, "Should find exactly 1 interval in second");
+        assert_eq!(
+            in_second.len(),
+            1,
+            "Should find exactly 1 interval in second"
+        );
         assert_eq!(in_second[0].start.line, 20);
-        
+
         // Query inside third interval
         let in_third = tree.query_point(Position::new(55, 0));
         assert_eq!(in_third.len(), 1, "Should find exactly 1 interval in third");
         assert_eq!(in_third[0].start.line, 50);
-        
+
         // Query inside fourth interval
         let in_fourth = tree.query_point(Position::new(105, 0));
-        assert_eq!(in_fourth.len(), 1, "Should find exactly 1 interval in fourth");
+        assert_eq!(
+            in_fourth.len(),
+            1,
+            "Should find exactly 1 interval in fourth"
+        );
         assert_eq!(in_fourth[0].start.line, 100);
-        
+
         // Query in gaps between intervals
         let in_gap_1 = tree.query_point(Position::new(15, 0)); // Between first and second
-        assert!(in_gap_1.is_empty(), "Should find no intervals in gap between first and second");
-        
+        assert!(
+            in_gap_1.is_empty(),
+            "Should find no intervals in gap between first and second"
+        );
+
         let in_gap_2 = tree.query_point(Position::new(40, 0)); // Between second and third
-        assert!(in_gap_2.is_empty(), "Should find no intervals in gap between second and third");
-        
+        assert!(
+            in_gap_2.is_empty(),
+            "Should find no intervals in gap between second and third"
+        );
+
         let in_gap_3 = tree.query_point(Position::new(80, 0)); // Between third and fourth
-        assert!(in_gap_3.is_empty(), "Should find no intervals in gap between third and fourth");
-        
+        assert!(
+            in_gap_3.is_empty(),
+            "Should find no intervals in gap between third and fourth"
+        );
+
         // Query before all intervals
         let before_all = tree.query_innermost(Position::new(15, 0));
         assert!(before_all.is_none(), "Should find no innermost in gap");
-        
+
         // Query after all intervals
         let after_all = tree.query_point(Position::new(200, 0));
         assert!(after_all.is_empty(), "Should find no intervals after all");
-        
+
         // Test query_innermost for each interval
         let innermost_first = tree.query_innermost(Position::new(5, 0));
         assert!(innermost_first.is_some());
         assert_eq!(innermost_first.unwrap().start.line, 0);
-        
+
         let innermost_second = tree.query_innermost(Position::new(25, 0));
         assert!(innermost_second.is_some());
         assert_eq!(innermost_second.unwrap().start.line, 20);
@@ -5608,58 +6946,90 @@ mod tests {
     fn test_interval_tree_with_same_start_positions() {
         // Test handling of intervals with identical start positions
         // Validates: Requirements 1.5 (handle identical start positions)
-        
+
         // Create intervals with same start but different ends
         let scopes = vec![
-            (10, 0, 20, 0),  // Same start, shorter
-            (10, 0, 50, 0),  // Same start, longer
-            (10, 0, 30, 0),  // Same start, medium
+            (10, 0, 20, 0), // Same start, shorter
+            (10, 0, 50, 0), // Same start, longer
+            (10, 0, 30, 0), // Same start, medium
         ];
         let tree = FunctionScopeTree::from_scopes(&scopes);
-        
+
         assert_eq!(tree.len(), 3, "Tree should have 3 intervals");
-        
+
         // Query at position inside all three (line 15)
         let all_containing = tree.query_point(Position::new(15, 0));
-        assert_eq!(all_containing.len(), 3, "Should find all 3 intervals at line 15");
-        
+        assert_eq!(
+            all_containing.len(),
+            3,
+            "Should find all 3 intervals at line 15"
+        );
+
         // Query at position inside only the longest (line 40)
         let only_longest = tree.query_point(Position::new(40, 0));
-        assert_eq!(only_longest.len(), 1, "Should find only 1 interval at line 40");
-        assert_eq!(only_longest[0].end.line, 50, "Should be the longest interval");
-        
+        assert_eq!(
+            only_longest.len(),
+            1,
+            "Should find only 1 interval at line 40"
+        );
+        assert_eq!(
+            only_longest[0].end.line, 50,
+            "Should be the longest interval"
+        );
+
         // query_innermost should return one of them (all have same start)
         let innermost = tree.query_innermost(Position::new(15, 0));
         assert!(innermost.is_some());
-        assert_eq!(innermost.unwrap().start, Position::new(10, 0),
-            "Innermost should have start at line 10");
+        assert_eq!(
+            innermost.unwrap().start,
+            Position::new(10, 0),
+            "Innermost should have start at line 10"
+        );
     }
 
     #[test]
     fn test_function_scope_interval_methods() {
         // Test FunctionScopeInterval helper methods
         // Validates: Requirements 4.1 (position comparison), 4.2 (inclusive boundaries)
-        
-        let interval = FunctionScopeInterval::new(
-            Position::new(10, 5),
-            Position::new(20, 15)
-        );
-        
+
+        let interval = FunctionScopeInterval::new(Position::new(10, 5), Position::new(20, 15));
+
         // Test contains() method
-        assert!(interval.contains(Position::new(10, 5)), "Should contain start position");
-        assert!(interval.contains(Position::new(20, 15)), "Should contain end position");
-        assert!(interval.contains(Position::new(15, 10)), "Should contain middle position");
-        assert!(!interval.contains(Position::new(10, 4)), "Should not contain position before start");
-        assert!(!interval.contains(Position::new(20, 16)), "Should not contain position after end");
-        assert!(!interval.contains(Position::new(5, 10)), "Should not contain position on earlier line");
-        assert!(!interval.contains(Position::new(25, 10)), "Should not contain position on later line");
-        
+        assert!(
+            interval.contains(Position::new(10, 5)),
+            "Should contain start position"
+        );
+        assert!(
+            interval.contains(Position::new(20, 15)),
+            "Should contain end position"
+        );
+        assert!(
+            interval.contains(Position::new(15, 10)),
+            "Should contain middle position"
+        );
+        assert!(
+            !interval.contains(Position::new(10, 4)),
+            "Should not contain position before start"
+        );
+        assert!(
+            !interval.contains(Position::new(20, 16)),
+            "Should not contain position after end"
+        );
+        assert!(
+            !interval.contains(Position::new(5, 10)),
+            "Should not contain position on earlier line"
+        );
+        assert!(
+            !interval.contains(Position::new(25, 10)),
+            "Should not contain position on later line"
+        );
+
         // Test from_tuple() and to_tuple() round-trip
         let tuple = (10, 5, 20, 15);
         let from_tuple = FunctionScopeInterval::from_tuple(tuple);
         assert_eq!(from_tuple.start, Position::new(10, 5));
         assert_eq!(from_tuple.end, Position::new(20, 15));
-        
+
         let back_to_tuple = from_tuple.as_tuple();
         assert_eq!(back_to_tuple, tuple, "Round-trip should preserve values");
     }
@@ -5668,23 +7038,23 @@ mod tests {
     fn test_position_ordering() {
         // Test Position lexicographic ordering
         // Validates: Requirements 4.1 (lexicographic ordering)
-        
+
         // Same line, different columns
         assert!(Position::new(5, 0) < Position::new(5, 10));
         assert!(Position::new(5, 10) < Position::new(5, 20));
-        
+
         // Different lines
         assert!(Position::new(5, 100) < Position::new(6, 0));
         assert!(Position::new(10, 0) < Position::new(20, 0));
-        
+
         // Equal positions
         assert!(Position::new(5, 10) == Position::new(5, 10));
         assert!(!(Position::new(5, 10) < Position::new(5, 10)));
         assert!(!(Position::new(5, 10) > Position::new(5, 10)));
-        
+
         // Test with large values
         assert!(Position::new(1000000, 50000) < Position::new(1000001, 0));
-        
+
         // Test ordering is consistent with Ord trait
         let mut positions = vec![
             Position::new(10, 5),
@@ -5694,7 +7064,7 @@ mod tests {
             Position::new(5, 10), // duplicate
         ];
         positions.sort();
-        
+
         assert_eq!(positions[0], Position::new(5, 10));
         assert_eq!(positions[1], Position::new(5, 10)); // duplicate
         assert_eq!(positions[2], Position::new(5, 20));
@@ -5706,7 +7076,7 @@ mod tests {
     fn test_invalid_intervals_filtered() {
         // Test that invalid intervals (start > end) are filtered out
         // Validates: Error handling for invalid intervals
-        
+
         let scopes = vec![
             (10, 0, 20, 0),  // Valid
             (30, 0, 25, 0),  // Invalid: end line < start line
@@ -5714,23 +7084,23 @@ mod tests {
             (60, 10, 60, 5), // Invalid: same line but end column < start column
         ];
         let tree = FunctionScopeTree::from_scopes(&scopes);
-        
+
         // Should only have 2 valid intervals
         assert_eq!(tree.len(), 2, "Tree should only have 2 valid intervals");
-        
+
         // Query should only find valid intervals
         let in_first = tree.query_point(Position::new(15, 0));
         assert_eq!(in_first.len(), 1);
         assert_eq!(in_first[0].start.line, 10);
-        
+
         let in_second = tree.query_point(Position::new(45, 0));
         assert_eq!(in_second.len(), 1);
         assert_eq!(in_second[0].start.line, 40);
-        
+
         // Invalid interval ranges should not be found
         let in_invalid_1 = tree.query_point(Position::new(27, 0));
         assert!(in_invalid_1.is_empty(), "Should not find invalid interval");
-        
+
         let in_invalid_2 = tree.query_point(Position::new(60, 7));
         assert!(in_invalid_2.is_empty(), "Should not find invalid interval");
     }
@@ -5748,9 +7118,17 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Find PackageLoad event
-        let package_load_events: Vec<_> = artifacts.timeline.iter()
+        let package_load_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| {
-                if let ScopeEvent::PackageLoad { line, column, package, function_scope } = e {
+                if let ScopeEvent::PackageLoad {
+                    line,
+                    column,
+                    package,
+                    function_scope,
+                } = e
+                {
                     Some((line, column, package, function_scope))
                 } else {
                     None
@@ -5758,11 +7136,18 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(package_load_events.len(), 1, "Should have exactly one PackageLoad event");
+        assert_eq!(
+            package_load_events.len(),
+            1,
+            "Should have exactly one PackageLoad event"
+        );
         let (line, _column, package, function_scope) = package_load_events[0];
         assert_eq!(*line, 0, "PackageLoad should be on line 0");
         assert_eq!(package, "dplyr", "Package name should be dplyr");
-        assert!(function_scope.is_none(), "Global library() call should have function_scope=None");
+        assert!(
+            function_scope.is_none(),
+            "Global library() call should have function_scope=None"
+        );
     }
 
     #[test]
@@ -5773,9 +7158,17 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Find PackageLoad event
-        let package_load_events: Vec<_> = artifacts.timeline.iter()
+        let package_load_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| {
-                if let ScopeEvent::PackageLoad { line, column, package, function_scope } = e {
+                if let ScopeEvent::PackageLoad {
+                    line,
+                    column,
+                    package,
+                    function_scope,
+                } = e
+                {
                     Some((*line, *column, package.clone(), function_scope.clone()))
                 } else {
                     None
@@ -5783,11 +7176,18 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(package_load_events.len(), 1, "Should have exactly one PackageLoad event");
+        assert_eq!(
+            package_load_events.len(),
+            1,
+            "Should have exactly one PackageLoad event"
+        );
         let (line, _column, package, function_scope) = &package_load_events[0];
         assert_eq!(*line, 1, "PackageLoad should be on line 1");
         assert_eq!(package, "dplyr", "Package name should be dplyr");
-        assert!(function_scope.is_some(), "library() inside function should have function_scope set");
+        assert!(
+            function_scope.is_some(),
+            "library() inside function should have function_scope set"
+        );
     }
 
     #[test]
@@ -5798,7 +7198,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Find PackageLoad events
-        let package_load_events: Vec<_> = artifacts.timeline.iter()
+        let package_load_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { line, package, .. } = e {
                     Some((*line, package.clone()))
@@ -5808,7 +7210,11 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(package_load_events.len(), 3, "Should have three PackageLoad events");
+        assert_eq!(
+            package_load_events.len(),
+            3,
+            "Should have three PackageLoad events"
+        );
         assert_eq!(package_load_events[0], (0, "dplyr".to_string()));
         assert_eq!(package_load_events[1], (1, "ggplot2".to_string()));
         assert_eq!(package_load_events[2], (2, "tidyr".to_string()));
@@ -5821,7 +7227,9 @@ mod tests {
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        let package_load_events: Vec<_> = artifacts.timeline.iter()
+        let package_load_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { package, .. } = e {
                     Some(package.clone())
@@ -5831,7 +7239,11 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(package_load_events.len(), 1, "Should have one PackageLoad event");
+        assert_eq!(
+            package_load_events.len(),
+            1,
+            "Should have one PackageLoad event"
+        );
         assert_eq!(package_load_events[0], "dplyr");
     }
 
@@ -5842,7 +7254,9 @@ mod tests {
         let tree = parse_r(code);
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
-        let package_load_events: Vec<_> = artifacts.timeline.iter()
+        let package_load_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { package, .. } = e {
                     Some(package.clone())
@@ -5852,7 +7266,11 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(package_load_events.len(), 1, "Should have one PackageLoad event");
+        assert_eq!(
+            package_load_events.len(),
+            1,
+            "Should have one PackageLoad event"
+        );
         assert_eq!(package_load_events[0], "dplyr");
     }
 
@@ -5864,7 +7282,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Extract event positions in order
-        let event_positions: Vec<(u32, &str)> = artifacts.timeline.iter()
+        let event_positions: Vec<(u32, &str)> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Def { line, symbol, .. } => Some((*line, symbol.name.as_str())),
                 ScopeEvent::PackageLoad { line, package, .. } => Some((*line, package.as_str())),
@@ -5874,7 +7294,7 @@ mod tests {
 
         // Should be in document order: x (line 0), dplyr (line 0), y (line 2)
         assert!(event_positions.len() >= 3, "Should have at least 3 events");
-        
+
         // Verify ordering
         let mut prev_line = 0;
         for (line, _) in &event_positions {
@@ -5916,7 +7336,9 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Find PackageLoad event
-        let package_load_events: Vec<_> = artifacts.timeline.iter()
+        let package_load_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| {
                 if let ScopeEvent::PackageLoad { function_scope, .. } = e {
                     Some(function_scope.clone())
@@ -5926,15 +7348,25 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(package_load_events.len(), 1, "Should have one PackageLoad event");
+        assert_eq!(
+            package_load_events.len(),
+            1,
+            "Should have one PackageLoad event"
+        );
         let function_scope = &package_load_events[0];
-        assert!(function_scope.is_some(), "library() in nested function should have function_scope set");
-        
+        assert!(
+            function_scope.is_some(),
+            "library() in nested function should have function_scope set"
+        );
+
         // The function_scope should be the inner function, not the outer one
         // We can verify this by checking that the scope interval is within the inner function
         if let Some(scope) = function_scope {
             // Inner function starts on line 1 and ends on line 3
-            assert!(scope.start.line >= 1, "Function scope should start at or after inner function definition");
+            assert!(
+                scope.start.line >= 1,
+                "Function scope should start at or after inner function definition"
+            );
         }
     }
 
@@ -5946,9 +7378,16 @@ mod tests {
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         // Find PackageLoad events
-        let package_load_events: Vec<_> = artifacts.timeline.iter()
+        let package_load_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter_map(|e| {
-                if let ScopeEvent::PackageLoad { package, function_scope, .. } = e {
+                if let ScopeEvent::PackageLoad {
+                    package,
+                    function_scope,
+                    ..
+                } = e
+                {
                     Some((package.clone(), function_scope.clone()))
                 } else {
                     None
@@ -5956,17 +7395,27 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(package_load_events.len(), 2, "Should have two PackageLoad events");
-        
+        assert_eq!(
+            package_load_events.len(),
+            2,
+            "Should have two PackageLoad events"
+        );
+
         // First should be global (dplyr)
         let (pkg1, scope1) = &package_load_events[0];
         assert_eq!(pkg1, "dplyr");
-        assert!(scope1.is_none(), "Global library(dplyr) should have function_scope=None");
-        
+        assert!(
+            scope1.is_none(),
+            "Global library(dplyr) should have function_scope=None"
+        );
+
         // Second should be function-scoped (ggplot2)
         let (pkg2, scope2) = &package_load_events[1];
         assert_eq!(pkg2, "ggplot2");
-        assert!(scope2.is_some(), "library(ggplot2) inside function should have function_scope set");
+        assert!(
+            scope2.is_some(),
+            "library(ggplot2) inside function should have function_scope set"
+        );
     }
 
     // ============================================================================
@@ -5995,9 +7444,12 @@ mod tests {
     /// let missing: HashSet<String> = get_exports("unknown");
     /// assert!(missing.is_empty());
     /// ```
-    fn mock_package_exports<'a>(packages: &'a [(&'a str, &'a [&'a str])]) -> impl Fn(&str) -> HashSet<String> + 'a {
+    fn mock_package_exports<'a>(
+        packages: &'a [(&'a str, &'a [&'a str])],
+    ) -> impl Fn(&str) -> HashSet<String> + 'a {
         move |pkg: &str| {
-            packages.iter()
+            packages
+                .iter()
                 .find(|(name, _)| *name == pkg)
                 .map(|(_, exports)| exports.iter().map(|s| s.to_string()).collect())
                 .unwrap_or_default()
@@ -6024,8 +7476,14 @@ mod tests {
 
         // Should have x but NOT package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
-        assert!(!scope.symbols.contains_key("mutate"), "mutate should NOT be in scope before library()");
-        assert!(!scope.symbols.contains_key("filter"), "filter should NOT be in scope before library()");
+        assert!(
+            !scope.symbols.contains_key("mutate"),
+            "mutate should NOT be in scope before library()"
+        );
+        assert!(
+            !scope.symbols.contains_key("filter"),
+            "filter should NOT be in scope before library()"
+        );
     }
 
     #[test]
@@ -6044,9 +7502,18 @@ mod tests {
         // Should have x, y, and package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
         assert!(scope.symbols.contains_key("y"), "y should be in scope");
-        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope after library()");
-        assert!(scope.symbols.contains_key("filter"), "filter should be in scope after library()");
-        assert!(scope.symbols.contains_key("select"), "select should be in scope after library()");
+        assert!(
+            scope.symbols.contains_key("mutate"),
+            "mutate should be in scope after library()"
+        );
+        assert!(
+            scope.symbols.contains_key("filter"),
+            "filter should be in scope after library()"
+        );
+        assert!(
+            scope.symbols.contains_key("select"),
+            "select should be in scope after library()"
+        );
     }
 
     #[test]
@@ -6063,8 +7530,14 @@ mod tests {
         let scope = scope_at_position_with_packages(&artifacts, 0, 20, &get_exports, &base_exports);
 
         // Package exports should be available
-        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope at library() line");
-        assert!(scope.symbols.contains_key("filter"), "filter should be in scope at library() line");
+        assert!(
+            scope.symbols.contains_key("mutate"),
+            "mutate should be in scope at library() line"
+        );
+        assert!(
+            scope.symbols.contains_key("filter"),
+            "filter should be in scope at library() line"
+        );
     }
 
     #[test]
@@ -6078,13 +7551,18 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query inside the function (line 2, after library call)
-        let scope_inside = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        let scope_inside =
+            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
 
         // Package exports should be available inside the function
-        assert!(scope_inside.symbols.contains_key("mutate"), 
-            "mutate should be in scope inside function after library()");
-        assert!(scope_inside.symbols.contains_key("filter"), 
-            "filter should be in scope inside function after library()");
+        assert!(
+            scope_inside.symbols.contains_key("mutate"),
+            "mutate should be in scope inside function after library()"
+        );
+        assert!(
+            scope_inside.symbols.contains_key("filter"),
+            "filter should be in scope inside function after library()"
+        );
     }
 
     #[test]
@@ -6098,15 +7576,23 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query outside the function (line 4)
-        let scope_outside = scope_at_position_with_packages(&artifacts, 4, 10, &get_exports, &base_exports);
+        let scope_outside =
+            scope_at_position_with_packages(&artifacts, 4, 10, &get_exports, &base_exports);
 
         // Package exports should NOT be available outside the function
-        assert!(!scope_outside.symbols.contains_key("mutate"), 
-            "mutate should NOT be in scope outside function");
-        assert!(!scope_outside.symbols.contains_key("filter"), 
-            "filter should NOT be in scope outside function");
+        assert!(
+            !scope_outside.symbols.contains_key("mutate"),
+            "mutate should NOT be in scope outside function"
+        );
+        assert!(
+            !scope_outside.symbols.contains_key("filter"),
+            "filter should NOT be in scope outside function"
+        );
         // But y should be available
-        assert!(scope_outside.symbols.contains_key("y"), "y should be in scope");
+        assert!(
+            scope_outside.symbols.contains_key("y"),
+            "y should be in scope"
+        );
     }
 
     #[test]
@@ -6120,14 +7606,20 @@ mod tests {
         let base_exports = empty_base_exports();
 
         // Query inside the function
-        let scope_inside = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
-        assert!(scope_inside.symbols.contains_key("mutate"), 
-            "Global package exports should be available inside function");
+        let scope_inside =
+            scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
+        assert!(
+            scope_inside.symbols.contains_key("mutate"),
+            "Global package exports should be available inside function"
+        );
 
         // Query outside the function
-        let scope_outside = scope_at_position_with_packages(&artifacts, 3, 10, &get_exports, &base_exports);
-        assert!(scope_outside.symbols.contains_key("filter"), 
-            "Global package exports should be available outside function");
+        let scope_outside =
+            scope_at_position_with_packages(&artifacts, 3, 10, &get_exports, &base_exports);
+        assert!(
+            scope_outside.symbols.contains_key("filter"),
+            "Global package exports should be available outside function"
+        );
     }
 
     #[test]
@@ -6147,10 +7639,22 @@ mod tests {
         let scope = scope_at_position_with_packages(&artifacts, 2, 10, &get_exports, &base_exports);
 
         // Should have exports from both packages
-        assert!(scope.symbols.contains_key("mutate"), "dplyr exports should be in scope");
-        assert!(scope.symbols.contains_key("filter"), "dplyr exports should be in scope");
-        assert!(scope.symbols.contains_key("ggplot"), "ggplot2 exports should be in scope");
-        assert!(scope.symbols.contains_key("aes"), "ggplot2 exports should be in scope");
+        assert!(
+            scope.symbols.contains_key("mutate"),
+            "dplyr exports should be in scope"
+        );
+        assert!(
+            scope.symbols.contains_key("filter"),
+            "dplyr exports should be in scope"
+        );
+        assert!(
+            scope.symbols.contains_key("ggplot"),
+            "ggplot2 exports should be in scope"
+        );
+        assert!(
+            scope.symbols.contains_key("aes"),
+            "ggplot2 exports should be in scope"
+        );
     }
 
     #[test]
@@ -6167,15 +7671,26 @@ mod tests {
         let scope = scope_at_position_with_packages(&artifacts, 1, 50, &get_exports, &base_exports);
 
         // mutate should be the local definition, not the package export
-        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope");
+        assert!(
+            scope.symbols.contains_key("mutate"),
+            "mutate should be in scope"
+        );
         let mutate_symbol = scope.symbols.get("mutate").unwrap();
-        assert_eq!(mutate_symbol.kind, SymbolKind::Function, 
-            "mutate should be a function (local definition)");
-        assert!(!mutate_symbol.source_uri.as_str().starts_with("package:"), 
-            "mutate should be from local file, not package");
+        assert_eq!(
+            mutate_symbol.kind,
+            SymbolKind::Function,
+            "mutate should be a function (local definition)"
+        );
+        assert!(
+            !mutate_symbol.source_uri.as_str().starts_with("package:"),
+            "mutate should be from local file, not package"
+        );
 
         // filter should still be from the package
-        assert!(scope.symbols.contains_key("filter"), "filter should be in scope");
+        assert!(
+            scope.symbols.contains_key("filter"),
+            "filter should be in scope"
+        );
     }
 
     #[test]
@@ -6191,8 +7706,11 @@ mod tests {
         let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
 
         let mutate_symbol = scope.symbols.get("mutate").unwrap();
-        assert_eq!(mutate_symbol.source_uri.as_str(), "package:dplyr", 
-            "Package symbol should have package:name URI");
+        assert_eq!(
+            mutate_symbol.source_uri.as_str(),
+            "package:dplyr",
+            "Package symbol should have package:name URI"
+        );
     }
 
     #[test]
@@ -6227,7 +7745,10 @@ mod tests {
 
         // Should just have x, no package exports
         assert!(scope.symbols.contains_key("x"), "x should be in scope");
-        assert!(!scope.symbols.contains_key("mutate"), "mutate should NOT be in scope");
+        assert!(
+            !scope.symbols.contains_key("mutate"),
+            "mutate should NOT be in scope"
+        );
     }
 
     #[test]
@@ -6242,8 +7763,14 @@ mod tests {
 
         let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
 
-        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope after require()");
-        assert!(scope.symbols.contains_key("filter"), "filter should be in scope after require()");
+        assert!(
+            scope.symbols.contains_key("mutate"),
+            "mutate should be in scope after require()"
+        );
+        assert!(
+            scope.symbols.contains_key("filter"),
+            "filter should be in scope after require()"
+        );
     }
 
     #[test]
@@ -6259,8 +7786,14 @@ x <- 1"#;
 
         let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
 
-        assert!(scope.symbols.contains_key("mutate"), "mutate should be in scope after loadNamespace()");
-        assert!(scope.symbols.contains_key("filter"), "filter should be in scope after loadNamespace()");
+        assert!(
+            scope.symbols.contains_key("mutate"),
+            "mutate should be in scope after loadNamespace()"
+        );
+        assert!(
+            scope.symbols.contains_key("filter"),
+            "filter should be in scope after loadNamespace()"
+        );
     }
 
     // ============================================================================
@@ -6283,16 +7816,36 @@ x <- 1"#;
         base_exports.insert("sum".to_string());
 
         // Query at the very beginning of the file
-        let scope_start = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
-        assert!(scope_start.symbols.contains_key("print"), "print should be in scope at start");
-        assert!(scope_start.symbols.contains_key("cat"), "cat should be in scope at start");
-        assert!(scope_start.symbols.contains_key("sum"), "sum should be in scope at start");
+        let scope_start =
+            scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+        assert!(
+            scope_start.symbols.contains_key("print"),
+            "print should be in scope at start"
+        );
+        assert!(
+            scope_start.symbols.contains_key("cat"),
+            "cat should be in scope at start"
+        );
+        assert!(
+            scope_start.symbols.contains_key("sum"),
+            "sum should be in scope at start"
+        );
 
         // Query at the end of the file
-        let scope_end = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
-        assert!(scope_end.symbols.contains_key("print"), "print should be in scope at end");
-        assert!(scope_end.symbols.contains_key("cat"), "cat should be in scope at end");
-        assert!(scope_end.symbols.contains_key("sum"), "sum should be in scope at end");
+        let scope_end =
+            scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
+        assert!(
+            scope_end.symbols.contains_key("print"),
+            "print should be in scope at end"
+        );
+        assert!(
+            scope_end.symbols.contains_key("cat"),
+            "cat should be in scope at end"
+        );
+        assert!(
+            scope_end.symbols.contains_key("sum"),
+            "sum should be in scope at end"
+        );
     }
 
     /// Ensures base package exports are available in scope before any explicit `library()` call.
@@ -6330,8 +7883,14 @@ x <- 1"#;
 
         // Query at line 0 (before library call)
         let scope = scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports);
-        assert!(scope.symbols.contains_key("print"), "print should be in scope before library()");
-        assert!(!scope.symbols.contains_key("mutate"), "mutate should NOT be in scope before library()");
+        assert!(
+            scope.symbols.contains_key("print"),
+            "print should be in scope before library()"
+        );
+        assert!(
+            !scope.symbols.contains_key("mutate"),
+            "mutate should NOT be in scope before library()"
+        );
     }
 
     #[test]
@@ -6347,8 +7906,11 @@ x <- 1"#;
 
         let scope = scope_at_position_with_packages(&artifacts, 0, 10, &get_exports, &base_exports);
         let print_symbol = scope.symbols.get("print").unwrap();
-        assert_eq!(print_symbol.source_uri.as_str(), "package:base", 
-            "Base export should have package:base URI");
+        assert_eq!(
+            print_symbol.source_uri.as_str(),
+            "package:base",
+            "Base export should have package:base URI"
+        );
     }
 
     #[test]
@@ -6364,12 +7926,17 @@ x <- 1"#;
 
         // Query after local definition
         let scope = scope_at_position_with_packages(&artifacts, 0, 50, &get_exports, &base_exports);
-        
+
         let print_symbol = scope.symbols.get("print").unwrap();
-        assert_eq!(print_symbol.kind, SymbolKind::Function, 
-            "print should be a function (local definition)");
-        assert!(!print_symbol.source_uri.as_str().starts_with("package:"), 
-            "print should be from local file, not base package");
+        assert_eq!(
+            print_symbol.kind,
+            SymbolKind::Function,
+            "print should be a function (local definition)"
+        );
+        assert!(
+            !print_symbol.source_uri.as_str().starts_with("package:"),
+            "print should be from local file, not base package"
+        );
     }
 
     #[test]
@@ -6386,11 +7953,14 @@ x <- 1"#;
 
         // Query after library call
         let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
-        
+
         let print_symbol = scope.symbols.get("print").unwrap();
         // The package export should override the base export
-        assert_eq!(print_symbol.source_uri.as_str(), "package:mypkg", 
-            "print should be from mypkg, not base package");
+        assert_eq!(
+            print_symbol.source_uri.as_str(),
+            "package:mypkg",
+            "print should be from mypkg, not base package"
+        );
     }
 
     #[test]
@@ -6406,7 +7976,10 @@ x <- 1"#;
 
         // Query inside the function
         let scope = scope_at_position_with_packages(&artifacts, 1, 10, &get_exports, &base_exports);
-        assert!(scope.symbols.contains_key("print"), "print should be in scope inside function");
+        assert!(
+            scope.symbols.contains_key("print"),
+            "print should be in scope inside function"
+        );
     }
 
     #[test]
@@ -6435,21 +8008,21 @@ x <- 1"#;
         // package exports should be available in sourced file from the start
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
-        
+
         // Parent file: library(dplyr) at line 0, source("child.R") at line 1
         let parent_code = "library(dplyr)\nsource(\"child.R\")";
         let parent_tree = parse_r(parent_code);
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-        
+
         // Child file: just uses mutate
         let child_code = "x <- mutate(df, y = 1)";
         let child_tree = parse_r(child_code);
         let child_uri = Url::parse("file:///project/child.R").unwrap();
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-        
+
         let workspace_root = Url::parse("file:///project").unwrap();
-        
+
         // Build dependency graph
         let mut graph = DependencyGraph::new();
         let parent_meta = CrossFileMetadata {
@@ -6466,7 +8039,7 @@ x <- 1"#;
             ..Default::default()
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
-        
+
         // Create artifacts lookup
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
@@ -6477,7 +8050,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
             if uri == &parent_uri {
                 Some(parent_meta.clone())
@@ -6485,7 +8058,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         // Query child's scope at position (0, 0) - should have inherited packages
         let scope = scope_at_position_with_graph(
             &child_uri,
@@ -6497,10 +8070,12 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Child should have inherited dplyr from parent
-        assert!(scope.inherited_packages.contains(&"dplyr".to_string()),
-            "Child should inherit dplyr package from parent");
+        assert!(
+            scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should inherit dplyr package from parent"
+        );
     }
 
     #[test]
@@ -6508,21 +8083,21 @@ x <- 1"#;
         // Requirement 5.1: Only packages loaded BEFORE source() call are propagated
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
-        
+
         // Parent file: source("child.R") at line 0, library(dplyr) at line 1
         let parent_code = "source(\"child.R\")\nlibrary(dplyr)";
         let parent_tree = parse_r(parent_code);
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-        
+
         // Child file
         let child_code = "x <- 1";
         let child_tree = parse_r(child_code);
         let child_uri = Url::parse("file:///project/child.R").unwrap();
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-        
+
         let workspace_root = Url::parse("file:///project").unwrap();
-        
+
         // Build dependency graph
         let mut graph = DependencyGraph::new();
         let parent_meta = CrossFileMetadata {
@@ -6539,7 +8114,7 @@ x <- 1"#;
             ..Default::default()
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
-        
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
                 Some(parent_artifacts.clone())
@@ -6549,7 +8124,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
             if uri == &parent_uri {
                 Some(parent_meta.clone())
@@ -6557,7 +8132,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         // Query child's scope - should NOT have dplyr (loaded after source())
         let scope = scope_at_position_with_graph(
             &child_uri,
@@ -6569,10 +8144,12 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Child should NOT have dplyr (it was loaded after source() call)
-        assert!(!scope.inherited_packages.contains(&"dplyr".to_string()),
-            "Child should NOT inherit dplyr (loaded after source() call)");
+        assert!(
+            !scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should NOT inherit dplyr (loaded after source() call)"
+        );
     }
 
     #[test]
@@ -6580,21 +8157,21 @@ x <- 1"#;
         // Requirement 5.3: Multiple packages loaded before source() are all propagated
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
-        
+
         // Parent file: library(dplyr) at line 0, library(ggplot2) at line 1, source() at line 2
         let parent_code = "library(dplyr)\nlibrary(ggplot2)\nsource(\"child.R\")";
         let parent_tree = parse_r(parent_code);
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-        
+
         // Child file
         let child_code = "x <- 1";
         let child_tree = parse_r(child_code);
         let child_uri = Url::parse("file:///project/child.R").unwrap();
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-        
+
         let workspace_root = Url::parse("file:///project").unwrap();
-        
+
         // Build dependency graph
         let mut graph = DependencyGraph::new();
         let parent_meta = CrossFileMetadata {
@@ -6611,7 +8188,7 @@ x <- 1"#;
             ..Default::default()
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
-        
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
                 Some(parent_artifacts.clone())
@@ -6621,7 +8198,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
             if uri == &parent_uri {
                 Some(parent_meta.clone())
@@ -6629,7 +8206,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         // Query child's scope
         let scope = scope_at_position_with_graph(
             &child_uri,
@@ -6641,12 +8218,16 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Child should have both packages
-        assert!(scope.inherited_packages.contains(&"dplyr".to_string()),
-            "Child should inherit dplyr from parent");
-        assert!(scope.inherited_packages.contains(&"ggplot2".to_string()),
-            "Child should inherit ggplot2 from parent");
+        assert!(
+            scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should inherit dplyr from parent"
+        );
+        assert!(
+            scope.inherited_packages.contains(&"ggplot2".to_string()),
+            "Child should inherit ggplot2 from parent"
+        );
     }
 
     #[test]
@@ -6655,21 +8236,21 @@ x <- 1"#;
         // unless the source() call is within the same function
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
-        
+
         // Parent file: function with library(dplyr) inside, source() outside
         let parent_code = "f <- function() {\n  library(dplyr)\n}\nsource(\"child.R\")";
         let parent_tree = parse_r(parent_code);
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-        
+
         // Child file
         let child_code = "x <- 1";
         let child_tree = parse_r(child_code);
         let child_uri = Url::parse("file:///project/child.R").unwrap();
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-        
+
         let workspace_root = Url::parse("file:///project").unwrap();
-        
+
         // Build dependency graph
         let mut graph = DependencyGraph::new();
         let parent_meta = CrossFileMetadata {
@@ -6686,7 +8267,7 @@ x <- 1"#;
             ..Default::default()
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
-        
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
                 Some(parent_artifacts.clone())
@@ -6696,7 +8277,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
             if uri == &parent_uri {
                 Some(parent_meta.clone())
@@ -6704,7 +8285,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         // Query child's scope
         let scope = scope_at_position_with_graph(
             &child_uri,
@@ -6716,10 +8297,12 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Child should NOT have dplyr (it's function-scoped in parent)
-        assert!(!scope.inherited_packages.contains(&"dplyr".to_string()),
-            "Child should NOT inherit function-scoped dplyr from parent");
+        assert!(
+            !scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Child should NOT inherit function-scoped dplyr from parent"
+        );
     }
 
     // ============================================================================
@@ -6733,21 +8316,21 @@ x <- 1"#;
         // back to the parent file.
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
-        
+
         // Parent file: source("child.R") at line 0, then uses mutate at line 1
         let parent_code = "source(\"child.R\")\nmutate(df, y = 1)";
         let parent_tree = parse_r(parent_code);
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-        
+
         // Child file: loads dplyr
         let child_code = "library(dplyr)\nx <- 1";
         let child_tree = parse_r(child_code);
         let child_uri = Url::parse("file:///project/child.R").unwrap();
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-        
+
         let workspace_root = Url::parse("file:///project").unwrap();
-        
+
         // Build dependency graph
         let mut graph = DependencyGraph::new();
         let parent_meta = CrossFileMetadata {
@@ -6764,7 +8347,7 @@ x <- 1"#;
             ..Default::default()
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
-        
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
                 Some(parent_artifacts.clone())
@@ -6774,7 +8357,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
             if uri == &parent_uri {
                 Some(parent_meta.clone())
@@ -6782,7 +8365,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         // Query parent's scope AFTER the source() call
         // The parent should NOT have dplyr in inherited_packages because
         // packages don't propagate backward from child to parent
@@ -6796,11 +8379,13 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Parent should NOT have dplyr (it was loaded in child, not parent)
         // Requirement 5.4: Forward-only propagation
-        assert!(!scope.inherited_packages.contains(&"dplyr".to_string()),
-            "Parent should NOT inherit dplyr from child (forward-only propagation)");
+        assert!(
+            !scope.inherited_packages.contains(&"dplyr".to_string()),
+            "Parent should NOT inherit dplyr from child (forward-only propagation)"
+        );
     }
 
     #[test]
@@ -6809,21 +8394,21 @@ x <- 1"#;
         // packages loaded in child files should NOT be propagated back.
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
-        
+
         // Parent file: source("child.R") at line 0
         let parent_code = "source(\"child.R\")\ny <- helper_func()";
         let parent_tree = parse_r(parent_code);
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-        
+
         // Child file: loads ggplot2 and defines helper_func
         let child_code = "library(ggplot2)\nhelper_func <- function() { 1 }";
         let child_tree = parse_r(child_code);
         let child_uri = Url::parse("file:///project/child.R").unwrap();
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-        
+
         let workspace_root = Url::parse("file:///project").unwrap();
-        
+
         // Build dependency graph
         let mut graph = DependencyGraph::new();
         let parent_meta = CrossFileMetadata {
@@ -6840,7 +8425,7 @@ x <- 1"#;
             ..Default::default()
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
-        
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
                 Some(parent_artifacts.clone())
@@ -6850,7 +8435,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
             if uri == &parent_uri {
                 Some(parent_meta.clone())
@@ -6858,7 +8443,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         // Query parent's scope after source() call
         let scope = scope_at_position_with_graph(
             &parent_uri,
@@ -6870,15 +8455,19 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Symbols from child SHOULD be available in parent
-        assert!(scope.symbols.contains_key("helper_func"),
-            "Parent should have helper_func from child (symbols propagate)");
-        
+        assert!(
+            scope.symbols.contains_key("helper_func"),
+            "Parent should have helper_func from child (symbols propagate)"
+        );
+
         // But packages from child should NOT be in parent's inherited_packages
         // Requirement 5.4: Forward-only propagation
-        assert!(!scope.inherited_packages.contains(&"ggplot2".to_string()),
-            "Parent should NOT inherit ggplot2 from child (forward-only propagation)");
+        assert!(
+            !scope.inherited_packages.contains(&"ggplot2".to_string()),
+            "Parent should NOT inherit ggplot2 from child (forward-only propagation)"
+        );
     }
 
     #[test]
@@ -6887,30 +8476,31 @@ x <- 1"#;
         // should NOT propagate back through the chain.
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
-        
+
         // Grandparent file: source("parent.R")
         let grandparent_code = "source(\"parent.R\")\nz <- 1";
         let grandparent_tree = parse_r(grandparent_code);
         let grandparent_uri = Url::parse("file:///project/grandparent.R").unwrap();
-        let grandparent_artifacts = compute_artifacts(&grandparent_uri, &grandparent_tree, grandparent_code);
-        
+        let grandparent_artifacts =
+            compute_artifacts(&grandparent_uri, &grandparent_tree, grandparent_code);
+
         // Parent file: source("child.R")
         let parent_code = "source(\"child.R\")\ny <- 1";
         let parent_tree = parse_r(parent_code);
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-        
+
         // Child file: loads stringr
         let child_code = "library(stringr)\nx <- 1";
         let child_tree = parse_r(child_code);
         let child_uri = Url::parse("file:///project/child.R").unwrap();
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-        
+
         let workspace_root = Url::parse("file:///project").unwrap();
-        
+
         // Build dependency graph
         let mut graph = DependencyGraph::new();
-        
+
         let grandparent_meta = CrossFileMetadata {
             sources: vec![ForwardSource {
                 path: "parent.R".to_string(),
@@ -6924,8 +8514,13 @@ x <- 1"#;
             }],
             ..Default::default()
         };
-        graph.update_file(&grandparent_uri, &grandparent_meta, Some(&workspace_root), |_| None);
-        
+        graph.update_file(
+            &grandparent_uri,
+            &grandparent_meta,
+            Some(&workspace_root),
+            |_| None,
+        );
+
         let parent_meta = CrossFileMetadata {
             sources: vec![ForwardSource {
                 path: "child.R".to_string(),
@@ -6940,7 +8535,7 @@ x <- 1"#;
             ..Default::default()
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
-        
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &grandparent_uri {
                 Some(grandparent_artifacts.clone())
@@ -6952,7 +8547,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
             if uri == &grandparent_uri {
                 Some(grandparent_meta.clone())
@@ -6962,7 +8557,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         // Query grandparent's scope after source() call
         let grandparent_scope = scope_at_position_with_graph(
             &grandparent_uri,
@@ -6974,12 +8569,16 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Grandparent should NOT have stringr (loaded in grandchild)
         // Requirement 5.4: Forward-only propagation
-        assert!(!grandparent_scope.inherited_packages.contains(&"stringr".to_string()),
-            "Grandparent should NOT inherit stringr from grandchild (forward-only propagation)");
-        
+        assert!(
+            !grandparent_scope
+                .inherited_packages
+                .contains(&"stringr".to_string()),
+            "Grandparent should NOT inherit stringr from grandchild (forward-only propagation)"
+        );
+
         // Query parent's scope after source() call
         let parent_scope = scope_at_position_with_graph(
             &parent_uri,
@@ -6991,10 +8590,14 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Parent should also NOT have stringr (loaded in child)
-        assert!(!parent_scope.inherited_packages.contains(&"stringr".to_string()),
-            "Parent should NOT inherit stringr from child (forward-only propagation)");
+        assert!(
+            !parent_scope
+                .inherited_packages
+                .contains(&"stringr".to_string()),
+            "Parent should NOT inherit stringr from child (forward-only propagation)"
+        );
     }
 
     #[test]
@@ -7003,21 +8606,21 @@ x <- 1"#;
         // don't propagate back to parent.
         use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
-        
+
         // Parent file: library(dplyr), source("child.R")
         let parent_code = "library(dplyr)\nsource(\"child.R\")\nz <- 1";
         let parent_tree = parse_r(parent_code);
         let parent_uri = Url::parse("file:///project/parent.R").unwrap();
         let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
-        
+
         // Child file: loads ggplot2
         let child_code = "library(ggplot2)\nx <- 1";
         let child_tree = parse_r(child_code);
         let child_uri = Url::parse("file:///project/child.R").unwrap();
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
-        
+
         let workspace_root = Url::parse("file:///project").unwrap();
-        
+
         // Build dependency graph
         let mut graph = DependencyGraph::new();
         let parent_meta = CrossFileMetadata {
@@ -7034,7 +8637,7 @@ x <- 1"#;
             ..Default::default()
         };
         graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
-        
+
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
                 Some(parent_artifacts.clone())
@@ -7044,7 +8647,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
             if uri == &parent_uri {
                 Some(parent_meta.clone())
@@ -7052,7 +8655,7 @@ x <- 1"#;
                 None
             }
         };
-        
+
         // Query child's scope - should have dplyr from parent
         let child_scope = scope_at_position_with_graph(
             &child_uri,
@@ -7064,11 +8667,15 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Child SHOULD have dplyr (propagated from parent)
-        assert!(child_scope.inherited_packages.contains(&"dplyr".to_string()),
-            "Child should inherit dplyr from parent (forward propagation works)");
-        
+        assert!(
+            child_scope
+                .inherited_packages
+                .contains(&"dplyr".to_string()),
+            "Child should inherit dplyr from parent (forward propagation works)"
+        );
+
         // Query parent's scope after source() call
         let parent_scope = scope_at_position_with_graph(
             &parent_uri,
@@ -7080,11 +8687,15 @@ x <- 1"#;
             Some(&workspace_root),
             10,
         );
-        
+
         // Parent should NOT have ggplot2 (loaded in child)
         // Requirement 5.4: Forward-only propagation
-        assert!(!parent_scope.inherited_packages.contains(&"ggplot2".to_string()),
-            "Parent should NOT inherit ggplot2 from child (forward-only propagation)");
+        assert!(
+            !parent_scope
+                .inherited_packages
+                .contains(&"ggplot2".to_string()),
+            "Parent should NOT inherit ggplot2 from child (forward-only propagation)"
+        );
     }
 
     // ============================================================================
@@ -7102,13 +8713,17 @@ x <- 1"#;
 
         // Query at line 0 (before library call) - should NOT have dplyr in loaded_packages
         let scope_before = scope_at_position(&artifacts, 0, 10);
-        assert!(!scope_before.loaded_packages.contains(&"dplyr".to_string()),
-            "dplyr should NOT be in loaded_packages before library() call");
+        assert!(
+            !scope_before.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should NOT be in loaded_packages before library() call"
+        );
 
         // Query at line 2 (after library call) - should have dplyr in loaded_packages
         let scope_after = scope_at_position(&artifacts, 2, 10);
-        assert!(scope_after.loaded_packages.contains(&"dplyr".to_string()),
-            "dplyr should be in loaded_packages after library() call");
+        assert!(
+            scope_after.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages after library() call"
+        );
     }
 
     #[test]
@@ -7120,17 +8735,25 @@ x <- 1"#;
 
         // Query at line 0 (after first library, before second)
         let scope_mid = scope_at_position(&artifacts, 0, 20);
-        assert!(scope_mid.loaded_packages.contains(&"dplyr".to_string()),
-            "dplyr should be in loaded_packages after first library() call");
-        assert!(!scope_mid.loaded_packages.contains(&"ggplot2".to_string()),
-            "ggplot2 should NOT be in loaded_packages before second library() call");
+        assert!(
+            scope_mid.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages after first library() call"
+        );
+        assert!(
+            !scope_mid.loaded_packages.contains(&"ggplot2".to_string()),
+            "ggplot2 should NOT be in loaded_packages before second library() call"
+        );
 
         // Query at line 2 (after both library calls)
         let scope_end = scope_at_position(&artifacts, 2, 10);
-        assert!(scope_end.loaded_packages.contains(&"dplyr".to_string()),
-            "dplyr should be in loaded_packages");
-        assert!(scope_end.loaded_packages.contains(&"ggplot2".to_string()),
-            "ggplot2 should be in loaded_packages");
+        assert!(
+            scope_end.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages"
+        );
+        assert!(
+            scope_end.loaded_packages.contains(&"ggplot2".to_string()),
+            "ggplot2 should be in loaded_packages"
+        );
     }
 
     #[test]
@@ -7146,13 +8769,17 @@ y <- filter(df)"#;
 
         // Query inside the function (line 2) - should have dplyr
         let scope_inside = scope_at_position(&artifacts, 2, 10);
-        assert!(scope_inside.loaded_packages.contains(&"dplyr".to_string()),
-            "dplyr should be in loaded_packages inside function");
+        assert!(
+            scope_inside.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages inside function"
+        );
 
         // Query outside the function (line 4) - should NOT have dplyr
         let scope_outside = scope_at_position(&artifacts, 4, 10);
-        assert!(!scope_outside.loaded_packages.contains(&"dplyr".to_string()),
-            "dplyr should NOT be in loaded_packages outside function (function-scoped)");
+        assert!(
+            !scope_outside.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should NOT be in loaded_packages outside function (function-scoped)"
+        );
     }
 
     #[test]
@@ -7163,8 +8790,10 @@ y <- filter(df)"#;
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         let scope = scope_at_position(&artifacts, 1, 10);
-        assert!(scope.loaded_packages.contains(&"dplyr".to_string()),
-            "dplyr should be in loaded_packages after require() call");
+        assert!(
+            scope.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages after require() call"
+        );
     }
 
     #[test]
@@ -7175,7 +8804,9 @@ y <- filter(df)"#;
         let artifacts = compute_artifacts(&test_uri(), &tree, code);
 
         let scope = scope_at_position(&artifacts, 1, 10);
-        assert!(scope.loaded_packages.contains(&"dplyr".to_string()),
-            "dplyr should be in loaded_packages after loadNamespace() call");
+        assert!(
+            scope.loaded_packages.contains(&"dplyr".to_string()),
+            "dplyr should be in loaded_packages after loadNamespace() call"
+        );
     }
 }

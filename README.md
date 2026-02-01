@@ -102,6 +102,4 @@ Both Sight and Raven were written by the same author to address the same problem
 
 ## License
 
-[GPL-3.0](LICENSE)
-
-The GPL-3.0 license applies to Raven as a whole. Files derived from Ark (MIT-licensed) retain their original copyright notices; the MIT license permits redistribution under GPL-3.0.
+[GPL-3.0](LICENSE). See [NOTICE](NOTICE) for third-party attributions.

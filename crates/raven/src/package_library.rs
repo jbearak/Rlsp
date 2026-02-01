@@ -23,7 +23,15 @@ use crate::r_subprocess::RSubprocess;
 /// Requirement 4.3: WHEN the package is `tidyverse`, THE Package_Resolver SHALL also load
 /// exports from: dplyr, readr, forcats, stringr, ggplot2, tibble, lubridate, tidyr, purrr
 pub const TIDYVERSE_PACKAGES: &[&str] = &[
-    "dplyr", "readr", "forcats", "stringr", "ggplot2", "tibble", "lubridate", "tidyr", "purrr",
+    "dplyr",
+    "readr",
+    "forcats",
+    "stringr",
+    "ggplot2",
+    "tibble",
+    "lubridate",
+    "tidyr",
+    "purrr",
 ];
 
 /// Requirement 4.4: WHEN the package is `tidymodels`, THE Package_Resolver SHALL also load
@@ -238,7 +246,9 @@ impl PackageLibrary {
         let packages_cache = self.packages.try_read().ok();
 
         if combined_cache.is_none() && packages_cache.is_none() {
-            log::trace!("Could not acquire any package cache lock for completions, returning empty");
+            log::trace!(
+                "Could not acquire any package cache lock for completions, returning empty"
+            );
             return result;
         }
 
@@ -418,7 +428,11 @@ impl PackageLibrary {
     ///
     /// Searches through loaded packages to find which one exports the given symbol.
     /// Returns the first package name that exports the symbol, or None.
-    pub fn find_package_for_symbol(&self, symbol: &str, loaded_packages: &[String]) -> Option<String> {
+    pub fn find_package_for_symbol(
+        &self,
+        symbol: &str,
+        loaded_packages: &[String],
+    ) -> Option<String> {
         // Check combined_exports cache first
         if let Ok(cache) = self.combined_exports.try_read() {
             for pkg_name in loaded_packages {
@@ -547,7 +561,11 @@ impl PackageLibrary {
         let base_packages_list = if let Some(ref r_subprocess) = self.r_subprocess {
             match r_subprocess.get_base_packages().await {
                 Ok(packages) => {
-                    log::trace!("Got {} base packages from R: {:?}", packages.len(), packages);
+                    log::trace!(
+                        "Got {} base packages from R: {:?}",
+                        packages.len(),
+                        packages
+                    );
                     packages
                 }
                 Err(e) => {
@@ -748,11 +766,7 @@ impl PackageLibrary {
                             filtered
                         }
                         Err(e) => {
-                            log::trace!(
-                                "Failed to parse NAMESPACE for package '{}': {}",
-                                name,
-                                e
-                            );
+                            log::trace!("Failed to parse NAMESPACE for package '{}': {}", name, e);
                             Vec::new()
                         }
                     }
@@ -883,7 +897,11 @@ impl PackageLibrary {
         {
             let mut cache = self.combined_exports.write().await;
             cache.insert(name.to_string(), Arc::new(all_exports.clone()));
-            log::trace!("Cached {} combined exports for package '{}'", all_exports.len(), name);
+            log::trace!(
+                "Cached {} combined exports for package '{}'",
+                all_exports.len(),
+                name
+            );
         }
 
         all_exports
@@ -1254,19 +1272,13 @@ mod tests {
         );
 
         // Should have base packages
-        assert!(
-            !lib.base_packages().is_empty(),
-            "Should have base packages"
-        );
+        assert!(!lib.base_packages().is_empty(), "Should have base packages");
         assert!(lib.is_base_package("base"), "Should have 'base' package");
         assert!(lib.is_base_package("stats"), "Should have 'stats' package");
         assert!(lib.is_base_package("utils"), "Should have 'utils' package");
 
         // Should have base exports (from querying base packages)
-        assert!(
-            !lib.base_exports().is_empty(),
-            "Should have base exports"
-        );
+        assert!(!lib.base_exports().is_empty(), "Should have base exports");
         // Common base functions should be in exports
         assert!(
             lib.is_base_export("print"),
@@ -1333,8 +1345,8 @@ mod tests {
         // Requirement 6.3: Base packages shall be available at all positions
         // These are common functions that should be in base exports
         let common_base_functions = [
-            "print", "cat", "c", "list", "length", "sum", "mean",
-            "paste", "paste0", "sprintf", "format",
+            "print", "cat", "c", "list", "length", "sum", "mean", "paste", "paste0", "sprintf",
+            "format",
         ];
 
         for func in &common_base_functions {
@@ -1358,11 +1370,7 @@ mod tests {
 
         // All returned lib_paths should exist
         for path in lib.lib_paths() {
-            assert!(
-                path.exists(),
-                "Library path {:?} should exist",
-                path
-            );
+            assert!(path.exists(), "Library path {:?} should exist", path);
         }
     }
 
@@ -1444,10 +1452,7 @@ mod tests {
         assert!(!pkg.exports.is_empty(), "base package should have exports");
 
         // Common base functions should be in exports
-        assert!(
-            pkg.exports.contains("print"),
-            "base should export 'print'"
-        );
+        assert!(pkg.exports.contains("print"), "base should export 'print'");
         assert!(pkg.exports.contains("cat"), "base should export 'cat'");
         assert!(pkg.exports.contains("c"), "base should export 'c'");
     }
@@ -1658,7 +1663,10 @@ mod tests {
         let (exports, _depends) = lib.load_package_from_filesystem("stats");
 
         // stats package should have exports from NAMESPACE
-        assert!(!exports.is_empty(), "stats should have exports from NAMESPACE");
+        assert!(
+            !exports.is_empty(),
+            "stats should have exports from NAMESPACE"
+        );
     }
 
     // ============================================================================
@@ -1710,8 +1718,14 @@ mod tests {
         let all_exports = lib.get_all_exports("mainpkg").await;
 
         // Should have exports from both packages
-        assert!(all_exports.contains("main_func"), "Should have main package export");
-        assert!(all_exports.contains("dep_func"), "Should have dependency export");
+        assert!(
+            all_exports.contains("main_func"),
+            "Should have main package export"
+        );
+        assert!(
+            all_exports.contains("dep_func"),
+            "Should have dependency export"
+        );
         assert_eq!(all_exports.len(), 2);
     }
 
@@ -1957,8 +1971,12 @@ mod tests {
         // Should have stats exports
         assert!(!all_exports.is_empty(), "stats should have exports");
         // Common stats functions
-        assert!(all_exports.contains("lm") || all_exports.contains("t.test") || all_exports.contains("sd"),
-            "stats should have common statistical functions");
+        assert!(
+            all_exports.contains("lm")
+                || all_exports.contains("t.test")
+                || all_exports.contains("sd"),
+            "stats should have common statistical functions"
+        );
     }
 
     // ============================================================================
@@ -2246,7 +2264,8 @@ mod tests {
     ///
     /// Generates a set of packages where all packages are connected in a single cycle.
     /// Returns a Vec of (name, exports, depends) tuples.
-    fn circular_deps_strategy() -> impl Strategy<Value = Vec<(String, HashSet<String>, Vec<String>)>> {
+    fn circular_deps_strategy() -> impl Strategy<Value = Vec<(String, HashSet<String>, Vec<String>)>>
+    {
         // Generate 2-6 packages with circular dependencies
         (2..=6usize).prop_flat_map(|num_packages| {
             // Generate unique package names
@@ -2709,7 +2728,10 @@ mod tests {
         // Validates: Requirement 15.1 (non-installed packages should trigger diagnostic)
         let lib = PackageLibrary::new_empty();
 
-        assert!(!lib.package_exists("__nonexistent_package_xyz__"), "non-existent package should not exist");
+        assert!(
+            !lib.package_exists("__nonexistent_package_xyz__"),
+            "non-existent package should not exist"
+        );
     }
 
     #[tokio::test]
@@ -2728,7 +2750,10 @@ mod tests {
         assert!(lib.package_exists("stats"), "stats should exist with R");
 
         // Non-existent package should not exist
-        assert!(!lib.package_exists("__nonexistent_package_xyz__"), "non-existent package should not exist");
+        assert!(
+            !lib.package_exists("__nonexistent_package_xyz__"),
+            "non-existent package should not exist"
+        );
     }
 
     // ============================================================================
@@ -2742,7 +2767,10 @@ mod tests {
         let lib = PackageLibrary::new_empty();
 
         let result = lib.get_exports_for_completions(&[]);
-        assert!(result.is_empty(), "Empty package list should return empty map");
+        assert!(
+            result.is_empty(),
+            "Empty package list should return empty map"
+        );
     }
 
     #[tokio::test]
@@ -2857,7 +2885,11 @@ mod tests {
         // Request exports from dplyr (cached) and ggplot2 (not cached)
         let result = lib.get_exports_for_completions(&["dplyr".to_string(), "ggplot2".to_string()]);
 
-        assert_eq!(result.len(), 1, "Should only have exports from cached package");
+        assert_eq!(
+            result.len(),
+            1,
+            "Should only have exports from cached package"
+        );
         assert_eq!(result.get("mutate"), Some(&vec!["dplyr".to_string()]));
         assert!(
             result.get("ggplot").is_none(),
@@ -2876,4 +2908,3 @@ mod tests {
         assert!(result.is_empty());
     }
 }
-

@@ -51,6 +51,32 @@ impl MetadataCache {
             guard.remove(uri);
         }
     }
+
+    /// Invalidate (remove) multiple metadata cache entries at once.
+    ///
+    /// This is more efficient than calling `remove` multiple times when
+    /// invalidating several entries, as it only acquires the write lock once.
+    ///
+    /// # Arguments
+    /// * `uris` - Iterator of URIs whose cache entries should be invalidated
+    ///
+    /// # Returns
+    /// The number of entries that were actually removed from the cache.
+    ///
+    /// _Requirements: 8.3_
+    pub fn invalidate_many<'a>(&self, uris: impl IntoIterator<Item = &'a Url>) -> usize {
+        if let Ok(mut guard) = self.inner.write() {
+            let mut count = 0;
+            for uri in uris {
+                if guard.remove(uri).is_some() {
+                    count += 1;
+                }
+            }
+            count
+        } else {
+            0
+        }
+    }
 }
 
 /// Artifacts cache with interior mutability
@@ -171,7 +197,6 @@ impl ParentSelectionCache {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +281,53 @@ mod tests {
 
         cache.invalidate(&child);
         assert!(cache.get(&child, &key).is_none());
+    }
+
+    #[test]
+    fn test_metadata_cache_invalidate_many() {
+        let cache = MetadataCache::new();
+        let uri1 = test_uri("test1.R");
+        let uri2 = test_uri("test2.R");
+        let uri3 = test_uri("test3.R");
+        let uri4 = test_uri("test4.R"); // Not in cache
+
+        // Insert some entries
+        cache.insert(uri1.clone(), CrossFileMetadata::default());
+        cache.insert(uri2.clone(), CrossFileMetadata::default());
+        cache.insert(uri3.clone(), CrossFileMetadata::default());
+
+        // Verify all are present
+        assert!(cache.get(&uri1).is_some());
+        assert!(cache.get(&uri2).is_some());
+        assert!(cache.get(&uri3).is_some());
+
+        // Invalidate uri1 and uri2 (and uri4 which doesn't exist)
+        let uris_to_invalidate = vec![uri1.clone(), uri2.clone(), uri4.clone()];
+        let count = cache.invalidate_many(&uris_to_invalidate);
+
+        // Should have invalidated 2 entries (uri1 and uri2, not uri4)
+        assert_eq!(count, 2);
+
+        // uri1 and uri2 should be gone
+        assert!(cache.get(&uri1).is_none());
+        assert!(cache.get(&uri2).is_none());
+
+        // uri3 should still be present
+        assert!(cache.get(&uri3).is_some());
+    }
+
+    #[test]
+    fn test_metadata_cache_invalidate_many_empty() {
+        let cache = MetadataCache::new();
+        let uri1 = test_uri("test1.R");
+
+        cache.insert(uri1.clone(), CrossFileMetadata::default());
+
+        // Invalidate with empty iterator
+        let count = cache.invalidate_many(&Vec::<Url>::new());
+        assert_eq!(count, 0);
+
+        // Entry should still be present
+        assert!(cache.get(&uri1).is_some());
     }
 }

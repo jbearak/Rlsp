@@ -1,8 +1,7 @@
 //
 // r_env.rs
 //
-// Copyright (C) 2024-2026 Posit Software, PBC. All rights reserved.
-// Modifications copyright (C) 2026 Jonathan Marc Bearak
+// Copyright (C) 2026 Jonathan Marc Bearak
 //
 
 use std::env;

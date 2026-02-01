@@ -3,8 +3,8 @@
 // This module calls R as a subprocess to get help documentation.
 // It's "static" in that it doesn't embed R, but can still access help.
 
-use std::process::Command;
 use std::collections::HashMap;
+use std::process::Command;
 use std::sync::{Arc, RwLock};
 
 /// Cache for help content
@@ -64,7 +64,15 @@ cat(paste(txt, collapse = "\n"))
 "#;
 
     let mut cmd = Command::new("R");
-    cmd.args(["--slave", "--no-save", "--no-restore", "-e", r_code, "--args", topic]);
+    cmd.args([
+        "--slave",
+        "--no-save",
+        "--no-restore",
+        "-e",
+        r_code,
+        "--args",
+        topic,
+    ]);
     if let Some(pkg) = package {
         cmd.arg(pkg);
     }
@@ -115,22 +123,22 @@ cat(paste(txt, collapse = "\n"))
 /// ```
 pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
     let lines: Vec<&str> = help_text.lines().collect();
-    
+
     // Find the "Usage:" section
     let usage_idx = lines.iter().position(|line| line.trim() == "Usage:")?;
-    
+
     // Collect lines after "Usage:" until we hit another section (like "Arguments:")
     let mut signature_lines: Vec<&str> = Vec::new();
     let mut in_s3_comment = false;
-    
+
     for line in lines.iter().skip(usage_idx + 1) {
         let trimmed = line.trim();
-        
+
         // Stop at the next section header (ends with ":" and doesn't contain parentheses)
         if !trimmed.is_empty() && trimmed.ends_with(':') && !trimmed.contains('(') {
             break;
         }
-        
+
         // Check for S3 method comments
         if trimmed.starts_with("## S3 method") || trimmed.starts_with("## Default S3 method") {
             // If we already have a non-S3 signature, we're done
@@ -140,7 +148,7 @@ pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
             in_s3_comment = true;
             continue;
         }
-        
+
         // Skip empty lines
         if trimmed.is_empty() {
             // If we have a complete signature (ends with ')'), we're done
@@ -153,7 +161,7 @@ pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
             in_s3_comment = false;
             continue;
         }
-        
+
         // If we're after an S3 comment and don't have a signature yet, take this one
         // Otherwise, if we're not after an S3 comment, this is a generic signature
         if in_s3_comment && signature_lines.is_empty() {
@@ -172,14 +180,14 @@ pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
             }
         }
     }
-    
+
     if signature_lines.is_empty() {
         return None;
     }
-    
+
     // Join multi-line signatures
     let signature = signature_lines.join("\n");
-    
+
     Some(signature)
 }
 
@@ -227,7 +235,7 @@ Arguments:
 
        x: an R object.
 "#;
-        
+
         let sig = extract_signature_from_help(help_text);
         assert_eq!(sig, Some("mean(x, ...)".to_string()));
     }
@@ -255,7 +263,7 @@ Arguments:
 
    .data: A data frame.
 "#;
-        
+
         let sig = extract_signature_from_help(help_text);
         assert_eq!(sig, Some("mutate(.data, ...)".to_string()));
     }
@@ -268,7 +276,7 @@ Description:
 
      Some description without usage section.
 "#;
-        
+
         let sig = extract_signature_from_help(help_text);
         assert_eq!(sig, None);
     }
@@ -293,7 +301,7 @@ Arguments:
 
        x: an object.
 "#;
-        
+
         // Should return the S3 method signature since there's no generic
         let sig = extract_signature_from_help(help_text);
         assert_eq!(sig, Some("bar(x, y = 1)".to_string()));

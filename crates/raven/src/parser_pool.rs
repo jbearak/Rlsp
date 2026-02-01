@@ -32,9 +32,7 @@ mod tests {
     #[test]
     fn test_parser_initialized_with_r_language() {
         // Parser should be able to parse R code
-        let result = with_parser(|parser| {
-            parser.parse("x <- 1", None).is_some()
-        });
+        let result = with_parser(|parser| parser.parse("x <- 1", None).is_some());
         assert!(result, "Parser should successfully parse R code");
     }
 
@@ -44,7 +42,7 @@ mod tests {
         let result1 = with_parser(|parser| parser.parse("a <- 1", None).is_some());
         let result2 = with_parser(|parser| parser.parse("b <- 2", None).is_some());
         let result3 = with_parser(|parser| parser.parse("c <- 3", None).is_some());
-        
+
         assert!(result1 && result2 && result3, "All parses should succeed");
     }
 
@@ -53,11 +51,11 @@ mod tests {
         // Parse a complete program
         let tree1 = with_parser(|parser| parser.parse("function(x) { x + 1 }", None));
         assert!(tree1.is_some());
-        
+
         // Parse a different program - should work independently
         let tree2 = with_parser(|parser| parser.parse("y <- 42", None));
         assert!(tree2.is_some());
-        
+
         // Verify trees are independent by checking their structure differs
         let tree1 = tree1.unwrap();
         let tree2 = tree2.unwrap();

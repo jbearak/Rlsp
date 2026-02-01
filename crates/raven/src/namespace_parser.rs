@@ -343,8 +343,13 @@ fn parse_s3method_args(args: &str) -> Option<String> {
 /// assert!(deps.iter().all(|s| !s.contains('(')));
 /// ```
 pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>> {
-    let content = fs::read_to_string(description_path)
-        .map_err(|e| anyhow!("Failed to read DESCRIPTION file {:?}: {}", description_path, e))?;
+    let content = fs::read_to_string(description_path).map_err(|e| {
+        anyhow!(
+            "Failed to read DESCRIPTION file {:?}: {}",
+            description_path,
+            e
+        )
+    })?;
 
     Ok(parse_description_field(&content, "Depends"))
 }
@@ -1238,46 +1243,44 @@ importFrom(magrittr, "%>%")
     }
 
     /// Generates a proptest strategy that produces a tuple containing:
-    
+
     /// - an `S3method(...)` directive string, and
-    
+
     /// - the corresponding expected export name `generic.class` as a single-item `Vec<String>`.
-    
+
     ///
-    
+
     /// # Examples
-    
+
     ///
-    
+
     /// ```
-    
+
     /// use proptest::test_runner::TestRunner;
-    
+
     ///
-    
+
     /// let mut runner = TestRunner::default();
-    
+
     /// let strategy = s3method_directive_strategy();
-    
+
     /// let tree = strategy.new_tree(&mut runner).unwrap();
-    
+
     /// let (directive, expected) = tree.current();
-    
+
     /// assert!(directive.starts_with("S3method("));
-    
+
     /// assert_eq!(expected.len(), 1);
-    
+
     /// assert!(expected[0].contains('.'));
-    
+
     /// ```
     fn s3method_directive_strategy() -> impl Strategy<Value = (String, Vec<String>)> {
-        (r_identifier_strategy(), r_identifier_with_dots_strategy()).prop_map(
-            |(generic, class)| {
-                let directive = format!("S3method({}, {})", generic, class);
-                let expected = vec![format!("{}.{}", generic, class)];
-                (directive, expected)
-            },
-        )
+        (r_identifier_strategy(), r_identifier_with_dots_strategy()).prop_map(|(generic, class)| {
+            let directive = format!("S3method({}, {})", generic, class);
+            let expected = vec![format!("{}.{}", generic, class)];
+            (directive, expected)
+        })
     }
 
     /// Constructs a proptest Strategy that generates synthetic NAMESPACE file content paired with the expected list of exported symbol strings.

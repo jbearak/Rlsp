@@ -70,7 +70,11 @@ impl CrossFileWorkspaceIndex {
 
     /// Get artifacts for a URI (without freshness check)
     pub fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts> {
-        self.inner.read().ok()?.get(uri).map(|e| e.artifacts.clone())
+        self.inner
+            .read()
+            .ok()?
+            .get(uri)
+            .map(|e| e.artifacts.clone())
     }
 
     /// Update index entry for a URI.
@@ -129,12 +133,20 @@ impl CrossFileWorkspaceIndex {
 
     /// Check if URI is in index
     pub fn contains(&self, uri: &Url) -> bool {
-        self.inner.read().ok().map(|g| g.contains_key(uri)).unwrap_or(false)
+        self.inner
+            .read()
+            .ok()
+            .map(|g| g.contains_key(uri))
+            .unwrap_or(false)
     }
 
     /// Get all indexed URIs
     pub fn uris(&self) -> Vec<Url> {
-        self.inner.read().ok().map(|g| g.keys().cloned().collect()).unwrap_or_default()
+        self.inner
+            .read()
+            .ok()
+            .map(|g| g.keys().cloned().collect())
+            .unwrap_or_default()
     }
 }
 

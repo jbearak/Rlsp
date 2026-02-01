@@ -16,8 +16,8 @@ use crate::cross_file::file_cache::CrossFileFileCache;
 use crate::cross_file::scope::{self, ScopeArtifacts};
 use crate::cross_file::types::CrossFileMetadata;
 use crate::cross_file::workspace_index::CrossFileWorkspaceIndex;
-use crate::state::Document;
 use crate::document_store::DocumentStore;
+use crate::state::Document;
 use crate::workspace_index::WorkspaceIndex;
 
 /// Trait for content providers (sync operations)
@@ -320,10 +320,16 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// **Validates: Requirements 14.3**
     fn exists_cached(&self, uri: &Url) -> bool {
         self.document_store.contains(uri)
-            || self.legacy_documents.is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
+            || self
+                .legacy_documents
+                .is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
             || self.workspace_index.contains(uri)
-            || self.legacy_workspace_index.is_some_and(|ws: &HashMap<Url, Document>| ws.contains_key(uri))
-            || self.legacy_cross_file_workspace_index.is_some_and(|cf_ws| cf_ws.contains(uri))
+            || self
+                .legacy_workspace_index
+                .is_some_and(|ws: &HashMap<Url, Document>| ws.contains_key(uri))
+            || self
+                .legacy_cross_file_workspace_index
+                .is_some_and(|cf_ws| cf_ws.contains(uri))
             || self.file_cache.get(uri).is_some()
     }
 
@@ -334,7 +340,9 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// **Validates: Requirements 3.3, 7.1**
     fn is_open(&self, uri: &Url) -> bool {
         self.document_store.contains(uri)
-            || self.legacy_documents.is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
+            || self
+                .legacy_documents
+                .is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
     }
 }
 
@@ -480,8 +488,8 @@ mod tests {
     #[test]
     fn test_mock_get_content() {
         let uri = test_uri("test.R");
-        let provider = MockContentProvider::new()
-            .with_content(uri.clone(), "test content".to_string());
+        let provider =
+            MockContentProvider::new().with_content(uri.clone(), "test content".to_string());
 
         assert_eq!(provider.get_content(&uri), Some("test content".to_string()));
         assert_eq!(provider.get_content(&test_uri("other.R")), None);
@@ -490,8 +498,7 @@ mod tests {
     #[test]
     fn test_mock_exists_cached() {
         let uri = test_uri("test.R");
-        let provider = MockContentProvider::new()
-            .with_content(uri.clone(), "content".to_string());
+        let provider = MockContentProvider::new().with_content(uri.clone(), "content".to_string());
 
         assert!(provider.exists_cached(&uri));
         assert!(!provider.exists_cached(&test_uri("other.R")));
@@ -500,8 +507,7 @@ mod tests {
     #[test]
     fn test_mock_is_open() {
         let uri = test_uri("test.R");
-        let provider = MockContentProvider::new()
-            .with_open(uri.clone());
+        let provider = MockContentProvider::new().with_open(uri.clone());
 
         assert!(provider.is_open(&uri));
         assert!(!provider.is_open(&test_uri("other.R")));
@@ -517,7 +523,9 @@ mod tests {
             .with_content(uri1.clone(), "content1".to_string())
             .with_content(uri2.clone(), "content2".to_string());
 
-        let results = provider.check_existence_batch(&[uri1.clone(), uri2.clone(), uri3.clone()]).await;
+        let results = provider
+            .check_existence_batch(&[uri1.clone(), uri2.clone(), uri3.clone()])
+            .await;
 
         assert_eq!(results.get(&uri1), Some(&true));
         assert_eq!(results.get(&uri2), Some(&true));
@@ -527,8 +535,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_exists_single() {
         let uri = test_uri("test.R");
-        let provider = MockContentProvider::new()
-            .with_content(uri.clone(), "content".to_string());
+        let provider = MockContentProvider::new().with_content(uri.clone(), "content".to_string());
 
         assert!(provider.exists(&uri).await);
         assert!(!provider.exists(&test_uri("other.R")).await);
@@ -720,7 +727,9 @@ mod tests {
         workspace_index.insert(uri.clone(), index_entry);
 
         // Open document (will have different metadata from parsing)
-        doc_store.open(uri.clone(), "# @lsp-cd: open_wd\nx <- 1", 1).await;
+        doc_store
+            .open(uri.clone(), "# @lsp-cd: open_wd\nx <- 1", 1)
+            .await;
 
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
 
@@ -766,7 +775,9 @@ mod tests {
         workspace_index.insert(uri.clone(), index_entry);
 
         // Open document with different function
-        doc_store.open(uri.clone(), "open_func <- function() {}", 1).await;
+        doc_store
+            .open(uri.clone(), "open_func <- function() {}", 1)
+            .await;
 
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
 
@@ -807,7 +818,9 @@ mod tests {
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
 
         // Check existence - should find cached URIs without disk I/O
-        let results = provider.check_existence_batch(&[uri1.clone(), uri2.clone()]).await;
+        let results = provider
+            .check_existence_batch(&[uri1.clone(), uri2.clone()])
+            .await;
 
         assert_eq!(results.get(&uri1), Some(&true));
         assert_eq!(results.get(&uri2), Some(&true));
@@ -834,7 +847,9 @@ mod tests {
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
 
         // Check existence - should check disk for uncached URIs
-        let results = provider.check_existence_batch(&[existing_uri.clone(), nonexistent_uri.clone()]).await;
+        let results = provider
+            .check_existence_batch(&[existing_uri.clone(), nonexistent_uri.clone()])
+            .await;
 
         assert_eq!(results.get(&existing_uri), Some(&true));
         assert_eq!(results.get(&nonexistent_uri), Some(&false));
@@ -1617,7 +1632,7 @@ mod integration_tests {
 
     /// Integration test for full document lifecycle
     /// Tests: open → edit → close → workspace index update flow
-    /// 
+    ///
     /// **Validates: Requirements 1.3, 1.4, 1.5, 3.4**
     #[tokio::test]
     async fn test_document_lifecycle() {
@@ -1647,13 +1662,22 @@ mod integration_tests {
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
         assert!(provider.is_open(&uri));
         assert!(provider.exists_cached(&uri));
-        assert_eq!(provider.get_content(&uri), Some(initial_content.to_string()));
+        assert_eq!(
+            provider.get_content(&uri),
+            Some(initial_content.to_string())
+        );
 
         // Phase 3: Edit document
         let changes = vec![tower_lsp::lsp_types::TextDocumentContentChangeEvent {
             range: Some(tower_lsp::lsp_types::Range {
-                start: tower_lsp::lsp_types::Position { line: 0, character: 0 },
-                end: tower_lsp::lsp_types::Position { line: 0, character: 7 },
+                start: tower_lsp::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: tower_lsp::lsp_types::Position {
+                    line: 0,
+                    character: 7,
+                },
             }),
             range_length: None,
             text: "new_func".to_string(),
@@ -1669,7 +1693,7 @@ mod integration_tests {
 
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
         assert!(!provider.is_open(&uri));
-        
+
         // Phase 5: Add to workspace index (simulating file watcher update)
         let index_entry = crate::workspace_index::IndexEntry {
             contents: ropey::Rope::from_str("workspace_func <- function() {}"),
@@ -1688,12 +1712,15 @@ mod integration_tests {
 
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
         assert!(provider.exists_cached(&uri));
-        assert_eq!(provider.get_content(&uri), Some("workspace_func <- function() {}".to_string()));
+        assert_eq!(
+            provider.get_content(&uri),
+            Some("workspace_func <- function() {}".to_string())
+        );
     }
 
     /// Integration test for cross-file resolution
     /// Tests that cross-file features work with new architecture
-    /// 
+    ///
     /// **Validates: Requirements 7.2, 13.2**
     #[tokio::test]
     async fn test_cross_file_resolution() {
@@ -1746,12 +1773,15 @@ mod integration_tests {
         // Verify we can get artifacts from utils.R via ContentProvider
         let utils_artifacts_from_provider = provider.get_artifacts(&utils_uri);
         assert!(utils_artifacts_from_provider.is_some());
-        assert!(utils_artifacts_from_provider.unwrap().exported_interface.contains_key("helper_func"));
+        assert!(utils_artifacts_from_provider
+            .unwrap()
+            .exported_interface
+            .contains_key("helper_func"));
     }
 
     /// Integration test for async diagnostics
     /// Tests that missing file diagnostics work with async existence checks
-    /// 
+    ///
     /// **Validates: Requirements 14.2, 14.5**
     #[tokio::test]
     async fn test_async_existence_checking() {
@@ -1787,12 +1817,12 @@ mod integration_tests {
 
         // uri1 not in any cache, uri2 in workspace index, uri3 not anywhere
         assert_eq!(results.get(&uri1), Some(&false)); // Not in cache
-        assert_eq!(results.get(&uri2), Some(&true));  // In workspace index
+        assert_eq!(results.get(&uri2), Some(&true)); // In workspace index
         assert_eq!(results.get(&uri3), Some(&false)); // Not anywhere
     }
 
     /// Test that open documents take precedence over workspace index
-    /// 
+    ///
     /// **Validates: Requirements 3.1, 3.2, 3.4**
     #[tokio::test]
     async fn test_open_docs_precedence() {

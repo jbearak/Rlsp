@@ -1,7 +1,7 @@
 //
 // main.rs
 //
-// Copyright (C) 2024-2026 Posit Software, PBC. All rights reserved.
+// Copyright (C) 2022-2025 Posit Software, PBC. All rights reserved.
 // Modifications copyright (C) 2026 Jonathan Marc Bearak
 //
 
@@ -23,7 +23,10 @@ mod workspace_index;
 use std::env;
 
 fn print_usage() {
-    println!("raven {}, a static R Language Server.", env!("CARGO_PKG_VERSION"));
+    println!(
+        "raven {}, a static R Language Server.",
+        env!("CARGO_PKG_VERSION")
+    );
     print!(
         r#"
 Usage: raven [OPTIONS]

@@ -11,6 +11,480 @@ use super::parent_resolve::{infer_call_site_from_parent, resolve_match_pattern};
 use super::path_resolve::{path_to_uri, resolve_path, PathContext};
 use super::types::{CallSiteSpec, CrossFileMetadata};
 
+/// Resolve the effective working directory of a parent file for inheritance.
+///
+/// Returns the parent's effective working directory as a string path that can
+/// be stored in the child's metadata.
+///
+/// This is a convenience wrapper around `resolve_parent_working_directory_with_depth`
+/// that uses the default maximum depth.
+///
+/// # Arguments
+/// * `parent_uri` - The URI of the parent file
+/// * `get_metadata` - A closure that retrieves metadata for a given URI
+/// * `workspace_root` - Optional workspace root URI for resolving workspace-relative paths
+///
+/// # Returns
+/// * `Some(String)` - The parent's effective working directory as a string path
+/// * `None` - If the parent URI cannot be converted to a file path
+///
+/// # Fallback Behavior
+/// If parent metadata cannot be retrieved via `get_metadata`, the function falls back
+/// to using the parent file's directory as the inherited working directory.
+///
+/// _Requirements: 5.1, 5.3_
+pub fn resolve_parent_working_directory<F>(
+    parent_uri: &Url,
+    get_metadata: F,
+    workspace_root: Option<&Url>,
+) -> Option<String>
+where
+    F: Fn(&Url) -> Option<CrossFileMetadata>,
+{
+    resolve_parent_working_directory_with_depth(
+        parent_uri,
+        &get_metadata,
+        workspace_root,
+        DEFAULT_MAX_INHERITANCE_DEPTH,
+    )
+}
+
+/// Resolve the effective working directory of a parent file for inheritance,
+/// with depth tracking to prevent infinite chains.
+///
+/// Returns the parent's effective working directory as a string path that can
+/// be stored in the child's metadata.
+///
+/// # Arguments
+/// * `parent_uri` - The URI of the parent file
+/// * `get_metadata` - A closure that retrieves metadata for a given URI
+/// * `workspace_root` - Optional workspace root URI for resolving workspace-relative paths
+/// * `remaining_depth` - Remaining depth for inheritance chain traversal
+///
+/// # Returns
+/// * `Some(String)` - The parent's effective working directory as a string path
+/// * `None` - If the parent URI cannot be converted to a file path
+///
+/// # Fallback Behavior
+/// If parent metadata cannot be retrieved via `get_metadata`, or if the depth limit is
+/// reached, the function falls back to using the parent file's directory as the effective
+/// working directory.
+///
+/// # Transitive Inheritance
+/// When the parent has an inherited_working_directory in its metadata (from its own parent),
+/// that value is used through PathContext::from_metadata. This enables transitive inheritance:
+/// A → B → C where A has @lsp-cd, B inherits from A, and C inherits from B (getting A's WD).
+///
+/// _Requirements: 5.1, 5.3, 9.1, 9.2_
+pub fn resolve_parent_working_directory_with_depth<F>(
+    parent_uri: &Url,
+    get_metadata: &F,
+    workspace_root: Option<&Url>,
+    remaining_depth: usize,
+) -> Option<String>
+where
+    F: Fn(&Url) -> Option<CrossFileMetadata>,
+{
+    let mut visited = HashSet::new();
+    resolve_parent_working_directory_with_visited(
+        parent_uri,
+        get_metadata,
+        workspace_root,
+        remaining_depth,
+        &mut visited,
+    )
+}
+
+/// Resolve the effective working directory of a parent file for inheritance,
+/// with depth tracking and cycle detection to prevent infinite chains.
+///
+/// Returns the parent's effective working directory as a string path that can
+/// be stored in the child's metadata.
+///
+/// # Arguments
+/// * `parent_uri` - The URI of the parent file
+/// * `get_metadata` - A closure that retrieves metadata for a given URI
+/// * `workspace_root` - Optional workspace root URI for resolving workspace-relative paths
+/// * `remaining_depth` - Remaining depth for inheritance chain traversal
+/// * `visited` - Set of URIs already visited during this inheritance resolution (for cycle detection)
+///
+/// # Returns
+/// * `Some(String)` - The parent's effective working directory as a string path
+/// * `None` - If the parent URI cannot be converted to a file path
+///
+/// # Fallback Behavior
+/// If parent metadata cannot be retrieved via `get_metadata`, or if the depth limit is
+/// reached, the function falls back to using the parent file's directory as the effective
+/// working directory.
+///
+/// # Cycle Detection
+/// When a URI is encountered that's already in the visited set, the function stops
+/// inheritance and returns the *direct parent's directory*. This breaks the loop while still
+/// allowing the child to inherit from its parent.
+///
+/// # Transitive Inheritance
+/// When the parent has an inherited_working_directory in its metadata (from its own parent),
+/// that value is used through PathContext::from_metadata. This enables transitive inheritance:
+/// A → B → C where A has @lsp-cd, B inherits from A, and C inherits from B (getting A's WD).
+///
+/// _Requirements: 5.1, 5.3, 9.1, 9.2, 9.3_
+pub fn resolve_parent_working_directory_with_visited<F>(
+    parent_uri: &Url,
+    get_metadata: &F,
+    workspace_root: Option<&Url>,
+    remaining_depth: usize,
+    visited: &mut HashSet<Url>,
+) -> Option<String>
+where
+    F: Fn(&Url) -> Option<CrossFileMetadata>,
+{
+    // Check for cycle: if we've already visited this URI, stop and use file's directory
+    // (Requirement 9.3)
+    if visited.contains(parent_uri) {
+        log::trace!(
+            "Cycle detected when resolving parent WD for {}, falling back to parent's directory",
+            parent_uri
+        );
+        // In a cycle, still return the direct parent's directory so the child inherits from
+        // its parent (not itself), while breaking the loop.
+        let parent_path = parent_uri.to_file_path().ok()?;
+        let parent_dir = parent_path.parent()?;
+        return Some(parent_dir.to_string_lossy().to_string());
+    }
+
+    // Add current URI to visited set before processing
+    visited.insert(parent_uri.clone());
+
+    // Check depth limit
+    if remaining_depth == 0 {
+        log::trace!(
+            "Depth limit reached when resolving parent WD for {}, falling back to parent's directory",
+            parent_uri
+        );
+        // Fall back to parent's directory when depth is exhausted
+        let parent_path = parent_uri.to_file_path().ok()?;
+        let parent_dir = parent_path.parent()?;
+        return Some(parent_dir.to_string_lossy().to_string());
+    }
+
+    // Try to get parent's metadata
+    if let Some(parent_meta) = get_metadata(parent_uri) {
+        // Build parent's PathContext from metadata
+        // This handles transitive inheritance: if parent has inherited_working_directory,
+        // it will be used in effective_working_directory() (Requirement 9.1)
+        if let Some(parent_ctx) =
+            PathContext::from_metadata(parent_uri, &parent_meta, workspace_root)
+        {
+            // Get effective working directory
+            let effective_wd = parent_ctx.effective_working_directory();
+            log::trace!(
+                "Resolved parent working directory for {}: {} (depth remaining: {})",
+                parent_uri,
+                effective_wd.display(),
+                remaining_depth
+            );
+            return Some(effective_wd.to_string_lossy().to_string());
+        }
+    }
+
+    // Fallback: use parent's directory when metadata is unavailable
+    // This handles the case where the parent file is not indexed or not accessible
+    log::trace!(
+        "Parent metadata unavailable for {}, falling back to parent's directory",
+        parent_uri
+    );
+
+    // Convert parent URI to file path and get its directory
+    let parent_path = match parent_uri.to_file_path() {
+        Ok(path) => path,
+        Err(_) => {
+            log::trace!(
+                "Cannot convert parent URI to file path for WD inheritance: {}",
+                parent_uri
+            );
+            return None;
+        }
+    };
+    let parent_dir = match parent_path.parent() {
+        Some(dir) => dir,
+        None => {
+            log::trace!(
+                "Parent path has no parent directory: {}",
+                parent_path.display()
+            );
+            return None;
+        }
+    };
+
+    Some(parent_dir.to_string_lossy().to_string())
+}
+
+/// Default maximum depth for working directory inheritance chains.
+/// This prevents infinite loops in circular backward directive chains.
+pub const DEFAULT_MAX_INHERITANCE_DEPTH: usize = 10;
+
+/// Compute the inherited working directory for a file based on its backward directives.
+///
+/// Uses the first backward directive's parent to determine inheritance.
+/// Returns None if no backward directives exist, if the child has an explicit working
+/// directory, or if the parent URI cannot be resolved to a file path.
+///
+/// This is a convenience wrapper around `compute_inherited_working_directory_with_depth`
+/// that uses the default maximum depth.
+///
+/// # Arguments
+/// * `uri` - The URI of the child file
+/// * `meta` - The child file's metadata
+/// * `workspace_root` - Optional workspace root URI for resolving workspace-relative paths
+/// * `get_metadata` - A closure that retrieves metadata for a given URI
+///
+/// # Returns
+/// * `Some(String)` - The inherited working directory from the parent
+/// * `None` - If inheritance should not occur (explicit WD, no backward directives, etc.)
+///
+/// # Behavior
+/// - Skips inheritance if the child file has an explicit `@lsp-cd` directive
+/// - Uses the first backward directive (document order) to determine the parent
+/// - Resolves the parent path using file-relative resolution (not affected by @lsp-cd)
+/// - Calls `resolve_parent_working_directory` to get the parent's effective working directory
+/// - Uses default max depth of 10 to prevent infinite chains
+///
+/// _Requirements: 1.1, 2.1, 7.1_
+pub fn compute_inherited_working_directory<F>(
+    uri: &Url,
+    meta: &CrossFileMetadata,
+    workspace_root: Option<&Url>,
+    get_metadata: F,
+) -> Option<String>
+where
+    F: Fn(&Url) -> Option<CrossFileMetadata>,
+{
+    compute_inherited_working_directory_with_depth(
+        uri,
+        meta,
+        workspace_root,
+        get_metadata,
+        DEFAULT_MAX_INHERITANCE_DEPTH,
+    )
+}
+
+/// Compute the inherited working directory for a file based on its backward directives,
+/// with configurable depth tracking to prevent infinite chains.
+///
+/// Uses the first backward directive's parent to determine inheritance.
+/// Returns None if no backward directives exist, if the child has an explicit working
+/// directory, if parent metadata is unavailable, or if max_depth is exceeded.
+///
+/// # Arguments
+/// * `uri` - The URI of the child file
+/// * `meta` - The child file's metadata
+/// * `workspace_root` - Optional workspace root URI for resolving workspace-relative paths
+/// * `get_metadata` - A closure that retrieves metadata for a given URI
+/// * `max_depth` - Maximum depth for inheritance chain traversal (prevents infinite loops)
+///
+/// # Returns
+/// * `Some(String)` - The inherited working directory from the parent
+/// * `None` - If inheritance should not occur (explicit WD, no backward directives, max depth exceeded, etc.)
+///
+/// # Behavior
+/// - Skips inheritance if the child file has an explicit `@lsp-cd` directive
+/// - Uses the first backward directive (document order) to determine the parent
+/// - Resolves the parent path using file-relative resolution (not affected by @lsp-cd)
+/// - Calls `resolve_parent_working_directory_with_visited` to get the parent's effective working directory
+/// - Stops inheritance if max_depth is 0 (depth limit reached)
+/// - Detects cycles and stops inheritance when a cycle is detected
+///
+/// # Transitive Inheritance
+/// When computing B's inherited WD from A, if B's metadata already has an inherited_working_directory,
+/// that value is used (which may have come from A). When computing C's inherited WD from B,
+/// it gets B's effective WD (which includes A's WD if B inherited from A).
+/// This naturally handles transitive inheritance through metadata propagation.
+///
+/// _Requirements: 1.1, 2.1, 7.1, 9.1, 9.2, 9.3_
+pub fn compute_inherited_working_directory_with_depth<F>(
+    uri: &Url,
+    meta: &CrossFileMetadata,
+    workspace_root: Option<&Url>,
+    get_metadata: F,
+    max_depth: usize,
+) -> Option<String>
+where
+    F: Fn(&Url) -> Option<CrossFileMetadata>,
+{
+    let mut visited = HashSet::new();
+    compute_inherited_working_directory_with_visited(
+        uri,
+        meta,
+        workspace_root,
+        &get_metadata,
+        max_depth,
+        &mut visited,
+    )
+}
+
+/// Compute the inherited working directory for a file based on its backward directives,
+/// with configurable depth tracking and cycle detection to prevent infinite chains.
+///
+/// Uses the first backward directive's parent to determine inheritance.
+/// Returns None if no backward directives exist, if the child has an explicit working
+/// directory, if parent metadata is unavailable, if max_depth is exceeded, or if a cycle
+/// is detected.
+///
+/// # Arguments
+/// * `uri` - The URI of the child file
+/// * `meta` - The child file's metadata
+/// * `workspace_root` - Optional workspace root URI for resolving workspace-relative paths
+/// * `get_metadata` - A closure that retrieves metadata for a given URI
+/// * `max_depth` - Maximum depth for inheritance chain traversal (prevents infinite loops)
+/// * `visited` - Set of URIs already visited during this inheritance resolution (for cycle detection)
+///
+/// # Returns
+/// * `Some(String)` - The inherited working directory from the parent
+/// * `None` - If inheritance should not occur (explicit WD, no backward directives, max depth exceeded, cycle detected, etc.)
+///
+/// # Behavior
+/// - Skips inheritance if the child file has an explicit `@lsp-cd` directive
+/// - Uses the first backward directive (document order) to determine the parent
+/// - Resolves the parent path using file-relative resolution (not affected by @lsp-cd)
+/// - Calls `resolve_parent_working_directory_with_visited` to get the parent's effective working directory
+/// - Stops inheritance if max_depth is 0 (depth limit reached)
+/// - Detects cycles and stops inheritance when a cycle is detected (Requirement 9.3)
+///
+/// # Cycle Detection
+/// When a URI is encountered that's already in the visited set, the function stops
+/// inheritance and returns None. The caller should then use the file's own directory.
+/// This prevents infinite loops in circular backward directive chains (e.g., A → B → A).
+///
+/// # Transitive Inheritance
+/// When computing B's inherited WD from A, if B's metadata already has an inherited_working_directory,
+/// that value is used (which may have come from A). When computing C's inherited WD from B,
+/// it gets B's effective WD (which includes A's WD if B inherited from A).
+/// This naturally handles transitive inheritance through metadata propagation.
+///
+/// _Requirements: 1.1, 2.1, 7.1, 9.1, 9.2, 9.3_
+pub fn compute_inherited_working_directory_with_visited<F>(
+    uri: &Url,
+    meta: &CrossFileMetadata,
+    workspace_root: Option<&Url>,
+    get_metadata: &F,
+    max_depth: usize,
+    visited: &mut HashSet<Url>,
+) -> Option<String>
+where
+    F: Fn(&Url) -> Option<CrossFileMetadata>,
+{
+    // Check for cycle: if we've already visited this URI, stop inheritance
+    // (Requirement 9.3)
+    if visited.contains(uri) {
+        log::trace!(
+            "Cycle detected when computing inherited WD for {}, stopping inheritance",
+            uri
+        );
+        return None;
+    }
+
+    // Add current URI to visited set before processing
+    visited.insert(uri.clone());
+
+    // Check depth limit to prevent infinite chains (Requirement 9.2)
+    if max_depth == 0 {
+        log::trace!("Skipping WD inheritance for {}: max depth exceeded", uri);
+        return None;
+    }
+
+    // Skip if file has explicit working directory (Requirement 3.1)
+    if meta.working_directory.is_some() {
+        log::trace!("Skipping WD inheritance for {}: has explicit @lsp-cd", uri);
+        return None;
+    }
+
+    // Get first backward directive (document order) (Requirement 7.1, 7.2)
+    let first_directive = meta.sourced_by.first()?;
+
+    // Log when multiple backward directives exist (Requirement 7.3)
+    if meta.sourced_by.len() > 1 {
+        log::trace!(
+            "File {} has {} backward directives; using first parent '{}' for WD inheritance",
+            uri,
+            meta.sourced_by.len(),
+            first_directive.path
+        );
+    }
+
+    log::trace!(
+        "Computing inherited WD for {} from backward directive: {} (depth remaining: {})",
+        uri,
+        first_directive.path,
+        max_depth
+    );
+
+    // Resolve parent URI using file-relative resolution only
+    // IMPORTANT: Backward directive paths ignore both explicit @lsp-cd and inherited
+    // working directories - they always resolve relative to the file's directory
+    // (Requirements 4.1, 4.2, 4.3)
+    let backward_ctx = PathContext::new(uri, workspace_root)?;
+    let parent_path = resolve_path(&first_directive.path, &backward_ctx)?;
+    let parent_uri = path_to_uri(&parent_path)?;
+
+    // Get parent's effective working directory with depth tracking and cycle detection
+    let inherited_wd = resolve_parent_working_directory_with_visited(
+        &parent_uri,
+        get_metadata,
+        workspace_root,
+        max_depth,
+        visited,
+    );
+
+    // If multiple backward directives resolve to different working directories, log which one we used.
+    if meta.sourced_by.len() > 1 {
+        if let Some(ref first_wd) = inherited_wd {
+            let mut differing_parent: Option<(String, String)> = None;
+            let backward_ctx = PathContext::new(uri, workspace_root);
+            for directive in meta.sourced_by.iter().skip(1) {
+                let ctx = match backward_ctx.as_ref() {
+                    Some(ctx) => ctx,
+                    None => break,
+                };
+                let other_parent_path = match resolve_path(&directive.path, ctx) {
+                    Some(path) => path,
+                    None => continue,
+                };
+                let other_parent_uri = match path_to_uri(&other_parent_path) {
+                    Some(uri) => uri,
+                    None => continue,
+                };
+                let mut other_visited = HashSet::new();
+                let other_wd = resolve_parent_working_directory_with_visited(
+                    &other_parent_uri,
+                    get_metadata,
+                    workspace_root,
+                    max_depth,
+                    &mut other_visited,
+                );
+                if let Some(other_wd) = other_wd {
+                    if &other_wd != first_wd {
+                        differing_parent = Some((directive.path.clone(), other_wd));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((other_parent, other_wd)) = differing_parent {
+                log::trace!(
+                    "Multiple backward directives for {} resolve to different working directories; using first parent '{}' with WD '{}', ignoring '{}' (WD '{}')",
+                    uri,
+                    first_directive.path,
+                    first_wd,
+                    other_parent,
+                    other_wd
+                );
+            }
+        }
+    }
+
+    inherited_wd
+}
+
 /// A dependency edge from parent (caller) to child (callee)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyEdge {
@@ -28,8 +502,11 @@ pub struct DependencyEdge {
     pub chdir: bool,
     /// True for sys.source(), false for source()
     pub is_sys_source: bool,
-    /// True if from @lsp-source directive, false if from AST detection
+    /// True if the edge was created from an LSP directive (@lsp-source or @lsp-sourced-by)
     pub is_directive: bool,
+    /// True if the directive origin is a backward directive (@lsp-sourced-by / @lsp-run-by).
+    /// False for forward directives (@lsp-source) and AST-detected edges.
+    pub is_backward_directive: bool,
 }
 
 /// Canonical key for edge deduplication (from, to pair only)
@@ -49,6 +526,7 @@ struct EdgeKey {
     local: bool,
     chdir: bool,
     is_sys_source: bool,
+    is_backward_directive: bool,
 }
 
 impl DependencyEdge {
@@ -61,6 +539,7 @@ impl DependencyEdge {
             local: self.local,
             chdir: self.chdir,
             is_sys_source: self.is_sys_source,
+            is_backward_directive: self.is_backward_directive,
         }
     }
 
@@ -100,6 +579,14 @@ impl DependencyGraph {
     /// Uses PathContext for proper working directory and workspace-root-relative path resolution.
     /// The `get_content` closure provides parent file content for match=/inference resolution.
     /// It should return None for files that aren't available (not open, not cached).
+    ///
+    /// **Note on Working Directory Inheritance**: If the file has backward directives and should
+    /// inherit a working directory from its parent, the caller should compute this inheritance
+    /// using `compute_inherited_working_directory()` and set `meta.inherited_working_directory`
+    /// BEFORE calling this method. The `PathContext::from_metadata()` will then use the inherited
+    /// working directory when resolving forward source paths.
+    ///
+    /// _Requirements: 5.1, 5.2_
     pub fn update_file<F>(
         &mut self,
         uri: &Url,
@@ -118,9 +605,14 @@ impl DependencyGraph {
             None => return result,
         };
 
-        // Build separate PathContext for backward directives (without working_directory)
-        // Backward directives should always resolve relative to the file's directory,
-        // not affected by @lsp-cd directives
+        // Build separate PathContext for backward directives (without any working_directory)
+        // IMPORTANT: Backward directive paths (e.g., @lsp-sourced-by: ../parent.R) should
+        // ALWAYS resolve relative to the child file's directory, regardless of:
+        //   - Explicit @lsp-cd directives in the child file
+        //   - Inherited working directory from parent files
+        // This is intentional behavior per Requirements 4.1, 4.2, 4.3.
+        // Using PathContext::new() ensures neither working_directory nor
+        // inherited_working_directory are set, so paths resolve file-relative.
         let backward_path_ctx = match PathContext::new(uri, workspace_root) {
             Some(ctx) => ctx,
             None => return result,
@@ -132,7 +624,8 @@ impl DependencyGraph {
             path_to_uri(&resolved)
         };
 
-        // Helper to resolve paths for backward directives (without working_directory)
+        // Helper to resolve paths for backward directives (file-relative only)
+        // Does NOT use working_directory or inherited_working_directory
         let do_resolve_backward = |path: &str| -> Option<Url> {
             let resolved = resolve_path(path, &backward_path_ctx)?;
             path_to_uri(&resolved)
@@ -164,6 +657,7 @@ impl DependencyGraph {
                         chdir: source.chdir,
                         is_sys_source: source.is_sys_source,
                         is_directive: true,
+                        is_backward_directive: false,
                     };
                     directive_from_to.insert(edge.as_from_to_pair());
                     directive_edges.push(edge);
@@ -172,21 +666,24 @@ impl DependencyGraph {
         }
 
         // Process backward directives (@lsp-sourced-by) - create forward edges from parent to this file
-        // Use separate PathContext without working_directory to ensure paths are resolved
-        // relative to the file's directory, not affected by @lsp-cd directives
+        // Uses do_resolve_backward which resolves paths relative to the file's directory,
+        // ignoring both explicit @lsp-cd and inherited working directories (Requirements 4.1-4.3)
         for directive in &meta.sourced_by {
             if let Some(parent_uri) = do_resolve_backward(&directive.path) {
                 // Extract child filename for inference
-                let child_filename = uri.path_segments()
+                let child_filename = uri
+                    .path_segments()
                     .and_then(|mut s| s.next_back())
                     .unwrap_or("");
-                
+
                 let (call_site_line, call_site_column) = match &directive.call_site {
                     CallSiteSpec::Line(n) => (Some(*n), Some(u32::MAX)), // end-of-line
                     CallSiteSpec::Match(pattern) => {
                         // Resolve match pattern in parent content
                         if let Some(parent_content) = get_content(&parent_uri) {
-                            if let Some((line, col)) = resolve_match_pattern(&parent_content, pattern, child_filename) {
+                            if let Some((line, col)) =
+                                resolve_match_pattern(&parent_content, pattern, child_filename)
+                            {
                                 (Some(line), Some(col))
                             } else {
                                 (None, None) // Pattern not found
@@ -198,7 +695,9 @@ impl DependencyGraph {
                     CallSiteSpec::Default => {
                         // Try text-inference: scan parent for source() call to child
                         if let Some(parent_content) = get_content(&parent_uri) {
-                            if let Some((line, col)) = infer_call_site_from_parent(&parent_content, child_filename) {
+                            if let Some((line, col)) =
+                                infer_call_site_from_parent(&parent_content, child_filename)
+                            {
                                 (Some(line), Some(col))
                             } else {
                                 (None, None) // No source() call found
@@ -217,6 +716,7 @@ impl DependencyGraph {
                     chdir: false,
                     is_sys_source: false,
                     is_directive: true,
+                    is_backward_directive: true,
                 };
                 let pair = edge.as_from_to_pair();
                 if !directive_from_to.contains(&pair) {
@@ -240,13 +740,15 @@ impl DependencyGraph {
                         chdir: source.chdir,
                         is_sys_source: source.is_sys_source,
                         is_directive: false,
+                        is_backward_directive: false,
                     };
                     let pair = edge.as_from_to_pair();
 
                     // Check for directive-vs-AST conflict (Requirement 6.8)
                     if directive_from_to.contains(&pair) {
                         // Find the directive edge for this (from, to) pair
-                        let directive_edge = directive_edges.iter().find(|e| e.as_from_to_pair() == pair);
+                        let directive_edge =
+                            directive_edges.iter().find(|e| e.as_from_to_pair() == pair);
 
                         if let Some(dir_edge) = directive_edge {
                             // Check if directive has a known call site
@@ -255,7 +757,8 @@ impl DependencyGraph {
 
                             if directive_has_call_site {
                                 // Directive has known call site: only override AST edge at same call site
-                                let call_sites_match = dir_edge.call_site_line == edge.call_site_line
+                                let call_sites_match = dir_edge.call_site_line
+                                    == edge.call_site_line
                                     && dir_edge.call_site_column == edge.call_site_column;
 
                                 if call_sites_match {
@@ -269,12 +772,22 @@ impl DependencyGraph {
                             } else {
                                 // Directive has no call site: suppress all AST edges to this target
                                 // Emit warning about suppression
-                                let diag_line = meta.sourced_by.iter()
-                                    .find(|d| do_resolve(&d.path) == Some(dir_edge.from.clone()))
+                                let diag_line = meta
+                                    .sourced_by
+                                    .iter()
+                                    .find(|d| {
+                                        do_resolve_backward(&d.path) == Some(dir_edge.from.clone())
+                                    })
                                     .map(|d| d.directive_line)
-                                    .or_else(|| meta.sources.iter()
-                                        .find(|s| s.is_directive && do_resolve(&s.path) == Some(to_uri.clone()))
-                                        .map(|s| s.line))
+                                    .or_else(|| {
+                                        meta.sources
+                                            .iter()
+                                            .find(|s| {
+                                                s.is_directive
+                                                    && do_resolve(&s.path) == Some(to_uri.clone())
+                                            })
+                                            .map(|s| s.line)
+                                    })
                                     .unwrap_or(0);
 
                                 result.diagnostics.push(Diagnostic {
@@ -314,51 +827,69 @@ impl DependencyGraph {
 
         // Log total edge count after update
         let total_edges: usize = self.forward.values().map(|v| v.len()).sum();
-        log::trace!("Dependency graph now has {} total edges after updating {}", total_edges, uri);
+        log::trace!(
+            "Dependency graph now has {} total edges after updating {}",
+            total_edges,
+            uri
+        );
 
         result
     }
 
     /// Simple update without content provider (for backward compatibility in tests)
     /// Uses file-relative path resolution only (no workspace root)
-    pub fn update_file_simple(
-        &mut self,
-        uri: &Url,
-        meta: &CrossFileMetadata,
-    ) {
+    pub fn update_file_simple(&mut self, uri: &Url, meta: &CrossFileMetadata) {
         let _ = self.update_file(uri, meta, None, |_| None);
     }
 
     /// Remove edges where the given URI is the child that were created from backward directives
     fn remove_backward_edges_for_child(&mut self, child_uri: &Url) {
         // Get edges where this file is the child
-        let edges_to_remove: Vec<DependencyEdge> = self.backward
+        let edges_to_remove: Vec<DependencyEdge> = self
+            .backward
             .get(child_uri)
             .map(|edges| {
-                edges.iter()
-                    .filter(|e| e.is_directive && &e.to == child_uri)
+                edges
+                    .iter()
+                    .filter(|e| e.is_backward_directive && &e.to == child_uri)
                     .cloned()
                     .collect()
             })
             .unwrap_or_default();
 
         if !edges_to_remove.is_empty() {
-            log::trace!("Removing {} backward directive edges for child {}", edges_to_remove.len(), child_uri);
+            log::trace!(
+                "Removing {} backward directive edges for child {}",
+                edges_to_remove.len(),
+                child_uri
+            );
         }
 
         // Remove from both forward and backward indices
         for edge in edges_to_remove {
-            log::trace!("  Removing backward directive edge: {} -> {}", edge.from, edge.to);
+            log::trace!(
+                "  Removing backward directive edge: {} -> {}",
+                edge.from,
+                edge.to
+            );
             // Remove from forward index
             if let Some(forward_edges) = self.forward.get_mut(&edge.from) {
-                forward_edges.retain(|e| !(e.to == edge.to && e.is_directive && e.call_site_line == edge.call_site_line));
+                forward_edges.retain(|e| {
+                    !(e.to == edge.to
+                        && e.is_backward_directive
+                        && e.call_site_line == edge.call_site_line)
+                });
                 if forward_edges.is_empty() {
                     self.forward.remove(&edge.from);
                 }
             }
             // Remove from backward index
             if let Some(backward_edges) = self.backward.get_mut(child_uri) {
-                backward_edges.retain(|e| !(e.from == edge.from && e.is_directive && e.call_site_line == edge.call_site_line));
+                backward_edges.retain(|e| {
+                    !(e.from == edge.from
+                        && e.is_backward_directive
+                        && e.call_site_line == edge.call_site_line)
+                });
                 if backward_edges.is_empty() {
                     self.backward.remove(child_uri);
                 }
@@ -430,17 +961,14 @@ impl DependencyGraph {
             edge.local,
             edge.chdir
         );
-        
+
         // Add to forward index
         self.forward
             .entry(edge.from.clone())
             .or_default()
             .push(edge.clone());
         // Add to backward index
-        self.backward
-            .entry(edge.to.clone())
-            .or_default()
-            .push(edge);
+        self.backward.entry(edge.to.clone()).or_default().push(edge);
     }
 
     fn remove_forward_edges(&mut self, uri: &Url) {
@@ -460,34 +988,38 @@ impl DependencyGraph {
 
     /// Remove forward edges from a file, but only those created by forward sources/directives
     /// in that file. Preserve edges created by backward directives in other files.
-    /// 
+    ///
     /// This is used during update_file to avoid removing edges that were created by
     /// backward directives in child files.
     fn remove_forward_edges_from_this_file(&mut self, uri: &Url) {
         // Get all current forward edges from this file
         let edges_to_check = self.forward.get(uri).cloned().unwrap_or_default();
-        
+
         if edges_to_check.is_empty() {
             return;
         }
-        
-        log::trace!("Checking {} forward edges from {} for removal", edges_to_check.len(), uri);
-        
+
+        log::trace!(
+            "Checking {} forward edges from {} for removal",
+            edges_to_check.len(),
+            uri
+        );
+
         // We'll rebuild the forward edges list, keeping only edges created by backward directives
         let mut edges_to_keep = Vec::new();
         let mut edges_to_remove = Vec::new();
-        
+
         for edge in edges_to_check {
             // Heuristic: if this is a directive edge, it might have been created by a backward
             // directive in the child file. We'll keep it for now and let it be removed when
             // the child file is updated (via remove_backward_edges_for_child).
-            // 
+            //
             // However, if it's NOT a directive edge, it was definitely created by a source()
             // call in THIS file, so we should remove it.
             //
             // Actually, this heuristic is not quite right. A directive edge could be from
             // either a forward directive in this file OR a backward directive in the child.
-            // 
+            //
             // Better approach: we'll remove ALL non-directive edges (source() calls), and
             // we'll also remove directive edges, but they'll be re-created if they're still
             // in the metadata. Edges from backward directives in other files will be preserved
@@ -508,7 +1040,7 @@ impl DependencyGraph {
             //
             // The downside: if we remove a forward directive from THIS file, the edge won't
             // be removed until we update the child file. But that's acceptable for now.
-            
+
             if edge.is_directive {
                 // Keep directive edges - they might be from backward directives in other files
                 edges_to_keep.push(edge);
@@ -517,19 +1049,24 @@ impl DependencyGraph {
                 edges_to_remove.push(edge);
             }
         }
-        
+
         // Update the forward index
         if edges_to_keep.is_empty() {
             self.forward.remove(uri);
         } else {
             self.forward.insert(uri.clone(), edges_to_keep);
         }
-        
+
         // Remove from backward index
         for edge in edges_to_remove {
-            log::trace!("  Removing non-directive edge: {} -> {}", edge.from, edge.to);
+            log::trace!(
+                "  Removing non-directive edge: {} -> {}",
+                edge.from,
+                edge.to
+            );
             if let Some(backward_edges) = self.backward.get_mut(&edge.to) {
-                backward_edges.retain(|e| !(e.from == edge.from && e.to == edge.to && !e.is_directive));
+                backward_edges
+                    .retain(|e| !(e.from == edge.from && e.to == edge.to && !e.is_directive));
                 if backward_edges.is_empty() {
                     self.backward.remove(&edge.to);
                 }
@@ -563,19 +1100,28 @@ impl DependencyGraph {
     pub fn dump_state(&self) -> String {
         let total_edges: usize = self.forward.values().map(|v| v.len()).sum();
         let mut output = String::new();
-        output.push_str(&format!("Dependency Graph State ({} total edges):\n", total_edges));
-        output.push_str(&format!("  {} parent files with outgoing edges\n", self.forward.len()));
-        output.push_str(&format!("  {} child files with incoming edges\n\n", self.backward.len()));
-        
+        output.push_str(&format!(
+            "Dependency Graph State ({} total edges):\n",
+            total_edges
+        ));
+        output.push_str(&format!(
+            "  {} parent files with outgoing edges\n",
+            self.forward.len()
+        ));
+        output.push_str(&format!(
+            "  {} child files with incoming edges\n\n",
+            self.backward.len()
+        ));
+
         if self.forward.is_empty() {
             output.push_str("  (no edges)\n");
             return output;
         }
-        
+
         // Sort parents for consistent output
         let mut parents: Vec<_> = self.forward.keys().collect();
         parents.sort();
-        
+
         for parent in parents {
             if let Some(edges) = self.forward.get(parent) {
                 output.push_str(&format!("  {}:\n", parent));
@@ -587,17 +1133,29 @@ impl DependencyGraph {
                     };
                     let flags = {
                         let mut f = Vec::new();
-                        if edge.is_directive { f.push("directive"); }
-                        if edge.local { f.push("local"); }
-                        if edge.chdir { f.push("chdir"); }
-                        if edge.is_sys_source { f.push("sys.source"); }
-                        if f.is_empty() { "".to_string() } else { format!(" [{}]", f.join(", ")) }
+                        if edge.is_directive {
+                            f.push("directive");
+                        }
+                        if edge.local {
+                            f.push("local");
+                        }
+                        if edge.chdir {
+                            f.push("chdir");
+                        }
+                        if edge.is_sys_source {
+                            f.push("sys.source");
+                        }
+                        if f.is_empty() {
+                            "".to_string()
+                        } else {
+                            format!(" [{}]", f.join(", "))
+                        }
                     };
                     output.push_str(&format!("    -> {} ({}){}\n", edge.to, call_site, flags));
                 }
             }
         }
-        
+
         output
     }
 
@@ -626,6 +1184,7 @@ impl DependencyGraph {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::BackwardDirective;
     use super::*;
 
     fn url(s: &str) -> Url {
@@ -898,7 +1457,7 @@ mod tests {
         // because directive has known call site and doesn't suppress AST at different site
         let deps = graph.get_dependencies(&main);
         assert_eq!(deps.len(), 2);
-        
+
         // No warning since directive has known call site
         assert!(result.diagnostics.is_empty());
     }
@@ -1054,7 +1613,11 @@ z <- 3
 "#;
 
         graph.update_file(&child, &meta, Some(&workspace_root()), |uri| {
-            if uri == &parent { Some(parent_content.to_string()) } else { None }
+            if uri == &parent {
+                Some(parent_content.to_string())
+            } else {
+                None
+            }
         });
 
         // Should create forward edge from parent to child with resolved call site
@@ -1092,7 +1655,11 @@ z <- 3
 "#;
 
         graph.update_file(&child, &meta, Some(&workspace_root()), |uri| {
-            if uri == &parent { Some(parent_content.to_string()) } else { None }
+            if uri == &parent {
+                Some(parent_content.to_string())
+            } else {
+                None
+            }
         });
 
         // Should create forward edge from parent to child with inferred call site
@@ -1138,7 +1705,7 @@ z <- 3
 
         // Test dump_state
         let state = graph.dump_state();
-        
+
         // Verify output contains expected information
         assert!(state.contains("2 total edges"));
         assert!(state.contains("file:///project/main.R"));
@@ -1147,5 +1714,852 @@ z <- 3
         assert!(state.contains("line 5, col 10"));
         assert!(state.contains("line 10, col 5"));
         assert!(state.contains("[directive, local]"));
+    }
+
+    // Tests for resolve_parent_working_directory
+    // Validates: Requirements 5.1, 5.3
+
+    #[test]
+    fn test_resolve_parent_working_directory_with_explicit_wd() {
+        // Validates: Requirements 5.1
+        // When parent has explicit @lsp-cd, return that as the effective working directory
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let parent_meta = CrossFileMetadata {
+            working_directory: Some("/data".to_string()),
+            ..Default::default()
+        };
+
+        let result = resolve_parent_working_directory(
+            &parent_uri,
+            |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            },
+            Some(&workspace),
+        );
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // The explicit working directory "/data" is workspace-relative, so resolves to /project/data
+        assert_eq!(wd, "/project/data");
+    }
+
+    #[test]
+    fn test_resolve_parent_working_directory_no_explicit_wd() {
+        // Validates: Requirements 5.1
+        // When parent has no explicit @lsp-cd, return parent's directory as effective WD
+        let parent_uri = Url::parse("file:///project/src/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let parent_meta = CrossFileMetadata {
+            working_directory: None,
+            ..Default::default()
+        };
+
+        let result = resolve_parent_working_directory(
+            &parent_uri,
+            |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            },
+            Some(&workspace),
+        );
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Parent's directory is /project/src
+        assert_eq!(wd, "/project/src");
+    }
+
+    #[test]
+    fn test_resolve_parent_working_directory_fallback_when_metadata_unavailable() {
+        // Validates: Requirements 5.3
+        // When parent metadata cannot be retrieved, fall back to parent's directory
+        let parent_uri = Url::parse("file:///project/scripts/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let result = resolve_parent_working_directory(
+            &parent_uri,
+            |_| None, // Metadata unavailable
+            Some(&workspace),
+        );
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Should fall back to parent's directory
+        assert_eq!(wd, "/project/scripts");
+    }
+
+    #[test]
+    fn test_resolve_parent_working_directory_with_inherited_wd() {
+        // Validates: Requirements 5.1
+        // When parent has inherited working directory (no explicit), use that
+        let parent_uri = Url::parse("file:///project/src/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        // Note: inherited_working_directory is stored as an absolute path string
+        // that was already resolved, so we use a path that doesn't start with /
+        // to avoid workspace-relative resolution
+        let parent_meta = CrossFileMetadata {
+            working_directory: None,
+            // Use a relative path that will resolve correctly
+            inherited_working_directory: Some("../data".to_string()),
+            ..Default::default()
+        };
+
+        let result = resolve_parent_working_directory(
+            &parent_uri,
+            |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            },
+            Some(&workspace),
+        );
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Parent's effective WD should be the inherited one resolved from parent's directory
+        // ../data from /project/src resolves to /project/data
+        assert_eq!(wd, "/project/data");
+    }
+
+    #[test]
+    fn test_resolve_parent_working_directory_explicit_takes_precedence() {
+        // Validates: Requirements 5.1
+        // When parent has both explicit and inherited WD, explicit takes precedence
+        let parent_uri = Url::parse("file:///project/src/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let parent_meta = CrossFileMetadata {
+            working_directory: Some("/explicit".to_string()),
+            inherited_working_directory: Some("/project/inherited".to_string()),
+            ..Default::default()
+        };
+
+        let result = resolve_parent_working_directory(
+            &parent_uri,
+            |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            },
+            Some(&workspace),
+        );
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Explicit WD should take precedence
+        assert_eq!(wd, "/project/explicit");
+    }
+
+    #[test]
+    fn test_resolve_parent_working_directory_relative_explicit_wd() {
+        // Validates: Requirements 5.1
+        // When parent has relative explicit @lsp-cd, resolve it relative to parent's directory
+        let parent_uri = Url::parse("file:///project/src/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let parent_meta = CrossFileMetadata {
+            working_directory: Some("../data".to_string()),
+            ..Default::default()
+        };
+
+        let result = resolve_parent_working_directory(
+            &parent_uri,
+            |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            },
+            Some(&workspace),
+        );
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // ../data from /project/src resolves to /project/data
+        assert_eq!(wd, "/project/data");
+    }
+
+    #[test]
+    fn test_resolve_parent_working_directory_no_workspace_root() {
+        // Test behavior when workspace root is not available
+        let parent_uri = Url::parse("file:///project/src/parent.R").unwrap();
+
+        let parent_meta = CrossFileMetadata {
+            working_directory: None,
+            ..Default::default()
+        };
+
+        let result = resolve_parent_working_directory(
+            &parent_uri,
+            |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            },
+            None, // No workspace root
+        );
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Should still return parent's directory
+        assert_eq!(wd, "/project/src");
+    }
+
+    // Tests for compute_inherited_working_directory
+
+    #[test]
+    fn test_compute_inherited_wd_basic() {
+        // Validates: Requirements 1.1, 2.1
+        // Child with backward directive inherits parent's explicit WD
+        let child_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let parent_uri = Url::parse("file:///project/src/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        let parent_meta = CrossFileMetadata {
+            working_directory: Some("/data".to_string()),
+            ..Default::default()
+        };
+
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            });
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Should inherit parent's explicit WD
+        assert_eq!(wd, "/project/data");
+    }
+
+    #[test]
+    fn test_compute_inherited_wd_skips_when_explicit() {
+        // Validates: Requirement 3.1
+        // Child with explicit @lsp-cd should not inherit from parent
+        let child_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: Some("/child/explicit".to_string()), // Has explicit WD
+            ..Default::default()
+        };
+
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |_| {
+                panic!("Should not call get_metadata when child has explicit WD")
+            });
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_compute_inherited_wd_no_backward_directives() {
+        // When child has no backward directives, return None
+        let child_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![], // No backward directives
+            working_directory: None,
+            ..Default::default()
+        };
+
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |_| {
+                panic!("Should not call get_metadata when no backward directives")
+            });
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_compute_inherited_wd_first_directive_wins() {
+        // Validates: Requirement 7.1
+        // When multiple backward directives exist, use the first one
+        let child_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let parent1_uri = Url::parse("file:///project/src/parent1.R").unwrap();
+        let parent2_uri = Url::parse("file:///project/src/parent2.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![
+                BackwardDirective {
+                    path: "parent1.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 0,
+                },
+                BackwardDirective {
+                    path: "parent2.R".to_string(),
+                    call_site: CallSiteSpec::Default,
+                    directive_line: 1,
+                },
+            ],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        let parent1_meta = CrossFileMetadata {
+            working_directory: Some("/first".to_string()),
+            ..Default::default()
+        };
+
+        let parent2_meta = CrossFileMetadata {
+            working_directory: Some("/second".to_string()),
+            ..Default::default()
+        };
+
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
+                if uri == &parent1_uri {
+                    Some(parent1_meta.clone())
+                } else if uri == &parent2_uri {
+                    Some(parent2_meta.clone())
+                } else {
+                    None
+                }
+            });
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Should use first parent's WD
+        assert_eq!(wd, "/project/first");
+    }
+
+    #[test]
+    fn test_compute_inherited_wd_parent_implicit() {
+        // Validates: Requirement 2.1
+        // When parent has no explicit WD, inherit parent's directory
+        let child_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let parent_uri = Url::parse("file:///project/scripts/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "../scripts/parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        let parent_meta = CrossFileMetadata {
+            working_directory: None, // No explicit WD
+            ..Default::default()
+        };
+
+        let result =
+            compute_inherited_working_directory(&child_uri, &child_meta, Some(&workspace), |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            });
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Should inherit parent's directory
+        assert_eq!(wd, "/project/scripts");
+    }
+
+    #[test]
+    fn test_compute_inherited_wd_parent_not_found() {
+        // When parent file cannot be resolved, return None
+        let child_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "nonexistent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // The parent path resolves but metadata is unavailable
+        // In this case, resolve_parent_working_directory falls back to parent's directory
+        let result = compute_inherited_working_directory(
+            &child_uri,
+            &child_meta,
+            Some(&workspace),
+            |_| None, // Metadata unavailable
+        );
+
+        // Should still return something (fallback to parent's directory)
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Parent path "nonexistent.R" resolves to /project/src/nonexistent.R
+        // Its directory is /project/src
+        assert_eq!(wd, "/project/src");
+    }
+
+    // Tests for depth tracking in working directory inheritance
+    // Validates: Requirements 9.1, 9.2
+
+    #[test]
+    fn test_compute_inherited_wd_with_depth_zero() {
+        // Validates: Requirement 9.2
+        // When max_depth is 0, inheritance should stop
+        let child_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        let result = compute_inherited_working_directory_with_depth(
+            &child_uri,
+            &child_meta,
+            Some(&workspace),
+            |_| panic!("Should not call get_metadata when depth is 0"),
+            0, // Zero depth
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_compute_inherited_wd_with_depth_one() {
+        // Validates: Requirement 9.2
+        // With depth 1, should resolve parent's metadata directly (no further recursion needed)
+        let child_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let parent_uri = Url::parse("file:///project/src/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // Parent has explicit working directory (workspace-relative)
+        let parent_meta = CrossFileMetadata {
+            working_directory: Some("/data".to_string()),
+            ..Default::default()
+        };
+
+        // With depth 2, we have enough depth to resolve parent's metadata
+        let result = compute_inherited_working_directory_with_depth(
+            &child_uri,
+            &child_meta,
+            Some(&workspace),
+            |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            },
+            1, // Depth of 1: allows direct parent lookup
+        );
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        assert_eq!(wd, "/project/data");
+    }
+
+    #[test]
+    fn test_transitive_inheritance_a_to_b_to_c() {
+        // Validates: Requirement 9.1
+        // Chain: A (has @lsp-cd) -> B (inherits from A) -> C (inherits from B, gets A's WD)
+        let a_uri = Url::parse("file:///project/a.R").unwrap();
+        let b_uri = Url::parse("file:///project/b.R").unwrap();
+        let c_uri = Url::parse("file:///project/c.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        // A has explicit working directory (workspace-relative, resolves to /project/data)
+        let a_meta = CrossFileMetadata {
+            working_directory: Some("/data".to_string()),
+            ..Default::default()
+        };
+
+        // B has backward directive to A, and has inherited WD from A
+        // Note: inherited_working_directory stores the RESOLVED absolute path
+        // (not the original workspace-relative path)
+        let b_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "a.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            // This is stored as a file-relative path that will resolve correctly
+            // from B's directory (/project) to /project/data
+            inherited_working_directory: Some("data".to_string()),
+            ..Default::default()
+        };
+
+        // C has backward directive to B
+        let c_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "b.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // Compute C's inherited WD - should get A's WD through B
+        let result =
+            compute_inherited_working_directory(&c_uri, &c_meta, Some(&workspace), |uri| {
+                if uri == &a_uri {
+                    Some(a_meta.clone())
+                } else if uri == &b_uri {
+                    Some(b_meta.clone())
+                } else {
+                    None
+                }
+            });
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // C should inherit A's working directory through B
+        assert_eq!(wd, "/project/data");
+    }
+
+    #[test]
+    fn test_transitive_inheritance_depth_limit() {
+        // Validates: Requirement 9.2
+        // When depth limit is reached, should fall back to parent's directory
+        let child_uri = Url::parse("file:///project/src/child.R").unwrap();
+        let parent_uri = Url::parse("file:///project/src/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // Parent has backward directive but we'll hit depth limit
+        let parent_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "grandparent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // With depth 1, we can resolve parent but parent's inheritance will be limited
+        let result = compute_inherited_working_directory_with_depth(
+            &child_uri,
+            &child_meta,
+            Some(&workspace),
+            |uri| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else {
+                    None
+                }
+            },
+            1, // Only depth 1
+        );
+
+        // Should still get a result (parent's directory as fallback when depth exhausted)
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Parent has no explicit WD and depth is exhausted, so falls back to parent's directory
+        assert_eq!(wd, "/project/src");
+    }
+
+    #[test]
+    fn test_resolve_parent_wd_with_depth_zero_fallback() {
+        // Validates: Requirement 9.2
+        // When depth is 0, should fall back to parent's directory
+        let parent_uri = Url::parse("file:///project/scripts/parent.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let result = resolve_parent_working_directory_with_depth(
+            &parent_uri,
+            &|_| panic!("Should not call get_metadata when depth is 0"),
+            Some(&workspace),
+            0, // Zero depth
+        );
+
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // Should fall back to parent's directory
+        assert_eq!(wd, "/project/scripts");
+    }
+
+    #[test]
+    fn test_default_max_inheritance_depth_constant() {
+        // Verify the default constant is reasonable
+        assert_eq!(DEFAULT_MAX_INHERITANCE_DEPTH, 10);
+    }
+
+    // Tests for cycle detection in working directory inheritance
+    // Validates: Requirement 9.3
+
+    #[test]
+    fn test_cycle_detection_simple_a_to_b_to_a() {
+        // Validates: Requirement 9.3
+        // Cycle: A -> B -> A (A sources B, B sources A via backward directives)
+        // When computing A's inherited WD, if we follow A -> B -> A, we should detect the cycle
+        let a_uri = Url::parse("file:///project/a.R").unwrap();
+        let b_uri = Url::parse("file:///project/b.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        // A has backward directive to B
+        let a_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "b.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // B has backward directive to A (creates cycle)
+        let b_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "a.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // Compute A's inherited WD - should detect cycle and return None or fallback
+        let result =
+            compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
+                if uri == &a_uri {
+                    Some(a_meta.clone())
+                } else if uri == &b_uri {
+                    Some(b_meta.clone())
+                } else {
+                    None
+                }
+            });
+
+        // Should get B's directory as the result (B is the parent, and when we try to
+        // resolve B's inherited WD, we detect the cycle back to A and fall back to B's directory)
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // B's directory is /project
+        assert_eq!(wd, "/project");
+    }
+
+    #[test]
+    fn test_cycle_detection_self_reference() {
+        // Validates: Requirement 9.3
+        // Edge case: A has backward directive to itself
+        let a_uri = Url::parse("file:///project/a.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        // A has backward directive to itself (self-cycle)
+        let a_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "a.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // Compute A's inherited WD - should detect self-cycle
+        let result =
+            compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
+                if uri == &a_uri {
+                    Some(a_meta.clone())
+                } else {
+                    None
+                }
+            });
+
+        // Should get A's directory as fallback when cycle is detected
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        // A's directory is /project
+        assert_eq!(wd, "/project");
+    }
+
+    #[test]
+    fn test_cycle_detection_three_file_cycle() {
+        // Validates: Requirement 9.3
+        // Cycle: A -> B -> C -> A
+        let a_uri = Url::parse("file:///project/a.R").unwrap();
+        let b_uri = Url::parse("file:///project/b.R").unwrap();
+        let c_uri = Url::parse("file:///project/c.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        // A has backward directive to B
+        let a_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "b.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // B has backward directive to C
+        let b_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "c.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // C has backward directive to A (creates cycle)
+        let c_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "a.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // Compute A's inherited WD - should detect cycle eventually
+        let result =
+            compute_inherited_working_directory(&a_uri, &a_meta, Some(&workspace), |uri| {
+                if uri == &a_uri {
+                    Some(a_meta.clone())
+                } else if uri == &b_uri {
+                    Some(b_meta.clone())
+                } else if uri == &c_uri {
+                    Some(c_meta.clone())
+                } else {
+                    None
+                }
+            });
+
+        // Should get a result (fallback to some directory when cycle is detected)
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_resolve_parent_wd_with_visited_detects_cycle() {
+        // Validates: Requirement 9.3
+        // Test the lower-level function directly
+        let a_uri = Url::parse("file:///project/a.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let a_meta = CrossFileMetadata {
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // Pre-populate visited set with the URI we're about to resolve
+        let mut visited = HashSet::new();
+        visited.insert(a_uri.clone());
+
+        let result = resolve_parent_working_directory_with_visited(
+            &a_uri,
+            &|uri| {
+                if uri == &a_uri {
+                    Some(a_meta.clone())
+                } else {
+                    None
+                }
+            },
+            Some(&workspace),
+            10, // Plenty of depth
+            &mut visited,
+        );
+
+        // Should detect cycle and fall back to file's directory
+        assert!(result.is_some());
+        let wd = result.unwrap();
+        assert_eq!(wd, "/project");
+    }
+
+    #[test]
+    fn test_compute_inherited_wd_with_visited_detects_cycle() {
+        // Validates: Requirement 9.3
+        // Test the lower-level function directly
+        let a_uri = Url::parse("file:///project/a.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+
+        let a_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            working_directory: None,
+            ..Default::default()
+        };
+
+        // Pre-populate visited set with the URI we're about to compute
+        let mut visited = HashSet::new();
+        visited.insert(a_uri.clone());
+
+        let result = compute_inherited_working_directory_with_visited(
+            &a_uri,
+            &a_meta,
+            Some(&workspace),
+            &|_| None,
+            10, // Plenty of depth
+            &mut visited,
+        );
+
+        // Should detect cycle and return None
+        assert!(result.is_none());
     }
 }

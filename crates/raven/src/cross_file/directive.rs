@@ -215,7 +215,10 @@ mod tests {
         let content = r#"# @lsp-sourced-by ../main.R match="source(""#;
         let meta = parse_directives(content);
         assert_eq!(meta.sourced_by.len(), 1);
-        assert_eq!(meta.sourced_by[0].call_site, CallSiteSpec::Match("source(".to_string()));
+        assert_eq!(
+            meta.sourced_by[0].call_site,
+            CallSiteSpec::Match("source(".to_string())
+        );
     }
 
     #[test]
@@ -253,10 +256,21 @@ mod tests {
 
     #[test]
     fn test_working_directory_synonyms() {
-        for directive in ["@lsp-wd", "@lsp-cd", "@lsp-current-directory", "@lsp-current-dir", "@lsp-working-dir"] {
+        for directive in [
+            "@lsp-wd",
+            "@lsp-cd",
+            "@lsp-current-directory",
+            "@lsp-current-dir",
+            "@lsp-working-dir",
+        ] {
             let content = format!("# {} /data", directive);
             let meta = parse_directives(&content);
-            assert_eq!(meta.working_directory, Some("/data".to_string()), "Failed for {}", directive);
+            assert_eq!(
+                meta.working_directory,
+                Some("/data".to_string()),
+                "Failed for {}",
+                directive
+            );
         }
     }
 
@@ -406,10 +420,21 @@ x <- undefined"#;
 
     #[test]
     fn test_working_dir_no_at_prefix_synonyms() {
-        for directive in ["lsp-cd", "lsp-working-directory", "lsp-working-dir", "lsp-current-directory", "lsp-current-dir"] {
+        for directive in [
+            "lsp-cd",
+            "lsp-working-directory",
+            "lsp-working-dir",
+            "lsp-current-directory",
+            "lsp-current-dir",
+        ] {
             let content = format!("# {} /data", directive);
             let meta = parse_directives(&content);
-            assert_eq!(meta.working_directory, Some("/data".to_string()), "Failed for {}", directive);
+            assert_eq!(
+                meta.working_directory,
+                Some("/data".to_string()),
+                "Failed for {}",
+                directive
+            );
         }
     }
 

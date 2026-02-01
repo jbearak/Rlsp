@@ -69,30 +69,34 @@ pub use workspace_index::*;
 /// assert!(meta.library_calls.iter().any(|lc| lc.name == "pkg"));
 /// ```
 pub fn extract_metadata(content: &str) -> CrossFileMetadata {
-    log::trace!("Extracting cross-file metadata from content ({} bytes)", content.len());
-    
+    log::trace!(
+        "Extracting cross-file metadata from content ({} bytes)",
+        content.len()
+    );
+
     // Parse directives first
     let mut meta = directive::parse_directives(content);
-    
+
     // Parse AST for source() calls and library() calls using thread-local parser for efficiency
     if let Some(tree) = crate::parser_pool::with_parser(|parser| parser.parse(content, None)) {
         let detected = source_detect::detect_source_calls(&tree, content);
-        
+
         // Merge detected source() calls with directive sources
         // Directive sources take precedence (Requirement 6.8)
         for source in detected {
             // Check if there's already a directive at the same line
-            let has_directive = meta.sources.iter().any(|s| {
-                s.is_directive && s.line == source.line
-            });
+            let has_directive = meta
+                .sources
+                .iter()
+                .any(|s| s.is_directive && s.line == source.line);
             if !has_directive {
                 meta.sources.push(source);
             }
         }
-        
+
         // Sort by line number for consistent ordering
         meta.sources.sort_by_key(|s| (s.line, s.column));
-        
+
         // Detect library(), require(), loadNamespace() calls (Requirement 1.8)
         let mut library_calls = source_detect::detect_library_calls(&tree, content);
         // Sort by line/column for document order (Requirement 1.8)
@@ -101,7 +105,7 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
     } else {
         log::warn!("Failed to parse R code with tree-sitter during metadata extraction");
     }
-    
+
     log::trace!(
         "Metadata extraction complete: {} total sources ({} from directives, {} from AST), {} backward directives, {} library calls",
         meta.sources.len(),
@@ -110,6 +114,6 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
         meta.sourced_by.len(),
         meta.library_calls.len()
     );
-    
+
     meta
 }
