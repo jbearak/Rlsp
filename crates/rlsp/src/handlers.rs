@@ -21,15 +21,26 @@ use crate::builtins;
 // Cross-File Scope Helper
 // ============================================================================
 
-/// Get cross-file symbols available at a position.
-/// This traverses the source() chain to include symbols from sourced files,
-/// and also includes symbols from parent files via backward directives.
+/// Collects cross-file symbols visible at the given document position.
 ///
-/// Uses ContentProvider for unified access to file content, metadata, and artifacts.
-/// The ContentProvider already implements the open-docs-authoritative rule,
-/// so no manual fallback logic is needed.
+/// The returned set includes symbols brought into scope via `source()` chains
+/// and parent-file backward directives; it uses the state's ContentProvider to
+/// resolve referenced files and artifacts.
 ///
-/// **Validates: Requirements 7.2, 13.2**
+/// # Examples
+///
+/// ```no_run
+/// use url::Url;
+/// // `state` is a prepared WorldState; obtain or mock as appropriate in tests.
+/// let state = /* WorldState */ todo!();
+/// let uri = Url::parse("file:///path/to/script.R").unwrap();
+/// let symbols = crate::get_cross_file_symbols(&state, &uri, 12, 4);
+/// // `symbols` maps symbol names to their scoped metadata.
+/// ```
+///
+/// # Returns
+///
+/// A `HashMap` mapping symbol names to their corresponding `ScopedSymbol` entries.
 fn get_cross_file_symbols(
     state: &WorldState,
     uri: &Url,
@@ -39,10 +50,23 @@ fn get_cross_file_symbols(
     get_cross_file_scope(state, uri, line, column).symbols
 }
 
-/// Get the full scope at a position, including symbols and loaded packages.
-/// This is used for position-aware package checking in diagnostics.
+/// Compute the unified cross-file scope at a given position, including available symbols and package visibility.
 ///
-/// **Validates: Requirements 8.1, 8.3, 8.4**
+/// This returns a position-aware ScopeAtPosition that reflects symbols visible at (line, column) in `uri`, along with loaded and inherited package lists and depth information for cross-file resolution.
+///
+/// # Returns
+///
+/// A `scope::ScopeAtPosition` containing the resolved symbols, `loaded_packages`, `inherited_packages`, and scope depth metadata for the specified location.
+///
+/// # Examples
+///
+/// ```no_run
+/// use url::Url;
+/// // `state` is your WorldState and `uri` is the file URL you want to query.
+/// let uri = Url::parse("file:///path/to/script.R").unwrap();
+/// let scope = get_cross_file_scope(&state, &uri, 10, 5);
+/// // inspect scope.symbols, scope.loaded_packages, etc.
+/// ```
 fn get_cross_file_scope(
     state: &WorldState,
     uri: &Url,
@@ -245,6 +269,24 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 // Diagnostics
 // ============================================================================
 
+/// Compute diagnostics for the document at the given URI.
+///
+/// Performs a full set of checks for the specified open document and returns collected diagnostics.
+/// Reported issues include syntax errors, circular dependency and max-depth problems, missing or ambiguous
+/// sourced files, out-of-scope symbol usage, missing package warnings, and (when enabled) undefined-variable
+/// diagnostics that account for cross-file and package scope.
+///
+/// # Returns
+///
+/// `Vec<Diagnostic>` containing diagnostics for the document at `uri`, which may be empty if no issues were found.
+///
+/// # Examples
+///
+/// ```
+/// // Given a prepared `WorldState` and a `Url` referring to an open document:
+/// let diags = diagnostics(&state, &uri);
+/// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
+/// ```
 pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     let Some(doc) = state.get_document(uri) else {
         return Vec::new();
@@ -823,7 +865,24 @@ fn collect_max_depth_diagnostics(
     }
 }
 
-/// Collect diagnostics for ambiguous parent relationships
+/// Emit a diagnostic when a file's parent resolution is ambiguous.
+///
+/// This inspects the cross-file metadata and graph to resolve the file's parent(s).
+/// If resolution returns an ambiguous result, a single `Diagnostic` is pushed that
+/// points at the first backward directive line and suggests adding `line=` or `match=`
+/// to disambiguate. The diagnostic's severity is taken from the cross-file config.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use url::Url;
+/// # use lsp_types::Diagnostic;
+/// # use crate::WorldState;
+/// # use crate::cross_file::CrossFileMetadata;
+/// # fn example(state: &WorldState, uri: &Url, meta: &CrossFileMetadata, diagnostics: &mut Vec<Diagnostic>) {
+/// collect_ambiguous_parent_diagnostics(state, uri, meta, diagnostics);
+/// # }
+/// ```
 fn collect_ambiguous_parent_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -889,13 +948,22 @@ fn collect_ambiguous_parent_diagnostics(
     }
 }
 
-/// Collect diagnostics for library() calls referencing non-installed packages
+/// Emit diagnostics for `library()` calls that reference packages not present in the package library.
 ///
-/// This function checks each library() call in the metadata and emits a warning
-/// diagnostic if the referenced package is not installed.
+/// Scans the cross-file metadata for `library()` calls and, for each call that is not ignored
+/// via directives and whose package is not found in `state.package_library`, appends a warning
+/// Diagnostic covering the call's line range with the configured severity.
 ///
-/// **Validates: Requirement 15.1** - WHEN a library() call references a non-installed package,
-/// THE Diagnostic_Engine SHALL emit a warning diagnostic at the call site
+/// # Examples
+///
+/// ```ignore
+/// // Construct a WorldState with packages enabled and an empty PackageLibrary,
+/// // provide CrossFileMetadata containing a LibraryCall for "foo", then:
+/// //
+/// // collect_missing_package_diagnostics(&state, &meta, &mut diagnostics);
+/// //
+/// // After the call, `diagnostics` will contain a warning about package "foo".
+/// ```
 fn collect_missing_package_diagnostics(
     state: &WorldState,
     meta: &crate::cross_file::CrossFileMetadata,
@@ -935,7 +1003,35 @@ fn collect_missing_package_diagnostics(
     }
 }
 
-/// Collect diagnostics for symbols used before their source() call (Requirement 10.3)
+/// Emit diagnostics for symbols defined in sourced files that are referenced
+/// earlier in the current document than the corresponding `source()` call.
+///
+/// This function:
+/// - Scans `directive_meta.sources` and collects source paths declared in the file.
+/// - Collects identifier usages (UTF-16 columns) in `node`.
+/// - For each sourced file, resolves its URI and obtains its exported symbols (preferring open documents, then cross-file index, then legacy index).
+/// - Emits a diagnostic for every usage of an exported symbol that occurs before the `source()` call (skipping lines marked ignored by directives).
+///
+/// The produced diagnostics are appended to `diagnostics` and use the configured
+/// `out_of_scope_severity` from `state.cross_file_config`.
+///
+/// # Parameters
+///
+/// - `state`: Workspace state and indexes used to resolve artifacts and configuration.
+/// - `uri`: URI of the current document being analyzed (used to resolve relative source paths).
+/// - `node`: Root AST node of the current document.
+/// - `text`: Full source text of the current document.
+/// - `directive_meta`: Cross-file directive metadata (contains `@lsp-source` / `source()` locations).
+/// - `diagnostics`: Mutable vector to receive emitted diagnostics.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Collect diagnostics into `diags` for a parsed document:
+/// let mut diags = Vec::new();
+/// collect_out_of_scope_diagnostics(&state, &uri, root_node, &text, &directive_meta, &mut diags);
+/// // `diags` now contains diagnostics for symbols used before their `source()` calls.
+/// ```
 fn collect_out_of_scope_diagnostics(
     state: &WorldState,
     uri: &Url,
@@ -1117,9 +1213,22 @@ fn collect_syntax_errors(node: Node, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
-/// Position-aware undefined variable collection.
-/// Checks each usage against the cross-file scope at that specific position.
-/// Respects @lsp-ignore and @lsp-ignore-next directives.
+/// Report undefined variable usages in a document using position-aware cross-file scope.
+///
+/// This inspects every identifier usage in `node`, skipping local definitions, builtins,
+/// and workspace imports, and checks visibility at the exact usage position by querying
+/// the cross-file scope (including position-aware loaded/inherited packages). Lines marked
+/// with `@lsp-ignore` or `@lsp-ignore-next` are ignored. When a usage is not found in the
+/// resolved scope or in package exports (if packages are enabled), a `Diagnostic` with a
+/// UTF-16-aware range is emitted for the undefined variable.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Illustrative only — real usage requires a populated WorldState, AST node and other
+/// // project-specific types from the language server state.
+/// // collect_undefined_variables_position_aware(&state, &uri, root_node, &text, &[], &workspace_imports, &package_library, &directive_meta, &mut diagnostics);
+/// ```
 #[allow(clippy::too_many_arguments)]
 fn collect_undefined_variables_position_aware(
     state: &WorldState,
@@ -1209,6 +1318,31 @@ fn collect_undefined_variables_position_aware(
     }
 }
 
+/// Emit diagnostics for identifiers that are used but not defined, built-in, imported, exported by a loaded package, or available from cross-file symbols.
+///
+/// This function performs a two-pass analysis on the provided syntax `node`:
+/// it collects all defined identifiers, then collects usages (respecting NSE/context rules),
+/// and pushes a `Diagnostic` with severity `Warning` for each usage that is not found in any of:
+/// - the local definitions in the current tree,
+/// - the set of builtins,
+/// - symbols exported by any loaded package (via `package_library` and `loaded_packages`),
+/// - names imported into the workspace (`workspace_imports`),
+/// - the provided `cross_file_symbols`.
+///
+/// Parameters:
+/// - `node`, `text`: the root AST node and source text to analyze.
+/// - `loaded_packages`: names of packages considered loaded for package-export checks.
+/// - `workspace_imports`: names imported into the workspace (treated as defined).
+/// - `package_library`: authoritative package export/index used to determine package exports.
+/// - `cross_file_symbols`: cross-file symbols available to the current file.
+/// - `diagnostics`: destination vector; undefined-variable diagnostics are appended here.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Illustrative example (non-executable here): parse a document to `root` and call:
+/// // collect_undefined_variables(root, &text, &loaded_packages, &workspace_imports, &package_library, &cross_file_symbols, &mut diagnostics);
+/// ```
 #[allow(dead_code)]
 fn collect_undefined_variables(
     node: Node,
@@ -1465,6 +1599,20 @@ fn collect_usages_with_context<'a>(
     }
 }
 
+/// Determines whether an identifier is a recognized R builtin (constant or function).
+///
+/// Checks common R constants (e.g., `TRUE`, `FALSE`, `NULL`, `NA`, `Inf`, `NaN`, `T`, `F`) first and then consults the comprehensive builtin registry.
+///
+/// # Examples
+///
+/// ```
+/// assert!(is_builtin("TRUE"));
+/// assert!(is_builtin("sum"));
+/// assert!(!is_builtin("my_custom_fn"));
+/// ```
+///
+/// # Returns
+/// `true` if `name` is a recognized R builtin constant or function, `false` otherwise.
 fn is_builtin(name: &str) -> bool {
     // Check constants first
     if matches!(name, "TRUE" | "FALSE" | "NULL" | "NA" | "Inf" | "NaN" | "T" | "F") {
@@ -1474,6 +1622,23 @@ fn is_builtin(name: &str) -> bool {
     builtins::is_builtin(name)
 }
 
+/// Determines whether an identifier is exported by any of the currently loaded packages.
+///
+/// Queries the provided PackageLibrary to decide if `name` originates from one of the packages
+/// listed in `loaded_packages`.
+///
+/// # Returns
+///
+/// `true` if the symbol is exported by a loaded package, `false` otherwise.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # use crate::package_library::PackageLibrary;
+/// # let package_library: PackageLibrary = unimplemented!();
+/// let loaded = vec!["stats".to_string(), "base".to_string()];
+/// let is_export = is_package_export("lm", &loaded, &package_library);
+/// ```
 fn is_package_export(name: &str, loaded_packages: &[String], package_library: &crate::package_library::PackageLibrary) -> bool {
     // Use PackageLibrary's synchronous method to check if symbol is from loaded packages
     // This checks base exports first, then cached package exports
@@ -1485,6 +1650,23 @@ fn is_package_export(name: &str, loaded_packages: &[String], package_library: &c
 // Completions
 // ============================================================================
 
+/// Build a list of completion items for the given document and cursor position.
+///
+/// Returns completion items that prioritize local document definitions, then package exports
+/// (when packages are enabled) with per-package attribution, and finally cross-file symbols.
+/// The function returns `None` when the document, its parse tree, or the node at the cursor
+/// cannot be resolved.
+///
+/// # Examples
+///
+/// ```
+/// // Obtain a `WorldState`, `Url`, and `Position` from your environment.
+/// let state = /* WorldState instance */;
+/// let uri = /* Url for the document */;
+/// let pos = /* Position { line, character } */;
+/// let resp = completion(&state, &uri, pos);
+/// assert!(resp.is_some());
+/// ```
 pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<CompletionResponse> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
@@ -2002,6 +2184,27 @@ fn extract_function_header(node: tree_sitter::Node, content: &str) -> String {
 // Hover
 // ============================================================================
 
+/// Provide hover information for the symbol at a given text document position.
+///
+/// Tries, in order:
+/// 1. Cross-file symbol resolution (including local definitions), returning an extracted definition or signature with source attribution.
+/// 2. Package exports discovered from the combined package scope, returning a signature and package attribution.
+/// 3. Cached R help text or a one-time lookup of R help for builtins and other symbols.
+///
+/// The produced hover content is Markdown (code block for signatures/definitions and optional attribution) and the hover range corresponds to the identifier node under the cursor.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use lsp_types::Position;
+/// # use url::Url;
+/// # use crate::state::WorldState;
+/// // Assuming `state` is available and `uri` refers to an open R document:
+/// let pos = Position::new(10, 4);
+/// let _ = hover(&state, &uri, pos);
+/// ```
+///
+/// Returns `Some(Hover)` when information (definition, signature, package attribution, or help text) is available for the identifier at `position`, `None` when no useful hover content can be produced.
 pub fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<Hover> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
@@ -2209,6 +2412,26 @@ pub fn signature_help(
 // Goto Definition
 // ============================================================================
 
+/// Locate the definition location for the identifier at the given position by searching
+/// the current document, cross-file symbols, open documents, and the workspace index.
+///
+/// If the identifier is defined in the current document, its local definition is returned.
+/// Otherwise the function searches cross-file symbols and exported interfaces from open
+/// documents and the workspace. If the symbol originates from a package (pseudo-URI
+/// starting with "package:"), no navigable location is returned.
+///
+/// # Returns
+///
+/// `Some(Location)` pointing to the symbol's defining range when a navigable definition is found;
+/// `None` if no definition is found or if the symbol is a package export (non-navigable).
+///
+/// # Examples
+///
+/// ```
+/// // Assume `state`, `uri`, and `pos` are available in the test harness.
+/// let result = goto_definition(&state, &uri, pos);
+/// // `result` will be `Some(...)` when a navigable definition exists, otherwise `None`.
+/// ```
 pub fn goto_definition(
     state: &WorldState,
     uri: &Url,
@@ -3426,8 +3649,19 @@ x <- "#;
         });
     }
 
-    /// Test the full precedence chain: local > package > cross-file
-    /// Validates: Requirements 9.4, 9.5
+    /// Verifies completion precedence where local definitions shadow package exports, and package exports take precedence over cross-file symbols.
+    ///
+    /// Sets up a WorldState with a package ("dplyr") that exports several symbols, opens a document that loads that package and defines a local `mutate` (which should shadow the package export) and `my_func`, then requests completions at a position and asserts:
+    /// - the local `mutate` appears once with no package attribution,
+    /// - `filter` and `select` appear once each with package attribution `{dplyr}`,
+    /// - `my_func` appears as a function completion.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Arrange: create state, insert package exports and document, then call completion.
+    /// // Assert: see comments above for expected precedence behavior.
+    /// ```
     #[test]
     fn test_completion_full_precedence_chain() {
         use crate::state::{WorldState, Document};
@@ -5805,6 +6039,34 @@ z <- mutate(5)  # Uses local definition"#;
     // Tests for goto_definition package handling - Task 13.1
     // ============================================================================
 
+    /// Verifies that symbols originating from packages are treated as non-navigable.
+    ///
+    /// This test constructs a `ScopedSymbol` whose `source_uri` uses the `package:`
+    /// scheme and asserts that such URIs are recognized as package exports (which
+    /// goto-definition should not navigate into).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+    /// use url::Url;
+    ///
+    /// let package_uri = Url::parse("package:dplyr").unwrap();
+    /// let symbol = ScopedSymbol {
+    ///     name: "mutate".to_string(),
+    ///     kind: SymbolKind::Function,
+    ///     source_uri: package_uri.clone(),
+    ///     defined_line: 0,
+    ///     defined_column: 0,
+    ///     signature: Some("mutate(.data, ...)".to_string()),
+    /// };
+    ///
+    /// assert!(symbol.source_uri.as_str().starts_with("package:"));
+    /// let is_package_export = symbol.source_uri.as_str().starts_with("package:");
+    /// assert!(is_package_export);
+    /// let package_name = symbol.source_uri.as_str().strip_prefix("package:");
+    /// assert_eq!(package_name, Some("dplyr"));
+    /// ```
     #[test]
     fn test_goto_definition_returns_none_for_package_exports() {
         // Test that goto_definition returns None for package exports
@@ -5975,6 +6237,17 @@ result <- my_func(1, 2)"#;
         }
     }
 
+    /// Verifies that scope resolution prefers local definitions over package exports for goto-definition.
+    ///
+    /// Constructs a document containing a `library()` call and a local function named `filter`, computes
+    /// the cross-file scope at a position after the local definition, and asserts that the `filter`
+    /// symbol resolves to the local file (not a `package:` URI) and has the expected definition line.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Confirms a local `filter` shadows the `dplyr` export when resolving definitions.
+    /// ```
     #[test]
     fn test_goto_definition_shadowing_scope_resolution() {
         // Test that scope resolution correctly returns local definitions over package exports.
@@ -6101,4 +6374,3 @@ y <- x"#;
         }
     }
 }
-

@@ -67,6 +67,23 @@ pub struct CrossFileConfig {
 }
 
 impl Default for CrossFileConfig {
+    /// Creates a CrossFileConfig populated with sensible defaults used by the cross-file awareness subsystem.
+    ///
+    /// The defaults enable workspace indexing, on-demand indexing, package awareness, and conservative traversal limits
+    /// (backward/forward depth: 10, chain depth: 20). Diagnostic severities and debounce/revalidation limits are
+    /// initialized to typical values for editor integrations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = CrossFileConfig::default();
+    /// assert!(cfg.index_workspace);
+    /// assert_eq!(cfg.max_chain_depth, 20);
+    /// assert_eq!(cfg.max_backward_depth, 10);
+    /// assert_eq!(cfg.max_forward_depth, 10);
+    /// assert!(cfg.on_demand_indexing_enabled);
+    /// assert!(cfg.packages_enabled);
+    /// ```
     fn default() -> Self {
         Self {
             max_backward_depth: 10,

@@ -836,16 +836,14 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     artifacts
 }
 
-/// Compute the lexical scope for a single file at the given document position.
+/// Compute the lexical scope at the given document position within a single file.
 ///
-/// Returns the set of symbols that are visible at (line, column) within `artifacts`,
-/// without performing any cross-file traversal or dependency resolution.
-///
-/// Behaviour:
-/// - Includes global definitions that occur at or before the query position.
-/// - Includes function-local definitions only if the query position lies inside the same function scope as the definition.
-/// - Includes function parameters when the query position is inside the function body (EOF sentinel positions are ignored).
-/// - Applies removal events that occur strictly before the query position and respects function-scoped removals.
+/// The returned ScopeAtPosition reflects only local, in-file visibility at (line, column):
+/// - Global definitions that occur at or before the query position are included.
+/// - Function-local definitions are included only when the query position lies inside the same function scope as the definition.
+/// - Function parameters are included when the query position is inside the function body (EOF sentinel positions are ignored).
+/// - Removal events that occur strictly before the query position are applied, respecting function-scoped removals.
+/// - Package load events from the same file are recorded in `loaded_packages` when they occur at or before the query position and match function-scoping rules.
 ///
 /// # Examples
 ///
@@ -945,40 +943,26 @@ pub fn scope_at_position(
     scope
 }
 
-/// Compute the lexical scope for a single file at the given document position,
-/// including symbols from loaded packages.
+/// Compute the lexical scope at a document position, including package exports
+/// loaded before that position.
 ///
-/// This is an extended version of `scope_at_position()` that also processes
-/// `PackageLoad` events to include package exports in the scope.
-///
-/// The `get_package_exports` callback is called for each package loaded before
-/// the query position, and should return the set of exported symbol names.
-/// These are added to the scope as `Variable` symbols with the package name
-/// as the source URI scheme (e.g., `package:dplyr`).
-///
-/// Behaviour:
-/// - Includes global definitions that occur at or before the query position.
-/// - Includes function-local definitions only if the query position lies inside the same function scope.
-/// - Includes function parameters when the query position is inside the function body.
-/// - Applies removal events that occur strictly before the query position.
-/// - Includes package exports from packages loaded before the query position.
-/// - Respects function-scoped package loads (only available within that function).
-///
-/// Requirements:
-/// - 2.1: Scope at position before library() call SHALL NOT include package exports
-/// - 2.2: Scope at position after library() call SHALL include package exports
-/// - 2.4: Function-scoped library() calls only available within that function
-/// - 2.5: Top-level library() calls available globally from that point forward
+/// This function returns the set of symbols visible at (line, column) in a
+/// single file by processing the file's timeline (definitions, function
+/// scopes, removals, and PackageLoad events). Package exports are injected
+/// using the provided `get_package_exports` callback for each package loaded
+/// at or before the query position; `base_exports` are seeded with lowest
+/// precedence and may be overridden by local definitions or explicit package
+/// loads. Function-scoped package loads are only visible when the query
+/// position lies inside the corresponding function scope.
 ///
 /// # Examples
 ///
 /// ```
-/// let artifacts = ScopeArtifacts::default();
-/// let get_exports = |_pkg: &str| -> std::collections::HashSet<String> {
-///     std::collections::HashSet::new()
-/// };
-/// let base_exports = std::collections::HashSet::new();
-/// let scope = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
+/// use std::collections::HashSet;
+/// let artifacts = crate::cross_file::scope::ScopeArtifacts::default();
+/// let get_exports = |_pkg: &str| -> HashSet<String> { HashSet::new() };
+/// let base_exports = HashSet::new();
+/// let scope = crate::cross_file::scope::scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
 /// assert!(scope.symbols.is_empty());
 /// ```
 pub fn scope_at_position_with_packages<F>(
@@ -1155,39 +1139,44 @@ where
     scope
 }
 
-/// Recursively computes the lexical scope at a position across sourced files.
+/// Compute the lexical scope at a given position for `uri`, merging symbols from the file
+/// and any transitive `source()` targets up to `max_depth`, while respecting local
+/// scoping, function-local definitions, removals, and cycle prevention.
 ///
-/// Walks the timeline and function-scope intervals for `uri`, merging symbols from
-/// the current file and any transitive `source()` targets (up to `max_depth`),
-/// respecting local scoping, function-local definitions, removals, and cycle prevention.
+/// Only `source()` targets whose calls occur before the query position are followed.
+/// Function-scoped sources and definitions are visible only when the query position is
+/// inside the same function scope. Traversal stops when `max_depth` would be exceeded;
+/// locations where traversal was curtailed are recorded in the result.
 ///
-/// Parameters:
-/// - `uri`: the file URI whose scope is being computed.
-/// - `line`, `column`: the query position (use `u32::MAX` for EOF / to include all symbols).
-/// - `get_artifacts`: callback that returns `ScopeArtifacts` for a given `Url`.
+/// Parameters with non-obvious behavior:
+/// - `get_artifacts`: callback that returns `ScopeArtifacts` for a `Url`.
 /// - `resolve_path`: callback that resolves a source path relative to `uri` and returns a `Url`.
-/// - `max_depth`: maximum recursion depth for following `source()` chains.
-/// - `current_depth`: current recursion depth (start callers at 0).
-/// - `visited`: mutable set of already-visited `Url`s to prevent cycles.
+/// - `max_depth`: maximum number of recursive `source()` hops to follow (root call counts as depth 0).
+/// - `visited`: mutable set used to prevent cycles across recursion; callers should provide an empty set.
 ///
-/// Returns:
-/// A `ScopeAtPosition` containing the merged symbols, the chain of visited URIs,
-/// and any (uri, line, column) tuples where traversal was curtailed due to depth limits.
+/// # Returns
+///
+/// A `ScopeAtPosition` whose `symbols` are the merged, precedence-resolved symbols available at the
+/// queried position; `chain` is the sequence of visited URIs (root first); `depth_exceeded` lists
+/// (uri, line, column) tuples where traversal was stopped due to `max_depth`.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// // Example (conceptual): compute top-level scope for a file.
+/// use lsp_types::Url;
+/// use std::collections::HashSet;
+///
 /// let uri = Url::parse("file:///project/main.R").unwrap();
-/// let artifacts_db = |u: &Url| -> Option<ScopeArtifacts> { /* load or parse file */ None };
-/// let resolver = |path: &str, base: &Url| -> Option<Url> { /* resolve path */ None };
-/// let mut visited = std::collections::HashSet::new();
+/// let get_artifacts = |_u: &Url| -> Option<ScopeArtifacts> { None };
+/// let resolve_path = |_path: &str, _base: &Url| -> Option<Url> { None };
+/// let mut visited = HashSet::new();
+///
 /// let scope = scope_at_position_recursive(
 ///     &uri,
 ///     10, // line
 ///     2,  // column
-///     &artifacts_db,
-///     &resolver,
+///     &get_artifacts,
+///     &resolve_path,
 ///     10, // max_depth
 ///     0,  // current_depth
 ///     &mut visited,
@@ -1707,22 +1696,42 @@ fn extract_function_signature(func_node: Node, name: &str, content: &str) -> Str
     format!("{}()", name)
 }
 
+/// Get the source slice corresponding to a tree-sitter `Node`.
+///
+/// The returned string slice borrows from `content` and spans the byte range reported by `node.byte_range()`.
+///
+/// # Examples
+///
+/// ```
+/// // Given a `node: tree_sitter::Node` and `source: &str`:
+/// // let text = node_text(node, source);
+/// // `text` will be the substring of `source` that corresponds to `node`.
+/// ```
 fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
     &content[node.byte_range()]
 }
 
-/// Compute a deterministic hash of the file's exported interface and loaded packages.
+/// Compute a deterministic hash of the exported interface and loaded packages.
 ///
-/// This hash is used for cache invalidation: when the interface hash changes, dependent
-/// files need to be revalidated. Including loaded packages ensures that changes to
-/// library() calls trigger proper cache invalidation.
+/// Symbols are incorporated deterministically by sorting the interface keys before hashing each
+/// ScopedSymbol; package names are included sorted as well. The resulting hash is suitable for
+/// cache invalidation when a file's exported symbols or loaded packages change.
 ///
-/// # Arguments
+/// # Returns
 ///
-/// * `interface` - The exported symbols from this file
-/// * `packages` - Package names loaded in this file (from PackageLoad events)
+/// `u64` hash of the provided `interface` and `packages`.
 ///
-/// # Requirements: 14.5
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// // Use an empty interface and no packages as the simplest example.
+/// let interface: HashMap<String, crate::ScopedSymbol> = HashMap::new();
+/// let packages: Vec<String> = Vec::new();
+/// let h1 = crate::compute_interface_hash(&interface, &packages);
+/// let h2 = crate::compute_interface_hash(&interface, &packages);
+/// assert_eq!(h1, h2);
+/// ```
 fn compute_interface_hash(
     interface: &HashMap<String, ScopedSymbol>,
     packages: &[String],
@@ -1808,14 +1817,18 @@ where
     )
 }
 
-/// Resolve the effective scope at a position using the dependency graph to include parent (backward) and sourced (forward) symbols.
+/// Compute the lexical and cross-file scope visible at a position using the dependency graph.
 ///
-/// This recursively collects symbols visible at (line, column) in `uri` by:
-/// - Merging symbols from parent files indicated by dependency-graph edges (respecting local/sys.source/global rules and depth limits).
-/// - Applying the file's own timeline (definitions, function-parameter scopes, removals) and resolving forward `source()` calls through the provided `PathContext`.
-/// - Propagating PackageLoad events from parent files to child files (Requirements 5.1, 5.2, 5.3).
+/// This collects symbols visible at (line, column) in `uri` by merging parent (backward) symbols
+/// from dependency-graph edges, applying the file's own timeline (definitions, parameters,
+/// removals) and resolving forward `source()` calls (including propagated package loads).
+/// Function-scoped visibility, sys.source/local scoping rules, cycle prevention, and `max_depth`
+/// are respected; entries that would exceed `max_depth` are recorded in `ScopeAtPosition::depth_exceeded`.
 ///
-/// The function guards against cycles and enforces `max_depth`; entries that would exceed `max_depth` are recorded in `ScopeAtPosition::depth_exceeded`.
+/// # Returns
+///
+/// A `ScopeAtPosition` containing the merged symbols, provenance chain, recorded depth-exceeded
+/// entries, and package information applicable at the queried position.
 ///
 /// # Examples
 ///
@@ -1823,7 +1836,7 @@ where
 /// use url::Url;
 /// use std::collections::HashSet;
 ///
-/// // Call with minimal stubs: no artifacts, no metadata, and an empty graph.
+/// // Minimal stubs: no artifacts, no metadata, and an empty graph.
 /// let uri = Url::parse("file:///example.R").unwrap();
 /// let get_artifacts = |_u: &Url| -> Option<super::ScopeArtifacts> { None };
 /// let get_metadata = |_u: &Url| -> Option<super::types::CrossFileMetadata> { None };
@@ -1842,12 +1855,11 @@ where
 ///     10,
 ///     0,
 ///     &mut visited,
-///     &[], // No inherited packages for root file
+///     &[], // no inherited packages
 /// );
 ///
 /// assert!(scope.symbols.is_empty());
 /// ```
-#[allow(clippy::too_many_arguments)]
 fn scope_at_position_with_graph_recursive<F, G>(
     uri: &Url,
     line: u32,
@@ -5854,6 +5866,31 @@ mod tests {
         }
     }
 
+    /// Verifies that a `library()` call inside a nested function is associated with the innermost function scope.
+    ///
+    /// This test parses a snippet with an outer and inner function, computes scope artifacts,
+    /// locates the `PackageLoad` event for `library(dplyr)`, and asserts its `function_scope`
+    /// is set and corresponds to the inner function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Parses code with nested functions and ensures the package load is scoped to the inner function.
+    /// let code = "outer <- function() {\n  inner <- function() {\n    library(dplyr)\n  }\n}";
+    /// let tree = parse_r(code);
+    /// let artifacts = compute_artifacts(&test_uri(), &tree, code);
+    /// let package_load_events: Vec<_> = artifacts.timeline.iter()
+    ///     .filter_map(|e| {
+    ///         if let ScopeEvent::PackageLoad { function_scope, .. } = e {
+    ///             Some(function_scope.clone())
+    ///         } else {
+    ///             None
+    ///         }
+    ///     })
+    ///     .collect();
+    /// assert_eq!(package_load_events.len(), 1);
+    /// assert!(package_load_events[0].is_some());
+    /// ```
     #[test]
     fn test_package_load_nested_function_scope() {
         // Test that library() in nested function gets the innermost function scope
@@ -5920,7 +5957,27 @@ mod tests {
     // Validates: Requirements 2.1, 2.2, 2.4, 2.5
     // ============================================================================
 
-    /// Helper function to create a mock package exports callback
+    /// Creates a lookup closure that returns a package's exported symbols.
+    ///
+    /// The returned closure maps a package name to a `HashSet<String>` containing
+    /// the package's exports given by `packages`. If the package is not present,
+    /// the closure returns an empty set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashSet;
+    ///
+    /// let packages = [("pkgA", &["a", "b"][..]), ("pkgB", &["x"][..])];
+    /// let get_exports = mock_package_exports(&packages);
+    ///
+    /// let a_exports: HashSet<String> = get_exports("pkgA");
+    /// assert!(a_exports.contains("a"));
+    /// assert!(a_exports.contains("b"));
+    ///
+    /// let missing: HashSet<String> = get_exports("unknown");
+    /// assert!(missing.is_empty());
+    /// ```
     fn mock_package_exports<'a>(packages: &'a [(&'a str, &'a [&'a str])]) -> impl Fn(&str) -> HashSet<String> + 'a {
         move |pkg: &str| {
             packages.iter()
@@ -6221,6 +6278,28 @@ x <- 1"#;
         assert!(scope_end.symbols.contains_key("sum"), "sum should be in scope at end");
     }
 
+    /// Ensures base package exports are available in scope before any explicit `library()` call.
+    ///
+    /// This test verifies that symbols from the base environment (e.g., `print`) are present
+    /// at a position earlier in the file than a subsequent `library()` invocation, while
+    /// symbols provided by the later-loaded package (e.g., `mutate` from `dplyr`) are not.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // given code with a base call and a later library() call
+    /// let code = "x <- print(1)\nlibrary(dplyr)\ny <- 2";
+    /// let tree = parse_r(code);
+    /// let artifacts = compute_artifacts(&test_uri(), &tree, code);
+    ///
+    /// let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
+    /// let mut base_exports = std::collections::HashSet::new();
+    /// base_exports.insert("print".to_string());
+    ///
+    /// let scope = scope_at_position_with_packages(&artifacts, 0, 5, &get_exports, &base_exports);
+    /// assert!(scope.symbols.contains_key("print"));
+    /// assert!(!scope.symbols.contains_key("mutate"));
+    /// ```
     #[test]
     fn test_base_exports_available_before_any_library_call() {
         // Base exports should be available even before any library() call

@@ -36,7 +36,19 @@ impl Default for HelpCache {
     }
 }
 
-/// Get help for a topic by calling R as a subprocess
+/// Fetches help text for an R topic by invoking R and returns the rendered help if available.
+///
+/// Returns `Some(String)` containing the help text when R executes successfully, the output is not empty,
+/// and the output does not contain the phrase "No documentation". Returns `None` otherwise.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Attempt to get help for `mean` from the base package
+/// if let Some(text) = rlsp::help::get_help("mean", Some("base")) {
+///     assert!(text.contains("Usage:"));
+/// }
+/// ```
 pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
     let r_code = if let Some(pkg) = package {
         format!(
@@ -65,31 +77,39 @@ pub fn get_help(topic: &str, package: Option<&str>) -> Option<String> {
     None
 }
 
-/// Extract the function signature from R help text.
-/// 
-/// R help text has a "Usage:" section that contains the function signature(s).
-/// This function extracts the first signature, preferring generic signatures over S3 methods.
-/// 
-/// Example help text format:
-/// ```text
+/// Extracts the first function signature from R help text.
+///
+/// Scans the "Usage:" section of R help output and returns the first available
+/// signature, preferring a generic signature over an S3 method. Handles
+/// multi-line signatures and stops at the next section header (a non-parenthesized
+/// line ending with ':').
+///
+/// # Returns
+///
+/// `Some(String)` containing the joined signature lines if a signature is found,
+/// `None` otherwise.
+///
+/// # Examples
+///
+/// ```
+/// let help = r#"
 /// Arithmetic Mean
-/// 
+///
 /// Description:
 ///     Generic function for the (trimmed) arithmetic mean.
-/// 
+///
 /// Usage:
 ///     mean(x, ...)
-///     
+///
 ///     ## Default S3 method:
 ///     mean(x, trim = 0, na.rm = FALSE, ...)
-/// 
+///
 /// Arguments:
 ///     ...
+/// "#;
+///
+/// assert_eq!(extract_signature_from_help(help), Some("mean(x, ...)".to_string()));
 /// ```
-/// 
-/// This would extract: `mean(x, ...)`
-/// 
-/// **Validates: Requirement 10.2**
 pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
     let lines: Vec<&str> = help_text.lines().collect();
     
@@ -160,11 +180,22 @@ pub fn extract_signature_from_help(help_text: &str) -> Option<String> {
     Some(signature)
 }
 
-/// Get the function signature for a package function.
-/// 
-/// This is a convenience function that gets help and extracts the signature.
-/// 
-/// **Validates: Requirement 10.2**
+/// Retrieves the function signature for a topic within a package.
+///
+/// Attempts to fetch the topic's help text and extract the first available function signature from its Usage section.
+///
+/// # Returns
+///
+/// `Some(signature)` if a signature is found, `None` otherwise.
+///
+/// # Examples
+///
+/// ```
+/// let sig = get_function_signature("mean", "base");
+/// if let Some(s) = sig {
+///     println!("{}", s);
+/// }
+/// ```
 pub fn get_function_signature(topic: &str, package: &str) -> Option<String> {
     let help_text = get_help(topic, Some(package))?;
     extract_signature_from_help(&help_text)

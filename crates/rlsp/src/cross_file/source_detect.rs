@@ -36,8 +36,33 @@ pub struct LibraryCall {
     pub function_scope: Option<FunctionScopeInterval>,
 }
 
-/// Detect source() and sys.source() calls in R code.
-/// Parses AST to find source calls with their parameters (local, chdir, envir).
+/// Locate all top-level `source()` and `sys.source()` calls in an R syntax tree and extract their static parameters.
+///
+/// This function traverses the given tree-sitter `Tree` of R source code and collects each `source()`
+/// or `sys.source()` call that has a statically determinable file path. For each detected call it
+/// records the file path, the end-position line and UTF-16 column, whether the call is `sys.source`,
+/// and the boolean `local` and `chdir` argument values when they are statically resolvable. Calls with
+/// non-string or otherwise non-determinable file arguments are ignored.
+///
+/// # Returns
+///
+/// A `Vec<ForwardSource>` containing one entry per detected `source()`/`sys.source()` call in document
+/// order, with fields populated for path, line, column, is_sys_source, local, chdir, and (for
+/// `sys.source`) `sys_source_global_env`.
+///
+/// # Examples
+///
+/// ```
+/// use tree_sitter::Parser;
+/// // Parse R source text and detect source calls
+/// let mut parser = Parser::new();
+/// parser.set_language(tree_sitter_r::language()).unwrap();
+/// let tree = parser.parse("source('utils.R', local = TRUE)\n", None).unwrap();
+/// let sources = crates::rlsp::cross_file::source_detect::detect_source_calls(&tree, "source('utils.R', local = TRUE)\n");
+/// assert_eq!(sources.len(), 1);
+/// assert_eq!(sources[0].path, "utils.R");
+/// assert!(sources[0].local);
+/// ```
 pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
     log::trace!("Starting tree-sitter parsing for source() call detection");
     let mut sources = Vec::new();
@@ -398,8 +423,17 @@ fn is_c_call(node: Node, content: &str) -> bool {
     false
 }
 
-/// Extract string arguments from a c() call.
-/// Only extracts string literals, skips other argument types.
+/// Extracts string literal arguments from a `c()` call node.
+///
+/// Only string literal arguments are returned; other argument types are ignored.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Given a Tree-sitter `Node` for `c("a", "b")`:
+/// let strings = extract_c_string_args(node, r#"c("a", "b")"#);
+/// assert_eq!(strings, vec!["a".to_string(), "b".to_string()]);
+/// ```
 fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
     let mut symbols = Vec::new();
 
@@ -425,9 +459,25 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 // Library Call Detection
 // ============================================================================
 
-/// Detect library(), require(), loadNamespace() calls in R code.
-/// Returns calls with statically determinable package names.
-/// Skips calls with character.only = TRUE or variable/expression package names.
+/// Detects `library()`, `require()`, and `loadNamespace()` calls that specify a static package name.
+///
+/// This returns entries for calls where the package can be determined from a bare identifier
+/// (e.g., `library(dplyr)`) or a string literal (e.g., `library("dplyr")`). Calls that use
+/// `character.only = TRUE` or whose package argument is an expression or variable are skipped.
+///
+/// # Examples
+///
+/// ```
+/// use tree_sitter::Parser;
+///
+/// let mut parser = Parser::new();
+/// parser.set_language(tree_sitter_r::language()).unwrap();
+/// let source = r#"library(dplyr)"#;
+/// let tree = parser.parse(source, None).unwrap();
+/// let calls = detect_library_calls(&tree, source);
+/// assert_eq!(calls.len(), 1);
+/// assert_eq!(calls[0].package, "dplyr");
+/// ```
 pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
     log::trace!("Starting tree-sitter parsing for library() call detection");
     let mut library_calls = Vec::new();
@@ -448,6 +498,27 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
     library_calls
 }
 
+/// Recursively traverses an AST subtree and collects statically determinable `library`/`require`/`loadNamespace` calls.
+///
+/// This function walks `node` and its descendants in document order. When a call node representing a
+/// statically resolvable package load is found, a `LibraryCall` describing that call (package and end
+/// position) is pushed into `library_calls`.
+///
+/// # Parameters
+///
+/// - `node`: the current AST node to visit (will recurse into its children).
+/// - `content`: source text for extracting node-local values when parsing calls.
+/// - `library_calls`: mutable collector that receives discovered `LibraryCall` entries in document order.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Traverse the whole tree and collect library-like calls.
+/// let mut library_calls = Vec::new();
+/// let root = tree.root_node();
+/// visit_node_for_library(root, source_text, &mut library_calls);
+/// assert!(library_calls.iter().all(|c| !c.package.is_empty()));
+/// ```
 fn visit_node_for_library(node: Node, content: &str, library_calls: &mut Vec<LibraryCall>) {
     // Skip identifier nodes - they have no children
     if node.kind() == "identifier" {
@@ -464,6 +535,28 @@ fn visit_node_for_library(node: Node, content: &str, library_calls: &mut Vec<Lib
     }
 }
 
+/// Parse a call AST node and, if it is a static `library()`, `require()`, or `loadNamespace()` invocation,
+/// return a `LibraryCall` containing the package name and the byte position (line and UTF-16 column) at the end of the call.
+///
+/// Returns `Some(LibraryCall)` when:
+/// - the function name is `library`, `require`, or `loadNamespace`,
+/// - the call's arguments are syntactically valid,
+/// - the package name is statically determinable from a bare identifier or string literal (including a named `package=` argument),
+/// - `character.only = TRUE` is not present (such calls are skipped as dynamic).
+/// Returns `None` otherwise.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Given a tree-sitter `Node` for a call and the source `content`,
+/// // `try_parse_library_call` returns a `LibraryCall` when the package is statically known.
+/// // (Constructing a Node requires a tree-sitter parse; this example is illustrative.)
+/// # use crates::rlsp::cross_file::source_detect::try_parse_library_call;
+/// # use crates::rlsp::cross_file::source_detect::LibraryCall;
+/// # let node = panic!("node from tree-sitter required");
+/// # let content = "library(dplyr)";
+/// # let _ = try_parse_library_call(node, content);
+/// ```
 fn try_parse_library_call(node: Node, content: &str) -> Option<LibraryCall> {
     let func_node = node.child_by_field_name("function")?;
     let func_text = node_text(func_node, content);
@@ -502,7 +595,25 @@ fn try_parse_library_call(node: Node, content: &str) -> Option<LibraryCall> {
     })
 }
 
-/// Check if library/require call has character.only = TRUE
+/// Determine whether an arguments node sets `character.only` to `TRUE` or `T`.
+///
+/// Scans the children of `args_node` for a named argument `character.only` and
+/// returns `true` only if its value text is the literal `TRUE` or `T`.
+///
+/// # Returns
+///
+/// `true` if `character.only` is explicitly `TRUE` or `T`, `false` otherwise.
+///
+/// # Examples
+///
+/// ```
+/// // `args_node` is the Tree-sitter `arguments` node for a call like:
+/// //   library(foo, character.only = TRUE)
+/// // `content` is the source text containing that call.
+/// // The function will return `true` for that node.
+/// let res = has_character_only_true(&args_node, content);
+/// assert!(res);
+/// ```
 fn has_character_only_true(args_node: &Node, content: &str) -> bool {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
@@ -521,9 +632,29 @@ fn has_character_only_true(args_node: &Node, content: &str) -> bool {
     false
 }
 
-/// Extract package name from library/require/loadNamespace arguments.
-/// Returns Some(package_name) for bare identifiers or string literals.
-/// Returns None for variables, expressions, or other dynamic package names.
+/// Determine a statically determinable package name from a call's argument list.
+///
+/// Looks for a named `package` argument first; if absent, inspects the first positional argument.
+/// Returns `Some(package_name)` when the argument is a bare identifier (e.g., `library(dplyr)`)
+/// or a string literal (e.g., `library("dplyr")` or `library('dplyr')`). Returns `None` for variables,
+/// expressions, or other dynamic package specifications.
+///
+/// # Arguments
+///
+/// * `args_node` - The Tree-sitter `arguments` node of a call expression.
+/// * `content` - The source text for extracting string literal contents.
+///
+/// # Returns
+///
+/// `Some(String)` containing the package name when statically determinable, `None` otherwise.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Parse an R call, obtain its arguments node, then:
+/// let pkg = extract_package_name(&args_node, source_text);
+/// assert_eq!(pkg, Some("dplyr".to_string()));
+/// ```
 fn extract_package_name(args_node: &Node, content: &str) -> Option<String> {
     let mut cursor = args_node.walk();
     let children: Vec<_> = args_node.children(&mut cursor).collect();
@@ -1487,6 +1618,16 @@ mod property_tests {
     use proptest::prelude::*;
     use tree_sitter::Parser;
 
+    /// Parse R source code into a tree-sitter `Tree`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let code = "x <- 1";
+    /// let tree = parse_r(code);
+    /// // root node kind for R source files is "source"
+    /// assert_eq!(tree.root_node().kind(), "source");
+    /// ```
     fn parse_r(code: &str) -> Tree {
         let mut parser = Parser::new();
         parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
@@ -1499,17 +1640,57 @@ mod property_tests {
         "NA", "NaN", "Inf", "NULL", "TRUE", "FALSE", "T", "F",
     ];
 
-    /// Check if a name is a valid R package name (not reserved)
+    /// Determine whether a string is a valid R package name (non-empty and not an R reserved word).
+    ///
+    /// # Returns
+    ///
+    /// `true` if the name is non-empty and not an R reserved word, `false` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(is_valid_package_name("dplyr"));
+    /// assert!(!is_valid_package_name(""));
+    /// assert!(!is_valid_package_name("if")); // reserved word
+    /// ```
     fn is_valid_package_name(name: &str) -> bool {
         !R_RESERVED.contains(&name) && !name.is_empty()
     }
 
-    /// Generate a valid R package name (lowercase letters and dots, starting with letter)
+    /// Strategy that generates valid R package names.
+    ///
+    /// The produced strings start with a lowercase ASCII letter, contain only
+    /// lowercase ASCII letters, digits, and dots, and are at most 9 characters long.
+    /// Reserved or otherwise invalid package names are excluded by the strategy's filter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    ///
+    /// proptest!(|(name in crate::package_name())| {
+    ///     let first = name.chars().next().unwrap();
+    ///     assert!(first.is_ascii_lowercase());
+    ///     assert!(name.len() <= 9);
+    ///     assert!(name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.'));
+    /// });
+    /// ```
     fn package_name() -> impl Strategy<Value = String> {
         "[a-z][a-z0-9\\.]{0,8}".prop_filter("not reserved", |s| is_valid_package_name(s))
     }
 
-    /// Generate a library call function name
+    /// Produces a proptest strategy that yields one of the strings `"library"`, `"require"`, or `"loadNamespace"`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    /// let strat = crate::library_function();
+    /// let mut runner = proptest::test_runner::TestRunner::default();
+    /// let tree = strat.new_tree(&mut runner).unwrap();
+    /// let value = tree.current();
+    /// assert!(value == "library" || value == "require" || value == "loadNamespace");
+    /// ```
     fn library_function() -> impl Strategy<Value = &'static str> {
         prop_oneof![
             Just("library"),
@@ -1526,6 +1707,21 @@ mod property_tests {
         Single,     // library('dplyr')
     }
 
+    /// Produces a proptest Strategy that yields one of the `QuoteStyle` variants.
+    ///
+    /// The strategy generates `QuoteStyle::None`, `QuoteStyle::Double`, or `QuoteStyle::Single`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    /// // generate a single value from the strategy
+    /// let mut runner = TestRunner::default();
+    /// let value = quote_style().new_tree(&mut runner).unwrap().current();
+    /// match value {
+    ///     QuoteStyle::None | QuoteStyle::Double | QuoteStyle::Single => (),
+    /// }
+    /// ```
     fn quote_style() -> impl Strategy<Value = QuoteStyle> {
         prop_oneof![
             Just(QuoteStyle::None),
@@ -1543,6 +1739,39 @@ mod property_tests {
         use_named_arg: bool,
     }
 
+    /// Generates an arbitrary `LibraryCallSpec` strategy for property-based tests.
+    
+    ///
+    
+    /// The strategy produces tuples describing a library-like call: the function name (`library`, `require`, or `loadNamespace`),
+    
+    /// a package name, the string quote style to use (none, single, or double), and a boolean indicating whether the package
+    
+    /// is supplied with a named `package=` argument.
+    
+    ///
+    
+    /// # Examples
+    
+    ///
+    
+    /// ```
+    
+    /// use proptest::prelude::*;
+    
+    ///
+    
+    /// let mut runner = proptest::test_runner::TestRunner::default();
+    
+    /// let tree = library_call_spec().new_tree(&mut runner).unwrap();
+    
+    /// let spec = tree.current();
+    
+    /// // `spec` contains generated fields: `func`, `package`, `quote_style`, and `use_named_arg`.
+    
+    /// assert!(!spec.package.is_empty());
+    
+    /// ```
     fn library_call_spec() -> impl Strategy<Value = LibraryCallSpec> {
         (library_function(), package_name(), quote_style(), any::<bool>())
             .prop_map(|(func, package, quote_style, use_named_arg)| {
@@ -1550,7 +1779,28 @@ mod property_tests {
             })
     }
 
-    /// Generate R code for a library call
+    /// Render an R library-like call from a specification.
+    ///
+    /// Constructs an R call string using the specification's function name, package
+    /// name, quoting style, and whether to use a named `package =` argument.
+    ///
+    /// # Returns
+    ///
+    /// A `String` containing the R expression (for example `library("dplyr")` or
+    /// `require(package = 'pkg')`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let spec = LibraryCallSpec {
+    ///     func: "library".into(),
+    ///     package: "dplyr".into(),
+    ///     quote_style: QuoteStyle::Double,
+    ///     use_named_arg: false,
+    /// };
+    /// let code = generate_library_call_code(&spec);
+    /// assert_eq!(code, "library(\"dplyr\")");
+    /// ```
     fn generate_library_call_code(spec: &LibraryCallSpec) -> String {
         let quoted_pkg = match spec.quote_style {
             QuoteStyle::None => spec.package.clone(),
@@ -1565,7 +1815,19 @@ mod property_tests {
         }
     }
 
-    /// Generate R code with multiple library calls and filler statements
+    /// Generates a proptest strategy that yields R source text containing 1 to 5 `library`/`require`/`loadNamespace` calls interleaved with simple filler statements, together with the corresponding specs for each library call.
+    ///
+    /// The returned strategy produces a tuple `(code, specs)` where `code` is the generated R code as a single string (lines joined with `\n`) and `specs` is a vector of `LibraryCallSpec` describing each generated library call in document order.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use proptest::strategy::Strategy;
+    /// // `r_code_with_library_calls` yields `(String, Vec<LibraryCallSpec>)`
+    /// let strat = r_code_with_library_calls();
+    /// // Use the strategy in a proptest test or sample from it via a test runner.
+    /// let _ = strat;
+    /// ```
     fn r_code_with_library_calls() -> impl Strategy<Value = (String, Vec<LibraryCallSpec>)> {
         // Generate 1-5 library calls
         prop::collection::vec(library_call_spec(), 1..=5)
@@ -1985,6 +2247,32 @@ mod property_tests {
         CExpression,
     }
 
+    /// Creates a proptest strategy that yields one of the `DynamicCallType` variants representing
+    /// dynamic/library-call patterns that should be treated as non-statically-determinable.
+    ///
+    /// # Returns
+    ///
+    /// A `Strategy` that produces a `DynamicCallType` chosen from:
+    /// `CharacterOnlyTrue`, `CharacterOnlyT`, `Paste0Expression`, `PasteExpression`,
+    /// `GetExpression`, `SprintfExpression`, and `CExpression`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    ///
+    /// // obtain the strategy and use it in a proptest
+    /// let strat = crate::dynamic_call_type();
+    ///
+    /// proptest!(|(kind in strat)| {
+    ///     // `kind` is a `DynamicCallType` variant
+    ///     match kind {
+    ///         crate::DynamicCallType::CharacterOnlyTrue => {},
+    ///         crate::DynamicCallType::CharacterOnlyT => {},
+    ///         _ => {},
+    ///     }
+    /// });
+    /// ```
     fn dynamic_call_type() -> impl Strategy<Value = DynamicCallType> {
         prop_oneof![
             Just(DynamicCallType::CharacterOnlyTrue),
@@ -1997,7 +2285,21 @@ mod property_tests {
         ]
     }
 
-    /// Generate R code for a dynamic library call (should NOT be detected)
+    /// Generate R code representing a dynamic (non-statically-determinable) library/require/loadNamespace call.
+    ///
+    /// This returns an R expression string that uses a dynamic form of specifying the package (e.g., `character.only = TRUE`, `paste0(...)`, `get(...)`, `c(...)`, etc.), which should not be recognized as a statically determinable package by static analyzers.
+    /// - `call_type`: selects which dynamic pattern to emit.
+    /// - `pkg`: the package name used within the generated expression (may be split or wrapped depending on the pattern).
+    /// - `func`: the function name to call (e.g., `"library"`, `"require"`, or `"loadNamespace"`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let s = generate_dynamic_library_call(&DynamicCallType::CharacterOnlyTrue, "dplyr", "library");
+    /// assert!(s.contains("character.only"));
+    /// let s2 = generate_dynamic_library_call(&DynamicCallType::Paste0Expression, "pkgname", "require");
+    /// assert!(s2.contains("paste0"));
+    /// ```
     fn generate_dynamic_library_call(call_type: &DynamicCallType, pkg: &str, func: &str) -> String {
         match call_type {
             DynamicCallType::CharacterOnlyTrue => {
@@ -2036,6 +2338,20 @@ mod property_tests {
         call_type: DynamicCallType,
     }
 
+    /// Creates a proptest strategy that generates `DynamicLibraryCallSpec` values.
+    ///
+    /// The produced spec combines a library-related function variant, a package name, and a dynamic call type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    /// let strategy = dynamic_library_call_spec();
+    /// proptest!(|(spec in strategy)| {
+    ///     // `spec` is a generated DynamicLibraryCallSpec
+    ///     let _pkg: String = spec.package.clone();
+    /// });
+    /// ```
     fn dynamic_library_call_spec() -> impl Strategy<Value = DynamicLibraryCallSpec> {
         (library_function(), package_name(), dynamic_call_type())
             .prop_map(|(func, package, call_type)| {
@@ -2043,7 +2359,23 @@ mod property_tests {
             })
     }
 
-    /// Generate R code with dynamic library calls that should NOT be detected
+    /// Generate R source code containing dynamic library calls that should not be detected.
+    ///
+    /// The returned proptest Strategy produces tuples of `(code, specs)` where `code` is the generated
+    /// R source as a `String` and `specs` is a `Vec<DynamicLibraryCallSpec>` describing each dynamic
+    /// library-style call inserted into the code. The code includes 1–5 dynamic calls with optional
+    /// filler lines between them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    /// let strat = r_code_with_dynamic_library_calls();
+    /// let mut runner = proptest::test_runner::TestRunner::default();
+    /// let (code, specs) = strat.new_tree(&mut runner).unwrap().current();
+    /// assert!(!code.is_empty());
+    /// assert!(!specs.is_empty());
+    /// ```
     fn r_code_with_dynamic_library_calls() -> impl Strategy<Value = (String, Vec<DynamicLibraryCallSpec>)> {
         // Generate 1-5 dynamic library calls
         prop::collection::vec(dynamic_library_call_spec(), 1..=5)
@@ -2078,7 +2410,22 @@ mod property_tests {
             })
     }
 
-    /// Generate R code with a mix of static and dynamic library calls
+    /// Generate R source text containing an interleaved sequence of statically determinable
+    /// and dynamic library-style calls, along with the specifications used to build them.
+    ///
+    /// The produced strategy yields a tuple containing:
+    /// 1. A single String with the generated R code (multiple lines, interleaved static and dynamic calls).
+    /// 2. A Vec of `LibraryCallSpec` describing the statically determinable calls included.
+    /// 3. A Vec of `DynamicLibraryCallSpec` describing the dynamic calls included.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Obtain the proptest strategy and use it in property tests.
+    /// let strat = r_code_with_mixed_library_calls();
+    /// // `strat` is a `Strategy` that generates `(String, Vec<LibraryCallSpec>, Vec<DynamicLibraryCallSpec>)`.
+    /// let _ = strat;
+    /// ```
     fn r_code_with_mixed_library_calls() -> impl Strategy<Value = (String, Vec<LibraryCallSpec>, Vec<DynamicLibraryCallSpec>)> {
         (
             prop::collection::vec(library_call_spec(), 1..=3),

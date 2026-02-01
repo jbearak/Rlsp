@@ -89,7 +89,50 @@ struct ActiveDocumentsChangedParams {
     timestamp_ms: u64,
 }
 
-/// Parse cross-file configuration from LSP settings
+/// Parse cross-file configuration from LSP settings.
+///
+/// Reads the top-level `crossFile` section (and related `diagnostics` and `packages`
+/// settings) from a serde_json::Value and constructs a populated `CrossFileConfig`.
+/// Only fields present in the provided JSON are applied; absent fields retain their
+/// defaults from `CrossFileConfig::default()`.
+///
+/// Supported top-level keys read:
+/// - `crossFile`: core cross-file behavior and diagnostic severities.
+/// - `diagnostics.undefinedVariables`: enables undefined variable diagnostics.
+/// - `packages`: package-related settings (`enabled`, `additionalLibraryPaths`, `rPath`, `missingPackageSeverity`).
+///
+/// # Returns
+///
+/// `Some(CrossFileConfig)` populated from `settings` when the top-level `crossFile`
+/// section is present; `None` if `crossFile` is missing.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// let settings = json!({
+///     "crossFile": {
+///         "maxBackwardDepth": 5,
+///         "indexWorkspace": true,
+///         "missingFileSeverity": "warning",
+///         "onDemandIndexing": { "enabled": true, "priority2Enabled": false }
+///     },
+///     "packages": {
+///         "enabled": true,
+///         "additionalLibraryPaths": ["/usr/local/lib/R/site-library"],
+///         "rPath": "/usr/bin/R",
+///         "missingPackageSeverity": "information"
+///     },
+///     "diagnostics": { "undefinedVariables": false }
+/// });
+///
+/// let cfg = crate::backend::parse_cross_file_config(&settings);
+/// assert!(cfg.is_some());
+/// let cfg = cfg.unwrap();
+/// assert_eq!(cfg.max_backward_depth, 5);
+/// assert!(cfg.index_workspace);
+/// assert!(cfg.packages_enabled);
+/// ```
 fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_file::CrossFileConfig> {
     use crate::cross_file::{CallSiteDefault, CrossFileConfig};
 
@@ -303,6 +346,18 @@ impl LanguageServer for Backend {
         })
     }
 
+    /// Performs post-initialization work for the language server.
+    ///
+    /// This method performs workspace startup tasks: it scans configured workspace folders and applies the discovered workspace index to shared state, and it initializes or replaces the in-memory PackageLibrary according to the current cross-file configuration (enabling package-aware features when configured). All long-running or blocking operations are performed without holding the main WorldState write lock so startup does not block other LSP activity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Assuming `backend` is an initialized `Backend` and a Tokio runtime is available:
+    /// // tokio::spawn(async move {
+    /// //     backend.initialized(lsp_types::InitializedParams {}).await;
+    /// // });
+    /// ```
     async fn initialized(&self, _: InitializedParams) {
         log::info!("ark-lsp initialized");
         
@@ -728,6 +783,22 @@ impl LanguageServer for Backend {
         }
     }
 
+    /// Handle a text-document change: update in-memory state, compute affected documents, and schedule debounced diagnostics and optional package prefetching.
+    ///
+    /// This method processes an LSP `textDocument/didChange` notification by updating the server's document store and dependency graph, determining which open documents are affected by the change, and scheduling debounced asynchronous diagnostics for those documents. If package indexing is enabled and package references are found, it also triggers background prefetching of package exports.
+    ///
+    /// Key observable behaviors:
+    /// - Updates the server's document store and legacy open-document map with the incoming changes.
+    /// - Recomputes cross-file dependencies and selects affected open documents to revalidate (subject to configured caps and activity-based prioritization).
+    /// - Schedules debounced diagnostic runs for each affected document; each scheduled run performs freshness checks before and after asynchronous work and respects the server's monotonic publishing gate.
+    /// - If packages are enabled and package names were discovered, initiates background prefetch of referenced package exports without holding the main state lock.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Typical invocation occurs inside the LSP runtime:
+    /// // backend.did_change(params).await;
+    /// ```
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
@@ -979,6 +1050,22 @@ impl LanguageServer for Backend {
         state.close_document(uri);
     }
 
+    /// Apply updated workspace configuration, invalidate caches that affect name-resolution scope, and re-run diagnostics for all open documents.
+    ///
+    /// This handles parsing the new cross-file configuration from the provided LSP settings, applies it to shared state if valid, invalidates cross-file resolution caches, marks open documents for force republish, optionally reinitializes the PackageLibrary when package-related settings change, and schedules diagnostics publication for every open document.
+    ///
+    /// # Parameters
+    ///
+    /// - `params`: LSP DidChangeConfigurationParams containing the new settings to parse and apply.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// // Called from an async context when the client sends updated configuration.
+    /// # async fn example(backend: &crate::backend::Backend, params: lsp_types::DidChangeConfigurationParams) {
+    /// backend.did_change_configuration(params).await;
+    /// # }
+    /// ```
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         // Requirement 11.11: When configuration changes, re-resolve scope chains for open documents
         log::trace!("Configuration changed, parsing new config and scheduling revalidation");

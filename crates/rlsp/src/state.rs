@@ -413,6 +413,24 @@ pub struct WorldState {
 }
 
 impl WorldState {
+    /// Creates a new WorldState initialized with default cross-file configuration and empty caches.
+    ///
+    /// The returned state is populated with:
+    /// - default CrossFileConfig (logged at initialization),
+    /// - empty document and workspace indexes (legacy and new),
+    /// - a Library constructed from `library_paths`,
+    /// - an empty, concurrently accessible PackageLibrary,
+    /// - all cross-file caches and auxiliary structures in their default state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// let ws = WorldState::new(vec![PathBuf::from("/usr/lib/R/library")]);
+    /// // newly created state has no opened documents or workspace folders by default
+    /// assert!(ws.documents.is_empty());
+    /// assert!(ws.workspace_folders.is_empty());
+    /// ```
     pub fn new(library_paths: Vec<PathBuf>) -> Self {
         let config = CrossFileConfig::default();
         

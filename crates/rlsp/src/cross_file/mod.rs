@@ -48,8 +48,26 @@ pub use source_detect::*;
 pub use types::*;
 pub use workspace_index::*;
 
-/// Extract cross-file metadata from R source code (Requirement 0.1)
-/// Combines directive parsing with AST-detected source() calls
+/// Extract cross-file metadata from R source by combining directive parsing with AST-detected `source()` and library-related calls.
+///
+/// Directive-derived `source` entries take precedence over AST-detected `source()` calls when they occur on the same line. When a thread-local parser is available the function also detects `library()`, `require()`, and `loadNamespace()` calls and records them in `library_calls`; if parsing fails those AST-derived detections are skipped.
+///
+/// # Returns
+///
+/// A `CrossFileMetadata` containing collected `sources`, `sourced_by` entries, and `library_calls`. `sources` and `library_calls` are sorted by document order (line, column).
+///
+/// # Examples
+///
+/// ```
+/// let content = r#"
+/// #> sourceline: helper.R
+/// source('other.R')
+/// library(pkg)
+/// "#;
+/// let meta = cross_file::extract_metadata(content);
+/// assert!(meta.sources.len() >= 1);
+/// assert!(meta.library_calls.iter().any(|lc| lc.name == "pkg"));
+/// ```
 pub fn extract_metadata(content: &str) -> CrossFileMetadata {
     log::trace!("Extracting cross-file metadata from content ({} bytes)", content.len());
     

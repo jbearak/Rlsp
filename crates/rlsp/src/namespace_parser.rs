@@ -15,28 +15,25 @@ use anyhow::{anyhow, Result};
 use std::fs;
 use std::path::Path;
 
-/// Parse NAMESPACE file for exports
+/// Extracts exported symbol names from an R package NAMESPACE file.
 ///
-/// Parses an R package NAMESPACE file and extracts all exported symbols.
-/// Handles the following directive types:
-/// - `export(name)` - exports specific symbols (Requirement 3.3)
-/// - `exportPattern("pattern")` - exports symbols matching a regex pattern (Requirement 3.4)
-/// - `S3method(generic, class)` - exports S3 methods as `generic.class` (Requirement 3.5)
-///
-/// # Arguments
-/// * `namespace_path` - Path to the NAMESPACE file
+/// Recognizes `export(name[, ...])`, `exportPattern("pattern")` and `S3method(generic, class[, method])`.
+/// Comments and blank lines are ignored; multiline directives are supported. `exportPattern` entries
+/// are preserved as markers in the form `__PATTERN__:<pattern>`. S3 methods are returned as
+/// `generic.class`. Whitespace is trimmed and empty names are omitted.
 ///
 /// # Returns
-/// * `Ok(Vec<String>)` - List of exported symbol names
-/// * `Err` - If the file cannot be read
 ///
-/// # Notes
-/// - Comments (lines starting with #) are ignored
-/// - Multi-line directives are supported (parentheses spanning multiple lines)
-/// - `exportPattern` directives return the pattern string itself since we cannot
-///   expand patterns without access to the package's R source files
-/// - Whitespace is trimmed from symbol names
-/// - Empty symbol names are filtered out
+/// A `Vec<String>` containing exported symbol names in document order. Pattern exports appear as
+/// `__PATTERN__:<pattern>` and S3 methods as `generic.class`.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// let exports = crate::namespace_parser::parse_namespace_exports(Path::new("NAMESPACE")).unwrap();
+/// // `exports` may contain entries like "foo", "__PATTERN__:^bar.*$", or "print.myclass"
+/// ```
 pub fn parse_namespace_exports(namespace_path: &Path) -> Result<Vec<String>> {
     let content = fs::read_to_string(namespace_path)
         .map_err(|e| anyhow!("Failed to read NAMESPACE file {:?}: {}", namespace_path, e))?;
@@ -44,10 +41,28 @@ pub fn parse_namespace_exports(namespace_path: &Path) -> Result<Vec<String>> {
     Ok(parse_namespace_content(&content))
 }
 
-/// Parse NAMESPACE content string for exports
+/// Parse NAMESPACE file content to extract exported symbols and pattern markers.
 ///
-/// This is the internal implementation that parses the content string.
-/// Separated from `parse_namespace_exports` for easier testing.
+/// This function scans normalized NAMESPACE directives and collects:
+/// - plain exported names from `export(...)` directives,
+/// - S3 methods from `S3method(generic, class[, method])` formatted as `generic.class`,
+/// - export patterns from `exportPattern(...)` stored as markers `__PATTERN__:<pattern>`.
+/// Comments and blank lines are ignored; whitespace is trimmed and empty names are filtered out.
+///
+/// # Examples
+///
+/// ```
+/// let content = r#"
+/// export(foo, "bar")
+/// exportPattern(".*_internal$")
+/// S3method(print, foo)
+/// "#;
+/// let exports = parse_namespace_content(content);
+/// assert!(exports.contains(&"foo".to_string()));
+/// assert!(exports.contains(&"bar".to_string()));
+/// assert!(exports.contains(&"__PATTERN__:.*_internal$".to_string()));
+/// assert!(exports.contains(&"print.foo".to_string()));
+/// ```
 fn parse_namespace_content(content: &str) -> Vec<String> {
     let mut exports = Vec::new();
 
@@ -99,18 +114,29 @@ fn parse_namespace_content(content: &str) -> Vec<String> {
     exports
 }
 
-/// Normalize multi-line directives by joining lines within parentheses
+/// Collapse NAMESPACE directives that span multiple lines into single logical lines.
 ///
-/// NAMESPACE files can have directives spanning multiple lines, e.g.:
+/// Preserves comment-only lines (lines starting with `#`) as separate lines when they are
+/// not inside a parenthesized directive. If a directive's parentheses never close, the
+/// accumulated line is emitted as-is at the end.
+///
+/// # Examples
+///
 /// ```
+/// let src = r#"
 /// export(
-///     func1,
-///     func2,
-///     func3
+///   func1,
+///   func2
 /// )
-/// ```
+/// # a comment
+/// otherDirective(x)
+/// "#;
 ///
-/// This function joins such multi-line directives into single lines.
+/// let normalized = normalize_multiline_directives(src);
+/// assert!(normalized.contains("export( func1, func2 )"));
+/// assert!(normalized.contains("# a comment\n"));
+/// assert!(normalized.contains("otherDirective(x)"));
+/// ```
 fn normalize_multiline_directives(content: &str) -> String {
     let mut result = String::new();
     let mut current_line = String::new();
@@ -160,10 +186,20 @@ fn normalize_multiline_directives(content: &str) -> String {
     result
 }
 
-/// Extract arguments from a directive like `export(arg1, arg2)`
+/// Extracts the argument text for a directive like `export(arg1, arg2)`.
 ///
-/// Returns the content between the parentheses, or None if the line
-/// doesn't match the directive pattern.
+/// Returns the string between the directive's outer parentheses if the given line
+/// starts with the directive name followed immediately by `(`; returns `None`
+/// if the line does not start with the directive or lacks the opening `(`.
+/// If a matching closing parenthesis cannot be found, returns the remainder of
+/// the line after the opening `(` with any trailing `)` characters trimmed.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(extract_directive_args("export(foo, bar)", "export"), Some("foo, bar".to_string()));
+/// assert_eq!(extract_directive_args("something(foo)", "export"), None);
+/// ```
 fn extract_directive_args(line: &str, directive: &str) -> Option<String> {
     // Check if line starts with the directive name (case-sensitive)
     if !line.starts_with(directive) {
@@ -186,7 +222,17 @@ fn extract_directive_args(line: &str, directive: &str) -> Option<String> {
     }
 }
 
-/// Find the position of the matching closing parenthesis
+/// Find the byte index of the closing parenthesis that matches an implicit opening parenthesis immediately before the input.
+///
+/// Scans the input left-to-right while tracking nested `(` / `)` pairs; returns the index of the `)` that closes the implicit opener (i.e., the `)` that brings the nesting depth to zero). Returns `None` if no matching closing parenthesis is found.
+///
+/// # Examples
+///
+/// ```
+/// let s = "a,b)";
+/// // treating the input as the content after an opening '(', the closing ')' is at byte index 3
+/// assert_eq!(find_matching_paren(s), Some(3));
+/// ```
 fn find_matching_paren(s: &str) -> Option<usize> {
     let mut depth = 0;
     for (i, ch) in s.char_indices() {
@@ -204,12 +250,19 @@ fn find_matching_paren(s: &str) -> Option<usize> {
     None
 }
 
-/// Parse comma-separated arguments, handling quoted strings
+/// Split a comma-separated argument string into individual arguments while preserving quoted substrings.
 ///
-/// Handles:
-/// - Bare identifiers: `foo, bar, baz`
-/// - Quoted strings: `"foo", "bar"`
-/// - Mixed: `foo, "bar", baz`
+/// Trims surrounding whitespace for each argument, supports both double (`"`) and single (`'`) quotes,
+/// ignores commas that appear inside quoted strings, and omits empty items.
+///
+/// Returns a `Vec<String>` containing the parsed, trimmed arguments in order.
+///
+/// # Examples
+///
+/// ```
+/// let v = parse_comma_separated_args(r#"foo, "bar baz", 'qux',  , "escaped,comma""#);
+/// assert_eq!(v, vec!["foo", "bar baz", "qux", "escaped,comma"]);
+/// ```
 fn parse_comma_separated_args(args: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
@@ -247,13 +300,18 @@ fn parse_comma_separated_args(args: &str) -> Vec<String> {
     result
 }
 
-/// Parse S3method directive arguments
+/// Parse S3method directive arguments into an export name.
 ///
-/// S3method can have 2 or 3 arguments:
-/// - `S3method(generic, class)` -> exports `generic.class`
-/// - `S3method(generic, class, method)` -> exports `generic.class` (method is the actual function name)
+/// Returns `Some("generic.class")` when the arguments contain a non-empty generic and class;
+/// returns `None` otherwise.
 ///
-/// Returns the exported method name in the form `generic.class`
+/// # Examples
+///
+/// ```
+/// assert_eq!(parse_s3method_args("foo, bar"), Some("foo.bar".to_string()));
+/// assert_eq!(parse_s3method_args("foo, bar, baz"), Some("foo.bar".to_string())); // method ignored
+/// assert_eq!(parse_s3method_args(""), None);
+/// ```
 fn parse_s3method_args(args: &str) -> Option<String> {
     let parts = parse_comma_separated_args(args);
 
@@ -269,25 +327,24 @@ fn parse_s3method_args(args: &str) -> Option<String> {
     None
 }
 
-/// Parse DESCRIPTION file for Depends field
+/// Extracts package names from the DESCRIPTION file's "Depends" field.
 ///
-/// Parses an R package DESCRIPTION file and extracts package names from
-/// the Depends field.
+/// Parses the DCF-formatted DESCRIPTION content, supports continuation lines
+/// for multi-line field values, strips version constraints (e.g., "(>= 3.5)"),
+/// and filters out the special "R" entry.
 ///
-/// Requirement 4.1: WHEN a package is loaded, THE Package_Resolver SHALL read
-/// the package's DESCRIPTION file to find the `Depends` field
+/// Returns a `Vec<String>` with package names listed in the `Depends` field;
+/// returns an empty vector if the field is missing or empty. Returns an `Err`
+/// if the DESCRIPTION file cannot be read.
 ///
-/// # Arguments
-/// * `description_path` - Path to the DESCRIPTION file
+/// # Examples
 ///
-/// # Returns
-/// * `Ok(Vec<String>)` - List of package names from the Depends field
-/// * `Err` - If the file cannot be read
-///
-/// # Notes
-/// - The "R" dependency (R version requirement) is filtered out
-/// - Version constraints like `(>= 3.5)` are stripped from package names
-/// - Multi-line field values are supported (continuation lines start with whitespace)
+/// ```
+/// use std::path::Path;
+/// // Assume a DESCRIPTION file exists at "tests/fixtures/DESCRIPTION"
+/// let deps = crate::namespace_parser::parse_description_depends(Path::new("tests/fixtures/DESCRIPTION")).unwrap();
+/// assert!(deps.iter().all(|s| !s.contains('(')));
+/// ```
 pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>> {
     let content = fs::read_to_string(description_path)
         .map_err(|e| anyhow!("Failed to read DESCRIPTION file {:?}: {}", description_path, e))?;
@@ -295,12 +352,43 @@ pub fn parse_description_depends(description_path: &Path) -> Result<Vec<String>>
     Ok(parse_description_field(&content, "Depends"))
 }
 
-/// Parse a field from DESCRIPTION file content
+/// Extracts the value of a named field from DESCRIPTION (DCF) content and parses it into package names.
+
 ///
-/// DESCRIPTION files use DCF (Debian Control File) format:
-/// - Field names are followed by a colon
-/// - Values can span multiple lines (continuation lines start with whitespace)
-/// - Fields are separated by blank lines or new field names
+
+/// The function locates `field_name:` at the start of a line, accumulates its value including continuation
+
+/// lines that begin with whitespace, and stops when a new field or a non-continuation line is encountered.
+
+/// The collected field value is then parsed into package names (version constraints are stripped and the
+
+/// `R` entry is excluded).
+
+///
+
+/// # Examples
+
+///
+
+/// ```
+
+/// let desc = "\
+
+/// Package: foo
+
+/// Depends: R (>= 3.5.0), dplyr (>= 1.0.0),
+
+///  tibble
+
+/// Imports: utils
+
+/// ";
+
+/// let deps = parse_description_field(desc, "Depends");
+
+/// assert_eq!(deps, vec!["dplyr".to_string(), "tibble".to_string()]);
+
+/// ```
 fn parse_description_field(content: &str, field_name: &str) -> Vec<String> {
     let mut field_value = String::new();
     let mut in_field = false;
@@ -328,15 +416,16 @@ fn parse_description_field(content: &str, field_name: &str) -> Vec<String> {
     parse_depends_value(&field_value)
 }
 
-/// Parse the value of a Depends field
+/// Extracts package names from a DESCRIPTION "Depends" field value.
 ///
-/// The Depends field is a comma-separated list of package names,
-/// optionally with version constraints in parentheses.
+/// Strips any parenthesized version constraints and excludes the special `R` entry.
 ///
-/// Examples:
-/// - "R (>= 3.5), dplyr, ggplot2"
-/// - "methods, stats"
-/// - "R (>= 4.0.0)"
+/// # Examples
+///
+/// ```
+/// let pkgs = parse_depends_value("R (>= 3.5), dplyr, ggplot2");
+/// assert_eq!(pkgs, vec!["dplyr", "ggplot2"]);
+/// ```
 fn parse_depends_value(value: &str) -> Vec<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1038,21 +1127,74 @@ importFrom(magrittr, "%>%")
     use proptest::prelude::*;
     use std::collections::HashSet;
 
-    /// Generate a valid R identifier for export names
-    /// R identifiers start with a letter or dot, followed by letters, digits, dots, or underscores
+    /// Generates a proptest strategy that produces valid R identifiers for export names.
+    ///
+    /// Identifiers begin with a lowercase ASCII letter and are followed by up to 10 characters
+    /// drawn from lowercase ASCII letters, digits, dots, or underscores (total length 1–11).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    ///
+    /// let mut runner = proptest::test_runner::TestRunner::default();
+    /// let value = r_identifier_strategy()
+    ///     .new_tree(&mut runner)
+    ///     .unwrap()
+    ///     .current();
+    ///
+    /// let mut chars = value.chars();
+    /// let first = chars.next().unwrap();
+    /// assert!(first.is_ascii_lowercase());
+    /// assert!(value.len() <= 11);
+    /// for c in chars {
+    ///     assert!(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_');
+    /// }
+    /// ```
     fn r_identifier_strategy() -> impl Strategy<Value = String> {
         // Use simple lowercase identifiers to avoid reserved words
         "[a-z][a-z0-9_]{0,10}".prop_filter("not empty", |s| !s.is_empty())
     }
 
-    /// Generate a valid R identifier that may contain dots (for S3 methods)
+    /// Produces a proptest strategy that generates valid R identifiers which may include dots.
+    ///
+    /// The strategy yields lowercase-starting identifiers composed of letters, digits, underscores,
+    /// and dots, with a length between 1 and 11 characters, excluding identifiers that end with a
+    /// dot or contain consecutive dots.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    ///
+    /// let mut runner = proptest::test_runner::TestRunner::default();
+    /// let tree = r_identifier_with_dots_strategy().new_tree(&mut runner).unwrap();
+    /// let ident = tree.current();
+    /// assert!(!ident.is_empty());
+    /// assert!(!ident.ends_with('.'));
+    /// assert!(!ident.contains(".."));
+    /// ```
     fn r_identifier_with_dots_strategy() -> impl Strategy<Value = String> {
         "[a-z][a-z0-9_.]{0,10}".prop_filter("not empty and valid", |s| {
             !s.is_empty() && !s.ends_with('.') && !s.contains("..")
         })
     }
 
-    /// Generate a simple regex pattern for exportPattern
+    /// Provides a proptest strategy that yields simple regex patterns suitable for `exportPattern` tests.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    ///
+    /// proptest! {
+    ///     #[test]
+    ///     fn example(pattern in crate::regex_pattern_strategy()) {
+    ///         // pattern is a simple regex string like "^helper_" or "^[A-Z]"
+    ///         prop_assert!(!pattern.is_empty());
+    ///     }
+    /// }
+    /// ```
     fn regex_pattern_strategy() -> impl Strategy<Value = String> {
         prop_oneof![
             Just("^[^.]".to_string()),
@@ -1063,7 +1205,27 @@ importFrom(magrittr, "%>%")
         ]
     }
 
-    /// Generate an export() directive with one or more names
+    /// Produces a proptest strategy that generates an `export(...)` directive string and its parsed names.
+    ///
+    /// The strategy yields a tuple `(directive, names)` where `directive` is a string like
+    /// `export(foo, bar)` and `names` is the Vec of identifier strings contained in the directive.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    /// use proptest::test_runner::TestRunner;
+    ///
+    /// let mut runner = TestRunner::default();
+    /// let tree = crate::export_directive_strategy().new_tree(&mut runner).unwrap();
+    /// let (directive, names) = tree.current();
+    /// assert!(directive.starts_with("export("));
+    /// assert!(directive.ends_with(")"));
+    /// assert_eq!(
+    ///     directive,
+    ///     format!("export({})", names.join(", "))
+    /// );
+    /// ```
     fn export_directive_strategy() -> impl Strategy<Value = (String, Vec<String>)> {
         prop::collection::vec(r_identifier_strategy(), 1..=5).prop_map(|names| {
             let directive = format!("export({})", names.join(", "));
@@ -1071,7 +1233,23 @@ importFrom(magrittr, "%>%")
         })
     }
 
-    /// Generate an exportPattern() directive
+    /// Generates a test strategy that produces a tuple containing:
+    /// 1. a string with an `exportPattern("...")` directive using a generated regex pattern, and
+    /// 2. the corresponding expected export marker vector with a single entry `"__PATTERN__:<pattern>"`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    ///
+    /// let strat = export_pattern_directive_strategy();
+    /// proptest!(|(pair in strat)| {
+    ///     let (directive, expected) = pair;
+    ///     prop_assert!(directive.starts_with("exportPattern(\""));
+    ///     prop_assert_eq!(expected.len(), 1);
+    ///     prop_assert!(directive.contains(&expected[0].trim_start_matches("__PATTERN__:")));
+    /// });
+    /// ```
     fn export_pattern_directive_strategy() -> impl Strategy<Value = (String, Vec<String>)> {
         regex_pattern_strategy().prop_map(|pattern| {
             let directive = format!("exportPattern(\"{}\")", pattern);
@@ -1080,7 +1258,39 @@ importFrom(magrittr, "%>%")
         })
     }
 
-    /// Generate an S3method() directive
+    /// Generates a proptest strategy that produces a tuple containing:
+    
+    /// - an `S3method(...)` directive string, and
+    
+    /// - the corresponding expected export name `generic.class` as a single-item `Vec<String>`.
+    
+    ///
+    
+    /// # Examples
+    
+    ///
+    
+    /// ```
+    
+    /// use proptest::test_runner::TestRunner;
+    
+    ///
+    
+    /// let mut runner = TestRunner::default();
+    
+    /// let strategy = s3method_directive_strategy();
+    
+    /// let tree = strategy.new_tree(&mut runner).unwrap();
+    
+    /// let (directive, expected) = tree.current();
+    
+    /// assert!(directive.starts_with("S3method("));
+    
+    /// assert_eq!(expected.len(), 1);
+    
+    /// assert!(expected[0].contains('.'));
+    
+    /// ```
     fn s3method_directive_strategy() -> impl Strategy<Value = (String, Vec<String>)> {
         (r_identifier_strategy(), r_identifier_with_dots_strategy()).prop_map(
             |(generic, class)| {
@@ -1091,7 +1301,20 @@ importFrom(magrittr, "%>%")
         )
     }
 
-    /// Generate a complete NAMESPACE file content with various directives
+    /// Constructs a proptest Strategy that generates synthetic NAMESPACE file content paired with the expected list of exported symbol strings.
+    ///
+    /// The produced strategy yields a tuple: the first element is the generated NAMESPACE file text (multiple directive lines joined with newlines), and the second element is the Vec of export entries that the parser should produce for that content.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::prelude::*;
+    /// let strat = namespace_content_strategy();
+    /// let mut runner = proptest::test_runner::TestRunner::default();
+    /// let (content, expected_exports) = strat.new_tree(&mut runner).unwrap().current();
+    /// // content is the generated NAMESPACE text and expected_exports lists the symbols that should be parsed from it
+    /// assert!(content.len() > 0 || expected_exports.is_empty());
+    /// ```
     fn namespace_content_strategy() -> impl Strategy<Value = (String, Vec<String>)> {
         (
             prop::collection::vec(export_directive_strategy(), 0..=3),
@@ -1125,7 +1348,19 @@ importFrom(magrittr, "%>%")
             })
     }
 
-    /// Generate NAMESPACE content with comments interspersed
+    /// Produces a proptest strategy that yields a tuple of
+    /// (NAMESPACE file content with interspersed comment lines, expected exports).
+    ///
+    /// The content is derived from `namespace_content_strategy` with a header comment,
+    /// a comment inserted before each original line, and a footer comment.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use proptest::strategy::Strategy;
+    /// let strat = crate::namespace_content_with_comments_strategy();
+    /// // `strat` generates values of type `(String, Vec<String>)`
+    /// ```
     fn namespace_content_with_comments_strategy() -> impl Strategy<Value = (String, Vec<String>)> {
         namespace_content_strategy().prop_map(|(content, expected)| {
             // Add comments between lines
