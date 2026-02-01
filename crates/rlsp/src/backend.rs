@@ -166,6 +166,26 @@ fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_
         }
     }
     
+    // Parse package settings (Requirement 12, Task 14.2)
+    if let Some(packages) = settings.get("packages") {
+        if let Some(v) = packages.get("enabled").and_then(|v| v.as_bool()) {
+            config.packages_enabled = v;
+        }
+        if let Some(paths) = packages.get("additionalLibraryPaths").and_then(|v| v.as_array()) {
+            config.packages_additional_library_paths = paths
+                .iter()
+                .filter_map(|p| p.as_str())
+                .map(std::path::PathBuf::from)
+                .collect();
+        }
+        if let Some(v) = packages.get("rPath").and_then(|v| v.as_str()) {
+            config.packages_r_path = Some(std::path::PathBuf::from(v));
+        }
+        if let Some(sev) = packages.get("missingPackageSeverity").and_then(|v| v.as_str()) {
+            config.packages_missing_package_severity = parse_severity(sev);
+        }
+    }
+    
     log::info!("Cross-file configuration loaded from LSP settings:");
     log::info!("  max_backward_depth: {}", config.max_backward_depth);
     log::info!("  max_forward_depth: {}", config.max_forward_depth);
@@ -187,6 +207,11 @@ fn parse_cross_file_config(settings: &serde_json::Value) -> Option<crate::cross_
     log::info!("    out_of_scope: {:?}", config.out_of_scope_severity);
     log::info!("    ambiguous_parent: {:?}", config.ambiguous_parent_severity);
     log::info!("    max_chain_depth: {:?}", config.max_chain_depth_severity);
+    log::info!("  Package settings:");
+    log::info!("    enabled: {}", config.packages_enabled);
+    log::info!("    additional_library_paths: {:?}", config.packages_additional_library_paths);
+    log::info!("    r_path: {:?}", config.packages_r_path);
+    log::info!("    missing_package_severity: {:?}", config.packages_missing_package_severity);
     
     Some(config)
 }
