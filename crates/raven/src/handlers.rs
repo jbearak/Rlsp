@@ -2493,32 +2493,34 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             }
             None => {
                 // Graceful fallback: show symbol info without definition statement
-                // For package exports, try to get function signature from R help
+                // For package exports, get full R help documentation
                 // Validates: Requirement 10.2
                 if let Some(pkg) = package_name {
-                    // Try to get function signature from R help
+                    // Try to get full help documentation from R
                     let name_owned = name.to_string();
                     let pkg_owned = pkg.to_string();
-                    if let Ok(signature) = tokio::task::spawn_blocking(move || {
-                        crate::help::get_function_signature(&name_owned, &pkg_owned)
+                    if let Ok(help_result) = tokio::task::spawn_blocking(move || {
+                        crate::help::get_help(&name_owned, Some(&pkg_owned))
                     })
                     .await
                     {
-                        if let Some(signature) = signature {
-                            value.push_str(&format!("```r\n{}\n```\n", signature));
+                        if let Some(help_text) = help_result {
+                            // Show full R documentation
+                            value.push_str(&format!("```\n{}\n```", help_text));
                         } else if let Some(sig) = &symbol.signature {
                             value.push_str(&format!("```r\n{}\n```\n", sig));
+                            value.push_str(&format!("\nfrom {{{}}}", pkg));
                         } else {
                             value.push_str(&format!("```r\n{}\n```\n", name));
+                            value.push_str(&format!("\nfrom {{{}}}", pkg));
                         }
                     } else if let Some(sig) = &symbol.signature {
                         value.push_str(&format!("```r\n{}\n```\n", sig));
+                        value.push_str(&format!("\nfrom {{{}}}", pkg));
                     } else {
                         value.push_str(&format!("```r\n{}\n```\n", name));
+                        value.push_str(&format!("\nfrom {{{}}}", pkg));
                     }
-                    // Display package name prominently for package exports
-                    // Validates: Requirement 10.1
-                    value.push_str(&format!("\nfrom {{{}}}", pkg));
                 } else if let Some(sig) = &symbol.signature {
                     value.push_str(&format!("```r\n{}\n```\n", sig));
                     if symbol.source_uri != *uri {
@@ -2563,23 +2565,25 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
         {
             let mut value = String::new();
 
-            // Try to get function signature from R help
+            // Try to get full help documentation from R
             let name_owned = name.to_string();
             let pkg_owned = pkg_name.to_string();
-            if let Ok(signature) = tokio::task::spawn_blocking(move || {
-                crate::help::get_function_signature(&name_owned, &pkg_owned)
+            if let Ok(help_result) = tokio::task::spawn_blocking(move || {
+                crate::help::get_help(&name_owned, Some(&pkg_owned))
             })
             .await
             {
-                if let Some(signature) = signature {
-                    value.push_str(&format!("```r\n{}\n```\n", signature));
+                if let Some(help_text) = help_result {
+                    // Show full R documentation
+                    value.push_str(&format!("```\n{}\n```", help_text));
                 } else {
                     value.push_str(&format!("```r\n{}\n```\n", name));
+                    value.push_str(&format!("\nfrom {{{}}}", pkg_name));
                 }
             } else {
                 value.push_str(&format!("```r\n{}\n```\n", name));
+                value.push_str(&format!("\nfrom {{{}}}", pkg_name));
             }
-            value.push_str(&format!("\nfrom {{{}}}", pkg_name));
 
             return Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
