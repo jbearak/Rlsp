@@ -1833,8 +1833,14 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         file_path_context,
         crate::file_path_intellisense::FilePathContext::None
     ) {
-        // Get cross-file metadata for path resolution (needed for @lsp-cd support)
-        let metadata = crate::cross_file::directive::parse_directives(&text);
+        // Only parse directives if we're in a source() call context (for @lsp-cd support)
+        // Directive contexts don't use @lsp-cd, so we can skip parsing
+        let metadata = match file_path_context {
+            crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
+                crate::cross_file::directive::parse_directives(&text)
+            }
+            _ => Default::default(),
+        };
         let workspace_root = state.workspace_folders.first();
 
         // Generate file path completions
