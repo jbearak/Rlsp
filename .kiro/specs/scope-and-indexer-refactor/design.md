@@ -189,9 +189,9 @@ pub struct CrossFileConfig {
 **Validation**: Migration tests compare results before and after.
 
 ### Property 2: Background Indexing Completeness
-**Statement**: All files that would have been indexed under the priority system are still indexed under the simplified system.
+**Statement**: All files that would have been indexed under the priority system are still indexed under the simplified system, provided the `on_demand_indexing_max_queue_size` is not exceeded (or dropped tasks are re-queued).
 
-**Validation**: Integration tests verify all transitive dependencies are indexed.
+**Validation**: Integration tests verify all transitive dependencies are indexed under non-capacity conditions, and verify that queue-full scenarios are handled gracefully.
 
 ### Property 3: No Regression in Cross-File Features
 **Statement**: All cross-file features (completions, hover, diagnostics, go-to-definition) work identically after the refactor.

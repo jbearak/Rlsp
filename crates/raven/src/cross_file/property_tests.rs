@@ -10056,7 +10056,7 @@ proptest! {
     /// # child.R
     /// library(stringr)
     /// ```
-    /// Both grandparent and parent should have the package in inherited_packages.
+    /// Both grandparent and parent should have the package in loaded_packages.
     #[test]
     fn prop_package_propagation_deep_chain(
         package in pkg_name(),
@@ -10142,7 +10142,7 @@ proptest! {
     /// library(ggplot2)
     /// helper_func <- function() { 1 }
     /// ```
-    /// Parent should have "helper_func" symbol and "ggplot2" in inherited_packages.
+    /// Parent should have "helper_func" symbol and "ggplot2" in loaded_packages.
     #[test]
     fn prop_package_propagation_symbols_and_packages(
         package in pkg_name(),
@@ -10214,7 +10214,7 @@ proptest! {
     /// x <- 1
     /// ```
     /// Child should have "dplyr" in inherited_packages.
-    /// Parent should have "ggplot2" in inherited_packages.
+    /// Parent should have "ggplot2" in loaded_packages.
     #[test]
     fn prop_package_propagation_asymmetric(
         parent_pkg in pkg_name(),

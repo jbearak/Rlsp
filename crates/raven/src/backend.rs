@@ -1804,7 +1804,7 @@ impl LanguageServer for Backend {
                 let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
                 let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
                 let ready = match lib.initialize().await {
-                    Ok(()) => true,
+                    Ok(()) => !lib.lib_paths().is_empty(),
                     Err(e) => {
                         log::warn!("Failed to reinitialize PackageLibrary: {}", e);
                         false

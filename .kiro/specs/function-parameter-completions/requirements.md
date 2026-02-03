@@ -71,7 +71,7 @@ This feature adds two new completion types to Raven (an R language server): func
 
 1. THE Completion_Handler SHALL display parameter completions with a distinct icon or kind (e.g., `CompletionItemKind::PROPERTY` or `CompletionItemKind::FIELD`)
 2. WHEN a parameter has a default value, THE Completion_Handler SHALL show the default in the detail field (e.g., `= TRUE`)
-3. WHEN inserting a parameter completion, THE Completion_Handler SHALL append `= ` after the parameter name
+3. WHEN inserting a parameter completion, THE Completion_Handler SHALL append an equals sign followed by a space (`=` + space) after the parameter name
 4. THE Completion_Handler SHALL filter parameter completions based on the user's typed prefix
 5. THE Completion_Handler SHALL exclude parameters that have already been specified in the current function call
 

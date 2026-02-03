@@ -126,7 +126,7 @@ This implementation adds function parameter completions and dollar-sign completi
   - [ ] 10.3 Implement `get_parameter_completions()` function
     - Use `ParameterResolver` to get function signature
     - Filter out already-specified parameters
-    - Format completions with `= ` suffix and default value detail
+    - Format completions with equals-space suffix and default value detail
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
   
   - [ ] 10.4 Write property test for already-specified parameter exclusion

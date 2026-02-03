@@ -425,7 +425,14 @@ impl RSubprocess {
         let exports = parse_packages_output(&output);
         if exports.is_empty() {
             let preview = if output.len() > 200 {
-                format!("{}...", &output[..200])
+                // Safe UTF-8 truncation: find the last valid char boundary before 200 bytes
+                let truncate_at = output
+                    .char_indices()
+                    .take_while(|(i, _)| *i < 200)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                format!("{}...", &output[..truncate_at])
             } else {
                 output.clone()
             };
