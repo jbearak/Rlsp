@@ -6,7 +6,7 @@ This implementation adds file path intellisense to Raven, providing completions 
 
 ## Tasks
 
-- [-] 1. Set up module structure and core types
+- [x] 1. Set up module structure and core types
   - [x] 1.1 Create `crates/raven/src/file_path_intellisense.rs` with module structure and imports
     - Create the new module file with necessary imports (tree-sitter, lsp-types, std::path, etc.)
     - _Requirements: Foundation for all file path intellisense features_
@@ -20,7 +20,7 @@ This implementation adds file path intellisense to Raven, providing completions 
     - Export the new module for use by handlers
     - _Requirements: Foundation_
 
-- [ ] 2. Implement context detection for source() calls
+- [x] 2. Implement context detection for source() calls
   - [x] 2.1 Implement `is_source_call_string_context()` using tree-sitter AST
     - Traverse AST to find `call` nodes with `source` or `sys.source` function names
     - Check if cursor position is inside the string argument
@@ -36,7 +36,7 @@ This implementation adds file path intellisense to Raven, providing completions 
     - **Property 1: Source Call Context Detection**
     - **Validates: Requirements 1.1, 1.2**
 
-- [ ] 3. Implement context detection for LSP directives
+- [x] 3. Implement context detection for LSP directives
   - [x] 3.1 Implement `is_directive_path_context()` using regex patterns
     - Match `@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`, `@lsp-source` directives
     - Handle optional colon and quotes syntax variations
@@ -51,7 +51,7 @@ This implementation adds file path intellisense to Raven, providing completions 
     - **Property 3: Forward Directive Context Detection**
     - **Validates: Requirements 1.6**
 
-- [ ] 4. Implement unified context detection
+- [x] 4. Implement unified context detection
   - [x] 4.1 Implement `detect_file_path_context()` combining source call and directive detection
     - Check source call context first, then directive context
     - Return `FilePathContext::None` for non-matching contexts
@@ -64,7 +64,7 @@ This implementation adds file path intellisense to Raven, providing completions 
 - [x] 5. Checkpoint - Context detection complete
   - Ensure all context detection tests pass, ask the user if questions arise.
 
-- [ ] 6. Implement directory listing and filtering
+- [x] 6. Implement directory listing and filtering
   - [x] 6.1 Implement `list_directory_entries()` function
     - List files and directories in the given base path
     - Exclude hidden files/directories (starting with `.`)
@@ -80,7 +80,7 @@ This implementation adds file path intellisense to Raven, providing completions 
     - **Property 5: R File and Directory Filtering**
     - **Validates: Requirements 2.1, 2.2**
 
-- [ ] 7. Implement completion item creation
+- [x] 7. Implement completion item creation
   - [x] 7.1 Implement `create_path_completion_item()` for files and directories
     - Set `CompletionItemKind::FILE` or `CompletionItemKind::FOLDER`
     - Add trailing `/` to directory insert_text
@@ -95,7 +95,7 @@ This implementation adds file path intellisense to Raven, providing completions 
     - **Property 11: Output Path Separator**
     - **Validates: Requirements 4.3**
 
-- [ ] 8. Implement path resolution for completions
+- [x] 8. Implement path resolution for completions
   - [x] 8.1 Implement relative path resolution (including `../` prefixes)
     - Use existing `PathContext` infrastructure
     - For source() calls: respect @lsp-cd working directory
@@ -118,7 +118,7 @@ This implementation adds file path intellisense to Raven, providing completions 
     - **Property 10: Path Separator Normalization**
     - **Validates: Requirements 4.1, 4.2**
 
-- [ ] 9. Implement main completion function
+- [x] 9. Implement main completion function
   - [x] 9.1 Implement `file_path_completions()` main function
     - Determine base directory from context and partial path
     - List and filter directory entries
@@ -133,7 +133,7 @@ This implementation adds file path intellisense to Raven, providing completions 
 - [x] 10. Checkpoint - Completions implementation complete
   - Ensure all completion tests pass, ask the user if questions arise.
 
-- [ ] 11. Implement go-to-definition for file paths
+- [x] 11. Implement go-to-definition for file paths
   - [x] 11.1 Implement `extract_file_path_at_position()` to get full path string at cursor
     - For source() calls: extract string literal content
     - For directives: extract path after directive keyword
