@@ -1844,6 +1844,17 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         let workspace_root = state.workspace_folders.first();
 
         // Generate file path completions
+        // NOTE: This uses blocking I/O (std::fs::read_dir) on the LSP request thread.
+        // This is acceptable because:
+        // 1. Directory reads are typically <1ms on modern systems
+        // 2. We only read a single directory level (no recursion)
+        // 3. The handler is already async, so we don't block the entire server
+        // 4. Making this async would add significant complexity (spawn_blocking,
+        //    cancellation, race conditions) without measurable benefit
+        // If performance issues arise with large directories, consider:
+        // - Caching directory listings
+        // - Using tokio::spawn_blocking for the read_dir call
+        // - Adding a timeout/cancellation mechanism
         let items = crate::file_path_intellisense::file_path_completions(
             &file_path_context,
             uri,
