@@ -103,24 +103,31 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 async function promptWordSeparators(context: vscode.ExtensionContext) {
-    const PROMPT_KEY = 'rWordSeparatorsPromptShown';
     const WORD_SEPARATORS = "`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?";
+    
+    const config = vscode.workspace.getConfiguration('raven');
+    const setting = config.get<string>('editor.dotInWordSeparators', 'ask');
 
-    // Check if prompt was already shown
-    if (context.globalState.get(PROMPT_KEY)) {
+    // If set to 'yes', ensure the setting is applied
+    if (setting === 'yes') {
+        await ensureWordSeparators(WORD_SEPARATORS);
         return;
     }
 
-    // Check if [r].editor.wordSeparators is already configured
-    const config = vscode.workspace.getConfiguration();
-    const rConfig = config.inspect('[r]');
+    // If set to 'no', do nothing
+    if (setting === 'no') {
+        return;
+    }
+
+    // If set to 'ask', check if we should prompt
+    const wsConfig = vscode.workspace.getConfiguration();
+    const rConfig = wsConfig.inspect('[r]');
     const hasWordSeparators = 
         (rConfig?.globalValue as any)?.['editor.wordSeparators'] !== undefined ||
         (rConfig?.workspaceValue as any)?.['editor.wordSeparators'] !== undefined ||
         (rConfig?.workspaceFolderValue as any)?.['editor.wordSeparators'] !== undefined;
 
     if (hasWordSeparators) {
-        await context.globalState.update(PROMPT_KEY, true);
         return;
     }
 
@@ -132,13 +139,8 @@ async function promptWordSeparators(context: vscode.ExtensionContext) {
     );
 
     if (choice === 'Enable') {
-        const currentRConfig = config.get('[r]', {}) as Record<string, any>;
-        const updatedRConfig = {
-            ...currentRConfig,
-            'editor.wordSeparators': WORD_SEPARATORS
-        };
-        await config.update('[r]', updatedRConfig, vscode.ConfigurationTarget.Global);
-        await context.globalState.update(PROMPT_KEY, true);
+        await config.update('editor.dotInWordSeparators', 'yes', vscode.ConfigurationTarget.Global);
+        await ensureWordSeparators(WORD_SEPARATORS);
         
         const reload = await vscode.window.showInformationMessage(
             'R word separators updated: dots will now be part of words in R files. Reload window to apply?',
@@ -149,7 +151,21 @@ async function promptWordSeparators(context: vscode.ExtensionContext) {
             vscode.commands.executeCommand('workbench.action.reloadWindow');
         }
     } else if (choice === 'No thanks') {
-        await context.globalState.update(PROMPT_KEY, true);
+        await config.update('editor.dotInWordSeparators', 'no', vscode.ConfigurationTarget.Global);
+    }
+}
+
+async function ensureWordSeparators(wordSeparators: string) {
+    const config = vscode.workspace.getConfiguration();
+    const currentRConfig = config.get('[r]', {}) as Record<string, any>;
+    
+    // Only update if not already set correctly
+    if (currentRConfig['editor.wordSeparators'] !== wordSeparators) {
+        const updatedRConfig = {
+            ...currentRConfig,
+            'editor.wordSeparators': wordSeparators
+        };
+        await config.update('[r]', updatedRConfig, vscode.ConfigurationTarget.Global);
     }
 }
 

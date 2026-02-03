@@ -34,6 +34,12 @@
           "type": "string",
           "default": "",
           "description": "Path to raven binary. If empty, uses bundled binary."
+        },
+        "raven.editor.dotInWordSeparators": {
+          "type": "string",
+          "enum": ["ask", "yes", "no"],
+          "default": "ask",
+          "description": "Whether to exclude dots from word separators in R files. 'ask' prompts on first use, 'yes' always applies the setting, 'no' never applies it."
         }
       }
     }
