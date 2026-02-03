@@ -1,16 +1,10 @@
 //! Background indexer for on-demand file indexing.
 //!
-//! Provides Priority 2 (backward directive targets) and Priority 3 (transitive dependencies)
-//! indexing for files not currently open in the editor. Uses a priority queue with
-//! configurable limits and transitive depth tracking.
-//!
-//! # Priority Levels
-//! - Priority 2: Files referenced by backward directives (@lsp-run-by, @lsp-sourced-by)
-//! - Priority 3: Transitive dependencies (files sourced by Priority 2 files)
+//! Provides background indexing for transitive dependencies of files not currently
+//! open in the editor. Uses a FIFO queue with configurable limits and depth tracking.
 //!
 //! # Design
-//! - Single worker thread processes queue sequentially
-//! - Priority ordering ensures important files indexed first
+//! - Single worker thread processes queue sequentially (FIFO order)
 //! - Depth tracking prevents infinite transitive chains
 //! - Duplicate detection avoids redundant work
 
@@ -34,7 +28,6 @@ use crate::state::WorldState;
 #[derive(Debug, Clone)]
 pub struct IndexTask {
     pub uri: Url,
-    pub priority: usize,
     pub depth: usize,
     pub submitted_at: Instant,
 }
@@ -102,8 +95,8 @@ impl BackgroundIndexer {
         self.canceled.lock().unwrap().clear();
     }
 
-    /// Submits indexing task with priority ordering
-    pub fn submit(&self, uri: Url, priority: usize, depth: usize) {
+    /// Submits indexing task with FIFO ordering
+    pub fn submit(&self, uri: Url, depth: usize) {
         // Check if on-demand indexing is enabled
         let enabled = self
             .state
@@ -145,22 +138,16 @@ impl BackgroundIndexer {
 
         let task = IndexTask {
             uri: uri.clone(),
-            priority,
             depth,
             submitted_at: Instant::now(),
         };
 
-        // Insert with priority ordering (lower priority number = higher priority)
-        let insert_pos = queue
-            .iter()
-            .position(|t| t.priority > priority)
-            .unwrap_or(queue.len());
-        queue.insert(insert_pos, task);
+        // Simple FIFO ordering
+        queue.push_back(task);
 
         log::trace!(
-            "Submitted indexing task for {} (priority={}, depth={}, queue_size={})",
+            "Submitted indexing task for {} (depth={}, queue_size={})",
             uri,
-            priority,
             depth,
             queue.len()
         );
@@ -213,9 +200,8 @@ impl BackgroundIndexer {
 
         let start_time = Instant::now();
         log::trace!(
-            "Processing indexing task for {} (priority={}, depth={})",
+            "Processing indexing task for {} (depth={})",
             task.uri,
-            task.priority,
             task.depth
         );
 
@@ -356,7 +342,7 @@ impl BackgroundIndexer {
         Ok(cross_file_meta)
     }
 
-    /// Queues transitive dependencies for Priority 3 indexing
+    /// Queues transitive dependencies for background indexing
     async fn queue_transitive_deps(
         state: Arc<RwLock<WorldState>>,
         queue: Arc<Mutex<VecDeque<IndexTask>>>,
@@ -364,7 +350,7 @@ impl BackgroundIndexer {
         metadata: &CrossFileMetadata,
         current_depth: usize,
     ) {
-        let (on_demand_enabled, max_depth, max_queue_size, priority_3_enabled, workspace_root) = {
+        let (on_demand_enabled, max_depth, max_queue_size, workspace_root) = {
             let state_guard = state.read().await;
             (
                 state_guard.cross_file_config.on_demand_indexing_enabled,
@@ -374,14 +360,11 @@ impl BackgroundIndexer {
                 state_guard
                     .cross_file_config
                     .on_demand_indexing_max_queue_size,
-                state_guard
-                    .cross_file_config
-                    .on_demand_indexing_priority_3_enabled,
                 state_guard.workspace_folders.first().cloned(),
             )
         };
 
-        if !on_demand_enabled || !priority_3_enabled || current_depth >= max_depth {
+        if !on_demand_enabled || current_depth >= max_depth {
             return;
         }
 
@@ -402,7 +385,7 @@ impl BackgroundIndexer {
                         if needs_indexing {
                             let mut q = queue.lock().unwrap();
 
-                            // Check queue size limit (Requirement 3.4)
+                            // Check queue size limit
                             if q.len() >= max_queue_size {
                                 log::warn!(
                                     "Background indexing queue full, dropping transitive task for {} ({}/{})",
@@ -418,7 +401,6 @@ impl BackgroundIndexer {
                                 let next_depth = current_depth.saturating_add(1);
                                 q.push_back(IndexTask {
                                     uri: source_uri.clone(),
-                                    priority: 3,
                                     depth: next_depth,
                                     submitted_at: Instant::now(),
                                 });
@@ -464,59 +446,47 @@ mod tests {
     fn test_index_task_creation() {
         let task = IndexTask {
             uri: test_uri("test.r"),
-            priority: 2,
             depth: 0,
             submitted_at: Instant::now(),
         };
-        assert_eq!(task.priority, 2);
         assert_eq!(task.depth, 0);
     }
 
     #[test]
-    fn test_queue_priority_ordering() {
+    fn test_queue_fifo_ordering() {
         let queue: Arc<Mutex<VecDeque<IndexTask>>> = Arc::new(Mutex::new(VecDeque::new()));
 
-        // Insert tasks with different priorities
+        // Insert tasks in order
         let tasks = vec![
             IndexTask {
-                uri: test_uri("p3.r"),
-                priority: 3,
-                depth: 1,
-                submitted_at: Instant::now(),
-            },
-            IndexTask {
-                uri: test_uri("p2.r"),
-                priority: 2,
+                uri: test_uri("first.r"),
                 depth: 0,
                 submitted_at: Instant::now(),
             },
             IndexTask {
-                uri: test_uri("p3b.r"),
-                priority: 3,
+                uri: test_uri("second.r"),
+                depth: 1,
+                submitted_at: Instant::now(),
+            },
+            IndexTask {
+                uri: test_uri("third.r"),
                 depth: 2,
                 submitted_at: Instant::now(),
             },
         ];
 
-        // Simulate submit logic for priority ordering
+        // Add tasks to queue (FIFO)
         for task in tasks {
             let mut q = queue.lock().unwrap();
-            let insert_pos = q
-                .iter()
-                .position(|t| t.priority > task.priority)
-                .unwrap_or(q.len());
-            q.insert(insert_pos, task);
+            q.push_back(task);
         }
 
-        // Verify order: priority 2 first, then priority 3s in FIFO order
+        // Verify FIFO order
         let q = queue.lock().unwrap();
         assert_eq!(q.len(), 3);
-        assert_eq!(q[0].priority, 2);
-        assert_eq!(q[1].priority, 3);
-        assert_eq!(q[2].priority, 3);
-        assert_eq!(q[0].uri.path(), "/test/p2.r");
-        assert_eq!(q[1].uri.path(), "/test/p3.r");
-        assert_eq!(q[2].uri.path(), "/test/p3b.r");
+        assert_eq!(q[0].uri.path(), "/test/first.r");
+        assert_eq!(q[1].uri.path(), "/test/second.r");
+        assert_eq!(q[2].uri.path(), "/test/third.r");
     }
 
     #[test]
@@ -528,7 +498,6 @@ mod tests {
             let mut q = queue.lock().unwrap();
             q.push_back(IndexTask {
                 uri: test_uri("test.r"),
-                priority: 2,
                 depth: 0,
                 submitted_at: Instant::now(),
             });
@@ -555,7 +524,6 @@ mod tests {
             let mut q = queue.lock().unwrap();
             q.push_back(IndexTask {
                 uri: test_uri(&format!("file{}.r", i)),
-                priority: 2,
                 depth: 0,
                 submitted_at: Instant::now(),
             });
@@ -570,46 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_2_before_priority_3() {
-        let queue: Arc<Mutex<VecDeque<IndexTask>>> = Arc::new(Mutex::new(VecDeque::new()));
-
-        // Add priority 3 first
-        {
-            let mut q = queue.lock().unwrap();
-            q.push_back(IndexTask {
-                uri: test_uri("p3.r"),
-                priority: 3,
-                depth: 1,
-                submitted_at: Instant::now(),
-            });
-        }
-
-        // Add priority 2 (should go before priority 3)
-        {
-            let mut q = queue.lock().unwrap();
-            let task = IndexTask {
-                uri: test_uri("p2.r"),
-                priority: 2,
-                depth: 0,
-                submitted_at: Instant::now(),
-            };
-            let insert_pos = q
-                .iter()
-                .position(|t| t.priority > task.priority)
-                .unwrap_or(q.len());
-            q.insert(insert_pos, task);
-        }
-
-        let q = queue.lock().unwrap();
-        assert_eq!(q[0].priority, 2);
-        assert_eq!(q[1].priority, 3);
-    }
-
-    #[test]
     fn test_depth_tracking() {
         let task = IndexTask {
             uri: test_uri("test.r"),
-            priority: 3,
             depth: 2,
             submitted_at: Instant::now(),
         };
@@ -632,13 +563,11 @@ mod tests {
             let mut q = queue.lock().unwrap();
             q.push_back(IndexTask {
                 uri: test_uri("a.r"),
-                priority: 2,
                 depth: 0,
                 submitted_at: Instant::now(),
             });
             q.push_back(IndexTask {
                 uri: test_uri("b.r"),
-                priority: 2,
                 depth: 0,
                 submitted_at: Instant::now(),
             });
@@ -685,7 +614,6 @@ mod tests {
             for name in &["a.r", "b.r", "c.r", "d.r"] {
                 q.push_back(IndexTask {
                     uri: test_uri(name),
-                    priority: 2,
                     depth: 0,
                     submitted_at: Instant::now(),
                 });

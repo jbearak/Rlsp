@@ -10,7 +10,8 @@
       "Bash(xargs -I {} sh -c 'echo \"\"=== {} ===\"\" && head -15 {}')",
       "Bash(tree:*)",
       "Bash(ls:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(R --slave --no-save --no-restore:*)"
     ]
   }
 }

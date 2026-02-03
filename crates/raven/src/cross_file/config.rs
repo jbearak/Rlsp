@@ -52,10 +52,6 @@ pub struct CrossFileConfig {
     pub on_demand_indexing_max_transitive_depth: usize,
     /// Maximum queue size for background indexing
     pub on_demand_indexing_max_queue_size: usize,
-    /// Whether Priority 2 (backward directive) indexing is enabled
-    pub on_demand_indexing_priority_2_enabled: bool,
-    /// Whether Priority 3 (transitive dependency) indexing is enabled
-    pub on_demand_indexing_priority_3_enabled: bool,
     /// Whether package function awareness is enabled
     pub packages_enabled: bool,
     /// Additional R library paths for package discovery
@@ -102,8 +98,6 @@ impl Default for CrossFileConfig {
             on_demand_indexing_enabled: true,
             on_demand_indexing_max_transitive_depth: 2,
             on_demand_indexing_max_queue_size: 50,
-            on_demand_indexing_priority_2_enabled: true,
-            on_demand_indexing_priority_3_enabled: true,
             packages_enabled: true,
             packages_additional_library_paths: Vec::new(),
             packages_r_path: None,
@@ -141,8 +135,6 @@ mod tests {
         assert!(config.on_demand_indexing_enabled);
         assert_eq!(config.on_demand_indexing_max_transitive_depth, 2);
         assert_eq!(config.on_demand_indexing_max_queue_size, 50);
-        assert!(config.on_demand_indexing_priority_2_enabled);
-        assert!(config.on_demand_indexing_priority_3_enabled);
         // Package awareness defaults
         assert!(config.packages_enabled);
         assert!(config.packages_additional_library_paths.is_empty());

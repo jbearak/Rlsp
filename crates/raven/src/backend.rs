@@ -21,6 +21,15 @@ use crate::handlers;
 use crate::r_env;
 use crate::state::{scan_workspace, WorldState};
 
+/// Category of files for on-demand indexing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexCategory {
+    /// Files directly sourced by open documents
+    Sourced,
+    /// Files referenced by backward directives (@lsp-run-by, @lsp-sourced-by)
+    BackwardDirective,
+}
+
 /// Extract loaded packages from a parsed tree
 ///
 /// This is a helper function for on-demand indexing that extracts
@@ -224,12 +233,6 @@ fn parse_cross_file_config(
         if let Some(v) = on_demand.get("maxQueueSize").and_then(|v| v.as_u64()) {
             config.on_demand_indexing_max_queue_size = v as usize;
         }
-        if let Some(v) = on_demand.get("priority2Enabled").and_then(|v| v.as_bool()) {
-            config.on_demand_indexing_priority_2_enabled = v;
-        }
-        if let Some(v) = on_demand.get("priority3Enabled").and_then(|v| v.as_bool()) {
-            config.on_demand_indexing_priority_3_enabled = v;
-        }
     }
 
     // Parse diagnostics.undefinedVariables
@@ -295,14 +298,6 @@ fn parse_cross_file_config(
     log::info!(
         "    max_queue_size: {}",
         config.on_demand_indexing_max_queue_size
-    );
-    log::info!(
-        "    priority_2_enabled: {}",
-        config.on_demand_indexing_priority_2_enabled
-    );
-    log::info!(
-        "    priority_3_enabled: {}",
-        config.on_demand_indexing_priority_3_enabled
     );
     log::info!("  Diagnostic severities:");
     log::info!("    missing_file: {:?}", config.missing_file_severity);
@@ -639,7 +634,7 @@ impl LanguageServer for Backend {
             let package_library = state.package_library.clone();
 
             // On-demand indexing: Collect sourced files that need indexing
-            // Priority 1: Files directly sourced by this open document
+            // Synchronous indexing: Files directly sourced by this open document and backward directive targets
             let mut files_to_index = Vec::new();
 
             if on_demand_enabled {
@@ -663,14 +658,14 @@ impl LanguageServer for Backend {
                                         "Scheduling on-demand indexing for sourced file: {}",
                                         source_uri
                                     );
-                                    files_to_index.push((source_uri, 1)); // Priority 1
+                                    files_to_index.push((source_uri, IndexCategory::Sourced));
                                 }
                             }
                         }
                     }
                 }
 
-                // Priority 2: Files referenced by backward directives
+                // Files referenced by backward directives
                 let backward_ctx = crate::cross_file::path_resolve::PathContext::new(
                     &uri_clone,
                     workspace_root.as_ref(),
@@ -689,7 +684,7 @@ impl LanguageServer for Backend {
                                         "Scheduling on-demand indexing for parent file: {}",
                                         parent_uri
                                     );
-                                    files_to_index.push((parent_uri, 2)); // Priority 2
+                                    files_to_index.push((parent_uri, IndexCategory::BackwardDirective));
                                 }
                             }
                         }
@@ -829,43 +824,38 @@ impl LanguageServer for Backend {
 
         // Only perform on-demand indexing if enabled
         if on_demand_enabled {
-            // Perform SYNCHRONOUS on-demand indexing for Priority 1 files (directly sourced)
+            // Perform SYNCHRONOUS on-demand indexing for sourced files
             // This ensures symbols are available BEFORE diagnostics run
-            let priority_1_files: Vec<Url> = files_to_index
+            let sourced_files: Vec<Url> = files_to_index
                 .iter()
-                .filter(|(_, priority)| *priority == 1)
+                .filter(|(_, category)| *category == IndexCategory::Sourced)
                 .map(|(uri, _)| uri.clone())
                 .collect();
 
-            // Collect metadata from Priority 1 files for transitive dependency queuing
-            let mut priority_1_metadata: Vec<(Url, crate::cross_file::CrossFileMetadata)> =
+            // Collect metadata from sourced files for transitive dependency queuing
+            let mut sourced_metadata: Vec<(Url, crate::cross_file::CrossFileMetadata)> =
                 Vec::new();
 
-            if !priority_1_files.is_empty() {
+            if !sourced_files.is_empty() {
                 log::info!(
                     "Synchronously indexing {} directly sourced files before diagnostics",
-                    priority_1_files.len()
+                    sourced_files.len()
                 );
-                for file_uri in priority_1_files {
+                for file_uri in sourced_files {
                     if let Some(meta) = self.index_file_on_demand(&file_uri).await {
-                        priority_1_metadata.push((file_uri, meta));
+                        sourced_metadata.push((file_uri, meta));
                     }
                 }
             }
 
-            // Queue transitive dependencies from Priority 1 files as Priority 3
-            let (priority_3_enabled, workspace_root) = {
+            // Queue transitive dependencies from sourced files for background indexing
+            let workspace_root = {
                 let state = self.state.read().await;
-                (
-                    state
-                        .cross_file_config
-                        .on_demand_indexing_priority_3_enabled,
-                    state.workspace_folders.first().cloned(),
-                )
+                state.workspace_folders.first().cloned()
             };
 
-            if priority_3_enabled && !priority_1_metadata.is_empty() {
-                for (file_uri, meta) in &priority_1_metadata {
+            if !sourced_metadata.is_empty() {
+                for (file_uri, meta) in &sourced_metadata {
                     let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
                         file_uri,
                         meta,
@@ -888,10 +878,10 @@ impl LanguageServer for Backend {
 
                                     if needs_indexing {
                                         log::trace!(
-                                            "Queuing transitive dependency from Priority 1: {}",
+                                            "Queuing transitive dependency: {}",
                                             source_uri
                                         );
-                                        self.background_indexer.submit(source_uri, 3, 1);
+                                        self.background_indexer.submit(source_uri, 1);
                                     }
                                 }
                             }
@@ -900,38 +890,33 @@ impl LanguageServer for Backend {
                 }
             }
 
-            // Priority 2 files (backward directive targets) are indexed synchronously
+            // Backward directive targets are indexed synchronously
             // so parent scopes are available before diagnostics.
-            let (priority_2_enabled, max_backward_depth, max_forward_depth) = {
+            let (max_backward_depth, max_forward_depth) = {
                 let state = self.state.read().await;
                 (
-                    state
-                        .cross_file_config
-                        .on_demand_indexing_priority_2_enabled,
                     state.cross_file_config.max_backward_depth,
                     state.cross_file_config.max_forward_depth,
                 )
             };
 
-            if priority_2_enabled {
-                let priority_2_files: Vec<Url> = files_to_index
-                    .iter()
-                    .filter(|(_, priority)| *priority == 2)
-                    .map(|(uri, _)| uri.clone())
-                    .collect();
+            let backward_directive_files: Vec<Url> = files_to_index
+                .iter()
+                .filter(|(_, category)| *category == IndexCategory::BackwardDirective)
+                .map(|(uri, _)| uri.clone())
+                .collect();
 
-                if !priority_2_files.is_empty() {
-                    log::info!(
-                        "Synchronously indexing {} backward directive targets before diagnostics",
-                        priority_2_files.len()
-                    );
-                    self.index_backward_chain(
-                        priority_2_files,
-                        max_backward_depth,
-                        max_forward_depth,
-                    )
-                    .await;
-                }
+            if !backward_directive_files.is_empty() {
+                log::info!(
+                    "Synchronously indexing {} backward directive targets before diagnostics",
+                    backward_directive_files.len()
+                );
+                self.index_backward_chain(
+                    backward_directive_files,
+                    max_backward_depth,
+                    max_forward_depth,
+                )
+                .await;
             }
 
             // Re-enrich metadata now that backward/forward chains are indexed.
@@ -3029,37 +3014,44 @@ mod tests {
     /// Tests for on-demand indexing global flag
     /// Validates Requirements 1.1, 1.2, 1.3, 1.4
     mod on_demand_indexing_flag {
+        /// Category of files for on-demand indexing (test-local copy)
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum IndexCategory {
+            Sourced,
+            BackwardDirective,
+        }
+
         /// Property 1: On-demand indexing respects global flag
         /// When on_demand_indexing_enabled is false, no indexing operations should occur.
         #[test]
         fn test_global_flag_disables_all_indexing() {
             // Simulate the flag check logic from did_open
             let on_demand_enabled = false;
-            let mut files_to_index: Vec<(String, usize)> = Vec::new();
-            let mut priority_1_indexed = false;
-            let mut priority_2_submitted = false;
-            let mut priority_3_queued = false;
+            let mut files_to_index: Vec<(String, IndexCategory)> = Vec::new();
+            let mut sourced_indexed = false;
+            let mut backward_indexed = false;
+            let mut transitive_queued = false;
 
             // Simulate file collection (only if enabled)
             if on_demand_enabled {
-                files_to_index.push(("sourced.R".to_string(), 1));
-                files_to_index.push(("parent.R".to_string(), 2));
+                files_to_index.push(("sourced.R".to_string(), IndexCategory::Sourced));
+                files_to_index.push(("parent.R".to_string(), IndexCategory::BackwardDirective));
             }
 
             // Simulate indexing (only if enabled)
             if on_demand_enabled {
-                // Priority 1 synchronous indexing
-                for (_, priority) in &files_to_index {
-                    if *priority == 1 {
-                        priority_1_indexed = true;
+                // Sourced files synchronous indexing
+                for (_, category) in &files_to_index {
+                    if *category == IndexCategory::Sourced {
+                        sourced_indexed = true;
                     }
                 }
-                // Priority 3 transitive queuing would happen here
-                priority_3_queued = true;
-                // Priority 2 background submission
-                for (_, priority) in &files_to_index {
-                    if *priority == 2 {
-                        priority_2_submitted = true;
+                // Transitive queuing would happen here
+                transitive_queued = true;
+                // Backward directive files synchronous indexing
+                for (_, category) in &files_to_index {
+                    if *category == IndexCategory::BackwardDirective {
+                        backward_indexed = true;
                     }
                 }
             }
@@ -3069,40 +3061,40 @@ mod tests {
                 files_to_index.is_empty(),
                 "No files should be collected when disabled"
             );
-            assert!(!priority_1_indexed, "Priority 1 indexing should be skipped");
+            assert!(!sourced_indexed, "Sourced file indexing should be skipped");
             assert!(
-                !priority_2_submitted,
-                "Priority 2 submission should be skipped"
+                !backward_indexed,
+                "Backward directive indexing should be skipped"
             );
-            assert!(!priority_3_queued, "Priority 3 queuing should be skipped");
+            assert!(!transitive_queued, "Transitive queuing should be skipped");
         }
 
         #[test]
         fn test_global_flag_enables_indexing() {
             // Simulate the flag check logic from did_open
             let on_demand_enabled = true;
-            let mut files_to_index: Vec<(String, usize)> = Vec::new();
-            let mut priority_1_indexed = false;
-            let mut priority_2_submitted = false;
+            let mut files_to_index: Vec<(String, IndexCategory)> = Vec::new();
+            let mut sourced_indexed = false;
+            let mut backward_indexed = false;
 
             // Simulate file collection (only if enabled)
             if on_demand_enabled {
-                files_to_index.push(("sourced.R".to_string(), 1));
-                files_to_index.push(("parent.R".to_string(), 2));
+                files_to_index.push(("sourced.R".to_string(), IndexCategory::Sourced));
+                files_to_index.push(("parent.R".to_string(), IndexCategory::BackwardDirective));
             }
 
             // Simulate indexing (only if enabled)
             if on_demand_enabled {
-                // Priority 1 synchronous indexing
-                for (_, priority) in &files_to_index {
-                    if *priority == 1 {
-                        priority_1_indexed = true;
+                // Sourced files synchronous indexing
+                for (_, category) in &files_to_index {
+                    if *category == IndexCategory::Sourced {
+                        sourced_indexed = true;
                     }
                 }
-                // Priority 2 background submission
-                for (_, priority) in &files_to_index {
-                    if *priority == 2 {
-                        priority_2_submitted = true;
+                // Backward directive files synchronous indexing
+                for (_, category) in &files_to_index {
+                    if *category == IndexCategory::BackwardDirective {
+                        backward_indexed = true;
                     }
                 }
             }
@@ -3113,8 +3105,8 @@ mod tests {
                 2,
                 "Files should be collected when enabled"
             );
-            assert!(priority_1_indexed, "Priority 1 indexing should occur");
-            assert!(priority_2_submitted, "Priority 2 submission should occur");
+            assert!(sourced_indexed, "Sourced file indexing should occur");
+            assert!(backward_indexed, "Backward directive indexing should occur");
         }
     }
 }
