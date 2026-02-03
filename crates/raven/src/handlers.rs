@@ -1833,11 +1833,13 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         file_path_context,
         crate::file_path_intellisense::FilePathContext::None
     ) {
-        // Only parse directives if we're in a source() call context (for @lsp-cd support)
-        // Directive contexts don't use @lsp-cd, so we can skip parsing
+        // Get enriched metadata from state for source() calls (includes inherited_working_directory)
+        // Directive contexts don't use @lsp-cd, so we use default metadata
         let metadata = match file_path_context {
             crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
-                crate::cross_file::directive::parse_directives(&text)
+                // Use get_enriched_metadata to get metadata with inherited_working_directory
+                // from parent files, not just the current file's directives
+                state.get_enriched_metadata(uri).unwrap_or_default()
             }
             _ => Default::default(),
         };
@@ -1860,6 +1862,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
             uri,
             &metadata,
             workspace_root,
+            position, // Pass cursor position for text_edit range
         );
         return Some(CompletionResponse::Array(items));
     }
@@ -2776,10 +2779,13 @@ pub fn goto_definition(
         file_path_context,
         crate::file_path_intellisense::FilePathContext::None
     ) {
-        // Only parse directives for source() calls (which need @lsp-cd)
+        // Get enriched metadata from state for source() calls (includes inherited_working_directory)
+        // Directive contexts don't use @lsp-cd, so we use default metadata
         let metadata = match file_path_context {
             crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
-                crate::cross_file::directive::parse_directives(&text)
+                // Use get_enriched_metadata to get metadata with inherited_working_directory
+                // from parent files, not just the current file's directives
+                state.get_enriched_metadata(uri).unwrap_or_default()
             }
             _ => Default::default(),
         };

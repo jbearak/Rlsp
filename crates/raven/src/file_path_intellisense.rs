@@ -582,6 +582,7 @@ fn unescape_string(s: &str) -> String {
 /// * `file_uri` - URI of the current file
 /// * `metadata` - Cross-file metadata for the current file
 /// * `workspace_root` - Optional workspace root URI
+/// * `cursor_position` - The cursor position for text_edit range
 ///
 /// # Returns
 /// Vector of CompletionItem for R files and directories
@@ -590,11 +591,27 @@ pub fn file_path_completions(
     file_uri: &Url,
     metadata: &CrossFileMetadata,
     workspace_root: Option<&Url>,
+    cursor_position: Position,
 ) -> Vec<CompletionItem> {
     // 1. Return empty vec if context is None
     if matches!(context, FilePathContext::None) {
         return Vec::new();
     }
+
+    // Extract path_start and partial_path from context for text_edit
+    let (path_start, partial_path) = match context {
+        FilePathContext::SourceCall {
+            content_start,
+            partial_path,
+            ..
+        } => (*content_start, partial_path.as_str()),
+        FilePathContext::Directive {
+            path_start,
+            partial_path,
+            ..
+        } => (*path_start, partial_path.as_str()),
+        FilePathContext::None => return Vec::new(),
+    };
 
     // 2. Resolve the base directory for listing
     let base_dir = match resolve_base_directory(context, file_uri, metadata, workspace_root) {
@@ -627,10 +644,16 @@ pub fn file_path_completions(
     // 5. Filter to R files and directories
     let filtered_entries = filter_r_files_and_dirs(entries);
 
-    // 6. Create completion items for each entry
+    // 6. Extract the directory prefix from partial_path (everything up to and including last /)
+    // This prefix will be prepended to completion items
+    let dir_prefix = extract_directory_component(partial_path);
+
+    // 7. Create completion items for each entry
     filtered_entries
         .iter()
-        .map(|(name, _path, is_directory)| create_path_completion_item(name, *is_directory))
+        .map(|(name, _path, is_directory)| {
+            create_path_completion_item(name, *is_directory, &dir_prefix, path_start, cursor_position)
+        })
         .collect()
 }
 
@@ -772,19 +795,55 @@ fn filter_r_files_and_dirs(
 /// - Sets CompletionItemKind::FILE or FOLDER
 /// - Appends trailing '/' to directory insert_text
 /// - Uses forward slashes for all paths (R convention)
+/// - Sets text_edit to replace from path_start to cursor position
 ///
 /// # Arguments
 /// * `name` - The file or directory name
 /// * `is_directory` - Whether this is a directory
+/// * `dir_prefix` - The directory prefix from the partial path (e.g., "../" or "subdir/")
+/// * `path_start` - The position where the path starts (for text_edit range)
+/// * `cursor_position` - The cursor position (end of text_edit range)
 ///
 /// # Returns
 /// A CompletionItem configured for the entry
-fn create_path_completion_item(name: &str, is_directory: bool) -> CompletionItem {
-    // TODO: Task 7.1 - Implement completion item creation
-    // 1. Set label to name
-    // 2. Set kind to FILE or FOLDER
-    // 3. Set insert_text with trailing '/' for directories
-    // 4. Use forward slashes for path separators
+fn create_path_completion_item(
+    name: &str,
+    is_directory: bool,
+    dir_prefix: &str,
+    path_start: Position,
+    cursor_position: Position,
+) -> CompletionItem {
+    // Build the full insert text with directory prefix
+    let insert_text = if is_directory {
+        format!("{}{}/", dir_prefix, name)
+    } else {
+        format!("{}{}", dir_prefix, name)
+    };
+
+    // Create text_edit that replaces from path_start to cursor position
+    // This ensures the completion replaces the entire partial path typed so far
+    let text_edit = tower_lsp::lsp_types::CompletionTextEdit::Edit(
+        tower_lsp::lsp_types::TextEdit {
+            range: tower_lsp::lsp_types::Range {
+                start: path_start,
+                end: cursor_position,
+            },
+            new_text: insert_text.clone(),
+        },
+    );
+
+    // For directories, add a command to re-trigger completions after accepting
+    // This allows users to continue navigating into subdirectories
+    let command = if is_directory {
+        Some(tower_lsp::lsp_types::Command {
+            title: String::from("Trigger Suggest"),
+            command: String::from("editor.action.triggerSuggest"),
+            arguments: None,
+        })
+    } else {
+        None
+    };
+
     CompletionItem {
         label: name.to_string(),
         kind: Some(if is_directory {
@@ -792,11 +851,11 @@ fn create_path_completion_item(name: &str, is_directory: bool) -> CompletionItem
         } else {
             CompletionItemKind::FILE
         }),
-        insert_text: Some(if is_directory {
-            format!("{}/", name)
-        } else {
-            name.to_string()
-        }),
+        // Set filter_text to the full path so it matches the partial path typed
+        // This is important for the client to filter completions correctly
+        filter_text: Some(insert_text.clone()),
+        text_edit: Some(text_edit),
+        command,
         ..Default::default()
     }
 }
@@ -1459,18 +1518,54 @@ mod tests {
 
     #[test]
     fn test_create_path_completion_item_file() {
-        let item = create_path_completion_item("utils.R", false);
+        let path_start = Position { line: 0, character: 8 };
+        let cursor_pos = Position { line: 0, character: 8 };
+        let item = create_path_completion_item("utils.R", false, "", path_start, cursor_pos);
         assert_eq!(item.label, "utils.R");
         assert_eq!(item.kind, Some(CompletionItemKind::FILE));
-        assert_eq!(item.insert_text, Some("utils.R".to_string()));
+        assert_eq!(item.filter_text, Some("utils.R".to_string()));
     }
 
     #[test]
     fn test_create_path_completion_item_directory() {
-        let item = create_path_completion_item("subdir", true);
+        let path_start = Position { line: 0, character: 8 };
+        let cursor_pos = Position { line: 0, character: 8 };
+        let item = create_path_completion_item("subdir", true, "", path_start, cursor_pos);
         assert_eq!(item.label, "subdir");
         assert_eq!(item.kind, Some(CompletionItemKind::FOLDER));
-        assert_eq!(item.insert_text, Some("subdir/".to_string()));
+        assert_eq!(item.filter_text, Some("subdir/".to_string()));
+        // Directory completions should have a command to re-trigger suggestions
+        assert!(item.command.is_some(), "Directory completion should have command");
+        let cmd = item.command.unwrap();
+        assert_eq!(cmd.command, "editor.action.triggerSuggest");
+    }
+
+    #[test]
+    fn test_create_path_completion_item_file_no_command() {
+        let path_start = Position { line: 0, character: 8 };
+        let cursor_pos = Position { line: 0, character: 8 };
+        let item = create_path_completion_item("utils.R", false, "", path_start, cursor_pos);
+        assert_eq!(item.label, "utils.R");
+        assert_eq!(item.kind, Some(CompletionItemKind::FILE));
+        // File completions should NOT have a command
+        assert!(item.command.is_none(), "File completion should not have command");
+    }
+
+    #[test]
+    fn test_create_path_completion_item_with_prefix() {
+        let path_start = Position { line: 0, character: 8 };
+        let cursor_pos = Position { line: 0, character: 11 }; // After typing "../"
+        let item = create_path_completion_item("utils.R", false, "../", path_start, cursor_pos);
+        assert_eq!(item.label, "utils.R");
+        assert_eq!(item.filter_text, Some("../utils.R".to_string()));
+        // Check text_edit range
+        if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = item.text_edit {
+            assert_eq!(edit.range.start, path_start);
+            assert_eq!(edit.range.end, cursor_pos);
+            assert_eq!(edit.new_text, "../utils.R");
+        } else {
+            panic!("Expected text_edit to be set");
+        }
     }
 
     #[test]
@@ -1942,6 +2037,31 @@ mod tests {
         assert_eq!(directive_type, DirectiveType::SourcedBy);
         assert_eq!(partial, "../");
         assert_eq!(path_start.line, 1);
+    }
+
+    #[test]
+    fn test_directive_colon_space_empty_path() {
+        // Bug case: colon followed by space, cursor at end
+        let content = "# @lsp-sourced-by: ";
+        // # @lsp-sourced-by: 
+        // 0         1        
+        // 0123456789012345678 9
+        // Position 19 is at the end (after the space)
+        let position = Position { line: 0, character: 19 };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some(), "Should detect directive context with colon and space");
+        let (directive_type, partial, _path_start) = result.unwrap();
+        assert_eq!(directive_type, DirectiveType::SourcedBy);
+        assert_eq!(partial, "");
+    }
+
+    #[test]
+    fn test_directive_colon_no_space_empty_path() {
+        // Colon but no space after
+        let content = "# @lsp-sourced-by:";
+        let position = Position { line: 0, character: 18 };
+        let result = is_directive_path_context(content, position);
+        assert!(result.is_some(), "Should detect directive context with colon and no space");
     }
 
     // ========================================================================
@@ -2489,6 +2609,25 @@ mod tests {
                 .set_language(&tree_sitter_r::LANGUAGE.into())
                 .unwrap();
             parser.parse(code, None).unwrap()
+        }
+
+        /// Helper to create a completion item with default positions for property tests
+        /// This simplifies tests that only care about the completion item properties,
+        /// not the text_edit range.
+        fn create_test_completion_item(name: &str, is_directory: bool) -> CompletionItem {
+            let default_pos = Position { line: 0, character: 0 };
+            create_path_completion_item(name, is_directory, "", default_pos, default_pos)
+        }
+
+        /// Helper to create a completion item with a directory prefix for property tests
+        #[allow(dead_code)] // Reserved for future tests that need directory prefixes
+        fn create_test_completion_item_with_prefix(
+            name: &str,
+            is_directory: bool,
+            dir_prefix: &str,
+        ) -> CompletionItem {
+            let default_pos = Position { line: 0, character: 0 };
+            create_path_completion_item(name, is_directory, dir_prefix, default_pos, default_pos)
         }
 
         // ====================================================================
@@ -4073,16 +4212,16 @@ mod tests {
                 dir_name in dirname_strategy(),
             ) {
                 // Call the function under test with is_directory = true
-                let completion_item = create_path_completion_item(&dir_name, true);
+                let completion_item = create_test_completion_item(&dir_name, true);
 
-                // Property 1: insert_text must end with forward slash
-                let insert_text = completion_item.insert_text.as_ref()
-                    .expect("Directory completion item should have insert_text");
+                // Property 1: filter_text must end with forward slash
+                let filter_text = completion_item.filter_text.as_ref()
+                    .expect("Directory completion item should have filter_text");
                 prop_assert!(
-                    insert_text.ends_with('/'),
-                    "Directory '{}' insert_text '{}' should end with '/'",
+                    filter_text.ends_with('/'),
+                    "Directory '{}' filter_text '{}' should end with '/'",
                     dir_name,
-                    insert_text
+                    filter_text
                 );
 
                 // Property 2: kind must be FOLDER
@@ -4103,12 +4242,12 @@ mod tests {
                     "Directory label should be the directory name"
                 );
 
-                // Property 4: insert_text should be dir_name + "/"
-                let expected_insert_text = format!("{}/", dir_name);
+                // Property 4: filter_text should be dir_name + "/"
+                let expected_filter_text = format!("{}/", dir_name);
                 prop_assert_eq!(
-                    insert_text,
-                    &expected_insert_text,
-                    "Directory insert_text should be name + '/'"
+                    filter_text,
+                    &expected_filter_text,
+                    "Directory filter_text should be name + '/'"
                 );
             }
 
@@ -4120,16 +4259,16 @@ mod tests {
                 file_name in r_filename_strategy(),
             ) {
                 // Call the function under test with is_directory = false
-                let completion_item = create_path_completion_item(&file_name, false);
+                let completion_item = create_test_completion_item(&file_name, false);
 
-                // Property 1: insert_text must NOT end with forward slash
-                let insert_text = completion_item.insert_text.as_ref()
-                    .expect("File completion item should have insert_text");
+                // Property 1: filter_text must NOT end with forward slash
+                let filter_text = completion_item.filter_text.as_ref()
+                    .expect("File completion item should have filter_text");
                 prop_assert!(
-                    !insert_text.ends_with('/'),
-                    "File '{}' insert_text '{}' should NOT end with '/'",
+                    !filter_text.ends_with('/'),
+                    "File '{}' filter_text '{}' should NOT end with '/'",
                     file_name,
-                    insert_text
+                    filter_text
                 );
 
                 // Property 2: kind must be FILE
@@ -4150,11 +4289,11 @@ mod tests {
                     "File label should be the file name"
                 );
 
-                // Property 4: insert_text should be the file name (no trailing slash)
+                // Property 4: filter_text should be the file name (no trailing slash)
                 prop_assert_eq!(
-                    insert_text,
+                    filter_text,
                     &file_name,
-                    "File insert_text should be the file name without trailing slash"
+                    "File filter_text should be the file name without trailing slash"
                 );
             }
 
@@ -4168,25 +4307,25 @@ mod tests {
             ) {
                 prop_assume!(!base.is_empty());
 
-                let completion_item = create_path_completion_item(&base, true);
+                let completion_item = create_test_completion_item(&base, true);
 
-                let insert_text = completion_item.insert_text.as_ref()
-                    .expect("Directory completion item should have insert_text");
+                let filter_text = completion_item.filter_text.as_ref()
+                    .expect("Directory completion item should have filter_text");
 
                 // Must end with slash
                 prop_assert!(
-                    insert_text.ends_with('/'),
-                    "Directory '{}' insert_text '{}' should end with '/'",
+                    filter_text.ends_with('/'),
+                    "Directory '{}' filter_text '{}' should end with '/'",
                     base,
-                    insert_text
+                    filter_text
                 );
 
                 // Must be exactly name + "/"
                 let expected = format!("{}/", base);
                 prop_assert_eq!(
-                    insert_text,
+                    filter_text,
                     &expected,
-                    "Directory insert_text should be exactly name + '/'"
+                    "Directory filter_text should be exactly name + '/'"
                 );
             }
 
@@ -4198,7 +4337,7 @@ mod tests {
             /// **Property 11: Output Path Separator**
             ///
             /// *For any* completion item returned by the completion provider, the path
-            /// separator used in `insert_text` and `label` SHALL be a forward slash `/`
+            /// separator used in `filter_text` and `label` SHALL be a forward slash `/`
             /// (R convention), regardless of the operating system.
             ///
             /// **Validates: Requirements 4.3**
@@ -4210,23 +4349,23 @@ mod tests {
                 prop_assume!(!name.is_empty());
 
                 // Call the function under test
-                let completion_item = create_path_completion_item(&name, is_directory);
+                let completion_item = create_test_completion_item(&name, is_directory);
 
-                // Property 1: insert_text must NOT contain backslashes
-                if let Some(insert_text) = &completion_item.insert_text {
+                // Property 1: filter_text must NOT contain backslashes
+                if let Some(filter_text) = &completion_item.filter_text {
                     prop_assert!(
-                        !insert_text.contains('\\'),
-                        "insert_text '{}' should NOT contain backslashes",
-                        insert_text
+                        !filter_text.contains('\\'),
+                        "filter_text '{}' should NOT contain backslashes",
+                        filter_text
                     );
 
-                    // Property 2: Any path separators in insert_text must be forward slashes
+                    // Property 2: Any path separators in filter_text must be forward slashes
                     // For directories, the trailing separator must be '/'
                     if is_directory {
                         prop_assert!(
-                            insert_text.ends_with('/'),
-                            "Directory insert_text '{}' should end with forward slash '/'",
-                            insert_text
+                            filter_text.ends_with('/'),
+                            "Directory filter_text '{}' should end with forward slash '/'",
+                            filter_text
                         );
                     }
                 }
@@ -4247,14 +4386,14 @@ mod tests {
             fn prop_output_path_separator_r_files(
                 file_name in r_filename_strategy(),
             ) {
-                let completion_item = create_path_completion_item(&file_name, false);
+                let completion_item = create_test_completion_item(&file_name, false);
 
-                // insert_text must NOT contain backslashes
-                if let Some(insert_text) = &completion_item.insert_text {
+                // filter_text must NOT contain backslashes
+                if let Some(filter_text) = &completion_item.filter_text {
                     prop_assert!(
-                        !insert_text.contains('\\'),
-                        "R file insert_text '{}' should NOT contain backslashes",
-                        insert_text
+                        !filter_text.contains('\\'),
+                        "R file filter_text '{}' should NOT contain backslashes",
+                        filter_text
                     );
                 }
 
@@ -4274,23 +4413,23 @@ mod tests {
             fn prop_output_path_separator_directories(
                 dir_name in dirname_strategy(),
             ) {
-                let completion_item = create_path_completion_item(&dir_name, true);
+                let completion_item = create_test_completion_item(&dir_name, true);
 
-                // insert_text must NOT contain backslashes
-                let insert_text = completion_item.insert_text.as_ref()
-                    .expect("Directory completion item should have insert_text");
+                // filter_text must NOT contain backslashes
+                let filter_text = completion_item.filter_text.as_ref()
+                    .expect("Directory completion item should have filter_text");
 
                 prop_assert!(
-                    !insert_text.contains('\\'),
-                    "Directory insert_text '{}' should NOT contain backslashes",
-                    insert_text
+                    !filter_text.contains('\\'),
+                    "Directory filter_text '{}' should NOT contain backslashes",
+                    filter_text
                 );
 
                 // The trailing separator must be a forward slash
                 prop_assert!(
-                    insert_text.ends_with('/'),
-                    "Directory insert_text '{}' should end with forward slash '/'",
-                    insert_text
+                    filter_text.ends_with('/'),
+                    "Directory filter_text '{}' should end with forward slash '/'",
+                    filter_text
                 );
 
                 // label must NOT contain backslashes
@@ -4318,22 +4457,22 @@ mod tests {
                 // Create a name with underscores that might look path-like
                 let name = format!("{}_{}", base, suffix);
 
-                let completion_item = create_path_completion_item(&name, is_directory);
+                let completion_item = create_test_completion_item(&name, is_directory);
 
-                // insert_text must NOT contain backslashes
-                if let Some(insert_text) = &completion_item.insert_text {
+                // filter_text must NOT contain backslashes
+                if let Some(filter_text) = &completion_item.filter_text {
                     prop_assert!(
-                        !insert_text.contains('\\'),
-                        "Path-like name insert_text '{}' should NOT contain backslashes",
-                        insert_text
+                        !filter_text.contains('\\'),
+                        "Path-like name filter_text '{}' should NOT contain backslashes",
+                        filter_text
                     );
 
                     // If directory, must end with forward slash
                     if is_directory {
                         prop_assert!(
-                            insert_text.ends_with('/'),
-                            "Directory insert_text '{}' should end with forward slash",
-                            insert_text
+                            filter_text.ends_with('/'),
+                            "Directory filter_text '{}' should end with forward slash",
+                            filter_text
                         );
                     }
                 }
@@ -6905,11 +7044,13 @@ mod tests {
 
                 // Completions should return empty vec without panicking
                 // because the directory with null byte cannot exist
+                let cursor_pos = Position { line: 0, character: 8 + invalid_dir_path.len() as u32 };
                 let completions = file_path_completions(
                     &context,
                     &file_uri,
                     &metadata,
                     Some(&workspace_root_url),
+                    cursor_pos,
                 );
 
                 // Property: Should return empty vec for invalid directory path (not panic)
@@ -7176,11 +7317,13 @@ mod tests {
                 let metadata = CrossFileMetadata::default();
 
                 // Get completions
+                let cursor_pos = Position { line: 0, character: 8 + partial_path.len() as u32 };
                 let completions = file_path_completions(
                     &context,
                     &file_uri,
                     &metadata,
                     Some(&workspace_root_url),
+                    cursor_pos,
                 );
 
                 // Property: Should return completions for files in directory with spaces
@@ -8410,6 +8553,92 @@ mod tests {
             assert!(result.is_some());
             let location = result.unwrap();
             assert_eq!(location.uri, Url::from_file_path(&utils_path).unwrap());
+        }
+
+        #[test]
+        fn test_file_path_definition_path_with_subdirectory() {
+            // Create temp directory structure:
+            // temp_dir/
+            //   main.R
+            //   subdir/
+            //     utils.R
+            let temp_dir = TempDir::new().unwrap();
+            let main_path = temp_dir.path().join("main.R");
+
+            let subdir = temp_dir.path().join("subdir");
+            fs::create_dir(&subdir).unwrap();
+            let utils_path = subdir.join("utils.R");
+            fs::write(&utils_path, "# utils file").unwrap();
+
+            // Test go-to-definition for source("subdir/utils.R")
+            let code = r#"source("subdir/utils.R")"#;
+            let tree = parse_r(code);
+
+            let file_uri = Url::from_file_path(&main_path).unwrap();
+            let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+            let metadata = make_metadata(None);
+
+            // Cursor in the middle of the path
+            let position = Position { line: 0, character: 15 };
+
+            let result = file_path_definition(
+                &tree,
+                code,
+                position,
+                &file_uri,
+                &metadata,
+                Some(&workspace_root),
+            );
+
+            assert!(result.is_some(), "Should find file at subdir/utils.R");
+            let location = result.unwrap();
+            assert_eq!(location.uri, Url::from_file_path(&utils_path).unwrap());
+        }
+
+        #[test]
+        fn test_file_path_definition_deep_path() {
+            // Create temp directory structure:
+            // temp_dir/
+            //   main.R
+            //   path/
+            //     to/
+            //       some/
+            //         file.R
+            let temp_dir = TempDir::new().unwrap();
+            let main_path = temp_dir.path().join("main.R");
+
+            let path_dir = temp_dir.path().join("path");
+            fs::create_dir(&path_dir).unwrap();
+            let to_dir = path_dir.join("to");
+            fs::create_dir(&to_dir).unwrap();
+            let some_dir = to_dir.join("some");
+            fs::create_dir(&some_dir).unwrap();
+            let file_path = some_dir.join("file.R");
+            fs::write(&file_path, "# deep file").unwrap();
+
+            // Test go-to-definition for source("path/to/some/file.R")
+            let code = r#"source("path/to/some/file.R")"#;
+            let tree = parse_r(code);
+
+            let file_uri = Url::from_file_path(&main_path).unwrap();
+            let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+            let metadata = make_metadata(None);
+
+            // Cursor in the middle of the path
+            let position = Position { line: 0, character: 18 };
+
+            let result = file_path_definition(
+                &tree,
+                code,
+                position,
+                &file_uri,
+                &metadata,
+                Some(&workspace_root),
+            );
+
+            assert!(result.is_some(), "Should find file at path/to/some/file.R");
+            let location = result.unwrap();
+            assert_eq!(location.uri, Url::from_file_path(&file_path).unwrap());
         }
 
         #[test]
