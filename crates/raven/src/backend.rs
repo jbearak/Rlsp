@@ -433,6 +433,8 @@ impl LanguageServer for Backend {
                         String::from(":"),
                         String::from("$"),
                         String::from("@"),
+                        String::from("/"),  // File path navigation
+                        String::from("\""), // String literal start for source() calls
                     ]),
                     ..Default::default()
                 }),

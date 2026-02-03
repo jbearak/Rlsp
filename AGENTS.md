@@ -2,15 +2,34 @@
 
 ## Project Overview
 
-Raven is a static R Language Server extracted from Ark. It provides LSP features without embedding R runtime. Uses tree-sitter for parsing, subprocess calls for help.
+Raven is a static R Language Server with cross-file awareness for scientific research workflows. It provides LSP features without embedding R runtime. Uses tree-sitter for parsing, subprocess calls for help.
+
+**Provenance**: Raven combines code from two sources:
+- **[Ark](https://github.com/posit-dev/ark)** (MIT License, Posit Software, PBC) - Raven began as a fork of Ark's LSP component. The core LSP infrastructure derives from Ark.
+- **[Sight](https://github.com/jbearak/sight)** (GPL-3.0) - The cross-file awareness system was ported from Sight, a Stata language server with similar goals.
+
+Both Sight and Raven were written by the same author to address the same problem: scientific research codebases that span many files.
 
 ## Repository Structure
 
 - `crates/raven/`: Main LSP implementation
 - `crates/raven/src/cross_file/`: Cross-file awareness module
 - `editors/vscode/`: VS Code extension
+- `sight/`: Git submodule containing the Sight Stata language server (reference implementation)
 - `Cargo.toml`: Workspace root
 - `setup.sh`: Build and install script
+
+### Sight Submodule
+
+The `sight/` directory is a git submodule containing the Sight Stata language server. It exists as a **reference implementation** for features being ported to Raven. When implementing new features (especially directive handling or cross-file awareness), consult the Sight codebase for patterns and approaches:
+
+- `sight/src/providers/completion.ts` - File path completion implementation
+- `sight/src/providers/definition.ts` - Go-to-definition for file paths
+- `sight/src/directive-parser/` - Directive parsing patterns
+- `sight/src/scope-resolver/` - Cross-file scope resolution
+- `sight/src/utils/file-path-utils.ts` - Path resolution utilities
+
+Sight is TypeScript-based while Raven is Rust-based, so implementations need adaptation, but the algorithms and UX patterns should be consistent.
 
 ## Build Commands
 

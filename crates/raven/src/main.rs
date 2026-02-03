@@ -10,6 +10,7 @@ mod builtins;
 mod content_provider;
 mod cross_file;
 mod document_store;
+mod file_path_intellisense;
 mod handlers;
 mod help;
 mod namespace_parser;
