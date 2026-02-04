@@ -245,32 +245,39 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
             let op_text = node_text(op, text);
             if matches!(op_text, "<-" | "=" | "<<-") && lhs.kind() == "identifier" {
                 let name = node_text(lhs, text).to_string();
-                let kind = if rhs.kind() == "function_definition" {
-                    SymbolKind::FUNCTION
-                } else {
-                    SymbolKind::VARIABLE
-                };
 
-                symbols.push(SymbolInformation {
-                    name,
-                    kind,
-                    tags: None,
-                    deprecated: None,
-                    location: Location {
-                        uri: Url::parse("file:///").unwrap(), // Will be replaced
-                        range: Range {
-                            start: Position::new(
-                                node.start_position().row as u32,
-                                node.start_position().column as u32,
-                            ),
-                            end: Position::new(
-                                node.end_position().row as u32,
-                                node.end_position().column as u32,
-                            ),
+                // Skip reserved words - they should not appear as document symbols
+                // (Requirement 6.1, 6.2)
+                if crate::reserved_words::is_reserved_word(&name) {
+                    // Continue to recurse but don't add this symbol
+                } else {
+                    let kind = if rhs.kind() == "function_definition" {
+                        SymbolKind::FUNCTION
+                    } else {
+                        SymbolKind::VARIABLE
+                    };
+
+                    symbols.push(SymbolInformation {
+                        name,
+                        kind,
+                        tags: None,
+                        deprecated: None,
+                        location: Location {
+                            uri: Url::parse("file:///").unwrap(), // Will be replaced
+                            range: Range {
+                                start: Position::new(
+                                    node.start_position().row as u32,
+                                    node.start_position().column as u32,
+                                ),
+                                end: Position::new(
+                                    node.end_position().row as u32,
+                                    node.end_position().column as u32,
+                                ),
+                            },
                         },
-                    },
-                    container_name: None,
-                });
+                        container_name: None,
+                    });
+                }
             }
         }
     }
@@ -1384,6 +1391,13 @@ pub(crate) fn collect_undefined_variables_position_aware(
 
     // Report undefined variables with position-aware cross-file scope
     for (name, usage_node) in used {
+        // Skip reserved words BEFORE any other checks (Requirement 3.4)
+        // Reserved words like `if`, `else`, `TRUE`, etc. should never produce
+        // "Undefined variable" diagnostics regardless of their position in code
+        if crate::reserved_words::is_reserved_word(&name) {
+            continue;
+        }
+
         let usage_line = usage_node.start_position().row as u32;
 
         // Skip if line is ignored via @lsp-ignore or @lsp-ignore-next
@@ -1982,6 +1996,14 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
             ..Default::default()
         });
     }
+
+    // Filter out reserved words from identifier completions
+    // (Keywords are added separately with CompletionItemKind::KEYWORD)
+    // Requirements 5.1, 5.2, 5.3: Reserved words should not appear as identifier completions
+    items.retain(|item| {
+        item.kind == Some(CompletionItemKind::KEYWORD)
+            || !crate::reserved_words::is_reserved_word(&item.label)
+    });
 
     Some(CompletionResponse::Array(items))
 }
@@ -5573,6 +5595,537 @@ mod proptests {
 
             let var_used = used.iter().any(|(name, _)| name == &var);
             prop_assert!(var_used, "Standalone identifier '{}' should be collected", var);
+        }
+
+        // ========================================================================
+        // **Feature: reserved-keyword-handling, Property 3: Undefined Variable Check Exclusion**
+        // **Validates: Requirements 3.1, 3.2, 3.3**
+        //
+        // For any R code containing a reserved word used as an identifier (in any
+        // syntactic position), the undefined variable checker SHALL NOT emit an
+        // "Undefined variable" diagnostic for that reserved word.
+        // ========================================================================
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 3: Undefined Variable Check Exclusion
+        ///
+        /// For any R code containing a reserved word used as an identifier (in any
+        /// syntactic position), the undefined variable checker SHALL NOT emit an
+        /// "Undefined variable" diagnostic for that reserved word.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_reserved_words_not_flagged_as_undefined_standalone(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
+        ) {
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Create code with just the reserved word as a standalone identifier
+            let code = reserved_word.to_string();
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // Filter for "Undefined variable" diagnostics for this reserved word
+            let undefined_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", reserved_word)))
+                .collect();
+
+            prop_assert!(
+                undefined_diags.is_empty(),
+                "Reserved word '{}' should NOT produce 'Undefined variable' diagnostic, but got: {:?}",
+                reserved_word,
+                undefined_diags
+            );
+        }
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 3: Undefined Variable Check Exclusion
+        ///
+        /// For any R code containing a reserved word used in an expression context,
+        /// the undefined variable checker SHALL NOT emit an "Undefined variable"
+        /// diagnostic for that reserved word.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_reserved_words_not_flagged_as_undefined_in_expression(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS),
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Create code with reserved word used in an expression (e.g., x <- else)
+            // This is syntactically invalid R, but the undefined variable checker
+            // should still not flag the reserved word as undefined
+            let code = format!("{} <- {}", var_name, reserved_word);
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // Filter for "Undefined variable" diagnostics for this reserved word
+            let undefined_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", reserved_word)))
+                .collect();
+
+            prop_assert!(
+                undefined_diags.is_empty(),
+                "Reserved word '{}' in expression should NOT produce 'Undefined variable' diagnostic, but got: {:?}",
+                reserved_word,
+                undefined_diags
+            );
+        }
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 3: Undefined Variable Check Exclusion
+        ///
+        /// For any R code containing a reserved word used in a function call context,
+        /// the undefined variable checker SHALL NOT emit an "Undefined variable"
+        /// diagnostic for that reserved word.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_reserved_words_not_flagged_as_undefined_in_call(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
+        ) {
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Create code with reserved word used as a function argument
+            // e.g., print(else) - syntactically invalid but tests the checker
+            let code = format!("print({})", reserved_word);
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // Filter for "Undefined variable" diagnostics for this reserved word
+            let undefined_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", reserved_word)))
+                .collect();
+
+            prop_assert!(
+                undefined_diags.is_empty(),
+                "Reserved word '{}' in function call should NOT produce 'Undefined variable' diagnostic, but got: {:?}",
+                reserved_word,
+                undefined_diags
+            );
+        }
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 3: Undefined Variable Check Exclusion (Negative Control)
+        ///
+        /// For any R code containing a non-reserved identifier that is not defined,
+        /// the undefined variable checker SHALL emit an "Undefined variable" diagnostic.
+        /// This is a negative control to ensure the checker is working correctly.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_non_reserved_undefined_vars_are_flagged(
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Create code with just the non-reserved identifier (undefined)
+            let code = var_name.clone();
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // Filter for "Undefined variable" diagnostics for this variable
+            let undefined_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", var_name)))
+                .collect();
+
+            prop_assert!(
+                !undefined_diags.is_empty(),
+                "Non-reserved undefined variable '{}' SHOULD produce 'Undefined variable' diagnostic",
+                var_name
+            );
+        }
+
+        // ========================================================================
+        // **Feature: reserved-keyword-handling, Property 4: Completion Exclusion**
+        // **Validates: Requirements 5.1, 5.2, 5.3**
+        //
+        // For any completion request that aggregates identifiers from document, scope,
+        // workspace index, or package sources, the completion provider SHALL NOT include
+        // reserved words in the identifier completion list. Keyword completions (with
+        // CompletionItemKind::KEYWORD) may still include reserved words.
+        // ========================================================================
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 4: Completion Exclusion
+        ///
+        /// For any R code containing an assignment to a reserved word, the completion
+        /// provider SHALL NOT include that reserved word as an identifier completion
+        /// (FUNCTION or VARIABLE kind). Reserved words MAY still appear as keyword
+        /// completions (KEYWORD kind).
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.3**
+        fn prop_reserved_words_not_in_identifier_completions(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Create code with assignment to reserved word (e.g., "else <- 1")
+            // This is syntactically invalid R, but tests that even if such code exists,
+            // the completion provider won't suggest the reserved word as an identifier
+            let code = format!("{} <- 1", reserved_word);
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Request completions at the end of the document
+            let position = Position::new(0, code.len() as u32);
+            let response = completion(&state, &uri, position);
+
+            prop_assert!(response.is_some(), "Completion should return a response");
+
+            if let Some(CompletionResponse::Array(items)) = response {
+                // Check that reserved word does NOT appear as identifier completion
+                let identifier_completions: Vec<_> = items
+                    .iter()
+                    .filter(|item| {
+                        item.label == reserved_word
+                            && matches!(
+                                item.kind,
+                                Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::VARIABLE)
+                            )
+                    })
+                    .collect();
+
+                prop_assert!(
+                    identifier_completions.is_empty(),
+                    "Reserved word '{}' should NOT appear as identifier completion (FUNCTION/VARIABLE), but found: {:?}",
+                    reserved_word,
+                    identifier_completions
+                );
+
+                // Verify reserved word DOES appear as keyword completion (positive control)
+                let keyword_completions: Vec<_> = items
+                    .iter()
+                    .filter(|item| {
+                        item.label == reserved_word && item.kind == Some(CompletionItemKind::KEYWORD)
+                    })
+                    .collect();
+
+                prop_assert!(
+                    !keyword_completions.is_empty(),
+                    "Reserved word '{}' SHOULD appear as keyword completion (KEYWORD kind)",
+                    reserved_word
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 4: Completion Exclusion
+        ///
+        /// For any R code containing a function definition with a reserved word name,
+        /// the completion provider SHALL NOT include that reserved word as a function
+        /// completion. Reserved words MAY still appear as keyword completions.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.3**
+        fn prop_reserved_words_not_in_function_completions(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Create code with function definition using reserved word name
+            // (e.g., "if <- function() {}")
+            let code = format!("{} <- function() {{}}", reserved_word);
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Request completions at the end of the document
+            let position = Position::new(0, code.len() as u32);
+            let response = completion(&state, &uri, position);
+
+            prop_assert!(response.is_some(), "Completion should return a response");
+
+            if let Some(CompletionResponse::Array(items)) = response {
+                // Check that reserved word does NOT appear as function completion
+                let function_completions: Vec<_> = items
+                    .iter()
+                    .filter(|item| {
+                        item.label == reserved_word && item.kind == Some(CompletionItemKind::FUNCTION)
+                    })
+                    .collect();
+
+                prop_assert!(
+                    function_completions.is_empty(),
+                    "Reserved word '{}' should NOT appear as function completion, but found: {:?}",
+                    reserved_word,
+                    function_completions
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 4: Completion Exclusion (Negative Control)
+        ///
+        /// For any R code containing an assignment to a non-reserved identifier,
+        /// the completion provider SHALL include that identifier as a completion.
+        /// This is a negative control to ensure the completion provider is working correctly.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.3**
+        fn prop_non_reserved_identifiers_in_completions(
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Create code with assignment to non-reserved identifier
+            let code = format!("{} <- 1", var_name);
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Request completions at the end of the document
+            let position = Position::new(0, code.len() as u32);
+            let response = completion(&state, &uri, position);
+
+            prop_assert!(response.is_some(), "Completion should return a response");
+
+            if let Some(CompletionResponse::Array(items)) = response {
+                // Check that non-reserved identifier DOES appear as completion
+                let var_completions: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == var_name)
+                    .collect();
+
+                prop_assert!(
+                    !var_completions.is_empty(),
+                    "Non-reserved identifier '{}' SHOULD appear in completions",
+                    var_name
+                );
+            }
+        }
+
+        // ========================================================================
+        // **Feature: reserved-keyword-handling, Property 5: Document Symbol Exclusion**
+        // **Validates: Requirements 6.1, 6.2**
+        //
+        // For any document symbol collection where a candidate symbol name is a
+        // reserved word, the provider SHALL NOT include it in the emitted symbol list.
+        // ========================================================================
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 5: Document Symbol Exclusion
+        ///
+        /// For any R code containing an assignment to a reserved word (e.g., `else <- 1`),
+        /// the document symbol provider SHALL NOT include that reserved word in the
+        /// emitted symbol list.
+        ///
+        /// **Validates: Requirements 6.1, 6.2**
+        fn prop_reserved_words_not_in_document_symbols(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
+        ) {
+            // Create code with assignment to reserved word (e.g., "else <- 1")
+            // This is syntactically invalid R, but tests that even if such code exists,
+            // the document symbol provider won't include the reserved word as a symbol
+            let code = format!("{} <- 1", reserved_word);
+            let tree = parse_r_code(&code);
+
+            let mut symbols = Vec::new();
+            collect_symbols(tree.root_node(), &code, &mut symbols);
+
+            // Check that reserved word does NOT appear in document symbols
+            let reserved_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|sym| sym.name == reserved_word)
+                .collect();
+
+            prop_assert!(
+                reserved_symbols.is_empty(),
+                "Reserved word '{}' should NOT appear in document symbols, but found: {:?}",
+                reserved_word,
+                reserved_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 5: Document Symbol Exclusion
+        ///
+        /// For any R code containing a function definition with a reserved word name
+        /// (e.g., `if <- function() {}`), the document symbol provider SHALL NOT
+        /// include that reserved word in the emitted symbol list.
+        ///
+        /// **Validates: Requirements 6.1, 6.2**
+        fn prop_reserved_words_not_in_document_symbols_function(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
+        ) {
+            // Create code with function definition using reserved word name
+            // (e.g., "if <- function() {}")
+            let code = format!("{} <- function() {{}}", reserved_word);
+            let tree = parse_r_code(&code);
+
+            let mut symbols = Vec::new();
+            collect_symbols(tree.root_node(), &code, &mut symbols);
+
+            // Check that reserved word does NOT appear in document symbols
+            let reserved_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|sym| sym.name == reserved_word)
+                .collect();
+
+            prop_assert!(
+                reserved_symbols.is_empty(),
+                "Reserved word '{}' should NOT appear in document symbols (function), but found: {:?}",
+                reserved_word,
+                reserved_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 5: Document Symbol Exclusion (Negative Control)
+        ///
+        /// For any R code containing an assignment to a non-reserved identifier,
+        /// the document symbol provider SHALL include that identifier in the symbol list.
+        /// This is a negative control to ensure the document symbol provider is working correctly.
+        ///
+        /// **Validates: Requirements 6.1, 6.2**
+        fn prop_non_reserved_identifiers_in_document_symbols(
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Create code with assignment to non-reserved identifier
+            let code = format!("{} <- 1", var_name);
+            let tree = parse_r_code(&code);
+
+            let mut symbols = Vec::new();
+            collect_symbols(tree.root_node(), &code, &mut symbols);
+
+            // Check that non-reserved identifier DOES appear in document symbols
+            let var_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|sym| sym.name == var_name)
+                .collect();
+
+            prop_assert!(
+                !var_symbols.is_empty(),
+                "Non-reserved identifier '{}' SHOULD appear in document symbols",
+                var_name
+            );
+        }
+
+        #[test]
+        /// Feature: reserved-keyword-handling, Property 5: Document Symbol Exclusion
+        ///
+        /// For any R code containing multiple assignments where some are to reserved words
+        /// and some are to non-reserved identifiers, the document symbol provider SHALL
+        /// include only the non-reserved identifiers in the symbol list.
+        ///
+        /// **Validates: Requirements 6.1, 6.2**
+        fn prop_mixed_reserved_and_non_reserved_document_symbols(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS),
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Create code with both reserved and non-reserved assignments
+            let code = format!("{} <- 1\n{} <- 2", reserved_word, var_name);
+            let tree = parse_r_code(&code);
+
+            let mut symbols = Vec::new();
+            collect_symbols(tree.root_node(), &code, &mut symbols);
+
+            // Check that reserved word does NOT appear in document symbols
+            let reserved_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|sym| sym.name == reserved_word)
+                .collect();
+
+            prop_assert!(
+                reserved_symbols.is_empty(),
+                "Reserved word '{}' should NOT appear in document symbols",
+                reserved_word
+            );
+
+            // Check that non-reserved identifier DOES appear in document symbols
+            let var_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|sym| sym.name == var_name)
+                .collect();
+
+            prop_assert!(
+                !var_symbols.is_empty(),
+                "Non-reserved identifier '{}' SHOULD appear in document symbols",
+                var_name
+            );
         }
     }
 }

@@ -1766,6 +1766,11 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
         }
         let name = node_text(rhs, content).to_string();
 
+        // Skip reserved words - they cannot be defined (Requirement 2.1, 2.2)
+        if crate::reserved_words::is_reserved_word(&name) {
+            return None;
+        }
+
         let (kind, signature) = if lhs.kind() == "function_definition" {
             let sig = extract_function_signature(lhs, &name, content);
             (SymbolKind::Function, Some(sig))
@@ -1798,6 +1803,11 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
         return None;
     }
     let name = node_text(lhs, content).to_string();
+
+    // Skip reserved words - they cannot be defined (Requirement 2.1, 2.2)
+    if crate::reserved_words::is_reserved_word(&name) {
+        return None;
+    }
 
     // Get the right-hand side to determine kind
     let (kind, signature) = if rhs.kind() == "function_definition" {
@@ -8593,5 +8603,230 @@ y <- filter(df)"#;
             scope.loaded_packages.contains(&"dplyr".to_string()),
             "dplyr should be in loaded_packages after loadNamespace() call"
         );
+    }
+
+    // ============================================================================
+    // Property-Based Tests for Reserved Word Handling
+    // ============================================================================
+
+    mod reserved_word_property_tests {
+        use super::*;
+        use crate::reserved_words::{is_reserved_word, RESERVED_WORDS};
+        use proptest::prelude::*;
+
+        /// Strategy to generate a reserved word from the set.
+        fn reserved_word_strategy() -> impl Strategy<Value = &'static str> {
+            prop::sample::select(RESERVED_WORDS)
+        }
+
+        /// Strategy to generate an assignment operator.
+        fn assignment_operator_strategy() -> impl Strategy<Value = &'static str> {
+            prop::sample::select(&["<-", "=", "<<-", "->"])
+        }
+
+        /// Strategy to generate a simple R value (number, string, or function).
+        fn r_value_strategy() -> impl Strategy<Value = String> {
+            prop_oneof![
+                // Numeric values
+                (1i32..1000).prop_map(|n| n.to_string()),
+                // String values
+                "[a-z]{1,5}".prop_map(|s| format!("\"{}\"", s)),
+                // Function definitions
+                Just("function() {}".to_string()),
+                Just("function(x) { x }".to_string()),
+                Just("function(x, y) { x + y }".to_string()),
+            ]
+        }
+
+        /// Generate R code with an assignment to a reserved word.
+        /// Returns (code, reserved_word, operator).
+        fn reserved_word_assignment_strategy(
+        ) -> impl Strategy<Value = (String, &'static str, &'static str)> {
+            (
+                reserved_word_strategy(),
+                assignment_operator_strategy(),
+                r_value_strategy(),
+            )
+                .prop_map(|(reserved, op, value)| {
+                    let code = if op == "->" {
+                        // Right assignment: value -> name
+                        format!("{} {} {}", value, op, reserved)
+                    } else {
+                        // Left assignment: name <- value
+                        format!("{} {} {}", reserved, op, value)
+                    };
+                    (code, reserved, op)
+                })
+        }
+
+        // ========================================================================
+        // **Feature: reserved-keyword-handling, Property 2: Definition Extraction Exclusion**
+        // **Validates: Requirements 2.1, 2.2, 2.3, 2.4**
+        //
+        // For any R code containing an assignment (left-assignment `<-`, `=`, `<<-`
+        // or right-assignment `->`) where the target identifier is a reserved word,
+        // the definition extractor SHALL NOT include that reserved word in either
+        // the exported interface or the scope timeline.
+        // ========================================================================
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            /// Property 2a: Reserved words SHALL NOT appear in exported interface.
+            ///
+            /// For any assignment where the target is a reserved word, the reserved
+            /// word SHALL NOT be present in the exported_interface of the computed
+            /// ScopeArtifacts.
+            #[test]
+            fn prop_reserved_words_not_in_exported_interface(
+                (code, reserved, _op) in reserved_word_assignment_strategy()
+            ) {
+                let tree = parse_r(&code);
+                let artifacts = compute_artifacts(&test_uri(), &tree, &code);
+
+                // The reserved word should NOT be in the exported interface
+                prop_assert!(
+                    !artifacts.exported_interface.contains_key(reserved),
+                    "Reserved word '{}' should NOT be in exported_interface for code: {}",
+                    reserved,
+                    code
+                );
+            }
+
+            /// Property 2b: Reserved words SHALL NOT appear in scope timeline definitions.
+            ///
+            /// For any assignment where the target is a reserved word, the reserved
+            /// word SHALL NOT appear as a Def event in the scope timeline.
+            #[test]
+            fn prop_reserved_words_not_in_timeline(
+                (code, reserved, _op) in reserved_word_assignment_strategy()
+            ) {
+                let tree = parse_r(&code);
+                let artifacts = compute_artifacts(&test_uri(), &tree, &code);
+
+                // Check that no Def event in the timeline has the reserved word as its name
+                let has_reserved_def = artifacts.timeline.iter().any(|event| {
+                    if let ScopeEvent::Def { symbol, .. } = event {
+                        symbol.name == reserved
+                    } else {
+                        false
+                    }
+                });
+
+                prop_assert!(
+                    !has_reserved_def,
+                    "Reserved word '{}' should NOT appear as Def in timeline for code: {}",
+                    reserved,
+                    code
+                );
+            }
+
+            /// Property 2c: Reserved words excluded regardless of assignment operator.
+            ///
+            /// For any assignment operator (<-, =, <<-, ->), if the target is a
+            /// reserved word, it SHALL NOT be extracted as a definition.
+            #[test]
+            fn prop_reserved_words_excluded_all_operators(
+                reserved in reserved_word_strategy(),
+                op in assignment_operator_strategy(),
+                value in r_value_strategy()
+            ) {
+                let code = if op == "->" {
+                    format!("{} {} {}", value, op, reserved)
+                } else {
+                    format!("{} {} {}", reserved, op, value)
+                };
+
+                let tree = parse_r(&code);
+                let artifacts = compute_artifacts(&test_uri(), &tree, &code);
+
+                // Verify exclusion from exported interface
+                prop_assert!(
+                    !artifacts.exported_interface.contains_key(reserved),
+                    "Reserved word '{}' with operator '{}' should NOT be in exported_interface",
+                    reserved,
+                    op
+                );
+
+                // Verify exclusion from timeline
+                let has_reserved_def = artifacts.timeline.iter().any(|event| {
+                    if let ScopeEvent::Def { symbol, .. } = event {
+                        symbol.name == reserved
+                    } else {
+                        false
+                    }
+                });
+
+                prop_assert!(
+                    !has_reserved_def,
+                    "Reserved word '{}' with operator '{}' should NOT appear as Def in timeline",
+                    reserved,
+                    op
+                );
+            }
+
+            /// Property 2d: Non-reserved identifiers ARE extracted as definitions.
+            ///
+            /// This is a positive control test: for any valid R identifier that is
+            /// NOT a reserved word, the definition extractor SHALL include it in
+            /// the exported interface.
+            #[test]
+            fn prop_non_reserved_identifiers_are_extracted(
+                ident in "[a-z][a-z0-9_]{0,10}".prop_filter("not reserved", |s| !is_reserved_word(s)),
+                op in prop::sample::select(&["<-", "=", "<<-"]),
+                value in (1i32..1000).prop_map(|n| n.to_string())
+            ) {
+                let code = format!("{} {} {}", ident, op, value);
+                let tree = parse_r(&code);
+                let artifacts = compute_artifacts(&test_uri(), &tree, &code);
+
+                // Non-reserved identifier SHOULD be in exported interface
+                prop_assert!(
+                    artifacts.exported_interface.contains_key(&ident),
+                    "Non-reserved identifier '{}' SHOULD be in exported_interface for code: {}",
+                    ident,
+                    code
+                );
+            }
+
+            /// Property 2e: Mixed code with reserved and non-reserved assignments.
+            ///
+            /// When code contains both reserved word assignments and valid identifier
+            /// assignments, only the valid identifiers SHALL appear in the exported
+            /// interface.
+            #[test]
+            fn prop_mixed_reserved_and_valid_assignments(
+                reserved in reserved_word_strategy(),
+                valid_ident in "[a-z][a-z0-9_]{0,10}".prop_filter("not reserved", |s| !is_reserved_word(s)),
+                value1 in (1i32..100).prop_map(|n| n.to_string()),
+                value2 in (100i32..200).prop_map(|n| n.to_string())
+            ) {
+                // Code with both a reserved word assignment and a valid assignment
+                let code = format!("{} <- {}\n{} <- {}", reserved, value1, valid_ident, value2);
+                let tree = parse_r(&code);
+                let artifacts = compute_artifacts(&test_uri(), &tree, &code);
+
+                // Reserved word should NOT be in exported interface
+                prop_assert!(
+                    !artifacts.exported_interface.contains_key(reserved),
+                    "Reserved word '{}' should NOT be in exported_interface",
+                    reserved
+                );
+
+                // Valid identifier SHOULD be in exported interface
+                prop_assert!(
+                    artifacts.exported_interface.contains_key(&valid_ident),
+                    "Valid identifier '{}' SHOULD be in exported_interface",
+                    valid_ident
+                );
+
+                // Only the valid identifier should be in the interface
+                prop_assert_eq!(
+                    artifacts.exported_interface.len(),
+                    1,
+                    "Only one symbol should be in exported_interface (the valid identifier)"
+                );
+            }
+        }
     }
 }

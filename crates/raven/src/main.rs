@@ -18,6 +18,7 @@ mod package_library;
 mod parser_pool;
 mod r_env;
 mod r_subprocess;
+mod reserved_words;
 mod state;
 mod workspace_index;
 
