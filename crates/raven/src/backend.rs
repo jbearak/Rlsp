@@ -1737,6 +1737,9 @@ impl LanguageServer for Backend {
             open_uris,
             scope_changed,
             package_settings_changed,
+            diagnostics_enabled_changed,
+            old_diagnostics_enabled,
+            new_diagnostics_enabled,
             packages_enabled,
             packages_r_path,
             additional_paths,
@@ -1748,6 +1751,14 @@ impl LanguageServer for Backend {
                 .as_ref()
                 .map(|c| state.cross_file_config.scope_settings_changed(c))
                 .unwrap_or(false);
+
+            // Check if diagnostics_enabled (master switch) changed - Requirement 5.2
+            let old_diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
+            let new_diagnostics_enabled = new_config
+                .as_ref()
+                .map(|c| c.diagnostics_enabled)
+                .unwrap_or(old_diagnostics_enabled);
+            let diagnostics_enabled_changed = old_diagnostics_enabled != new_diagnostics_enabled;
 
             // Check if package settings changed
             let package_settings_changed = new_config
@@ -1798,11 +1809,23 @@ impl LanguageServer for Backend {
                 open_uris,
                 scope_changed,
                 package_settings_changed,
+                diagnostics_enabled_changed,
+                old_diagnostics_enabled,
+                new_diagnostics_enabled,
                 packages_enabled,
                 packages_r_path,
                 additional_paths,
             )
         };
+
+        // Log diagnostics_enabled change - Requirement 5.2
+        if diagnostics_enabled_changed {
+            log::info!(
+                "Diagnostics master switch changed: {} -> {}",
+                old_diagnostics_enabled,
+                new_diagnostics_enabled
+            );
+        }
 
         // Reinitialize PackageLibrary if package settings changed
         if package_settings_changed {

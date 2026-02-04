@@ -64,4 +64,4 @@ This feature adds a master switch configuration option (`raven.diagnostics.enabl
 #### Acceptance Criteria
 
 1. WHEN the configuration is loaded, THE Raven server SHALL log the `diagnostics_enabled` value
-2. WHEN the master switch state changes at runtime, THE Raven server SHALL log the new state
+2. WHEN the master switch state changes at runtime, THE Raven server SHALL log the previous and new `diagnostics_enabled` values in the `did_change_configuration` handler

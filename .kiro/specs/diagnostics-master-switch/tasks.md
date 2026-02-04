@@ -34,6 +34,11 @@ This implementation adds a master switch configuration option (`raven.diagnostic
     - Log `diagnostics_enabled` value with other config values
     - _Requirements: 5.1_
   
+  - [x] 3.5 Add runtime logging for diagnostics_enabled changes
+    - Detect when `diagnostics_enabled` changes in `did_change_configuration`
+    - Log the previous and new values when the setting changes
+    - _Requirements: 5.2_
+  
   - [x] 3.3 Write property test for configuration parsing
     - **Property 3: Configuration parsing round-trip for explicit boolean**
     - **Validates: Requirements 2.3**
