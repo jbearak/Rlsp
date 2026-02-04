@@ -447,7 +447,7 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 
 **Implementation**:
 - `parse_namespace_exports()` extracts exports from NAMESPACE file
-- `parse_index_exports()` extracts documented exports from INDEX file (for pattern packages)
+- `parse_index_exports()` extracts documented exports from INDEX file (for pattern packages); reads via `spawn_blocking` and caches per package dir to avoid blocking LSP request handlers
 - `parse_description_depends()` extracts dependencies from DESCRIPTION
 - Pattern detection: exports starting with `__PATTERN__:` marker
 

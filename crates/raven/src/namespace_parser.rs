@@ -12,8 +12,16 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
+use dashmap::DashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static INDEX_EXPORTS_CACHE: OnceLock<DashMap<PathBuf, Vec<String>>> = OnceLock::new();
+
+fn index_exports_cache() -> &'static DashMap<PathBuf, Vec<String>> {
+    INDEX_EXPORTS_CACHE.get_or_init(DashMap::new)
+}
 
 /// Extracts exported symbol names from an R package NAMESPACE file.
 ///
@@ -448,6 +456,8 @@ fn parse_depends_value(value: &str) -> Vec<String> {
 /// This is used as a fallback for packages that use `exportPattern()` when the R
 /// subprocess is unavailable.
 ///
+/// Results are cached per `package_dir` to avoid repeated filesystem reads.
+///
 /// # Arguments
 /// * `package_dir` - Path to the installed package directory
 ///
@@ -456,17 +466,34 @@ fn parse_depends_value(value: &str) -> Vec<String> {
 /// cannot be read.
 ///
 /// # Examples
-/// ```
+/// ```rust,no_run
 /// use std::path::Path;
-/// let exports = crate::namespace_parser::parse_index_exports(Path::new("/usr/lib/R/library/dplyr")).unwrap();
+/// # async fn demo() -> anyhow::Result<()> {
+/// let exports = crate::namespace_parser::parse_index_exports(Path::new("/usr/lib/R/library/dplyr")).await?;
 /// assert!(exports.contains(&"mutate".to_string()));
+/// # Ok(())
+/// # }
 /// ```
-pub fn parse_index_exports(package_dir: &Path) -> Result<Vec<String>> {
-    let index_path = package_dir.join("INDEX");
-    let content = fs::read_to_string(&index_path)
-        .map_err(|e| anyhow!("Failed to read INDEX file {:?}: {}", index_path, e))?;
+pub async fn parse_index_exports(package_dir: &Path) -> Result<Vec<String>> {
+    let cache_key = package_dir.to_path_buf();
+    if let Some(cached) = index_exports_cache().get(&cache_key) {
+        return Ok(cached.value().clone());
+    }
 
-    Ok(parse_index_content(&content))
+    let index_path = package_dir.join("INDEX");
+
+    // Offload filesystem I/O from the LSP request executor.
+    let content = tokio::task::spawn_blocking({
+        let index_path = index_path.clone();
+        move || fs::read_to_string(&index_path)
+    })
+    .await
+    .map_err(|e| anyhow!("Failed to read INDEX file {:?}: {}", index_path, e))?
+    .map_err(|e| anyhow!("Failed to read INDEX file {:?}: {}", index_path, e))?;
+
+    let exports = parse_index_content(&content);
+    index_exports_cache().insert(cache_key, exports.clone());
+    Ok(exports)
 }
 
 /// Parse INDEX file content to extract function names.

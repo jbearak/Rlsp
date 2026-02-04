@@ -468,7 +468,8 @@ impl PackageLibrary {
         // Step 1: Load static packages immediately (no R subprocess needed)
         for (name, _pkg_dir, parse_result) in static_packages {
             let exports: HashSet<String> = parse_result.explicit_exports.into_iter().collect();
-            let info = PackageInfo::with_details(name.clone(), exports, parse_result.depends, vec![]);
+            let info =
+                PackageInfo::with_details(name.clone(), exports, parse_result.depends, vec![]);
 
             log::trace!(
                 "Loaded {} exports for package '{}' statically",
@@ -496,13 +497,13 @@ impl PackageLibrary {
                         for (pkg_name, exports) in exports_map {
                             let exports_set: HashSet<String> = exports.into_iter().collect();
                             // Get depends from static parse
-                            let depends = if let Some(pkg_dir) = self.find_package_directory(&pkg_name)
-                            {
-                                parse_description_depends(&pkg_dir.join("DESCRIPTION"))
-                                    .unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            };
+                            let depends =
+                                if let Some(pkg_dir) = self.find_package_directory(&pkg_name) {
+                                    parse_description_depends(&pkg_dir.join("DESCRIPTION"))
+                                        .unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                };
 
                             let info = PackageInfo::with_details(
                                 pkg_name.clone(),
@@ -528,8 +529,9 @@ impl PackageLibrary {
                         for pkg_name in &pattern_packages {
                             if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
                                 if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
-                                    let exports =
-                                        self.load_with_index_fallback(&pkg_dir, &parse_result);
+                                    let exports = self
+                                        .load_with_index_fallback(&pkg_dir, &parse_result)
+                                        .await;
                                     let info = PackageInfo::with_details(
                                         pkg_name.clone(),
                                         exports,
@@ -552,7 +554,8 @@ impl PackageLibrary {
                 for pkg_name in &pattern_packages {
                     if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
                         if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
-                            let exports = self.load_with_index_fallback(&pkg_dir, &parse_result);
+                            let exports =
+                                self.load_with_index_fallback(&pkg_dir, &parse_result).await;
                             let info = PackageInfo::with_details(
                                 pkg_name.clone(),
                                 exports,
@@ -707,7 +710,7 @@ impl PackageLibrary {
     /// When a package uses `exportPattern()` and R subprocess is unavailable,
     /// this method combines explicit exports from NAMESPACE with documented
     /// exports from the INDEX file.
-    fn load_with_index_fallback(
+    async fn load_with_index_fallback(
         &self,
         pkg_dir: &Path,
         parse_result: &NamespaceParseResult,
@@ -715,7 +718,7 @@ impl PackageLibrary {
         let mut exports: HashSet<String> = parse_result.explicit_exports.iter().cloned().collect();
 
         // Add INDEX exports for pattern packages
-        if let Ok(index_exports) = parse_index_exports(pkg_dir) {
+        if let Ok(index_exports) = parse_index_exports(pkg_dir).await {
             log::trace!(
                 "Loaded {} exports from INDEX file for pattern package",
                 index_exports.len()
@@ -820,7 +823,8 @@ impl PackageLibrary {
 
                     if parse_result.has_export_pattern {
                         // Base packages use exportPattern - add INDEX exports and track for R fallback
-                        let index_exports = self.load_with_index_fallback(&pkg_dir, &parse_result);
+                        let index_exports =
+                            self.load_with_index_fallback(&pkg_dir, &parse_result).await;
                         all_base_exports.extend(index_exports);
                         pattern_packages.push(package.clone());
                     }
@@ -986,7 +990,7 @@ impl PackageLibrary {
                             name,
                             e
                         );
-                        self.load_with_index_fallback(&pkg_dir, &parse_result)
+                        self.load_with_index_fallback(&pkg_dir, &parse_result).await
                     }
                 }
             } else {
@@ -995,7 +999,7 @@ impl PackageLibrary {
                     "No R subprocess available for package '{}', using INDEX fallback",
                     name
                 );
-                self.load_with_index_fallback(&pkg_dir, &parse_result)
+                self.load_with_index_fallback(&pkg_dir, &parse_result).await
             }
         } else {
             // Tier 1: No exportPattern, static parsing is sufficient (94% of packages)
@@ -1008,12 +1012,8 @@ impl PackageLibrary {
         };
 
         // Step 5: Create PackageInfo and insert into cache
-        let info = PackageInfo::with_details(
-            name.to_string(),
-            exports,
-            parse_result.depends,
-            Vec::new(),
-        );
+        let info =
+            PackageInfo::with_details(name.to_string(), exports, parse_result.depends, Vec::new());
 
         log::trace!(
             "Created PackageInfo for '{}': {} exports, {} depends, is_meta_package={}",
