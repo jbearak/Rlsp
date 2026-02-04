@@ -491,31 +491,11 @@ impl LanguageServer for Backend {
         log::info!("ark-lsp initialized");
 
         // Get workspace folders and config under brief lock
-        let (folders, max_chain_depth): (Vec<Url>, usize) = {
+        let (folders, max_chain_depth, packages_enabled, packages_r_path, additional_paths) = {
             let state = self.state.read().await;
             (
                 state.workspace_folders.clone(),
                 state.cross_file_config.max_chain_depth,
-            )
-        };
-
-        // Scan workspace without holding lock (Requirement 13a)
-        let (index, imports, cross_file_entries, new_index_entries) =
-            tokio::task::spawn_blocking(move || scan_workspace(&folders, max_chain_depth))
-                .await
-                .unwrap_or_default();
-
-        // Apply results under brief write lock
-        {
-            let mut state = self.state.write().await;
-            state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
-        }
-
-        // Initialize PackageLibrary without holding WorldState lock
-        // Get config values under brief read lock
-        let (packages_enabled, packages_r_path, additional_paths) = {
-            let state = self.state.read().await;
-            (
                 state.cross_file_config.packages_enabled,
                 state.cross_file_config.packages_r_path.clone(),
                 state
@@ -525,34 +505,66 @@ impl LanguageServer for Backend {
             )
         };
 
-        let (new_package_library, package_library_ready) = if packages_enabled {
-            // Create RSubprocess and initialize PackageLibrary
-            let r_subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
-            let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
-            let ready = match lib.initialize().await {
-                Ok(()) => !lib.lib_paths().is_empty(),
-                Err(e) => {
-                    log::warn!("Failed to initialize PackageLibrary: {}", e);
-                    false
-                }
-            };
-            // Add additional library paths (dedup)
-            lib.add_library_paths(&additional_paths);
-            log::info!(
-                "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
-                lib.lib_paths().len(),
-                lib.base_packages().len(),
-                lib.base_exports().len()
-            );
-            (std::sync::Arc::new(lib), ready)
-        } else {
-            log::info!("Package function awareness disabled");
-            (std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()), false)
+        // Task A: Scan workspace without holding lock (Requirement 13a)
+        let folders_clone = folders.clone();
+        let scan_task =
+            tokio::task::spawn_blocking(move || scan_workspace(&folders_clone, max_chain_depth));
+
+        // Task B: Initialize PackageLibrary concurrently
+        let package_task = async move {
+            if packages_enabled {
+                // Get workspace root from folders (if available) for R working directory (e.g. for renv)
+                let workspace_root = folders.first().and_then(|url| url.to_file_path().ok());
+
+                // Move R discovery to blocking task since it performs synchronous IO (which/where/R --version)
+                let r_subprocess = tokio::task::spawn_blocking(move || {
+                    let subprocess = crate::r_subprocess::RSubprocess::new(packages_r_path);
+                    match (subprocess, workspace_root) {
+                        (Some(sub), Some(root)) => Some(sub.with_working_dir(root)),
+                        (sub, _) => sub,
+                    }
+                })
+                .await
+                .unwrap_or(None);
+
+                // Create and initialize library
+                let mut lib = crate::package_library::PackageLibrary::with_subprocess(r_subprocess);
+                let ready = match lib.initialize().await {
+                    Ok(()) => !lib.lib_paths().is_empty(),
+                    Err(e) => {
+                        log::warn!("Failed to initialize PackageLibrary: {}", e);
+                        false
+                    }
+                };
+                // Add additional library paths (dedup)
+                lib.add_library_paths(&additional_paths);
+                log::info!(
+                    "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
+                    lib.lib_paths().len(),
+                    lib.base_packages().len(),
+                    lib.base_exports().len()
+                );
+                (std::sync::Arc::new(lib), ready)
+            } else {
+                log::info!("Package function awareness disabled");
+                (
+                    std::sync::Arc::new(crate::package_library::PackageLibrary::new_empty()),
+                    false,
+                )
+            }
         };
 
-        // Replace package_library under brief write lock
+        // Run both tasks concurrently
+        let (scan_result, (new_package_library, package_library_ready)) =
+            tokio::join!(scan_task, package_task);
+
+        let (index, imports, cross_file_entries, new_index_entries) =
+            scan_result.unwrap_or_default();
+
+        // Apply results under brief write lock
         {
             let mut state = self.state.write().await;
+            state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
             state.package_library = new_package_library;
             state.package_library_ready = package_library_ready;
         }

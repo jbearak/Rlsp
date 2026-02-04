@@ -47,6 +47,24 @@ Sight is TypeScript-based while Raven is Rust-based, so implementations need ada
 - Thread-safe caching (RwLock)
 - Cross-file awareness via source() detection and directives
 
+## R Integration Architecture
+
+Raven uses an ephemeral R subprocess strategy to query dynamic information (library paths, package exports) without embedding an R runtime.
+
+### Subprocess Lifecycle
+- **Ephemeral**: Subprocesses are spawned on-demand for specific queries and destroyed immediately. No persistent REPL or session state is maintained.
+- **Lightweight**: All commands run with `--vanilla --slave` to suppress user profiles (`.Rprofile`, `.Renviron`) and startup messages, ensuring predictable behavior and minimal latency.
+
+### Parallel Initialization
+To minimize startup time, the R interface initializes concurrently with workspace indexing:
+1. **Non-Blocking Discovery**: R executable path discovery (`which`/`where`) runs in a blocking task to avoid stalling the async runtime.
+2. **Parallel Execution**: `backend.rs` spawns the workspace scanner (CPU-bound) and PackageLibrary initializer (IO/Process-bound) simultaneously.
+
+### Project Environment Support (`renv`)
+Raven supports project-local package libraries (like `renv`):
+- **Working Directory**: The R subprocess is spawned with the workspace root as its working directory.
+- **Activation**: When querying `.libPaths()`, Raven checks for `renv/activate.R` in the project root and sources it if present. This ensures access to the correct project-specific library paths.
+
 ## Cross-File Architecture
 
 ### Overview

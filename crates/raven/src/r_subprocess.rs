@@ -16,6 +16,8 @@ use tokio::process::Command;
 pub struct RSubprocess {
     /// Path to R executable
     r_path: PathBuf,
+    /// Working directory for R subprocess
+    working_dir: Option<PathBuf>,
 }
 
 impl RSubprocess {
@@ -48,8 +50,17 @@ impl RSubprocess {
 
         path.map(|r_path| {
             log::trace!("Using R executable at: {:?}", r_path);
-            Self { r_path }
+            Self {
+                r_path,
+                working_dir: None,
+            }
         })
+    }
+
+    /// Set the working directory for the R subprocess
+    pub fn with_working_dir(mut self, path: PathBuf) -> Self {
+        self.working_dir = Some(path);
+        self
     }
 
     /// Get the path to the R executable
@@ -257,8 +268,14 @@ impl RSubprocess {
     /// assert_eq!(out.trim(), "ok");
     /// ```
     pub async fn execute_r_code(&self, r_code: &str) -> Result<String> {
-        let output = Command::new(&self.r_path)
-            .args(["--slave", "--no-save", "--no-restore", "-e", r_code])
+        let mut cmd = Command::new(&self.r_path);
+        cmd.args(["--vanilla", "--slave", "-e", r_code]);
+
+        if let Some(wd) = &self.working_dir {
+            cmd.current_dir(wd);
+        }
+
+        let output = cmd
             .output()
             .await
             .map_err(|e| anyhow!("Failed to execute R subprocess: {}", e))?;
@@ -297,7 +314,8 @@ impl RSubprocess {
     /// ```
     pub async fn get_lib_paths(&self) -> Result<Vec<PathBuf>> {
         // Use cat() with sep="\n" to output each path on its own line without R's vector formatting
-        let r_code = r#"cat(.libPaths(), sep="\n")"#;
+        // Check for renv/activate.R and source it if it exists (handles renv projects)
+        let r_code = r#"if (file.exists("renv/activate.R")) try(source("renv/activate.R"), silent=TRUE); cat(.libPaths(), sep="\n")"#;
 
         match self.execute_r_code(r_code).await {
             Ok(output) => {
