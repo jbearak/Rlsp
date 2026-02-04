@@ -149,7 +149,7 @@ struct ActiveDocumentsChangedParams {
 /// assert!(cfg.index_workspace);
 /// assert!(cfg.packages_enabled);
 /// ```
-fn parse_cross_file_config(
+pub(crate) fn parse_cross_file_config(
     settings: &serde_json::Value,
 ) -> Option<crate::cross_file::CrossFileConfig> {
     use crate::cross_file::{CallSiteDefault, CrossFileConfig};
@@ -235,8 +235,13 @@ fn parse_cross_file_config(
         }
     }
 
-    // Parse diagnostics.undefinedVariables
+    // Parse diagnostics settings
     if let Some(diag) = diagnostics {
+        // Parse diagnostics.enabled (master switch)
+        if let Some(v) = diag.get("enabled").and_then(|v| v.as_bool()) {
+            config.diagnostics_enabled = v;
+        }
+        // Parse diagnostics.undefinedVariables
         if let Some(v) = diag.get("undefinedVariables").and_then(|v| v.as_bool()) {
             config.undefined_variables_enabled = v;
         }
@@ -289,6 +294,7 @@ fn parse_cross_file_config(
         "  undefined_variables_enabled: {}",
         config.undefined_variables_enabled
     );
+    log::info!("  diagnostics_enabled: {}", config.diagnostics_enabled);
     log::info!("  On-demand indexing:");
     log::info!("    enabled: {}", config.on_demand_indexing_enabled);
     log::info!(
@@ -2942,6 +2948,98 @@ mod tests {
     }
 
     // ============================================================================
+    // Unit Tests for Configuration Parsing Defaults
+    // Property 4: Configuration parsing defaults to enabled when absent
+    // **Validates: Requirements 2.4**
+    // ============================================================================
+    mod config_parsing_defaults {
+        use serde_json::json;
+
+        /// Test that missing `diagnostics.enabled` results in `true` (default)
+        /// when the JSON has only the required `crossFile` section.
+        ///
+        /// **Property 4: Configuration parsing defaults to enabled when absent**
+        /// **Validates: Requirements 2.4**
+        #[test]
+        fn test_minimal_json_defaults_diagnostics_enabled_to_true() {
+            // JSON with only required crossFile section, no diagnostics section
+            let settings = json!({
+                "crossFile": {}
+            });
+
+            let config = crate::backend::parse_cross_file_config(&settings);
+
+            // Should successfully parse
+            assert!(config.is_some(), "Configuration parsing should succeed");
+            let config = config.unwrap();
+
+            // diagnostics_enabled should default to true
+            assert!(
+                config.diagnostics_enabled,
+                "diagnostics_enabled should default to true when diagnostics section is absent"
+            );
+        }
+
+        /// Test that missing `diagnostics.enabled` results in `true` (default)
+        /// when the `diagnostics` section exists but has no `enabled` key.
+        ///
+        /// **Property 4: Configuration parsing defaults to enabled when absent**
+        /// **Validates: Requirements 2.4**
+        #[test]
+        fn test_diagnostics_section_without_enabled_defaults_to_true() {
+            // JSON with diagnostics section but no enabled key
+            let settings = json!({
+                "crossFile": {},
+                "diagnostics": {
+                    "undefinedVariables": false
+                }
+            });
+
+            let config = crate::backend::parse_cross_file_config(&settings);
+
+            // Should successfully parse
+            assert!(config.is_some(), "Configuration parsing should succeed");
+            let config = config.unwrap();
+
+            // diagnostics_enabled should default to true
+            assert!(
+                config.diagnostics_enabled,
+                "diagnostics_enabled should default to true when enabled key is absent"
+            );
+        }
+
+        /// Test that missing `diagnostics.enabled` results in `true` (default)
+        /// when other settings are present but no `diagnostics` section exists.
+        ///
+        /// **Property 4: Configuration parsing defaults to enabled when absent**
+        /// **Validates: Requirements 2.4**
+        #[test]
+        fn test_other_settings_without_diagnostics_section_defaults_to_true() {
+            // JSON with other settings but no diagnostics section
+            let settings = json!({
+                "crossFile": {
+                    "enabled": true
+                },
+                "packages": {
+                    "enabled": true
+                }
+            });
+
+            let config = crate::backend::parse_cross_file_config(&settings);
+
+            // Should successfully parse
+            assert!(config.is_some(), "Configuration parsing should succeed");
+            let config = config.unwrap();
+
+            // diagnostics_enabled should default to true
+            assert!(
+                config.diagnostics_enabled,
+                "diagnostics_enabled should default to true when diagnostics section is absent"
+            );
+        }
+    }
+
+    // ============================================================================
     // Property Tests for Saturating Arithmetic
     // Property 1: Saturating Arithmetic Prevents Overflow - validates Requirements 1.1, 1.2
     // ============================================================================
@@ -2951,6 +3049,44 @@ mod tests {
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
+
+            // ============================================================================
+            // Property 3: Configuration parsing round-trip for explicit boolean
+            // **Validates: Requirements 2.3**
+            // For any boolean value `b`, if initialization options JSON contains
+            // `diagnostics.enabled` set to `b`, parsing SHALL produce a `CrossFileConfig`
+            // with `diagnostics_enabled` equal to `b`.
+            // ============================================================================
+
+            /// Property 3: Configuration parsing round-trip for explicit boolean
+            #[test]
+            fn prop_config_parsing_diagnostics_enabled_roundtrip(enabled: bool) {
+                use serde_json::json;
+
+                // Create JSON with diagnostics.enabled set to the generated boolean
+                let settings = json!({
+                    "crossFile": {},
+                    "diagnostics": {
+                        "enabled": enabled
+                    }
+                });
+
+                // Parse the configuration
+                let config = crate::backend::parse_cross_file_config(&settings);
+
+                // Should successfully parse
+                prop_assert!(config.is_some(), "Configuration parsing should succeed");
+                let config = config.unwrap();
+
+                // The parsed diagnostics_enabled should equal the input boolean
+                prop_assert_eq!(
+                    config.diagnostics_enabled,
+                    enabled,
+                    "diagnostics_enabled should match input: expected {}, got {}",
+                    enabled,
+                    config.diagnostics_enabled
+                );
+            }
 
             /// Property 1: For any usize value, saturating_add(1) should never overflow
             /// and should return a value >= the original value.

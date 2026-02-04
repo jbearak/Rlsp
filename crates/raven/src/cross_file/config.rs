@@ -20,6 +20,9 @@ pub enum CallSiteDefault {
 /// Cross-file awareness configuration
 #[derive(Debug, Clone)]
 pub struct CrossFileConfig {
+    /// Master switch for all diagnostics
+    /// When false, all diagnostics are suppressed regardless of individual severity settings
+    pub diagnostics_enabled: bool,
     /// Maximum depth for backward directive traversal
     pub max_backward_depth: usize,
     /// Maximum depth for forward source() traversal
@@ -82,6 +85,7 @@ impl Default for CrossFileConfig {
     /// ```
     fn default() -> Self {
         Self {
+            diagnostics_enabled: true,
             max_backward_depth: 10,
             max_forward_depth: 10,
             max_chain_depth: 20,
@@ -174,5 +178,17 @@ mod tests {
 
         config2.undefined_variables_enabled = false;
         assert!(!config1.scope_settings_changed(&config2));
+    }
+
+    #[test]
+    fn test_diagnostics_enabled_default_is_true() {
+        // Validates: Requirements 2.2
+        // The diagnostics_enabled field should default to true so that
+        // diagnostics are enabled by default when no configuration is provided
+        let config = CrossFileConfig::default();
+        assert!(
+            config.diagnostics_enabled,
+            "diagnostics_enabled should default to true"
+        );
     }
 }

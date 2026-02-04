@@ -206,6 +206,11 @@
           "minimum": 1,
           "description": "Maximum number of files that can be queued for background indexing. Limits memory usage and prevents excessive background work in projects with many transitive dependencies."
         },
+        "raven.diagnostics.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable all diagnostics. When disabled, no diagnostic messages will be shown regardless of individual severity settings."
+        },
         "raven.diagnostics.undefinedVariables": {
           "type": "boolean",
           "default": true,

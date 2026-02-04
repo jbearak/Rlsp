@@ -312,6 +312,11 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 /// assert!(diags.is_empty() || diags.iter().any(|d| d.severity.is_some()));
 /// ```
 pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
+    // Master switch check - return empty if diagnostics disabled
+    if !state.cross_file_config.diagnostics_enabled {
+        return Vec::new();
+    }
+
     let Some(doc) = state.get_document(uri) else {
         return Vec::new();
     };
@@ -9779,6 +9784,299 @@ my_func <- function(a = default_value) {
         assert!(
             !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: default_value"),
             "Defined variable 'default_value' should not be flagged as undefined"
+        );
+    }
+}
+
+
+// ============================================================================
+// Property Tests for Diagnostics Master Switch
+// ============================================================================
+
+#[cfg(test)]
+mod diagnostics_master_switch_tests {
+    use proptest::prelude::*;
+    use tower_lsp::lsp_types::Url;
+    use crate::handlers::diagnostics;
+    use crate::state::{WorldState, Document};
+
+    /// Strategy to generate arbitrary R code content.
+    /// Includes valid R code, syntax errors, and edge cases.
+    fn arbitrary_r_code() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Valid R code
+            Just("x <- 1".to_string()),
+            Just("f <- function(a, b) { a + b }".to_string()),
+            Just("library(dplyr)\nfilter(data)".to_string()),
+            Just("for (i in 1:10) { print(i) }".to_string()),
+            // Code with undefined variables (would normally produce diagnostics)
+            Just("undefined_var".to_string()),
+            Just("x <- undefined_func()".to_string()),
+            Just("result <- a + b".to_string()),
+            // Syntax errors (would normally produce diagnostics)
+            Just("x <- ".to_string()),
+            Just("function( { }".to_string()),
+            Just("if (TRUE".to_string()),
+            Just("for (i in".to_string()),
+            // Empty and whitespace
+            Just("".to_string()),
+            Just("   \n\n   ".to_string()),
+            // Comments only
+            Just("# This is a comment".to_string()),
+            Just("# Comment 1\n# Comment 2".to_string()),
+            // Complex code with multiple issues
+            Just("x <- 1\nundefined\nfor (i in".to_string()),
+            // Random alphanumeric strings (may or may not be valid R)
+            "[a-zA-Z0-9_ ]+".prop_map(|s| s),
+        ]
+    }
+
+    // ========================================================================
+    // Property 1: Master switch disabled suppresses all diagnostics
+    // **Validates: Requirements 1.4, 3.1, 3.4**
+    // ========================================================================
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Property 1: Master switch disabled suppresses all diagnostics
+        ///
+        /// For any document URI and any WorldState where `diagnostics_enabled` is `false`,
+        /// calling `diagnostics(state, uri)` SHALL return an empty vector regardless of
+        /// document content, syntax errors, or other configuration settings (including
+        /// individual severity settings).
+        ///
+        /// **Validates: Requirements 1.4, 3.1, 3.4**
+        #[test]
+        fn prop_master_switch_disabled_suppresses_all_diagnostics(
+            code in arbitrary_r_code(),
+            undefined_variables_enabled in any::<bool>(),
+        ) {
+            // Create a WorldState with diagnostics_enabled = false
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.diagnostics_enabled = false;
+            
+            // Also vary other diagnostic settings to ensure master switch takes precedence
+            state.cross_file_config.undefined_variables_enabled = undefined_variables_enabled;
+            
+            // Create a document with the generated code
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+            
+            // Call diagnostics - should always return empty when master switch is disabled
+            let result = diagnostics(&state, &uri);
+            
+            prop_assert!(
+                result.is_empty(),
+                "When diagnostics_enabled is false, diagnostics() should return empty vector. \
+                 Got {} diagnostics for code: {:?}",
+                result.len(),
+                code
+            );
+        }
+    }
+
+    // ========================================================================
+    // Unit test to verify the property with specific edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_master_switch_disabled_with_syntax_error() {
+        // Validates: Requirements 1.4, 3.1, 3.4
+        // Even code with syntax errors should produce no diagnostics when disabled
+        let mut state = WorldState::new(vec![]);
+        state.cross_file_config.diagnostics_enabled = false;
+        
+        let uri = Url::parse("file:///test.R").unwrap();
+        // Code with obvious syntax error
+        let code = "x <- function( { }";
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        let result = diagnostics(&state, &uri);
+        assert!(
+            result.is_empty(),
+            "Syntax errors should be suppressed when master switch is disabled"
+        );
+    }
+
+    #[test]
+    fn test_master_switch_disabled_with_undefined_variables() {
+        // Validates: Requirements 1.4, 3.1, 3.4
+        // Even code with undefined variables should produce no diagnostics when disabled
+        let mut state = WorldState::new(vec![]);
+        state.cross_file_config.diagnostics_enabled = false;
+        state.cross_file_config.undefined_variables_enabled = true; // Would normally produce diagnostics
+        
+        let uri = Url::parse("file:///test.R").unwrap();
+        // Code with undefined variable
+        let code = "result <- undefined_variable + 1";
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        let result = diagnostics(&state, &uri);
+        assert!(
+            result.is_empty(),
+            "Undefined variable diagnostics should be suppressed when master switch is disabled"
+        );
+    }
+
+    #[test]
+    fn test_master_switch_disabled_takes_precedence_over_individual_settings() {
+        // Validates: Requirements 3.4
+        // Master switch should take precedence over all individual diagnostic severity settings
+        let mut state = WorldState::new(vec![]);
+        state.cross_file_config.diagnostics_enabled = false;
+        
+        // Enable all individual diagnostic settings
+        state.cross_file_config.undefined_variables_enabled = true;
+        // Severity settings are already set to non-None values by default
+        
+        let uri = Url::parse("file:///test.R").unwrap();
+        // Code that would trigger multiple types of diagnostics
+        let code = r#"
+# Syntax error
+x <- function( { }
+# Undefined variable
+result <- undefined_var
+"#;
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        let result = diagnostics(&state, &uri);
+        assert!(
+            result.is_empty(),
+            "Master switch should suppress all diagnostics regardless of individual settings"
+        );
+    }
+
+    // ========================================================================
+    // Property 2: Master switch enabled preserves normal diagnostics behavior
+    // **Validates: Requirements 1.3, 3.3**
+    // ========================================================================
+
+    /// Strategy to generate R code that is known to produce diagnostics.
+    /// These are code patterns that will definitely trigger diagnostic messages.
+    fn code_with_known_issues() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Syntax errors - incomplete expressions
+            Just("x <- ".to_string()),
+            Just("function( { }".to_string()),
+            Just("if (TRUE".to_string()),
+            Just("for (i in".to_string()),
+            Just("while (".to_string()),
+            Just("x <- (1 +".to_string()),
+            // Multiple syntax errors
+            Just("x <- \ny <- ".to_string()),
+            Just("if (TRUE\nfor (i in".to_string()),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+
+        /// Property 2: Master switch enabled preserves normal diagnostics behavior
+        ///
+        /// For any document URI and any WorldState where `diagnostics_enabled` is `true`,
+        /// calling `diagnostics(state, uri)` SHALL return the same diagnostics as if the
+        /// master switch check did not exist (i.e., the master switch is transparent when enabled).
+        ///
+        /// This test verifies that code with known issues DOES produce diagnostics when
+        /// the master switch is enabled, demonstrating that the switch is transparent.
+        ///
+        /// **Validates: Requirements 1.3, 3.3**
+        #[test]
+        fn prop_master_switch_enabled_preserves_normal_diagnostics(
+            code in code_with_known_issues(),
+        ) {
+            // Create a WorldState with diagnostics_enabled = true (the default)
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.diagnostics_enabled = true;
+            
+            // Create a document with code that has known issues
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+            
+            // Call diagnostics - should return non-empty for code with issues
+            let result = diagnostics(&state, &uri);
+            
+            prop_assert!(
+                !result.is_empty(),
+                "When diagnostics_enabled is true, code with syntax errors should produce diagnostics. \
+                 Got 0 diagnostics for code: {:?}",
+                code
+            );
+        }
+    }
+
+    // ========================================================================
+    // Unit tests for Property 2: Master switch enabled
+    // ========================================================================
+
+    #[test]
+    fn test_master_switch_enabled_with_syntax_error() {
+        // Validates: Requirements 1.3, 3.3
+        // Code with syntax errors should produce diagnostics when enabled
+        let mut state = WorldState::new(vec![]);
+        state.cross_file_config.diagnostics_enabled = true;
+        
+        let uri = Url::parse("file:///test.R").unwrap();
+        // Code with obvious syntax error (incomplete assignment)
+        let code = "x <- ";
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        let result = diagnostics(&state, &uri);
+        assert!(
+            !result.is_empty(),
+            "Syntax errors should produce diagnostics when master switch is enabled"
+        );
+    }
+
+    #[test]
+    fn test_master_switch_enabled_is_transparent() {
+        // Validates: Requirements 1.3, 3.3
+        // The master switch should be transparent when enabled - same result as if check didn't exist
+        let mut state_enabled = WorldState::new(vec![]);
+        state_enabled.cross_file_config.diagnostics_enabled = true;
+        
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "x <- \nfor (i in";
+        state_enabled.documents.insert(uri.clone(), Document::new(code, None));
+        
+        let result_enabled = diagnostics(&state_enabled, &uri);
+        
+        // The result should be non-empty (diagnostics are computed normally)
+        assert!(
+            !result_enabled.is_empty(),
+            "Master switch enabled should allow diagnostics to be computed normally"
+        );
+        
+        // Verify we get syntax error diagnostics
+        assert!(
+            result_enabled.iter().any(|d| d.message.to_lowercase().contains("error") 
+                || d.message.to_lowercase().contains("syntax")
+                || d.message.to_lowercase().contains("unexpected")),
+            "Should contain syntax-related diagnostics, got: {:?}",
+            result_enabled.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_master_switch_enabled_default_behavior() {
+        // Validates: Requirements 1.3, 3.3
+        // Default state (diagnostics_enabled = true) should compute diagnostics normally
+        let mut state = WorldState::new(vec![]);
+        // Don't explicitly set diagnostics_enabled - use default
+        assert!(
+            state.cross_file_config.diagnostics_enabled,
+            "Default value should be true"
+        );
+        
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = "if (TRUE"; // Incomplete if statement - syntax error
+        state.documents.insert(uri.clone(), Document::new(code, None));
+        
+        let result = diagnostics(&state, &uri);
+        assert!(
+            !result.is_empty(),
+            "Default configuration should allow diagnostics to be computed"
         );
     }
 }
