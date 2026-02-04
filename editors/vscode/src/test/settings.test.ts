@@ -94,7 +94,8 @@ const SETTINGS_MAPPING: Array<{
 function arbitraryForSetting(setting: typeof SETTINGS_MAPPING[number]): fc.Arbitrary<unknown> {
     switch (setting.type) {
         case 'number':
-            return fc.integer({ min: 1, max: 100 });
+            // Include 0 to align with package.json schema (minimum: 0 for revalidationDebounceMs, maxTransitiveDepth)
+            return fc.integer({ min: 0, max: 100 });
         case 'boolean':
             return fc.boolean();
         case 'string':

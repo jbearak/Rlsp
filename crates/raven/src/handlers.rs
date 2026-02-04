@@ -1863,9 +1863,18 @@ fn collect_usages_with_context<'a>(
 
             // Skip if this is a function parameter definition
             // Function parameters appear inside `parameter` or `default_parameter` nodes
-            // which are children of `parameters` nodes
-            if matches!(parent.kind(), "parameter" | "default_parameter") {
-                return; // Skip function parameter definitions
+            // which are children of `parameters` nodes.
+            // Only skip the parameter name (name field), NOT identifiers in the default
+            // expression (e.g., function(a = b) should check b for undefined)
+            if parent.kind() == "parameter" || parent.kind() == "default_parameter" {
+                // Only skip if this identifier is the parameter name (name field)
+                // The default expression should still be checked for undefined variables
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if name_node.id() == node.id() {
+                        return; // Skip the parameter name
+                    }
+                }
+                // Don't return here - identifiers in default expressions should be checked
             }
 
             // Also check if we're directly inside a `parameters` node (some grammars)
@@ -9596,10 +9605,10 @@ add <- function(a, b) {
             &mut diagnostics
         );
         
-        // Filter to only undefined variable warnings
+        // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Undefined variable"))
+            .filter(|d| d.message.starts_with("Undefined variable: "))
             .collect();
         
         // Print diagnostics for debugging
@@ -9608,12 +9617,13 @@ add <- function(a, b) {
         }
         
         // Function parameters a and b should NOT be flagged as undefined
+        // Use exact equality to avoid substring false positives (e.g., "a" matching "ab")
         assert!(
-            !undefined_var_diags.iter().any(|d| d.message.contains("Undefined variable: a")),
+            !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: a"),
             "Parameter 'a' should not be flagged as undefined"
         );
         assert!(
-            !undefined_var_diags.iter().any(|d| d.message.contains("Undefined variable: b")),
+            !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: b"),
             "Parameter 'b' should not be flagged as undefined"
         );
     }
@@ -9647,10 +9657,10 @@ outer_func <- function(x) {
             &mut diagnostics
         );
         
-        // Filter to only undefined variable warnings
+        // Filter to only undefined variable warnings (use starts_with for filtering, exact match for assertions)
         let undefined_var_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("Undefined variable"))
+            .filter(|d| d.message.starts_with("Undefined variable: "))
             .collect();
         
         // Print diagnostics for debugging
@@ -9659,13 +9669,116 @@ outer_func <- function(x) {
         }
         
         // Function parameters x and y should NOT be flagged as undefined
+        // Use exact equality to avoid substring false positives (e.g., "x" matching "x_var")
         assert!(
-            !undefined_var_diags.iter().any(|d| d.message.contains("Undefined variable: x")),
+            !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: x"),
             "Parameter 'x' should not be flagged as undefined"
         );
         assert!(
-            !undefined_var_diags.iter().any(|d| d.message.contains("Undefined variable: y")),
+            !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: y"),
             "Parameter 'y' should not be flagged as undefined"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_expression_checked() {
+        // Test that identifiers in default parameter expressions ARE checked for undefined
+        // e.g., function(a = b) should flag 'b' as undefined if not defined
+        let mut state = create_test_state();
+        let code = r#"
+my_func <- function(a = undefined_var) {
+  a
+}
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+        
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics
+        );
+        
+        // Filter to only undefined variable warnings
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+        
+        // Print diagnostics for debugging
+        for diag in &undefined_var_diags {
+            println!("Diagnostic: {} at line {}", diag.message, diag.range.start.line);
+        }
+        
+        // The parameter name 'a' should NOT be flagged
+        assert!(
+            !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: a"),
+            "Parameter name 'a' should not be flagged as undefined"
+        );
+        
+        // The undefined variable in the default expression SHOULD be flagged
+        assert!(
+            undefined_var_diags.iter().any(|d| d.message == "Undefined variable: undefined_var"),
+            "Undefined variable 'undefined_var' in default expression should be flagged"
+        );
+    }
+
+    #[test]
+    fn test_default_parameter_with_defined_var() {
+        // Test that identifiers in default parameter expressions are NOT flagged if defined
+        let mut state = create_test_state();
+        let code = r#"
+default_value <- 42
+my_func <- function(a = default_value) {
+  a
+}
+"#;
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+        
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics
+        );
+        
+        // Filter to only undefined variable warnings
+        let undefined_var_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("Undefined variable: "))
+            .collect();
+        
+        // Print diagnostics for debugging
+        for diag in &undefined_var_diags {
+            println!("Diagnostic: {} at line {}", diag.message, diag.range.start.line);
+        }
+        
+        // Neither 'a' nor 'default_value' should be flagged
+        assert!(
+            !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: a"),
+            "Parameter name 'a' should not be flagged as undefined"
+        );
+        assert!(
+            !undefined_var_diags.iter().any(|d| d.message == "Undefined variable: default_value"),
+            "Defined variable 'default_value' should not be flagged as undefined"
         );
     }
 }
