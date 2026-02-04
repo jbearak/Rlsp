@@ -6,14 +6,14 @@ This implementation adds all Raven LSP configuration settings to the VS Code ext
 
 ## Tasks
 
-- [ ] 1. Add cross-file depth settings to package.json
+- [x] 1. Add cross-file depth settings to package.json
   - Add `raven.crossFile.maxBackwardDepth` (number, default 10)
   - Add `raven.crossFile.maxForwardDepth` (number, default 10)
   - Add `raven.crossFile.maxChainDepth` (number, default 20)
   - Include descriptions explaining each setting's purpose
   - _Requirements: 1.1, 1.2, 1.3, 9.1_
 
-- [ ] 2. Add cross-file behavior settings to package.json
+- [x] 2. Add cross-file behavior settings to package.json
   - Add `raven.crossFile.assumeCallSite` (enum: "start", "end", default "end")
   - Add `raven.crossFile.indexWorkspace` (boolean, default true)
   - Add `raven.crossFile.maxRevalidationsPerTrigger` (number, default 10)
@@ -21,7 +21,7 @@ This implementation adds all Raven LSP configuration settings to the VS Code ext
   - Include descriptions for each setting
   - _Requirements: 2.1, 2.2, 3.1, 4.1, 4.2, 9.1_
 
-- [ ] 3. Add cross-file diagnostic severity settings to package.json
+- [x] 3. Add cross-file diagnostic severity settings to package.json
   - Add `raven.crossFile.missingFileSeverity` (enum: error/warning/information/hint, default "warning")
   - Add `raven.crossFile.circularDependencySeverity` (enum, default "error")
   - Add `raven.crossFile.outOfScopeSeverity` (enum, default "warning")
@@ -30,19 +30,19 @@ This implementation adds all Raven LSP configuration settings to the VS Code ext
   - Include descriptions for each severity setting
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 9.1_
 
-- [ ] 4. Add on-demand indexing settings to package.json
+- [x] 4. Add on-demand indexing settings to package.json
   - Add `raven.crossFile.onDemandIndexing.enabled` (boolean, default true)
   - Add `raven.crossFile.onDemandIndexing.maxTransitiveDepth` (number, default 2)
   - Add `raven.crossFile.onDemandIndexing.maxQueueSize` (number, default 50)
   - Include descriptions for each setting
   - _Requirements: 6.1, 6.2, 6.3, 9.1_
 
-- [ ] 5. Add diagnostics settings to package.json
+- [x] 5. Add diagnostics settings to package.json
   - Add `raven.diagnostics.undefinedVariables` (boolean, default true)
   - Include description explaining the setting
   - _Requirements: 7.1, 9.1_
 
-- [ ] 6. Add package awareness settings to package.json
+- [x] 6. Add package awareness settings to package.json
   - Add `raven.packages.enabled` (boolean, default true)
   - Add `raven.packages.additionalLibraryPaths` (array of strings, default [])
   - Add `raven.packages.rPath` (string, default "")
@@ -50,44 +50,44 @@ This implementation adds all Raven LSP configuration settings to the VS Code ext
   - Include descriptions for each setting
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 9.1_
 
-- [ ] 7. Checkpoint - Verify package.json schema
+- [x] 7. Checkpoint - Verify package.json schema
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 8. Implement getInitializationOptions function in extension.ts
-  - [ ] 8.1 Create TypeScript interface for RavenInitializationOptions
+- [x] 8. Implement getInitializationOptions function in extension.ts
+  - [x] 8.1 Create TypeScript interface for RavenInitializationOptions
     - Define interface matching LSP server's expected JSON structure
     - Include optional fields for all settings
     - _Requirements: 10.2_
   
-  - [ ] 8.2 Implement getInitializationOptions function
+  - [x] 8.2 Implement getInitializationOptions function
     - Read all raven.* settings from VS Code configuration
     - Construct initializationOptions object with correct JSON paths
     - Only include explicitly configured settings (omit undefined)
     - _Requirements: 10.1, 10.4_
   
-  - [ ] 8.3 Write property test for settings transmission
+  - [x] 8.3 Write property test for settings transmission
     - **Property 1: Settings Transmission Correctness**
     - **Validates: Requirements 1.4, 2.3, 3.2, 4.3, 5.6, 6.4, 7.2, 8.5, 10.2**
 
-- [ ] 9. Wire initializationOptions to LanguageClient
+- [x] 9. Wire initializationOptions to LanguageClient
   - Update LanguageClient constructor to include initializationOptions
   - Call getInitializationOptions() during activation
   - _Requirements: 10.3_
 
-- [ ] 10. Implement configuration change handler
-  - [ ] 10.1 Register onDidChangeConfiguration listener
+- [x] 10. Implement configuration change handler
+  - [x] 10.1 Register onDidChangeConfiguration listener
     - Listen for changes to raven.* settings
     - _Requirements: 11.1_
   
-  - [ ] 10.2 Send didChangeConfiguration notification
+  - [x] 10.2 Send didChangeConfiguration notification
     - When settings change, read new configuration
     - Send workspace/didChangeConfiguration notification to LSP server
     - _Requirements: 11.2, 11.3_
 
-- [ ] 11. Checkpoint - Verify end-to-end functionality
+- [x] 11. Checkpoint - Verify end-to-end functionality
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 12. Write unit tests for settings reader
+- [-] 12. Write unit tests for settings reader
   - Test getInitializationOptions with various configurations
   - Test that unconfigured settings are omitted
   - Test nested settings structure (onDemandIndexing)

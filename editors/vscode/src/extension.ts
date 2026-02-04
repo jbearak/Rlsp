@@ -6,6 +6,222 @@ import {
     ServerOptions,
 } from 'vscode-languageclient/node';
 
+/**
+ * Severity level for diagnostic messages.
+ * Maps to LSP DiagnosticSeverity values.
+ */
+type SeverityLevel = "error" | "warning" | "information" | "hint";
+
+/**
+ * Initialization options passed to the Raven LSP server.
+ * This interface matches the JSON structure expected by the server's
+ * `parse_cross_file_config()` and related parsing functions.
+ */
+interface RavenInitializationOptions {
+    crossFile?: {
+        maxBackwardDepth?: number;
+        maxForwardDepth?: number;
+        maxChainDepth?: number;
+        assumeCallSite?: "start" | "end";
+        indexWorkspace?: boolean;
+        maxRevalidationsPerTrigger?: number;
+        revalidationDebounceMs?: number;
+        missingFileSeverity?: SeverityLevel;
+        circularDependencySeverity?: SeverityLevel;
+        outOfScopeSeverity?: SeverityLevel;
+        ambiguousParentSeverity?: SeverityLevel;
+        maxChainDepthSeverity?: SeverityLevel;
+        onDemandIndexing?: {
+            enabled?: boolean;
+            maxTransitiveDepth?: number;
+            maxQueueSize?: number;
+        };
+    };
+    diagnostics?: {
+        undefinedVariables?: boolean;
+    };
+    packages?: {
+        enabled?: boolean;
+        additionalLibraryPaths?: string[];
+        rPath?: string;
+        missingPackageSeverity?: SeverityLevel;
+    };
+}
+
+/**
+ * Check if a setting is explicitly configured (not using default).
+ * Uses config.inspect() to determine if the setting has a value at any scope.
+ */
+function isExplicitlyConfigured<T>(config: vscode.WorkspaceConfiguration, key: string): boolean {
+    const inspection = config.inspect<T>(key);
+    if (!inspection) {
+        return false;
+    }
+    // A setting is explicitly configured if it has a value at any scope
+    return (
+        inspection.globalValue !== undefined ||
+        inspection.workspaceValue !== undefined ||
+        inspection.workspaceFolderValue !== undefined ||
+        inspection.globalLanguageValue !== undefined ||
+        inspection.workspaceLanguageValue !== undefined ||
+        inspection.workspaceFolderLanguageValue !== undefined
+    );
+}
+
+/**
+ * Get a setting value only if it's explicitly configured.
+ * Returns undefined if the setting is using its default value.
+ */
+function getExplicitSetting<T>(config: vscode.WorkspaceConfiguration, key: string): T | undefined {
+    if (isExplicitlyConfigured<T>(config, key)) {
+        return config.get<T>(key);
+    }
+    return undefined;
+}
+
+/**
+ * Read all raven.* settings from VS Code configuration and construct
+ * the initializationOptions object for the LSP server.
+ * Only includes settings that are explicitly configured (omits defaults).
+ */
+function getInitializationOptions(): RavenInitializationOptions {
+    const config = vscode.workspace.getConfiguration('raven');
+    const options: RavenInitializationOptions = {};
+
+    // Cross-file depth settings
+    const maxBackwardDepth = getExplicitSetting<number>(config, 'crossFile.maxBackwardDepth');
+    const maxForwardDepth = getExplicitSetting<number>(config, 'crossFile.maxForwardDepth');
+    const maxChainDepth = getExplicitSetting<number>(config, 'crossFile.maxChainDepth');
+    const assumeCallSite = getExplicitSetting<"start" | "end">(config, 'crossFile.assumeCallSite');
+    const indexWorkspace = getExplicitSetting<boolean>(config, 'crossFile.indexWorkspace');
+    const maxRevalidationsPerTrigger = getExplicitSetting<number>(config, 'crossFile.maxRevalidationsPerTrigger');
+    const revalidationDebounceMs = getExplicitSetting<number>(config, 'crossFile.revalidationDebounceMs');
+    const missingFileSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.missingFileSeverity');
+    const circularDependencySeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.circularDependencySeverity');
+    const outOfScopeSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.outOfScopeSeverity');
+    const ambiguousParentSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.ambiguousParentSeverity');
+    const maxChainDepthSeverity = getExplicitSetting<SeverityLevel>(config, 'crossFile.maxChainDepthSeverity');
+
+    // On-demand indexing settings
+    const onDemandEnabled = getExplicitSetting<boolean>(config, 'crossFile.onDemandIndexing.enabled');
+    const onDemandMaxTransitiveDepth = getExplicitSetting<number>(config, 'crossFile.onDemandIndexing.maxTransitiveDepth');
+    const onDemandMaxQueueSize = getExplicitSetting<number>(config, 'crossFile.onDemandIndexing.maxQueueSize');
+
+    // Build onDemandIndexing object only if any setting is configured
+    let onDemandIndexing: {
+        enabled?: boolean;
+        maxTransitiveDepth?: number;
+        maxQueueSize?: number;
+    } | undefined = undefined;
+    if (onDemandEnabled !== undefined || onDemandMaxTransitiveDepth !== undefined || onDemandMaxQueueSize !== undefined) {
+        onDemandIndexing = {};
+        if (onDemandEnabled !== undefined) {
+            onDemandIndexing.enabled = onDemandEnabled;
+        }
+        if (onDemandMaxTransitiveDepth !== undefined) {
+            onDemandIndexing.maxTransitiveDepth = onDemandMaxTransitiveDepth;
+        }
+        if (onDemandMaxQueueSize !== undefined) {
+            onDemandIndexing.maxQueueSize = onDemandMaxQueueSize;
+        }
+    }
+
+    // Build crossFile object only if any setting is configured
+    if (
+        maxBackwardDepth !== undefined ||
+        maxForwardDepth !== undefined ||
+        maxChainDepth !== undefined ||
+        assumeCallSite !== undefined ||
+        indexWorkspace !== undefined ||
+        maxRevalidationsPerTrigger !== undefined ||
+        revalidationDebounceMs !== undefined ||
+        missingFileSeverity !== undefined ||
+        circularDependencySeverity !== undefined ||
+        outOfScopeSeverity !== undefined ||
+        ambiguousParentSeverity !== undefined ||
+        maxChainDepthSeverity !== undefined ||
+        onDemandIndexing !== undefined
+    ) {
+        options.crossFile = {};
+        if (maxBackwardDepth !== undefined) {
+            options.crossFile.maxBackwardDepth = maxBackwardDepth;
+        }
+        if (maxForwardDepth !== undefined) {
+            options.crossFile.maxForwardDepth = maxForwardDepth;
+        }
+        if (maxChainDepth !== undefined) {
+            options.crossFile.maxChainDepth = maxChainDepth;
+        }
+        if (assumeCallSite !== undefined) {
+            options.crossFile.assumeCallSite = assumeCallSite;
+        }
+        if (indexWorkspace !== undefined) {
+            options.crossFile.indexWorkspace = indexWorkspace;
+        }
+        if (maxRevalidationsPerTrigger !== undefined) {
+            options.crossFile.maxRevalidationsPerTrigger = maxRevalidationsPerTrigger;
+        }
+        if (revalidationDebounceMs !== undefined) {
+            options.crossFile.revalidationDebounceMs = revalidationDebounceMs;
+        }
+        if (missingFileSeverity !== undefined) {
+            options.crossFile.missingFileSeverity = missingFileSeverity;
+        }
+        if (circularDependencySeverity !== undefined) {
+            options.crossFile.circularDependencySeverity = circularDependencySeverity;
+        }
+        if (outOfScopeSeverity !== undefined) {
+            options.crossFile.outOfScopeSeverity = outOfScopeSeverity;
+        }
+        if (ambiguousParentSeverity !== undefined) {
+            options.crossFile.ambiguousParentSeverity = ambiguousParentSeverity;
+        }
+        if (maxChainDepthSeverity !== undefined) {
+            options.crossFile.maxChainDepthSeverity = maxChainDepthSeverity;
+        }
+        if (onDemandIndexing !== undefined) {
+            options.crossFile.onDemandIndexing = onDemandIndexing;
+        }
+    }
+
+    // Diagnostics settings
+    const undefinedVariables = getExplicitSetting<boolean>(config, 'diagnostics.undefinedVariables');
+    if (undefinedVariables !== undefined) {
+        options.diagnostics = {
+            undefinedVariables: undefinedVariables,
+        };
+    }
+
+    // Package settings
+    const packagesEnabled = getExplicitSetting<boolean>(config, 'packages.enabled');
+    const additionalLibraryPaths = getExplicitSetting<string[]>(config, 'packages.additionalLibraryPaths');
+    const rPath = getExplicitSetting<string>(config, 'packages.rPath');
+    const missingPackageSeverity = getExplicitSetting<SeverityLevel>(config, 'packages.missingPackageSeverity');
+
+    if (
+        packagesEnabled !== undefined ||
+        additionalLibraryPaths !== undefined ||
+        rPath !== undefined ||
+        missingPackageSeverity !== undefined
+    ) {
+        options.packages = {};
+        if (packagesEnabled !== undefined) {
+            options.packages.enabled = packagesEnabled;
+        }
+        if (additionalLibraryPaths !== undefined) {
+            options.packages.additionalLibraryPaths = additionalLibraryPaths;
+        }
+        if (rPath !== undefined) {
+            options.packages.rPath = rPath;
+        }
+        if (missingPackageSeverity !== undefined) {
+            options.packages.missingPackageSeverity = missingPackageSeverity;
+        }
+    }
+
+    return options;
+}
+
 let client: LanguageClient;
 
 function getServerPath(context: vscode.ExtensionContext): string {
@@ -74,6 +290,7 @@ export function activate(context: vscode.ExtensionContext) {
             fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{r,R,rmd,Rmd,qmd}'),
         },
         outputChannel: outputChannel,
+        initializationOptions: getInitializationOptions(),
     };
 
     client = new LanguageClient(
@@ -95,6 +312,19 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.window.onDidChangeVisibleTextEditors(() => {
             sendActivityNotification();
+        })
+    );
+
+    // Register configuration change listener
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((event) => {
+            if (event.affectsConfiguration('raven')) {
+                // Send updated configuration to LSP server
+                const settings = getInitializationOptions();
+                client.sendNotification('workspace/didChangeConfiguration', {
+                    settings: settings
+                });
+            }
         })
     );
 
