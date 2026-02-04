@@ -563,8 +563,13 @@ impl LanguageServer for Backend {
         let (scan_result, (new_package_library, package_library_ready)) =
             tokio::join!(scan_task, package_task);
 
-        let (index, imports, cross_file_entries, new_index_entries) =
-            scan_result.unwrap_or_default();
+        let (index, imports, cross_file_entries, new_index_entries) = match scan_result {
+            Ok(res) => res,
+            Err(e) => {
+                log::error!("Workspace scan task failed: {}", e);
+                Default::default()
+            }
+        };
 
         // Apply results under brief write lock
         {
