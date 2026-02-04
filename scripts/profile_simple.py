@@ -153,7 +153,7 @@ def main():
     print("\n" + "="*60)
     print("STDERR TIMELINE (first 50 lines)")
     print("="*60)
-    for i, (ts, line) in enumerate(stderr_lines[:50]):
+    for ts, line in stderr_lines[:50]:
         print(f"[{(ts - start_time)*1000:8.1f}ms] {line}")
 
 if __name__ == "__main__":

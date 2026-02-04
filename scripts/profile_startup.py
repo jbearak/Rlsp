@@ -159,7 +159,7 @@ def main():
     time.sleep(0.1)
 
     # Open the files
-    for i, file_path in enumerate(files_to_open):
+    for file_path in files_to_open:
         with open(file_path, 'r') as f:
             content = f.read()
 
