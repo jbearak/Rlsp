@@ -10,6 +10,8 @@ This feature adds a master switch configuration option (`raven.diagnostics.enabl
 - **Raven**: The static R Language Server providing LSP features
 - **CrossFileConfig**: The configuration struct that holds all cross-file and diagnostic settings
 - **Diagnostics**: Error, warning, information, or hint messages displayed in the editor for code issues
+- **raven.diagnostics.enabled**: The full VS Code setting name (user-facing configuration key)
+- **diagnostics.enabled**: The JSON path within LSP initialization options (server-side parsing path)
 
 ## Requirements
 
@@ -32,8 +34,8 @@ This feature adds a master switch configuration option (`raven.diagnostics.enabl
 
 1. THE CrossFileConfig struct SHALL include a `diagnostics_enabled` boolean field
 2. THE `diagnostics_enabled` field SHALL default to `true`
-3. WHEN parsing initialization options, THE configuration parser SHALL read the `diagnostics.enabled` setting from the LSP client
-4. IF the `diagnostics.enabled` setting is absent, THEN THE configuration parser SHALL use the default value of `true`
+3. WHEN parsing initialization options, THE configuration parser SHALL read the `diagnostics.enabled` path from the LSP client settings JSON (corresponding to the VS Code setting `raven.diagnostics.enabled`)
+4. IF the `diagnostics.enabled` path is absent in the settings JSON, THEN THE configuration parser SHALL use the default value of `true`
 
 ### Requirement 3: Diagnostics Suppression
 
