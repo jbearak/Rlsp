@@ -87,7 +87,7 @@ This implementation adds all Raven LSP configuration settings to the VS Code ext
 - [x] 11. Checkpoint - Verify end-to-end functionality
   - Ensure all tests pass, ask the user if questions arise.
 
-- [-] 12. Write unit tests for settings reader
+- [x] 12. Write unit tests for settings reader
   - Test getInitializationOptions with various configurations
   - Test that unconfigured settings are omitted
   - Test nested settings structure (onDemandIndexing)

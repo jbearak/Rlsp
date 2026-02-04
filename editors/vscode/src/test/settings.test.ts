@@ -623,6 +623,7 @@ suite('Settings Transmission Unit Tests', () => {
 
     /**
      * Unit test: Partial configuration only includes configured settings.
+     * **Validates: Requirement 10.4**
      */
     test('partial configuration only includes configured settings', () => {
         const configuredSettings = new Map<string, unknown>([
@@ -642,5 +643,183 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.crossFile?.assumeCallSite, undefined);
         assert.strictEqual(options.diagnostics, undefined);
         assert.strictEqual(options.packages?.rPath, undefined);
+    });
+
+    /**
+     * Unit test: Nested onDemandIndexing with partial settings.
+     * Verifies that the nested structure is created correctly when only some
+     * onDemandIndexing settings are configured.
+     * **Validates: Requirements 10.2, 10.4**
+     */
+    test('onDemandIndexing partial nested settings create correct structure', () => {
+        // Only configure one nested setting
+        const configuredSettings = new Map<string, unknown>([
+            ['crossFile.onDemandIndexing.enabled', true],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        // The nested structure should exist with only the configured setting
+        assert.strictEqual(options.crossFile?.onDemandIndexing?.enabled, true);
+        assert.strictEqual(options.crossFile?.onDemandIndexing?.maxTransitiveDepth, undefined);
+        assert.strictEqual(options.crossFile?.onDemandIndexing?.maxQueueSize, undefined);
+    });
+
+    /**
+     * Unit test: Parent object not created when no child settings configured.
+     * Verifies that parent objects (crossFile, diagnostics, packages) are not
+     * created when none of their child settings are configured.
+     * **Validates: Requirement 10.4**
+     */
+    test('parent objects not created when no child settings configured', () => {
+        // Configure only packages settings - crossFile and diagnostics should be absent
+        const configuredSettings = new Map<string, unknown>([
+            ['packages.enabled', true],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.crossFile, undefined);
+        assert.strictEqual(options.diagnostics, undefined);
+        assert.notStrictEqual(options.packages, undefined);
+        assert.strictEqual(options.packages?.enabled, true);
+    });
+
+    /**
+     * Unit test: All severity settings with different values.
+     * Verifies that each severity setting can be configured independently
+     * with different values.
+     * **Validates: Requirement 10.2**
+     */
+    test('all severity settings can have different values', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['crossFile.missingFileSeverity', 'error'],
+            ['crossFile.circularDependencySeverity', 'warning'],
+            ['crossFile.outOfScopeSeverity', 'information'],
+            ['crossFile.ambiguousParentSeverity', 'hint'],
+            ['crossFile.maxChainDepthSeverity', 'error'],
+            ['packages.missingPackageSeverity', 'warning'],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.crossFile?.missingFileSeverity, 'error');
+        assert.strictEqual(options.crossFile?.circularDependencySeverity, 'warning');
+        assert.strictEqual(options.crossFile?.outOfScopeSeverity, 'information');
+        assert.strictEqual(options.crossFile?.ambiguousParentSeverity, 'hint');
+        assert.strictEqual(options.crossFile?.maxChainDepthSeverity, 'error');
+        assert.strictEqual(options.packages?.missingPackageSeverity, 'warning');
+    });
+
+    /**
+     * Unit test: Empty array for additionalLibraryPaths.
+     * Verifies that an empty array is correctly transmitted.
+     * **Validates: Requirement 10.2**
+     */
+    test('empty array for additionalLibraryPaths transmits correctly', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['packages.additionalLibraryPaths', []],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.deepStrictEqual(options.packages?.additionalLibraryPaths, []);
+    });
+
+    /**
+     * Unit test: Empty string for rPath.
+     * Verifies that an empty string is correctly transmitted.
+     * **Validates: Requirement 10.2**
+     */
+    test('empty string for rPath transmits correctly', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['packages.rPath', ''],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.packages?.rPath, '');
+    });
+
+    /**
+     * Unit test: Boolean false values are transmitted (not omitted).
+     * Verifies that explicitly configured false values are included in output.
+     * **Validates: Requirements 10.2, 10.4**
+     */
+    test('boolean false values are transmitted not omitted', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['crossFile.indexWorkspace', false],
+            ['crossFile.onDemandIndexing.enabled', false],
+            ['diagnostics.undefinedVariables', false],
+            ['packages.enabled', false],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        // All false values should be present (not omitted)
+        assert.strictEqual(options.crossFile?.indexWorkspace, false);
+        assert.strictEqual(options.crossFile?.onDemandIndexing?.enabled, false);
+        assert.strictEqual(options.diagnostics?.undefinedVariables, false);
+        assert.strictEqual(options.packages?.enabled, false);
+    });
+
+    /**
+     * Unit test: Zero values for number settings are transmitted.
+     * Verifies that zero is a valid value and is transmitted correctly.
+     * **Validates: Requirement 10.2**
+     */
+    test('zero values for number settings are transmitted', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['crossFile.maxBackwardDepth', 0],
+            ['crossFile.revalidationDebounceMs', 0],
+            ['crossFile.onDemandIndexing.maxTransitiveDepth', 0],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.crossFile?.maxBackwardDepth, 0);
+        assert.strictEqual(options.crossFile?.revalidationDebounceMs, 0);
+        assert.strictEqual(options.crossFile?.onDemandIndexing?.maxTransitiveDepth, 0);
+    });
+
+    /**
+     * Unit test: Revalidation settings transmit correctly.
+     * **Validates: Requirement 10.2**
+     */
+    test('revalidation settings transmit correctly', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['crossFile.maxRevalidationsPerTrigger', 25],
+            ['crossFile.revalidationDebounceMs', 500],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.crossFile?.maxRevalidationsPerTrigger, 25);
+        assert.strictEqual(options.crossFile?.revalidationDebounceMs, 500);
+    });
+
+    /**
+     * Unit test: indexWorkspace boolean setting transmits correctly.
+     * **Validates: Requirement 10.2**
+     */
+    test('indexWorkspace boolean setting transmits correctly', () => {
+        for (const value of [true, false]) {
+            const configuredSettings = new Map<string, unknown>([
+                ['crossFile.indexWorkspace', value],
+            ]);
+
+            const mockConfig = createMockConfig(configuredSettings);
+            const options = getInitializationOptions(mockConfig);
+
+            assert.strictEqual(options.crossFile?.indexWorkspace, value);
+        }
     });
 });
