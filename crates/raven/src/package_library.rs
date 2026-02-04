@@ -539,6 +539,42 @@ impl PackageLibrary {
     /// Requirement 7.1: THE LSP SHALL query R subprocess to get library paths
     /// using `.libPaths()`
     pub async fn initialize(&mut self) -> anyhow::Result<()> {
+        // Try batched initialization first (single R subprocess call)
+        // This is significantly faster than individual calls (~700-2100ms savings)
+        if let Some(ref r_subprocess) = self.r_subprocess {
+            match r_subprocess.initialize_batch().await {
+                Ok(batch_result) => {
+                    self.base_exports = batch_result.all_base_exports();
+                    self.base_packages = batch_result.base_packages.iter().cloned().collect();
+                    self.lib_paths = batch_result.lib_paths;
+
+                    log::trace!(
+                        "Initialized PackageLibrary via batch: {} lib_paths, {} base_packages, {} base_exports",
+                        self.lib_paths.len(),
+                        self.base_packages.len(),
+                        self.base_exports.len()
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::trace!(
+                        "Batch initialization failed: {}, falling back to sequential",
+                        e
+                    );
+                    // Fall through to sequential initialization
+                }
+            }
+        }
+
+        // Fallback: Sequential initialization (used when R is unavailable or batch fails)
+        self.initialize_sequential().await
+    }
+
+    /// Sequential initialization fallback
+    ///
+    /// This is the original initialization path, used when batch initialization fails
+    /// or when R subprocess is not available.
+    async fn initialize_sequential(&mut self) -> anyhow::Result<()> {
         // Step 1: Get library paths from R or use fallback
         let lib_paths = if let Some(ref r_subprocess) = self.r_subprocess {
             match r_subprocess.get_lib_paths().await {
@@ -616,7 +652,7 @@ impl PackageLibrary {
         }
 
         log::trace!(
-            "Initialized PackageLibrary with {} lib_paths, {} base_packages, {} base_exports",
+            "Initialized PackageLibrary (sequential) with {} lib_paths, {} base_packages, {} base_exports",
             self.lib_paths.len(),
             self.base_packages.len(),
             all_base_exports.len()

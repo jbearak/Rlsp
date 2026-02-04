@@ -494,9 +494,17 @@ impl LanguageServer for Backend {
     /// ```
     async fn initialized(&self, _: InitializedParams) {
         log::info!("ark-lsp initialized");
+        let init_start = std::time::Instant::now();
 
         // Get workspace folders and config under brief lock
-        let (folders, max_chain_depth, packages_enabled, packages_r_path, additional_paths) = {
+        let (
+            folders,
+            max_chain_depth,
+            packages_enabled,
+            packages_r_path,
+            additional_paths,
+            index_workspace,
+        ) = {
             let state = self.state.read().await;
             (
                 state.workspace_folders.clone(),
@@ -507,16 +515,59 @@ impl LanguageServer for Backend {
                     .cross_file_config
                     .packages_additional_library_paths
                     .clone(),
+                state.cross_file_config.index_workspace,
             )
         };
 
-        // Task A: Scan workspace without holding lock (Requirement 13a)
+        // Task A: Spawn background workspace scan (don't await - runs in background)
+        // This allows LSP to respond to requests immediately while scan completes.
+        // Files the user opens will be indexed on-demand via did_open, which takes
+        // priority over the background scan.
+        let state_clone = self.state.clone();
         let folders_clone = folders.clone();
-        let scan_task =
-            tokio::task::spawn_blocking(move || scan_workspace(&folders_clone, max_chain_depth));
+        if index_workspace {
+            tokio::task::spawn(async move {
+                // Run the blocking scan in a blocking task
+                let scan_result = tokio::task::spawn_blocking(move || {
+                    let scan_start = std::time::Instant::now();
+                    let result = scan_workspace(&folders_clone, max_chain_depth);
+                    let scan_duration = scan_start.elapsed();
+                    let file_count = result.0.len();
+                    crate::perf::record_workspace_scan(scan_duration, file_count);
+                    log::info!(
+                        "[Background] Workspace scan complete: {} files in {:?}",
+                        file_count,
+                        scan_duration
+                    );
+                    result
+                })
+                .await;
 
-        // Task B: Initialize PackageLibrary concurrently
-        let package_task = async move {
+                // Apply results when scan completes
+                match scan_result {
+                    Ok((index, imports, cross_file_entries, new_index_entries)) => {
+                        let mut state = state_clone.write().await;
+                        state.apply_workspace_index(
+                            index,
+                            imports,
+                            cross_file_entries,
+                            new_index_entries,
+                        );
+                        log::info!("[Background] Workspace index applied");
+                    }
+                    Err(e) => {
+                        log::error!("Background workspace scan task failed: {}", e);
+                    }
+                }
+            });
+        }
+
+        // Task B: Initialize PackageLibrary (await this - diagnostics need it)
+        // This is fast (~100ms) due to batched R subprocess calls.
+        let (new_package_library, package_library_ready) = {
+            let pkg_start = std::time::Instant::now();
+            let r_calls_before = crate::perf::get_r_subprocess_calls();
+
             if packages_enabled {
                 // Get workspace root from folders (if available) for R working directory (e.g. for renv)
                 let workspace_root = folders.first().and_then(|url| url.to_file_path().ok());
@@ -543,6 +594,11 @@ impl LanguageServer for Backend {
                 };
                 // Add additional library paths (dedup)
                 lib.add_library_paths(&additional_paths);
+
+                let pkg_duration = pkg_start.elapsed();
+                let r_calls = crate::perf::get_r_subprocess_calls() - r_calls_before;
+                crate::perf::record_package_init(pkg_duration, r_calls);
+
                 log::info!(
                     "PackageLibrary initialized: {} lib_paths, {} base_packages, {} base_exports",
                     lib.lib_paths().len(),
@@ -559,27 +615,21 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Run both tasks concurrently
-        let (scan_result, (new_package_library, package_library_ready)) =
-            tokio::join!(scan_task, package_task);
-
-        let (index, imports, cross_file_entries, new_index_entries) = match scan_result {
-            Ok(res) => res,
-            Err(e) => {
-                log::error!("Workspace scan task failed: {}", e);
-                Default::default()
-            }
-        };
-
-        // Apply results under brief write lock
+        // Apply PackageLibrary immediately (workspace index will be applied when background scan completes)
         {
             let mut state = self.state.write().await;
-            state.apply_workspace_index(index, imports, cross_file_entries, new_index_entries);
             state.package_library = new_package_library;
             state.package_library_ready = package_library_ready;
         }
 
-        log::info!("Workspace initialization complete");
+        let init_duration = init_start.elapsed();
+        if crate::perf::is_enabled() {
+            log::info!("[PERF] Total initialization: {:?}", init_duration);
+            crate::perf::startup_metrics().lock().ok().map(|m| m.log_summary());
+        }
+        log::info!(
+            "Initialization complete (workspace scan running in background)"
+        );
     }
 
     async fn shutdown(&self) -> Result<()> {

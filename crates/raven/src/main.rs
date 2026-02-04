@@ -16,6 +16,7 @@ mod help;
 mod namespace_parser;
 mod package_library;
 mod parser_pool;
+mod perf;
 mod r_env;
 mod r_subprocess;
 mod reserved_words;

@@ -36,6 +36,8 @@ Sight is TypeScript-based while Raven is Rust-based, so implementations need ada
 - `cargo build -p raven` - Debug build
 - `cargo build --release -p raven` - Release build
 - `cargo test -p raven` - Run tests
+- `cargo bench --bench startup` - Run performance benchmarks
+- `RAVEN_PERF=1 cargo run -p raven -- --stdio` - Run with performance timing enabled
 - `./setup.sh` - Build and install everything
 
 ## LSP Architecture
@@ -55,10 +57,20 @@ Raven uses an ephemeral R subprocess strategy to query dynamic information (libr
 - **Ephemeral**: Subprocesses are spawned on-demand for specific queries and destroyed immediately. No persistent REPL or session state is maintained.
 - **Lightweight**: All commands run with `--vanilla --slave` to suppress user profiles (`.Rprofile`, `.Renviron`) and startup messages, ensuring predictable behavior and minimal latency.
 
-### Parallel Initialization
-To minimize startup time, the R interface initializes concurrently with workspace indexing:
-1. **Non-Blocking Discovery**: R executable path discovery (`which`/`where`) runs in a blocking task to avoid stalling the async runtime.
-2. **Parallel Execution**: `backend.rs` spawns the workspace scanner (CPU-bound) and PackageLibrary initializer (IO/Process-bound) simultaneously.
+### Initialization Architecture
+To minimize user-perceived startup latency:
+
+1. **Background Workspace Scanning**: The full workspace scan runs in background via `tokio::spawn()` and does not block LSP responsiveness. Files are indexed incrementally as the scan progresses.
+
+2. **Foreground PackageLibrary Init**: Only the PackageLibrary initialization (~100ms) is awaited before returning from `initialized()`. This uses batched R subprocess calls (`initialize_batch()`) to query lib_paths, base_packages, and all base package exports in a single R invocation.
+
+3. **On-Demand File Indexing**: When a user opens a file, `did_open()` immediately indexes:
+   - The opened file itself
+   - Direct dependencies (files in `source()` calls and `@lsp-source` directives)
+   - Backward directive targets (`@lsp-sourced-by`, `@lsp-run-by`)
+   - Transitive dependencies are queued for background indexing
+
+4. **Priority-Based Processing**: `CrossFileActivityState` tracks active, visible, and recent documents. Revalidation and diagnostics prioritize files the user is actually looking at.
 
 ### Project Environment Support (`renv`)
 Raven supports project-local package libraries (like `renv`):
@@ -292,6 +304,18 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - For intentionally-unused public APIs, either wire them into a caller or add a localized `#[allow(dead_code)]` with a brief comment to avoid warning noise.
 - Base exports must be gated by `package_library_ready` to avoid using empty exports before R subprocess initialization completes.
 - When adding parameters to scope resolution functions, update all callers including test helpers.
+
+### Performance & Profiling
+
+- R subprocess spawning is expensive (~100-300ms each); batch multiple queries into single R invocations where possible using `RSubprocess::initialize_batch()`.
+- Use `RAVEN_PERF=1` environment variable to enable timing logs for diagnosing startup latency.
+- Workspace scanning runs in background (`tokio::spawn`) while PackageLibrary initialization is awaited - LSP becomes responsive after ~100ms (package init) rather than waiting for full workspace scan.
+- Sequential per-package export queries in the old `PackageLibrary::initialize()` path can add 700-2100ms to startup; the batched path reduces this to a single R subprocess call (~100ms).
+- `SKIP_DIRECTORIES` in `state.rs` filters node_modules, .git, and target during workspace scan - keep this list minimal to avoid skipping legitimate R code locations.
+- Files opened by the user are indexed on-demand via `did_open`, with their dependencies taking priority over background workspace scanning.
+- For criterion benchmarks, use `async_tokio` feature and run with `cargo bench --bench startup`.
+- The `perf.rs` module provides `TimingGuard` for RAII-style timing and `PerfMetrics` for aggregated startup analysis.
+- Key instrumentation points: `initialized()` for overall init, `scan_workspace()` for file scanning, `execute_r_code()` for R subprocess calls.
 
 ### Rust/Clippy Best Practices
 
