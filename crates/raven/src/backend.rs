@@ -107,20 +107,20 @@ struct ActiveDocumentsChangedParams {
 
 /// Parse cross-file configuration from LSP settings.
 ///
-/// Reads the top-level `crossFile` section (and related `diagnostics` and `packages`
-/// settings) from a serde_json::Value and constructs a populated `CrossFileConfig`.
-/// Only fields present in the provided JSON are applied; absent fields retain their
-/// defaults from `CrossFileConfig::default()`.
+/// Reads the top-level `crossFile`, `diagnostics`, and `packages` sections from a
+/// serde_json::Value and constructs a populated `CrossFileConfig`. Only fields
+/// present in the provided JSON are applied; absent fields retain their defaults
+/// from `CrossFileConfig::default()`.
 ///
 /// Supported top-level keys read:
 /// - `crossFile`: core cross-file behavior and diagnostic severities.
-/// - `diagnostics.undefinedVariables`: enables undefined variable diagnostics.
+/// - `diagnostics.enabled` and `diagnostics.undefinedVariables`: diagnostics master switch and undefined variable diagnostics.
 /// - `packages`: package-related settings (`enabled`, `additionalLibraryPaths`, `rPath`, `missingPackageSeverity`).
 ///
 /// # Returns
 ///
-/// `Some(CrossFileConfig)` populated from `settings` when the top-level `crossFile`
-/// section is present; `None` if `crossFile` is missing.
+/// `Some(CrossFileConfig)` populated from `settings` when at least one of
+/// `crossFile`, `diagnostics`, or `packages` is present; `None` if all are missing.
 ///
 /// # Examples
 ///
@@ -139,7 +139,7 @@ struct ActiveDocumentsChangedParams {
 ///         "rPath": "/usr/bin/R",
 ///         "missingPackageSeverity": "information"
 ///     },
-///     "diagnostics": { "undefinedVariables": false }
+///     "diagnostics": { "enabled": true, "undefinedVariables": false }
 /// });
 ///
 /// let cfg = crate::backend::parse_cross_file_config(&settings);
@@ -148,6 +148,7 @@ struct ActiveDocumentsChangedParams {
 /// assert_eq!(cfg.max_backward_depth, 5);
 /// assert!(cfg.index_workspace);
 /// assert!(cfg.packages_enabled);
+/// assert!(cfg.diagnostics_enabled);
 /// ```
 pub(crate) fn parse_cross_file_config(
     settings: &serde_json::Value,
