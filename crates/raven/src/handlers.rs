@@ -545,7 +545,7 @@ async fn collect_missing_file_diagnostics_standalone(
     for source in &meta.sources {
         let resolved = forward_ctx
             .as_ref()
-            .and_then(|ctx| crate::cross_file::path_resolve::resolve_path(&source.path, ctx));
+            .and_then(|ctx| crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx));
         if let Some(path) = resolved {
             if let Some(root) = &workspace_root {
                 if !path.starts_with(root) {
@@ -711,9 +711,11 @@ fn collect_missing_file_diagnostics(
         crate::cross_file::path_resolve::PathContext::new(uri, state.workspace_folders.first());
 
     // Check forward sources (source() calls and @lsp-source directives)
+    // Uses workspace-root fallback for files without @lsp-cd directives
     for source in &meta.sources {
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            let path = crate::cross_file::path_resolve::resolve_path(&source.path, ctx)?;
+            let path =
+                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)?;
             crate::cross_file::path_resolve::path_to_uri(&path)
         });
         if let Some(target_uri) = resolved {
@@ -816,9 +818,11 @@ pub async fn collect_missing_file_diagnostics_async(
     // Collect all URIs to check
     let mut uris_to_check: Vec<(Url, String, u32, u32, bool)> = Vec::new(); // (uri, path, line, col, is_backward)
 
+    // Uses workspace-root fallback for files without @lsp-cd directives
     for source in &meta.sources {
         let resolved = forward_ctx.as_ref().and_then(|ctx| {
-            let path = crate::cross_file::path_resolve::resolve_path(&source.path, ctx)?;
+            let path =
+                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)?;
             crate::cross_file::path_resolve::path_to_uri(&path)
         });
         if let Some(target_uri) = resolved {

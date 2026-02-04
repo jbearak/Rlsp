@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 use tower_lsp::lsp_types::Url;
 
 use crate::cross_file::file_cache::FileSnapshot;
-use crate::cross_file::path_resolve::{resolve_path, PathContext};
+use crate::cross_file::path_resolve::{
+    resolve_path, resolve_path_with_workspace_fallback, PathContext,
+};
 use crate::cross_file::scope::compute_artifacts;
 use crate::cross_file::{extract_metadata, CrossFileMetadata};
 use crate::state::WorldState;
@@ -371,9 +373,10 @@ impl BackgroundIndexer {
         let path_ctx =
             PathContext::from_metadata(uri, metadata, workspace_root.as_ref().map(|u| u as &Url));
 
+        // Uses workspace-root fallback for files without @lsp-cd directives
         for source in &metadata.sources {
             if let Some(ctx) = path_ctx.as_ref() {
-                if let Some(resolved) = resolve_path(&source.path, ctx) {
+                if let Some(resolved) = resolve_path_with_workspace_fallback(&source.path, ctx) {
                     if let Ok(source_uri) = Url::from_file_path(resolved) {
                         // Check if file needs indexing
                         let needs_indexing = {

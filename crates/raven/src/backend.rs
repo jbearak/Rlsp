@@ -749,7 +749,7 @@ impl LanguageServer for Backend {
                 for source in &meta.sources {
                     if let Some(ctx) = path_ctx.as_ref() {
                         if let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
+                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
                         {
                             if let Ok(source_uri) = Url::from_file_path(resolved) {
                                 // Check if file needs indexing (not open, not in workspace index)
@@ -1000,7 +1000,7 @@ impl LanguageServer for Backend {
                     for source in &meta.sources {
                         if let Some(ctx) = path_ctx.as_ref() {
                             if let Some(resolved) =
-                                crate::cross_file::path_resolve::resolve_path(&source.path, ctx)
+                                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, ctx)
                             {
                                 if let Ok(source_uri) = Url::from_file_path(resolved) {
                                     let needs_indexing = {
@@ -1123,7 +1123,7 @@ impl LanguageServer for Backend {
                 {
                     for source in &meta.sources {
                         if let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path(&source.path, &forward_ctx)
+                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, &forward_ctx)
                         {
                             log::trace!(
                                 "did_open re-enrich: source() {} -> {}",
@@ -1156,7 +1156,7 @@ impl LanguageServer for Backend {
                 {
                     for source in &meta.sources {
                         if let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path(&source.path, &forward_ctx)
+                            crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, &forward_ctx)
                         {
                             if let Ok(child_uri) = Url::from_file_path(resolved) {
                                 let needs_indexing = {
@@ -2684,7 +2684,7 @@ impl Backend {
 
             for source in &meta.sources {
                 if let Some(resolved) =
-                    crate::cross_file::path_resolve::resolve_path(&source.path, &forward_ctx)
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(&source.path, &forward_ctx)
                 {
                     log::trace!(
                         "index_forward_chain: {} -> child {}",

@@ -186,6 +186,34 @@ Working directory synonyms: `@lsp-working-directory`, `@lsp-working-dir`, `@lsp-
 - Uses `PathContext::from_metadata()` which includes working_directory from metadata
 - Applied via `do_resolve()` helper in `dependency.rs`
 
+#### Workspace-Root Fallback for Unannotated Codebases
+
+For codebases without LSP directives (no @lsp-cd), source() paths are often written relative to the workspace root (e.g., the project is typically run from the root directory). To support these codebases without requiring LSP annotations:
+
+**Fallback Behavior** (source() statements only):
+1. First, try resolving relative to file's directory (standard behavior)
+2. If file doesn't exist AND the file has no @lsp-cd directive AND no inherited working directory:
+   - Try resolving relative to workspace root
+   - Use workspace-resolved path if it exists
+
+**Example**:
+```r
+# File: scripts/analysis.R (no LSP directives)
+# Workspace root: /project
+
+source("data/load.R")  # File is at /project/data/load.R
+```
+
+Resolution:
+1. Try `/project/scripts/data/load.R` (file-relative) - doesn't exist
+2. Try `/project/data/load.R` (workspace-root fallback) - exists, use this
+
+**Important**: This fallback only applies to source() statements, NOT to LSP directives like @lsp-sourced-by.
+
+**Implementation**:
+- `resolve_path_with_workspace_fallback()` in `path_resolve.rs`
+- Checks `has_explicit_wd` (from @lsp-cd) and `has_inherited_wd` (from parent chain) to determine if fallback should apply
+
 #### Example Scenario
 ```r
 # File: subdir/child.r
@@ -340,6 +368,8 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - For intentionally-unused public APIs, either wire them into a caller or add a localized `#[allow(dead_code)]` with a brief comment to avoid warning noise.
 - Base exports must be gated by `package_library_ready` to avoid using empty exports before R subprocess initialization completes.
 - When adding parameters to scope resolution functions, update all callers including test helpers.
+- For unannotated codebases (no @lsp-cd directives), use workspace-root fallback for source() path resolution - many R projects assume scripts run from the project root.
+- The workspace-root fallback should ONLY apply when the file has no explicit @lsp-cd and no inherited working directory from parent chain; don't override intentional working directory configuration.
 - When profiling LSP startup, use binary mode (not `text=True`) in Python subprocess calls - text mode can cause 30+ second delays due to buffering/encoding issues with LSP protocol.
 - Profile with realistic workspaces: a workspace with many `library()` calls across files reveals bottlenecks that toy examples miss.
 - Package export prefetching happens in background after `did_open` returns, but diagnostics wait for it - batch queries to minimize wait time.
