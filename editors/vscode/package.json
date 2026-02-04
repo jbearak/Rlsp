@@ -12,7 +12,9 @@
   "engines": {
     "vscode": "^1.75.0"
   },
-  "categories": ["Programming Languages"],
+  "categories": [
+    "Programming Languages"
+  ],
   "activationEvents": [
     "onLanguage:r"
   ],
@@ -21,8 +23,17 @@
     "languages": [
       {
         "id": "r",
-        "aliases": ["R", "r"],
-        "extensions": [".r", ".R", ".rmd", ".Rmd", ".qmd"],
+        "aliases": [
+          "R",
+          "r"
+        ],
+        "extensions": [
+          ".r",
+          ".R",
+          ".rmd",
+          ".Rmd",
+          ".qmd"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -37,9 +48,203 @@
         },
         "raven.editor.dotInWordSeparators": {
           "type": "string",
-          "enum": ["ask", "yes", "no"],
+          "enum": [
+            "ask",
+            "yes",
+            "no"
+          ],
           "default": "ask",
           "description": "Whether to exclude dots from word separators in R files. 'ask' prompts on first use, 'yes' always applies the setting, 'no' never applies it."
+        },
+        "raven.crossFile.maxBackwardDepth": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "description": "Maximum depth for backward traversal when resolving cross-file dependencies. Controls how many levels of parent files (files that source the current file) are analyzed. Higher values provide more complete analysis but may impact performance in deeply nested projects."
+        },
+        "raven.crossFile.maxForwardDepth": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "description": "Maximum depth for forward traversal when resolving cross-file dependencies. Controls how many levels of sourced files (files sourced by the current file) are analyzed. Higher values provide more complete symbol resolution but may impact performance."
+        },
+        "raven.crossFile.maxChainDepth": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "description": "Maximum total chain depth for cross-file dependency resolution. Limits the combined depth of forward and backward traversal to prevent excessive analysis in complex dependency graphs. Default is 20."
+        },
+        "raven.crossFile.assumeCallSite": {
+          "type": "string",
+          "enum": [
+            "start",
+            "end"
+          ],
+          "enumDescriptions": [
+            "Assume symbols from sourced files are available from the start of the file",
+            "Assume symbols from sourced files are available from the end of the file"
+          ],
+          "default": "end",
+          "description": "Default call site assumption when the actual source() call location cannot be determined. Controls symbol availability: 'start' makes symbols available from the beginning of the file, 'end' makes them available only after the presumed source() call at the end."
+        },
+        "raven.crossFile.indexWorkspace": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable workspace indexing for cross-file awareness. When enabled, closed files in the workspace are indexed to provide symbol information for cross-file features like completions and go-to-definition."
+        },
+        "raven.crossFile.maxRevalidationsPerTrigger": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "description": "Maximum number of dependent files to revalidate when a file changes. Limits the cascade of diagnostic updates to prevent performance issues in projects with many cross-file dependencies."
+        },
+        "raven.crossFile.revalidationDebounceMs": {
+          "type": "number",
+          "default": 200,
+          "minimum": 0,
+          "description": "Debounce delay in milliseconds before triggering cross-file revalidation after a file change. Higher values reduce CPU usage during rapid editing but delay diagnostic updates."
+        },
+        "raven.crossFile.missingFileSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "enumDescriptions": [
+            "Report missing sourced files as errors",
+            "Report missing sourced files as warnings",
+            "Report missing sourced files as information",
+            "Report missing sourced files as hints"
+          ],
+          "default": "warning",
+          "description": "Severity level for diagnostics when a sourced file cannot be found. Controls how missing file references in source() calls and LSP directives are reported."
+        },
+        "raven.crossFile.circularDependencySeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "enumDescriptions": [
+            "Report circular dependencies as errors",
+            "Report circular dependencies as warnings",
+            "Report circular dependencies as information",
+            "Report circular dependencies as hints"
+          ],
+          "default": "error",
+          "description": "Severity level for diagnostics when circular dependencies are detected between files. Circular dependencies occur when file A sources file B which directly or indirectly sources file A."
+        },
+        "raven.crossFile.outOfScopeSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "enumDescriptions": [
+            "Report out-of-scope symbol usage as errors",
+            "Report out-of-scope symbol usage as warnings",
+            "Report out-of-scope symbol usage as information",
+            "Report out-of-scope symbol usage as hints"
+          ],
+          "default": "warning",
+          "description": "Severity level for diagnostics when symbols are used before they are available in scope. This can occur when referencing symbols from a sourced file before the source() call."
+        },
+        "raven.crossFile.ambiguousParentSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "enumDescriptions": [
+            "Report ambiguous parent resolution as errors",
+            "Report ambiguous parent resolution as warnings",
+            "Report ambiguous parent resolution as information",
+            "Report ambiguous parent resolution as hints"
+          ],
+          "default": "warning",
+          "description": "Severity level for diagnostics when a file's parent cannot be unambiguously determined. This occurs when multiple files source the same child file and the call site cannot be resolved."
+        },
+        "raven.crossFile.maxChainDepthSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "enumDescriptions": [
+            "Report max chain depth exceeded as errors",
+            "Report max chain depth exceeded as warnings",
+            "Report max chain depth exceeded as information",
+            "Report max chain depth exceeded as hints"
+          ],
+          "default": "warning",
+          "description": "Severity level for diagnostics when the maximum chain depth is exceeded during cross-file dependency resolution. This indicates the dependency chain is deeper than the configured maxChainDepth limit."
+        },
+        "raven.crossFile.onDemandIndexing.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable on-demand background indexing of files not currently open in the editor. When enabled, files referenced by source() calls and LSP directives are automatically indexed to provide cross-file symbol resolution."
+        },
+        "raven.crossFile.onDemandIndexing.maxTransitiveDepth": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "description": "Maximum depth for transitive dependency indexing. Controls how many levels of indirect dependencies (files sourced by sourced files) are indexed in the background. Higher values provide more complete cross-file awareness but increase indexing workload."
+        },
+        "raven.crossFile.onDemandIndexing.maxQueueSize": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "description": "Maximum number of files that can be queued for background indexing. Limits memory usage and prevents excessive background work in projects with many transitive dependencies."
+        },
+        "raven.diagnostics.undefinedVariables": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable diagnostics for undefined variables. When enabled, Raven reports variables that are used but not defined in the current scope, sourced files, or loaded packages. Disable this setting to suppress undefined variable warnings if they produce too many false positives in your workflow."
+        },
+        "raven.packages.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable package awareness features. When enabled, Raven analyzes library() calls to provide completions, hover information, and diagnostics for R package functions. Disable this setting if you don't need package-aware features or want to reduce resource usage."
+        },
+        "raven.packages.additionalLibraryPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional library paths to search for R packages. These paths are searched in addition to the default R library paths. Useful for projects with packages installed in non-standard locations or custom library directories."
+        },
+        "raven.packages.rPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the R executable. If empty, Raven searches for R in the system PATH. Specify this setting if R is installed in a non-standard location or if you want to use a specific R installation."
+        },
+        "raven.packages.missingPackageSeverity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "information",
+            "hint"
+          ],
+          "enumDescriptions": [
+            "Report missing packages as errors",
+            "Report missing packages as warnings",
+            "Report missing packages as information",
+            "Report missing packages as hints"
+          ],
+          "default": "warning",
+          "description": "Severity level for diagnostics when a package referenced in library() cannot be found. Controls how missing package references are reported in the editor."
         }
       }
     }
@@ -68,6 +273,7 @@
     "@vscode/test-electron": "^2.3.9",
     "@vscode/vsce": "^2.22.0",
     "esbuild": "^0.27.2",
+    "fast-check": "^4.5.3",
     "mocha": "^10.2.0",
     "typescript": "^5.0.0"
   }
