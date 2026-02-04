@@ -14,7 +14,7 @@
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 static INDEX_EXPORTS_CACHE: OnceLock<DashMap<PathBuf, Vec<String>>> = OnceLock::new();
@@ -482,14 +482,36 @@ pub async fn parse_index_exports(package_dir: &Path) -> Result<Vec<String>> {
 
     let index_path = package_dir.join("INDEX");
 
+    // Basic validation: `package_dir` should not contain path-traversal components.
+    // (Defense in depth: package names ultimately come from user code.)
+    if package_dir
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "Suspicious package_dir {:?} when reading INDEX file {:?}",
+            package_dir,
+            index_path
+        ));
+    }
+
     // Offload filesystem I/O from the LSP request executor.
     let content = tokio::task::spawn_blocking({
         let index_path = index_path.clone();
-        move || fs::read_to_string(&index_path)
+        let package_dir = cache_key.clone();
+        move || {
+            if !package_dir.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("package_dir is not a directory: {:?}", package_dir),
+                ));
+            }
+            fs::read_to_string(&index_path)
+        }
     })
     .await
-    .map_err(|e| anyhow!("Failed to read INDEX file {:?}: {}", index_path, e))?
-    .map_err(|e| anyhow!("Failed to read INDEX file {:?}: {}", index_path, e))?;
+    .map_err(|e| anyhow!("Task join error reading INDEX file {:?}: {e}", index_path))?
+    .map_err(|e| anyhow!("Failed to read INDEX file {:?}: {e}", index_path))?;
 
     let exports = parse_index_content(&content);
     index_exports_cache().insert(cache_key, exports.clone());
@@ -540,8 +562,8 @@ fn is_valid_r_identifier(s: &str) -> bool {
         return false;
     }
 
-    // Backtick-quoted identifiers are valid
-    if s.starts_with('`') && s.ends_with('`') && s.len() >= 2 {
+    // Backtick-quoted identifiers are valid, but must not be empty.
+    if s.starts_with('`') && s.ends_with('`') && s.len() > 2 {
         return true;
     }
 
