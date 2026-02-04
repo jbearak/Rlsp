@@ -72,6 +72,21 @@ To minimize user-perceived startup latency:
 
 4. **Priority-Based Processing**: `CrossFileActivityState` tracks active, visible, and recent documents. Revalidation and diagnostics prioritize files the user is actually looking at.
 
+### R Subprocess API (`r_subprocess.rs`)
+
+Key methods for querying R:
+
+| Method | Purpose | Performance |
+|--------|---------|-------------|
+| `initialize_batch()` | Get lib_paths, base_packages, base exports in one call | ~100ms |
+| `get_multiple_package_exports()` | Batch export queries for N packages | ~100-500ms (vs N*100ms) |
+| `get_package_exports()` | Single package exports | ~75-350ms |
+| `get_package_depends()` | Package DESCRIPTION Depends field | ~75-100ms |
+| `get_lib_paths()` | R library paths | ~75-100ms |
+| `get_base_packages()` | Currently loaded packages | ~75-100ms |
+
+All methods validate package names to prevent R code injection.
+
 ### Project Environment Support (`renv`)
 Raven supports project-local package libraries (like `renv`):
 - **Working Directory**: The R subprocess is spawned with the workspace root as its working directory.
@@ -304,18 +319,40 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - For intentionally-unused public APIs, either wire them into a caller or add a localized `#[allow(dead_code)]` with a brief comment to avoid warning noise.
 - Base exports must be gated by `package_library_ready` to avoid using empty exports before R subprocess initialization completes.
 - When adding parameters to scope resolution functions, update all callers including test helpers.
+- When profiling LSP startup, use binary mode (not `text=True`) in Python subprocess calls - text mode can cause 30+ second delays due to buffering/encoding issues with LSP protocol.
+- Profile with realistic workspaces: a workspace with many `library()` calls across files reveals bottlenecks that toy examples miss.
+- Package export prefetching happens in background after `did_open` returns, but diagnostics wait for it - batch queries to minimize wait time.
+- Filter already-cached packages before querying R to avoid redundant subprocess calls.
+- When parsing structured R output (markers like `__PKG:name__`), handle missing end markers gracefully to avoid losing partial results.
 
 ### Performance & Profiling
 
-- R subprocess spawning is expensive (~100-300ms each); batch multiple queries into single R invocations where possible using `RSubprocess::initialize_batch()`.
+- R subprocess spawning is expensive (~75-350ms each); batch multiple queries into single R invocations where possible.
 - Use `RAVEN_PERF=1` environment variable to enable timing logs for diagnosing startup latency.
 - Workspace scanning runs in background (`tokio::spawn`) while PackageLibrary initialization is awaited - LSP becomes responsive after ~100ms (package init) rather than waiting for full workspace scan.
-- Sequential per-package export queries in the old `PackageLibrary::initialize()` path can add 700-2100ms to startup; the batched path reduces this to a single R subprocess call (~100ms).
 - `SKIP_DIRECTORIES` in `state.rs` filters node_modules, .git, and target during workspace scan - keep this list minimal to avoid skipping legitimate R code locations.
 - Files opened by the user are indexed on-demand via `did_open`, with their dependencies taking priority over background workspace scanning.
 - For criterion benchmarks, use `async_tokio` feature and run with `cargo bench --bench startup`.
 - The `perf.rs` module provides `TimingGuard` for RAII-style timing and `PerfMetrics` for aggregated startup analysis.
 - Key instrumentation points: `initialized()` for overall init, `scan_workspace()` for file scanning, `execute_r_code()` for R subprocess calls.
+
+#### R Subprocess Batching
+
+**Startup initialization** (`RSubprocess::initialize_batch()`):
+- Batches lib_paths, base_packages, and all base package exports into a single R call
+- Reduces startup from 700-2100ms (sequential) to ~100ms (batched)
+- Used by `PackageLibrary::initialize()`
+
+**Package prefetch** (`RSubprocess::get_multiple_package_exports()`):
+- Batches multiple package export queries into a single R call
+- Critical for files with many `library()` calls (e.g., 30 packages → 3-5s sequential vs ~500ms batched)
+- Used by `PackageLibrary::prefetch_packages()` which filters already-cached packages first
+- Falls back to sequential queries if batch fails
+
+**Measured improvements** (on workspace with ~30 package dependencies):
+- First diagnostic: 5.2s → 1.2s (4.3x faster)
+- All files diagnosed: 6.7s → 2.6s (2.6x faster)
+- R subprocess calls: ~90 → ~8 (11x fewer)
 
 ### Rust/Clippy Best Practices
 
