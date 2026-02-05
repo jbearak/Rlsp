@@ -35,5 +35,10 @@ ropey = "1.6"
 xdg = "2.5.2"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.4"
 tempfile = "3"
+
+[[bench]]
+name = "startup"
+harness = false

@@ -6,3 +6,6 @@ out/
 .vscode-test/
 bin/raven
 bin/raven.exe
+
+# Claude Code local settings
+.claude/

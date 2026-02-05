@@ -124,6 +124,26 @@ impl PathContext {
 /// Resolve a path string to an absolute path.
 /// Handles file-relative, workspace-relative, and absolute paths with working directory context.
 pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
+    resolve_path_impl(path, context, false)
+}
+
+/// Resolve a path with workspace-root fallback for source() statements.
+///
+/// This function first tries normal resolution (relative to file's directory or @lsp-cd).
+/// If that fails AND the file has no explicit working directory directive, it falls back
+/// to trying the path relative to workspace root.
+///
+/// This is useful for codebases that haven't been annotated with LSP directives but where
+/// source() calls use paths relative to the project root (a common pattern in R projects).
+///
+/// Use this for source() statements. Do NOT use for backward directives (@lsp-sourced-by)
+/// which should always resolve relative to the file's directory.
+pub fn resolve_path_with_workspace_fallback(path: &str, context: &PathContext) -> Option<PathBuf> {
+    resolve_path_impl(path, context, true)
+}
+
+/// Internal implementation of path resolution with optional workspace fallback
+fn resolve_path_impl(path: &str, context: &PathContext, try_workspace_fallback: bool) -> Option<PathBuf> {
     if path.is_empty() {
         log::trace!("Path resolution: empty path provided");
         return None;
@@ -140,8 +160,8 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
         context.file_path.display()
     );
 
-    let resolved = if let Some(stripped) = path.strip_prefix('/') {
-        // Workspace-root-relative path
+    // If path starts with /, it's explicitly workspace-root-relative
+    if let Some(stripped) = path.strip_prefix('/') {
         let workspace_root = context.workspace_root.as_ref();
         if workspace_root.is_none() {
             log::warn!(
@@ -151,24 +171,8 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
             );
             return None;
         }
-        workspace_root.unwrap().join(stripped)
-    } else {
-        // File-relative or working-directory-relative path
-        let base = context.effective_working_directory();
-        base.join(path)
-    };
-
-    // Normalize the path (resolve .. and .)
-    match normalize_path(&resolved) {
-        Some(canonical) => {
-            log::trace!(
-                "Resolved path '{}' to canonical path: '{}'",
-                path,
-                canonical.display()
-            );
-            Some(canonical)
-        }
-        None => {
+        let resolved = workspace_root.unwrap().join(stripped);
+        return normalize_path(&resolved).or_else(|| {
             log::warn!(
                 "Failed to resolve path '{}': normalization failed, attempted_path='{}', base_dir='{}'",
                 path,
@@ -176,8 +180,67 @@ pub fn resolve_path(path: &str, context: &PathContext) -> Option<PathBuf> {
                 base_dir.display()
             );
             None
-        }
+        });
     }
+
+    // Try file-relative or working-directory-relative path first
+    let base = context.effective_working_directory();
+    let resolved = base.join(path);
+
+    if let Some(canonical) = normalize_path(&resolved) {
+        // Check if the file exists
+        if canonical.exists() {
+            log::trace!(
+                "Resolved path '{}' to canonical path: '{}'",
+                path,
+                canonical.display()
+            );
+            return Some(canonical);
+        }
+
+        // File doesn't exist at the resolved path
+        // Try workspace-root fallback if:
+        // 1. Fallback is enabled (for source() statements)
+        // 2. No explicit @lsp-cd directive (working_directory is None)
+        // 3. No inherited working directory
+        // 4. Workspace root is available
+        let has_explicit_wd = context.working_directory.is_some();
+        let has_inherited_wd = context.inherited_working_directory.is_some();
+
+        if try_workspace_fallback && !has_explicit_wd && !has_inherited_wd {
+            if let Some(ref workspace_root) = context.workspace_root {
+                let workspace_resolved = workspace_root.join(path);
+                if let Some(workspace_canonical) = normalize_path(&workspace_resolved) {
+                    if workspace_canonical.exists() {
+                        log::trace!(
+                            "Resolved path '{}' via workspace-root fallback: '{}' (file-relative '{}' did not exist)",
+                            path,
+                            workspace_canonical.display(),
+                            canonical.display()
+                        );
+                        return Some(workspace_canonical);
+                    }
+                }
+            }
+        }
+
+        // Return the original resolved path even if file doesn't exist
+        // (caller may want to report diagnostics about missing file)
+        log::trace!(
+            "Resolved path '{}' to canonical path: '{}' (file may not exist)",
+            path,
+            canonical.display()
+        );
+        return Some(canonical);
+    }
+
+    log::warn!(
+        "Failed to resolve path '{}': normalization failed, attempted_path='{}', base_dir='{}'",
+        path,
+        resolved.display(),
+        base_dir.display()
+    );
+    None
 }
 
 /// Resolve a working directory path.

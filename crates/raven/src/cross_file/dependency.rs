@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range, Url};
 
 use super::parent_resolve::{infer_call_site_from_parent, resolve_match_pattern};
-use super::path_resolve::{path_to_uri, resolve_path, PathContext};
+use super::path_resolve::{path_to_uri, resolve_path, resolve_path_with_workspace_fallback, PathContext};
 use super::types::{CallSiteSpec, CrossFileMetadata};
 
 /// Resolve the effective working directory of a parent file for inheritance.
@@ -619,8 +619,9 @@ impl DependencyGraph {
         };
 
         // Helper to resolve paths using PathContext (for forward sources)
+        // Uses workspace-root fallback for source() statements in files without @lsp-cd
         let do_resolve = |path: &str| -> Option<Url> {
-            let resolved = resolve_path(path, &path_ctx)?;
+            let resolved = resolve_path_with_workspace_fallback(path, &path_ctx)?;
             path_to_uri(&resolved)
         };
 

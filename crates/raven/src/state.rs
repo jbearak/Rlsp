@@ -805,6 +805,30 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
     (index, imports, cross_file_entries, new_index_entries)
 }
 
+/// Directories to skip during workspace scanning.
+///
+/// This is a conservative list of directories that are extremely unlikely to
+/// contain user R source files. The workspace scan runs in the background,
+/// so the primary goal is to avoid wasting time on directories that would
+/// never contain R files.
+///
+/// Note: We intentionally keep this list minimal. Directories like `renv/`,
+/// `.Rproj.user/`, or `build/` might legitimately contain R code that users
+/// want to navigate to. Only skip directories that are definitively not
+/// R-related.
+const SKIP_DIRECTORIES: &[&str] = &[
+    "node_modules", // JavaScript dependencies (can have 100k+ files)
+    ".git",         // Git internal files
+    "target",       // Rust build artifacts
+];
+
+/// Check if a directory should be skipped during scanning
+fn should_skip_directory(dir_name: &str) -> bool {
+    SKIP_DIRECTORIES
+        .iter()
+        .any(|skip| dir_name.eq_ignore_ascii_case(skip))
+}
+
 fn scan_directory(
     dir: &std::path::Path,
     index: &mut HashMap<Url, Document>,
@@ -819,6 +843,13 @@ fn scan_directory(
         let path = entry.path();
 
         if path.is_dir() {
+            // Skip common non-R directories to improve scan performance
+            if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                if should_skip_directory(dir_name) {
+                    log::trace!("Skipping directory: {}", path.display());
+                    continue;
+                }
+            }
             scan_directory(&path, index, cross_file_entries, new_index_entries);
         } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
             // Match both .R and .r extensions (case-insensitive)

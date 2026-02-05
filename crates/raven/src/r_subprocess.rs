@@ -268,6 +268,9 @@ impl RSubprocess {
     /// assert_eq!(out.trim(), "ok");
     /// ```
     pub async fn execute_r_code(&self, r_code: &str) -> Result<String> {
+        let start = std::time::Instant::now();
+        crate::perf::increment_r_subprocess_calls();
+
         let mut cmd = Command::new(&self.r_path);
         cmd.args(["--vanilla", "--slave", "-e", r_code]);
 
@@ -279,6 +282,18 @@ impl RSubprocess {
             .output()
             .await
             .map_err(|e| anyhow!("Failed to execute R subprocess: {}", e))?;
+
+        let elapsed = start.elapsed();
+        if crate::perf::is_enabled() {
+            // Truncate r_code for logging (first 50 chars)
+            let code_preview: String = r_code.chars().take(50).collect();
+            let code_preview = if r_code.len() > 50 {
+                format!("{}...", code_preview)
+            } else {
+                code_preview
+            };
+            log::info!("[PERF] R subprocess call ({:?}): {}", elapsed, code_preview);
+        }
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -553,6 +568,289 @@ impl RSubprocess {
 
         Ok(depends)
     }
+
+    /// Retrieve exports for multiple packages in a single R subprocess call.
+    ///
+    /// This is significantly faster than calling `get_package_exports` multiple times,
+    /// as it eliminates the overhead of spawning multiple R processes (~75-350ms each).
+    ///
+    /// # Parameters
+    ///
+    /// - `packages` — List of package names whose exports to retrieve
+    ///
+    /// # Returns
+    ///
+    /// A HashMap mapping package name to its exports. Packages that couldn't be loaded
+    /// (not installed, errors) will have empty export lists.
+    ///
+    /// # Performance
+    ///
+    /// This method replaces N R subprocess calls with a single call, saving
+    /// approximately (N-1) * 75-350ms on typical systems.
+    pub async fn get_multiple_package_exports(
+        &self,
+        packages: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        if packages.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Validate all package names
+        for pkg in packages {
+            if !is_valid_package_name(pkg) {
+                return Err(anyhow!(
+                    "Invalid package name '{}': must contain only letters, numbers, dots, and underscores",
+                    pkg
+                ));
+            }
+        }
+
+        // Build R code that queries all packages
+        let packages_vector = packages
+            .iter()
+            .map(|p| format!("\"{}\"", p))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let r_code = format!(
+            r#"
+pkgs <- c({})
+cat("__RAVEN_MULTI_EXPORTS__\n")
+for (pkg in pkgs) {{
+    cat(paste0("__PKG:", pkg, "__\n"))
+    tryCatch(
+        cat(getNamespaceExports(asNamespace(pkg)), sep="\n"),
+        error = function(e) {{}}
+    )
+}}
+cat("__RAVEN_END__\n")
+"#,
+            packages_vector
+        );
+
+        let output = self.execute_r_code(&r_code).await?;
+
+        // Parse the structured output
+        parse_multi_exports_output(&output)
+    }
+
+    /// Batch initialization: retrieve lib_paths, base_packages, and all base package exports
+    /// in a single R subprocess call.
+    ///
+    /// This is significantly faster than making separate calls for each piece of data,
+    /// as it eliminates the overhead of spawning multiple R processes (~100-300ms each).
+    ///
+    /// # Returns
+    ///
+    /// A `BatchInitResult` containing:
+    /// - `lib_paths`: Library paths from `.libPaths()`
+    /// - `base_packages`: Base packages from `.packages()`
+    /// - `base_exports`: Combined exports from all base packages
+    ///
+    /// # Performance
+    ///
+    /// This method replaces 2 + N R subprocess calls (where N is the number of base packages,
+    /// typically 7) with a single call, saving approximately 700-2100ms on typical systems.
+    pub async fn initialize_batch(&self) -> Result<BatchInitResult> {
+        // Single R script that outputs all needed data in a structured format
+        // We use markers to separate sections for reliable parsing
+        let r_code = r#"
+# Handle renv activation for project-local libraries
+renv_path <- normalizePath("renv/activate.R", mustWork=FALSE)
+if (file.exists(renv_path) && dirname(renv_path) == file.path(getwd(), "renv")) {
+    try(source(renv_path), silent=TRUE)
+}
+
+# Output library paths
+cat("__RAVEN_LIB_PATHS__\n")
+cat(.libPaths(), sep="\n")
+
+# Output base packages
+cat("\n__RAVEN_BASE_PACKAGES__\n")
+pkgs <- .packages()
+cat(pkgs, sep="\n")
+
+# Output exports for each base package
+cat("\n__RAVEN_EXPORTS__\n")
+for (pkg in pkgs) {
+    cat(paste0("__PKG:", pkg, "__\n"))
+    tryCatch(
+        cat(getNamespaceExports(asNamespace(pkg)), sep="\n"),
+        error = function(e) {}
+    )
+}
+cat("__RAVEN_END__\n")
+"#;
+
+        let output = self.execute_r_code(r_code).await?;
+
+        // Parse the structured output
+        parse_batch_init_output(&output)
+    }
+}
+
+/// Result of batch initialization from R subprocess
+#[derive(Debug, Clone, Default)]
+pub struct BatchInitResult {
+    /// Library paths from `.libPaths()`
+    pub lib_paths: Vec<PathBuf>,
+    /// Base packages from `.packages()`
+    pub base_packages: Vec<String>,
+    /// Exports for each base package (package name -> list of exports)
+    pub package_exports: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl BatchInitResult {
+    /// Get combined exports from all base packages
+    pub fn all_base_exports(&self) -> std::collections::HashSet<String> {
+        self.package_exports
+            .values()
+            .flat_map(|exports| exports.iter().cloned())
+            .collect()
+    }
+}
+
+/// Parse the output of `initialize_batch()` into a `BatchInitResult`
+fn parse_batch_init_output(output: &str) -> Result<BatchInitResult> {
+    let mut result = BatchInitResult::default();
+
+    // Split by section markers
+    let lib_paths_start = output
+        .find("__RAVEN_LIB_PATHS__")
+        .ok_or_else(|| anyhow!("Missing __RAVEN_LIB_PATHS__ marker in R output"))?;
+    let base_packages_start = output
+        .find("__RAVEN_BASE_PACKAGES__")
+        .ok_or_else(|| anyhow!("Missing __RAVEN_BASE_PACKAGES__ marker in R output"))?;
+    let exports_start = output
+        .find("__RAVEN_EXPORTS__")
+        .ok_or_else(|| anyhow!("Missing __RAVEN_EXPORTS__ marker in R output"))?;
+
+    // Parse lib_paths section
+    let lib_paths_section =
+        &output[lib_paths_start + "__RAVEN_LIB_PATHS__".len()..base_packages_start];
+    result.lib_paths = lib_paths_section
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+
+    // Parse base_packages section
+    let base_packages_section =
+        &output[base_packages_start + "__RAVEN_BASE_PACKAGES__".len()..exports_start];
+    result.base_packages = base_packages_section
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect();
+
+    // Parse exports section - each package is marked with __PKG:name__
+    let exports_section = &output[exports_start + "__RAVEN_EXPORTS__".len()..];
+    let mut current_package: Option<String> = None;
+    let mut current_exports: Vec<String> = Vec::new();
+
+    for line in exports_section.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("__PKG:") && line.ends_with("__") {
+            // Save previous package exports
+            if let Some(pkg) = current_package.take() {
+                result
+                    .package_exports
+                    .insert(pkg, std::mem::take(&mut current_exports));
+            }
+            // Start new package
+            let pkg_name = &line[6..line.len() - 2]; // Strip __PKG: and __
+            current_package = Some(pkg_name.to_string());
+        } else if line == "__RAVEN_END__" {
+            // End marker - save final package
+            if let Some(pkg) = current_package.take() {
+                result
+                    .package_exports
+                    .insert(pkg, std::mem::take(&mut current_exports));
+            }
+            break;
+        } else if current_package.is_some() {
+            // Export name
+            current_exports.push(line.to_string());
+        }
+    }
+
+    // Handle case where __RAVEN_END__ was missing
+    if let Some(pkg) = current_package {
+        result
+            .package_exports
+            .insert(pkg, std::mem::take(&mut current_exports));
+    }
+
+    log::trace!(
+        "Batch init: {} lib_paths, {} base_packages, {} packages with exports",
+        result.lib_paths.len(),
+        result.base_packages.len(),
+        result.package_exports.len()
+    );
+
+    Ok(result)
+}
+
+/// Parse the output of `get_multiple_package_exports()` into a HashMap
+fn parse_multi_exports_output(
+    output: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut result = std::collections::HashMap::new();
+
+    // Find the start marker
+    let exports_start = output
+        .find("__RAVEN_MULTI_EXPORTS__")
+        .ok_or_else(|| anyhow!("Missing __RAVEN_MULTI_EXPORTS__ marker in R output"))?;
+
+    // Parse exports section - each package is marked with __PKG:name__
+    let exports_section = &output[exports_start + "__RAVEN_MULTI_EXPORTS__".len()..];
+    let mut current_package: Option<String> = None;
+    let mut current_exports: Vec<String> = Vec::new();
+
+    for line in exports_section.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("__PKG:") && line.ends_with("__") {
+            // Save previous package exports
+            if let Some(pkg) = current_package.take() {
+                result.insert(pkg, std::mem::take(&mut current_exports));
+            }
+            // Start new package
+            let pkg_name = &line[6..line.len() - 2]; // Strip __PKG: and __
+            current_package = Some(pkg_name.to_string());
+        } else if line == "__RAVEN_END__" {
+            // End marker - save final package
+            if let Some(pkg) = current_package.take() {
+                result.insert(pkg, std::mem::take(&mut current_exports));
+            }
+            break;
+        } else if current_package.is_some() {
+            // Export name
+            current_exports.push(line.to_string());
+        }
+    }
+
+    // Handle case where __RAVEN_END__ was missing
+    if let Some(pkg) = current_package {
+        result.insert(pkg, std::mem::take(&mut current_exports));
+    }
+
+    log::trace!(
+        "Multi-export query: {} packages with exports",
+        result.len()
+    );
+
+    Ok(result)
 }
 
 /// Parse an R DESCRIPTION `Depends` field into its package names.

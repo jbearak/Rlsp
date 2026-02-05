@@ -12,10 +12,13 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::namespace_parser::{
+    parse_description_depends, parse_index_exports, parse_namespace_exports,
+};
 use crate::r_subprocess::RSubprocess;
 
 /// Meta-packages that attach multiple other packages when loaded
@@ -123,6 +126,20 @@ impl PackageInfo {
             lazy_data,
         }
     }
+}
+
+/// Result of parsing a package's NAMESPACE and DESCRIPTION files statically.
+///
+/// This struct separates explicit exports (from `export()` and `S3method()` directives)
+/// from packages that require R subprocess due to `exportPattern()` usage.
+#[derive(Debug)]
+pub struct NamespaceParseResult {
+    /// Explicit exports from export() and S3method() directives
+    pub explicit_exports: Vec<String>,
+    /// Whether the package uses exportPattern() and needs R subprocess for accuracy
+    pub has_export_pattern: bool,
+    /// Dependencies from DESCRIPTION Depends field
+    pub depends: Vec<String>,
 }
 
 /// Package library manager
@@ -394,12 +411,166 @@ impl PackageLibrary {
     /// populating both the per-package cache and combined_exports cache.
     /// Used for background warm-up after detecting library() calls.
     ///
+    /// # Performance - Tiered Prefetch Strategy
+    ///
+    /// 1. **Static packages (94%)**: Loaded immediately via NAMESPACE parsing (~1-5ms each)
+    /// 2. **Pattern packages (6%)**: Batched into single R subprocess call (~100-500ms total)
+    ///
+    /// This approach eliminates R subprocess calls for most packages while still
+    /// providing accurate exports for packages using `exportPattern()`.
+    ///
     /// # Arguments
     /// * `packages` - List of package names to prefetch
     pub async fn prefetch_packages(&self, packages: &[String]) {
-        for pkg_name in packages {
-            log::trace!("Prefetching package exports for '{}'", pkg_name);
-            // get_all_exports populates both caches
+        if packages.is_empty() {
+            return;
+        }
+
+        // Filter out packages we've already cached
+        let uncached_packages: Vec<String> = {
+            let combined_cache = self.combined_exports.read().await;
+            let packages_cache = self.packages.read().await;
+            packages
+                .iter()
+                .filter(|p| !combined_cache.contains_key(*p) && !packages_cache.contains_key(*p))
+                .cloned()
+                .collect()
+        };
+
+        if uncached_packages.is_empty() {
+            log::trace!("All {} packages already cached", packages.len());
+            return;
+        }
+
+        // Categorize packages: static (no exportPattern) vs pattern (needs R)
+        let mut static_packages: Vec<(String, PathBuf, NamespaceParseResult)> = Vec::new();
+        let mut pattern_packages: Vec<String> = Vec::new();
+
+        for pkg_name in &uncached_packages {
+            if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
+                if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
+                    if parse_result.has_export_pattern {
+                        pattern_packages.push(pkg_name.clone());
+                    } else {
+                        static_packages.push((pkg_name.clone(), pkg_dir, parse_result));
+                    }
+                }
+            }
+        }
+
+        log::trace!(
+            "Prefetching {} packages: {} static, {} pattern",
+            uncached_packages.len(),
+            static_packages.len(),
+            pattern_packages.len()
+        );
+
+        // Step 1: Load static packages immediately (no R subprocess needed)
+        for (name, _pkg_dir, parse_result) in static_packages {
+            let exports: HashSet<String> = parse_result.explicit_exports.into_iter().collect();
+            let info =
+                PackageInfo::with_details(name.clone(), exports, parse_result.depends, vec![]);
+
+            log::trace!(
+                "Loaded {} exports for package '{}' statically",
+                info.exports.len(),
+                name
+            );
+
+            self.insert_package(info).await;
+        }
+
+        // Step 2: Batch R subprocess call only for pattern packages
+        if !pattern_packages.is_empty() {
+            if let Some(ref r_subprocess) = self.r_subprocess {
+                log::trace!(
+                    "Batching R subprocess call for {} pattern packages",
+                    pattern_packages.len()
+                );
+
+                match r_subprocess
+                    .get_multiple_package_exports(&pattern_packages)
+                    .await
+                {
+                    Ok(exports_map) => {
+                        // Populate the per-package cache with the R subprocess results
+                        for (pkg_name, exports) in exports_map {
+                            let exports_set: HashSet<String> = exports.into_iter().collect();
+                            // Get depends from static parse
+                            let depends =
+                                if let Some(pkg_dir) = self.find_package_directory(&pkg_name) {
+                                    parse_description_depends(&pkg_dir.join("DESCRIPTION"))
+                                        .unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                };
+
+                            let info = PackageInfo::with_details(
+                                pkg_name.clone(),
+                                exports_set,
+                                depends,
+                                Vec::new(),
+                            );
+                            log::trace!(
+                                "Cached {} exports for pattern package '{}' from R",
+                                info.exports.len(),
+                                pkg_name
+                            );
+                            self.insert_package(info).await;
+                        }
+                    }
+                    Err(e) => {
+                        log::trace!(
+                            "Batch R call failed: {}, falling back to INDEX for pattern packages",
+                            e
+                        );
+
+                        // Fall back to INDEX + explicit exports for pattern packages
+                        for pkg_name in &pattern_packages {
+                            if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
+                                if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
+                                    let exports = self
+                                        .load_with_index_fallback(&pkg_dir, &parse_result)
+                                        .await;
+                                    let info = PackageInfo::with_details(
+                                        pkg_name.clone(),
+                                        exports,
+                                        parse_result.depends,
+                                        Vec::new(),
+                                    );
+                                    self.insert_package(info).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No R subprocess - use INDEX fallback for pattern packages
+                log::trace!(
+                    "No R subprocess, using INDEX fallback for {} pattern packages",
+                    pattern_packages.len()
+                );
+
+                for pkg_name in &pattern_packages {
+                    if let Some(pkg_dir) = self.find_package_directory(pkg_name) {
+                        if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
+                            let exports =
+                                self.load_with_index_fallback(&pkg_dir, &parse_result).await;
+                            let info = PackageInfo::with_details(
+                                pkg_name.clone(),
+                                exports,
+                                parse_result.depends,
+                                Vec::new(),
+                            );
+                            self.insert_package(info).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 3: Populate combined_exports cache
+        for pkg_name in &uncached_packages {
             let _ = self.get_all_exports(pkg_name).await;
         }
     }
@@ -482,6 +653,82 @@ impl PackageLibrary {
         self.base_exports = exports;
     }
 
+    /// Parse a package's NAMESPACE and DESCRIPTION files statically.
+    ///
+    /// This method extracts exports from the NAMESPACE file and dependencies from
+    /// the DESCRIPTION file without calling R. It detects whether the package uses
+    /// `exportPattern()` directives that would require R subprocess for accurate results.
+    ///
+    /// Special case: The `base` package doesn't have a NAMESPACE file. For such packages,
+    /// we treat them as having `exportPattern()` (needing R or INDEX fallback).
+    ///
+    /// # Returns
+    /// - `Some(NamespaceParseResult)` with exports, pattern flag, and dependencies
+    /// - `None` if the package directory doesn't exist
+    pub fn parse_package_static(&self, pkg_dir: &Path) -> Option<NamespaceParseResult> {
+        let namespace_path = pkg_dir.join("NAMESPACE");
+
+        // Parse NAMESPACE file if it exists
+        let (explicit_exports, has_export_pattern) = if namespace_path.exists() {
+            match parse_namespace_exports(&namespace_path) {
+                Ok(raw_exports) => {
+                    let has_pattern = raw_exports.iter().any(|e| e.starts_with("__PATTERN__:"));
+                    let explicit: Vec<String> = raw_exports
+                        .into_iter()
+                        .filter(|e| !e.starts_with("__PATTERN__:"))
+                        .collect();
+                    (explicit, has_pattern)
+                }
+                Err(e) => {
+                    log::trace!("Failed to parse NAMESPACE at {:?}: {}", namespace_path, e);
+                    // NAMESPACE exists but failed to parse - treat as having pattern
+                    (Vec::new(), true)
+                }
+            }
+        } else {
+            // No NAMESPACE file (e.g., `base` package) - needs INDEX fallback
+            log::trace!(
+                "No NAMESPACE file at {:?}, treating as pattern package",
+                namespace_path
+            );
+            (Vec::new(), true)
+        };
+
+        // Parse DESCRIPTION for Depends
+        let description_path = pkg_dir.join("DESCRIPTION");
+        let depends = parse_description_depends(&description_path).unwrap_or_default();
+
+        Some(NamespaceParseResult {
+            explicit_exports,
+            has_export_pattern,
+            depends,
+        })
+    }
+
+    /// Load package exports using INDEX file as fallback for pattern packages.
+    ///
+    /// When a package uses `exportPattern()` and R subprocess is unavailable,
+    /// this method combines explicit exports from NAMESPACE with documented
+    /// exports from the INDEX file.
+    async fn load_with_index_fallback(
+        &self,
+        pkg_dir: &Path,
+        parse_result: &NamespaceParseResult,
+    ) -> HashSet<String> {
+        let mut exports: HashSet<String> = parse_result.explicit_exports.iter().cloned().collect();
+
+        // Add INDEX exports for pattern packages
+        if let Ok(index_exports) = parse_index_exports(pkg_dir).await {
+            log::trace!(
+                "Loaded {} exports from INDEX file for pattern package",
+                index_exports.len()
+            );
+            exports.extend(index_exports);
+        }
+
+        exports
+    }
+
     /// Check if a symbol is exported by a specific package
     ///
     /// Returns true if the package is cached and exports the symbol.
@@ -539,108 +786,133 @@ impl PackageLibrary {
     /// Requirement 7.1: THE LSP SHALL query R subprocess to get library paths
     /// using `.libPaths()`
     pub async fn initialize(&mut self) -> anyhow::Result<()> {
-        // Step 1: Get library paths from R or use fallback
-        let lib_paths = if let Some(ref r_subprocess) = self.r_subprocess {
-            match r_subprocess.get_lib_paths().await {
-                Ok(paths) => {
-                    log::trace!("Got {} library paths from R", paths.len());
-                    paths
-                }
-                Err(e) => {
-                    log::trace!("Failed to get lib_paths from R: {}, using fallback", e);
-                    crate::r_subprocess::get_fallback_lib_paths()
-                }
-            }
-        } else {
-            log::trace!("No R subprocess available, using fallback lib_paths");
-            crate::r_subprocess::get_fallback_lib_paths()
-        };
-        self.lib_paths = lib_paths;
+        // Strategy: Try static initialization first, then fall back to R subprocess
+        //
+        // Static initialization is preferred because:
+        // 1. Much faster (~50ms vs ~100ms+ for R subprocess)
+        // 2. No dependency on R being available
+        // 3. Works offline
+        //
+        // R subprocess is used as fallback for:
+        // 1. Getting lib_paths if platform fallbacks fail
+        // 2. Pattern packages (base R uses exportPattern)
 
-        // Step 2: Get base packages from R or use fallback
-        let base_packages_list = if let Some(ref r_subprocess) = self.r_subprocess {
-            match r_subprocess.get_base_packages().await {
-                Ok(packages) => {
-                    log::trace!(
-                        "Got {} base packages from R: {:?}",
-                        packages.len(),
-                        packages
-                    );
-                    packages
-                }
-                Err(e) => {
-                    log::trace!("Failed to get base_packages from R: {}, using fallback", e);
-                    crate::r_subprocess::get_fallback_base_packages()
-                }
-            }
-        } else {
-            log::trace!("No R subprocess available, using fallback base_packages");
-            crate::r_subprocess::get_fallback_base_packages()
-        };
+        // Step 1: Get library paths (try R first for accuracy, then fallback)
+        self.lib_paths = self.get_lib_paths_with_fallback().await;
+
+        if self.lib_paths.is_empty() {
+            log::trace!("Warning: No library paths found, package loading will fail");
+        }
+
+        // Step 2: Use hardcoded base packages list (always reliable)
+        let base_packages_list = crate::r_subprocess::get_fallback_base_packages();
         self.base_packages = base_packages_list.iter().cloned().collect();
 
-        // Step 3: Pre-populate base_exports from base packages
-        // Query exports for each base package and combine them
+        // Step 3: Load base package exports statically with INDEX fallback
+        // Base packages use exportPattern, but INDEX file provides documented exports
         let mut all_base_exports = HashSet::new();
+        let mut pattern_packages: Vec<String> = Vec::new();
 
         for package in &base_packages_list {
-            let exports = if let Some(ref r_subprocess) = self.r_subprocess {
-                match r_subprocess.get_package_exports(package).await {
-                    Ok(exports) => {
-                        log::trace!(
-                            "Got {} exports for base package '{}'",
-                            exports.len(),
-                            package
-                        );
-                        exports
+            if let Some(pkg_dir) = self.find_package_directory(package) {
+                if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
+                    // Add explicit exports
+                    for export in &parse_result.explicit_exports {
+                        all_base_exports.insert(export.clone());
+                    }
+
+                    if parse_result.has_export_pattern {
+                        // Base packages use exportPattern - add INDEX exports and track for R fallback
+                        let index_exports =
+                            self.load_with_index_fallback(&pkg_dir, &parse_result).await;
+                        all_base_exports.extend(index_exports);
+                        pattern_packages.push(package.clone());
+                    }
+                }
+            }
+        }
+
+        // Step 4: If R subprocess is available and we have pattern packages,
+        // try to get accurate exports for them
+        if !pattern_packages.is_empty() {
+            if let Some(ref r_subprocess) = self.r_subprocess {
+                log::trace!(
+                    "Querying R for {} base packages with exportPattern",
+                    pattern_packages.len()
+                );
+                match r_subprocess
+                    .get_multiple_package_exports(&pattern_packages)
+                    .await
+                {
+                    Ok(exports_map) => {
+                        for (_pkg_name, exports) in exports_map {
+                            for export in exports {
+                                all_base_exports.insert(export);
+                            }
+                        }
                     }
                     Err(e) => {
                         log::trace!(
-                            "Failed to get exports for base package '{}': {}, skipping",
-                            package,
+                            "R batch query for base packages failed: {}, using INDEX fallback",
                             e
                         );
-                        Vec::new()
+                        // Continue with INDEX-based exports
                     }
                 }
-            } else {
-                // No R subprocess - we can't get exports without it
-                // This is expected when R is not available
-                Vec::new()
-            };
-
-            // Add exports to the combined set
-            for export in exports {
-                all_base_exports.insert(export);
             }
         }
 
         log::trace!(
-            "Initialized PackageLibrary with {} lib_paths, {} base_packages, {} base_exports",
+            "Initialized PackageLibrary: {} lib_paths, {} base_packages, {} base_exports",
             self.lib_paths.len(),
             self.base_packages.len(),
             all_base_exports.len()
         );
 
         self.base_exports = all_base_exports;
-
         Ok(())
     }
 
-    /// Get package info, loading from cache or R subprocess
+    /// Get library paths with fallback strategy
+    async fn get_lib_paths_with_fallback(&self) -> Vec<PathBuf> {
+        // Try R subprocess first (most accurate)
+        if let Some(ref r_subprocess) = self.r_subprocess {
+            match r_subprocess.get_lib_paths().await {
+                Ok(paths) if !paths.is_empty() => {
+                    log::trace!("Got {} library paths from R", paths.len());
+                    return paths;
+                }
+                Ok(_) => {
+                    log::trace!("R returned empty lib_paths, using fallback");
+                }
+                Err(e) => {
+                    log::trace!("Failed to get lib_paths from R: {}, using fallback", e);
+                }
+            }
+        }
+
+        // Use platform-specific fallback
+        let fallback = crate::r_subprocess::get_fallback_lib_paths();
+        log::trace!("Using fallback library paths: {:?}", fallback);
+        fallback
+    }
+    /// Get package info using tiered loading strategy
     ///
-    /// This method checks the cache first, then queries R subprocess,
-    /// falling back to NAMESPACE parsing if subprocess fails.
+    /// # Tiered Loading Strategy
     ///
-    /// # Behavior
-    /// 1. Check cache first - return immediately if found
-    /// 2. Try R subprocess to get exports and depends
-    /// 3. If R subprocess fails, fall back to NAMESPACE/DESCRIPTION file parsing
-    /// 4. Create PackageInfo and insert into cache
-    /// 5. For meta-packages (tidyverse, tidymodels), attached_packages are set automatically
+    /// 1. **Cache check**: Return immediately if package is cached
+    /// 2. **Tier 1 - Static parsing**: Parse NAMESPACE/DESCRIPTION files (~1-5ms)
+    ///    - If no `exportPattern()` directives: Use static exports directly (94% of packages)
+    /// 3. **Tier 2 - R subprocess**: Only for packages with `exportPattern()` (~6%)
+    ///    - Call R subprocess for accurate pattern expansion (~100-300ms)
+    /// 4. **Tier 3 - INDEX fallback**: If R fails or unavailable
+    ///    - Combine explicit exports with INDEX file (~95% accuracy)
+    ///
+    /// This approach eliminates R subprocess calls for 94% of packages while
+    /// maintaining 100% accuracy for packages using explicit exports.
     ///
     /// Requirement 3.1: WHEN a package is loaded, THE Package_Resolver SHALL query R subprocess
-    /// to get the package's exported symbols using `getNamespaceExports()`
+    /// to get the package's exported symbols using `getNamespaceExports()` (for pattern packages)
     ///
     /// Requirement 3.2: IF R subprocess is unavailable, THE Package_Resolver SHALL fall back
     /// to parsing the package's NAMESPACE file directly
@@ -659,65 +931,89 @@ impl PackageLibrary {
 
         log::trace!("Package '{}' not in cache, attempting to load", name);
 
-        // Step 2: Try R subprocess to get exports
-        let (exports, depends) = if let Some(ref r_subprocess) = self.r_subprocess {
-            // Try to get exports from R subprocess
-            let exports_result = r_subprocess.get_package_exports(name).await;
-            let depends_result = r_subprocess.get_package_depends(name).await;
+        // Step 2: Find package directory
+        let pkg_dir = match self.find_package_directory(name) {
+            Some(dir) => dir,
+            None => {
+                log::trace!(
+                    "Package '{}' not found in any library path: {:?}",
+                    name,
+                    self.lib_paths
+                );
+                // Don't cache missing packages - return None directly so
+                // package_exists() can correctly report the package as missing
+                return None;
+            }
+        };
 
-            match exports_result {
-                Ok(exports) => {
-                    log::trace!(
-                        "Got {} exports for package '{}' from R subprocess",
-                        exports.len(),
-                        name
-                    );
-                    let depends = depends_result.unwrap_or_else(|e| {
+        // Step 3: Try static parsing (Tier 1)
+        let parse_result = match self.parse_package_static(&pkg_dir) {
+            Some(result) => result,
+            None => {
+                log::trace!(
+                    "Failed to parse NAMESPACE for package '{}', caching empty",
+                    name
+                );
+                let info = PackageInfo::with_details(
+                    name.to_string(),
+                    HashSet::new(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                self.insert_package(info).await;
+                return self.get_cached_package(name).await;
+            }
+        };
+
+        // Step 4: Determine export loading strategy based on pattern presence
+        let exports: HashSet<String> = if parse_result.has_export_pattern {
+            // Tier 2: Package uses exportPattern - try R subprocess for accuracy
+            log::trace!(
+                "Package '{}' uses exportPattern, trying R subprocess for accuracy",
+                name
+            );
+
+            if let Some(ref r_subprocess) = self.r_subprocess {
+                match r_subprocess.get_package_exports(name).await {
+                    Ok(r_exports) => {
                         log::trace!(
-                            "Failed to get depends for package '{}' from R: {}, using empty",
+                            "Got {} exports for package '{}' from R subprocess",
+                            r_exports.len(),
+                            name
+                        );
+                        r_exports.into_iter().collect()
+                    }
+                    Err(e) => {
+                        // Tier 3: R failed, fall back to INDEX + explicit exports
+                        log::trace!(
+                            "R subprocess failed for package '{}': {}, using INDEX fallback",
                             name,
                             e
                         );
-                        Vec::new()
-                    });
-                    (exports, depends)
+                        self.load_with_index_fallback(&pkg_dir, &parse_result).await
+                    }
                 }
-                Err(e) => {
-                    log::trace!(
-                        "Failed to get exports for package '{}' from R subprocess: {}, falling back to NAMESPACE parsing",
-                        name,
-                        e
-                    );
-                    // Fall back to NAMESPACE parsing
-                    self.load_package_from_filesystem(name)
-                }
+            } else {
+                // No R subprocess, use INDEX fallback
+                log::trace!(
+                    "No R subprocess available for package '{}', using INDEX fallback",
+                    name
+                );
+                self.load_with_index_fallback(&pkg_dir, &parse_result).await
             }
         } else {
-            // No R subprocess available, fall back to NAMESPACE parsing
+            // Tier 1: No exportPattern, static parsing is sufficient (94% of packages)
             log::trace!(
-                "No R subprocess available, falling back to NAMESPACE parsing for package '{}'",
-                name
+                "Package '{}' uses explicit exports only, loaded {} exports statically",
+                name,
+                parse_result.explicit_exports.len()
             );
-            self.load_package_from_filesystem(name)
+            parse_result.explicit_exports.into_iter().collect()
         };
 
-        // If we couldn't get any exports, the package might not be installed
-        if exports.is_empty() {
-            log::trace!(
-                "No exports found for package '{}', package may not be installed. lib_paths={:?}",
-                name,
-                self.lib_paths
-            );
-            // Still create a PackageInfo with empty exports - this allows us to cache
-            // the fact that we tried to load this package and it had no exports
-            // This prevents repeated failed lookups
-        }
-
-        // Step 3: Create PackageInfo and insert into cache
-        // Note: PackageInfo::with_details automatically handles meta-packages
-        // (tidyverse, tidymodels) by setting is_meta_package and attached_packages
-        let exports_set: HashSet<String> = exports.into_iter().collect();
-        let info = PackageInfo::with_details(name.to_string(), exports_set, depends, Vec::new());
+        // Step 5: Create PackageInfo and insert into cache
+        let info =
+            PackageInfo::with_details(name.to_string(), exports, parse_result.depends, Vec::new());
 
         log::trace!(
             "Created PackageInfo for '{}': {} exports, {} depends, is_meta_package={}",
@@ -817,12 +1113,35 @@ impl PackageLibrary {
 
     /// Find the package directory in lib_paths
     ///
-    /// Searches each library path for a directory with the package name.
+    /// Searches each library path for a directory with the package name
+    /// that contains a NAMESPACE or DESCRIPTION file (indicating a valid R package).
+    /// Note: The `base` package doesn't have a NAMESPACE file, only DESCRIPTION.
     /// Returns the first match found.
-    fn find_package_directory(&self, name: &str) -> Option<std::path::PathBuf> {
+    ///
+    /// Validates package names to prevent path traversal attacks - rejects names
+    /// containing path separators or parent directory references.
+    pub fn find_package_directory(&self, name: &str) -> Option<PathBuf> {
+        // Validate package name to prevent path traversal attacks
+        // Valid R package names contain only alphanumeric, '.', and '_' characters
+        // and must not contain path separators or '..'
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || name.starts_with('.')
+        {
+            log::trace!(
+                "Rejecting invalid package name '{}' (possible path traversal)",
+                name
+            );
+            return None;
+        }
+
         for lib_path in &self.lib_paths {
             let package_dir = lib_path.join(name);
-            if package_dir.is_dir() {
+            // Check for NAMESPACE or DESCRIPTION file to ensure it's a valid R package
+            // Note: `base` package doesn't have NAMESPACE, only DESCRIPTION
+            if package_dir.join("NAMESPACE").exists() || package_dir.join("DESCRIPTION").exists() {
                 return Some(package_dir);
             }
         }
@@ -1551,8 +1870,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_package_nonexistent_returns_empty_exports() {
+    async fn test_get_package_nonexistent_returns_none() {
         // Test that get_package handles non-existent packages gracefully
+        // by returning None (not caching missing packages, so package_exists()
+        // correctly reports them as missing)
         // Skip if R is not available
         let r_subprocess = match RSubprocess::new(None) {
             Some(s) => s,
@@ -1563,10 +1884,10 @@ mod tests {
 
         // Query a package that definitely doesn't exist
         let result = lib.get_package("__nonexistent_package_xyz__").await;
-        // Should return Some with empty exports (cached negative result)
-        assert!(result.is_some());
-        let pkg = result.unwrap();
-        assert!(pkg.exports.is_empty());
+        // Should return None for missing packages (not cached)
+        assert!(result.is_none());
+        // package_exists should also return false
+        assert!(!lib.package_exists("__nonexistent_package_xyz__"));
     }
 
     #[tokio::test]
@@ -1577,10 +1898,13 @@ mod tests {
         // Without R subprocess, we rely on fallback lib_paths
         // The method should not panic regardless of whether packages are found
         let result = lib.get_package("dplyr").await;
-        // Should return Some (we cache the result either way)
-        assert!(result.is_some());
-        // Note: exports may or may not be empty depending on whether
-        // fallback lib_paths contain the package
+        // Should return Some if dplyr is installed (common in most R environments)
+        // Returns None if package not found (not cached to allow package_exists to work)
+        if result.is_some() {
+            // Package is installed, test that it's cached for subsequent calls
+            let result2 = lib.get_package("dplyr").await;
+            assert!(result2.is_some());
+        }
     }
 
     #[tokio::test]

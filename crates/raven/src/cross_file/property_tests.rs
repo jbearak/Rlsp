@@ -8248,10 +8248,10 @@ proptest! {
         let intervals = vec![base, nested];
         let tree = FunctionScopeTree::from_scopes(&intervals);
 
-        // Query at a point inside the nested interval
-        let query_line = (nested_start_line + nested_end_line) / 2;
-        let query_col = (nested_start_col + nested_end_col) / 2;
-        let query_pos = Position::new(query_line, query_col);
+        // Query at a point guaranteed to be inside the nested interval.
+        // Using the start position avoids cases where the midpoint is outside
+        // the interval (e.g., when start/end are on different lines and end_col < start_col).
+        let query_pos = Position::new(nested_start_line, nested_start_col);
 
         let result = tree.query_innermost(query_pos);
 

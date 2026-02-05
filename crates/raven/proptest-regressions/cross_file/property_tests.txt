@@ -8,3 +8,4 @@ cc 3fd469e658912adada5a798ff3c931c73f19a1d9f97e05707fb17718441f7d59 # shrinks to
 cc 299729e4c56f393e7ba74e75b7639292cbce32f1c1ff4a47ff6412c5cf4ec4ef # shrinks to package = "a", export_name = "x0", lines_before = 2
 cc 3ee8dab8418b546fb721d52e050e644834a03e5a1210d737ec97852cd07c16e4 # shrinks to package = "a", func_name = "q", export_name = "q"
 cc b9745a39e47060a2d57c216b49cbb44a772bb37e70f046b405885b3fb1573fe3 # shrinks to package = "a", func = "library", export_name = "x0", lines_before = 1, lines_after = 1
+cc ffd6f09a52f117b182862921598ada0778f9f549321de96d5ca096bc7a12dcc6 # shrinks to base_start_line = 329, base_start_col = 43, base_end_line = 512, base_end_col = 50, nest_offset_start_line = 86, nest_offset_start_col = 3, nest_offset_end_line = 96, nest_offset_end_col = 5

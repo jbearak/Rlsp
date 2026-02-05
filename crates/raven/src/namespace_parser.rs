@@ -12,8 +12,16 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
+use dashmap::DashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
+
+static INDEX_EXPORTS_CACHE: OnceLock<DashMap<PathBuf, Vec<String>>> = OnceLock::new();
+
+fn index_exports_cache() -> &'static DashMap<PathBuf, Vec<String>> {
+    INDEX_EXPORTS_CACHE.get_or_init(DashMap::new)
+}
 
 /// Extracts exported symbol names from an R package NAMESPACE file.
 ///
@@ -432,6 +440,158 @@ fn parse_depends_value(value: &str) -> Vec<String> {
         .filter(|s| *s != "R")
         .map(String::from)
         .collect()
+}
+
+/// Extracts documented export names from an R package INDEX file.
+///
+/// INDEX files list documented functions with their descriptions. The format is:
+/// ```text
+/// function_name           Description text that may span
+///                         multiple lines (continuation lines
+///                         start with whitespace)
+/// another_function        Another description
+/// ```
+///
+/// This function extracts only the function names (first column), ignoring descriptions.
+/// This is used as a fallback for packages that use `exportPattern()` when the R
+/// subprocess is unavailable.
+///
+/// Results are cached per `package_dir` to avoid repeated filesystem reads.
+///
+/// # Arguments
+/// * `package_dir` - Path to the installed package directory
+///
+/// # Returns
+/// A `Vec<String>` containing documented function names, or an error if the file
+/// cannot be read.
+///
+/// # Examples
+/// ```rust,no_run
+/// use std::path::Path;
+/// # async fn demo() -> anyhow::Result<()> {
+/// let exports = crate::namespace_parser::parse_index_exports(Path::new("/usr/lib/R/library/dplyr")).await?;
+/// assert!(exports.contains(&"mutate".to_string()));
+/// # Ok(())
+/// # }
+/// ```
+pub async fn parse_index_exports(package_dir: &Path) -> Result<Vec<String>> {
+    let cache_key = package_dir.to_path_buf();
+    if let Some(cached) = index_exports_cache().get(&cache_key) {
+        return Ok(cached.value().clone());
+    }
+
+    let index_path = package_dir.join("INDEX");
+
+    // Basic validation: `package_dir` should not contain path-traversal components.
+    // (Defense in depth: package names ultimately come from user code.)
+    if package_dir
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "Suspicious package_dir {:?} when reading INDEX file {:?}",
+            package_dir,
+            index_path
+        ));
+    }
+
+    // Offload filesystem I/O from the LSP request executor.
+    let content = tokio::task::spawn_blocking({
+        let index_path = index_path.clone();
+        let package_dir = cache_key.clone();
+        move || {
+            if !package_dir.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("package_dir is not a directory: {:?}", package_dir),
+                ));
+            }
+            fs::read_to_string(&index_path)
+        }
+    })
+    .await
+    .map_err(|e| anyhow!("Task join error reading INDEX file {:?}: {e}", index_path))?
+    .map_err(|e| anyhow!("Failed to read INDEX file {:?}: {e}", index_path))?;
+
+    let exports = parse_index_content(&content);
+    index_exports_cache().insert(cache_key, exports.clone());
+    Ok(exports)
+}
+
+/// Parse INDEX file content to extract function names.
+///
+/// INDEX format: Lines starting with a non-whitespace character begin a new entry.
+/// The function name is the first word on such lines. Continuation lines (starting
+/// with whitespace) are ignored as they contain description text.
+fn parse_index_content(content: &str) -> Vec<String> {
+    let mut exports = Vec::new();
+
+    for line in content.lines() {
+        // Skip empty lines
+        if line.is_empty() {
+            continue;
+        }
+
+        // Continuation lines start with whitespace - skip them
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+
+        // Extract the function name (first word before whitespace)
+        // INDEX format: "function_name    Description text..."
+        let name = line.split_whitespace().next();
+        if let Some(name) = name {
+            // Validate it looks like a valid R identifier
+            if !name.is_empty() && is_valid_r_identifier(name) {
+                exports.push(name.to_string());
+            }
+        }
+    }
+
+    exports
+}
+
+/// Check if a string looks like a valid R identifier.
+///
+/// Valid R identifiers:
+/// - Start with a letter or dot (if dot, second char must be a letter or not exist)
+/// - Contain letters, digits, dots, and underscores
+/// - May be backtick-quoted (e.g., `%>%`)
+fn is_valid_r_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+
+    // Backtick-quoted identifiers are valid, but must not be empty.
+    if s.starts_with('`') && s.ends_with('`') && s.len() > 2 {
+        return true;
+    }
+
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+
+    // Must start with letter or dot
+    if !first.is_ascii_alphabetic() && first != '.' {
+        return false;
+    }
+
+    // If starts with dot, second char must be letter (not digit)
+    if first == '.' {
+        if let Some(second) = chars.next() {
+            if second.is_ascii_digit() {
+                return false;
+            }
+        }
+    }
+
+    // Rest must be alphanumeric, dot, or underscore
+    for ch in s.chars().skip(1) {
+        if !ch.is_ascii_alphanumeric() && ch != '.' && ch != '_' {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -1619,5 +1779,100 @@ importFrom(magrittr, "%>%")
                 result
             );
         }
+    }
+
+    // ============================================================================
+    // Tests for INDEX File Parsing
+    // ============================================================================
+
+    #[test]
+    fn test_parse_index_simple() {
+        let content = r#"across                  Apply a function across columns
+arrange                 Order rows using column values
+mutate                  Create or modify columns"#;
+        let exports = parse_index_content(content);
+        assert_eq!(exports, vec!["across", "arrange", "mutate"]);
+    }
+
+    #[test]
+    fn test_parse_index_multiline_description() {
+        let content = r#"consecutive_id          Generate a unique identifier for consecutive
+                        combinations
+context                 Information about the "current" group or
+                        variable
+copy_to                 Copy a local data frame to a remote src"#;
+        let exports = parse_index_content(content);
+        assert_eq!(exports, vec!["consecutive_id", "context", "copy_to"]);
+    }
+
+    #[test]
+    fn test_parse_index_empty() {
+        let content = "";
+        let exports = parse_index_content(content);
+        assert!(exports.is_empty());
+    }
+
+    #[test]
+    fn test_parse_index_only_whitespace() {
+        let content = "   \n\t\n   ";
+        let exports = parse_index_content(content);
+        assert!(exports.is_empty());
+    }
+
+    #[test]
+    fn test_parse_index_with_dots() {
+        let content = r#"data.frame              Create a data frame
+as.character            Convert to character
+is.null                 Check for NULL"#;
+        let exports = parse_index_content(content);
+        assert_eq!(exports, vec!["data.frame", "as.character", "is.null"]);
+    }
+
+    #[test]
+    fn test_parse_index_with_underscores() {
+        let content = r#"read_csv                Read CSV file
+write_csv               Write CSV file
+parse_number            Parse numbers"#;
+        let exports = parse_index_content(content);
+        assert_eq!(exports, vec!["read_csv", "write_csv", "parse_number"]);
+    }
+
+    #[test]
+    fn test_parse_index_operators() {
+        // Backtick-quoted operators should be valid
+        let content = r#"`%>%`                   Pipe operator
+`%<>%`                  Assignment pipe"#;
+        let exports = parse_index_content(content);
+        assert_eq!(exports, vec!["`%>%`", "`%<>%`"]);
+    }
+
+    #[test]
+    fn test_parse_index_ignores_invalid_identifiers() {
+        // Lines that don't start with valid R identifiers should be skipped
+        let content = r#"valid_func              A valid function
+123invalid              Invalid - starts with number
+valid2                  Another valid one"#;
+        let exports = parse_index_content(content);
+        assert_eq!(exports, vec!["valid_func", "valid2"]);
+    }
+
+    #[test]
+    fn test_is_valid_r_identifier() {
+        // Valid identifiers
+        assert!(is_valid_r_identifier("foo"));
+        assert!(is_valid_r_identifier("foo_bar"));
+        assert!(is_valid_r_identifier("foo.bar"));
+        assert!(is_valid_r_identifier("foo123"));
+        assert!(is_valid_r_identifier(".foo"));
+        assert!(is_valid_r_identifier("`%>%`"));
+        assert!(is_valid_r_identifier("data.frame"));
+        assert!(is_valid_r_identifier("as.character"));
+
+        // Invalid identifiers
+        assert!(!is_valid_r_identifier(""));
+        assert!(!is_valid_r_identifier("123foo")); // starts with digit
+        assert!(!is_valid_r_identifier(".123")); // dot followed by digit
+        assert!(!is_valid_r_identifier("foo-bar")); // contains hyphen
+        assert!(!is_valid_r_identifier("foo bar")); // contains space
     }
 }

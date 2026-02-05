@@ -6,6 +6,7 @@
 
 /// Complete list of R reserved words for this feature.
 /// These words cannot be used as user-defined identifiers.
+#[allow(dead_code)] // Used in tests to verify consistency with is_reserved_word()
 pub const RESERVED_WORDS: &[&str] = &[
     "if",
     "else",
