@@ -75,7 +75,7 @@ For files that aren't explicitly sourced, add a directive:
 ## Features
 
 - **Cross-file awareness** - Symbol resolution across `source()` chains with position-aware scope
-- **Declaration directives** - Declare dynamically-created symbols (`@lsp-var`, `@lsp-func`) for proper IDE support
+- **Declaration directives** - Suppress diagnostics for dynamically-created symbols (`@lsp-var`, `@lsp-func`) that cannot be statically detected
 - **Diagnostics** - Undefined variable detection that understands sourced files
 - **Go-to-definition** - Navigate to symbol definitions across file boundaries
 - **Find references** - Locate all symbol usages project-wide
@@ -88,6 +88,7 @@ For files that aren't explicitly sourced, add a directive:
 ## Documentation
 
 - [Cross-File Awareness](docs/cross-file.md) - Directives, source() detection, symbol resolution
+- [Declaration Directives](docs/declaration-directives.md) - @lsp-var, @lsp-func for dynamically-created symbols
 - [Package Function Awareness](docs/packages.md) - library() support, meta-packages, base packages
 - [Configuration](docs/configuration.md) - All settings and options
 

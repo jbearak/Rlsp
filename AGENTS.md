@@ -213,7 +213,7 @@ Function declaration synonyms: `@lsp-func`, `@lsp-function`, `@lsp-declare-func`
 
 ### Declaration Directives
 
-Declaration directives allow users to declare symbols (variables and functions) that cannot be statically detected by the parser. This enables proper IDE support for dynamically created symbols from `eval()`, `assign()`, `load()`, or external data loading.
+Declaration directives allow users to declare symbols (variables and functions) that cannot be statically detected by the parser. This suppresses false-positive diagnostics for dynamically created symbols from `eval()`, `assign()`, `load()`, or external data loading.
 
 **Syntax:**
 - `# @lsp-var myvar` - Declare a variable

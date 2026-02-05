@@ -175,7 +175,7 @@ myfunc (declared function)
 Declared via @lsp-func directive at line 10
 ```
 
-The hover content uses markdown formatting and includes:
+The hover content uses Markdown formatting and includes:
 1. Symbol name with kind annotation in parentheses
 2. Blank line separator
 3. Declaration source with directive type and 1-based line number (for user display)

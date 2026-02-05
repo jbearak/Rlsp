@@ -1101,11 +1101,19 @@ pub fn compute_artifacts_with_metadata(
     });
 
     // Add declared symbols to exported interface in timeline order
-    // This ensures later declarations overwrite earlier ones (Requirement 11.1)
-    // Processing in sorted order means the later declaration (by line number) wins
+    // Only insert if no real (non-declared) definition exists, so that real definitions
+    // are never downgraded by later declarations. Among declared symbols, later ones win.
     for event in &artifacts.timeline {
         if let ScopeEvent::Declaration { symbol, .. } = event {
-            artifacts.exported_interface.insert(symbol.name.clone(), symbol.clone());
+            artifacts
+                .exported_interface
+                .entry(symbol.name.clone())
+                .and_modify(|existing| {
+                    if existing.is_declared {
+                        *existing = symbol.clone();
+                    }
+                })
+                .or_insert_with(|| symbol.clone());
         }
     }
 
@@ -1278,7 +1286,16 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
                 // Include if declaration position is before or at the query position.
                 if (*decl_line, *decl_col) <= (line, column) {
                     // Declared symbols are always global scope (not function-local)
-                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                    // Only insert if no real (non-declared) definition exists
+                    scope
+                        .symbols
+                        .entry(symbol.name.clone())
+                        .and_modify(|existing| {
+                            if existing.is_declared {
+                                *existing = symbol.clone();
+                            }
+                        })
+                        .or_insert_with(|| symbol.clone());
                 }
             }
         }
@@ -1500,7 +1517,16 @@ where
                 // Include if declaration position is before or at the query position.
                 if (*decl_line, *decl_col) <= (line, column) {
                     // Declared symbols are always global scope (not function-local)
-                    scope.symbols.insert(symbol.name.clone(), symbol.clone());
+                    // Only insert if no real (non-declared) definition exists
+                    scope
+                        .symbols
+                        .entry(symbol.name.clone())
+                        .and_modify(|existing| {
+                            if existing.is_declared {
+                                *existing = symbol.clone();
+                            }
+                        })
+                        .or_insert_with(|| symbol.clone());
                 }
             }
         }

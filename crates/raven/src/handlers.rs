@@ -3068,12 +3068,17 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             };
             // Convert 0-based line to 1-based for display
             let display_line = symbol.defined_line + 1;
-            
-            let value = format!(
-                "{} ({})\n\nDeclared via {} directive at line {}",
+
+            let mut value = format!(
+                "```r\n{} ({})\n```\n\nDeclared via {} directive at line {}",
                 name, kind_str, directive_type, display_line
             );
-            
+            if symbol.source_uri != *uri {
+                let workspace_root = state.workspace_folders.first();
+                let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
+                value.push_str(&format!("\n\n*Defined in {}*", relative_path));
+            }
+
             return Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
