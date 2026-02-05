@@ -60,8 +60,8 @@ def read_message(proc, timeout=60):
     return json.loads(content.decode('utf-8'))
 
 def main():
-    workspace = os.path.expanduser("~/repos/worldwide")
-    raven_path = os.path.expanduser("~/repos/raven/target/release/raven")
+    workspace = os.path.expanduser(os.environ.get("RAVEN_WORKSPACE", "~/repos/worldwide"))
+    raven_path = os.path.expanduser(os.environ.get("RAVEN_PATH", "~/repos/raven/target/release/raven"))
 
     env = os.environ.copy()
     env["RAVEN_PERF"] = "verbose"
