@@ -5,9 +5,11 @@
 This document describes the design for adding the `@lsp-source` forward directive to Raven, the R Language Server. The `@lsp-source` directive allows developers to explicitly declare that a file sources another file, complementing the existing backward directives (`@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`).
 
 Forward directives are useful when:
-- `source()` calls use dynamic paths (variables, expressions)
-- `source()` calls are conditional (inside if statements)
+- `source()` calls use dynamic paths (variables, expressions) that Raven cannot statically analyze
 - The relationship needs to be declared at a specific line for position-aware scope
+- You want to explicitly document a sourcing relationship for clarity
+
+**Note**: Raven already detects `source()` calls inside conditionals, loops, and function bodies through recursive AST traversal. The `@lsp-source` directive is primarily needed for dynamic paths that cannot be statically determined.
 
 ### Key Design Decisions
 
@@ -54,7 +56,7 @@ The implementation extends the existing cross-file awareness system with minimal
 
 **Changes Required**: 
 - Add `@lsp-run` and `@lsp-include` as synonyms
-- Add `line=N` parameter parsing for forward directives
+- Add optional `line=N` parameter parsing for forward directives (allows specifying call-site line explicitly)
 
 #### Updated Regex Pattern
 
