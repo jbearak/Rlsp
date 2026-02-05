@@ -4,11 +4,11 @@ set -e
 # Release script: bumps version, commits, tags, and pushes.
 #
 # Usage:
-#   ./scripts/release.sh <version>
+#   ./scripts/bump-version.sh <version>
 #
 # Examples:
-#   ./scripts/release.sh 0.2.0
-#   ./scripts/release.sh 1.0.0-beta.1
+#   ./scripts/bump-version.sh 0.2.0
+#   ./scripts/bump-version.sh 1.0.0-beta.1
 #
 # This script will:
 #   1. Validate the working directory is clean
