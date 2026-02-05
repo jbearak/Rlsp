@@ -230,6 +230,25 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
     Some(DocumentSymbolResponse::Flat(symbols))
 }
 
+/// Collects top-level symbols from a syntax tree and appends them to `symbols`.
+///
+/// This examines assignment expressions (e.g., `name <- ...`, `name = ...`, `name <<- ...`)
+/// and records an entry for the left-hand identifier. If the right-hand side is a
+/// `function_definition`, the symbol kind is `FUNCTION`; otherwise it is `VARIABLE`.
+/// Reserved words are skipped and not added to `symbols`.
+///
+/// The appended `SymbolInformation.location.uri` uses a placeholder (`file:///`) which
+/// the caller is expected to replace with the actual document URI.
+///
+/// # Examples
+///
+/// ```
+/// // Given a parsed tree `tree` and source text `src`:
+/// // let root = tree.root_node();
+/// // let mut symbols = Vec::new();
+/// // collect_symbols(root, src, &mut symbols);
+/// // assert!(symbols.iter().any(|s| s.name == "my_function"));
+/// ```
 #[allow(deprecated)]
 fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>) {
     // Look for assignments: identifier <- value or identifier = value
@@ -286,6 +305,203 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_symbols(child, text, symbols);
+    }
+}
+
+// ============================================================================
+// Workspace Symbols
+// ============================================================================
+
+/// Maximum number of symbols returned by workspace/symbol.
+const WORKSPACE_SYMBOL_LIMIT: usize = 500;
+
+/// Collects workspace symbols whose names contain the given query as a case-insensitive substring.
+///
+/// Searches symbols in this priority order: open documents, the new workspace index (closed files),
+/// the cross-file workspace index, legacy open documents (AST fallback), and the legacy workspace index
+/// (AST fallback). Files already seen in a higher-priority source are not re-scanned (deduplicated by URI).
+/// Virtual symbols declared via directive annotations are skipped by the artifact collector.
+/// Results are truncated to at most WORKSPACE_SYMBOL_LIMIT entries.
+///
+/// # Parameters
+///
+/// - `query`: Case-insensitive substring used to filter symbol names.
+///
+/// # Returns
+///
+/// A `Vec<SymbolInformation>` containing up to `WORKSPACE_SYMBOL_LIMIT` symbols that match `query`.
+/// Each symbol's `location.uri` indicates the source file where the symbol is defined.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Given a populated `state: WorldState`
+/// let symbols = workspace_symbol(&state, "plot");
+/// // `symbols` is `Some(Vec<SymbolInformation>)` containing matching symbols (up to the configured limit)
+/// ```
+pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInformation>> {
+    let lower_query = query.to_lowercase();
+    let mut symbols = Vec::new();
+    let mut seen_uris = std::collections::HashSet::<Url>::new();
+
+    // 1. Open documents (highest priority)
+    for uri in state.document_store.uris() {
+        seen_uris.insert(uri.clone());
+        if let Some(doc) = state.document_store.get_without_touch(&uri) {
+            collect_workspace_symbols_from_artifacts(
+                &uri,
+                &doc.artifacts,
+                &lower_query,
+                &mut symbols,
+            );
+        }
+    }
+
+    // 2. New workspace index (closed files)
+    for (uri, entry) in state.workspace_index_new.iter() {
+        if seen_uris.contains(&uri) {
+            continue;
+        }
+        seen_uris.insert(uri.clone());
+        collect_workspace_symbols_from_artifacts(&uri, &entry.artifacts, &lower_query, &mut symbols);
+    }
+
+    // 3. Cross-file workspace index
+    for uri in state.cross_file_workspace_index.uris() {
+        if seen_uris.contains(&uri) {
+            continue;
+        }
+        seen_uris.insert(uri.clone());
+        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(&uri) {
+            collect_workspace_symbols_from_artifacts(&uri, &artifacts, &lower_query, &mut symbols);
+        }
+    }
+
+    // 4. Legacy documents (AST fallback)
+    for (uri, doc) in &state.documents {
+        if seen_uris.contains(uri) {
+            continue;
+        }
+        seen_uris.insert(uri.clone());
+        if let Some(tree) = &doc.tree {
+            let text = doc.text();
+            let mut file_symbols = Vec::new();
+            collect_symbols(tree.root_node(), &text, &mut file_symbols);
+            for mut sym in file_symbols {
+                if sym.name.to_lowercase().contains(&lower_query) {
+                    sym.location.uri = uri.clone();
+                    symbols.push(sym);
+                }
+            }
+        }
+    }
+
+    // 5. Legacy workspace index (AST fallback)
+    for (uri, doc) in &state.workspace_index {
+        if seen_uris.contains(uri) {
+            continue;
+        }
+        seen_uris.insert(uri.clone());
+        if let Some(tree) = &doc.tree {
+            let text = doc.text();
+            let mut file_symbols = Vec::new();
+            collect_symbols(tree.root_node(), &text, &mut file_symbols);
+            for mut sym in file_symbols {
+                if sym.name.to_lowercase().contains(&lower_query) {
+                    sym.location.uri = uri.clone();
+                    symbols.push(sym);
+                }
+            }
+        }
+    }
+
+    symbols.truncate(WORKSPACE_SYMBOL_LIMIT);
+    Some(symbols)
+}
+
+/// Collect matching symbols from precomputed `ScopeArtifacts` and append them to `symbols`.
+
+///
+
+/// This filters exported symbols by whether their name (case-insensitively) contains `lower_query`,
+
+/// skips declared (virtual) symbols such as `@lsp-var`/`@lsp-func`, and maps internal symbol kinds
+
+/// to LSP `SymbolKind` values. Each matched symbol is appended as a `SymbolInformation` with the
+
+/// provided `file_uri` and the symbol's definition position.
+
+///
+
+/// - `file_uri`: URI to assign to each returned `SymbolInformation`.
+
+/// - `artifacts`: Precomputed `ScopeArtifacts` containing `exported_interface`.
+
+/// - `lower_query`: a lowercased query string used for substring matching against symbol names.
+
+/// - `symbols`: output vector to which matching `SymbolInformation` entries will be appended.
+
+///
+
+/// # Examples
+
+///
+
+/// ```no_run
+
+/// # use lsp_types::{Location, Range, Position, SymbolInformation, SymbolKind};
+
+/// # use url::Url;
+
+/// # // Assume `artifacts` is a prepared ScopeArtifacts instance and `symbols` is an empty Vec.
+
+/// # let file_uri = Url::parse("file:///path/to/file.R").unwrap();
+
+/// # let lower_query = "foo";
+
+/// # let mut symbols: Vec<SymbolInformation> = Vec::new();
+
+/// # // collect_workspace_symbols_from_artifacts(&file_uri, &artifacts, lower_query, &mut symbols);
+
+/// // After calling, `symbols` will contain any exported symbols whose names contain "foo".
+
+/// ```
+fn collect_workspace_symbols_from_artifacts(
+    file_uri: &Url,
+    artifacts: &crate::cross_file::scope::ScopeArtifacts,
+    lower_query: &str,
+    symbols: &mut Vec<SymbolInformation>,
+) {
+    for scoped_symbol in artifacts.exported_interface.values() {
+        if !scoped_symbol.name.to_lowercase().contains(lower_query) {
+            continue;
+        }
+
+        // Skip declared symbols (@lsp-var, @lsp-func) — they are virtual
+        if scoped_symbol.is_declared {
+            continue;
+        }
+
+        let kind = match scoped_symbol.kind {
+            crate::cross_file::scope::SymbolKind::Function => SymbolKind::FUNCTION,
+            crate::cross_file::scope::SymbolKind::Variable => SymbolKind::VARIABLE,
+            crate::cross_file::scope::SymbolKind::Parameter => SymbolKind::VARIABLE,
+        };
+
+        symbols.push(SymbolInformation {
+            name: scoped_symbol.name.clone(),
+            kind,
+            tags: None,
+            deprecated: None,
+            location: Location {
+                uri: file_uri.clone(),
+                range: Range {
+                    start: Position::new(scoped_symbol.defined_line, scoped_symbol.defined_column),
+                    end: Position::new(scoped_symbol.defined_line, scoped_symbol.defined_column),
+                },
+            },
+            container_name: None,
+        });
     }
 }
 
@@ -9037,6 +9253,130 @@ mod proptests {
                 }
             }
         }
+    }
+
+    // ========================================================================
+    // Workspace Symbol Tests
+    // ========================================================================
+
+    #[test]
+    fn test_workspace_symbol_basic_search() {
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new(vec![]);
+
+        let uri1 = Url::parse("file:///test1.R").unwrap();
+        state
+            .documents
+            .insert(uri1.clone(), Document::new("my_func <- function(x) x + 1\nmy_var <- 42", None));
+
+        let uri2 = Url::parse("file:///test2.R").unwrap();
+        state
+            .documents
+            .insert(uri2.clone(), Document::new("helper_func <- function(y) y * 2", None));
+
+        let result = workspace_symbol(&state, "func").unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|s| s.name == "my_func"));
+        assert!(result.iter().any(|s| s.name == "helper_func"));
+
+        let result = workspace_symbol(&state, "var").unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result.iter().any(|s| s.name == "my_var"));
+    }
+
+    #[test]
+    fn test_workspace_symbol_case_insensitive() {
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new(vec![]);
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new("MyFunction <- function() {}", None));
+
+        let result = workspace_symbol(&state, "myfunction").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "MyFunction");
+
+        let result = workspace_symbol(&state, "MYFUNCTION").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "MyFunction");
+    }
+
+    #[test]
+    fn test_workspace_symbol_empty_query_returns_all() {
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new(vec![]);
+        let uri = Url::parse("file:///test.R").unwrap();
+        state.documents.insert(
+            uri.clone(),
+            Document::new("foo <- 1\nbar <- function() {}\nbaz <- 3", None),
+        );
+
+        let result = workspace_symbol(&state, "").unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_workspace_symbol_correct_uris() {
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new(vec![]);
+        let uri1 = Url::parse("file:///dir/file1.R").unwrap();
+        state
+            .documents
+            .insert(uri1.clone(), Document::new("alpha <- 1", None));
+
+        let uri2 = Url::parse("file:///dir/file2.R").unwrap();
+        state
+            .documents
+            .insert(uri2.clone(), Document::new("beta <- 2", None));
+
+        let result = workspace_symbol(&state, "").unwrap();
+        for sym in &result {
+            if sym.name == "alpha" {
+                assert_eq!(sym.location.uri, uri1);
+            } else if sym.name == "beta" {
+                assert_eq!(sym.location.uri, uri2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_workspace_symbol_no_match() {
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new(vec![]);
+        let uri = Url::parse("file:///test.R").unwrap();
+        state
+            .documents
+            .insert(uri.clone(), Document::new("foo <- 1", None));
+
+        let result = workspace_symbol(&state, "zzz_nonexistent").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_symbol_function_and_variable_kinds() {
+        use crate::state::{Document, WorldState};
+
+        let mut state = WorldState::new(vec![]);
+        let uri = Url::parse("file:///test.R").unwrap();
+        state.documents.insert(
+            uri.clone(),
+            Document::new("my_func <- function() {}\nmy_var <- 42", None),
+        );
+
+        let result = workspace_symbol(&state, "my_").unwrap();
+        assert_eq!(result.len(), 2);
+
+        let func_sym = result.iter().find(|s| s.name == "my_func").unwrap();
+        assert_eq!(func_sym.kind, tower_lsp::lsp_types::SymbolKind::FUNCTION);
+
+        let var_sym = result.iter().find(|s| s.name == "my_var").unwrap();
+        assert_eq!(var_sym.kind, tower_lsp::lsp_types::SymbolKind::VARIABLE);
     }
 }
 
