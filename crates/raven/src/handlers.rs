@@ -230,6 +230,25 @@ pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolRe
     Some(DocumentSymbolResponse::Flat(symbols))
 }
 
+/// Collects top-level symbols from a syntax tree and appends them to `symbols`.
+///
+/// This examines assignment expressions (e.g., `name <- ...`, `name = ...`, `name <<- ...`)
+/// and records an entry for the left-hand identifier. If the right-hand side is a
+/// `function_definition`, the symbol kind is `FUNCTION`; otherwise it is `VARIABLE`.
+/// Reserved words are skipped and not added to `symbols`.
+///
+/// The appended `SymbolInformation.location.uri` uses a placeholder (`file:///`) which
+/// the caller is expected to replace with the actual document URI.
+///
+/// # Examples
+///
+/// ```
+/// // Given a parsed tree `tree` and source text `src`:
+/// // let root = tree.root_node();
+/// // let mut symbols = Vec::new();
+/// // collect_symbols(root, src, &mut symbols);
+/// // assert!(symbols.iter().any(|s| s.name == "my_function"));
+/// ```
 #[allow(deprecated)]
 fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>) {
     // Look for assignments: identifier <- value or identifier = value
@@ -296,12 +315,30 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 /// Maximum number of symbols returned by workspace/symbol.
 const WORKSPACE_SYMBOL_LIMIT: usize = 500;
 
-/// Returns symbols from all indexed files matching the query string.
+/// Collects workspace symbols whose names contain the given query as a case-insensitive substring.
 ///
-/// Queries symbols from open documents, workspace index, and legacy indices.
-/// Open documents take precedence over workspace index entries for deduplication.
-/// Filtering is case-insensitive substring matching.
-#[allow(deprecated)]
+/// Searches symbols in this priority order: open documents, the new workspace index (closed files),
+/// the cross-file workspace index, legacy open documents (AST fallback), and the legacy workspace index
+/// (AST fallback). Files already seen in a higher-priority source are not re-scanned (deduplicated by URI).
+/// Virtual symbols declared via directive annotations are skipped by the artifact collector.
+/// Results are truncated to at most WORKSPACE_SYMBOL_LIMIT entries.
+///
+/// # Parameters
+///
+/// - `query`: Case-insensitive substring used to filter symbol names.
+///
+/// # Returns
+///
+/// A `Vec<SymbolInformation>` containing up to `WORKSPACE_SYMBOL_LIMIT` symbols that match `query`.
+/// Each symbol's `location.uri` indicates the source file where the symbol is defined.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Given a populated `state: WorldState`
+/// let symbols = workspace_symbol(&state, "plot");
+/// // `symbols` is `Some(Vec<SymbolInformation>)` containing matching symbols (up to the configured limit)
+/// ```
 pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInformation>> {
     let lower_query = query.to_lowercase();
     let mut symbols = Vec::new();
@@ -382,8 +419,53 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
     Some(symbols)
 }
 
-/// Collect symbols from pre-computed ScopeArtifacts, filtering by query.
-#[allow(deprecated)]
+/// Collect matching symbols from precomputed `ScopeArtifacts` and append them to `symbols`.
+
+///
+
+/// This filters exported symbols by whether their name (case-insensitively) contains `lower_query`,
+
+/// skips declared (virtual) symbols such as `@lsp-var`/`@lsp-func`, and maps internal symbol kinds
+
+/// to LSP `SymbolKind` values. Each matched symbol is appended as a `SymbolInformation` with the
+
+/// provided `file_uri` and the symbol's definition position.
+
+///
+
+/// - `file_uri`: URI to assign to each returned `SymbolInformation`.
+
+/// - `artifacts`: Precomputed `ScopeArtifacts` containing `exported_interface`.
+
+/// - `lower_query`: a lowercased query string used for substring matching against symbol names.
+
+/// - `symbols`: output vector to which matching `SymbolInformation` entries will be appended.
+
+///
+
+/// # Examples
+
+///
+
+/// ```no_run
+
+/// # use lsp_types::{Location, Range, Position, SymbolInformation, SymbolKind};
+
+/// # use url::Url;
+
+/// # // Assume `artifacts` is a prepared ScopeArtifacts instance and `symbols` is an empty Vec.
+
+/// # let file_uri = Url::parse("file:///path/to/file.R").unwrap();
+
+/// # let lower_query = "foo";
+
+/// # let mut symbols: Vec<SymbolInformation> = Vec::new();
+
+/// # // collect_workspace_symbols_from_artifacts(&file_uri, &artifacts, lower_query, &mut symbols);
+
+/// // After calling, `symbols` will contain any exported symbols whose names contain "foo".
+
+/// ```
 fn collect_workspace_symbols_from_artifacts(
     file_uri: &Url,
     artifacts: &crate::cross_file::scope::ScopeArtifacts,

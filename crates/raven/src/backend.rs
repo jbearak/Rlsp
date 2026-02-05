@@ -450,6 +450,23 @@ impl Backend {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
+    /// Initializes the server state from the client's InitializeParams and returns the LSP
+    /// InitializeResult advertising the server's capabilities (text sync, folding, symbols,
+    /// completion triggers, hover, signature help, definition/references, formatting, workspace symbols, etc.).
+    ///
+    /// The method records workspace folders from the params into shared state before constructing
+    /// the capabilities and server information.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use lsp_types::InitializeParams;
+    /// # async fn example(backend: &crate::backend::Backend) -> lsp_types::InitializeResult {
+    /// let params = InitializeParams::default();
+    /// // run inside an async context (tokio/runtime)
+    /// backend.initialize(params).await.unwrap()
+    /// }
+    /// ```
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         log::info!("Initializing ark-lsp");
 
@@ -2318,6 +2335,22 @@ impl LanguageServer for Backend {
         ))
     }
 
+    /// Provides the document symbols for the specified text document URI.
+    ///
+    /// The returned value contains the symbol information or hierarchical document symbols
+    /// for the document, or `None` when no symbols are available.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsp_types::DocumentSymbolParams;
+    /// # async fn example(backend: &crate::backend::Backend, params: DocumentSymbolParams) {
+    /// let result = backend.document_symbol(params).await.unwrap();
+    /// if let Some(symbols) = result {
+    ///     // process symbols
+    /// }
+    /// # }
+    /// ```
     async fn document_symbol(
         &self,
         params: DocumentSymbolParams,
@@ -2326,6 +2359,21 @@ impl LanguageServer for Backend {
         Ok(handlers::document_symbol(&state, &params.text_document.uri))
     }
 
+    /// Searches workspace symbols that match the provided query string.
+    ///
+    /// Returns an `Option<Vec<SymbolInformation>>` containing matching symbols when available,
+    /// or `None` if the server has no symbol results for the query.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Call from an async context with a prepared `backend` and params:
+    /// let params = lsp_types::WorkspaceSymbolParams { query: "my_fn".into(), ..Default::default() };
+    /// let symbols_opt = backend.symbol(params).await?;
+    /// if let Some(symbols) = symbols_opt {
+    ///     // inspect or assert on `symbols`
+    /// }
+    /// ```
     async fn symbol(
         &self,
         params: WorkspaceSymbolParams,
@@ -2334,6 +2382,25 @@ impl LanguageServer for Backend {
         Ok(handlers::workspace_symbol(&state, &params.query))
     }
 
+    /// Compute code completions for a text document position.
+    ///
+    /// Returns `Some(CompletionResponse)` with completion items when completions are available for the
+    /// given document position, `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use lsp_types::CompletionParams;
+    ///
+    /// // `backend` is an initialized `Backend` instance and `params` is a prepared `CompletionParams`.
+    /// // This example shows the call site; actual construction of `Backend` and `params` is omitted.
+    /// # async fn example(backend: &crate::backend::Backend, params: CompletionParams) {
+    /// let result = backend.completion(params).await.unwrap();
+    /// if let Some(response) = result {
+    ///     // Inspect completion items in `response`
+    /// }
+    /// # }
+    /// ```
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let state = self.state.read().await;
         Ok(handlers::completion(
