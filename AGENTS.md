@@ -174,16 +174,17 @@ Cross-file awareness enables Raven to understand symbol definitions and relation
 **Key Features**:
 1. **Automatic detection**: Parses `source()` and `sys.source()` calls from R code
 2. **Manual directives**: `@lsp-sourced-by`, `@lsp-run-by` for files not explicitly sourced
-3. **Working directory support**: `@lsp-cd` directive affects source() path resolution
-4. **Position-aware scope**: Symbols only available after their source() call
-5. **Cycle detection**: Prevents infinite loops in circular dependencies
-6. **Real-time updates**: Changes propagate to dependent files automatically
+3. **Declaration directives**: `@lsp-var`, `@lsp-func` for dynamically created symbols
+4. **Working directory support**: `@lsp-cd` directive affects source() path resolution
+5. **Position-aware scope**: Symbols only available after their source() call
+6. **Cycle detection**: Prevents infinite loops in circular dependencies
+7. **Real-time updates**: Changes propagate to dependent files automatically
 
 ### Module Structure (`crates/raven/src/cross_file/`)
 
 - `background_indexer.rs` - Background indexing queue for transitive dependencies
-- `types.rs` - Core types (CrossFileMetadata, BackwardDirective, ForwardSource, CallSiteSpec)
-- `directive.rs` - Directive parsing (@lsp-sourced-by, @lsp-source, etc.) with optional colon/quotes
+- `types.rs` - Core types (CrossFileMetadata, BackwardDirective, ForwardSource, DeclaredSymbol, CallSiteSpec)
+- `directive.rs` - Directive parsing (@lsp-sourced-by, @lsp-source, @lsp-var, @lsp-func, etc.) with optional colon/quotes
 - `source_detect.rs` - Tree-sitter based source() call detection with UTF-16 columns
 - `path_resolve.rs` - Path resolution with working directory support
 - `dependency.rs` - Dependency graph with directive-vs-AST conflict resolution
@@ -207,6 +208,36 @@ All directives support optional colon and quotes:
 Backward directive synonyms: `@lsp-sourced-by`, `@lsp-run-by`, `@lsp-included-by`
 Forward directive synonyms: `@lsp-source`, `@lsp-run`, `@lsp-include`
 Working directory synonyms: `@lsp-working-directory`, `@lsp-working-dir`, `@lsp-current-directory`, `@lsp-current-dir`, `@lsp-wd`, `@lsp-cd`
+Variable declaration synonyms: `@lsp-var`, `@lsp-variable`, `@lsp-declare-var`, `@lsp-declare-variable`
+Function declaration synonyms: `@lsp-func`, `@lsp-function`, `@lsp-declare-func`, `@lsp-declare-function`
+
+### Declaration Directives
+
+Declaration directives allow users to declare symbols (variables and functions) that cannot be statically detected by the parser. This enables proper IDE support for dynamically created symbols from `eval()`, `assign()`, `load()`, or external data loading.
+
+**Syntax:**
+- `# @lsp-var myvar` - Declare a variable
+- `# @lsp-func myfunc` - Declare a function
+- Supports optional colon: `# @lsp-var: myvar`
+- Supports quotes for special characters: `# @lsp-var "my.var"`
+
+**Key behaviors:**
+- **Position-aware**: Declared symbols are available starting from the line after the directive (line N+1), matching `source()` semantics
+- **Cross-file inheritance**: Declarations propagate to sourced child files if declared before the `source()` call
+- **Diagnostic suppression**: Declared symbols suppress "undefined variable" warnings
+- **LSP features**: Completions, hover (shows "declared via @lsp-var directive at line N"), go-to-definition (navigates to directive)
+- **Interface hash**: Declaration changes trigger revalidation of dependent files
+
+**Conflicting declarations** (same symbol as both variable and function):
+- Later declaration (by line) determines symbol kind for completions/hover
+- First declaration used for go-to-definition
+- Diagnostic suppression applies regardless of kind
+
+**Implementation:**
+- `DeclaredSymbol` struct in `types.rs` stores name, line, and is_function flag
+- `CrossFileMetadata` has `declared_variables` and `declared_functions` fields
+- `ScopeEvent::Declaration` variant in `scope.rs` for timeline integration
+- Column set to `u32::MAX` (end-of-line sentinel) ensures symbol available from line+1
 
 ### Path Resolution: Critical Distinction
 

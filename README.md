@@ -75,6 +75,7 @@ For files that aren't explicitly sourced, add a directive:
 ## Features
 
 - **Cross-file awareness** - Symbol resolution across `source()` chains with position-aware scope
+- **Declaration directives** - Declare dynamically-created symbols (`@lsp-var`, `@lsp-func`) for proper IDE support
 - **Diagnostics** - Undefined variable detection that understands sourced files
 - **Go-to-definition** - Navigate to symbol definitions across file boundaries
 - **Find references** - Locate all symbol usages project-wide
