@@ -75,6 +75,9 @@ echo "Updated Cargo.toml and editors/vscode/package.json"
 
 # Commit, tag, and push
 git -C "$REPO_ROOT" add Cargo.toml editors/vscode/package.json
+if [ -f "$REPO_ROOT/editors/vscode/package-lock.json" ]; then
+  git -C "$REPO_ROOT" add editors/vscode/package-lock.json
+fi
 git -C "$REPO_ROOT" commit -m "chore: bump version to $VERSION"
 
 echo "Creating tag $TAG..."

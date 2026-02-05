@@ -40,11 +40,11 @@ jobs:
 
       - name: Get tag commit SHA
         id: tag_sha
-        run: echo "sha=$(git rev-parse refs/tags/${{ inputs.tag }})" >> $GITHUB_OUTPUT
+        run: echo "sha=$(git rev-parse refs/tags/${{ inputs.tag }})" >> "$GITHUB_OUTPUT"
 
       - name: Extract version
         id: version
-        run: echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
         env:
           TAG: ${{ inputs.tag }}
 
@@ -135,8 +135,8 @@ jobs:
           tag_name: ${{ inputs.tag }}
           name: Release ${{ inputs.tag }}
           files: |
-            lsp-artifacts/*
-            vscode-artifacts/*
+            lsp-artifacts/**/*.zip
+            vscode-artifacts/**/*.vsix
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -157,7 +157,8 @@ jobs:
 
       - name: Publish to VS Code Marketplace
         run: |
-          for vsix in vscode-artifacts/*.vsix; do
+          shopt -s globstar
+          for vsix in vscode-artifacts/**/*.vsix; do
             echo "Publishing $vsix to VS Code Marketplace..."
             vsce publish --packagePath "$vsix"
           done
@@ -167,7 +168,8 @@ jobs:
       - name: Publish to Open VSX
         continue-on-error: true
         run: |
-          for vsix in vscode-artifacts/*.vsix; do
+          shopt -s globstar
+          for vsix in vscode-artifacts/**/*.vsix; do
             echo "Publishing $vsix to Open VSX..."
             ovsx publish "$vsix"
           done
