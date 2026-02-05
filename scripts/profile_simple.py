@@ -9,6 +9,7 @@ import sys
 import time
 import os
 import threading
+from pathlib import Path
 
 def send_message(proc, msg):
     content = json.dumps(msg)
@@ -75,7 +76,7 @@ def read_message(proc, timeout=60):
     return json.loads(body.decode('utf-8'))
 
 def main():
-    workspace = os.path.expanduser(os.environ.get("RAVEN_WORKSPACE", "~/repos/worldwide"))
+    workspace = Path(os.path.expanduser(os.environ.get("RAVEN_WORKSPACE", "~/repos/worldwide"))).resolve()
     raven_path = os.path.expanduser(os.environ.get("RAVEN_PATH", "~/repos/raven/target/release/raven"))
 
     env = os.environ.copy()
@@ -105,16 +106,17 @@ def main():
     # Send initialize
     print("Sending initialize...")
     init_send_time = time.time()
+    workspace_uri = workspace.as_uri()
     send_message(proc, {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
         "params": {
             "processId": os.getpid(),
-            "rootUri": f"file://{workspace}",
+            "rootUri": workspace_uri,
             "capabilities": {},
             "workspaceFolders": [
-                {"uri": f"file://{workspace}", "name": "worldwide"}
+                {"uri": workspace_uri, "name": "worldwide"}
             ],
             "initializationOptions": {
                 "crossFile": {
