@@ -81,9 +81,9 @@ impl CrossFileFileCache {
     }
 
     /// Update existence cache (called after background check)
-    pub fn cache_existence(&self, path: std::path::PathBuf, exists: bool) {
+    pub fn cache_existence(&self, path: &Path, exists: bool) {
         if let Ok(mut guard) = self.existence.write() {
-            guard.insert(path, exists);
+            guard.insert(path.to_path_buf(), exists);
         }
     }
 

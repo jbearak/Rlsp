@@ -134,6 +134,8 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
         is_sys_source,
         sys_source_global_env,
         explicit_line: false, // AST-detected sources never have explicit line=N
+        directive_line: 0,    // Not applicable for AST-detected sources
+        user_line_zero: false, // Not applicable for AST-detected sources
     })
 }
 

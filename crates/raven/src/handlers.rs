@@ -429,6 +429,9 @@ pub fn diagnostics(state: &WorldState, uri: &Url) -> Vec<Diagnostic> {
     // Check for redundant forward directives (Requirement 6.2)
     collect_redundant_directive_diagnostics(state, uri, &directive_meta, &mut diagnostics);
 
+    // Check for invalid line=0 in forward directives
+    collect_invalid_line_param_diagnostics(&directive_meta, &mut diagnostics);
+
     // Collect undefined variable errors if enabled in config
     if state.cross_file_config.undefined_variables_enabled {
         collect_undefined_variables_position_aware(
@@ -1416,6 +1419,40 @@ fn collect_redundant_directive_diagnostics(
                 });
                 break; // Only emit one diagnostic per directive
             }
+        }
+    }
+}
+
+/// Emit diagnostics for forward directives with invalid `line=0` parameter.
+///
+/// The `line=N` parameter uses 1-based line numbers (matching editor display).
+/// A value of `line=0` is invalid because there is no line 0 in 1-based numbering.
+/// When `line=0` is specified, the LSP emits a warning and treats it as line 1
+/// (which becomes internal line 0 after conversion).
+///
+/// # Parameters
+///
+/// - `meta`: Cross-file directive metadata containing forward sources.
+/// - `diagnostics`: Mutable vector to receive emitted diagnostics.
+fn collect_invalid_line_param_diagnostics(
+    meta: &crate::cross_file::CrossFileMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for source in &meta.sources {
+        // Only check directive sources with explicit line=0
+        if source.is_directive && source.user_line_zero {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position::new(source.directive_line, 0),
+                    end: Position::new(source.directive_line, u32::MAX),
+                },
+                severity: Some(DiagnosticSeverity::WARNING),
+                message: format!(
+                    "Invalid line=0 in @lsp-source directive for '{}': line numbers are 1-based. Using line 1 instead.",
+                    source.path
+                ),
+                ..Default::default()
+            });
         }
     }
 }

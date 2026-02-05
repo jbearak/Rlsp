@@ -75,6 +75,17 @@ pub struct ForwardSource {
     /// _Requirements: 6.2_
     #[serde(default)]
     pub explicit_line: bool,
+    /// 0-based line where the directive itself appears in the file.
+    /// Only relevant when is_directive=true.
+    /// Used for diagnostic positioning when line= parameter is invalid.
+    #[serde(default)]
+    pub directive_line: u32,
+    /// true if the user explicitly specified `line=0` (invalid value).
+    /// Line numbers in directives are 1-based, so line=0 is invalid.
+    /// When true, a warning diagnostic should be emitted.
+    /// Only relevant when is_directive=true and explicit_line=true.
+    #[serde(default)]
+    pub user_line_zero: bool,
 }
 
 fn default_sys_source_global_env() -> bool {

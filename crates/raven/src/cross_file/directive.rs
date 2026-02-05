@@ -108,18 +108,22 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
             // Parse line=N parameter from capture group 4 if present
             // Convert from 1-based user input to 0-based internal (N-1)
             // Use directive's own line when no line= parameter
-            let (call_site_line, has_explicit_line) = if let Some(line_match) = caps.get(4) {
-                let user_line: u32 = line_match.as_str().parse().unwrap_or(1);
-                (user_line.saturating_sub(1), true)
+            let (call_site_line, has_explicit_line, is_line_zero) = if let Some(line_match) = caps.get(4) {
+                let user_line: u32 = line_match.as_str().parse().unwrap_or(0);
+                let is_zero = user_line == 0;
+                // For line=0, treat as line=1 (internal 0) but flag it as invalid
+                let effective_line = if user_line == 0 { 0 } else { user_line.saturating_sub(1) };
+                (effective_line, true, is_zero)
             } else {
-                (line_num, false)
+                (line_num, false, false)
             };
             log::trace!(
-                "  Parsed forward directive at line {}: path='{}' call_site_line={} explicit_line={}",
+                "  Parsed forward directive at line {}: path='{}' call_site_line={} explicit_line={} user_line_zero={}",
                 line_num,
                 path,
                 call_site_line,
-                has_explicit_line
+                has_explicit_line,
+                is_line_zero
             );
             meta.sources.push(ForwardSource {
                 path,
@@ -131,6 +135,8 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 is_sys_source: false,
                 sys_source_global_env: true,
                 explicit_line: has_explicit_line,
+                directive_line: line_num,
+                user_line_zero: is_line_zero,
             });
             continue;
         }
@@ -574,6 +580,20 @@ x <- undefined"#;
         let meta = parse_directives(content);
         assert_eq!(meta.sources.len(), 1);
         assert_eq!(meta.sources[0].line, 0); // 1 - 1 = 0
+        assert!(meta.sources[0].explicit_line);
+        assert!(!meta.sources[0].user_line_zero);
+    }
+
+    #[test]
+    fn test_forward_directive_line_param_parsing_line_0() {
+        // Edge case: line=0 is invalid (1-based numbering), should be flagged
+        let content = "# @lsp-source utils.R line=0";
+        let meta = parse_directives(content);
+        assert_eq!(meta.sources.len(), 1);
+        assert_eq!(meta.sources[0].line, 0); // Treated as line 1 (internal 0)
+        assert!(meta.sources[0].explicit_line);
+        assert!(meta.sources[0].user_line_zero); // Flag that line=0 was specified
+        assert_eq!(meta.sources[0].directive_line, 0); // Directive is on line 0
     }
 
     #[test]
