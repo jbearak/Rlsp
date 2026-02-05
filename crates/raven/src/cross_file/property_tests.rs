@@ -11234,6 +11234,15 @@ proptest! {
     ) {
         // Ensure the exported and non-exported names are different
         prop_assume!(exported_name != non_exported_name);
+        
+        // Ensure non_exported_name doesn't conflict with generated variable names
+        for i in 0..lines_before {
+            prop_assume!(non_exported_name != format!("x{}", i));
+        }
+        for i in 0..lines_after {
+            prop_assume!(non_exported_name != format!("y{}", i));
+        }
+        prop_assume!(non_exported_name != "result");
 
         let uri = make_url("test_non_export_diag");
 
