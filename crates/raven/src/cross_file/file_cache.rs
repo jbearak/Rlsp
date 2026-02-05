@@ -63,11 +63,28 @@ struct CachedFile {
 pub struct CrossFileFileCache {
     /// Cached file contents by URI
     inner: RwLock<HashMap<Url, CachedFile>>,
+    /// Cached file existence by path (canonical)
+    existence: RwLock<HashMap<std::path::PathBuf, bool>>,
 }
 
 impl CrossFileFileCache {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            existence: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Check if a path exists (cached, non-blocking read)
+    pub fn path_exists(&self, path: &Path) -> Option<bool> {
+        self.existence.read().ok()?.get(path).copied()
+    }
+
+    /// Update existence cache (called after background check)
+    pub fn cache_existence(&self, path: std::path::PathBuf, exists: bool) {
+        if let Ok(mut guard) = self.existence.write() {
+            guard.insert(path, exists);
+        }
     }
 
     /// Get cached content if snapshot is still fresh

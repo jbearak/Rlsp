@@ -673,18 +673,7 @@ impl DependencyGraph {
         // Uses PathContext with working_directory from @lsp-cd, enabling paths to resolve
         // relative to the configured working directory rather than the file's directory.
         // Also uses workspace-root fallback for source() statements in files without @lsp-cd.
-        // Returns (Option<Url>, bool) where the bool indicates if the file exists.
-        let do_resolve_with_existence = |path: &str| -> (Option<Url>, bool) {
-            let resolved = match resolve_path_with_workspace_fallback(path, &path_ctx) {
-                Some(p) => p,
-                None => return (None, false),
-            };
-            let exists = resolved.exists();
-            let uri = path_to_uri(&resolved);
-            (uri, exists)
-        };
-
-        // Simple resolve helper for cases where we don't need existence check
+        // Returns Option<Url> - existence is checked later during file read operations.
         let do_resolve = |path: &str| -> Option<Url> {
             let resolved = resolve_path_with_workspace_fallback(path, &path_ctx)?;
             path_to_uri(&resolved)
@@ -713,15 +702,13 @@ impl DependencyGraph {
         // Process forward directive sources (@lsp-source, @lsp-run, @lsp-include)
         // Uses do_resolve which includes @lsp-cd working directory in path resolution.
         // This differs from backward directives which ignore @lsp-cd.
-        // Skip edge creation when resolved path doesn't exist (Requirement 3.3).
-        // (Requirements 3.1, 3.2, 3.3, 3.4)
+        // Creates edges optimistically; file existence is validated during file operations.
+        // (Requirements 3.1, 3.2, 3.4)
         for source in &meta.sources {
             if source.is_directive {
-                let (resolved_uri, exists) = do_resolve_with_existence(&source.path);
-                
-                match resolved_uri {
-                    Some(to_uri) if exists => {
-                        // File exists, create edge
+                match do_resolve(&source.path) {
+                    Some(to_uri) => {
+                        // Path resolved, create edge
                         let edge = DependencyEdge {
                             from: uri.clone(),
                             to: to_uri.clone(),
@@ -735,21 +722,6 @@ impl DependencyGraph {
                         };
                         directive_from_to.insert(edge.as_from_to_pair());
                         directive_edges.push(edge);
-                    }
-                    Some(_to_uri) => {
-                        // Path resolved but file doesn't exist - store for diagnostic emission
-                        // (Requirement 3.3)
-                        log::trace!(
-                            "Forward directive @lsp-source '{}' at line {} resolved but file does not exist, skipping edge creation",
-                            source.path,
-                            source.line
-                        );
-                        result.unresolved_forward_paths.push(UnresolvedForwardPath {
-                            path: source.path.clone(),
-                            line: source.line,
-                            column: source.column,
-                            reason: UnresolvedReason::FileNotFound,
-                        });
                     }
                     None => {
                         // Path resolution failed - store for diagnostic emission
@@ -1712,11 +1684,9 @@ mod tests {
         assert!(result.diagnostics.is_empty());
     }
 
-    /// Test that forward directives to non-existent files don't create edges
-    /// and are tracked in unresolved_forward_paths.
-    /// _Requirements: 3.3_
+    /// Test that forward directives create edges optimistically (existence checked later)
     #[test]
-    fn test_forward_directive_nonexistent_file_skips_edge() {
+    fn test_forward_directive_creates_edge_optimistically() {
         use super::super::types::ForwardSource;
 
         // Create temp workspace with only main.R (utils.R does NOT exist)
@@ -1742,22 +1712,16 @@ mod tests {
 
         let result = graph.update_file(&main, &meta, Some(&workspace_url), |_| None);
 
-        // Should NOT create edge for non-existent file
+        // Edge is created optimistically; existence is validated during file operations
         let deps = graph.get_dependencies(&main);
-        assert_eq!(deps.len(), 0, "No edge should be created for non-existent file");
+        assert_eq!(deps.len(), 1, "Edge should be created optimistically");
 
-        // Should track the unresolved path
+        // No unresolved paths since path resolution succeeded
         assert_eq!(
             result.unresolved_forward_paths.len(),
-            1,
-            "Should track unresolved forward path"
+            0,
+            "Path resolved successfully, no unresolved paths"
         );
-        assert_eq!(result.unresolved_forward_paths[0].path, "utils.R");
-        assert_eq!(result.unresolved_forward_paths[0].line, 5);
-        assert!(matches!(
-            result.unresolved_forward_paths[0].reason,
-            UnresolvedReason::FileNotFound
-        ));
     }
 
     /// Test that AST-detected source() calls still create edges even for non-existent files
