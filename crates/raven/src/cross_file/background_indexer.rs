@@ -22,7 +22,6 @@ use crate::cross_file::file_cache::FileSnapshot;
 use crate::cross_file::path_resolve::{
     resolve_path, resolve_path_with_workspace_fallback, PathContext,
 };
-use crate::cross_file::scope::compute_artifacts;
 use crate::cross_file::{extract_metadata, CrossFileMetadata};
 use crate::state::WorldState;
 
@@ -281,9 +280,12 @@ impl BackgroundIndexer {
         }
 
         // Compute scope artifacts using thread-local parser for efficiency
+        // Use compute_artifacts_with_metadata to include declared symbols from directives
+        // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
+        // **Validates: Requirements 12.1** (Workspace index declaration extraction)
         let artifacts = crate::parser_pool::with_parser(|parser| {
             if let Some(tree) = parser.parse(&content, None) {
-                compute_artifacts(uri, &tree, &content)
+                crate::cross_file::scope::compute_artifacts_with_metadata(uri, &tree, &content, Some(&cross_file_meta))
             } else {
                 crate::cross_file::scope::ScopeArtifacts::default()
             }

@@ -137,6 +137,10 @@ source("utils.R")  # Resolves to /data/project/utils.R (not relative to child.R'
 # @lsp-ignore-next      # Suppress diagnostics on next line
 ```
 
+### Declaration Directives
+
+See [Declaration Directives](declaration-directives.md) for declaring dynamically-created symbols (`@lsp-var`, `@lsp-func`). Declaration directives work in any R file, not just cross-file contexts.
+
 ## Position-Aware Symbol Availability
 
 Symbols from sourced files are only available AFTER the source() call site:

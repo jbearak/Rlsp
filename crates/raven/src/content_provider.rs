@@ -282,7 +282,10 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             if let Some(doc) = legacy_docs.get(uri) {
                 if let Some(tree) = &doc.tree {
                     let text = doc.text();
-                    return Some(scope::compute_artifacts(uri, tree, &text));
+                    // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
+                    // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+                    let metadata = crate::cross_file::extract_metadata(&text);
+                    return Some(scope::compute_artifacts_with_metadata(uri, tree, &text, Some(&metadata)));
                 }
             }
         }
@@ -304,7 +307,10 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             if let Some(doc) = legacy_ws.get(uri) {
                 if let Some(tree) = &doc.tree {
                     let text = doc.text();
-                    return Some(scope::compute_artifacts(uri, tree, &text));
+                    // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
+                    // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+                    let metadata = crate::cross_file::extract_metadata(&text);
+                    return Some(scope::compute_artifacts_with_metadata(uri, tree, &text, Some(&metadata)));
                 }
             }
         }
@@ -757,6 +763,7 @@ mod tests {
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             },
         );
         let index_entry = crate::workspace_index::IndexEntry {
@@ -1094,6 +1101,7 @@ mod tests {
                         defined_line: 0,
                         defined_column: 0,
                         signature: None,
+                        is_declared: false,
                     },
                 );
                 let index_content = format!("{} <- function() {{}}", index_func);
@@ -1175,6 +1183,7 @@ mod tests {
                         defined_line: 0,
                         defined_column: 0,
                         signature: None,
+                        is_declared: false,
                     },
                 );
                 let index_content = format!("# @lsp-cd: {}\n{} <- function() {{}}", index_wd, index_func);
@@ -1385,6 +1394,7 @@ mod tests {
                         defined_line: 1,
                         defined_column: 0,
                         signature: None,
+                        is_declared: false,
                     },
                 );
 
@@ -1532,6 +1542,7 @@ mod tests {
                         defined_line: 1,
                         defined_column: 0,
                         signature: None,
+                        is_declared: false,
                     },
                 );
                 let index_entry = crate::workspace_index::IndexEntry {
@@ -1742,6 +1753,7 @@ mod integration_tests {
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             },
         );
         let utils_entry = crate::workspace_index::IndexEntry {
@@ -1865,5 +1877,344 @@ mod integration_tests {
         // Verify workspace index content is returned again
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
         assert_eq!(provider.get_content(&uri), Some("old_content".to_string()));
+    }
+
+    // ========================================================================
+    // Feature: lsp-declaration-directives, Property 10: Workspace Index Declaration Extraction
+    // **Validates: Requirements 12.1, 12.2, 12.3**
+    // ========================================================================
+
+    /// Test that declared symbols from indexed (closed) files are available in scope resolution
+    ///
+    /// **Validates: Requirements 12.1, 12.2**
+    #[tokio::test]
+    async fn test_workspace_index_declared_symbols_available_in_scope() {
+        use crate::cross_file::scope::{ScopeArtifacts, ScopeEvent, ScopedSymbol, SymbolKind};
+        use crate::cross_file::types::DeclaredSymbol;
+
+        let doc_store = DocumentStore::new(DocumentStoreConfig::default());
+        let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig::default());
+        let file_cache = CrossFileFileCache::new();
+
+        let uri = test_uri("indexed_with_declarations.R");
+
+        // Create artifacts with declared symbols (simulating what workspace indexer produces)
+        let mut artifacts = ScopeArtifacts::default();
+        
+        // Add a declared variable to the timeline
+        let declared_var = ScopedSymbol {
+            name: "declared_var".to_string(),
+            kind: SymbolKind::Variable,
+            source_uri: uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+            is_declared: true,
+        };
+        artifacts.timeline.push(ScopeEvent::Declaration {
+            line: 0,
+            column: u32::MAX,
+            symbol: declared_var.clone(),
+        });
+        artifacts.exported_interface.insert("declared_var".to_string(), declared_var);
+
+        // Add a declared function to the timeline
+        let declared_func = ScopedSymbol {
+            name: "declared_func".to_string(),
+            kind: SymbolKind::Function,
+            source_uri: uri.clone(),
+            defined_line: 1,
+            defined_column: 0,
+            signature: None,
+            is_declared: true,
+        };
+        artifacts.timeline.push(ScopeEvent::Declaration {
+            line: 1,
+            column: u32::MAX,
+            symbol: declared_func.clone(),
+        });
+        artifacts.exported_interface.insert("declared_func".to_string(), declared_func);
+
+        // Create metadata with declared symbols
+        let metadata = CrossFileMetadata {
+            declared_variables: vec![DeclaredSymbol {
+                name: "declared_var".to_string(),
+                line: 0,
+                is_function: false,
+            }],
+            declared_functions: vec![DeclaredSymbol {
+                name: "declared_func".to_string(),
+                line: 1,
+                is_function: true,
+            }],
+            ..Default::default()
+        };
+
+        // Add to workspace index (simulating indexed closed file)
+        let index_entry = crate::workspace_index::IndexEntry {
+            contents: ropey::Rope::from_str("# @lsp-var declared_var\n# @lsp-func declared_func\nx <- 1"),
+            tree: None,
+            loaded_packages: vec![],
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 50,
+                content_hash: None,
+            },
+            metadata,
+            artifacts,
+            indexed_at_version: 0,
+        };
+        workspace_index.insert(uri.clone(), index_entry);
+
+        // Create provider and verify artifacts are available
+        let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
+
+        // Requirement 12.2: Declared symbols from indexed file should be available
+        let retrieved_artifacts = provider.get_artifacts(&uri);
+        assert!(retrieved_artifacts.is_some(), "Artifacts should be available from workspace index");
+
+        let artifacts = retrieved_artifacts.unwrap();
+        
+        // Verify declared variable is in exported interface
+        assert!(
+            artifacts.exported_interface.contains_key("declared_var"),
+            "Declared variable should be in exported interface"
+        );
+        let var_symbol = artifacts.exported_interface.get("declared_var").unwrap();
+        assert!(var_symbol.is_declared, "Symbol should be marked as declared");
+        assert_eq!(var_symbol.kind, SymbolKind::Variable);
+
+        // Verify declared function is in exported interface
+        assert!(
+            artifacts.exported_interface.contains_key("declared_func"),
+            "Declared function should be in exported interface"
+        );
+        let func_symbol = artifacts.exported_interface.get("declared_func").unwrap();
+        assert!(func_symbol.is_declared, "Symbol should be marked as declared");
+        assert_eq!(func_symbol.kind, SymbolKind::Function);
+
+        // Verify timeline contains Declaration events
+        let declaration_events: Vec<_> = artifacts.timeline.iter()
+            .filter(|e| matches!(e, ScopeEvent::Declaration { .. }))
+            .collect();
+        assert_eq!(declaration_events.len(), 2, "Timeline should contain 2 Declaration events");
+    }
+
+    /// Test that when an indexed file is opened, declared symbols are re-extracted from live content
+    ///
+    /// **Validates: Requirements 12.3**
+    #[tokio::test]
+    async fn test_opened_file_reextracts_declared_symbols() {
+        use crate::cross_file::scope::{ScopeArtifacts, ScopeEvent, ScopedSymbol, SymbolKind};
+        use crate::cross_file::types::DeclaredSymbol;
+
+        let mut doc_store = DocumentStore::new(DocumentStoreConfig::default());
+        let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig::default());
+        let file_cache = CrossFileFileCache::new();
+
+        let uri = test_uri("reextract_test.R");
+
+        // Create artifacts with old declared symbol (simulating stale workspace index)
+        let mut old_artifacts = ScopeArtifacts::default();
+        let old_symbol = ScopedSymbol {
+            name: "old_declared".to_string(),
+            kind: SymbolKind::Variable,
+            source_uri: uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+            is_declared: true,
+        };
+        old_artifacts.timeline.push(ScopeEvent::Declaration {
+            line: 0,
+            column: u32::MAX,
+            symbol: old_symbol.clone(),
+        });
+        old_artifacts.exported_interface.insert("old_declared".to_string(), old_symbol);
+
+        let old_metadata = CrossFileMetadata {
+            declared_variables: vec![DeclaredSymbol {
+                name: "old_declared".to_string(),
+                line: 0,
+                is_function: false,
+            }],
+            ..Default::default()
+        };
+
+        // Add to workspace index with old content
+        let index_entry = crate::workspace_index::IndexEntry {
+            contents: ropey::Rope::from_str("# @lsp-var old_declared\nx <- 1"),
+            tree: None,
+            loaded_packages: vec![],
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 30,
+                content_hash: None,
+            },
+            metadata: old_metadata,
+            artifacts: old_artifacts,
+            indexed_at_version: 0,
+        };
+        workspace_index.insert(uri.clone(), index_entry);
+
+        // Verify workspace index has old declared symbol
+        let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
+        let old_artifacts = provider.get_artifacts(&uri).unwrap();
+        assert!(
+            old_artifacts.exported_interface.contains_key("old_declared"),
+            "Workspace index should have old declared symbol"
+        );
+        assert!(
+            !old_artifacts.exported_interface.contains_key("new_declared"),
+            "Workspace index should NOT have new declared symbol yet"
+        );
+
+        // Open document with NEW content (different declared symbol)
+        // Requirement 12.3: When file is opened, declared symbols should be re-extracted
+        let new_content = "# @lsp-func new_declared\ny <- 2";
+        doc_store.open(uri.clone(), new_content, 1).await;
+
+        // Create new provider after opening document
+        let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
+
+        // Verify open document takes precedence and has new declared symbol
+        let new_artifacts = provider.get_artifacts(&uri).unwrap();
+        
+        // New declared symbol should be present
+        assert!(
+            new_artifacts.exported_interface.contains_key("new_declared"),
+            "Open document should have new declared symbol (re-extracted from live content)"
+        );
+        let new_symbol = new_artifacts.exported_interface.get("new_declared").unwrap();
+        assert!(new_symbol.is_declared, "New symbol should be marked as declared");
+        assert_eq!(new_symbol.kind, SymbolKind::Function, "New symbol should be a function");
+
+        // Old declared symbol should NOT be present (it was in the old content)
+        assert!(
+            !new_artifacts.exported_interface.contains_key("old_declared"),
+            "Open document should NOT have old declared symbol (live content doesn't have it)"
+        );
+    }
+
+    /// Test that scope resolution uses artifacts from workspace index for closed files in dependency chain
+    ///
+    /// **Validates: Requirements 12.2**
+    #[tokio::test]
+    async fn test_scope_resolution_uses_indexed_file_declarations() {
+        use crate::cross_file::scope::{
+            scope_at_position_with_graph, ScopeArtifacts, ScopeEvent, ScopedSymbol, SymbolKind,
+        };
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, DeclaredSymbol, ForwardSource};
+        use std::collections::HashSet;
+
+        let mut doc_store = DocumentStore::new(DocumentStoreConfig::default());
+        let workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig::default());
+        let file_cache = CrossFileFileCache::new();
+
+        let parent_uri = test_uri("parent.R");
+        let child_uri = test_uri("child.R");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Create child file with declared symbol (indexed, not open)
+        let mut child_artifacts = ScopeArtifacts::default();
+        let child_declared = ScopedSymbol {
+            name: "child_declared".to_string(),
+            kind: SymbolKind::Function,
+            source_uri: child_uri.clone(),
+            defined_line: 0,
+            defined_column: 0,
+            signature: None,
+            is_declared: true,
+        };
+        child_artifacts.timeline.push(ScopeEvent::Declaration {
+            line: 0,
+            column: u32::MAX,
+            symbol: child_declared.clone(),
+        });
+        child_artifacts.exported_interface.insert("child_declared".to_string(), child_declared);
+
+        let child_metadata = CrossFileMetadata {
+            declared_functions: vec![DeclaredSymbol {
+                name: "child_declared".to_string(),
+                line: 0,
+                is_function: true,
+            }],
+            ..Default::default()
+        };
+
+        // Add child to workspace index (closed file)
+        let child_entry = crate::workspace_index::IndexEntry {
+            contents: ropey::Rope::from_str("# @lsp-func child_declared\nz <- 3"),
+            tree: None,
+            loaded_packages: vec![],
+            snapshot: crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 35,
+                content_hash: None,
+            },
+            metadata: child_metadata.clone(),
+            artifacts: child_artifacts.clone(),
+            indexed_at_version: 0,
+        };
+        workspace_index.insert(child_uri.clone(), child_entry);
+
+        // Open parent file that sources the child
+        let parent_content = "source(\"child.R\")\nx <- 1";
+        doc_store.open(parent_uri.clone(), parent_content, 1).await;
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_metadata = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), |_| None);
+
+        // Create provider
+        let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
+
+        // Create closures for scope resolution
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            provider.get_artifacts(uri)
+        };
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            provider.get_metadata(uri)
+        };
+
+        // Query scope at end of parent file
+        let scope = scope_at_position_with_graph(
+            &parent_uri,
+            1, // After source() call
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        // Requirement 12.2: Declared symbol from indexed child file should be available
+        assert!(
+            scope.symbols.contains_key("child_declared"),
+            "Declared symbol from indexed (closed) child file should be available in parent's scope. \
+             Available symbols: {:?}",
+            scope.symbols.keys().collect::<Vec<_>>()
+        );
+
+        let symbol = scope.symbols.get("child_declared").unwrap();
+        assert!(symbol.is_declared, "Symbol should be marked as declared");
+        assert_eq!(symbol.kind, SymbolKind::Function, "Symbol should be a function");
     }
 }

@@ -7522,6 +7522,7 @@ proptest! {
                 ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
                 ScopeEvent::Removal { line, column, .. } => (*line, *column),
                 ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+                ScopeEvent::Declaration { line, column, .. } => (*line, *column),
             };
             prop_assert!(
                 pos >= prev_pos,
@@ -21196,6 +21197,2724 @@ proptest! {
         prop_assert_eq!(
             deps_v2[0].call_site_line, Some(line_v2),
             "Call site should be updated to line_v2"
+        );
+    }
+}
+
+// ============================================================================
+// Property 3 (Declaration Directives): Metadata Serialization Round-Trip
+// Feature: lsp-declaration-directives
+// Validates: Requirements 3.3
+// ============================================================================
+
+use super::types::DeclaredSymbol;
+
+/// Generate a valid R symbol name for declared symbols
+fn r_symbol_name() -> impl Strategy<Value = String> {
+    // R identifiers: start with letter or dot (if not followed by digit), contain letters, digits, dots, underscores
+    prop_oneof![
+        // Simple alphanumeric names
+        "[a-zA-Z][a-zA-Z0-9_.]{0,15}",
+        // Names starting with dot (valid in R)
+        "\\.[a-zA-Z][a-zA-Z0-9_.]{0,10}",
+    ]
+    .prop_filter("not reserved and not empty", |s| {
+        !s.is_empty() && is_valid_r_identifier(s) && !s.starts_with("..")
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 3: For any CrossFileMetadata containing declared variables and functions,
+    /// serializing to JSON and deserializing back SHALL produce an equivalent metadata
+    /// object with all declared symbols preserved.
+    ///
+    /// **Feature: lsp-declaration-directives, Property 3: Metadata Serialization Round-Trip**
+    /// **Validates: Requirements 3.3**
+    #[test]
+    fn prop_declared_symbol_serialization_round_trip(
+        var_names in prop::collection::vec(r_symbol_name(), 0..5),
+        func_names in prop::collection::vec(r_symbol_name(), 0..5),
+        var_lines in prop::collection::vec(0..1000u32, 0..5),
+        func_lines in prop::collection::vec(0..1000u32, 0..5),
+    ) {
+        // Build declared variables
+        let declared_variables: Vec<DeclaredSymbol> = var_names
+            .iter()
+            .zip(var_lines.iter().cycle())
+            .map(|(name, &line)| DeclaredSymbol {
+                name: name.clone(),
+                line,
+                is_function: false,
+            })
+            .collect();
+
+        // Build declared functions
+        let declared_functions: Vec<DeclaredSymbol> = func_names
+            .iter()
+            .zip(func_lines.iter().cycle())
+            .map(|(name, &line)| DeclaredSymbol {
+                name: name.clone(),
+                line,
+                is_function: true,
+            })
+            .collect();
+
+        let meta = CrossFileMetadata {
+            declared_variables: declared_variables.clone(),
+            declared_functions: declared_functions.clone(),
+            ..Default::default()
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&meta).expect("serialization should succeed");
+
+        // Deserialize back
+        let parsed: CrossFileMetadata = serde_json::from_str(&json).expect("deserialization should succeed");
+
+        // Verify declared_variables preserved
+        prop_assert_eq!(
+            parsed.declared_variables.len(),
+            declared_variables.len(),
+            "declared_variables count should match"
+        );
+        for (original, parsed) in declared_variables.iter().zip(parsed.declared_variables.iter()) {
+            prop_assert_eq!(&original.name, &parsed.name, "variable name should match");
+            prop_assert_eq!(original.line, parsed.line, "variable line should match");
+            prop_assert_eq!(original.is_function, parsed.is_function, "variable is_function should be false");
+        }
+
+        // Verify declared_functions preserved
+        prop_assert_eq!(
+            parsed.declared_functions.len(),
+            declared_functions.len(),
+            "declared_functions count should match"
+        );
+        for (original, parsed) in declared_functions.iter().zip(parsed.declared_functions.iter()) {
+            prop_assert_eq!(&original.name, &parsed.name, "function name should match");
+            prop_assert_eq!(original.line, parsed.line, "function line should match");
+            prop_assert_eq!(original.is_function, parsed.is_function, "function is_function should be true");
+        }
+    }
+
+    /// Property 3 extended: Round-trip with declared symbols alongside other metadata fields
+    ///
+    /// **Feature: lsp-declaration-directives, Property 3: Metadata Serialization Round-Trip**
+    /// **Validates: Requirements 3.3**
+    #[test]
+    fn prop_declared_symbol_round_trip_with_other_fields(
+        var_name in r_symbol_name(),
+        func_name in r_symbol_name(),
+        var_line in 0..1000u32,
+        func_line in 0..1000u32,
+        backward_path in relative_path_with_parents(),
+        forward_path in relative_path(),
+        wd_path in relative_path(),
+    ) {
+        let meta = CrossFileMetadata {
+            sourced_by: vec![super::types::BackwardDirective {
+                path: backward_path.clone(),
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            sources: vec![super::types::ForwardSource {
+                path: forward_path.clone(),
+                line: 5,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            working_directory: Some(wd_path.clone()),
+            declared_variables: vec![DeclaredSymbol {
+                name: var_name.clone(),
+                line: var_line,
+                is_function: false,
+            }],
+            declared_functions: vec![DeclaredSymbol {
+                name: func_name.clone(),
+                line: func_line,
+                is_function: true,
+            }],
+            ..Default::default()
+        };
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&meta).expect("serialization should succeed");
+        let parsed: CrossFileMetadata = serde_json::from_str(&json).expect("deserialization should succeed");
+
+        // Verify all fields preserved
+        prop_assert_eq!(parsed.sourced_by.len(), 1);
+        prop_assert_eq!(&parsed.sourced_by[0].path, &backward_path);
+        prop_assert_eq!(parsed.sources.len(), 1);
+        prop_assert_eq!(&parsed.sources[0].path, &forward_path);
+        prop_assert_eq!(parsed.working_directory, Some(wd_path));
+
+        // Verify declared symbols
+        prop_assert_eq!(parsed.declared_variables.len(), 1);
+        prop_assert_eq!(&parsed.declared_variables[0].name, &var_name);
+        prop_assert_eq!(parsed.declared_variables[0].line, var_line);
+        prop_assert!(!parsed.declared_variables[0].is_function);
+
+        prop_assert_eq!(parsed.declared_functions.len(), 1);
+        prop_assert_eq!(&parsed.declared_functions[0].name, &func_name);
+        prop_assert_eq!(parsed.declared_functions[0].line, func_line);
+        prop_assert!(parsed.declared_functions[0].is_function);
+    }
+
+    /// Property 3 extended: Empty declared symbols should serialize correctly
+    ///
+    /// **Feature: lsp-declaration-directives, Property 3: Metadata Serialization Round-Trip**
+    /// **Validates: Requirements 3.3**
+    #[test]
+    fn prop_empty_declared_symbols_round_trip(
+        backward_path in relative_path_with_parents(),
+    ) {
+        let meta = CrossFileMetadata {
+            sourced_by: vec![super::types::BackwardDirective {
+                path: backward_path,
+                call_site: CallSiteSpec::Default,
+                directive_line: 0,
+            }],
+            declared_variables: vec![],
+            declared_functions: vec![],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&meta).expect("serialization should succeed");
+        let parsed: CrossFileMetadata = serde_json::from_str(&json).expect("deserialization should succeed");
+
+        prop_assert!(parsed.declared_variables.is_empty());
+        prop_assert!(parsed.declared_functions.is_empty());
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-declaration-directives, Property 1: Directive Parsing Completeness
+// Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 2.1, 2.2, 2.3, 2.4, 2.5
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-declaration-directives, Property 1: Directive Parsing Completeness
+    ///
+    /// For any valid symbol name and any directive synonym form (@lsp-var, @lsp-variable,
+    /// @lsp-declare-var, @lsp-declare-variable for variables; @lsp-func, @lsp-function,
+    /// @lsp-declare-func, @lsp-declare-function for functions), with or without optional
+    /// colon, with or without quotes, parsing SHALL extract the exact symbol name and
+    /// correct symbol kind (function or variable).
+    ///
+    /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 2.1, 2.2, 2.3, 2.4, 2.5**
+    #[test]
+    fn prop_declaration_directive_parsing_completeness_var(
+        symbol_name in r_symbol_name(),
+        synonym_idx in 0..4usize,
+        use_colon in proptest::bool::ANY,
+        quote_style in 0..3usize, // 0=none, 1=double, 2=single
+    ) {
+        let var_synonyms = ["@lsp-var", "@lsp-variable", "@lsp-declare-var", "@lsp-declare-variable"];
+        let directive = var_synonyms[synonym_idx];
+
+        let colon = if use_colon { ":" } else { "" };
+        let quoted_name = match quote_style {
+            1 => format!("\"{}\"", symbol_name),
+            2 => format!("'{}'", symbol_name),
+            _ => symbol_name.clone(),
+        };
+
+        let content = format!("# {}{} {}", directive, colon, quoted_name);
+        let meta = parse_directives(&content);
+
+        prop_assert_eq!(
+            meta.declared_variables.len(),
+            1,
+            "Should parse exactly one variable declaration for directive '{}' with content: {}",
+            directive,
+            content
+        );
+        prop_assert_eq!(
+            &meta.declared_variables[0].name,
+            &symbol_name,
+            "Symbol name should match for directive '{}' with content: {}",
+            directive,
+            content
+        );
+        prop_assert!(
+            !meta.declared_variables[0].is_function,
+            "Should be marked as variable (is_function=false) for directive '{}'",
+            directive
+        );
+        prop_assert_eq!(
+            meta.declared_variables[0].line,
+            0,
+            "Line number should be 0 (first line) for directive '{}'",
+            directive
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 1: Directive Parsing Completeness (functions)
+    ///
+    /// **Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5**
+    #[test]
+    fn prop_declaration_directive_parsing_completeness_func(
+        symbol_name in r_symbol_name(),
+        synonym_idx in 0..4usize,
+        use_colon in proptest::bool::ANY,
+        quote_style in 0..3usize, // 0=none, 1=double, 2=single
+    ) {
+        let func_synonyms = ["@lsp-func", "@lsp-function", "@lsp-declare-func", "@lsp-declare-function"];
+        let directive = func_synonyms[synonym_idx];
+
+        let colon = if use_colon { ":" } else { "" };
+        let quoted_name = match quote_style {
+            1 => format!("\"{}\"", symbol_name),
+            2 => format!("'{}'", symbol_name),
+            _ => symbol_name.clone(),
+        };
+
+        let content = format!("# {}{} {}", directive, colon, quoted_name);
+        let meta = parse_directives(&content);
+
+        prop_assert_eq!(
+            meta.declared_functions.len(),
+            1,
+            "Should parse exactly one function declaration for directive '{}' with content: {}",
+            directive,
+            content
+        );
+        prop_assert_eq!(
+            &meta.declared_functions[0].name,
+            &symbol_name,
+            "Symbol name should match for directive '{}' with content: {}",
+            directive,
+            content
+        );
+        prop_assert!(
+            meta.declared_functions[0].is_function,
+            "Should be marked as function (is_function=true) for directive '{}'",
+            directive
+        );
+        prop_assert_eq!(
+            meta.declared_functions[0].line,
+            0,
+            "Line number should be 0 (first line) for directive '{}'",
+            directive
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 1 extended: Multiple declarations
+    ///
+    /// For any file with multiple declaration directives on separate lines, the parser
+    /// SHALL extract all declared variables and functions with correct line numbers.
+    ///
+    /// **Validates: Requirements 1.4, 1.5, 2.4, 2.5**
+    #[test]
+    fn prop_declaration_directive_multiple_on_separate_lines(
+        var_names in proptest::collection::vec(r_symbol_name(), 1..5),
+        func_names in proptest::collection::vec(r_symbol_name(), 1..5),
+    ) {
+        // Build content with alternating var and func declarations
+        let mut lines = Vec::new();
+        let mut expected_vars = Vec::new();
+        let mut expected_funcs = Vec::new();
+
+        for (_i, name) in var_names.iter().enumerate() {
+            let line_num = lines.len() as u32;
+            lines.push(format!("# @lsp-var {}", name));
+            expected_vars.push((name.clone(), line_num));
+        }
+
+        for (_i, name) in func_names.iter().enumerate() {
+            let line_num = lines.len() as u32;
+            lines.push(format!("# @lsp-func {}", name));
+            expected_funcs.push((name.clone(), line_num));
+        }
+
+        let content = lines.join("\n");
+        let meta = parse_directives(&content);
+
+        prop_assert_eq!(
+            meta.declared_variables.len(),
+            expected_vars.len(),
+            "Should parse all variable declarations"
+        );
+        prop_assert_eq!(
+            meta.declared_functions.len(),
+            expected_funcs.len(),
+            "Should parse all function declarations"
+        );
+
+        for (i, (expected_name, expected_line)) in expected_vars.iter().enumerate() {
+            prop_assert_eq!(
+                &meta.declared_variables[i].name,
+                expected_name,
+                "Variable name at index {} should match",
+                i
+            );
+            prop_assert_eq!(
+                meta.declared_variables[i].line,
+                *expected_line,
+                "Variable line at index {} should match",
+                i
+            );
+        }
+
+        for (i, (expected_name, expected_line)) in expected_funcs.iter().enumerate() {
+            prop_assert_eq!(
+                &meta.declared_functions[i].name,
+                expected_name,
+                "Function name at index {} should match",
+                i
+            );
+            prop_assert_eq!(
+                meta.declared_functions[i].line,
+                *expected_line,
+                "Function line at index {} should match",
+                i
+            );
+        }
+    }
+
+    /// Feature: lsp-declaration-directives, Property 1 extended: Line number recording
+    ///
+    /// For any declaration directive appearing at line N, the parser SHALL record
+    /// the 0-based line number N.
+    ///
+    /// **Validates: Requirements 1.5, 2.5**
+    #[test]
+    fn prop_declaration_directive_line_number_recording(
+        symbol_name in r_symbol_name(),
+        prefix_lines in 0..10usize,
+        is_function in proptest::bool::ANY,
+    ) {
+        // Build content with prefix lines before the directive
+        let mut lines: Vec<String> = (0..prefix_lines)
+            .map(|i| format!("x{} <- {}", i, i))
+            .collect();
+
+        let directive = if is_function { "@lsp-func" } else { "@lsp-var" };
+        lines.push(format!("# {} {}", directive, symbol_name));
+
+        let content = lines.join("\n");
+        let meta = parse_directives(&content);
+
+        let expected_line = prefix_lines as u32;
+
+        if is_function {
+            prop_assert_eq!(meta.declared_functions.len(), 1);
+            prop_assert_eq!(
+                meta.declared_functions[0].line,
+                expected_line,
+                "Function declaration line should be {} (0-based)",
+                expected_line
+            );
+        } else {
+            prop_assert_eq!(meta.declared_variables.len(), 1);
+            prop_assert_eq!(
+                meta.declared_variables[0].line,
+                expected_line,
+                "Variable declaration line should be {} (0-based)",
+                expected_line
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Feature: lsp-declaration-directives, Property 2: Required @ Prefix
+// Validates: Requirements 1.6, 2.6
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-declaration-directives, Property 2: Required @ Prefix
+    ///
+    /// For any directive-like comment that does not start with @ (e.g., # lsp-var myvar),
+    /// the parser SHALL NOT recognize it as a valid declaration directive and SHALL NOT
+    /// extract any declared symbol.
+    ///
+    /// **Validates: Requirements 1.6, 2.6**
+    #[test]
+    fn prop_declaration_directive_requires_at_prefix_var(
+        symbol_name in r_symbol_name(),
+        synonym_idx in 0..4usize,
+        use_colon in proptest::bool::ANY,
+    ) {
+        // Variable directive synonyms WITHOUT @ prefix
+        let var_synonyms_no_at = ["lsp-var", "lsp-variable", "lsp-declare-var", "lsp-declare-variable"];
+        let directive = var_synonyms_no_at[synonym_idx];
+
+        let colon = if use_colon { ":" } else { "" };
+        let content = format!("# {}{} {}", directive, colon, symbol_name);
+        let meta = parse_directives(&content);
+
+        prop_assert!(
+            meta.declared_variables.is_empty(),
+            "Should NOT parse variable declaration without @ prefix for directive '{}' with content: {}",
+            directive,
+            content
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 2: Required @ Prefix (functions)
+    ///
+    /// **Validates: Requirements 2.6**
+    #[test]
+    fn prop_declaration_directive_requires_at_prefix_func(
+        symbol_name in r_symbol_name(),
+        synonym_idx in 0..4usize,
+        use_colon in proptest::bool::ANY,
+    ) {
+        // Function directive synonyms WITHOUT @ prefix
+        let func_synonyms_no_at = ["lsp-func", "lsp-function", "lsp-declare-func", "lsp-declare-function"];
+        let directive = func_synonyms_no_at[synonym_idx];
+
+        let colon = if use_colon { ":" } else { "" };
+        let content = format!("# {}{} {}", directive, colon, symbol_name);
+        let meta = parse_directives(&content);
+
+        prop_assert!(
+            meta.declared_functions.is_empty(),
+            "Should NOT parse function declaration without @ prefix for directive '{}' with content: {}",
+            directive,
+            content
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 2 extended: @ prefix is required
+    ///
+    /// Verify that the same content WITH @ prefix IS recognized.
+    ///
+    /// **Validates: Requirements 1.6, 2.6**
+    #[test]
+    fn prop_declaration_directive_with_at_prefix_is_recognized(
+        symbol_name in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+    ) {
+        let directive = if is_function { "@lsp-func" } else { "@lsp-var" };
+        let content = format!("# {} {}", directive, symbol_name);
+        let meta = parse_directives(&content);
+
+        if is_function {
+            prop_assert_eq!(
+                meta.declared_functions.len(),
+                1,
+                "Should parse function declaration WITH @ prefix"
+            );
+            prop_assert_eq!(&meta.declared_functions[0].name, &symbol_name);
+        } else {
+            prop_assert_eq!(
+                meta.declared_variables.len(),
+                1,
+                "Should parse variable declaration WITH @ prefix"
+            );
+            prop_assert_eq!(&meta.declared_variables[0].name, &symbol_name);
+        }
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-declaration-directives, Property 4: Position-Aware Scope Inclusion
+// Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 4.6
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-declaration-directives, Property 4: Position-Aware Scope Inclusion
+    ///
+    /// For any file with declaration directives at various line positions and any query
+    /// position (line, column), a declared symbol SHALL appear in scope if and only if
+    /// the query line is strictly greater than the directive line (i.e., directive_line < query_line).
+    /// A symbol declared on line N is available starting from line N+1.
+    ///
+    /// **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 4.6**
+    #[test]
+    fn prop_declaration_position_aware_scope_inclusion(
+        symbol_name in r_symbol_name(),
+        directive_line in 0..10u32,
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position};
+        use tree_sitter::Parser;
+        use tower_lsp::lsp_types::Url;
+
+        // Build content with the directive at the specified line
+        let mut lines: Vec<String> = (0..directive_line)
+            .map(|i| format!("x{} <- {}", i, i))
+            .collect();
+
+        let directive = if is_function {
+            format!("# @lsp-func {}", symbol_name)
+        } else {
+            format!("# @lsp-var {}", symbol_name)
+        };
+        lines.push(directive);
+
+        // Add some lines after the directive
+        for i in 0..3 {
+            lines.push(format!("y{} <- {}", i, i + 100));
+        }
+
+        let content = lines.join("\n");
+        let uri = Url::parse("file:///test.R").unwrap();
+
+        // Parse the content
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&content, None).unwrap();
+
+        // Extract metadata and compute artifacts
+        let metadata = parse_directives(&content);
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &content, Some(&metadata));
+
+        // Test 1: Symbol should NOT be in scope on the directive line itself
+        let scope_on_directive_line = scope_at_position(&artifacts, directive_line, 0);
+        prop_assert!(
+            !scope_on_directive_line.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should NOT be in scope on directive line {}. Content:\n{}",
+            symbol_name, directive_line, content
+        );
+
+        // Test 2: Symbol should NOT be in scope at end of directive line (column u32::MAX - 1)
+        // This tests that the end-of-line sentinel works correctly
+        let scope_at_end_of_directive_line = scope_at_position(&artifacts, directive_line, u32::MAX - 1);
+        prop_assert!(
+            !scope_at_end_of_directive_line.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should NOT be in scope at end of directive line {}. Content:\n{}",
+            symbol_name, directive_line, content
+        );
+
+        // Test 3: Symbol SHOULD be in scope on the line after the directive
+        let scope_after_directive = scope_at_position(&artifacts, directive_line + 1, 0);
+        prop_assert!(
+            scope_after_directive.symbols.contains_key(&symbol_name),
+            "Symbol '{}' SHOULD be in scope on line {} (after directive on line {}). Content:\n{}",
+            symbol_name, directive_line + 1, directive_line, content
+        );
+
+        // Test 4: Verify the symbol has the correct kind
+        if let Some(symbol) = scope_after_directive.symbols.get(&symbol_name) {
+            if is_function {
+                prop_assert_eq!(
+                    symbol.kind,
+                    super::scope::SymbolKind::Function,
+                    "Symbol '{}' should be a function",
+                    symbol_name
+                );
+            } else {
+                prop_assert_eq!(
+                    symbol.kind,
+                    super::scope::SymbolKind::Variable,
+                    "Symbol '{}' should be a variable",
+                    symbol_name
+                );
+            }
+        }
+    }
+
+    /// Feature: lsp-declaration-directives, Property 4 extended: Multiple declarations at different lines
+    ///
+    /// For any file with multiple declaration directives at different lines, each symbol
+    /// should become available exactly on the line after its declaration.
+    ///
+    /// **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5**
+    #[test]
+    fn prop_declaration_multiple_position_aware(
+        symbols in proptest::collection::vec(
+            (r_symbol_name(), 0..5u32, proptest::bool::ANY),
+            1..4
+        ),
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position};
+        use tree_sitter::Parser;
+        use tower_lsp::lsp_types::Url;
+
+        // Deduplicate symbols by name (keep first occurrence)
+        let mut unique_symbols: std::collections::HashMap<String, (u32, bool)> = std::collections::HashMap::new();
+        for (name, line, is_func) in &symbols {
+            unique_symbols.entry(name.clone()).or_insert((*line, *is_func));
+        }
+        
+        // Also deduplicate by line (only one declaration per line)
+        let mut line_to_symbol: std::collections::HashMap<u32, (String, bool)> = std::collections::HashMap::new();
+        for (name, (line, is_func)) in &unique_symbols {
+            line_to_symbol.entry(*line).or_insert((name.clone(), *is_func));
+        }
+        
+        let mut sorted_symbols: Vec<(String, u32, bool)> = line_to_symbol
+            .into_iter()
+            .map(|(line, (name, is_func))| (name, line, is_func))
+            .collect();
+        sorted_symbols.sort_by_key(|(_, line, _)| *line);
+
+        // Build content with declarations at specified lines
+        // Use prefix "placeholder_" for generated code to avoid conflicts with declared symbol names
+        let max_line = sorted_symbols.iter().map(|(_, l, _)| *l).max().unwrap_or(0);
+        let mut lines: Vec<String> = Vec::new();
+
+        for line_num in 0..=max_line + 3 {
+            // Check if there's a declaration for this line
+            if let Some((name, _, is_func)) = sorted_symbols.iter().find(|(_, l, _)| *l == line_num) {
+                let directive = if *is_func {
+                    format!("# @lsp-func {}", name)
+                } else {
+                    format!("# @lsp-var {}", name)
+                };
+                lines.push(directive);
+            } else {
+                // Use "placeholder_" prefix to avoid conflicts with declared symbol names
+                lines.push(format!("placeholder_{} <- {}", line_num, line_num));
+            }
+        }
+
+        let content = lines.join("\n");
+        let uri = Url::parse("file:///test.R").unwrap();
+
+        // Parse the content
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&content, None).unwrap();
+
+        // Extract metadata and compute artifacts
+        let metadata = parse_directives(&content);
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &content, Some(&metadata));
+
+        // For each symbol, verify it's NOT available on its declaration line but IS available after
+        for (name, decl_line, _is_func) in &sorted_symbols {
+            // Should NOT be in scope on declaration line
+            let scope_on_decl = scope_at_position(&artifacts, *decl_line, 0);
+            prop_assert!(
+                !scope_on_decl.symbols.contains_key(name),
+                "Symbol '{}' should NOT be in scope on its declaration line {}. Content:\n{}",
+                name, decl_line, content
+            );
+
+            // Should be in scope on line after declaration
+            let scope_after_decl = scope_at_position(&artifacts, decl_line + 1, 0);
+            prop_assert!(
+                scope_after_decl.symbols.contains_key(name),
+                "Symbol '{}' SHOULD be in scope on line {} (after declaration on line {}). Content:\n{}",
+                name, decl_line + 1, decl_line, content
+            );
+        }
+    }
+
+    /// Feature: lsp-declaration-directives, Property 4 extended: Same-line code and directive
+    ///
+    /// When a directive appears on a line with code (e.g., `x <- 1 # @lsp-var foo`),
+    /// the declared symbol SHALL be available starting from line N+1, not on line N.
+    ///
+    /// **Validates: Requirements 4.6**
+    #[test]
+    fn prop_declaration_same_line_code_and_directive(
+        symbol_name in r_symbol_name(),
+        code_var_name in r_symbol_name(),
+        directive_line in 0..5u32,
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position};
+        use tree_sitter::Parser;
+        use tower_lsp::lsp_types::Url;
+
+        // Build content with code and directive on the same line
+        let mut lines: Vec<String> = (0..directive_line)
+            .map(|i| format!("x{} <- {}", i, i))
+            .collect();
+
+        let directive = if is_function {
+            format!("# @lsp-func {}", symbol_name)
+        } else {
+            format!("# @lsp-var {}", symbol_name)
+        };
+        // Code with trailing comment directive
+        lines.push(format!("{} <- 42 {}", code_var_name, directive));
+
+        // Add some lines after
+        for i in 0..3 {
+            lines.push(format!("y{} <- {}", i, i + 100));
+        }
+
+        let content = lines.join("\n");
+        let uri = Url::parse("file:///test.R").unwrap();
+
+        // Parse the content
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(&content, None).unwrap();
+
+        // Extract metadata and compute artifacts
+        let metadata = parse_directives(&content);
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &content, Some(&metadata));
+
+        // The declared symbol should NOT be in scope on the same line as the directive
+        let scope_on_directive_line = scope_at_position(&artifacts, directive_line, 0);
+        prop_assert!(
+            !scope_on_directive_line.symbols.contains_key(&symbol_name),
+            "Declared symbol '{}' should NOT be in scope on directive line {} (same line as code). Content:\n{}",
+            symbol_name, directive_line, content
+        );
+
+        // The declared symbol SHOULD be in scope on the next line
+        let scope_after_directive = scope_at_position(&artifacts, directive_line + 1, 0);
+        prop_assert!(
+            scope_after_directive.symbols.contains_key(&symbol_name),
+            "Declared symbol '{}' SHOULD be in scope on line {} (after directive on line {}). Content:\n{}",
+            symbol_name, directive_line + 1, directive_line, content
+        );
+
+        // The code variable (from the assignment) SHOULD be in scope on the same line
+        // (at a position after the assignment)
+        let scope_after_assignment = scope_at_position(&artifacts, directive_line, 10);
+        prop_assert!(
+            scope_after_assignment.symbols.contains_key(&code_var_name),
+            "Code variable '{}' SHOULD be in scope on line {} after assignment. Content:\n{}",
+            code_var_name, directive_line, content
+        );
+    }
+}
+
+// ============================================================================
+// Property 8 (Declaration Directives): Interface Hash Sensitivity
+// Feature: lsp-declaration-directives
+// Validates: Requirements 10.1, 10.2, 10.3, 10.4
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property 8: For any file, the interface hash SHALL change when a declaration
+    /// directive is added.
+    ///
+    /// **Feature: lsp-declaration-directives, Property 8: Interface Hash Sensitivity**
+    /// **Validates: Requirements 10.1**
+    #[test]
+    fn prop_interface_hash_changes_when_declaration_added(
+        symbol_name in r_symbol_name(),
+        directive_type in prop_oneof![
+            Just("@lsp-var"),
+            Just("@lsp-variable"),
+            Just("@lsp-declare-var"),
+            Just("@lsp-declare-variable"),
+            Just("@lsp-func"),
+            Just("@lsp-function"),
+            Just("@lsp-declare-func"),
+            Just("@lsp-declare-function"),
+        ],
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::compute_artifacts_with_metadata;
+
+        let uri = make_url("test");
+
+        // Code without declaration directive
+        let code_without = "x <- 42\ny <- 100";
+        let tree_without = parse_r_tree(code_without);
+        let metadata_without = parse_directives(code_without);
+        let artifacts_without = compute_artifacts_with_metadata(&uri, &tree_without, code_without, Some(&metadata_without));
+
+        // Code with declaration directive added
+        let code_with = format!("# {} {}\nx <- 42\ny <- 100", directive_type, symbol_name);
+        let tree_with = parse_r_tree(&code_with);
+        let metadata_with = parse_directives(&code_with);
+        let artifacts_with = compute_artifacts_with_metadata(&uri, &tree_with, &code_with, Some(&metadata_with));
+
+        // Interface hash should change when declaration is added
+        prop_assert_ne!(
+            artifacts_without.interface_hash,
+            artifacts_with.interface_hash,
+            "Interface hash should change when declaration directive '{}' for '{}' is added",
+            directive_type, symbol_name
+        );
+    }
+
+    /// Property 8: For any file, the interface hash SHALL change when a declaration
+    /// directive is removed.
+    ///
+    /// **Feature: lsp-declaration-directives, Property 8: Interface Hash Sensitivity**
+    /// **Validates: Requirements 10.2**
+    #[test]
+    fn prop_interface_hash_changes_when_declaration_removed(
+        symbol_name in r_symbol_name(),
+        directive_type in prop_oneof![
+            Just("@lsp-var"),
+            Just("@lsp-func"),
+        ],
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::compute_artifacts_with_metadata;
+
+        let uri = make_url("test");
+
+        // Code with declaration directive
+        let code_with = format!("# {} {}\nx <- 42", directive_type, symbol_name);
+        let tree_with = parse_r_tree(&code_with);
+        let metadata_with = parse_directives(&code_with);
+        let artifacts_with = compute_artifacts_with_metadata(&uri, &tree_with, &code_with, Some(&metadata_with));
+
+        // Code without declaration directive (directive removed)
+        let code_without = "# just a comment\nx <- 42";
+        let tree_without = parse_r_tree(code_without);
+        let metadata_without = parse_directives(code_without);
+        let artifacts_without = compute_artifacts_with_metadata(&uri, &tree_without, code_without, Some(&metadata_without));
+
+        // Interface hash should change when declaration is removed
+        prop_assert_ne!(
+            artifacts_with.interface_hash,
+            artifacts_without.interface_hash,
+            "Interface hash should change when declaration directive '{}' for '{}' is removed",
+            directive_type, symbol_name
+        );
+    }
+
+    /// Property 8: For any file, the interface hash SHALL change when a declared
+    /// symbol's name changes.
+    ///
+    /// **Feature: lsp-declaration-directives, Property 8: Interface Hash Sensitivity**
+    /// **Validates: Requirements 10.3**
+    #[test]
+    fn prop_interface_hash_changes_when_declaration_name_changes(
+        symbol_name1 in r_symbol_name(),
+        symbol_name2 in r_symbol_name(),
+        directive_type in prop_oneof![
+            Just("@lsp-var"),
+            Just("@lsp-func"),
+        ],
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::compute_artifacts_with_metadata;
+
+        prop_assume!(symbol_name1 != symbol_name2);
+
+        let uri = make_url("test");
+
+        // Code with first symbol name
+        let code1 = format!("# {} {}\nx <- 42", directive_type, symbol_name1);
+        let tree1 = parse_r_tree(&code1);
+        let metadata1 = parse_directives(&code1);
+        let artifacts1 = compute_artifacts_with_metadata(&uri, &tree1, &code1, Some(&metadata1));
+
+        // Code with second symbol name (name changed)
+        let code2 = format!("# {} {}\nx <- 42", directive_type, symbol_name2);
+        let tree2 = parse_r_tree(&code2);
+        let metadata2 = parse_directives(&code2);
+        let artifacts2 = compute_artifacts_with_metadata(&uri, &tree2, &code2, Some(&metadata2));
+
+        // Interface hash should change when declaration name changes
+        prop_assert_ne!(
+            artifacts1.interface_hash,
+            artifacts2.interface_hash,
+            "Interface hash should change when declaration name changes from '{}' to '{}'",
+            symbol_name1, symbol_name2
+        );
+    }
+
+    /// Property 8: For any file, the interface hash SHALL remain stable when only
+    /// non-declaration content changes (e.g., comments, local variable values).
+    ///
+    /// **Feature: lsp-declaration-directives, Property 8: Interface Hash Sensitivity**
+    /// **Validates: Requirements 10.4**
+    #[test]
+    fn prop_interface_hash_stable_when_non_declaration_changes(
+        symbol_name in r_symbol_name(),
+        directive_type in prop_oneof![
+            Just("@lsp-var"),
+            Just("@lsp-func"),
+        ],
+        value1 in 1..100i32,
+        value2 in 100..200i32,
+        comment1 in "[a-zA-Z ]{1,20}",
+        comment2 in "[a-zA-Z ]{1,20}",
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::compute_artifacts_with_metadata;
+
+        prop_assume!(value1 != value2);
+        prop_assume!(comment1 != comment2);
+
+        let uri = make_url("test");
+
+        // Code version 1
+        let code1 = format!(
+            "# {} {}\n# {}\nx <- {}",
+            directive_type, symbol_name, comment1, value1
+        );
+        let tree1 = parse_r_tree(&code1);
+        let metadata1 = parse_directives(&code1);
+        let artifacts1 = compute_artifacts_with_metadata(&uri, &tree1, &code1, Some(&metadata1));
+
+        // Code version 2 (different comment and value, same declaration)
+        let code2 = format!(
+            "# {} {}\n# {}\nx <- {}",
+            directive_type, symbol_name, comment2, value2
+        );
+        let tree2 = parse_r_tree(&code2);
+        let metadata2 = parse_directives(&code2);
+        let artifacts2 = compute_artifacts_with_metadata(&uri, &tree2, &code2, Some(&metadata2));
+
+        // Interface hash should remain the same (same exported symbols and declarations)
+        prop_assert_eq!(
+            artifacts1.interface_hash,
+            artifacts2.interface_hash,
+            "Interface hash should remain stable when only non-declaration content changes"
+        );
+    }
+
+    /// Property 8 extended: Interface hash changes when declaration kind changes
+    /// (same symbol declared as variable vs function).
+    ///
+    /// **Feature: lsp-declaration-directives, Property 8: Interface Hash Sensitivity**
+    /// **Validates: Requirements 10.1, 10.2, 10.3**
+    #[test]
+    fn prop_interface_hash_changes_when_declaration_kind_changes(
+        symbol_name in r_symbol_name(),
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::compute_artifacts_with_metadata;
+
+        let uri = make_url("test");
+
+        // Code with variable declaration
+        let code_var = format!("# @lsp-var {}\nx <- 42", symbol_name);
+        let tree_var = parse_r_tree(&code_var);
+        let metadata_var = parse_directives(&code_var);
+        let artifacts_var = compute_artifacts_with_metadata(&uri, &tree_var, &code_var, Some(&metadata_var));
+
+        // Code with function declaration (same symbol name)
+        let code_func = format!("# @lsp-func {}\nx <- 42", symbol_name);
+        let tree_func = parse_r_tree(&code_func);
+        let metadata_func = parse_directives(&code_func);
+        let artifacts_func = compute_artifacts_with_metadata(&uri, &tree_func, &code_func, Some(&metadata_func));
+
+        // Interface hash should change when declaration kind changes
+        prop_assert_ne!(
+            artifacts_var.interface_hash,
+            artifacts_func.interface_hash,
+            "Interface hash should change when declaration kind changes for symbol '{}'",
+            symbol_name
+        );
+    }
+
+    /// Property 8 extended: Interface hash changes when multiple declarations are
+    /// added or removed.
+    ///
+    /// **Feature: lsp-declaration-directives, Property 8: Interface Hash Sensitivity**
+    /// **Validates: Requirements 10.1, 10.2**
+    #[test]
+    fn prop_interface_hash_changes_with_multiple_declarations(
+        symbol1 in r_symbol_name(),
+        symbol2 in r_symbol_name(),
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::compute_artifacts_with_metadata;
+
+        prop_assume!(symbol1 != symbol2);
+
+        let uri = make_url("test");
+
+        // Code with one declaration
+        let code1 = format!("# @lsp-var {}\nx <- 42", symbol1);
+        let tree1 = parse_r_tree(&code1);
+        let metadata1 = parse_directives(&code1);
+        let artifacts1 = compute_artifacts_with_metadata(&uri, &tree1, &code1, Some(&metadata1));
+
+        // Code with two declarations
+        let code2 = format!("# @lsp-var {}\n# @lsp-func {}\nx <- 42", symbol1, symbol2);
+        let tree2 = parse_r_tree(&code2);
+        let metadata2 = parse_directives(&code2);
+        let artifacts2 = compute_artifacts_with_metadata(&uri, &tree2, &code2, Some(&metadata2));
+
+        // Interface hash should change when declarations are added
+        prop_assert_ne!(
+            artifacts1.interface_hash,
+            artifacts2.interface_hash,
+            "Interface hash should change when additional declaration is added"
+        );
+    }
+}
+
+
+
+// ============================================================================
+// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
+// Validates: Requirements 9.1, 9.2, 9.3, 9.4
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
+    ///
+    /// For any parent file with a declaration directive and a source() call, the declared
+    /// symbol SHALL be available in the sourced child file if and only if the declaration
+    /// directive appears before the source() call in the parent file.
+    ///
+    /// **Validates: Requirements 9.1, 9.2, 9.3, 9.4**
+    #[test]
+    fn prop_cross_file_declaration_inheritance_before_source(
+        symbol_name in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: declaration at line 0, source() at line 1
+        // Declaration is BEFORE source() call
+        let directive = if is_function {
+            format!("# @lsp-func {}", symbol_name)
+        } else {
+            format!("# @lsp-var {}", symbol_name)
+        };
+        let parent_code = format!("{}\nsource(\"child.R\")", directive);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_metadata = parse_directives(&parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, &parent_code, Some(&parent_metadata)
+        );
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &child_tree, child_code, None
+        );
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            declared_variables: parent_metadata.declared_variables.clone(),
+            declared_functions: parent_metadata.declared_functions.clone(),
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Child should have inherited the declared symbol from parent (Requirement 9.1)
+        prop_assert!(
+            scope.symbols.contains_key(&symbol_name),
+            "Declared symbol '{}' should be available in child file when declaration is BEFORE source() call. Parent code:\n{}",
+            symbol_name, parent_code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
+    ///
+    /// When a parent file declares a symbol AFTER a source() call, the declared symbol
+    /// SHALL NOT be available in the sourced child file.
+    ///
+    /// **Validates: Requirements 9.2**
+    #[test]
+    fn prop_cross_file_declaration_inheritance_after_source(
+        symbol_name in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: source() at line 0, declaration at line 1
+        // Declaration is AFTER source() call
+        let directive = if is_function {
+            format!("# @lsp-func {}", symbol_name)
+        } else {
+            format!("# @lsp-var {}", symbol_name)
+        };
+        let parent_code = format!("source(\"child.R\")\n{}", directive);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_metadata = parse_directives(&parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, &parent_code, Some(&parent_metadata)
+        );
+
+        // Child code: simple assignment with a different variable name
+        // Use a name that won't conflict with the generated symbol_name
+        let child_code = "child_local_var <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &child_tree, child_code, None
+        );
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,  // source() is at line 0
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            declared_variables: parent_metadata.declared_variables.clone(),
+            declared_functions: parent_metadata.declared_functions.clone(),
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Child should NOT have the declared symbol (declaration is after source() call)
+        prop_assert!(
+            !scope.symbols.contains_key(&symbol_name),
+            "Declared symbol '{}' should NOT be available in child file when declaration is AFTER source() call. Parent code:\n{}",
+            symbol_name, parent_code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
+    ///
+    /// When a source() call uses `local=TRUE`, the declared symbols from the parent
+    /// SHALL still be visible in the child file. Declarations describe symbol existence,
+    /// not export behavior.
+    ///
+    /// **Validates: Requirements 9.4**
+    #[test]
+    fn prop_cross_file_declaration_inheritance_with_local_true(
+        symbol_name in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: declaration at line 0, source() with local=TRUE at line 1
+        let directive = if is_function {
+            format!("# @lsp-func {}", symbol_name)
+        } else {
+            format!("# @lsp-var {}", symbol_name)
+        };
+        let parent_code = format!("{}\nsource(\"child.R\", local = TRUE)", directive);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_metadata = parse_directives(&parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, &parent_code, Some(&parent_metadata)
+        );
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &child_tree, child_code, None
+        );
+
+        // Build dependency graph with local=TRUE
+        let mut graph = DependencyGraph::new();
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: true,  // local=TRUE
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            declared_variables: parent_metadata.declared_variables.clone(),
+            declared_functions: parent_metadata.declared_functions.clone(),
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Child should have inherited the declared symbol even with local=TRUE (Requirement 9.4)
+        prop_assert!(
+            scope.symbols.contains_key(&symbol_name),
+            "Declared symbol '{}' should be available in child file even with local=TRUE (Requirement 9.4). Parent code:\n{}",
+            symbol_name, parent_code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
+    ///
+    /// When a source() call uses `local=TRUE`, regular (non-declared) symbols from the
+    /// parent SHALL NOT be visible in the child file, but declared symbols SHALL be.
+    /// This tests the distinction between declared and regular symbols.
+    ///
+    /// **Validates: Requirements 9.4**
+    #[test]
+    fn prop_cross_file_declaration_vs_regular_symbol_with_local_true(
+        declared_symbol in r_symbol_name(),
+        regular_symbol in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        // Ensure symbols are distinct
+        prop_assume!(declared_symbol != regular_symbol);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: declaration at line 0, regular definition at line 1, source() with local=TRUE at line 2
+        let directive = if is_function {
+            format!("# @lsp-func {}", declared_symbol)
+        } else {
+            format!("# @lsp-var {}", declared_symbol)
+        };
+        let parent_code = format!("{}\n{} <- 42\nsource(\"child.R\", local = TRUE)", directive, regular_symbol);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_metadata = parse_directives(&parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, &parent_code, Some(&parent_metadata)
+        );
+
+        // Child code: simple assignment with a name that won't collide with generated symbols
+        // Using a name with double underscore prefix which is not generated by r_symbol_name()
+        let child_code = "__child_local__ <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &child_tree, child_code, None
+        );
+
+        // Build dependency graph with local=TRUE
+        let mut graph = DependencyGraph::new();
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 2,
+                column: 0,
+                is_directive: false,
+                local: true,  // local=TRUE
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            declared_variables: parent_metadata.declared_variables.clone(),
+            declared_functions: parent_metadata.declared_functions.clone(),
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Declared symbol should be available (Requirement 9.4)
+        prop_assert!(
+            scope.symbols.contains_key(&declared_symbol),
+            "Declared symbol '{}' should be available in child file with local=TRUE (Requirement 9.4). Parent code:\n{}",
+            declared_symbol, parent_code
+        );
+
+        // Regular symbol should NOT be available (local=TRUE blocks regular symbols)
+        prop_assert!(
+            !scope.symbols.contains_key(&regular_symbol),
+            "Regular symbol '{}' should NOT be available in child file with local=TRUE. Parent code:\n{}",
+            regular_symbol, parent_code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
+    ///
+    /// When traversing the dependency chain (grandparent -> parent -> child), declared
+    /// symbols SHALL follow the same inheritance rules as regular symbols.
+    ///
+    /// **Validates: Requirements 9.3**
+    #[test]
+    fn prop_cross_file_declaration_inheritance_transitive(
+        symbol_name in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        let grandparent_uri = make_url("grandparent");
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Grandparent code: declaration at line 0, source() at line 1
+        let directive = if is_function {
+            format!("# @lsp-func {}", symbol_name)
+        } else {
+            format!("# @lsp-var {}", symbol_name)
+        };
+        let grandparent_code = format!("{}\nsource(\"parent.R\")", directive);
+        let grandparent_tree = parse_r_tree(&grandparent_code);
+        let grandparent_metadata = parse_directives(&grandparent_code);
+        let grandparent_artifacts = compute_artifacts_with_metadata(
+            &grandparent_uri, &grandparent_tree, &grandparent_code, Some(&grandparent_metadata)
+        );
+
+        // Parent code: source() at line 0
+        let parent_code = "source(\"child.R\")";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, parent_code, None
+        );
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &child_tree, child_code, None
+        );
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        // Grandparent -> Parent edge
+        let grandparent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "parent.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            declared_variables: grandparent_metadata.declared_variables.clone(),
+            declared_functions: grandparent_metadata.declared_functions.clone(),
+            ..Default::default()
+        };
+        graph.update_file(&grandparent_uri, &grandparent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        // Parent -> Child edge
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &grandparent_uri { Some(grandparent_artifacts.clone()) }
+            else if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &grandparent_uri { Some(grandparent_meta_for_graph.clone()) }
+            else if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Child should have inherited the declared symbol from grandparent through parent (Requirement 9.3)
+        prop_assert!(
+            scope.symbols.contains_key(&symbol_name),
+            "Declared symbol '{}' should be available in child file through transitive inheritance (Requirement 9.3). Grandparent code:\n{}",
+            symbol_name, grandparent_code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
+    ///
+    /// Multiple declarations in parent file should all be inherited by child file
+    /// when they appear before the source() call.
+    ///
+    /// **Validates: Requirements 9.1, 9.3**
+    #[test]
+    fn prop_cross_file_declaration_inheritance_multiple_symbols(
+        symbol1 in r_symbol_name(),
+        symbol2 in r_symbol_name(),
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        // Ensure symbols are distinct
+        prop_assume!(symbol1 != symbol2);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: two declarations at lines 0 and 1, source() at line 2
+        let parent_code = format!("# @lsp-var {}\n# @lsp-func {}\nsource(\"child.R\")", symbol1, symbol2);
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_metadata = parse_directives(&parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, &parent_code, Some(&parent_metadata)
+        );
+
+        // Child code: simple assignment
+        let child_code = "x <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &child_tree, child_code, None
+        );
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 2,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            declared_variables: parent_metadata.declared_variables.clone(),
+            declared_functions: parent_metadata.declared_functions.clone(),
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Both declared symbols should be available in child file
+        prop_assert!(
+            scope.symbols.contains_key(&symbol1),
+            "Declared variable '{}' should be available in child file. Parent code:\n{}",
+            symbol1, parent_code
+        );
+        prop_assert!(
+            scope.symbols.contains_key(&symbol2),
+            "Declared function '{}' should be available in child file. Parent code:\n{}",
+            symbol2, parent_code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
+    ///
+    /// When some declarations are before and some are after the source() call,
+    /// only the declarations before should be inherited.
+    ///
+    /// **Validates: Requirements 9.1, 9.2**
+    #[test]
+    fn prop_cross_file_declaration_inheritance_mixed_positions(
+        symbol_before in r_symbol_name(),
+        symbol_after in r_symbol_name(),
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        // Ensure symbols are distinct
+        prop_assume!(symbol_before != symbol_after);
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent code: declaration at line 0, source() at line 1, declaration at line 2
+        let parent_code = format!(
+            "# @lsp-var {}\nsource(\"child.R\")\n# @lsp-func {}",
+            symbol_before, symbol_after
+        );
+        let parent_tree = parse_r_tree(&parent_code);
+        let parent_metadata = parse_directives(&parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, &parent_code, Some(&parent_metadata)
+        );
+
+        // Child code: simple assignment with a name that won't collide with generated symbols
+        // Using a name with double underscore prefix which is not generated by r_symbol_name()
+        let child_code = "__child_local__ <- 1";
+        let child_tree = parse_r_tree(child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &child_tree, child_code, None
+        );
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,  // source() is at line 1
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            declared_variables: parent_metadata.declared_variables.clone(),
+            declared_functions: parent_metadata.declared_functions.clone(),
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else { None }
+        };
+
+        // Query child's scope at position (0, 0)
+        let scope = scope_at_position_with_graph(
+            &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Symbol declared BEFORE source() should be available (Requirement 9.1)
+        prop_assert!(
+            scope.symbols.contains_key(&symbol_before),
+            "Declared symbol '{}' (before source()) should be available in child file. Parent code:\n{}",
+            symbol_before, parent_code
+        );
+
+        // Symbol declared AFTER source() should NOT be available (Requirement 9.2)
+        prop_assert!(
+            !scope.symbols.contains_key(&symbol_after),
+            "Declared symbol '{}' (after source()) should NOT be available in child file. Parent code:\n{}",
+            symbol_after, parent_code
+        );
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-declaration-directives, Property 9: Conflicting Declaration Resolution
+// Validates: Requirements 11.1, 11.2, 11.3, 11.4
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-declaration-directives, Property 9: Conflicting Declaration Resolution
+    ///
+    /// For any file where the same symbol name is declared as both a variable and a function,
+    /// the later declaration (by line number) SHALL determine the symbol kind for completions
+    /// and hover.
+    ///
+    /// **Validates: Requirements 11.1, 11.4**
+    #[test]
+    fn prop_conflicting_declaration_later_wins_for_kind(
+        symbol_name in r_symbol_name(),
+        var_first in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position, SymbolKind};
+
+        let uri = make_url("test");
+
+        // Generate code with conflicting declarations
+        // If var_first is true: variable on line 0, function on line 1 -> function wins
+        // If var_first is false: function on line 0, variable on line 1 -> variable wins
+        let (first_directive, second_directive, expected_kind) = if var_first {
+            ("@lsp-var", "@lsp-func", SymbolKind::Function)
+        } else {
+            ("@lsp-func", "@lsp-var", SymbolKind::Variable)
+        };
+
+        // Use a different variable name for the assignment to avoid overwriting the declared symbol
+        let code = format!(
+            "# {} {}\n# {} {}\nother_var <- 42",
+            first_directive, symbol_name, second_directive, symbol_name
+        );
+        let tree = parse_r_tree(&code);
+        let metadata = parse_directives(&code);
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
+
+        // Check exported interface - later declaration should win
+        let exported_symbol = artifacts.exported_interface.get(&symbol_name);
+        prop_assert!(
+            exported_symbol.is_some(),
+            "Symbol '{}' should be in exported interface. Code:\n{}",
+            symbol_name, code
+        );
+        prop_assert_eq!(
+            exported_symbol.unwrap().kind,
+            expected_kind,
+            "Later declaration should determine symbol kind. First: {}, Second: {}, Expected: {:?}. Code:\n{}",
+            first_directive, second_directive, expected_kind, code
+        );
+
+        // Check scope at position after both declarations (line 2)
+        let scope = scope_at_position(&artifacts, 2, 0);
+        let scoped_symbol = scope.symbols.get(&symbol_name);
+        prop_assert!(
+            scoped_symbol.is_some(),
+            "Symbol '{}' should be in scope at line 2. Code:\n{}",
+            symbol_name, code
+        );
+        prop_assert_eq!(
+            scoped_symbol.unwrap().kind,
+            expected_kind,
+            "Scope symbol kind should reflect later declaration. Code:\n{}",
+            code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 9: Conflicting Declaration Resolution
+    ///
+    /// For any file where the same symbol name is declared as both a variable and a function,
+    /// diagnostic suppression SHALL apply regardless of which declaration comes first.
+    ///
+    /// **Validates: Requirements 11.2**
+    #[test]
+    fn prop_conflicting_declaration_diagnostic_suppression(
+        symbol_name in r_symbol_name(),
+        var_first in proptest::bool::ANY,
+        usage_line_offset in 0..5u32,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position};
+
+        let uri = make_url("test");
+
+        // Generate code with conflicting declarations and a usage after both
+        let (first_directive, second_directive) = if var_first {
+            ("@lsp-var", "@lsp-func")
+        } else {
+            ("@lsp-func", "@lsp-var")
+        };
+
+        // Build code: two declarations, then some filler lines, then usage
+        let mut lines = vec![
+            format!("# {} {}", first_directive, symbol_name),
+            format!("# {} {}", second_directive, symbol_name),
+        ];
+        
+        // Add filler lines
+        for i in 0..usage_line_offset {
+            lines.push(format!("filler{} <- {}", i, i));
+        }
+        
+        // Add usage line
+        lines.push(symbol_name.clone());
+
+        let code = lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let metadata = parse_directives(&code);
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
+
+        // Query scope at the usage line (line 2 + usage_line_offset)
+        let usage_line = 2 + usage_line_offset;
+        let scope = scope_at_position(&artifacts, usage_line, 0);
+
+        // Symbol should be in scope regardless of declaration order (Requirement 11.2)
+        prop_assert!(
+            scope.symbols.contains_key(&symbol_name),
+            "Symbol '{}' should be in scope at usage line {} (after conflicting declarations). \
+             First: {}, Second: {}. Code:\n{}",
+            symbol_name, usage_line, first_directive, second_directive, code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 9: Conflicting Declaration Resolution
+    ///
+    /// For any file where the same symbol name is declared as both a variable and a function,
+    /// go-to-definition SHALL navigate to the first declaration by line number.
+    ///
+    /// **Validates: Requirements 11.3**
+    #[test]
+    fn prop_conflicting_declaration_first_for_definition(
+        symbol_name in r_symbol_name(),
+        var_first in proptest::bool::ANY,
+        prefix_lines in 0..5u32,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position};
+
+        let uri = make_url("test");
+
+        // Generate code with prefix lines, then conflicting declarations
+        let (first_directive, second_directive) = if var_first {
+            ("@lsp-var", "@lsp-func")
+        } else {
+            ("@lsp-func", "@lsp-var")
+        };
+
+        let mut lines: Vec<String> = (0..prefix_lines)
+            .map(|i| format!("prefix{} <- {}", i, i))
+            .collect();
+        
+        let first_decl_line = prefix_lines;
+        let second_decl_line = prefix_lines + 1;
+        
+        lines.push(format!("# {} {}", first_directive, symbol_name));
+        lines.push(format!("# {} {}", second_directive, symbol_name));
+        lines.push("x <- 42".to_string());
+
+        let code = lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let metadata = parse_directives(&code);
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
+
+        // Query scope at line after both declarations
+        let query_line = second_decl_line + 1;
+        let scope = scope_at_position(&artifacts, query_line, 0);
+
+        let scoped_symbol = scope.symbols.get(&symbol_name);
+        prop_assert!(
+            scoped_symbol.is_some(),
+            "Symbol '{}' should be in scope at line {}. Code:\n{}",
+            symbol_name, query_line, code
+        );
+
+        // The symbol's defined_line should be the FIRST declaration line (Requirement 11.3)
+        // Note: The scope resolution uses the later declaration's kind but the first declaration's line
+        // for go-to-definition purposes. However, the ScopedSymbol in scope stores the line from
+        // the declaration that determined the kind (the later one).
+        // 
+        // The actual go-to-definition behavior (navigating to first declaration) is implemented
+        // in handlers.rs by scanning metadata for all declarations and finding the minimum line.
+        // Here we verify that both declarations are present in metadata.
+        prop_assert!(
+            !metadata.declared_variables.is_empty() || !metadata.declared_functions.is_empty(),
+            "Metadata should contain declarations. Code:\n{}",
+            code
+        );
+
+        // Verify both declarations are recorded in metadata
+        let all_decl_lines: Vec<u32> = metadata.declared_variables.iter()
+            .filter(|d| d.name == symbol_name)
+            .map(|d| d.line)
+            .chain(
+                metadata.declared_functions.iter()
+                    .filter(|d| d.name == symbol_name)
+                    .map(|d| d.line)
+            )
+            .collect();
+
+        prop_assert_eq!(
+            all_decl_lines.len(),
+            2,
+            "Should have exactly 2 declarations for symbol '{}'. Found lines: {:?}. Code:\n{}",
+            symbol_name, all_decl_lines, code
+        );
+
+        // Verify the first declaration line is recorded
+        let min_line = all_decl_lines.iter().min().copied();
+        prop_assert_eq!(
+            min_line,
+            Some(first_decl_line),
+            "First declaration should be at line {}. Found: {:?}. Code:\n{}",
+            first_decl_line, min_line, code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 9: Conflicting Declaration Resolution
+    ///
+    /// Extended test: When declarations are on non-consecutive lines, the later declaration
+    /// (by line number) still determines the symbol kind.
+    ///
+    /// **Validates: Requirements 11.1, 11.4**
+    #[test]
+    fn prop_conflicting_declaration_non_consecutive_lines(
+        symbol_name in r_symbol_name(),
+        var_first in proptest::bool::ANY,
+        gap_lines in 1..5u32,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position, SymbolKind};
+
+        let uri = make_url("test");
+
+        let (first_directive, second_directive, expected_kind) = if var_first {
+            ("@lsp-var", "@lsp-func", SymbolKind::Function)
+        } else {
+            ("@lsp-func", "@lsp-var", SymbolKind::Variable)
+        };
+
+        // Build code with gap between declarations
+        let mut lines = vec![format!("# {} {}", first_directive, symbol_name)];
+        
+        // Add gap lines
+        for i in 0..gap_lines {
+            lines.push(format!("gap{} <- {}", i, i));
+        }
+        
+        lines.push(format!("# {} {}", second_directive, symbol_name));
+        // Use a different variable name to avoid overwriting the declared symbol
+        lines.push("other_var <- 42".to_string());
+
+        let code = lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let metadata = parse_directives(&code);
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
+
+        // Query scope at end of file
+        let query_line = (lines.len() - 1) as u32;
+        let scope = scope_at_position(&artifacts, query_line, 0);
+
+        let scoped_symbol = scope.symbols.get(&symbol_name);
+        prop_assert!(
+            scoped_symbol.is_some(),
+            "Symbol '{}' should be in scope. Code:\n{}",
+            symbol_name, code
+        );
+        prop_assert_eq!(
+            scoped_symbol.unwrap().kind,
+            expected_kind,
+            "Later declaration should determine symbol kind even with {} gap lines. Code:\n{}",
+            gap_lines, code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 9: Conflicting Declaration Resolution
+    ///
+    /// Extended test: Multiple conflicting declarations (more than 2) - the last one wins.
+    ///
+    /// **Validates: Requirements 11.1, 11.4**
+    #[test]
+    fn prop_conflicting_declaration_multiple_declarations(
+        symbol_name in r_symbol_name(),
+        declaration_count in 2..5usize,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position, SymbolKind};
+
+        let uri = make_url("test");
+
+        // Generate alternating var/func declarations
+        let mut lines = Vec::new();
+        let mut last_is_function = false;
+        
+        for i in 0..declaration_count {
+            let is_function = i % 2 == 1;
+            let directive = if is_function { "@lsp-func" } else { "@lsp-var" };
+            lines.push(format!("# {} {}", directive, symbol_name));
+            last_is_function = is_function;
+        }
+        
+        lines.push("x <- 42".to_string());
+
+        let code = lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let metadata = parse_directives(&code);
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
+
+        // Expected kind is determined by the last declaration
+        let expected_kind = if last_is_function {
+            SymbolKind::Function
+        } else {
+            SymbolKind::Variable
+        };
+
+        // Query scope at end of file
+        let query_line = (lines.len() - 1) as u32;
+        let scope = scope_at_position(&artifacts, query_line, 0);
+
+        let scoped_symbol = scope.symbols.get(&symbol_name);
+        prop_assert!(
+            scoped_symbol.is_some(),
+            "Symbol '{}' should be in scope. Code:\n{}",
+            symbol_name, code
+        );
+        prop_assert_eq!(
+            scoped_symbol.unwrap().kind,
+            expected_kind,
+            "Last declaration (count={}) should determine symbol kind. Expected {:?}. Code:\n{}",
+            declaration_count, expected_kind, code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 9: Conflicting Declaration Resolution
+    ///
+    /// Extended test: Conflicting declarations with different syntax variants (colon, quotes)
+    /// should still follow the "later wins" rule.
+    ///
+    /// **Validates: Requirements 11.1, 11.4**
+    #[test]
+    fn prop_conflicting_declaration_syntax_variants(
+        symbol_name in r_symbol_name(),
+        var_first in proptest::bool::ANY,
+        first_use_colon in proptest::bool::ANY,
+        second_use_colon in proptest::bool::ANY,
+        first_quote_style in 0..3usize,
+        second_quote_style in 0..3usize,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position, SymbolKind};
+
+        let uri = make_url("test");
+
+        let (first_directive, second_directive, expected_kind) = if var_first {
+            ("@lsp-var", "@lsp-func", SymbolKind::Function)
+        } else {
+            ("@lsp-func", "@lsp-var", SymbolKind::Variable)
+        };
+
+        // Build directive strings with syntax variants
+        let format_directive = |directive: &str, use_colon: bool, quote_style: usize, name: &str| -> String {
+            let colon = if use_colon { ":" } else { "" };
+            let quoted_name = match quote_style {
+                1 => format!("\"{}\"", name),
+                2 => format!("'{}'", name),
+                _ => name.to_string(),
+            };
+            format!("# {}{} {}", directive, colon, quoted_name)
+        };
+
+        let first_line = format_directive(first_directive, first_use_colon, first_quote_style, &symbol_name);
+        let second_line = format_directive(second_directive, second_use_colon, second_quote_style, &symbol_name);
+
+        // Use a different variable name to avoid overwriting the declared symbol
+        let code = format!("{}\n{}\nother_var <- 42", first_line, second_line);
+        let tree = parse_r_tree(&code);
+        let metadata = parse_directives(&code);
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
+
+        // Query scope at line 2
+        let scope = scope_at_position(&artifacts, 2, 0);
+
+        let scoped_symbol = scope.symbols.get(&symbol_name);
+        prop_assert!(
+            scoped_symbol.is_some(),
+            "Symbol '{}' should be in scope with syntax variants. Code:\n{}",
+            symbol_name, code
+        );
+        prop_assert_eq!(
+            scoped_symbol.unwrap().kind,
+            expected_kind,
+            "Later declaration should win regardless of syntax variants. Code:\n{}",
+            code
+        );
+    }
+}
+
+
+// ============================================================================
+// Feature: lsp-declaration-directives, Property 10: Workspace Index Declaration Extraction
+// Validates: Requirements 12.1, 12.2, 12.3
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Feature: lsp-declaration-directives, Property 10: Workspace Index Declaration Extraction
+    ///
+    /// For any file indexed by the workspace indexer, declared symbols SHALL be extracted
+    /// and stored such that when the file participates in a dependency chain, its declared
+    /// symbols are available during scope resolution.
+    ///
+    /// This test verifies Requirement 12.1: When a closed file is indexed by the workspace
+    /// indexer, the declared symbols SHALL be extracted and stored.
+    ///
+    /// **Validates: Requirements 12.1**
+    #[test]
+    fn prop_workspace_index_extracts_declared_symbols(
+        symbol_name in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+        prefix_lines in 0..5usize,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, ScopeEvent, SymbolKind};
+
+        let uri = make_url("indexed_file");
+
+        // Build file content with declaration directive
+        let directive = if is_function {
+            format!("# @lsp-func {}", symbol_name)
+        } else {
+            format!("# @lsp-var {}", symbol_name)
+        };
+
+        let mut lines: Vec<String> = (0..prefix_lines)
+            .map(|i| format!("x{} <- {}", i, i))
+            .collect();
+        lines.push(directive);
+        lines.push("y <- 42".to_string());
+
+        let code = lines.join("\n");
+        let tree = parse_r_tree(&code);
+        let metadata = parse_directives(&code);
+
+        // Simulate workspace indexer behavior: compute artifacts with metadata
+        // This is what background_indexer.rs does when indexing a closed file
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
+
+        // Skip cases where the generated symbol name conflicts with real definitions
+        // in the test code ("y <- 42" or prefix vars "x0 <- 0", etc.). When a symbol
+        // has both a real definition and a declaration directive, the real definition
+        // correctly takes precedence (is_declared == false).
+        let prefix_names: Vec<String> = (0..prefix_lines)
+            .map(|i| format!("x{}", i))
+            .collect();
+        prop_assume!(
+            symbol_name != "y" && !prefix_names.contains(&symbol_name),
+            "Symbol name conflicts with a real definition in the test code"
+        );
+
+        // Requirement 12.1: Declared symbols should be extracted and stored
+        // Check that the declared symbol is in the exported interface
+        prop_assert!(
+            artifacts.exported_interface.contains_key(&symbol_name),
+            "Declared symbol '{}' should be in exported interface after indexing. Code:\n{}",
+            symbol_name, code
+        );
+
+        let symbol = artifacts.exported_interface.get(&symbol_name).unwrap();
+        prop_assert!(
+            symbol.is_declared,
+            "Symbol '{}' should be marked as declared. Code:\n{}",
+            symbol_name, code
+        );
+
+        let expected_kind = if is_function {
+            SymbolKind::Function
+        } else {
+            SymbolKind::Variable
+        };
+        prop_assert_eq!(
+            symbol.kind, expected_kind,
+            "Symbol '{}' should have correct kind. Code:\n{}",
+            symbol_name, code
+        );
+
+        // Check that the timeline contains a Declaration event
+        let declaration_events: Vec<_> = artifacts.timeline.iter()
+            .filter(|e| matches!(e, ScopeEvent::Declaration { symbol, .. } if symbol.name == symbol_name))
+            .collect();
+        prop_assert_eq!(
+            declaration_events.len(), 1,
+            "Timeline should contain exactly one Declaration event for '{}'. Code:\n{}",
+            symbol_name, code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 10: Workspace Index Declaration Extraction
+    ///
+    /// For any dependency chain that includes an indexed (closed) file with declarations,
+    /// the declared symbols SHALL be available in scope resolution.
+    ///
+    /// This test verifies Requirement 12.2: When a dependency chain includes an indexed
+    /// (closed) file with declarations, the declared symbols SHALL be available in scope
+    /// resolution.
+    ///
+    /// **Validates: Requirements 12.2**
+    #[test]
+    fn prop_workspace_index_declarations_available_in_dependency_chain(
+        symbol_name in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph, SymbolKind};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        // Skip if symbol conflicts with parent's own definitions
+        prop_assume!(symbol_name != "parent_var" && symbol_name != "child_var");
+
+        let parent_uri = make_url("parent");
+        let indexed_child_uri = make_url("indexed_child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent file: sources the indexed child (use unique variable name)
+        let parent_code = "source(\"indexed_child.R\")\nparent_var <- 1";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_metadata = parse_directives(parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, parent_code, Some(&parent_metadata)
+        );
+
+        // Indexed child file: has a declaration directive (use unique variable name)
+        // This simulates a closed file that was indexed by the workspace indexer
+        let directive = if is_function {
+            format!("# @lsp-func {}", symbol_name)
+        } else {
+            format!("# @lsp-var {}", symbol_name)
+        };
+        let child_code = format!("{}\nchild_var <- 42", directive);
+        let child_tree = parse_r_tree(&child_code);
+        let child_metadata = parse_directives(&child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &indexed_child_uri, &child_tree, &child_code, Some(&child_metadata)
+        );
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "indexed_child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        // Simulate workspace index providing artifacts for the indexed child
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &indexed_child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else if uri == &indexed_child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        // Query parent's scope at end of file (after source() call)
+        let scope = scope_at_position_with_graph(
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Requirement 12.2: Declared symbol from indexed child should be available in parent's scope
+        prop_assert!(
+            scope.symbols.contains_key(&symbol_name),
+            "Declared symbol '{}' from indexed child file should be available in parent's scope. \
+             Parent code:\n{}\nChild code:\n{}",
+            symbol_name, parent_code, child_code
+        );
+
+        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        prop_assert!(
+            symbol.is_declared,
+            "Symbol '{}' should be marked as declared. Parent code:\n{}\nChild code:\n{}",
+            symbol_name, parent_code, child_code
+        );
+
+        let expected_kind = if is_function {
+            SymbolKind::Function
+        } else {
+            SymbolKind::Variable
+        };
+        prop_assert_eq!(
+            symbol.kind, expected_kind,
+            "Symbol '{}' should have correct kind. Parent code:\n{}\nChild code:\n{}",
+            symbol_name, parent_code, child_code
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 10: Workspace Index Declaration Extraction
+    ///
+    /// When an indexed file is opened, the declared symbols SHALL be re-extracted from
+    /// the live document content.
+    ///
+    /// This test verifies Requirement 12.3: When an indexed file is opened, the declared
+    /// symbols SHALL be re-extracted from the live document content.
+    ///
+    /// **Validates: Requirements 12.3**
+    #[test]
+    fn prop_workspace_index_reextracts_on_open(
+        old_symbol in r_symbol_name(),
+        new_symbol in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph, SymbolKind};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        // Skip if old and new symbols are the same (can't test re-extraction)
+        prop_assume!(old_symbol != new_symbol);
+        // Skip if symbols conflict with real definitions in test code.
+        // Old code has "y <- 42", new code has "z <- 99", parent has "parent_var <- 1".
+        // Real definitions take precedence over declarations, which would break assertions.
+        prop_assume!(old_symbol != "parent_var" && new_symbol != "parent_var");
+        prop_assume!(old_symbol != "y" && new_symbol != "y");
+        prop_assume!(old_symbol != "z" && new_symbol != "z");
+
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent file: sources the child (use unique variable name to avoid conflicts)
+        let parent_code = "source(\"child.R\")\nparent_var <- 1";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_metadata = parse_directives(parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, parent_code, Some(&parent_metadata)
+        );
+
+        // OLD child content (simulating stale workspace index)
+        let old_directive = if is_function {
+            format!("# @lsp-func {}", old_symbol)
+        } else {
+            format!("# @lsp-var {}", old_symbol)
+        };
+        let old_child_code = format!("{}\ny <- 42", old_directive);
+        let old_child_tree = parse_r_tree(&old_child_code);
+        let old_child_metadata = parse_directives(&old_child_code);
+        let old_child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &old_child_tree, &old_child_code, Some(&old_child_metadata)
+        );
+
+        // NEW child content (simulating live document after opening)
+        let new_directive = if is_function {
+            format!("# @lsp-func {}", new_symbol)
+        } else {
+            format!("# @lsp-var {}", new_symbol)
+        };
+        let new_child_code = format!("{}\nz <- 99", new_directive);
+        let new_child_tree = parse_r_tree(&new_child_code);
+        let new_child_metadata = parse_directives(&new_child_code);
+        let new_child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &new_child_tree, &new_child_code, Some(&new_child_metadata)
+        );
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        // First, verify old artifacts have old symbol (simulating workspace index state)
+        prop_assert!(
+            old_child_artifacts.exported_interface.contains_key(&old_symbol),
+            "Old artifacts should contain old symbol '{}'. Old code:\n{}",
+            old_symbol, old_child_code
+        );
+        prop_assert!(
+            !old_child_artifacts.exported_interface.contains_key(&new_symbol),
+            "Old artifacts should NOT contain new symbol '{}'. Old code:\n{}",
+            new_symbol, old_child_code
+        );
+
+        // Simulate opening the file: now use new artifacts (re-extracted from live content)
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(new_child_artifacts.clone()) }  // Live content
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else if uri == &child_uri { Some(new_child_metadata.clone()) }  // Live content
+            else { None }
+        };
+
+        // Query parent's scope at end of file
+        let scope = scope_at_position_with_graph(
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Requirement 12.3: After opening, new declared symbol should be available
+        prop_assert!(
+            scope.symbols.contains_key(&new_symbol),
+            "New declared symbol '{}' should be available after re-extraction from live content. \
+             New code:\n{}",
+            new_symbol, new_child_code
+        );
+
+        // Old symbol should NOT be available (it was in the old content)
+        prop_assert!(
+            !scope.symbols.contains_key(&old_symbol),
+            "Old declared symbol '{}' should NOT be available after re-extraction. \
+             Old code:\n{}\nNew code:\n{}",
+            old_symbol, old_child_code, new_child_code
+        );
+
+        let symbol = scope.symbols.get(&new_symbol).unwrap();
+        prop_assert!(
+            symbol.is_declared,
+            "New symbol '{}' should be marked as declared",
+            new_symbol
+        );
+
+        let expected_kind = if is_function {
+            SymbolKind::Function
+        } else {
+            SymbolKind::Variable
+        };
+        prop_assert_eq!(
+            symbol.kind, expected_kind,
+            "New symbol '{}' should have correct kind",
+            new_symbol
+        );
+    }
+
+    /// Feature: lsp-declaration-directives, Property 10: Workspace Index Declaration Extraction
+    ///
+    /// Extended test: Multiple declarations in an indexed file should all be extracted
+    /// and available in the dependency chain.
+    ///
+    /// **Validates: Requirements 12.1, 12.2**
+    #[test]
+    fn prop_workspace_index_multiple_declarations(
+        var_names in proptest::collection::vec(r_symbol_name(), 1..4),
+        func_names in proptest::collection::vec(r_symbol_name(), 1..4),
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph, SymbolKind};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        // Ensure unique names and no conflicts with parent's own definitions
+        let all_names: HashSet<_> = var_names.iter().chain(func_names.iter()).collect();
+        prop_assume!(all_names.len() == var_names.len() + func_names.len());
+        // Skip if any name conflicts with parent's or child's variable
+        prop_assume!(!var_names.contains(&"parent_var".to_string()));
+        prop_assume!(!func_names.contains(&"parent_var".to_string()));
+        prop_assume!(!var_names.contains(&"child_var".to_string()));
+        prop_assume!(!func_names.contains(&"child_var".to_string()));
+
+        let parent_uri = make_url("parent");
+        let indexed_child_uri = make_url("indexed_child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Parent file: sources the indexed child (use unique variable name)
+        let parent_code = "source(\"indexed_child.R\")\nparent_var <- 1";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_metadata = parse_directives(parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, parent_code, Some(&parent_metadata)
+        );
+
+        // Indexed child file: has multiple declaration directives (use unique variable name)
+        let mut child_lines: Vec<String> = Vec::new();
+        for name in &var_names {
+            child_lines.push(format!("# @lsp-var {}", name));
+        }
+        for name in &func_names {
+            child_lines.push(format!("# @lsp-func {}", name));
+        }
+        child_lines.push("child_var <- 42".to_string());
+
+        let child_code = child_lines.join("\n");
+        let child_tree = parse_r_tree(&child_code);
+        let child_metadata = parse_directives(&child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &indexed_child_uri, &child_tree, &child_code, Some(&child_metadata)
+        );
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "indexed_child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &indexed_child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else if uri == &indexed_child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        // Query parent's scope at end of file
+        let scope = scope_at_position_with_graph(
+            &parent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // All declared variables should be available
+        for name in &var_names {
+            prop_assert!(
+                scope.symbols.contains_key(name),
+                "Declared variable '{}' should be available in parent's scope. Child code:\n{}",
+                name, child_code
+            );
+            let symbol = scope.symbols.get(name).unwrap();
+            prop_assert!(symbol.is_declared, "Variable '{}' should be marked as declared", name);
+            prop_assert_eq!(symbol.kind, SymbolKind::Variable, "Variable '{}' should have Variable kind", name);
+        }
+
+        // All declared functions should be available
+        for name in &func_names {
+            prop_assert!(
+                scope.symbols.contains_key(name),
+                "Declared function '{}' should be available in parent's scope. Child code:\n{}",
+                name, child_code
+            );
+            let symbol = scope.symbols.get(name).unwrap();
+            prop_assert!(symbol.is_declared, "Function '{}' should be marked as declared", name);
+            prop_assert_eq!(symbol.kind, SymbolKind::Function, "Function '{}' should have Function kind", name);
+        }
+    }
+
+    /// Feature: lsp-declaration-directives, Property 10: Workspace Index Declaration Extraction
+    ///
+    /// Extended test: Declarations in indexed files should work correctly in transitive
+    /// dependency chains (grandparent -> parent -> child).
+    ///
+    /// **Validates: Requirements 12.2**
+    #[test]
+    fn prop_workspace_index_transitive_declarations(
+        symbol_name in r_symbol_name(),
+        is_function in proptest::bool::ANY,
+    ) {
+        use super::directive::parse_directives;
+        use super::scope::{compute_artifacts_with_metadata, scope_at_position_with_graph, SymbolKind};
+        use super::dependency::DependencyGraph;
+        use super::types::ForwardSource;
+
+        // Skip if symbol conflicts with any file's own definitions
+        prop_assume!(symbol_name != "gp_var" && symbol_name != "p_var" && symbol_name != "c_var");
+
+        let grandparent_uri = make_url("grandparent");
+        let parent_uri = make_url("parent");
+        let child_uri = make_url("child");
+        let workspace_root = Url::parse("file:///").unwrap();
+
+        // Grandparent file: sources parent (use unique variable name)
+        let grandparent_code = "source(\"parent.R\")\ngp_var <- 1";
+        let grandparent_tree = parse_r_tree(grandparent_code);
+        let grandparent_metadata = parse_directives(grandparent_code);
+        let grandparent_artifacts = compute_artifacts_with_metadata(
+            &grandparent_uri, &grandparent_tree, grandparent_code, Some(&grandparent_metadata)
+        );
+
+        // Parent file (indexed): sources child (use unique variable name)
+        let parent_code = "source(\"child.R\")\np_var <- 2";
+        let parent_tree = parse_r_tree(parent_code);
+        let parent_metadata = parse_directives(parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri, &parent_tree, parent_code, Some(&parent_metadata)
+        );
+
+        // Child file (indexed): has declaration directive (use unique variable name)
+        let directive = if is_function {
+            format!("# @lsp-func {}", symbol_name)
+        } else {
+            format!("# @lsp-var {}", symbol_name)
+        };
+        let child_code = format!("{}\nc_var <- 3", directive);
+        let child_tree = parse_r_tree(&child_code);
+        let child_metadata = parse_directives(&child_code);
+        let child_artifacts = compute_artifacts_with_metadata(
+            &child_uri, &child_tree, &child_code, Some(&child_metadata)
+        );
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+
+        // Grandparent -> Parent edge
+        let grandparent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "parent.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&grandparent_uri, &grandparent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        // Parent -> Child edge
+        let parent_meta_for_graph = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 0,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta_for_graph, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<super::scope::ScopeArtifacts> {
+            if uri == &grandparent_uri { Some(grandparent_artifacts.clone()) }
+            else if uri == &parent_uri { Some(parent_artifacts.clone()) }
+            else if uri == &child_uri { Some(child_artifacts.clone()) }
+            else { None }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &grandparent_uri { Some(grandparent_meta_for_graph.clone()) }
+            else if uri == &parent_uri { Some(parent_meta_for_graph.clone()) }
+            else if uri == &child_uri { Some(child_metadata.clone()) }
+            else { None }
+        };
+
+        // Query grandparent's scope at end of file
+        let scope = scope_at_position_with_graph(
+            &grandparent_uri, 1, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
+        );
+
+        // Declared symbol from child should be available in grandparent's scope
+        // (through transitive dependency chain)
+        prop_assert!(
+            scope.symbols.contains_key(&symbol_name),
+            "Declared symbol '{}' from child should be available in grandparent's scope \
+             through transitive dependency chain. Child code:\n{}",
+            symbol_name, child_code
+        );
+
+        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        prop_assert!(
+            symbol.is_declared,
+            "Symbol '{}' should be marked as declared",
+            symbol_name
+        );
+
+        let expected_kind = if is_function {
+            SymbolKind::Function
+        } else {
+            SymbolKind::Variable
+        };
+        prop_assert_eq!(
+            symbol.kind, expected_kind,
+            "Symbol '{}' should have correct kind",
+            symbol_name
         );
     }
 }

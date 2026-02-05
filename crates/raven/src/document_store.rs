@@ -251,7 +251,10 @@ impl DocumentStore {
         let loaded_packages = Self::extract_packages(&tree, content);
         let metadata = crate::cross_file::extract_metadata(content);
         let artifacts = if let Some(ref tree) = tree {
-            crate::cross_file::scope::compute_artifacts(&uri, tree, content)
+            // Use compute_artifacts_with_metadata to include declared symbols from directives
+            // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
+            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+            crate::cross_file::scope::compute_artifacts_with_metadata(&uri, tree, content, Some(&metadata))
         } else {
             ScopeArtifacts::default()
         };
@@ -330,7 +333,10 @@ impl DocumentStore {
         let tree = Self::parse_content(content);
         let loaded_packages = Self::extract_packages(&tree, content);
         let artifacts = if let Some(ref tree) = tree {
-            crate::cross_file::scope::compute_artifacts(&uri, tree, content)
+            // Use compute_artifacts_with_metadata to include declared symbols from directives
+            // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
+            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+            crate::cross_file::scope::compute_artifacts_with_metadata(&uri, tree, content, Some(&metadata))
         } else {
             ScopeArtifacts::default()
         };
@@ -412,7 +418,10 @@ impl DocumentStore {
             state.loaded_packages = Self::extract_packages(&state.tree, &content);
             state.metadata = crate::cross_file::extract_metadata(&content);
             state.artifacts = if let Some(ref tree) = state.tree {
-                crate::cross_file::scope::compute_artifacts(uri, tree, &content)
+                // Use compute_artifacts_with_metadata to include declared symbols from directives
+                // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
+                // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+                crate::cross_file::scope::compute_artifacts_with_metadata(uri, tree, &content, Some(&state.metadata))
             } else {
                 ScopeArtifacts::default()
             };
@@ -450,7 +459,10 @@ impl DocumentStore {
             state.loaded_packages = Self::extract_packages(&state.tree, &content);
             state.metadata = metadata;
             state.artifacts = if let Some(ref tree) = state.tree {
-                crate::cross_file::scope::compute_artifacts(uri, tree, &content)
+                // Use compute_artifacts_with_metadata to include declared symbols from directives
+                // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
+                // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+                crate::cross_file::scope::compute_artifacts_with_metadata(uri, tree, &content, Some(&state.metadata))
             } else {
                 ScopeArtifacts::default()
             };

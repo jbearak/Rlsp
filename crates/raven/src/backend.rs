@@ -869,14 +869,12 @@ impl LanguageServer for Backend {
             }
 
             // Compute new interface_hash after opening the document
+            // Use the document_store which has artifacts computed with metadata (including declared symbols)
+            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
             let new_interface_hash = state
-                .documents
-                .get(&uri)
-                .and_then(|doc| doc.tree.as_ref())
-                .map(|tree| {
-                    let text = state.documents.get(&uri).map(|d| d.text()).unwrap_or_default();
-                    crate::cross_file::scope::compute_artifacts(&uri, tree, &text).interface_hash
-                });
+                .document_store
+                .get_without_touch(&uri)
+                .map(|doc| doc.artifacts.interface_hash);
 
             // Determine if interface changed (selective invalidation optimization)
             // Only invalidate dependents if the exported interface actually changed
@@ -1448,14 +1446,12 @@ impl LanguageServer for Backend {
 
             // Capture old interface_hash before applying changes (for selective invalidation)
             // This optimization avoids invalidating dependents when only comments/local vars change
+            // Use document_store which has artifacts computed with metadata (including declared symbols)
+            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
             let old_interface_hash = state
-                .documents
-                .get(&uri)
-                .and_then(|doc| doc.tree.as_ref())
-                .map(|tree| {
-                    let text = state.documents.get(&uri).map(|d| d.text()).unwrap_or_default();
-                    crate::cross_file::scope::compute_artifacts(&uri, tree, &text).interface_hash
-                });
+                .document_store
+                .get_without_touch(&uri)
+                .map(|doc| doc.artifacts.interface_hash);
 
             // Update legacy documents HashMap first (for migration compatibility)
             if let Some(doc) = state.documents.get_mut(&uri) {
@@ -1557,14 +1553,12 @@ impl LanguageServer for Backend {
             }
 
             // Compute new interface_hash after applying changes
+            // Use document_store which has artifacts computed with metadata (including declared symbols)
+            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
             let new_interface_hash = state
-                .documents
-                .get(&uri)
-                .and_then(|doc| doc.tree.as_ref())
-                .map(|tree| {
-                    let text = state.documents.get(&uri).map(|d| d.text()).unwrap_or_default();
-                    crate::cross_file::scope::compute_artifacts(&uri, tree, &text).interface_hash
-                });
+                .document_store
+                .get_without_touch(&uri)
+                .map(|doc| doc.artifacts.interface_hash);
 
             // Determine if interface changed (selective invalidation optimization)
             // Only invalidate dependents if the exported interface actually changed
@@ -2117,7 +2111,9 @@ impl LanguageServer for Backend {
                         let mut parser = tree_sitter::Parser::new();
                         if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {
                             if let Some(tree) = parser.parse(&content, None) {
-                                crate::cross_file::scope::compute_artifacts(&uri, &tree, &content)
+                                // Use compute_artifacts_with_metadata to include declared symbols from directives
+                                // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+                                crate::cross_file::scope::compute_artifacts_with_metadata(&uri, &tree, &content, Some(&cross_file_meta))
                             } else {
                                 crate::cross_file::scope::ScopeArtifacts::default()
                             }
@@ -2450,16 +2446,20 @@ impl Backend {
         };
 
         // Compute cross-file metadata and artifacts using thread-local parser
-        let mut cross_file_meta = crate::cross_file::extract_metadata(&content);
+        let cross_file_meta = crate::cross_file::extract_metadata(&content);
         let artifacts = crate::parser_pool::with_parser(|parser| {
             if let Some(tree) = parser.parse(&content, None) {
-                crate::cross_file::scope::compute_artifacts(file_uri, &tree, &content)
+                // Use compute_artifacts_with_metadata to include declared symbols from directives
+                // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+                crate::cross_file::scope::compute_artifacts_with_metadata(file_uri, &tree, &content, Some(&cross_file_meta))
             } else {
                 crate::cross_file::scope::ScopeArtifacts::default()
             }
         });
 
         // Enrich metadata with inherited working directory before indexing
+        // Note: We need to make cross_file_meta mutable for enrichment
+        let mut cross_file_meta = cross_file_meta;
         {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
@@ -2795,7 +2795,9 @@ impl Backend {
 
         let artifacts = crate::parser_pool::with_parser(|parser| {
             if let Some(tree) = parser.parse(&content, None) {
-                crate::cross_file::scope::compute_artifacts(file_uri, &tree, &content)
+                // Use compute_artifacts_with_metadata to include declared symbols from directives
+                // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
+                crate::cross_file::scope::compute_artifacts_with_metadata(file_uri, &tree, &content, Some(&cross_file_meta))
             } else {
                 crate::cross_file::scope::ScopeArtifacts::default()
             }

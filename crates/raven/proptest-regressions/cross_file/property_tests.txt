@@ -10,3 +10,10 @@ cc 3ee8dab8418b546fb721d52e050e644834a03e5a1210d737ec97852cd07c16e4 # shrinks to
 cc b9745a39e47060a2d57c216b49cbb44a772bb37e70f046b405885b3fb1573fe3 # shrinks to package = "a", func = "library", export_name = "x0", lines_before = 1, lines_after = 1
 cc ffd6f09a52f117b182862921598ada0778f9f549321de96d5ca096bc7a12dcc6 # shrinks to base_start_line = 329, base_start_col = 43, base_end_line = 512, base_end_col = 50, nest_offset_start_line = 86, nest_offset_start_col = 3, nest_offset_end_line = 96, nest_offset_end_col = 5
 cc d16550737af68fba261f0c57d7a8281798c96fd43cab9efb4d43e3dd8ac311d4 # shrinks to package = "a", func = "library", exported_name = "a", non_exported_name = "x0", lines_before = 1, lines_after = 1
+cc e4dde5be9bd451b8a6c58c13c265646d3cb399ce10448c7cbaf86e8478dfe4e1 # shrinks to symbols = [("A", 4, false), ("a", 4, false)]
+cc 1bf6a761c375c018de6cc75ef702c593338060ca4144d25cd23afeab8b3c977d # shrinks to symbols = [("z0", 1, false)]
+cc b1978a9d2d155bc69504f3eab7bd196fc4affa9f668be37ba27ea8ea39df9be7 # shrinks to declared_symbol = "A", regular_symbol = "x", is_function = false
+cc c0b2cf15ea48569706570f3e444704e5a16f7b732710c9e755b0abfc5587279c # shrinks to var_names = ["x"], func_names = ["a"]
+cc f6422bed12b3fd769eb1097db70cbbd7a66d07437fd0c4f8e2ce1a2801dfdbd2 # shrinks to symbol_name = "x", is_function = false
+cc 22f5803b605fb07455ff1a5ab6b25c60190d8499f4404eb03c707b8e98a2ade5 # shrinks to symbol_name = "y", is_function = false, prefix_lines = 0
+cc 44c37ae5d05d04862537acce37c6faf634169b54c37af5c402776be7983ca036 # shrinks to old_symbol = "a", new_symbol = "y", is_function = false

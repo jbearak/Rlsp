@@ -864,8 +864,10 @@ fn scan_directory(
                             let cross_file_meta = crate::cross_file::extract_metadata(&text);
 
                             // Compute artifacts if we have a tree
+                            // Use compute_artifacts_with_metadata to include declared symbols from directives
+                            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
                             let artifacts = if let Some(tree) = doc.tree.as_ref() {
-                                crate::cross_file::scope::compute_artifacts(&uri, tree, &text)
+                                crate::cross_file::scope::compute_artifacts_with_metadata(&uri, tree, &text, Some(&cross_file_meta))
                             } else {
                                 crate::cross_file::scope::ScopeArtifacts::default()
                             };

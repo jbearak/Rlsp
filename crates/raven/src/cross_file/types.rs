@@ -10,6 +10,19 @@ use tower_lsp::lsp_types::Url;
 
 use super::source_detect::LibraryCall;
 
+/// A declared symbol from an @lsp-var or @lsp-func directive.
+/// These directives allow users to declare symbols that cannot be statically
+/// detected by the parser (e.g., dynamically created via eval(), assign(), load()).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeclaredSymbol {
+    /// The symbol name (e.g., "myvar", "my.func")
+    pub name: String,
+    /// 0-based line number where the directive appears
+    pub line: u32,
+    /// true for @lsp-func, false for @lsp-var
+    pub is_function: bool,
+}
+
 /// Complete cross-file metadata for a document
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrossFileMetadata {
@@ -30,6 +43,12 @@ pub struct CrossFileMetadata {
     pub ignored_next_lines: HashSet<u32>,
     /// Detected library(), require(), loadNamespace() calls
     pub library_calls: Vec<LibraryCall>,
+    /// Variables declared via @lsp-var directives
+    #[serde(default)]
+    pub declared_variables: Vec<DeclaredSymbol>,
+    /// Functions declared via @lsp-func directives
+    #[serde(default)]
+    pub declared_functions: Vec<DeclaredSymbol>,
 }
 
 /// A backward directive declaring this file is sourced by another
@@ -275,6 +294,8 @@ mod tests {
             ignored_lines: HashSet::from([10, 20]),
             ignored_next_lines: HashSet::from([15]),
             library_calls: vec![],
+            declared_variables: vec![],
+            declared_functions: vec![],
         };
 
         // Round-trip serialization
@@ -312,6 +333,8 @@ mod tests {
             ignored_lines: HashSet::new(),
             ignored_next_lines: HashSet::new(),
             library_calls: vec![],
+            declared_variables: vec![],
+            declared_functions: vec![],
         };
 
         // Round-trip serialization
@@ -351,6 +374,8 @@ mod tests {
             ignored_lines: HashSet::new(),
             ignored_next_lines: HashSet::new(),
             library_calls: vec![],
+            declared_variables: vec![],
+            declared_functions: vec![],
         };
 
         // Round-trip serialization

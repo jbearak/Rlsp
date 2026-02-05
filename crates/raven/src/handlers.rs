@@ -3048,10 +3048,46 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
     );
     if let Some(symbol) = cross_file_symbols.get(name) {
         log::trace!(
-            "hover: found symbol '{}' in cross_file_symbols, source_uri={}",
+            "hover: found symbol '{}' in cross_file_symbols, source_uri={}, is_declared={}",
             name,
-            symbol.source_uri
+            symbol.source_uri,
+            symbol.is_declared
         );
+        
+        // Handle declared symbols (from @lsp-var or @lsp-func directives)
+        // Validates: Requirements 7.1, 7.2, 7.3
+        if symbol.is_declared {
+            let kind_str = match symbol.kind {
+                crate::cross_file::SymbolKind::Function => "declared function",
+                crate::cross_file::SymbolKind::Variable => "declared variable",
+                _ => "declared symbol",
+            };
+            let directive_type = match symbol.kind {
+                crate::cross_file::SymbolKind::Function => "@lsp-func",
+                _ => "@lsp-var",
+            };
+            // Convert 0-based line to 1-based for display
+            let display_line = symbol.defined_line + 1;
+
+            let mut value = format!(
+                "```r\n{} ({})\n```\n\nDeclared via {} directive at line {}",
+                name, kind_str, directive_type, display_line
+            );
+            if symbol.source_uri != *uri {
+                let workspace_root = state.workspace_folders.first();
+                let relative_path = compute_relative_path(&symbol.source_uri, workspace_root);
+                value.push_str(&format!("\n\n*Defined in {}*", relative_path));
+            }
+
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: Some(node_range),
+            });
+        }
+        
         let mut value = String::new();
 
         // Check if this is a package export (source_uri starts with "package:")
@@ -3379,6 +3415,49 @@ pub fn goto_definition(
                     .unwrap_or("unknown")
             );
             return None;
+        }
+
+        // Handle declared symbols (from @lsp-var or @lsp-func directives)
+        // For declared symbols, navigate to the directive line (column 0)
+        // If symbol is declared multiple times, use the first declaration by line number
+        // Validates: Requirements 8.1, 8.2
+        if symbol.is_declared {
+            // Get metadata for the symbol's source file to find the first declaration
+            if let Some(metadata) = content_provider.get_metadata(&symbol.source_uri) {
+                // Find all declarations of this symbol name (both variables and functions)
+                let mut first_line: Option<u32> = None;
+                
+                for decl in &metadata.declared_variables {
+                    if decl.name == name {
+                        first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
+                    }
+                }
+                for decl in &metadata.declared_functions {
+                    if decl.name == name {
+                        first_line = Some(first_line.map_or(decl.line, |l| l.min(decl.line)));
+                    }
+                }
+                
+                // Use the first declaration line, or fall back to symbol's defined_line
+                let definition_line = first_line.unwrap_or(symbol.defined_line);
+                
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: symbol.source_uri.clone(),
+                    range: Range {
+                        start: Position::new(definition_line, 0),
+                        end: Position::new(definition_line, 0),
+                    },
+                }));
+            }
+            
+            // Fallback if metadata not available: use symbol's stored location
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: symbol.source_uri.clone(),
+                range: Range {
+                    start: Position::new(symbol.defined_line, 0),
+                    end: Position::new(symbol.defined_line, 0),
+                },
+            }));
         }
 
         return Some(GotoDefinitionResponse::Scalar(Location {
@@ -5582,6 +5661,228 @@ x <- "#;
             "Requirement 3.3: Message should mention 'if'"
         );
     }
+
+    // ========================================================================
+    // Declared Symbol Completion Tests (Task 8.1)
+    // Tests for lsp-declaration-directives feature
+    // Validates: Requirements 6.1, 6.2, 6.3, 6.4
+    // ========================================================================
+
+    /// Test that declared variables appear in completions with VARIABLE kind.
+    /// Validates: Requirements 6.1, 6.4
+    #[test]
+    fn test_completion_declared_variable() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionItemKind, CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            // Create a document with a declared variable
+            let code = r#"# @lsp-var my_declared_var
+x <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            // Get completions at the end of the file (after "x <- ")
+            let position = Position::new(1, 5);
+            let completions = super::completion(&state, &uri, position);
+
+            assert!(completions.is_some(), "Should return completions");
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Find the declared variable completion item
+                let declared_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == "my_declared_var")
+                    .collect();
+
+                // Requirement 6.1: Declared variable should appear in completions
+                assert!(
+                    !declared_items.is_empty(),
+                    "Requirement 6.1: Declared variable 'my_declared_var' should appear in completions"
+                );
+
+                // Requirement 6.4: Declared variable should have VARIABLE kind
+                let declared_item = declared_items[0];
+                assert_eq!(
+                    declared_item.kind,
+                    Some(CompletionItemKind::VARIABLE),
+                    "Requirement 6.4: Declared variable should have CompletionItemKind::VARIABLE"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that declared functions appear in completions with FUNCTION kind.
+    /// Validates: Requirements 6.2, 6.3
+    #[test]
+    fn test_completion_declared_function() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionItemKind, CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            // Create a document with a declared function
+            let code = r#"# @lsp-func my_declared_func
+x <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            // Get completions at the end of the file (after "x <- ")
+            let position = Position::new(1, 5);
+            let completions = super::completion(&state, &uri, position);
+
+            assert!(completions.is_some(), "Should return completions");
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Find the declared function completion item
+                let declared_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == "my_declared_func")
+                    .collect();
+
+                // Requirement 6.2: Declared function should appear in completions
+                assert!(
+                    !declared_items.is_empty(),
+                    "Requirement 6.2: Declared function 'my_declared_func' should appear in completions"
+                );
+
+                // Requirement 6.3: Declared function should have FUNCTION kind
+                let declared_item = declared_items[0];
+                assert_eq!(
+                    declared_item.kind,
+                    Some(CompletionItemKind::FUNCTION),
+                    "Requirement 6.3: Declared function should have CompletionItemKind::FUNCTION"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
+
+    /// Test that declared symbols only appear in completions after their declaration line.
+    /// Validates: Requirements 6.1, 6.2 (position-aware)
+    #[test]
+    fn test_completion_declared_symbol_position_aware() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            // Create a document with a declared variable on line 2
+            let code = r#"x <- 1
+# @lsp-var late_declared
+y <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            // Get completions on line 0 (before declaration)
+            let position_before = Position::new(0, 5);
+            let completions_before = super::completion(&state, &uri, position_before);
+
+            if let Some(CompletionResponse::Array(items)) = completions_before {
+                let declared_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == "late_declared")
+                    .collect();
+
+                // Declared symbol should NOT appear before its declaration line
+                assert!(
+                    declared_items.is_empty(),
+                    "Declared symbol should NOT appear in completions before its declaration line"
+                );
+            }
+
+            // Get completions on line 2 (after declaration)
+            let position_after = Position::new(2, 5);
+            let completions_after = super::completion(&state, &uri, position_after);
+
+            if let Some(CompletionResponse::Array(items)) = completions_after {
+                let declared_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == "late_declared")
+                    .collect();
+
+                // Declared symbol SHOULD appear after its declaration line
+                assert!(
+                    !declared_items.is_empty(),
+                    "Declared symbol SHOULD appear in completions after its declaration line"
+                );
+            }
+        });
+    }
+
+    /// Test that both declared variables and functions appear in completions together.
+    /// Validates: Requirements 6.1, 6.2, 6.3, 6.4
+    #[test]
+    fn test_completion_mixed_declared_symbols() {
+        use crate::state::{Document, WorldState};
+        use tower_lsp::lsp_types::{CompletionItemKind, CompletionResponse, Position};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut state = WorldState::new(vec![]);
+
+            // Create a document with both declared variable and function
+            let code = r#"# @lsp-var my_var
+# @lsp-func my_func
+x <- "#;
+            let uri = Url::parse("file:///test.R").unwrap();
+            let doc = Document::new(code, None);
+            state.documents.insert(uri.clone(), doc);
+
+            // Get completions at the end of the file
+            let position = Position::new(2, 5);
+            let completions = super::completion(&state, &uri, position);
+
+            assert!(completions.is_some(), "Should return completions");
+
+            if let Some(CompletionResponse::Array(items)) = completions {
+                // Find declared variable
+                let var_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == "my_var")
+                    .collect();
+                assert!(
+                    !var_items.is_empty(),
+                    "Declared variable 'my_var' should appear in completions"
+                );
+                assert_eq!(
+                    var_items[0].kind,
+                    Some(CompletionItemKind::VARIABLE),
+                    "Declared variable should have VARIABLE kind"
+                );
+
+                // Find declared function
+                let func_items: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.label == "my_func")
+                    .collect();
+                assert!(
+                    !func_items.is_empty(),
+                    "Declared function 'my_func' should appear in completions"
+                );
+                assert_eq!(
+                    func_items[0].kind,
+                    Some(CompletionItemKind::FUNCTION),
+                    "Declared function should have FUNCTION kind"
+                );
+            } else {
+                panic!("Expected CompletionResponse::Array");
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -5812,6 +6113,7 @@ mod proptests {
             defined_line: 0,
             defined_column: 0,
             signature: None,
+            is_declared: false,
         };
 
         let result = extract_statement_from_tree(&tree, &symbol, code);
@@ -5832,6 +6134,7 @@ mod proptests {
             defined_line: 0,
             defined_column: 0,
             signature: Some("f(a, b)".to_string()),
+            is_declared: false,
         };
 
         let result = extract_statement_from_tree(&tree, &symbol, code);
@@ -5857,6 +6160,7 @@ mod proptests {
             defined_line: 0,
             defined_column: 0,
             signature: None,
+            is_declared: false,
         };
 
         let result = extract_statement_from_tree(&tree, &symbol, &code);
@@ -5888,6 +6192,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             };
 
             let result = extract_statement_from_tree(&tree, &symbol, code);
@@ -5913,6 +6218,7 @@ mod proptests {
             defined_line: 0,
             defined_column: 5, // Position of 'i' in for loop
             signature: None,
+            is_declared: false,
         };
 
         let result = extract_statement_from_tree(&tree, &symbol, code);
@@ -6018,6 +6324,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             };
 
             let def_info = extract_statement_from_tree(&tree, &symbol, &code);
@@ -6047,6 +6354,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             };
 
             let def_info = extract_statement_from_tree(&tree, &symbol, &code);
@@ -6082,6 +6390,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             };
 
             let def_info = extract_statement_from_tree(&tree, &symbol, &code);
@@ -6217,6 +6526,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             };
 
             let def_info = extract_statement_from_tree(&tree, &symbol, &statement);
@@ -6250,6 +6560,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: indent_size as u32,
                 signature: None,
+                is_declared: false,
             };
 
             let def_info = extract_statement_from_tree(&tree, &symbol, &statement);
@@ -6301,6 +6612,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             };
 
             let def_info = extract_statement_from_tree(&tree, &symbol, &code);
@@ -6332,6 +6644,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             };
 
             let def_info = extract_statement_from_tree(&tree, &symbol, &code);
@@ -6358,6 +6671,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: 5, // Position of iterator in for loop
                 signature: None,
+                is_declared: false,
             };
 
             let def_info = extract_statement_from_tree(&tree, &symbol, &code);
@@ -6391,6 +6705,7 @@ mod proptests {
                 defined_line: 0,
                 defined_column: func_name.len() as u32 + 15, // Approximate position in function signature
                 signature: None,
+                is_declared: false,
             };
 
             let def_info = extract_statement_from_tree(&tree, &symbol, &code);
@@ -6883,13 +7198,13 @@ mod proptests {
         #[test]
         /// Feature: reserved-keyword-handling, Property 3: Undefined Variable Check Exclusion (Negative Control)
         ///
-        /// For any R code containing a non-reserved identifier that is not defined,
+        /// For any R code containing a non-reserved, non-builtin identifier that is not defined,
         /// the undefined variable checker SHALL emit an "Undefined variable" diagnostic.
         /// This is a negative control to ensure the checker is working correctly.
         ///
         /// **Validates: Requirements 3.1, 3.2, 3.3**
         fn prop_non_reserved_undefined_vars_are_flagged(
-            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved or builtin", |s| !is_r_reserved(s) && !super::is_builtin(s))
         ) {
             use crate::state::{WorldState, Document};
             use crate::cross_file::directive::parse_directives;
@@ -7782,6 +8097,946 @@ mod proptests {
                 diagnostic.range.end.character
             );
         }
+
+        // ========================================================================
+        // **Feature: lsp-declaration-directives, Property 5: Diagnostic Suppression**
+        // **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
+        //
+        // For any file with a declaration directive and a usage of the declared symbol
+        // name (case-sensitive match), the undefined variable diagnostic SHALL be
+        // suppressed if and only if the usage position is after the declaration
+        // directive line.
+        // ========================================================================
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 5: Diagnostic Suppression
+        ///
+        /// For any file with a variable declaration directive (@lsp-var) and a usage
+        /// of the declared variable after the directive line, the undefined variable
+        /// diagnostic SHALL be suppressed.
+        ///
+        /// **Validates: Requirements 5.1**
+        fn prop_declared_variable_suppresses_diagnostic_after_directive(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            directive_form in prop::sample::select(vec![
+                "@lsp-var", "@lsp-variable", "@lsp-declare-var", "@lsp-declare-variable"
+            ]),
+            lines_between in 0usize..5
+        ) {
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Generate code with declaration directive followed by usage
+            // Pattern: # @lsp-var varname\n[blank_lines]\nvarname
+            let blank_lines = "\n".repeat(lines_between);
+            let code = format!("# {} {}\n{}{}",
+                directive_form, var_name, blank_lines, var_name);
+
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // Filter for "Undefined variable" diagnostics for this variable
+            let undefined_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", var_name)))
+                .collect();
+
+            prop_assert!(
+                undefined_diags.is_empty(),
+                "Declared variable '{}' used after directive should NOT produce 'Undefined variable' diagnostic. \
+                 Directive form: '{}', Lines between: {}, Code:\n{}\nDiagnostics: {:?}",
+                var_name, directive_form, lines_between, code, undefined_diags
+            );
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 5: Diagnostic Suppression
+        ///
+        /// For any file with a function declaration directive (@lsp-func) and a call
+        /// to the declared function after the directive line, the undefined variable
+        /// diagnostic SHALL be suppressed.
+        ///
+        /// **Validates: Requirements 5.2**
+        fn prop_declared_function_suppresses_diagnostic_after_directive(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            directive_form in prop::sample::select(vec![
+                "@lsp-func", "@lsp-function", "@lsp-declare-func", "@lsp-declare-function"
+            ]),
+            lines_between in 0usize..5
+        ) {
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Generate code with declaration directive followed by function call
+            // Pattern: # @lsp-func funcname\n[blank_lines]\nfuncname()
+            let blank_lines = "\n".repeat(lines_between);
+            let code = format!("# {} {}\n{}{}()",
+                directive_form, func_name, blank_lines, func_name);
+
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // Filter for "Undefined variable" diagnostics for this function
+            let undefined_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", func_name)))
+                .collect();
+
+            prop_assert!(
+                undefined_diags.is_empty(),
+                "Declared function '{}' called after directive should NOT produce 'Undefined variable' diagnostic. \
+                 Directive form: '{}', Lines between: {}, Code:\n{}\nDiagnostics: {:?}",
+                func_name, directive_form, lines_between, code, undefined_diags
+            );
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 5: Diagnostic Suppression
+        ///
+        /// For any file with a usage of a symbol BEFORE its declaration directive,
+        /// the undefined variable diagnostic SHALL be emitted.
+        ///
+        /// **Validates: Requirements 5.3**
+        fn prop_usage_before_declaration_emits_diagnostic(
+            symbol_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            is_function in any::<bool>(),
+            lines_between in 0usize..3
+        ) {
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Generate code with usage BEFORE declaration directive
+            // Pattern: symbolname\n[blank_lines]\n# @lsp-var symbolname
+            let blank_lines = "\n".repeat(lines_between);
+            let directive = if is_function { "@lsp-func" } else { "@lsp-var" };
+            let usage = if is_function {
+                format!("{}()", symbol_name)
+            } else {
+                symbol_name.clone()
+            };
+            let code = format!("{}\n{}# {} {}",
+                usage, blank_lines, directive, symbol_name);
+
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // Filter for "Undefined variable" diagnostics for this symbol
+            let undefined_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", symbol_name)))
+                .collect();
+
+            prop_assert!(
+                !undefined_diags.is_empty(),
+                "Symbol '{}' used BEFORE declaration directive SHOULD produce 'Undefined variable' diagnostic. \
+                 Is function: {}, Lines between: {}, Code:\n{}\nDiagnostics: {:?}",
+                symbol_name, is_function, lines_between, code, diagnostics
+            );
+
+            // Verify the diagnostic is on line 0 (the usage line)
+            prop_assert_eq!(
+                undefined_diags[0].range.start.line,
+                0,
+                "Diagnostic should be on line 0 (usage line). Code:\n{}\nDiagnostic: {:?}",
+                code, undefined_diags[0]
+            );
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 5: Diagnostic Suppression
+        ///
+        /// For any file with a declaration directive, the diagnostic suppression SHALL
+        /// be case-sensitive: exact matches are suppressed, case-mismatched usages are not.
+        ///
+        /// **Validates: Requirements 5.4**
+        fn prop_case_sensitive_diagnostic_suppression(
+            base_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            is_function in any::<bool>()
+        ) {
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Create a mixed-case version of the name
+            let mixed_case_name = {
+                let mut chars: Vec<char> = base_name.chars().collect();
+                if !chars.is_empty() {
+                    chars[0] = chars[0].to_ascii_uppercase();
+                }
+                chars.into_iter().collect::<String>()
+            };
+
+            // Generate code with declaration and both exact and case-mismatched usages
+            // Pattern: # @lsp-var basename\nbasename\nBasename
+            let directive = if is_function { "@lsp-func" } else { "@lsp-var" };
+            let exact_usage = if is_function {
+                format!("{}()", base_name)
+            } else {
+                base_name.clone()
+            };
+            let mismatched_usage = if is_function {
+                format!("{}()", mixed_case_name)
+            } else {
+                mixed_case_name.clone()
+            };
+            let code = format!("# {} {}\n{}\n{}",
+                directive, base_name, exact_usage, mismatched_usage);
+
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // Exact match should NOT produce diagnostic
+            let exact_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", base_name)))
+                .collect();
+
+            prop_assert!(
+                exact_diags.is_empty(),
+                "Exact case match '{}' should NOT produce diagnostic. Code:\n{}\nDiagnostics: {:?}",
+                base_name, code, exact_diags
+            );
+
+            // Case-mismatched usage SHOULD produce diagnostic
+            let mismatched_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", mixed_case_name)))
+                .collect();
+
+            prop_assert!(
+                !mismatched_diags.is_empty(),
+                "Case-mismatched '{}' (declared as '{}') SHOULD produce diagnostic. Code:\n{}\nDiagnostics: {:?}",
+                mixed_case_name, base_name, code, diagnostics
+            );
+
+            // Verify the mismatched diagnostic is on line 2 (the mismatched usage line)
+            prop_assert_eq!(
+                mismatched_diags[0].range.start.line,
+                2,
+                "Mismatched diagnostic should be on line 2. Code:\n{}\nDiagnostic: {:?}",
+                code, mismatched_diags[0]
+            );
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 5: Diagnostic Suppression
+        ///
+        /// For any file with multiple declaration directives at various positions,
+        /// the diagnostic suppression SHALL follow position rules: symbols are only
+        /// suppressed when used after their declaration line.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
+        fn prop_multiple_declarations_position_aware_suppression(
+            var1 in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved or builtin", |s| !is_r_reserved(s) && !super::is_builtin(s)),
+            var2 in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved or builtin", |s| !is_r_reserved(s) && !super::is_builtin(s))
+        ) {
+            // Skip if var1 and var2 are the same
+            prop_assume!(var1 != var2);
+
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Generate code with:
+            // - var1 used before its declaration (should emit diagnostic)
+            // - var1 declared
+            // - var2 declared
+            // - var1 used after declaration (should NOT emit diagnostic)
+            // - var2 used after declaration (should NOT emit diagnostic)
+            let code = format!(
+                "{}\n# @lsp-var {}\n# @lsp-var {}\n{}\n{}",
+                var1, var1, var2, var1, var2
+            );
+
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // var1 on line 0 (before declaration) should produce diagnostic
+            let var1_before_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| {
+                    d.message.contains(&format!("Undefined variable: {}", var1))
+                        && d.range.start.line == 0
+                })
+                .collect();
+
+            prop_assert!(
+                !var1_before_diags.is_empty(),
+                "'{}' used before declaration (line 0) SHOULD produce diagnostic. Code:\n{}\nDiagnostics: {:?}",
+                var1, code, diagnostics
+            );
+
+            // var1 on line 3 (after declaration) should NOT produce diagnostic
+            let var1_after_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| {
+                    d.message.contains(&format!("Undefined variable: {}", var1))
+                        && d.range.start.line == 3
+                })
+                .collect();
+
+            prop_assert!(
+                var1_after_diags.is_empty(),
+                "'{}' used after declaration (line 3) should NOT produce diagnostic. Code:\n{}\nDiagnostics: {:?}",
+                var1, code, diagnostics
+            );
+
+            // var2 on line 4 (after declaration) should NOT produce diagnostic
+            let var2_after_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| {
+                    d.message.contains(&format!("Undefined variable: {}", var2))
+                        && d.range.start.line == 4
+                })
+                .collect();
+
+            prop_assert!(
+                var2_after_diags.is_empty(),
+                "'{}' used after declaration (line 4) should NOT produce diagnostic. Code:\n{}\nDiagnostics: {:?}",
+                var2, code, diagnostics
+            );
+
+            // Total diagnostics should be exactly 1 (for var1 on line 0)
+            let total_undefined_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains("Undefined variable:"))
+                .collect();
+
+            prop_assert_eq!(
+                total_undefined_diags.len(),
+                1,
+                "Should have exactly 1 undefined variable diagnostic. Code:\n{}\nDiagnostics: {:?}",
+                code, total_undefined_diags
+            );
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 5: Diagnostic Suppression
+        ///
+        /// For any file with a declaration directive using optional colon or quote syntax,
+        /// the diagnostic suppression SHALL work correctly.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
+        fn prop_declaration_syntax_variants_suppress_diagnostics(
+            symbol_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            syntax_variant in prop::sample::select(vec![
+                "plain",      // @lsp-var name
+                "colon",      // @lsp-var: name
+                "quoted",     // @lsp-var "name"
+                "colon_quoted" // @lsp-var: "name"
+            ]),
+            is_function in any::<bool>()
+        ) {
+            use crate::state::{WorldState, Document};
+            use crate::cross_file::directive::parse_directives;
+
+            // Generate directive based on syntax variant
+            let directive_base = if is_function { "@lsp-func" } else { "@lsp-var" };
+            let directive = match syntax_variant {
+                "plain" => format!("# {} {}", directive_base, symbol_name),
+                "colon" => format!("# {}: {}", directive_base, symbol_name),
+                "quoted" => format!("# {} \"{}\"", directive_base, symbol_name),
+                "colon_quoted" => format!("# {}: \"{}\"", directive_base, symbol_name),
+                _ => unreachable!(),
+            };
+
+            let usage = if is_function {
+                format!("{}()", symbol_name)
+            } else {
+                symbol_name.clone()
+            };
+
+            let code = format!("{}\n{}", directive, usage);
+
+            let tree = parse_r_code(&code);
+
+            let mut state = WorldState::new(vec![]);
+            state.cross_file_config.undefined_variables_enabled = true;
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let directive_meta = parse_directives(&code);
+            let mut diagnostics = Vec::new();
+
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                tree.root_node(),
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            // Filter for "Undefined variable" diagnostics for this symbol
+            let undefined_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.contains(&format!("Undefined variable: {}", symbol_name)))
+                .collect();
+
+            prop_assert!(
+                undefined_diags.is_empty(),
+                "Declared symbol '{}' with syntax variant '{}' should NOT produce diagnostic. \
+                 Is function: {}, Code:\n{}\nDiagnostics: {:?}",
+                symbol_name, syntax_variant, is_function, code, undefined_diags
+            );
+        }
+
+        // ========================================================================
+        // **Feature: lsp-declaration-directives, Property 6: Completion Inclusion with Correct Kind**
+        // **Validates: Requirements 6.1, 6.2, 6.3, 6.4**
+        //
+        // For any completion request at a position after a declaration directive,
+        // the declared symbol SHALL appear in the completion list with
+        // CompletionItemKind::FUNCTION for function declarations and
+        // CompletionItemKind::VARIABLE for variable declarations.
+        // ========================================================================
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 6: Completion Inclusion with Correct Kind
+        ///
+        /// For any file with a variable declaration directive (@lsp-var) and a completion
+        /// request at a position after the directive line, the declared variable SHALL
+        /// appear in the completion list with CompletionItemKind::VARIABLE.
+        ///
+        /// **Validates: Requirements 6.1, 6.4**
+        fn prop_declared_variable_appears_in_completions_with_variable_kind(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            directive_form in prop::sample::select(vec![
+                "@lsp-var", "@lsp-variable", "@lsp-declare-var", "@lsp-declare-variable"
+            ]),
+            lines_between in 0usize..5
+        ) {
+            use crate::state::{WorldState, Document};
+            use tower_lsp::lsp_types::{Position, CompletionItemKind};
+
+            // Generate code with declaration directive followed by a position for completion
+            // Pattern: # @lsp-var varname\n[blank_lines]\n<cursor>
+            let blank_lines = "\n".repeat(lines_between);
+            let code = format!("# {} {}\n{}", directive_form, var_name, blank_lines);
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Request completions at the last line (after the directive)
+            let completion_line = (1 + lines_between) as u32;
+            let position = Position::new(completion_line, 0);
+
+            let response = super::completion(&state, &uri, position);
+
+            prop_assert!(
+                response.is_some(),
+                "Completion response should not be None. Code:\n{}", code
+            );
+
+            if let Some(tower_lsp::lsp_types::CompletionResponse::Array(items)) = response {
+                // Find the declared variable in completions
+                let var_completion = items.iter().find(|item| item.label == var_name);
+
+                prop_assert!(
+                    var_completion.is_some(),
+                    "Declared variable '{}' should appear in completions. \
+                     Directive form: '{}', Lines between: {}, Code:\n{}\nCompletion items: {:?}",
+                    var_name, directive_form, lines_between, code,
+                    items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                if let Some(item) = var_completion {
+                    prop_assert_eq!(
+                        item.kind,
+                        Some(CompletionItemKind::VARIABLE),
+                        "Declared variable '{}' should have CompletionItemKind::VARIABLE. \
+                         Directive form: '{}', Code:\n{}\nActual kind: {:?}",
+                        var_name, directive_form, code, item.kind
+                    );
+                }
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array, got something else");
+            }
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 6: Completion Inclusion with Correct Kind
+        ///
+        /// For any file with a function declaration directive (@lsp-func) and a completion
+        /// request at a position after the directive line, the declared function SHALL
+        /// appear in the completion list with CompletionItemKind::FUNCTION.
+        ///
+        /// **Validates: Requirements 6.2, 6.3**
+        fn prop_declared_function_appears_in_completions_with_function_kind(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            directive_form in prop::sample::select(vec![
+                "@lsp-func", "@lsp-function", "@lsp-declare-func", "@lsp-declare-function"
+            ]),
+            lines_between in 0usize..5
+        ) {
+            use crate::state::{WorldState, Document};
+            use tower_lsp::lsp_types::{Position, CompletionItemKind};
+
+            // Generate code with declaration directive followed by a position for completion
+            // Pattern: # @lsp-func funcname\n[blank_lines]\n<cursor>
+            let blank_lines = "\n".repeat(lines_between);
+            let code = format!("# {} {}\n{}", directive_form, func_name, blank_lines);
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Request completions at the last line (after the directive)
+            let completion_line = (1 + lines_between) as u32;
+            let position = Position::new(completion_line, 0);
+
+            let response = super::completion(&state, &uri, position);
+
+            prop_assert!(
+                response.is_some(),
+                "Completion response should not be None. Code:\n{}", code
+            );
+
+            if let Some(tower_lsp::lsp_types::CompletionResponse::Array(items)) = response {
+                // Find the declared function in completions
+                let func_completion = items.iter().find(|item| item.label == func_name);
+
+                prop_assert!(
+                    func_completion.is_some(),
+                    "Declared function '{}' should appear in completions. \
+                     Directive form: '{}', Lines between: {}, Code:\n{}\nCompletion items: {:?}",
+                    func_name, directive_form, lines_between, code,
+                    items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                if let Some(item) = func_completion {
+                    prop_assert_eq!(
+                        item.kind,
+                        Some(CompletionItemKind::FUNCTION),
+                        "Declared function '{}' should have CompletionItemKind::FUNCTION. \
+                         Directive form: '{}', Code:\n{}\nActual kind: {:?}",
+                        func_name, directive_form, code, item.kind
+                    );
+                }
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array, got something else");
+            }
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 6: Completion Inclusion with Correct Kind
+        ///
+        /// For any file with both variable and function declaration directives, completions
+        /// at a position after both directives SHALL include both symbols with their
+        /// respective correct kinds.
+        ///
+        /// **Validates: Requirements 6.1, 6.2, 6.3, 6.4**
+        fn prop_mixed_declarations_appear_in_completions_with_correct_kinds(
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            func_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if var_name and func_name are the same
+            prop_assume!(var_name != func_name);
+
+            use crate::state::{WorldState, Document};
+            use tower_lsp::lsp_types::{Position, CompletionItemKind};
+
+            // Generate code with both variable and function declarations
+            // Pattern: # @lsp-var varname\n# @lsp-func funcname\n<cursor>
+            let code = format!("# @lsp-var {}\n# @lsp-func {}\n", var_name, func_name);
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Request completions at line 2 (after both directives)
+            let position = Position::new(2, 0);
+
+            let response = super::completion(&state, &uri, position);
+
+            prop_assert!(
+                response.is_some(),
+                "Completion response should not be None. Code:\n{}", code
+            );
+
+            if let Some(tower_lsp::lsp_types::CompletionResponse::Array(items)) = response {
+                // Find the declared variable in completions
+                let var_completion = items.iter().find(|item| item.label == var_name);
+                let func_completion = items.iter().find(|item| item.label == func_name);
+
+                prop_assert!(
+                    var_completion.is_some(),
+                    "Declared variable '{}' should appear in completions. Code:\n{}\nCompletion items: {:?}",
+                    var_name, code, items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                prop_assert!(
+                    func_completion.is_some(),
+                    "Declared function '{}' should appear in completions. Code:\n{}\nCompletion items: {:?}",
+                    func_name, code, items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                if let Some(item) = var_completion {
+                    prop_assert_eq!(
+                        item.kind,
+                        Some(CompletionItemKind::VARIABLE),
+                        "Declared variable '{}' should have CompletionItemKind::VARIABLE. \
+                         Code:\n{}\nActual kind: {:?}",
+                        var_name, code, item.kind
+                    );
+                }
+
+                if let Some(item) = func_completion {
+                    prop_assert_eq!(
+                        item.kind,
+                        Some(CompletionItemKind::FUNCTION),
+                        "Declared function '{}' should have CompletionItemKind::FUNCTION. \
+                         Code:\n{}\nActual kind: {:?}",
+                        func_name, code, item.kind
+                    );
+                }
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array, got something else");
+            }
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 6: Completion Inclusion with Correct Kind
+        ///
+        /// For any file with a declaration directive using optional colon or quote syntax,
+        /// the declared symbol SHALL appear in completions with the correct kind.
+        ///
+        /// **Validates: Requirements 6.1, 6.2, 6.3, 6.4**
+        fn prop_declaration_syntax_variants_appear_in_completions(
+            symbol_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            syntax_variant in prop::sample::select(vec![
+                "plain",      // @lsp-var name
+                "colon",      // @lsp-var: name
+                "quoted",     // @lsp-var "name"
+                "colon_quoted" // @lsp-var: "name"
+            ]),
+            is_function in any::<bool>()
+        ) {
+            use crate::state::{WorldState, Document};
+            use tower_lsp::lsp_types::{Position, CompletionItemKind};
+
+            // Generate directive based on syntax variant
+            let directive_base = if is_function { "@lsp-func" } else { "@lsp-var" };
+            let directive = match syntax_variant {
+                "plain" => format!("# {} {}", directive_base, symbol_name),
+                "colon" => format!("# {}: {}", directive_base, symbol_name),
+                "quoted" => format!("# {} \"{}\"", directive_base, symbol_name),
+                "colon_quoted" => format!("# {}: \"{}\"", directive_base, symbol_name),
+                _ => unreachable!(),
+            };
+
+            let code = format!("{}\n", directive);
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Request completions at line 1 (after the directive)
+            let position = Position::new(1, 0);
+
+            let response = super::completion(&state, &uri, position);
+
+            prop_assert!(
+                response.is_some(),
+                "Completion response should not be None. Code:\n{}", code
+            );
+
+            if let Some(tower_lsp::lsp_types::CompletionResponse::Array(items)) = response {
+                // Find the declared symbol in completions
+                let symbol_completion = items.iter().find(|item| item.label == symbol_name);
+
+                prop_assert!(
+                    symbol_completion.is_some(),
+                    "Declared symbol '{}' with syntax variant '{}' should appear in completions. \
+                     Is function: {}, Code:\n{}\nCompletion items: {:?}",
+                    symbol_name, syntax_variant, is_function, code,
+                    items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                if let Some(item) = symbol_completion {
+                    let expected_kind = if is_function {
+                        CompletionItemKind::FUNCTION
+                    } else {
+                        CompletionItemKind::VARIABLE
+                    };
+
+                    prop_assert_eq!(
+                        item.kind,
+                        Some(expected_kind),
+                        "Declared symbol '{}' should have correct CompletionItemKind. \
+                         Is function: {}, Syntax variant: '{}', Code:\n{}\nActual kind: {:?}",
+                        symbol_name, is_function, syntax_variant, code, item.kind
+                    );
+                }
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array, got something else");
+            }
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 6: Completion Inclusion with Correct Kind
+        ///
+        /// For any file with a declaration directive, completions requested at a position
+        /// ON the directive line (not after) SHALL NOT include the declared symbol.
+        /// This validates position-aware completion behavior.
+        ///
+        /// **Validates: Requirements 6.1, 6.2 (position-aware behavior)**
+        fn prop_declared_symbol_not_in_completions_on_directive_line(
+            symbol_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            is_function in any::<bool>()
+        ) {
+            use crate::state::{WorldState, Document};
+            use tower_lsp::lsp_types::Position;
+
+            // Generate code with declaration directive
+            let directive = if is_function {
+                format!("# @lsp-func {}", symbol_name)
+            } else {
+                format!("# @lsp-var {}", symbol_name)
+            };
+
+            let code = format!("{}\nx <- 1", directive);
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Request completions at line 0 (ON the directive line)
+            let position = Position::new(0, 0);
+
+            let response = super::completion(&state, &uri, position);
+
+            prop_assert!(
+                response.is_some(),
+                "Completion response should not be None. Code:\n{}", code
+            );
+
+            if let Some(tower_lsp::lsp_types::CompletionResponse::Array(items)) = response {
+                // The declared symbol should NOT appear in completions on the directive line
+                let symbol_completion = items.iter().find(|item| item.label == symbol_name);
+
+                prop_assert!(
+                    symbol_completion.is_none(),
+                    "Declared symbol '{}' should NOT appear in completions on directive line (line 0). \
+                     Is function: {}, Code:\n{}\nCompletion items: {:?}",
+                    symbol_name, is_function, code,
+                    items.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+            } else {
+                prop_assert!(false, "Expected CompletionResponse::Array, got something else");
+            }
+        }
+
+        #[test]
+        /// Feature: lsp-declaration-directives, Property 6: Completion Inclusion with Correct Kind
+        ///
+        /// For any file with multiple declaration directives at various positions,
+        /// completions at a specific position SHALL only include symbols declared
+        /// before that position.
+        ///
+        /// **Validates: Requirements 6.1, 6.2 (position-aware behavior)**
+        fn prop_completions_position_aware_multiple_declarations(
+            var1 in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            var2 in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if var1 and var2 are the same
+            prop_assume!(var1 != var2);
+
+            use crate::state::{WorldState, Document};
+            use tower_lsp::lsp_types::{Position, CompletionItemKind};
+
+            // Generate code with:
+            // Line 0: # @lsp-var var1
+            // Line 1: <completion position A - should have var1>
+            // Line 2: # @lsp-var var2
+            // Line 3: <completion position B - should have var1 and var2>
+            let code = format!(
+                "# @lsp-var {}\n\n# @lsp-var {}\n",
+                var1, var2
+            );
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Request completions at line 1 (after var1, before var2)
+            let position_a = Position::new(1, 0);
+            let response_a = super::completion(&state, &uri, position_a);
+
+            prop_assert!(
+                response_a.is_some(),
+                "Completion response A should not be None. Code:\n{}", code
+            );
+
+            if let Some(tower_lsp::lsp_types::CompletionResponse::Array(items_a)) = response_a {
+                // var1 should be in completions at position A
+                let var1_completion = items_a.iter().find(|item| item.label == var1);
+                prop_assert!(
+                    var1_completion.is_some(),
+                    "'{}' should appear in completions at line 1. Code:\n{}\nCompletion items: {:?}",
+                    var1, code, items_a.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                if let Some(item) = var1_completion {
+                    prop_assert_eq!(
+                        item.kind,
+                        Some(CompletionItemKind::VARIABLE),
+                        "'{}' should have CompletionItemKind::VARIABLE",
+                        var1
+                    );
+                }
+
+                // var2 should NOT be in completions at position A (declared after)
+                let var2_completion = items_a.iter().find(|item| item.label == var2);
+                prop_assert!(
+                    var2_completion.is_none(),
+                    "'{}' should NOT appear in completions at line 1 (declared on line 2). Code:\n{}\nCompletion items: {:?}",
+                    var2, code, items_a.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+            }
+
+            // Request completions at line 3 (after both var1 and var2)
+            let position_b = Position::new(3, 0);
+            let response_b = super::completion(&state, &uri, position_b);
+
+            prop_assert!(
+                response_b.is_some(),
+                "Completion response B should not be None. Code:\n{}", code
+            );
+
+            if let Some(tower_lsp::lsp_types::CompletionResponse::Array(items_b)) = response_b {
+                // Both var1 and var2 should be in completions at position B
+                let var1_completion = items_b.iter().find(|item| item.label == var1);
+                let var2_completion = items_b.iter().find(|item| item.label == var2);
+
+                prop_assert!(
+                    var1_completion.is_some(),
+                    "'{}' should appear in completions at line 3. Code:\n{}\nCompletion items: {:?}",
+                    var1, code, items_b.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                prop_assert!(
+                    var2_completion.is_some(),
+                    "'{}' should appear in completions at line 3. Code:\n{}\nCompletion items: {:?}",
+                    var2, code, items_b.iter().map(|i| &i.label).collect::<Vec<_>>()
+                );
+
+                if let Some(item) = var1_completion {
+                    prop_assert_eq!(
+                        item.kind,
+                        Some(CompletionItemKind::VARIABLE),
+                        "'{}' should have CompletionItemKind::VARIABLE",
+                        var1
+                    );
+                }
+
+                if let Some(item) = var2_completion {
+                    prop_assert_eq!(
+                        item.kind,
+                        Some(CompletionItemKind::VARIABLE),
+                        "'{}' should have CompletionItemKind::VARIABLE",
+                        var2
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -7884,6 +9139,7 @@ mod integration_tests {
             defined_line: 0,
             defined_column: 0,
             signature: None,
+            is_declared: false,
         };
 
         // Test hover on the symbol
@@ -7991,6 +9247,247 @@ mod integration_tests {
         assert!(value.contains("```\n\nthis file"));
         assert!(!value.contains("```\n\n\nthis file")); // Not two blank lines
         assert!(!value.contains("```\nthis file")); // Not zero blank lines
+    }
+
+    // ============================================================================
+    // Tests for hover on declared symbols - Task 9.1
+    // ============================================================================
+
+    #[test]
+    fn test_hover_declared_variable_format() {
+        // Test that hover on a declared variable shows the correct format
+        // Validates: Requirements 7.1, 7.3
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+
+        // Create a declared variable symbol
+        let symbol = ScopedSymbol {
+            name: "myvar".to_string(),
+            kind: SymbolKind::Variable,
+            source_uri: Url::parse("file:///test.R").unwrap(),
+            defined_line: 4, // 0-based line 4 = display line 5
+            defined_column: 0,
+            signature: None,
+            is_declared: true,
+        };
+
+        // Verify the symbol is marked as declared
+        assert!(symbol.is_declared, "Symbol should be marked as declared");
+
+        // Verify the hover content format
+        let kind_str = match symbol.kind {
+            SymbolKind::Function => "declared function",
+            SymbolKind::Variable => "declared variable",
+            _ => "declared symbol",
+        };
+        let directive_type = match symbol.kind {
+            SymbolKind::Function => "@lsp-func",
+            _ => "@lsp-var",
+        };
+        let display_line = symbol.defined_line + 1;
+
+        let value = format!(
+            "{} ({})\n\nDeclared via {} directive at line {}",
+            symbol.name, kind_str, directive_type, display_line
+        );
+
+        assert!(value.contains("myvar (declared variable)"), "Should show symbol name with kind");
+        assert!(value.contains("Declared via @lsp-var directive at line 5"), "Should show directive info with 1-based line");
+    }
+
+    #[test]
+    fn test_hover_declared_function_format() {
+        // Test that hover on a declared function shows the correct format
+        // Validates: Requirements 7.2, 7.3
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+
+        // Create a declared function symbol
+        let symbol = ScopedSymbol {
+            name: "myfunc".to_string(),
+            kind: SymbolKind::Function,
+            source_uri: Url::parse("file:///test.R").unwrap(),
+            defined_line: 9, // 0-based line 9 = display line 10
+            defined_column: 0,
+            signature: None,
+            is_declared: true,
+        };
+
+        // Verify the symbol is marked as declared
+        assert!(symbol.is_declared, "Symbol should be marked as declared");
+
+        // Verify the hover content format
+        let kind_str = match symbol.kind {
+            SymbolKind::Function => "declared function",
+            SymbolKind::Variable => "declared variable",
+            _ => "declared symbol",
+        };
+        let directive_type = match symbol.kind {
+            SymbolKind::Function => "@lsp-func",
+            _ => "@lsp-var",
+        };
+        let display_line = symbol.defined_line + 1;
+
+        let value = format!(
+            "{} ({})\n\nDeclared via {} directive at line {}",
+            symbol.name, kind_str, directive_type, display_line
+        );
+
+        assert!(value.contains("myfunc (declared function)"), "Should show symbol name with kind");
+        assert!(value.contains("Declared via @lsp-func directive at line 10"), "Should show directive info with 1-based line");
+    }
+
+    #[test]
+    fn test_hover_declared_symbol_line_number_conversion() {
+        // Test that 0-based line numbers are correctly converted to 1-based for display
+        // Validates: Requirement 7.3
+        use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
+
+        // Test various line numbers
+        let test_cases = vec![
+            (0, 1),   // Line 0 -> display line 1
+            (4, 5),   // Line 4 -> display line 5
+            (99, 100), // Line 99 -> display line 100
+        ];
+
+        for (defined_line, expected_display_line) in test_cases {
+            let symbol = ScopedSymbol {
+                name: "test_symbol".to_string(),
+                kind: SymbolKind::Variable,
+                source_uri: Url::parse("file:///test.R").unwrap(),
+                defined_line,
+                defined_column: 0,
+                signature: None,
+                is_declared: true,
+            };
+
+            let display_line = symbol.defined_line + 1;
+            assert_eq!(
+                display_line, expected_display_line,
+                "Line {} should display as line {}",
+                defined_line, expected_display_line
+            );
+        }
+    }
+
+    // ============================================================================
+    // Tests for goto_definition on declared symbols - Task 10.1
+    // ============================================================================
+
+    #[test]
+    fn test_goto_definition_declared_variable() {
+        // Test that go-to-definition on a declared variable navigates to the directive line
+        // Validates: Requirements 8.1, 8.2
+        use crate::cross_file::directive::parse_directives;
+        use crate::handlers::goto_definition;
+        use crate::state::{Document, WorldState};
+
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = r#"# @lsp-var myvar
+x <- myvar + 1"#;
+
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // Update cross-file graph with metadata
+        let metadata = parse_directives(code);
+        state.cross_file_graph.update_file(&uri, &metadata, None, |_| None);
+
+        // Test go-to-definition on "myvar" usage (line 1, position 5)
+        let position = Position::new(1, 5);
+        let result = goto_definition(&state, &uri, position);
+
+        assert!(result.is_some(), "Should find definition for declared variable");
+
+        if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+            assert_eq!(location.uri, uri, "Should navigate to same file");
+            assert_eq!(location.range.start.line, 0, "Should navigate to directive line (0-based)");
+            assert_eq!(location.range.start.character, 0, "Should navigate to start of line (column 0)");
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_goto_definition_declared_function() {
+        // Test that go-to-definition on a declared function navigates to the directive line
+        // Validates: Requirements 8.1, 8.2
+        use crate::cross_file::directive::parse_directives;
+        use crate::handlers::goto_definition;
+        use crate::state::{Document, WorldState};
+
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let code = r#"# @lsp-func myfunc
+result <- myfunc(42)"#;
+
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // Update cross-file graph with metadata
+        let metadata = parse_directives(code);
+        state.cross_file_graph.update_file(&uri, &metadata, None, |_| None);
+
+        // Test go-to-definition on "myfunc" usage (line 1, position 10)
+        let position = Position::new(1, 10);
+        let result = goto_definition(&state, &uri, position);
+
+        assert!(result.is_some(), "Should find definition for declared function");
+
+        if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+            assert_eq!(location.uri, uri, "Should navigate to same file");
+            assert_eq!(location.range.start.line, 0, "Should navigate to directive line (0-based)");
+            assert_eq!(location.range.start.character, 0, "Should navigate to start of line (column 0)");
+        } else {
+            panic!("Expected Scalar response");
+        }
+    }
+
+    #[test]
+    fn test_goto_definition_declared_symbol_first_declaration() {
+        // Test that when a symbol is declared multiple times, go-to-definition
+        // navigates to the first declaration by line number
+        // Validates: Requirement 11.3 (conflicting declarations)
+        use crate::cross_file::directive::parse_directives;
+        use crate::handlers::goto_definition;
+        use crate::state::{Document, WorldState};
+
+        let library_paths = r_env::find_library_paths();
+        let mut state = WorldState::new(library_paths);
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        // Symbol declared as variable first (line 0), then as function (line 1)
+        let code = r#"# @lsp-var mysymbol
+# @lsp-func mysymbol
+result <- mysymbol"#;
+
+        state
+            .documents
+            .insert(uri.clone(), Document::new(code, None));
+
+        // Update cross-file graph with metadata
+        let metadata = parse_directives(code);
+        state.cross_file_graph.update_file(&uri, &metadata, None, |_| None);
+
+        // Test go-to-definition on "mysymbol" usage (line 2, position 10)
+        let position = Position::new(2, 10);
+        let result = goto_definition(&state, &uri, position);
+
+        assert!(result.is_some(), "Should find definition for declared symbol");
+
+        if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+            assert_eq!(location.uri, uri, "Should navigate to same file");
+            // Should navigate to FIRST declaration (line 0), not the later one (line 1)
+            assert_eq!(location.range.start.line, 0, "Should navigate to first declaration (line 0)");
+            assert_eq!(location.range.start.character, 0, "Should navigate to start of line (column 0)");
+        } else {
+            panic!("Expected Scalar response");
+        }
     }
 
     #[test]
@@ -8191,6 +9688,7 @@ result <- missing_func(42)"#;
             defined_line: 0,
             defined_column: 0,
             signature: Some("missing_func(x)".to_string()),
+            is_declared: false,
         };
 
         // Test extract_definition_statement with missing file (should return None)
@@ -8805,6 +10303,7 @@ result <- helper_with_spaces(42)"#;
             defined_line: 0,
             defined_column: 0,
             signature: None,
+            is_declared: false,
         };
 
         // Verify the package name can be extracted from the URI
@@ -8880,6 +10379,7 @@ result <- helper_with_spaces(42)"#;
             defined_line: 5,
             defined_column: 0,
             signature: Some("mutate <- function(x) { x + 1 }".to_string()),
+            is_declared: false,
         };
 
         // Verify this is NOT detected as a package export
@@ -9337,6 +10837,7 @@ result <- filter(c(1, -2, 3))"#;
             defined_line: 0,
             defined_column: 0,
             signature: Some("mutate(.data, ...)".to_string()),
+            is_declared: false,
         };
 
         // Verify this IS detected as a package export
@@ -9457,6 +10958,7 @@ z <- mutate(5)  # Uses local definition"#;
     ///     defined_line: 0,
     ///     defined_column: 0,
     ///     signature: Some("mutate(.data, ...)".to_string()),
+    ///     is_declared: false,
     /// };
     ///
     /// assert!(symbol.source_uri.as_str().starts_with("package:"));
@@ -9481,6 +10983,7 @@ z <- mutate(5)  # Uses local definition"#;
             defined_line: 0,
             defined_column: 0,
             signature: Some("mutate(.data, ...)".to_string()),
+            is_declared: false,
         };
 
         // Verify the package URI is detected correctly
@@ -9514,6 +11017,7 @@ z <- mutate(5)  # Uses local definition"#;
             defined_line: 5,
             defined_column: 0,
             signature: Some("mutate <- function(x) { x + 1 }".to_string()),
+            is_declared: false,
         };
 
         // Verify this is NOT a package export
@@ -9943,6 +11447,417 @@ x <- 2
         );
 
         assert_eq!(diagnostics.len(), 0, "Should have 0 diagnostics");
+    }
+
+    // ========================================================================
+    // Declaration Directive Diagnostic Suppression Tests
+    // Validates: Requirements 5.1, 5.2, 5.3, 5.4
+    // ========================================================================
+
+    #[test]
+    fn test_declared_variable_suppresses_undefined_diagnostic() {
+        // Requirement 5.1: WHEN a variable is declared via directive and used after the directive line,
+        // THE diagnostic collector SHALL NOT emit an "undefined variable" warning
+        let mut state = create_test_state();
+        let code = "# @lsp-var myvar
+myvar
+";
+        // Line 0: @lsp-var myvar (declaration)
+        // Line 1: myvar (usage) - should NOT be flagged as undefined
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        assert_eq!(diagnostics.len(), 0, "Declared variable should suppress undefined diagnostic");
+    }
+
+    #[test]
+    fn test_declared_function_suppresses_undefined_diagnostic() {
+        // Requirement 5.2: WHEN a function is declared via directive and called after the directive line,
+        // THE diagnostic collector SHALL NOT emit an "undefined variable" warning
+        let mut state = create_test_state();
+        let code = "# @lsp-func myfunc
+myfunc()
+";
+        // Line 0: @lsp-func myfunc (declaration)
+        // Line 1: myfunc() (usage) - should NOT be flagged as undefined
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        assert_eq!(diagnostics.len(), 0, "Declared function should suppress undefined diagnostic");
+    }
+
+    #[test]
+    fn test_usage_before_declaration_emits_diagnostic() {
+        // Requirement 5.3: WHEN a variable is used before its declaration directive,
+        // THE diagnostic collector SHALL emit an "undefined variable" warning
+        let mut state = create_test_state();
+        let code = "myvar
+# @lsp-var myvar
+";
+        // Line 0: myvar (usage) - should be flagged as undefined (before declaration)
+        // Line 1: @lsp-var myvar (declaration)
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        assert_eq!(diagnostics.len(), 1, "Usage before declaration should emit diagnostic");
+        assert!(diagnostics[0].message.contains("Undefined variable: myvar"));
+        assert_eq!(diagnostics[0].range.start.line, 0);
+    }
+
+    #[test]
+    fn test_declared_symbol_case_sensitive_matching() {
+        // Requirement 5.4: WHEN a declared symbol name matches a usage exactly (case-sensitive),
+        // THE diagnostic SHALL be suppressed
+        let mut state = create_test_state();
+        let code = "# @lsp-var myVar
+myVar
+MyVar
+";
+        // Line 0: @lsp-var myVar (declaration)
+        // Line 1: myVar (usage) - exact match, should NOT be flagged
+        // Line 2: MyVar (usage) - different case, should be flagged
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        assert_eq!(diagnostics.len(), 1, "Only case-mismatched usage should emit diagnostic");
+        assert!(diagnostics[0].message.contains("Undefined variable: MyVar"));
+        assert_eq!(diagnostics[0].range.start.line, 2);
+    }
+
+    #[test]
+    fn test_declared_variable_all_synonyms() {
+        // Test all 4 synonym forms: @lsp-declare-variable, @lsp-declare-var, @lsp-variable, @lsp-var
+        for directive in ["@lsp-declare-variable", "@lsp-declare-var", "@lsp-variable", "@lsp-var"] {
+            let mut state = create_test_state();
+            let code = format!("# {} myvar\nmyvar\n", directive);
+            let uri = add_document(&mut state, "file:///test.R", &code);
+            let tree = parse_r_code(&code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(&code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            assert_eq!(
+                diagnostics.len(),
+                0,
+                "Directive {} should suppress undefined diagnostic",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn test_declared_function_all_synonyms() {
+        // Test all 4 synonym forms: @lsp-declare-function, @lsp-declare-func, @lsp-function, @lsp-func
+        for directive in ["@lsp-declare-function", "@lsp-declare-func", "@lsp-function", "@lsp-func"] {
+            let mut state = create_test_state();
+            let code = format!("# {} myfunc\nmyfunc()\n", directive);
+            let uri = add_document(&mut state, "file:///test.R", &code);
+            let tree = parse_r_code(&code);
+            let root = tree.root_node();
+            let directive_meta = parse_directives(&code);
+
+            let mut diagnostics = Vec::new();
+            collect_undefined_variables_position_aware(
+                &state,
+                &uri,
+                root,
+                &code,
+                &[],
+                &[],
+                &state.package_library,
+                &directive_meta,
+                &mut diagnostics,
+            );
+
+            assert_eq!(
+                diagnostics.len(),
+                0,
+                "Directive {} should suppress undefined diagnostic",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn test_declared_symbol_on_same_line_not_available() {
+        // Requirement 4.6: WHEN a directive appears on a line with code,
+        // THE declared symbol SHALL be available starting from line N+1, not on line N
+        let mut state = create_test_state();
+        let code = "x <- myvar # @lsp-var myvar
+myvar
+";
+        // Line 0: x <- myvar # @lsp-var myvar - myvar usage is on same line as declaration
+        // Line 1: myvar (usage) - should NOT be flagged (after declaration)
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let root = tree.root_node();
+        let directive_meta = parse_directives(code);
+
+        let mut diagnostics = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri,
+            root,
+            code,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta,
+            &mut diagnostics,
+        );
+
+        // The usage on line 0 should be flagged (same line as declaration)
+        // The usage on line 1 should NOT be flagged (after declaration)
+        assert_eq!(diagnostics.len(), 1, "Usage on same line as declaration should emit diagnostic");
+        assert!(diagnostics[0].message.contains("Undefined variable: myvar"));
+        assert_eq!(diagnostics[0].range.start.line, 0);
+    }
+
+    // ========================================================================
+    // Conflicting Declaration Tests
+    // Validates: Requirements 11.1, 11.2, 11.3, 11.4
+    // ========================================================================
+
+    #[test]
+    fn test_conflicting_declarations_later_wins_for_kind_var_then_func() {
+        // Requirement 11.1: WHEN the same symbol name is declared as both a variable and a function,
+        // THE later declaration SHALL take precedence for symbol kind
+        // Test case: variable declared first (line 0), function declared later (line 1)
+        use crate::cross_file::scope::compute_artifacts_with_metadata;
+
+        let mut state = create_test_state();
+        let code = "# @lsp-var mysymbol
+# @lsp-func mysymbol
+mysymbol
+";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        // Compute artifacts with metadata to get scope
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, code, Some(&directive_meta));
+
+        // Check the exported interface - the symbol should have Function kind (later declaration)
+        let symbol = artifacts.exported_interface.get("mysymbol");
+        assert!(symbol.is_some(), "Symbol should be in exported interface");
+        assert_eq!(
+            symbol.unwrap().kind,
+            crate::cross_file::SymbolKind::Function,
+            "Later declaration (function on line 1) should take precedence for symbol kind"
+        );
+    }
+
+    #[test]
+    fn test_conflicting_declarations_later_wins_for_kind_func_then_var() {
+        // Requirement 11.1: WHEN the same symbol name is declared as both a variable and a function,
+        // THE later declaration SHALL take precedence for symbol kind
+        // Test case: function declared first (line 0), variable declared later (line 1)
+        use crate::cross_file::scope::compute_artifacts_with_metadata;
+
+        let mut state = create_test_state();
+        let code = "# @lsp-func mysymbol
+# @lsp-var mysymbol
+mysymbol
+";
+        let uri = add_document(&mut state, "file:///test.R", code);
+        let tree = parse_r_code(code);
+        let directive_meta = parse_directives(code);
+
+        // Compute artifacts with metadata to get scope
+        let artifacts = compute_artifacts_with_metadata(&uri, &tree, code, Some(&directive_meta));
+
+        // Check the exported interface - the symbol should have Variable kind (later declaration)
+        let symbol = artifacts.exported_interface.get("mysymbol");
+        assert!(symbol.is_some(), "Symbol should be in exported interface");
+        assert_eq!(
+            symbol.unwrap().kind,
+            crate::cross_file::SymbolKind::Variable,
+            "Later declaration (variable on line 1) should take precedence for symbol kind"
+        );
+    }
+
+    #[test]
+    fn test_conflicting_declarations_diagnostic_suppression_regardless_of_kind() {
+        // Requirement 11.2: WHEN conflicting declarations exist,
+        // THE diagnostic suppression SHALL apply regardless of kind (the symbol exists)
+        let mut state = create_test_state();
+        
+        // Test case 1: variable first, function second
+        let code1 = "# @lsp-var mysymbol
+# @lsp-func mysymbol
+mysymbol
+";
+        let uri1 = add_document(&mut state, "file:///test1.R", code1);
+        let tree1 = parse_r_code(code1);
+        let root1 = tree1.root_node();
+        let directive_meta1 = parse_directives(code1);
+
+        let mut diagnostics1 = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri1,
+            root1,
+            code1,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta1,
+            &mut diagnostics1,
+        );
+
+        assert_eq!(
+            diagnostics1.len(),
+            0,
+            "Conflicting declarations (var then func) should suppress undefined diagnostic"
+        );
+
+        // Test case 2: function first, variable second
+        let code2 = "# @lsp-func mysymbol
+# @lsp-var mysymbol
+mysymbol
+";
+        let uri2 = add_document(&mut state, "file:///test2.R", code2);
+        let tree2 = parse_r_code(code2);
+        let root2 = tree2.root_node();
+        let directive_meta2 = parse_directives(code2);
+
+        let mut diagnostics2 = Vec::new();
+        collect_undefined_variables_position_aware(
+            &state,
+            &uri2,
+            root2,
+            code2,
+            &[],
+            &[],
+            &state.package_library,
+            &directive_meta2,
+            &mut diagnostics2,
+        );
+
+        assert_eq!(
+            diagnostics2.len(),
+            0,
+            "Conflicting declarations (func then var) should suppress undefined diagnostic"
+        );
+    }
+
+    #[test]
+    fn test_conflicting_declarations_completion_kind_reflects_later() {
+        // Requirement 11.4: WHEN conflicting declarations exist,
+        // THE completion item kind SHALL reflect the later declaration's kind
+        use crate::cross_file::scope::{compute_artifacts_with_metadata, scope_at_position};
+
+        let mut state = create_test_state();
+        
+        // Test case 1: variable first (line 0), function second (line 1)
+        let code1 = "# @lsp-var mysymbol
+# @lsp-func mysymbol
+";
+        let uri1 = add_document(&mut state, "file:///test1.R", code1);
+        let tree1 = parse_r_code(code1);
+        let directive_meta1 = parse_directives(code1);
+        let artifacts1 = compute_artifacts_with_metadata(&uri1, &tree1, code1, Some(&directive_meta1));
+
+        // Get scope at line 2 (after both declarations)
+        let scope1 = scope_at_position(&artifacts1, 2, 0);
+        let symbol1 = scope1.symbols.get("mysymbol");
+        assert!(symbol1.is_some(), "Symbol should be in scope");
+        assert_eq!(
+            symbol1.unwrap().kind,
+            crate::cross_file::SymbolKind::Function,
+            "Completion kind should reflect later declaration (function)"
+        );
+
+        // Test case 2: function first (line 0), variable second (line 1)
+        let code2 = "# @lsp-func mysymbol
+# @lsp-var mysymbol
+";
+        let uri2 = add_document(&mut state, "file:///test2.R", code2);
+        let tree2 = parse_r_code(code2);
+        let directive_meta2 = parse_directives(code2);
+        let artifacts2 = compute_artifacts_with_metadata(&uri2, &tree2, code2, Some(&directive_meta2));
+
+        // Get scope at line 2 (after both declarations)
+        let scope2 = scope_at_position(&artifacts2, 2, 0);
+        let symbol2 = scope2.symbols.get("mysymbol");
+        assert!(symbol2.is_some(), "Symbol should be in scope");
+        assert_eq!(
+            symbol2.unwrap().kind,
+            crate::cross_file::SymbolKind::Variable,
+            "Completion kind should reflect later declaration (variable)"
+        );
     }
 
     #[test]

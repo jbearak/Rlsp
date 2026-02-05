@@ -7,7 +7,7 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use super::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource};
+use super::types::{BackwardDirective, CallSiteSpec, CrossFileMetadata, DeclaredSymbol, ForwardSource};
 
 /// Compiled regex patterns for directive parsing
 struct DirectivePatterns {
@@ -16,6 +16,8 @@ struct DirectivePatterns {
     working_dir: Regex,
     ignore: Regex,
     ignore_next: Regex,
+    declare_var: Regex,
+    declare_func: Regex,
 }
 
 /// Extract path from capture groups (double-quoted, single-quoted, or unquoted)
@@ -41,6 +43,18 @@ fn capture_path(caps: &regex::Captures, base_group: usize) -> Option<String> {
     None
 }
 
+/// Extract symbol name from capture groups (double-quoted, single-quoted, or unquoted).
+/// Returns None if the symbol name is empty or whitespace-only.
+/// Requirements: 1.4, 1.5, 2.4, 2.5, 3.4
+fn capture_symbol_name(caps: &regex::Captures, base_group: usize) -> Option<String> {
+    let name = capture_path(caps, base_group)?;
+    // Skip empty or whitespace-only symbol names
+    if name.trim().is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
 fn patterns() -> &'static DirectivePatterns {
     static PATTERNS: OnceLock<DirectivePatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
@@ -61,6 +75,20 @@ fn patterns() -> &'static DirectivePatterns {
             ).unwrap(),
             ignore_next: Regex::new(
                 r"#\s*@?lsp-ignore-next\s*:?\s*$"
+            ).unwrap(),
+            // Declaration directives for variables
+            // Synonyms: @lsp-declare-variable, @lsp-declare-var, @lsp-variable, @lsp-var
+            // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
+            // Requirements: 1.1, 1.2, 1.3
+            declare_var: Regex::new(
+                r#"#\s*@lsp-(?:declare-variable|declare-var|variable|var)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
+            ).unwrap(),
+            // Declaration directives for functions
+            // Synonyms: @lsp-declare-function, @lsp-declare-func, @lsp-function, @lsp-func
+            // Groups: 1=double-quoted, 2=single-quoted, 3=unquoted
+            // Requirements: 2.1, 2.2, 2.3
+            declare_func: Regex::new(
+                r#"#\s*@lsp-(?:declare-function|declare-func|function|func)\s*:?\s*(?:"([^"]+)"|'([^']+)'|(\S+))"#
             ).unwrap(),
         }
     })
@@ -163,15 +191,54 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
         if patterns.ignore_next.is_match(line) {
             log::trace!("  Parsed @lsp-ignore-next directive at line {}", line_num);
             meta.ignored_next_lines.insert(line_num + 1);
+            continue;
+        }
+
+        // Check variable declaration directives (@lsp-var, @lsp-variable, etc.)
+        // Requirements: 1.1, 1.2, 1.3, 1.4, 1.5
+        if let Some(caps) = patterns.declare_var.captures(line) {
+            if let Some(name) = capture_symbol_name(&caps, 1) {
+                log::trace!(
+                    "  Parsed variable declaration directive at line {}: name='{}'",
+                    line_num,
+                    name
+                );
+                meta.declared_variables.push(DeclaredSymbol {
+                    name,
+                    line: line_num,
+                    is_function: false,
+                });
+            }
+            continue;
+        }
+
+        // Check function declaration directives (@lsp-func, @lsp-function, etc.)
+        // Requirements: 2.1, 2.2, 2.3, 2.4, 2.5
+        if let Some(caps) = patterns.declare_func.captures(line) {
+            if let Some(name) = capture_symbol_name(&caps, 1) {
+                log::trace!(
+                    "  Parsed function declaration directive at line {}: name='{}'",
+                    line_num,
+                    name
+                );
+                meta.declared_functions.push(DeclaredSymbol {
+                    name,
+                    line: line_num,
+                    is_function: true,
+                });
+            }
+            continue;
         }
     }
 
     log::trace!(
-        "Completed directive parsing: {} backward directives, {} forward directives, working_dir={:?}, {} ignored lines",
+        "Completed directive parsing: {} backward directives, {} forward directives, working_dir={:?}, {} ignored lines, {} declared vars, {} declared funcs",
         meta.sourced_by.len(),
         meta.sources.len(),
         meta.working_directory,
-        meta.ignored_lines.len() + meta.ignored_next_lines.len()
+        meta.ignored_lines.len() + meta.ignored_next_lines.len(),
+        meta.declared_variables.len(),
+        meta.declared_functions.len()
     );
 
     meta
@@ -780,5 +847,285 @@ x <- undefined"#;
         let content = "# lsp-ignore-next\ny <- undefined";
         let meta = parse_directives(content);
         assert!(meta.ignored_next_lines.contains(&1));
+    }
+
+    // ============================================================================
+    // Tests for declaration directives (@lsp-var, @lsp-func, etc.)
+    // Requirements: 1.1-1.6, 2.1-2.6, 3.4
+    // ============================================================================
+
+    // Variable declaration directive tests
+    #[test]
+    fn test_declare_var_basic() {
+        let content = "# @lsp-var myvar";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].name, "myvar");
+        assert_eq!(meta.declared_variables[0].line, 0);
+        assert!(!meta.declared_variables[0].is_function);
+    }
+
+    #[test]
+    fn test_declare_var_with_colon() {
+        let content = "# @lsp-var: myvar";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].name, "myvar");
+    }
+
+    #[test]
+    fn test_declare_var_double_quoted() {
+        let content = r#"# @lsp-var "my.var""#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].name, "my.var");
+    }
+
+    #[test]
+    fn test_declare_var_single_quoted() {
+        let content = "# @lsp-var 'my.var'";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].name, "my.var");
+    }
+
+    #[test]
+    fn test_declare_var_all_synonyms() {
+        // Test all 4 synonym forms: @lsp-declare-variable, @lsp-declare-var, @lsp-variable, @lsp-var
+        for directive in ["@lsp-declare-variable", "@lsp-declare-var", "@lsp-variable", "@lsp-var"] {
+            let content = format!("# {} myvar", directive);
+            let meta = parse_directives(&content);
+            assert_eq!(
+                meta.declared_variables.len(),
+                1,
+                "Failed for {}",
+                directive
+            );
+            assert_eq!(
+                meta.declared_variables[0].name,
+                "myvar",
+                "Failed for {}",
+                directive
+            );
+            assert!(
+                !meta.declared_variables[0].is_function,
+                "Should be variable for {}",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn test_declare_var_line_number_recorded() {
+        let content = "x <- 1\ny <- 2\n# @lsp-var myvar\nz <- 3";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].line, 2); // 0-based line number
+    }
+
+    #[test]
+    fn test_declare_var_multiple() {
+        let content = "# @lsp-var var1\n# @lsp-var var2\n# @lsp-var var3";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 3);
+        assert_eq!(meta.declared_variables[0].name, "var1");
+        assert_eq!(meta.declared_variables[0].line, 0);
+        assert_eq!(meta.declared_variables[1].name, "var2");
+        assert_eq!(meta.declared_variables[1].line, 1);
+        assert_eq!(meta.declared_variables[2].name, "var3");
+        assert_eq!(meta.declared_variables[2].line, 2);
+    }
+
+    #[test]
+    fn test_declare_var_with_special_chars_quoted() {
+        // R allows special characters in symbol names when quoted
+        let content = r#"# @lsp-var "my.special_var""#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].name, "my.special_var");
+    }
+
+    #[test]
+    fn test_declare_var_no_at_prefix_not_recognized() {
+        // Requirement 1.6: Directives without @ prefix should NOT be recognized
+        let content = "# lsp-var myvar";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 0);
+    }
+
+    // Function declaration directive tests
+    #[test]
+    fn test_declare_func_basic() {
+        let content = "# @lsp-func myfunc";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].name, "myfunc");
+        assert_eq!(meta.declared_functions[0].line, 0);
+        assert!(meta.declared_functions[0].is_function);
+    }
+
+    #[test]
+    fn test_declare_func_with_colon() {
+        let content = "# @lsp-func: myfunc";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].name, "myfunc");
+    }
+
+    #[test]
+    fn test_declare_func_double_quoted() {
+        let content = r#"# @lsp-func "my.func""#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].name, "my.func");
+    }
+
+    #[test]
+    fn test_declare_func_single_quoted() {
+        let content = "# @lsp-func 'my.func'";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].name, "my.func");
+    }
+
+    #[test]
+    fn test_declare_func_all_synonyms() {
+        // Test all 4 synonym forms: @lsp-declare-function, @lsp-declare-func, @lsp-function, @lsp-func
+        for directive in ["@lsp-declare-function", "@lsp-declare-func", "@lsp-function", "@lsp-func"] {
+            let content = format!("# {} myfunc", directive);
+            let meta = parse_directives(&content);
+            assert_eq!(
+                meta.declared_functions.len(),
+                1,
+                "Failed for {}",
+                directive
+            );
+            assert_eq!(
+                meta.declared_functions[0].name,
+                "myfunc",
+                "Failed for {}",
+                directive
+            );
+            assert!(
+                meta.declared_functions[0].is_function,
+                "Should be function for {}",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn test_declare_func_line_number_recorded() {
+        let content = "x <- 1\ny <- 2\n# @lsp-func myfunc\nz <- 3";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].line, 2); // 0-based line number
+    }
+
+    #[test]
+    fn test_declare_func_multiple() {
+        let content = "# @lsp-func func1\n# @lsp-func func2\n# @lsp-func func3";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 3);
+        assert_eq!(meta.declared_functions[0].name, "func1");
+        assert_eq!(meta.declared_functions[0].line, 0);
+        assert_eq!(meta.declared_functions[1].name, "func2");
+        assert_eq!(meta.declared_functions[1].line, 1);
+        assert_eq!(meta.declared_functions[2].name, "func3");
+        assert_eq!(meta.declared_functions[2].line, 2);
+    }
+
+    #[test]
+    fn test_declare_func_with_special_chars_quoted() {
+        // R allows special characters in symbol names when quoted
+        let content = r#"# @lsp-func "my.special_func""#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].name, "my.special_func");
+    }
+
+    #[test]
+    fn test_declare_func_no_at_prefix_not_recognized() {
+        // Requirement 2.6: Directives without @ prefix should NOT be recognized
+        let content = "# lsp-func myfunc";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 0);
+    }
+
+    // Mixed declaration tests
+    #[test]
+    fn test_declare_mixed_vars_and_funcs() {
+        let content = "# @lsp-var myvar\n# @lsp-func myfunc\n# @lsp-variable another_var\n# @lsp-function another_func";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 2);
+        assert_eq!(meta.declared_functions.len(), 2);
+        assert_eq!(meta.declared_variables[0].name, "myvar");
+        assert_eq!(meta.declared_variables[1].name, "another_var");
+        assert_eq!(meta.declared_functions[0].name, "myfunc");
+        assert_eq!(meta.declared_functions[1].name, "another_func");
+    }
+
+    #[test]
+    fn test_declare_with_other_directives() {
+        let content = r#"# @lsp-sourced-by ../main.R
+# @lsp-var myvar
+# @lsp-cd /data
+# @lsp-func myfunc
+# @lsp-ignore"#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.sourced_by.len(), 1);
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.working_directory, Some("/data".to_string()));
+        assert!(meta.ignored_lines.contains(&4));
+    }
+
+    // Edge cases
+    #[test]
+    fn test_declare_var_empty_name_skipped() {
+        // Empty symbol names should be skipped
+        let content = "# @lsp-var ";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 0);
+    }
+
+    #[test]
+    fn test_declare_func_empty_name_skipped() {
+        // Empty symbol names should be skipped
+        let content = "# @lsp-func ";
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 0);
+    }
+
+    #[test]
+    fn test_declare_var_whitespace_only_quoted_skipped() {
+        // Whitespace-only quoted names should be skipped
+        let content = r#"# @lsp-var "   ""#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 0);
+    }
+
+    #[test]
+    fn test_declare_func_whitespace_only_quoted_skipped() {
+        // Whitespace-only quoted names should be skipped
+        let content = r#"# @lsp-func "   ""#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 0);
+    }
+
+    #[test]
+    fn test_declare_var_colon_and_quotes() {
+        let content = r#"# @lsp-var: "my.var""#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_variables.len(), 1);
+        assert_eq!(meta.declared_variables[0].name, "my.var");
+    }
+
+    #[test]
+    fn test_declare_func_colon_and_quotes() {
+        let content = r#"# @lsp-func: "my.func""#;
+        let meta = parse_directives(content);
+        assert_eq!(meta.declared_functions.len(), 1);
+        assert_eq!(meta.declared_functions[0].name, "my.func");
     }
 }

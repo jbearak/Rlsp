@@ -511,6 +511,9 @@ pub struct ScopedSymbol {
     /// 0-based UTF-16 column of definition
     pub defined_column: u32,
     pub signature: Option<String>,
+    /// Whether this symbol was declared via @lsp-var or @lsp-func directive
+    /// (as opposed to being statically detected from code)
+    pub is_declared: bool,
 }
 
 impl Hash for ScopedSymbol {
@@ -520,6 +523,7 @@ impl Hash for ScopedSymbol {
         self.source_uri.hash(state);
         self.defined_line.hash(state);
         self.defined_column.hash(state);
+        self.is_declared.hash(state);
     }
 }
 
@@ -561,6 +565,16 @@ pub enum ScopeEvent {
         package: String,
         /// Function scope if inside a function (None = global)
         function_scope: Option<FunctionScopeInterval>,
+    },
+    /// A symbol declared via @lsp-var or @lsp-func directive.
+    /// These directives allow users to declare symbols that cannot be statically
+    /// detected by the parser (e.g., dynamically created via eval(), assign(), load()).
+    /// The column is set to u32::MAX (end-of-line sentinel) so the symbol is
+    /// available starting from line+1, matching source() semantics.
+    Declaration {
+        line: u32,
+        column: u32,
+        symbol: ScopedSymbol,
     },
 }
 
@@ -778,6 +792,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         } => (*start_line, *start_column),
         ScopeEvent::Removal { line, column, .. } => (*line, *column),
         ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
     });
 
     // Build interval tree from function scopes for O(log n) queries
@@ -842,6 +857,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         } => (*start_line, *start_column),
         ScopeEvent::Removal { line, column, .. } => (*line, *column),
         ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
     });
 
     // Extract package names from PackageLoad events for interface hash computation
@@ -858,9 +874,10 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         })
         .collect();
 
-    // Compute interface hash including both symbols and loaded packages
+    // Compute interface hash including symbols, loaded packages, and declared symbols
+    // Note: compute_artifacts (without metadata) has no declared symbols
     artifacts.interface_hash =
-        compute_interface_hash(&artifacts.exported_interface, &loaded_packages);
+        compute_interface_hash(&artifacts.exported_interface, &loaded_packages, &[]);
 
     artifacts
 }
@@ -945,6 +962,50 @@ pub fn compute_artifacts_with_metadata(
                 }
             }
         }
+        
+        // Add Declaration events from @lsp-var directives
+        // Column is set to u32::MAX (end-of-line sentinel) so symbol is available from line+1
+        // Also add to exported_interface (later declarations will overwrite earlier ones)
+        for decl in &meta.declared_variables {
+            let symbol = ScopedSymbol {
+                name: decl.name.clone(),
+                kind: SymbolKind::Variable,
+                source_uri: uri.clone(),
+                defined_line: decl.line,
+                defined_column: 0,
+                signature: None,
+                is_declared: true,
+            };
+            artifacts.timeline.push(ScopeEvent::Declaration {
+                line: decl.line,
+                column: u32::MAX,
+                symbol: symbol.clone(),
+            });
+            // Add to exported interface - later declarations will overwrite earlier ones
+            // This is handled by processing declarations in timeline order after sorting
+        }
+        
+        // Add Declaration events from @lsp-func directives
+        // Column is set to u32::MAX (end-of-line sentinel) so symbol is available from line+1
+        // Also add to exported_interface (later declarations will overwrite earlier ones)
+        for decl in &meta.declared_functions {
+            let symbol = ScopedSymbol {
+                name: decl.name.clone(),
+                kind: SymbolKind::Function,
+                source_uri: uri.clone(),
+                defined_line: decl.line,
+                defined_column: 0,
+                signature: None,
+                is_declared: true,
+            };
+            artifacts.timeline.push(ScopeEvent::Declaration {
+                line: decl.line,
+                column: u32::MAX,
+                symbol: symbol.clone(),
+            });
+            // Add to exported interface - later declarations will overwrite earlier ones
+            // This is handled by processing declarations in timeline order after sorting
+        }
     }
 
     // Collect rm()/remove() calls and add them to timeline.
@@ -972,6 +1033,7 @@ pub fn compute_artifacts_with_metadata(
         } => (*start_line, *start_column),
         ScopeEvent::Removal { line, column, .. } => (*line, *column),
         ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
     });
 
     // Build interval tree from function scopes for O(log n) queries
@@ -1035,7 +1097,25 @@ pub fn compute_artifacts_with_metadata(
         } => (*start_line, *start_column),
         ScopeEvent::Removal { line, column, .. } => (*line, *column),
         ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+        ScopeEvent::Declaration { line, column, .. } => (*line, *column),
     });
+
+    // Add declared symbols to exported interface in timeline order
+    // Only insert if no real (non-declared) definition exists, so that real definitions
+    // are never downgraded by later declarations. Among declared symbols, later ones win.
+    for event in &artifacts.timeline {
+        if let ScopeEvent::Declaration { symbol, .. } = event {
+            artifacts
+                .exported_interface
+                .entry(symbol.name.clone())
+                .and_modify(|existing| {
+                    if existing.is_declared {
+                        *existing = symbol.clone();
+                    }
+                })
+                .or_insert_with(|| symbol.clone());
+        }
+    }
 
     // Extract package names from PackageLoad events for interface hash computation
     let loaded_packages: Vec<String> = artifacts
@@ -1050,9 +1130,21 @@ pub fn compute_artifacts_with_metadata(
         })
         .collect();
 
-    // Compute interface hash including both symbols and loaded packages
+    // Collect declared symbols from metadata for interface hash computation
+    // (Requirements 10.1-10.4: interface hash must include declared symbols for cache invalidation)
+    let declared_symbols: Vec<super::types::DeclaredSymbol> = metadata
+        .map(|m| {
+            m.declared_variables
+                .iter()
+                .chain(m.declared_functions.iter())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Compute interface hash including symbols, loaded packages, and declared symbols
     artifacts.interface_hash =
-        compute_interface_hash(&artifacts.exported_interface, &loaded_packages);
+        compute_interface_hash(&artifacts.exported_interface, &loaded_packages, &declared_symbols);
 
     artifacts
 }
@@ -1184,6 +1276,28 @@ pub fn scope_at_position(artifacts: &ScopeArtifacts, line: u32, column: u32) -> 
                     }
                 }
             }
+            ScopeEvent::Declaration {
+                line: decl_line,
+                column: decl_col,
+                symbol,
+            } => {
+                // Declaration events use column=u32::MAX (end-of-line sentinel) so the symbol
+                // is available starting from line+1, matching source() semantics.
+                // Include if declaration position is before or at the query position.
+                if (*decl_line, *decl_col) <= (line, column) {
+                    // Declared symbols are always global scope (not function-local)
+                    // Only insert if no real (non-declared) definition exists
+                    scope
+                        .symbols
+                        .entry(symbol.name.clone())
+                        .and_modify(|existing| {
+                            if existing.is_declared {
+                                *existing = symbol.clone();
+                            }
+                        })
+                        .or_insert_with(|| symbol.clone());
+                }
+            }
         }
     }
 
@@ -1240,6 +1354,7 @@ where
                 defined_line: 0,
                 defined_column: 0,
                 signature: None,
+                is_declared: false,
             },
         );
     }
@@ -1384,11 +1499,34 @@ where
                                         defined_line: 0,
                                         defined_column: 0,
                                         signature: None,
+                                        is_declared: false,
                                     },
                                 );
                             }
                         }
                     }
+                }
+            }
+            ScopeEvent::Declaration {
+                line: decl_line,
+                column: decl_col,
+                symbol,
+            } => {
+                // Declaration events use column=u32::MAX (end-of-line sentinel) so the symbol
+                // is available starting from line+1, matching source() semantics.
+                // Include if declaration position is before or at the query position.
+                if (*decl_line, *decl_col) <= (line, column) {
+                    // Declared symbols are always global scope (not function-local)
+                    // Only insert if no real (non-declared) definition exists
+                    scope
+                        .symbols
+                        .entry(symbol.name.clone())
+                        .and_modify(|existing| {
+                            if existing.is_declared {
+                                *existing = symbol.clone();
+                            }
+                        })
+                        .or_insert_with(|| symbol.clone());
                 }
             }
         }
@@ -1644,6 +1782,40 @@ where
             ScopeEvent::PackageLoad { .. } => {
                 // PackageLoad events are handled by scope resolution with package library access
             }
+            ScopeEvent::Declaration {
+                line: decl_line,
+                column: decl_col,
+                symbol,
+            } => {
+                // Declaration events use column=u32::MAX (end-of-line sentinel) so the symbol
+                // is available starting from line+1, matching source() semantics.
+                // Include if declaration position is before or at the query position.
+                if (*decl_line, *decl_col) <= (line, column) {
+                    // Declared symbols are always global scope (not function-local)
+                    // Only insert if no real (non-declared) definition exists;
+                    // among declared symbols, later ones win (timeline is sorted).
+                    scope
+                        .symbols
+                        .entry(symbol.name.clone())
+                        .and_modify(|existing| {
+                            if existing.is_declared {
+                                *existing = symbol.clone();
+                            }
+                        })
+                        .or_insert_with(|| {
+                            log::trace!(
+                                "  Found declared symbol: {} ({})",
+                                symbol.name,
+                                match symbol.kind {
+                                    SymbolKind::Function => "function",
+                                    SymbolKind::Variable => "variable",
+                                    SymbolKind::Parameter => "parameter",
+                                }
+                            );
+                            symbol.clone()
+                        });
+                }
+            }
         }
     }
 
@@ -1787,6 +1959,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
                         defined_line: start.row as u32,
                         defined_column: column,
                         signature: None,
+                        is_declared: false,
                     });
                 } else if child.kind() == "dots" {
                     let start = child.start_position();
@@ -1800,6 +1973,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
                         defined_line: start.row as u32,
                         defined_column: column,
                         signature: None,
+                        is_declared: false,
                     });
                 }
             }
@@ -1818,6 +1992,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
                 defined_line: start.row as u32,
                 defined_column: column,
                 signature: None,
+                is_declared: false,
             });
         }
         "dots" => {
@@ -1833,6 +2008,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
                 defined_line: start.row as u32,
                 defined_column: column,
                 signature: None,
+                is_declared: false,
             });
         }
         _ => {}
@@ -1904,6 +2080,7 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
         defined_line: start.row as u32,
         defined_column: column,
         signature: None,
+        is_declared: false,
     })
 }
 
@@ -1932,6 +2109,7 @@ fn try_extract_for_loop_iterator(node: Node, content: &str, uri: &Url) -> Option
         defined_line: start.row as u32,
         defined_column: column,
         signature: None,
+        is_declared: false,
     })
 }
 
@@ -1982,6 +2160,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
             defined_line: start.row as u32,
             defined_column: column,
             signature,
+            is_declared: false,
         });
     }
 
@@ -2021,6 +2200,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
         defined_line: start.row as u32,
         defined_column: column,
         signature,
+        is_declared: false,
     })
 }
 
@@ -2059,20 +2239,26 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 ///
 /// # Returns
 ///
-/// `u64` hash of the provided `interface` and `packages`.
+/// `u64` hash of the provided `interface`, `packages`, and `declared_symbols`.
 ///
 /// # Examples
 ///
 /// ```
 /// use std::collections::HashMap;
-/// // Use an empty interface and no packages as the simplest example.
+/// use crate::cross_file::types::DeclaredSymbol;
+/// // Use an empty interface, no packages, and no declared symbols as the simplest example.
 /// let interface: HashMap<String, crate::ScopedSymbol> = HashMap::new();
 /// let packages: Vec<String> = Vec::new();
-/// let h1 = crate::compute_interface_hash(&interface, &packages);
-/// let h2 = crate::compute_interface_hash(&interface, &packages);
+/// let declared: Vec<DeclaredSymbol> = Vec::new();
+/// let h1 = crate::compute_interface_hash(&interface, &packages, &declared);
+/// let h2 = crate::compute_interface_hash(&interface, &packages, &declared);
 /// assert_eq!(h1, h2);
 /// ```
-fn compute_interface_hash(interface: &HashMap<String, ScopedSymbol>, packages: &[String]) -> u64 {
+fn compute_interface_hash(
+    interface: &HashMap<String, ScopedSymbol>,
+    packages: &[String],
+    declared_symbols: &[super::types::DeclaredSymbol],
+) -> u64 {
     let mut hasher = DefaultHasher::new();
 
     // Sort keys for deterministic hashing of symbols
@@ -2090,6 +2276,18 @@ fn compute_interface_hash(interface: &HashMap<String, ScopedSymbol>, packages: &
     sorted_packages.sort();
     for package in sorted_packages {
         package.hash(&mut hasher);
+    }
+
+    // Include declared symbols in the hash (sorted for determinism)
+    // This ensures cache invalidation when declarations change (Requirements 10.1-10.4)
+    // Line is included because moving a directive across a source() call changes
+    // which sourced files can see the symbol (position-aware visibility).
+    let mut sorted_declared: Vec<_> = declared_symbols.iter().collect();
+    sorted_declared.sort_by_key(|d| (&d.name, d.is_function, d.line));
+    for decl in sorted_declared {
+        decl.name.hash(&mut hasher);
+        decl.is_function.hash(&mut hasher);
+        decl.line.hash(&mut hasher);
     }
 
     hasher.finish()
@@ -2233,6 +2431,7 @@ where
                     defined_line: 0,
                     defined_column: 0,
                     signature: None,
+                    is_declared: false,
                 },
             );
         }
@@ -2252,25 +2451,25 @@ where
     // STEP 1: Process parent context from dependency graph edges
     // Get edges where this file is the child (callee)
     for edge in graph.get_dependents(uri) {
-        // Skip local=TRUE edges (symbols not inherited)
-        if edge.local {
-            continue;
-        }
-        // Skip sys.source with non-global env
-        if edge.is_sys_source {
-            // For sys.source, we need to check if it's global env
-            // The edge doesn't store this directly, so we check metadata
+        // Determine if this is a local-scoped edge (local=TRUE or sys.source with non-global env)
+        // For local-scoped edges, only declared symbols are inherited (Requirement 9.4)
+        // Regular symbols are not inherited when local=TRUE
+        let is_local_scoped = if edge.local {
+            true
+        } else if edge.is_sys_source {
+            // For sys.source, check if it's targeting global env
             if let Some(meta) = get_metadata(&edge.from) {
-                let is_global = meta.sources.iter().any(|s| {
+                !meta.sources.iter().any(|s| {
                     s.is_sys_source
                         && s.sys_source_global_env
                         && s.line == edge.call_site_line.unwrap_or(u32::MAX)
-                });
-                if !is_global {
-                    continue;
-                }
+                })
+            } else {
+                true // Assume non-global if no metadata
             }
-        }
+        } else {
+            false
+        };
 
         // Get call site position for filtering
         let call_site_line = edge.call_site_line.unwrap_or(u32::MAX);
@@ -2314,8 +2513,18 @@ where
         );
 
         // Merge parent symbols (they are available at the START of this file)
+        // Requirement 9.4: For local=TRUE edges, only declared symbols are inherited
+        // (declarations describe symbol existence, not export behavior)
         for (name, symbol) in parent_scope.symbols {
-            scope.symbols.entry(name).or_insert(symbol);
+            if is_local_scoped {
+                // For local-scoped edges, only inherit declared symbols
+                if symbol.is_declared {
+                    scope.symbols.entry(name).or_insert(symbol);
+                }
+            } else {
+                // For non-local edges, inherit all symbols
+                scope.symbols.entry(name).or_insert(symbol);
+            }
         }
         scope.chain.extend(parent_scope.chain);
         scope.depth_exceeded.extend(parent_scope.depth_exceeded);
@@ -2660,6 +2869,29 @@ where
                     if should_include && !scope.loaded_packages.contains(package) {
                         scope.loaded_packages.push(package.clone());
                     }
+                }
+            }
+            ScopeEvent::Declaration {
+                line: decl_line,
+                column: decl_col,
+                symbol,
+            } => {
+                // Declaration events use column=u32::MAX (end-of-line sentinel) so the symbol
+                // is available starting from line+1, matching source() semantics.
+                // Include if declaration position is before or at the query position.
+                if (*decl_line, *decl_col) <= (line, column) {
+                    // Declared symbols are always global scope (not function-local)
+                    // Only insert if no real (non-declared) definition exists;
+                    // among declared symbols, later ones win (timeline is sorted).
+                    scope
+                        .symbols
+                        .entry(symbol.name.clone())
+                        .and_modify(|existing| {
+                            if existing.is_declared {
+                                *existing = symbol.clone();
+                            }
+                        })
+                        .or_insert_with(|| symbol.clone());
                 }
             }
         }
@@ -3261,6 +3493,254 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_file_declared_symbols_inherited_with_local_true() {
+        // Requirement 9.4: Declared symbols from parent SHALL be visible in child file
+        // even when source() uses local=TRUE. Declarations describe symbol existence,
+        // not export behavior.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, DeclaredSymbol, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // Parent code: declares 'declared_var' via directive, defines 'regular_var',
+        // then sources child with local=TRUE at line 2
+        let parent_code = "# @lsp-var declared_var\nregular_var <- 1\nsource(\"child.R\", local = TRUE)";
+        let parent_tree = parse_r(parent_code);
+        let mut parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Add Declaration event for declared_var (simulating directive parsing)
+        parent_artifacts.timeline.push(ScopeEvent::Declaration {
+            line: 0,
+            column: u32::MAX, // End-of-line sentinel
+            symbol: ScopedSymbol {
+                name: "declared_var".to_string(),
+                kind: SymbolKind::Variable,
+                source_uri: parent_uri.clone(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+                is_declared: true,
+            },
+        });
+        // Re-sort timeline
+        parent_artifacts.timeline.sort_by_key(|event| match event {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
+        });
+
+        // Child code: just a simple definition
+        let child_code = "child_var <- 2";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph with local=TRUE edge
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 2,
+                column: 0,
+                is_directive: false,
+                local: true, // local=TRUE
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: false,
+                ..Default::default()
+            }],
+            declared_variables: vec![DeclaredSymbol {
+                name: "declared_var".to_string(),
+                line: 0,
+                is_function: false,
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // In child file, declared_var should be available (Requirement 9.4)
+        // but regular_var should NOT be available (local=TRUE blocks regular symbols)
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            10,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            scope.symbols.contains_key("declared_var"),
+            "declared_var should be available from parent even with local=TRUE (Requirement 9.4)"
+        );
+        assert!(
+            !scope.symbols.contains_key("regular_var"),
+            "regular_var should NOT be available from parent with local=TRUE"
+        );
+        assert!(
+            scope.symbols.contains_key("child_var"),
+            "child_var should be available locally"
+        );
+    }
+
+    #[test]
+    fn test_cross_file_declared_symbols_position_aware() {
+        // Requirements 9.1, 9.2: Declared symbols follow position-based inheritance.
+        // Only declarations before the source() call are available in the child.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, DeclaredSymbol, ForwardSource};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        // Parent code: declares 'before_var' at line 0, sources child at line 1,
+        // declares 'after_var' at line 2
+        let parent_code = "# @lsp-var before_var\nsource(\"child.R\")\n# @lsp-var after_var";
+        let parent_tree = parse_r(parent_code);
+        let mut parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Add Declaration events
+        parent_artifacts.timeline.push(ScopeEvent::Declaration {
+            line: 0,
+            column: u32::MAX,
+            symbol: ScopedSymbol {
+                name: "before_var".to_string(),
+                kind: SymbolKind::Variable,
+                source_uri: parent_uri.clone(),
+                defined_line: 0,
+                defined_column: 0,
+                signature: None,
+                is_declared: true,
+            },
+        });
+        parent_artifacts.timeline.push(ScopeEvent::Declaration {
+            line: 2,
+            column: u32::MAX,
+            symbol: ScopedSymbol {
+                name: "after_var".to_string(),
+                kind: SymbolKind::Variable,
+                source_uri: parent_uri.clone(),
+                defined_line: 2,
+                defined_column: 0,
+                signature: None,
+                is_declared: true,
+            },
+        });
+        // Re-sort timeline
+        parent_artifacts.timeline.sort_by_key(|event| match event {
+            ScopeEvent::Def { line, column, .. } => (*line, *column),
+            ScopeEvent::Source { line, column, .. } => (*line, *column),
+            ScopeEvent::FunctionScope { start_line, start_column, .. } => (*start_line, *start_column),
+            ScopeEvent::Removal { line, column, .. } => (*line, *column),
+            ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
+        });
+
+        // Child code
+        let child_code = "child_var <- 1";
+        let child_tree = parse_r(child_code);
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        // Build dependency graph
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 1,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            declared_variables: vec![
+                DeclaredSymbol {
+                    name: "before_var".to_string(),
+                    line: 0,
+                    is_function: false,
+                },
+                DeclaredSymbol {
+                    name: "after_var".to_string(),
+                    line: 2,
+                    is_function: false,
+                },
+            ],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else {
+                None
+            }
+        };
+
+        // In child file:
+        // - before_var should be available (declared before source() call) - Requirement 9.1
+        // - after_var should NOT be available (declared after source() call) - Requirement 9.2
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            10,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+        );
+
+        assert!(
+            scope.symbols.contains_key("before_var"),
+            "before_var should be available (declared before source() call) - Requirement 9.1"
+        );
+        assert!(
+            !scope.symbols.contains_key("after_var"),
+            "after_var should NOT be available (declared after source() call) - Requirement 9.2"
+        );
+    }
+
+    #[test]
     fn test_max_depth_exceeded_forward() {
         // Test that depth_exceeded is populated when max depth is hit on forward sources
         let uri_a = Url::parse("file:///project/a.R").unwrap();
@@ -3460,6 +3940,7 @@ mod tests {
             } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
         });
 
         // Child file: defines 'child_var'
@@ -4187,6 +4668,7 @@ mod tests {
             } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
         });
 
         // Verify order: (2,0), (5,5), (5,10), (10,0)
@@ -4235,6 +4717,7 @@ mod tests {
             } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
         });
 
         // Verify order by column: 5, 10, 20
@@ -4270,6 +4753,7 @@ mod tests {
                     defined_line: 1,
                     defined_column: 0,
                     signature: None,
+                    is_declared: false,
                 },
             },
             ScopeEvent::Def {
@@ -4282,6 +4766,7 @@ mod tests {
                     defined_line: 5,
                     defined_column: 0,
                     signature: None,
+                    is_declared: false,
                 },
             },
         ];
@@ -4296,6 +4781,7 @@ mod tests {
             } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
         });
 
         // Verify order: Def(1,0), Removal(3,0), Def(5,0)
@@ -4367,6 +4853,7 @@ mod tests {
             } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
         });
 
         // Verify order: Source(1,0), Removal(2,0), Removal(4,0)
@@ -4405,6 +4892,7 @@ mod tests {
                     defined_line: 1,
                     defined_column: 0,
                     signature: None,
+                    is_declared: false,
                 },
             },
             ScopeEvent::Source {
@@ -4446,6 +4934,7 @@ mod tests {
             } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
         });
 
         // Verify order: Def(1,0), Source(3,0), Removal(5,0), FunctionScope(7,0), Removal(9,0)
@@ -4457,6 +4946,7 @@ mod tests {
                 ScopeEvent::FunctionScope { .. } => "FunctionScope",
                 ScopeEvent::Removal { .. } => "Removal",
                 ScopeEvent::PackageLoad { .. } => "PackageLoad",
+                ScopeEvent::Declaration { .. } => "Declaration",
             })
             .collect();
 
@@ -4474,6 +4964,7 @@ mod tests {
                 ScopeEvent::FunctionScope { start_line, .. } => *start_line,
                 ScopeEvent::Removal { line, .. } => *line,
                 ScopeEvent::PackageLoad { line, .. } => *line,
+                ScopeEvent::Declaration { line, .. } => *line,
             })
             .collect();
 
@@ -4502,6 +4993,7 @@ mod tests {
                     defined_line: 2,
                     defined_column: 0,
                     signature: None,
+                    is_declared: false,
                 },
             },
         ];
@@ -4516,6 +5008,7 @@ mod tests {
             } => (*start_line, *start_column),
             ScopeEvent::Removal { line, column, .. } => (*line, *column),
             ScopeEvent::PackageLoad { line, column, .. } => (*line, *column),
+            ScopeEvent::Declaration { line, column, .. } => (*line, *column),
         });
 
         // Both events should be at position (2, 0) - order between them is stable but not guaranteed
@@ -5000,6 +5493,7 @@ mod tests {
                 ScopeEvent::FunctionScope { start_line, .. } => ("FunctionScope", *start_line),
                 ScopeEvent::Removal { line, .. } => ("Removal", *line),
                 ScopeEvent::PackageLoad { line, .. } => ("PackageLoad", *line),
+                ScopeEvent::Declaration { line, .. } => ("Declaration", *line),
             })
             .collect();
 
