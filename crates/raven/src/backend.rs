@@ -496,6 +496,7 @@ impl LanguageServer for Backend {
                     first_trigger_character: String::from("\n"),
                     more_trigger_character: None,
                 }),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -2323,6 +2324,14 @@ impl LanguageServer for Backend {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let state = self.state.read().await;
         Ok(handlers::document_symbol(&state, &params.text_document.uri))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let state = self.state.read().await;
+        Ok(handlers::workspace_symbol(&state, &params.query))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
