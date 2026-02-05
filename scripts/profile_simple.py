@@ -56,8 +56,23 @@ def read_message(proc, timeout=60):
     if content_length == 0:
         return None
 
-    content = proc.stdout.read(content_length)
-    return json.loads(content.decode('utf-8'))
+    body = b""
+    while len(body) < content_length and time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None
+        if not select.select([proc.stdout], [], [], min(0.1, remaining))[0]:
+            continue
+        to_read = min(4096, content_length - len(body))
+        chunk = proc.stdout.read(to_read)
+        if not chunk:
+            return None
+        body += chunk
+
+    if len(body) != content_length:
+        return None
+
+    return json.loads(body.decode('utf-8'))
 
 def main():
     workspace = os.path.expanduser(os.environ.get("RAVEN_WORKSPACE", "~/repos/worldwide"))
