@@ -1,4 +1,4 @@
-name: Release
+name: Release Build
 
 on:
   push:
@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-build-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build-lsp:
@@ -25,6 +29,10 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: macos-arm64
+            use-zigbuild: false
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos-x64
             use-zigbuild: false
           - os: ubuntu-latest
             target: x86_64-pc-windows-gnu
@@ -79,13 +87,14 @@ jobs:
         with:
           name: lsp-${{ matrix.platform }}
           path: raven-${{ matrix.platform }}.zip
+          retention-days: 30
 
   build-vscode:
     needs: build-lsp
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [darwin-arm64, linux-x64, linux-arm64, win32-x64, win32-arm64]
+        target: [darwin-arm64, darwin-x64, linux-x64, linux-arm64, win32-x64, win32-arm64]
 
     steps:
       - uses: actions/checkout@v4
@@ -110,65 +119,41 @@ jobs:
 
       - name: Update package.json version
         run: |
-          cd vscode-extension
-          npm version ${{ steps.version.outputs.version }} --no-git-tag-version
+          cd editors/vscode
+          npm version ${{ steps.version.outputs.version }} --no-git-tag-version --allow-same-version
 
       - name: Install dependencies
         run: |
-          cd vscode-extension
+          cd editors/vscode
           npm install
 
       - name: Compile extension
         run: |
-          cd vscode-extension
-          npm run compile
+          cd editors/vscode
+          npx esbuild src/extension.ts --bundle --platform=node --outfile=dist/extension.js --external:vscode --minify
 
       - name: Copy LSP binary
         run: |
-          cd vscode-extension
+          cd editors/vscode
           mkdir -p bin
           case "${{ matrix.target }}" in
-            darwin-arm64) cp ../lsp-binaries/lsp-macos-arm64/raven-macos-arm64.zip bin/ && cd bin && unzip raven-macos-arm64.zip && mv raven raven-server ;;
-            linux-x64) cp ../lsp-binaries/lsp-linux-x64/raven-linux-x64.zip bin/ && cd bin && unzip raven-linux-x64.zip && mv raven raven-server ;;
-            linux-arm64) cp ../lsp-binaries/lsp-linux-arm64/raven-linux-arm64.zip bin/ && cd bin && unzip raven-linux-arm64.zip && mv raven raven-server ;;
-            win32-x64) cp ../lsp-binaries/lsp-windows-x64/raven-windows-x64.zip bin/ && cd bin && unzip raven-windows-x64.zip && mv raven.exe raven-server.exe ;;
-            win32-arm64) cp ../lsp-binaries/lsp-windows-arm64/raven-windows-arm64.zip bin/ && cd bin && unzip raven-windows-arm64.zip && mv raven.exe raven-server.exe ;;
+            darwin-arm64) cp ../../lsp-binaries/lsp-macos-arm64/raven-macos-arm64.zip bin/ && cd bin && unzip raven-macos-arm64.zip && rm -f raven-macos-arm64.zip ;;
+            darwin-x64) cp ../../lsp-binaries/lsp-macos-x64/raven-macos-x64.zip bin/ && cd bin && unzip raven-macos-x64.zip && rm -f raven-macos-x64.zip ;;
+            linux-x64) cp ../../lsp-binaries/lsp-linux-x64/raven-linux-x64.zip bin/ && cd bin && unzip raven-linux-x64.zip && rm -f raven-linux-x64.zip ;;
+            linux-arm64) cp ../../lsp-binaries/lsp-linux-arm64/raven-linux-arm64.zip bin/ && cd bin && unzip raven-linux-arm64.zip && rm -f raven-linux-arm64.zip ;;
+            win32-x64) cp ../../lsp-binaries/lsp-windows-x64/raven-windows-x64.zip bin/ && cd bin && unzip raven-windows-x64.zip && rm -f raven-windows-x64.zip ;;
+            win32-arm64) cp ../../lsp-binaries/lsp-windows-arm64/raven-windows-arm64.zip bin/ && cd bin && unzip raven-windows-arm64.zip && rm -f raven-windows-arm64.zip ;;
+            *) echo "ERROR: Unknown target '${{ matrix.target }}'" && exit 1 ;;
           esac
 
       - name: Package extension
         run: |
-          cd vscode-extension
+          cd editors/vscode
           vsce package --target ${{ matrix.target }}
 
       - name: Upload extension artifact
         uses: actions/upload-artifact@v4
         with:
           name: vscode-${{ matrix.target }}
-          path: vscode-extension/*.vsix
-
-  release:
-    needs: [build-lsp, build-vscode]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Extract version
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: Release v${{ steps.version.outputs.version }}
-          files: |
-            artifacts/lsp-*/raven-*.zip
-            artifacts/vscode-*/*.vsix
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          path: editors/vscode/*.vsix
+          retention-days: 30

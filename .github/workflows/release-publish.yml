@@ -1,0 +1,177 @@
+name: Release Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g., v0.1.0)'
+        required: true
+        type: string
+      publish_vscode:
+        description: 'Publish to VS Code Marketplace and Open VSX'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag_sha: ${{ steps.tag_sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        run: |
+          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "ERROR: Tag must match format v*.*.* (e.g., v0.1.0)"
+            exit 1
+          fi
+
+      - name: Validate tag exists
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/${{ inputs.tag }}" >/dev/null; then
+            echo "ERROR: Tag '${{ inputs.tag }}' does not exist. Push the tag first."
+            exit 1
+          fi
+
+      - name: Get tag commit SHA
+        id: tag_sha
+        run: echo "sha=$(git rev-parse refs/tags/${{ inputs.tag }})" >> "$GITHUB_OUTPUT"
+
+      - name: Extract version
+        id: version
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ inputs.tag }}
+
+  download-artifacts:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check build workflow status
+        run: |
+          COMMIT_SHA="${{ needs.validate.outputs.tag_sha }}"
+          echo "Checking workflow status for commit: $COMMIT_SHA"
+
+          RUN_INFO=$(gh run list --workflow=release-build.yml --commit="$COMMIT_SHA" --limit=1 --json status,conclusion --jq '.[0]')
+          if [ -z "$RUN_INFO" ] || [ "$RUN_INFO" = "null" ]; then
+            echo "ERROR: No release-build.yml workflow run found for commit $COMMIT_SHA"
+            exit 1
+          fi
+
+          STATUS=$(echo "$RUN_INFO" | jq -r '.status')
+          CONCLUSION=$(echo "$RUN_INFO" | jq -r '.conclusion')
+
+          if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
+            echo "ERROR: release-build.yml has not completed successfully for tag ${{ inputs.tag }}"
+            echo "Status: $STATUS, Conclusion: $CONCLUSION"
+            exit 1
+          fi
+
+          echo "Build workflow completed successfully"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download artifacts from build workflow
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: release-build.yml
+          commit: ${{ needs.validate.outputs.tag_sha }}
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Re-upload LSP artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-lsp-artifacts
+          path: artifacts/lsp-*/*
+          retention-days: 5
+
+      - name: Re-upload VSIX artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-vscode-artifacts
+          path: artifacts/vscode-*/*
+          retention-days: 5
+
+  github-release:
+    needs: [validate, download-artifacts]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download LSP artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-lsp-artifacts
+          path: lsp-artifacts
+
+      - name: Download VSIX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-vscode-artifacts
+          path: vscode-artifacts
+
+      - name: List release files
+        run: |
+          echo "=== LSP binaries ==="
+          find lsp-artifacts -type f | sort
+          echo "=== VSIX packages ==="
+          find vscode-artifacts -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: Release ${{ inputs.tag }}
+          files: |
+            lsp-artifacts/**/*.zip
+            vscode-artifacts/**/*.vsix
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-marketplace:
+    needs: [validate, download-artifacts]
+    if: inputs.publish_vscode
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download VSIX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-vscode-artifacts
+          path: vscode-artifacts
+
+      - name: Install vsce and ovsx
+        run: npm install -g @vscode/vsce ovsx
+
+      - name: Publish to VS Code Marketplace
+        run: |
+          shopt -s globstar
+          for vsix in vscode-artifacts/**/*.vsix; do
+            echo "Publishing $vsix to VS Code Marketplace..."
+            vsce publish --packagePath "$vsix"
+          done
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      - name: Publish to Open VSX
+        continue-on-error: true
+        run: |
+          shopt -s globstar
+          for vsix in vscode-artifacts/**/*.vsix; do
+            echo "Publishing $vsix to Open VSX..."
+            ovsx publish "$vsix"
+          done
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
