@@ -13,6 +13,8 @@ import time
 import os
 import threading
 import select
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 def send_message(proc, msg):
     """Send an LSP message to the server."""
@@ -66,23 +68,47 @@ def read_message(proc, timeout=30):
     if content_length == 0:
         return None
 
-    content = proc.stdout.read(content_length)
-    return json.loads(content.decode('utf-8'))
+    # Read the body with the same timeout/deadline enforcement as the header.
+    body = b""
+    while len(body) < content_length and time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None
+        if not select.select([proc.stdout], [], [], min(0.1, remaining))[0]:
+            continue
+        to_read = min(4096, content_length - len(body))
+        chunk = proc.stdout.read(to_read)
+        if not chunk:
+            return None
+        body += chunk
+
+    if len(body) != content_length:
+        return None
+
+    return json.loads(body.decode('utf-8'))
 
 def main():
-    workspace = os.path.expanduser("~/repos/worldwide")
+    workspace = Path(os.path.expanduser("~/repos/worldwide")).resolve()
     files_to_open = [
-        os.path.join(workspace, "oos.r"),
-        os.path.join(workspace, "validation_functions/collate.r"),
+        workspace / "oos.r",
+        workspace / "validation_functions/collate.r",
     ]
 
     # Verify files exist
     for f in files_to_open:
-        if not os.path.exists(f):
+        if not f.exists():
             print(f"Error: File not found: {f}")
             sys.exit(1)
 
-    raven_path = os.path.expanduser("~/repos/raven/target/release/raven")
+    raven_path = Path(os.path.expanduser("~/repos/raven/target/release/raven")).resolve()
+
+    # Preflight check: fail fast with a clear message.
+    if not raven_path.exists():
+        print(f"Error: Raven binary not found: {raven_path}", file=sys.stderr)
+        sys.exit(1)
+    if not os.access(raven_path, os.X_OK):
+        print(f"Error: Raven binary is not executable: {raven_path}", file=sys.stderr)
+        sys.exit(1)
 
     # Start Raven with perf logging
     env = os.environ.copy()
@@ -94,11 +120,11 @@ def main():
     stderr_lines = []
 
     proc = subprocess.Popen(
-        [raven_path, "--stdio"],
+        [str(raven_path), "--stdio"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=workspace,
+        cwd=str(workspace),
         env=env,
         bufsize=0,  # Unbuffered binary mode
     )
@@ -111,20 +137,22 @@ def main():
     print(f"  Process spawned: {(spawn_time - start_time)*1000:.1f}ms")
 
     # Send initialize
+    workspace_uri = workspace.as_uri()
+
     send_message(proc, {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
         "params": {
             "processId": os.getpid(),
-            "rootUri": f"file://{workspace}",
+            "rootUri": workspace_uri,
             "capabilities": {
                 "textDocument": {
                     "publishDiagnostics": {"relatedInformation": True}
                 }
             },
             "workspaceFolders": [
-                {"uri": f"file://{workspace}", "name": "worldwide"}
+                {"uri": workspace_uri, "name": "worldwide"}
             ],
             "initializationOptions": {
                 "crossFile": {
@@ -163,7 +191,7 @@ def main():
         with open(file_path, 'r') as f:
             content = f.read()
 
-        file_uri = f"file://{file_path}"
+        file_uri = file_path.as_uri()
         send_message(proc, {
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
@@ -177,7 +205,7 @@ def main():
             }
         })
         open_time = time.time()
-        print(f"  Opened {os.path.basename(file_path)}: {(open_time - start_time)*1000:.1f}ms")
+        print(f"  Opened {file_path.name}: {(open_time - start_time)*1000:.1f}ms")
 
     # Wait for diagnostics
     print("\nWaiting for diagnostics...")
@@ -203,12 +231,12 @@ def main():
                 print(f"\n  First diagnostic: {(now - start_time)*1000:.1f}ms (total)")
                 print(f"    From initialized: {(now - initialized_sent_time)*1000:.1f}ms")
 
-            basename = os.path.basename(uri.replace("file://", ""))
+            basename = Path(unquote(urlparse(uri).path)).name
             diagnostics_by_file[basename] = len(diags)
             print(f"    {basename}: {len(diags)} diagnostics @ {(now - start_time)*1000:.1f}ms")
 
             # Check if we have diagnostics for all opened files
-            opened_basenames = {os.path.basename(f) for f in files_to_open}
+            opened_basenames = {f.name for f in files_to_open}
             if opened_basenames.issubset(diagnostics_by_file.keys()):
                 all_diagnostics_time = now
                 break
