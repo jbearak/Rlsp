@@ -38,6 +38,7 @@ xdg = "2.5.2"
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.4"
 tempfile = "3"
+tokio = { version = "1.26.0", features = ["test-util"] }
 
 [[bench]]
 name = "startup"

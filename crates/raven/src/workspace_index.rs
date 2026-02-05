@@ -1368,6 +1368,9 @@ mod tests {
                 .unwrap();
 
             rt.block_on(async {
+                // Pause time so tests run instantly with simulated time
+                tokio::time::pause();
+
                 // Use a short debounce for faster tests
                 let debounce_ms = 50u64;
                 let config = WorkspaceIndexConfig {
@@ -1473,6 +1476,9 @@ mod tests {
                 .unwrap();
 
             rt.block_on(async {
+                // Pause time so tests run instantly with simulated time
+                tokio::time::pause();
+
                 let debounce_ms = 100u64;
                 let config = WorkspaceIndexConfig {
                     debounce_ms,
@@ -1548,6 +1554,9 @@ mod tests {
                 .unwrap();
 
             rt.block_on(async {
+                // Pause time so tests run instantly with simulated time
+                tokio::time::pause();
+
                 let debounce_ms = 50u64;
                 let config = WorkspaceIndexConfig {
                     debounce_ms,
