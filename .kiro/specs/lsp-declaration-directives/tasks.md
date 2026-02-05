@@ -18,7 +18,7 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
     - Ensure default values are empty vectors
     - _Requirements: 3.1, 3.2_
   
-  - [ ]* 1.3 Write property test for metadata serialization round-trip
+  - [ ] 1.3 Write property test for metadata serialization round-trip
     - **Property 3: Metadata Serialization Round-Trip**
     - **Validates: Requirements 3.3**
 
@@ -41,11 +41,11 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
     - Skip directives with empty/whitespace-only symbol names
     - _Requirements: 1.4, 1.5, 2.4, 2.5, 3.4_
   
-  - [ ]* 2.4 Write property test for directive parsing completeness
+  - [ ] 2.4 Write property test for directive parsing completeness
     - **Property 1: Directive Parsing Completeness**
     - **Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 2.1, 2.2, 2.3, 2.4, 2.5**
   
-  - [ ]* 2.5 Write property test for required @ prefix
+  - [ ] 2.5 Write property test for required @ prefix
     - **Property 2: Required @ Prefix**
     - **Validates: Requirements 1.6, 2.6**
 
@@ -70,7 +70,7 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
     - Exclude declared symbol if event line > query line
     - _Requirements: 4.1, 4.2_
   
-  - [ ]* 4.4 Write property test for position-aware scope inclusion
+  - [ ] 4.4 Write property test for position-aware scope inclusion
     - **Property 4: Position-Aware Scope Inclusion**
     - Verify symbol on line N is NOT available on line N, but IS available on line N+1
     - **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 4.6**
@@ -81,7 +81,7 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
     - Include symbol name and kind (function/variable) in hash
     - _Requirements: 10.1, 10.2, 10.3, 10.4_
   
-  - [ ]* 5.2 Write property test for interface hash sensitivity
+  - [ ] 5.2 Write property test for interface hash sensitivity
     - **Property 8: Interface Hash Sensitivity**
     - **Validates: Requirements 10.1, 10.2, 10.3, 10.4**
 
@@ -95,7 +95,7 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
     - Maintain case-sensitive matching
     - _Requirements: 5.1, 5.2, 5.3, 5.4_
   
-  - [ ]* 7.2 Write property test for diagnostic suppression
+  - [ ] 7.2 Write property test for diagnostic suppression
     - **Property 5: Diagnostic Suppression**
     - **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
 
@@ -106,7 +106,7 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
     - Only include symbols in scope at completion position
     - _Requirements: 6.1, 6.2, 6.3, 6.4_
   
-  - [ ]* 8.2 Write property test for completion inclusion with correct kind
+  - [ ] 8.2 Write property test for completion inclusion with correct kind
     - **Property 6: Completion Inclusion with Correct Kind**
     - **Validates: Requirements 6.1, 6.2, 6.3, 6.4**
 
@@ -134,7 +134,7 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
     - Follow same inheritance rules as regular symbols
     - _Requirements: 9.1, 9.2, 9.3_
   
-  - [ ]* 12.2 Write property test for cross-file declaration inheritance
+  - [ ] 12.2 Write property test for cross-file declaration inheritance
     - **Property 7: Cross-File Declaration Inheritance**
     - Include tests with `local=TRUE` source() calls
     - **Validates: Requirements 9.1, 9.2, 9.3, 9.4**
@@ -146,7 +146,7 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
     - Diagnostic suppression applies regardless of kind
     - _Requirements: 11.1, 11.2, 11.3, 11.4_
 
-  - [ ]* 13.2 Write property test for conflicting declaration resolution
+  - [ ] 13.2 Write property test for conflicting declaration resolution
     - **Property 9: Conflicting Declaration Resolution**
     - **Validates: Requirements 11.1, 11.2, 11.3, 11.4**
 
@@ -161,7 +161,7 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
     - Re-extract from live content when file is opened
     - _Requirements: 12.2, 12.3_
 
-  - [ ]* 14.3 Write property test for workspace index declaration extraction
+  - [ ] 14.3 Write property test for workspace index declaration extraction
     - **Property 10: Workspace Index Declaration Extraction**
     - **Validates: Requirements 12.1, 12.2, 12.3**
 
@@ -170,7 +170,6 @@ This plan implements declaration directives (`@lsp-var`, `@lsp-func` and synonym
 
 ## Notes
 
-- Tasks marked with `*` are optional property tests that can be skipped for faster MVP
 - Each task references specific requirements for traceability
 - Checkpoints ensure incremental validation
 - Property tests validate universal correctness properties
