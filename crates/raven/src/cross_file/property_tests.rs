@@ -23209,7 +23209,16 @@ proptest! {
             last_is_function = is_function;
         }
         
-        lines.push("x <- 42".to_string());
+        // Use a dummy variable name that cannot collide with the declared symbol_name.
+        // If symbol_name happens to be "x", a plain `x <- 42` would create a real
+        // definition that overrides the declared kind (real definitions take precedence
+        // over declarations). Using a guaranteed-unique name avoids this.
+        let dummy_var = if symbol_name == "dummy_var_placeholder" {
+            "dummy_var_placeholder2".to_string()
+        } else {
+            "dummy_var_placeholder".to_string()
+        };
+        lines.push(format!("{} <- 42", dummy_var));
 
         let code = lines.join("\n");
         let tree = parse_r_tree(&code);
