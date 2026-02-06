@@ -12,6 +12,90 @@ use std::sync::{Arc, RwLock};
 
 use ropey::Rope;
 use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
+/// Symbol provider configuration
+///
+/// Controls behavior of document symbol and workspace symbol providers.
+///
+/// # Configuration Options
+///
+/// - `workspace_max_results`: Maximum number of symbols returned by workspace symbol queries.
+///   Limits results to prevent overwhelming the client with large result sets.
+///   Valid range: 100-10000 (values outside this range are clamped).
+///
+/// # Requirements
+///
+/// - **11.1**: Default value of 1000 for workspace_max_results
+/// - **11.2**: Configurable via `symbols.workspaceMaxResults` initialization option
+/// - **11.3**: Valid range 100-10000 with clamping
+#[derive(Debug, Clone)]
+pub struct SymbolConfig {
+    /// Maximum workspace symbol results (default: 1000)
+    ///
+    /// When a workspace symbol query returns more results than this limit,
+    /// the results are truncated. Valid range: 100-10000.
+    pub workspace_max_results: usize,
+
+    /// Whether the client supports hierarchical document symbols.
+    ///
+    /// When true, the document symbol provider returns `DocumentSymbol[]` (nested structure).
+    /// When false, it returns `SymbolInformation[]` (flat structure) as fallback.
+    ///
+    /// This capability is detected from the client's `InitializeParams` at:
+    /// `params.capabilities.text_document.document_symbol.hierarchical_document_symbol_support`
+    ///
+    /// Requirements 1.1, 1.2: Response type selection based on client capability.
+    pub hierarchical_document_symbol_support: bool,
+}
+
+impl Default for SymbolConfig {
+    fn default() -> Self {
+        Self {
+            workspace_max_results: 1000,
+            // Default to false (flat response) until client capability is detected
+            hierarchical_document_symbol_support: false,
+        }
+    }
+}
+
+impl SymbolConfig {
+    /// Minimum allowed value for workspace_max_results
+    pub const MIN_WORKSPACE_MAX_RESULTS: usize = 100;
+
+    /// Maximum allowed value for workspace_max_results
+    pub const MAX_WORKSPACE_MAX_RESULTS: usize = 10000;
+
+    /// Default value for workspace_max_results
+    pub const DEFAULT_WORKSPACE_MAX_RESULTS: usize = 1000;
+
+    /// Create a new SymbolConfig with the given workspace_max_results value.
+    ///
+    /// The value is clamped to the valid range [100, 10000].
+    /// The hierarchical_document_symbol_support field defaults to false.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let config = SymbolConfig::with_max_results(500);
+    /// assert_eq!(config.workspace_max_results, 500);
+    ///
+    /// // Values below minimum are clamped
+    /// let config = SymbolConfig::with_max_results(50);
+    /// assert_eq!(config.workspace_max_results, 100);
+    ///
+    /// // Values above maximum are clamped
+    /// let config = SymbolConfig::with_max_results(20000);
+    /// assert_eq!(config.workspace_max_results, 10000);
+    /// ```
+    pub fn with_max_results(value: usize) -> Self {
+        Self {
+            workspace_max_results: value
+                .clamp(Self::MIN_WORKSPACE_MAX_RESULTS, Self::MAX_WORKSPACE_MAX_RESULTS),
+            hierarchical_document_symbol_support: false,
+        }
+    }
+}
+
+
 use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
@@ -419,6 +503,9 @@ pub struct WorldState {
 
     // Cross-file state
     pub cross_file_config: CrossFileConfig,
+    /// Symbol provider configuration
+    /// Controls document symbol and workspace symbol behavior
+    pub symbol_config: SymbolConfig,
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
     pub cross_file_cache: ArtifactsCache,
@@ -510,6 +597,7 @@ impl WorldState {
 
             // Cross-file state
             cross_file_config: config,
+            symbol_config: SymbolConfig::default(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             cross_file_cache: ArtifactsCache::new(),
@@ -1091,5 +1179,132 @@ mod tests {
         assert_eq!(utf16_offset_to_char_offset(line, 1), 1); // after 'a'
         assert_eq!(utf16_offset_to_char_offset(line, 2), 2); // after '中'
         assert_eq!(utf16_offset_to_char_offset(line, 3), 3); // after 'b'
+    }
+
+    // ============================================================================
+    // SymbolConfig Tests
+    // **Validates: Requirements 11.1, 11.2, 11.3**
+    // ============================================================================
+
+    #[test]
+    fn test_symbol_config_default() {
+        // **Validates: Requirement 11.1**
+        // The default value for workspace_max_results SHALL be 1000
+        let config = SymbolConfig::default();
+        assert_eq!(config.workspace_max_results, 1000);
+        assert_eq!(
+            config.workspace_max_results,
+            SymbolConfig::DEFAULT_WORKSPACE_MAX_RESULTS
+        );
+    }
+
+    #[test]
+    fn test_symbol_config_constants() {
+        // **Validates: Requirement 11.3**
+        // Valid range is 100-10000
+        assert_eq!(SymbolConfig::MIN_WORKSPACE_MAX_RESULTS, 100);
+        assert_eq!(SymbolConfig::MAX_WORKSPACE_MAX_RESULTS, 10000);
+        assert_eq!(SymbolConfig::DEFAULT_WORKSPACE_MAX_RESULTS, 1000);
+    }
+
+    #[test]
+    fn test_symbol_config_with_max_results_valid() {
+        // **Validates: Requirement 11.3**
+        // Values within range should be accepted as-is
+        let config = SymbolConfig::with_max_results(500);
+        assert_eq!(config.workspace_max_results, 500);
+
+        let config = SymbolConfig::with_max_results(100);
+        assert_eq!(config.workspace_max_results, 100);
+
+        let config = SymbolConfig::with_max_results(10000);
+        assert_eq!(config.workspace_max_results, 10000);
+
+        let config = SymbolConfig::with_max_results(5000);
+        assert_eq!(config.workspace_max_results, 5000);
+    }
+
+    #[test]
+    fn test_symbol_config_with_max_results_clamp_low() {
+        // **Validates: Requirement 11.3**
+        // Values below minimum should be clamped to 100
+        let config = SymbolConfig::with_max_results(50);
+        assert_eq!(config.workspace_max_results, 100);
+
+        let config = SymbolConfig::with_max_results(0);
+        assert_eq!(config.workspace_max_results, 100);
+
+        let config = SymbolConfig::with_max_results(99);
+        assert_eq!(config.workspace_max_results, 100);
+    }
+
+    #[test]
+    fn test_symbol_config_with_max_results_clamp_high() {
+        // **Validates: Requirement 11.3**
+        // Values above maximum should be clamped to 10000
+        let config = SymbolConfig::with_max_results(20000);
+        assert_eq!(config.workspace_max_results, 10000);
+
+        let config = SymbolConfig::with_max_results(10001);
+        assert_eq!(config.workspace_max_results, 10000);
+
+        let config = SymbolConfig::with_max_results(usize::MAX);
+        assert_eq!(config.workspace_max_results, 10000);
+    }
+
+    #[test]
+    fn test_symbol_config_clone() {
+        let config = SymbolConfig::with_max_results(750);
+        let cloned = config.clone();
+        assert_eq!(cloned.workspace_max_results, 750);
+        assert_eq!(
+            cloned.hierarchical_document_symbol_support,
+            config.hierarchical_document_symbol_support
+        );
+    }
+
+    #[test]
+    fn test_symbol_config_debug() {
+        let config = SymbolConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("SymbolConfig"));
+        assert!(debug_str.contains("workspace_max_results"));
+        assert!(debug_str.contains("1000"));
+        assert!(debug_str.contains("hierarchical_document_symbol_support"));
+    }
+
+    // ============================================================================
+    // SymbolConfig hierarchical_document_symbol_support Tests
+    // **Validates: Requirements 1.1, 1.2**
+    // ============================================================================
+
+    #[test]
+    fn test_symbol_config_hierarchical_support_default_false() {
+        // **Validates: Requirements 1.1, 1.2**
+        // Default should be false (flat response) until client capability is detected
+        let config = SymbolConfig::default();
+        assert!(!config.hierarchical_document_symbol_support);
+    }
+
+    #[test]
+    fn test_symbol_config_with_max_results_hierarchical_default_false() {
+        // **Validates: Requirements 1.1, 1.2**
+        // with_max_results should also default hierarchical support to false
+        let config = SymbolConfig::with_max_results(500);
+        assert!(!config.hierarchical_document_symbol_support);
+    }
+
+    #[test]
+    fn test_symbol_config_hierarchical_support_can_be_set() {
+        // **Validates: Requirements 1.1, 1.2**
+        // The field should be settable after initialization
+        let mut config = SymbolConfig::default();
+        assert!(!config.hierarchical_document_symbol_support);
+
+        config.hierarchical_document_symbol_support = true;
+        assert!(config.hierarchical_document_symbol_support);
+
+        config.hierarchical_document_symbol_support = false;
+        assert!(!config.hierarchical_document_symbol_support);
     }
 }

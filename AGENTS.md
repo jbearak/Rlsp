@@ -661,6 +661,44 @@ Manual tagging (`git tag vX.Y.Z && git push origin vX.Y.Z`) triggers GitHub Acti
 
 4. **Add tests** for diagnostic generation and severity configuration
 
+### Symbol Provider Architecture
+
+The document symbol and workspace symbol providers use a two-phase extraction and hierarchy building approach:
+
+**Components:**
+
+1. **SymbolExtractor** (`handlers.rs`):
+   - Extracts raw symbols from parsed R documents
+   - Detects assignments (functions, variables, constants)
+   - Detects S4 methods (`setMethod`, `setClass`, `setGeneric`)
+   - Detects R code sections (`# Section ----` pattern)
+   - Classifies symbol kinds (ALL_CAPS → CONSTANT, R6Class → CLASS, etc.)
+   - Extracts function signatures for detail field
+
+2. **HierarchyBuilder** (`handlers.rs`):
+   - Builds hierarchical `DocumentSymbol[]` from flat symbols
+   - Computes section ranges (from comment to next section or EOF)
+   - Nests symbols within sections based on position
+   - Nests symbols within function bodies based on containment
+   - Supports arbitrary nesting depth
+
+3. **DocumentSymbolKind** (`handlers.rs`):
+   - Extended symbol kind enum for richer LSP mapping
+   - Variants: Function, Variable, Constant, Class, Method, Interface, Module
+   - `to_lsp_kind()` method for LSP SymbolKind conversion
+
+4. **SymbolConfig** (`state.rs`):
+   - Configuration for symbol providers
+   - `workspace_max_results`: Limits workspace symbol results (default: 1000)
+   - `hierarchical_document_symbol_support`: Client capability flag
+
+**Key Patterns:**
+
+- R code sections use regex: `^\s*#(#*)\s*(%%)?\s*(\S.+?)\s*(#{4,}|-{4,}|={4,}|\*{4,}|\+{4,})\s*$`
+- ALL_CAPS constants: `^[A-Z][A-Z0-9_.]+$` (min 2 chars)
+- Reserved words are filtered from both document and workspace symbols
+- Workspace symbols include `containerName` (filename without extension)
+
 ### Testing Strategies
 
 **Unit Tests:**

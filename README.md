@@ -81,7 +81,8 @@ For files that aren't explicitly sourced, add a directive:
 - **Find references** - Locate all symbol usages project-wide
 - **Completions** - Intelligent completion including symbols from sourced files
 - **Hover** - Symbol information on hover
-- **Document symbols** - Outline view for R files
+- **Document symbols** - Hierarchical outline view with R code section support (`# Section ----`), S4/R6 class detection, and nested function display
+- **Workspace symbols** - Fast project-wide symbol search (Ctrl+T) with configurable result limits
 - **Workspace indexing** - Background indexing of your entire project
 - **Package awareness** - Recognition of `library()` calls and package exports
 

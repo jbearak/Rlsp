@@ -250,6 +250,13 @@
           ],
           "default": "warning",
           "description": "Severity level for diagnostics when a package referenced in library() cannot be found. Controls how missing package references are reported in the editor."
+        },
+        "raven.symbols.workspaceMaxResults": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 100,
+          "maximum": 10000,
+          "description": "Maximum number of symbols returned by workspace symbol search (Ctrl+T / Cmd+T). Higher values show more results but may impact performance. Valid range: 100-10000."
         }
       }
     }

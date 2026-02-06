@@ -34,6 +34,12 @@ All settings can be configured via VS Code settings or LSP initialization option
 | `raven.packages.rPath` | auto-detect | Path to R executable for subprocess calls |
 | `raven.packages.missingPackageSeverity` | "warning" | Severity for missing package diagnostics |
 
+## Symbol Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `raven.symbols.workspaceMaxResults` | 1000 | Maximum number of symbols returned by workspace symbol search (Ctrl+T). Valid range: 100-10000. Values outside this range are clamped to the nearest boundary. |
+
 ## Severity Values
 
 All severity settings accept one of:

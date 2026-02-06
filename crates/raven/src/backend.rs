@@ -19,7 +19,7 @@ use tower_lsp::Server;
 use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::r_env;
-use crate::state::{scan_workspace, WorldState};
+use crate::state::{scan_workspace, SymbolConfig, WorldState};
 
 /// Category of files for on-demand indexing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +378,62 @@ fn parse_optional_severity(s: &str) -> Option<DiagnosticSeverity> {
     }
 }
 
+/// Parse symbol provider configuration from LSP settings.
+///
+/// Reads the `symbols` section from a serde_json::Value and constructs a
+/// populated `SymbolConfig`. Only fields present in the provided JSON are
+/// applied; absent fields retain their defaults from `SymbolConfig::default()`.
+///
+/// Supported settings:
+/// - `symbols.workspaceMaxResults`: Maximum number of workspace symbol results (100-10000)
+///
+/// # Returns
+///
+/// `Some(SymbolConfig)` populated from `settings` when the `symbols` section is present;
+/// `None` if the section is missing.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// let settings = json!({
+///     "symbols": {
+///         "workspaceMaxResults": 500
+///     }
+/// });
+///
+/// let cfg = crate::backend::parse_symbol_config(&settings);
+/// assert!(cfg.is_some());
+/// let cfg = cfg.unwrap();
+/// assert_eq!(cfg.workspace_max_results, 500);
+/// ```
+///
+/// # Requirements
+///
+/// - **11.1**: Default value of 1000 for workspace_max_results
+/// - **11.2**: Configurable via `symbols.workspaceMaxResults` initialization option
+/// - **11.3**: Valid range 100-10000 with clamping
+pub(crate) fn parse_symbol_config(settings: &serde_json::Value) -> Option<SymbolConfig> {
+    let symbols = settings.get("symbols")?;
+
+    let mut config = SymbolConfig::default();
+
+    // Parse symbols.workspaceMaxResults
+    // Requirement 11.2: Configurable via symbols.workspaceMaxResults
+    // Requirement 11.3: Valid range 100-10000 with clamping
+    if let Some(v) = symbols.get("workspaceMaxResults").and_then(|v| v.as_u64()) {
+        config = SymbolConfig::with_max_results(v as usize);
+    }
+
+    log::info!("Symbol configuration loaded from LSP settings:");
+    log::info!(
+        "  workspace_max_results: {}",
+        config.workspace_max_results
+    );
+
+    Some(config)
+}
+
 pub struct Backend {
     client: Client,
     state: Arc<RwLock<WorldState>>,
@@ -481,6 +537,38 @@ impl LanguageServer for Backend {
             log::info!("Adding root URI as workspace folder: {}", root_uri);
             state.workspace_folders.push(root_uri);
         }
+
+        // Parse initialization options for configuration
+        // Requirement 11.2: Parse symbols.workspaceMaxResults from initialization options
+        if let Some(ref init_options) = params.initialization_options {
+            // Parse cross-file configuration
+            if let Some(config) = parse_cross_file_config(init_options) {
+                state.cross_file_config = config;
+            }
+
+            // Parse symbol configuration
+            // Requirement 11.3: Valid range 100-10000 with clamping
+            if let Some(config) = parse_symbol_config(init_options) {
+                state.symbol_config = config;
+            }
+        }
+
+        // Detect client capability for hierarchical document symbols
+        // Requirements 1.1, 1.2: Response type selection based on client capability
+        // Path: params.capabilities.text_document.document_symbol.hierarchical_document_symbol_support
+        let hierarchical_support = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.document_symbol.as_ref())
+            .and_then(|ds| ds.hierarchical_document_symbol_support)
+            .unwrap_or(false);
+
+        state.symbol_config.hierarchical_document_symbol_support = hierarchical_support;
+        log::info!(
+            "Client hierarchicalDocumentSymbolSupport: {}",
+            hierarchical_support
+        );
 
         drop(state);
 
@@ -1853,6 +1941,10 @@ impl LanguageServer for Backend {
         // Parse new configuration if provided
         let new_config = parse_cross_file_config(&params.settings);
 
+        // Parse symbol configuration if provided
+        // Requirement 11.2: Parse symbols.workspaceMaxResults from settings
+        let new_symbol_config = parse_symbol_config(&params.settings);
+
         // Log if configuration parsing failed and defaults will be used
         if new_config.is_none() {
             log::warn!("Failed to parse cross-file configuration from settings, using existing configuration");
@@ -1920,6 +2012,12 @@ impl LanguageServer for Backend {
             // Apply new config if parsed
             if let Some(config) = new_config {
                 state.cross_file_config = config;
+            }
+
+            // Apply new symbol config if parsed
+            // Requirement 11.2: Apply symbols.workspaceMaxResults from settings
+            if let Some(config) = new_symbol_config {
+                state.symbol_config = config;
             }
 
             // Invalidate all scope caches since config affects resolution
@@ -3554,6 +3652,143 @@ mod tests {
             );
             assert!(sourced_indexed, "Sourced file indexing should occur");
             assert!(backward_indexed, "Backward directive indexing should occur");
+        }
+    }
+
+    // ============================================================================
+    // Unit Tests for Symbol Configuration Parsing
+    // **Validates: Requirements 11.1, 11.2, 11.3**
+    // ============================================================================
+    mod symbol_config_parsing {
+        use serde_json::json;
+        use crate::state::SymbolConfig;
+
+        /// Test that parse_symbol_config returns None when symbols section is absent
+        /// **Validates: Requirements 11.1**
+        #[test]
+        fn test_missing_symbols_section_returns_none() {
+            let settings = json!({
+                "crossFile": {}
+            });
+
+            let config = crate::backend::parse_symbol_config(&settings);
+            assert!(config.is_none(), "Should return None when symbols section is absent");
+        }
+
+        /// Test that parse_symbol_config returns default when symbols section is empty
+        /// **Validates: Requirements 11.1**
+        #[test]
+        fn test_empty_symbols_section_returns_default() {
+            let settings = json!({
+                "symbols": {}
+            });
+
+            let config = crate::backend::parse_symbol_config(&settings);
+            assert!(config.is_some(), "Should return Some when symbols section exists");
+            let config = config.unwrap();
+            assert_eq!(
+                config.workspace_max_results,
+                SymbolConfig::DEFAULT_WORKSPACE_MAX_RESULTS,
+                "Should use default value when workspaceMaxResults is absent"
+            );
+        }
+
+        /// Test that parse_symbol_config parses workspaceMaxResults correctly
+        /// **Validates: Requirements 11.2**
+        #[test]
+        fn test_parse_workspace_max_results() {
+            let settings = json!({
+                "symbols": {
+                    "workspaceMaxResults": 500
+                }
+            });
+
+            let config = crate::backend::parse_symbol_config(&settings);
+            assert!(config.is_some(), "Should return Some when symbols section exists");
+            let config = config.unwrap();
+            assert_eq!(
+                config.workspace_max_results, 500,
+                "Should parse workspaceMaxResults value"
+            );
+        }
+
+        /// Test that values below minimum are clamped to 100
+        /// **Validates: Requirements 11.3**
+        #[test]
+        fn test_clamp_below_minimum() {
+            let settings = json!({
+                "symbols": {
+                    "workspaceMaxResults": 50
+                }
+            });
+
+            let config = crate::backend::parse_symbol_config(&settings);
+            assert!(config.is_some(), "Should return Some when symbols section exists");
+            let config = config.unwrap();
+            assert_eq!(
+                config.workspace_max_results,
+                SymbolConfig::MIN_WORKSPACE_MAX_RESULTS,
+                "Values below minimum should be clamped to 100"
+            );
+        }
+
+        /// Test that values above maximum are clamped to 10000
+        /// **Validates: Requirements 11.3**
+        #[test]
+        fn test_clamp_above_maximum() {
+            let settings = json!({
+                "symbols": {
+                    "workspaceMaxResults": 20000
+                }
+            });
+
+            let config = crate::backend::parse_symbol_config(&settings);
+            assert!(config.is_some(), "Should return Some when symbols section exists");
+            let config = config.unwrap();
+            assert_eq!(
+                config.workspace_max_results,
+                SymbolConfig::MAX_WORKSPACE_MAX_RESULTS,
+                "Values above maximum should be clamped to 10000"
+            );
+        }
+
+        /// Test that boundary values are accepted
+        /// **Validates: Requirements 11.3**
+        #[test]
+        fn test_boundary_values_accepted() {
+            // Test minimum boundary
+            let settings = json!({
+                "symbols": {
+                    "workspaceMaxResults": 100
+                }
+            });
+            let config = crate::backend::parse_symbol_config(&settings).unwrap();
+            assert_eq!(config.workspace_max_results, 100, "Minimum boundary should be accepted");
+
+            // Test maximum boundary
+            let settings = json!({
+                "symbols": {
+                    "workspaceMaxResults": 10000
+                }
+            });
+            let config = crate::backend::parse_symbol_config(&settings).unwrap();
+            assert_eq!(config.workspace_max_results, 10000, "Maximum boundary should be accepted");
+        }
+
+        /// Test that default value is 1000
+        /// **Validates: Requirements 11.1**
+        #[test]
+        fn test_default_value_is_1000() {
+            assert_eq!(
+                SymbolConfig::DEFAULT_WORKSPACE_MAX_RESULTS,
+                1000,
+                "Default value should be 1000"
+            );
+            assert_eq!(
+                SymbolConfig::default().workspace_max_results,
+                1000,
+                "Default config should have workspace_max_results = 1000"
+            );
         }
     }
 }

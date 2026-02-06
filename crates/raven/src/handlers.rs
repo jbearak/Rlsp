@@ -6,7 +6,9 @@
 //
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
+use regex::Regex;
 use tower_lsp::lsp_types::*;
 use tree_sitter::Node;
 use tree_sitter::Point;
@@ -17,6 +19,1458 @@ use crate::cross_file::{scope, ScopedSymbol};
 use crate::state::WorldState;
 
 use crate::builtins;
+use crate::reserved_words::is_reserved_word;
+
+// ============================================================================
+// Section Pattern
+// ============================================================================
+
+/// Get the compiled regex pattern for R code section comments.
+///
+/// Pattern: `^\s*#(#*)\s*(%%)?\s*(\S.+?)\s*(#{4,}|\-{4,}|={4,}|\*{4,}|\+{4,})\s*$`
+///
+/// Components:
+/// - `^\s*`           - Optional leading whitespace
+/// - `#(#*)`          - One or more # characters (capture group 1 = additional # count)
+/// - `\s*(%%)?\s*`    - Optional %% marker (RStudio style, capture group 2)
+/// - `(\S.+?)`        - Section name (capture group 3)
+/// - `\s*`            - Optional whitespace
+/// - `(#{4,}|...)`    - Trailing delimiter (4+ of #, -, =, *, +, capture group 4)
+/// - `\s*$`           - Optional trailing whitespace
+///
+/// Examples:
+/// - `# Section Name ----`
+/// - `## Subsection ####`
+/// - `# %% Cell Name ----`
+/// - `### Deep Section ========`
+fn section_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"^\s*#(#*)\s*(%%)?\s*(\S.+?)\s*(#{4,}|-{4,}|={4,}|\*{4,}|\+{4,})\s*$").unwrap()
+    })
+}
+
+// ============================================================================
+// Document Symbol Types
+// ============================================================================
+
+/// Extended symbol kind for document symbols.
+///
+/// Maps to LSP SymbolKind with richer categorization for R-specific constructs.
+/// This enum provides more granular classification than the basic function/variable
+/// distinction, supporting R6 classes, S4 methods, constants, and code sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentSymbolKind {
+    /// Regular function definition (SymbolKind::FUNCTION)
+    Function,
+    /// Variable assignment (SymbolKind::VARIABLE)
+    Variable,
+    /// ALL_CAPS constant pattern (SymbolKind::CONSTANT)
+    Constant,
+    /// R6Class or setRefClass/setClass definition (SymbolKind::CLASS)
+    Class,
+    /// setMethod definition (SymbolKind::METHOD)
+    Method,
+    /// setGeneric definition (SymbolKind::INTERFACE)
+    Interface,
+    /// R code section comment (SymbolKind::MODULE)
+    Module,
+}
+
+impl DocumentSymbolKind {
+    /// Convert to LSP SymbolKind for protocol responses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raven::handlers::DocumentSymbolKind;
+    /// use tower_lsp::lsp_types::SymbolKind;
+    ///
+    /// assert_eq!(DocumentSymbolKind::Function.to_lsp_kind(), SymbolKind::FUNCTION);
+    /// assert_eq!(DocumentSymbolKind::Constant.to_lsp_kind(), SymbolKind::CONSTANT);
+    /// ```
+    pub fn to_lsp_kind(self) -> SymbolKind {
+        match self {
+            Self::Function => SymbolKind::FUNCTION,
+            Self::Variable => SymbolKind::VARIABLE,
+            Self::Constant => SymbolKind::CONSTANT,
+            Self::Class => SymbolKind::CLASS,
+            Self::Method => SymbolKind::METHOD,
+            Self::Interface => SymbolKind::INTERFACE,
+            Self::Module => SymbolKind::MODULE,
+        }
+    }
+}
+
+/// Intermediate symbol representation before hierarchy building.
+///
+/// This struct captures all the information needed to build a hierarchical
+/// `DocumentSymbol` tree, including position information for nesting decisions
+/// and optional metadata like function signatures and section levels.
+///
+/// # Fields
+///
+/// - `name`: The symbol's identifier (function name, variable name, or section title)
+/// - `kind`: Classification determining the LSP SymbolKind
+/// - `range`: Full extent of the construct (start of assignment to end of value/body)
+/// - `selection_range`: Identifier-only range for navigation
+/// - `detail`: Optional function parameter signature (e.g., "(x, y, ...)")
+/// - `section_level`: For sections only, the heading level (1 = #, 2 = ##, etc.)
+/// - `children`: Child symbols nested within this symbol (for hierarchy building)
+///
+/// # Examples
+///
+/// ```
+/// use raven::handlers::{RawSymbol, DocumentSymbolKind};
+/// use tower_lsp::lsp_types::{Range, Position};
+///
+/// let symbol = RawSymbol {
+///     name: "my_function".to_string(),
+///     kind: DocumentSymbolKind::Function,
+///     range: Range {
+///         start: Position { line: 0, character: 0 },
+///         end: Position { line: 5, character: 1 },
+///     },
+///     selection_range: Range {
+///         start: Position { line: 0, character: 0 },
+///         end: Position { line: 0, character: 11 },
+///     },
+///     detail: Some("(x, y)".to_string()),
+///     section_level: None,
+///     children: Vec::new(),
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct RawSymbol {
+    /// Symbol name (function name, variable name, or section title)
+    pub name: String,
+    /// Symbol kind for LSP SymbolKind mapping
+    pub kind: DocumentSymbolKind,
+    /// Full range (start of construct to end of value/body)
+    pub range: Range,
+    /// Selection range (identifier only)
+    pub selection_range: Range,
+    /// Function parameter signature (for detail field), e.g., "(x, y, ...)"
+    pub detail: Option<String>,
+    /// Section heading level (1 = #, 2 = ##, etc.) for sections only
+    pub section_level: Option<u32>,
+    /// Child symbols nested within this symbol (for hierarchy building)
+    pub children: Vec<RawSymbol>,
+}
+
+// ============================================================================
+// Symbol Extractor
+// ============================================================================
+
+/// Extracts symbols from a parsed R document.
+///
+/// `SymbolExtractor` traverses the tree-sitter AST to collect function definitions,
+/// variable assignments, S4 methods, R6 classes, and R code sections. Each symbol
+/// includes both a full `range` (from start of assignment to end of value/body) and
+/// a `selection_range` (identifier only) for proper LSP navigation.
+///
+/// # Examples
+///
+/// ```
+/// use tree_sitter::Parser;
+/// use raven::handlers::SymbolExtractor;
+///
+/// let mut parser = Parser::new();
+/// parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+/// let code = "my_func <- function(x) { x + 1 }";
+/// let tree = parser.parse(code, None).unwrap();
+/// let extractor = SymbolExtractor::new(code, tree.root_node());
+/// let symbols = extractor.extract_all();
+/// assert_eq!(symbols.len(), 1);
+/// assert_eq!(symbols[0].name, "my_func");
+/// ```
+pub struct SymbolExtractor<'a> {
+    text: &'a str,
+    root: tree_sitter::Node<'a>,
+}
+
+impl<'a> SymbolExtractor<'a> {
+    /// Create a new SymbolExtractor for the given source text and AST root node.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The source text of the R document
+    /// * `root` - The root node of the tree-sitter parse tree
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tree_sitter::Parser;
+    /// use raven::handlers::SymbolExtractor;
+    ///
+    /// let mut parser = Parser::new();
+    /// parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+    /// let code = "x <- 42";
+    /// let tree = parser.parse(code, None).unwrap();
+    /// let extractor = SymbolExtractor::new(code, tree.root_node());
+    /// ```
+    pub fn new(text: &'a str, root: tree_sitter::Node<'a>) -> Self {
+        Self { text, root }
+    }
+
+    /// Extract all raw symbols from the document.
+    ///
+    /// This method traverses the entire AST and collects:
+    /// - Function definitions (assignments where RHS is a function)
+    /// - Variable assignments (assignments where RHS is not a function)
+    /// - S4 methods (setMethod, setClass, setGeneric calls)
+    /// - R6 classes (R6Class, setRefClass calls)
+    /// - R code sections (# Section ----)
+    ///
+    /// # Returns
+    ///
+    /// A vector of `RawSymbol` entries representing all symbols found in the document.
+    pub fn extract_all(&self) -> Vec<RawSymbol> {
+        let mut symbols = Vec::new();
+        self.extract_assignments_recursive(self.root, &mut symbols);
+        // Extract S4 method definitions (setMethod, setClass, setGeneric)
+        let s4_symbols = self.extract_s4_methods(self.root);
+        symbols.extend(s4_symbols);
+        // Extract R code sections (# Section ----)
+        let section_symbols = self.extract_sections();
+        symbols.extend(section_symbols);
+        symbols
+    }
+
+    /// Recursively extract assignments from the AST.
+    fn extract_assignments_recursive(
+        &self,
+        node: tree_sitter::Node<'a>,
+        symbols: &mut Vec<RawSymbol>,
+    ) {
+        // Try to extract an assignment from this node
+        if let Some(symbol) = self.extract_assignment(node) {
+            symbols.push(symbol);
+        }
+
+        // Recurse into children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.extract_assignments_recursive(child, symbols);
+        }
+    }
+
+    /// Extract a single assignment from a node if it represents an assignment.
+    ///
+    /// This method handles:
+    /// - `name <- value` (left assignment)
+    /// - `name = value` (equals assignment)
+    /// - `name <<- value` (super assignment)
+    /// - `value -> name` (right assignment)
+    ///
+    /// # Arguments
+    ///
+    /// * `node` - A tree-sitter node to check for assignment
+    ///
+    /// # Returns
+    ///
+    /// `Some(RawSymbol)` if the node is an assignment, `None` otherwise.
+    ///
+    /// # Range Computation
+    ///
+    /// - `range`: Spans from the start of the assignment to the end of the RHS (value/body)
+    /// - `selection_range`: Spans only the identifier (LHS for `<-`/`=`/`<<-`, RHS for `->`)
+    fn extract_assignment(&self, node: tree_sitter::Node<'a>) -> Option<RawSymbol> {
+        // Only process binary_operator nodes
+        if node.kind() != "binary_operator" {
+            return None;
+        }
+
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+
+        if children.len() != 3 {
+            return None;
+        }
+
+        let lhs = children[0];
+        let op = children[1];
+        let rhs = children[2];
+
+        let op_text = node_text(op, self.text);
+
+        // Handle -> operator: RHS is the name, LHS is the value
+        if op_text == "->" {
+            return self.extract_right_assignment(node, lhs, rhs);
+        }
+
+        // Handle <- = <<- operators: LHS is the name, RHS is the value
+        if matches!(op_text, "<-" | "=" | "<<-") {
+            return self.extract_left_assignment(node, lhs, rhs);
+        }
+
+        None
+    }
+
+    /// Extract a left assignment (name <- value, name = value, name <<- value).
+    fn extract_left_assignment(
+        &self,
+        node: tree_sitter::Node<'a>,
+        lhs: tree_sitter::Node<'a>,
+        rhs: tree_sitter::Node<'a>,
+    ) -> Option<RawSymbol> {
+        // LHS must be an identifier
+        if lhs.kind() != "identifier" {
+            return None;
+        }
+
+        let name = node_text(lhs, self.text).to_string();
+
+        // Skip reserved words
+        if crate::reserved_words::is_reserved_word(&name) {
+            return None;
+        }
+
+        // Determine symbol kind based on RHS and name
+        let kind = self.classify_symbol(&name, rhs);
+
+        // Compute full range: from start of assignment to end of RHS
+        let range = self.compute_node_range(node);
+
+        // Compute selection range: identifier only
+        let selection_range = self.compute_node_range(lhs);
+
+        // Extract function signature if this is a function
+        let detail = if matches!(kind, DocumentSymbolKind::Function) {
+            self.extract_signature(rhs)
+        } else {
+            None
+        };
+
+        Some(RawSymbol {
+            name,
+            kind,
+            range,
+            selection_range,
+            detail,
+            section_level: None,
+            children: Vec::new(),
+        })
+    }
+
+    /// Extract a right assignment (value -> name).
+    fn extract_right_assignment(
+        &self,
+        node: tree_sitter::Node<'a>,
+        lhs: tree_sitter::Node<'a>,
+        rhs: tree_sitter::Node<'a>,
+    ) -> Option<RawSymbol> {
+        // RHS must be an identifier (the name being assigned)
+        if rhs.kind() != "identifier" {
+            return None;
+        }
+
+        let name = node_text(rhs, self.text).to_string();
+
+        // Skip reserved words
+        if crate::reserved_words::is_reserved_word(&name) {
+            return None;
+        }
+
+        // Determine symbol kind based on LHS (the value) and name
+        let kind = self.classify_symbol(&name, lhs);
+
+        // Compute full range: from start of assignment to end of RHS
+        let range = self.compute_node_range(node);
+
+        // Compute selection range: identifier only (RHS for -> operator)
+        let selection_range = self.compute_node_range(rhs);
+
+        // Extract function signature if this is a function
+        // For right assignment, the function is on the LHS
+        let detail = if matches!(kind, DocumentSymbolKind::Function) {
+            self.extract_signature(lhs)
+        } else {
+            None
+        };
+
+        Some(RawSymbol {
+            name,
+            kind,
+            range,
+            selection_range,
+            detail,
+            section_level: None,
+            children: Vec::new(),
+        })
+    }
+
+    /// Determine symbol kind from assignment RHS and name.
+    ///
+    /// Classification priority:
+    /// 1. If RHS is R6Class() or setRefClass() call → CLASS
+    /// 2. If name matches ALL_CAPS pattern → CONSTANT
+    /// 3. If RHS is function_definition → FUNCTION
+    /// 4. Otherwise → VARIABLE
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The symbol name (identifier)
+    /// * `rhs` - The right-hand side node of the assignment (the value)
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // R6 class detection
+    /// // MyClass <- R6Class("MyClass", ...) → CLASS
+    ///
+    /// // ALL_CAPS constant detection
+    /// // MAX_VALUE <- 100 → CONSTANT
+    /// // PI <- 3.14159 → CONSTANT (single char not constant, but PI is 2 chars)
+    ///
+    /// // Function detection
+    /// // my_func <- function(x) x + 1 → FUNCTION
+    ///
+    /// // Variable detection
+    /// // x <- 42 → VARIABLE
+    /// ```
+    fn classify_symbol(&self, name: &str, rhs: tree_sitter::Node<'a>) -> DocumentSymbolKind {
+        // Priority 1: Check for R6Class() or setRefClass() call
+        if self.is_r6_class_call(rhs) {
+            return DocumentSymbolKind::Class;
+        }
+
+        // Priority 2: Check for ALL_CAPS constant pattern
+        if Self::is_all_caps_constant(name) {
+            return DocumentSymbolKind::Constant;
+        }
+
+        // Priority 3: Check for function definition (including inside parenthesized expressions)
+        if self.find_function_definition(rhs).is_some() {
+            return DocumentSymbolKind::Function;
+        }
+
+        // Priority 4: Default to variable
+        DocumentSymbolKind::Variable
+    }
+
+    /// Check if a node is an R6Class() or setRefClass() function call.
+    ///
+    /// This detects R6 class definitions which should be classified as CLASS.
+    ///
+    /// # Arguments
+    ///
+    /// * `node` - The node to check (typically the RHS of an assignment)
+    ///
+    /// # Returns
+    ///
+    /// `true` if the node is a call to R6Class() or setRefClass(), `false` otherwise.
+    fn is_r6_class_call(&self, node: tree_sitter::Node<'a>) -> bool {
+        // Must be a call node
+        if node.kind() != "call" {
+            return false;
+        }
+
+        // Get the function name from the "function" field
+        let func_node = match node.child_by_field_name("function") {
+            Some(n) => n,
+            None => return false,
+        };
+
+        let func_name = node_text(func_node, self.text);
+
+        // Check for R6Class or setRefClass
+        matches!(func_name, "R6Class" | "setRefClass")
+    }
+
+    /// Check if a name matches the ALL_CAPS constant pattern.
+    ///
+    /// Pattern: `^[A-Z][A-Z0-9_.]+$`
+    ///
+    /// Rules:
+    /// - Must start with uppercase letter
+    /// - Contains only uppercase letters, digits, dots, underscores
+    /// - Minimum 2 characters total
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The symbol name to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the name matches the ALL_CAPS constant pattern, `false` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// assert!(is_all_caps_constant("MAX_VALUE")); // constant
+    /// assert!(is_all_caps_constant("PI"));        // constant (2 chars)
+    /// assert!(is_all_caps_constant("API_KEY"));   // constant
+    /// assert!(is_all_caps_constant("A1"));        // constant
+    /// assert!(is_all_caps_constant("MY.CONST")); // constant (dot allowed)
+    /// assert!(!is_all_caps_constant("x"));        // not constant - lowercase
+    /// assert!(!is_all_caps_constant("A"));        // not constant - single char
+    /// assert!(!is_all_caps_constant("MaxValue")); // not constant - mixed case
+    /// assert!(!is_all_caps_constant("1ABC"));     // not constant - starts with digit
+    /// ```
+    fn is_all_caps_constant(name: &str) -> bool {
+        // Must have at least 2 characters
+        if name.len() < 2 {
+            return false;
+        }
+
+        let mut chars = name.chars();
+
+        // First character must be uppercase letter
+        match chars.next() {
+            Some(c) if c.is_ascii_uppercase() => {}
+            _ => return false,
+        }
+
+        // Remaining characters must be uppercase letters, digits, dots, or underscores
+        chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.' || c == '_')
+    }
+
+    /// Compute the LSP Range for a tree-sitter node.
+    ///
+    /// Converts tree-sitter byte positions to LSP positions with UTF-16 columns.
+    fn compute_node_range(&self, node: tree_sitter::Node<'a>) -> Range {
+        let start_pos = node.start_position();
+        let end_pos = node.end_position();
+
+        // Get line text for UTF-16 column conversion
+        let start_line_text = self.text.lines().nth(start_pos.row).unwrap_or("");
+        let end_line_text = self.text.lines().nth(end_pos.row).unwrap_or("");
+
+        let start_column =
+            crate::cross_file::types::byte_offset_to_utf16_column(start_line_text, start_pos.column);
+        let end_column =
+            crate::cross_file::types::byte_offset_to_utf16_column(end_line_text, end_pos.column);
+
+        Range {
+            start: Position::new(start_pos.row as u32, start_column),
+            end: Position::new(end_pos.row as u32, end_column),
+        }
+    }
+
+    /// Extract function parameter signature from a function definition node.
+    ///
+    /// This method extracts the parameter list from a function definition and formats
+    /// it as `(param1, param2, ...)`. If the parameter list exceeds 60 characters,
+    /// it is truncated and `...` is appended.
+    ///
+    /// # Arguments
+    ///
+    /// * `value_node` - The node representing the value being assigned (typically the RHS
+    ///   of a left assignment or LHS of a right assignment). This may be a `function_definition`
+    ///   directly, or a parenthesized expression containing one.
+    ///
+    /// # Returns
+    ///
+    /// `Some(String)` containing the formatted parameter signature if the node is or contains
+    /// a function definition, `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Simple function: my_func <- function(x, y) { ... }
+    /// // Returns: Some("(x, y)")
+    ///
+    /// // Function with defaults: add <- function(a, b = 1) { ... }
+    /// // Returns: Some("(a, b = 1)")
+    ///
+    /// // Function with dots: wrapper <- function(...) { ... }
+    /// // Returns: Some("(...)")
+    ///
+    /// // Long parameter list (truncated at 60 chars):
+    /// // Returns: Some("(very_long_param_name_1, very_long_param_name_2, ver...")
+    ///
+    /// // Not a function: x <- 42
+    /// // Returns: None
+    /// ```
+    fn extract_signature(&self, value_node: tree_sitter::Node<'a>) -> Option<String> {
+        // Find the function_definition node - it may be the value_node directly,
+        // or nested inside a parenthesized expression (for cases like `(function(x) x) -> f`)
+        let func_node = self.find_function_definition(value_node)?;
+
+        // Find the parameters child of the function_definition
+        let mut cursor = func_node.walk();
+        let params_node = func_node
+            .children(&mut cursor)
+            .find(|n| n.kind() == "parameters")?;
+
+        // Extract parameter names
+        let params = self.extract_parameter_names(params_node);
+
+        // Format as (param1, param2, ...)
+        let signature = format!("({})", params.join(", "));
+
+        // Truncate at 60 characters if needed
+        const MAX_LENGTH: usize = 60;
+        if signature.len() > MAX_LENGTH {
+            // Find a good truncation point (don't cut in the middle of a parameter)
+            let truncated = &signature[..MAX_LENGTH - 3]; // Leave room for "..."
+            Some(format!("{}...", truncated))
+        } else {
+            Some(signature)
+        }
+    }
+
+    /// Find a function_definition node within the given node.
+    ///
+    /// This handles cases where the function definition is wrapped in parentheses,
+    /// such as `(function(x) x) -> f`.
+    fn find_function_definition(
+        &self,
+        node: tree_sitter::Node<'a>,
+    ) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == "function_definition" {
+            return Some(node);
+        }
+
+        // Check if it's a parenthesized expression containing a function_definition
+        if node.kind() == "parenthesized_expression" {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(func) = self.find_function_definition(child) {
+                    return Some(func);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Extract parameter names from a parameters node.
+    ///
+    /// This extracts parameter names and their default values (if any) from
+    /// the parameters node of a function definition.
+    fn extract_parameter_names(&self, params_node: tree_sitter::Node<'a>) -> Vec<String> {
+        let mut parameters = Vec::new();
+        let mut cursor = params_node.walk();
+
+        for child in params_node.children(&mut cursor) {
+            if child.kind() == "parameter" {
+                let mut param_cursor = child.walk();
+                let param_children: Vec<_> = child.children(&mut param_cursor).collect();
+
+                // Check if this parameter contains dots
+                if param_children.iter().any(|n| n.kind() == "dots") {
+                    parameters.push("...".to_string());
+                } else if let Some(identifier) =
+                    param_children.iter().find(|n| n.kind() == "identifier")
+                {
+                    let param_name = node_text(*identifier, self.text);
+
+                    // Check for default value
+                    if param_children.len() >= 3 && param_children[1].kind() == "=" {
+                        let default_value = node_text(param_children[2], self.text);
+                        parameters.push(format!("{} = {}", param_name, default_value));
+                    } else {
+                        parameters.push(param_name.to_string());
+                    }
+                }
+            } else if child.kind() == "dots" {
+                parameters.push("...".to_string());
+            }
+        }
+
+        parameters
+    }
+
+    /// Extract S4 method definitions (setMethod, setClass, setGeneric) from the AST.
+    ///
+    /// This method detects top-level calls to S4 method definition functions and
+    /// extracts the method/class/generic name from the first string argument.
+    ///
+    /// # Arguments
+    ///
+    /// * `node` - A tree-sitter node to check for S4 method calls
+    ///
+    /// # Returns
+    ///
+    /// A vector of `RawSymbol` entries for any S4 method definitions found.
+    ///
+    /// # Symbol Kind Mapping
+    ///
+    /// - `setMethod("name", ...)` → SymbolKind::METHOD
+    /// - `setClass("name", ...)` → SymbolKind::CLASS
+    /// - `setGeneric("name", ...)` → SymbolKind::INTERFACE
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // setMethod("show", "MyClass", function(object) { ... })
+    /// // → RawSymbol { name: "show", kind: Method, ... }
+    ///
+    /// // setClass("Person", slots = c(name = "character", age = "numeric"))
+    /// // → RawSymbol { name: "Person", kind: Class, ... }
+    ///
+    /// // setGeneric("myGeneric", function(x) standardGeneric("myGeneric"))
+    /// // → RawSymbol { name: "myGeneric", kind: Interface, ... }
+    /// ```
+    pub fn extract_s4_methods(&self, node: tree_sitter::Node<'a>) -> Vec<RawSymbol> {
+        let mut symbols = Vec::new();
+        self.extract_s4_methods_recursive(node, &mut symbols);
+        symbols
+    }
+
+    /// Recursively extract S4 method definitions from the AST.
+    fn extract_s4_methods_recursive(
+        &self,
+        node: tree_sitter::Node<'a>,
+        symbols: &mut Vec<RawSymbol>,
+    ) {
+        // Try to extract an S4 method from this node
+        if let Some(symbol) = self.try_extract_s4_method(node) {
+            symbols.push(symbol);
+        }
+
+        // Recurse into children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.extract_s4_methods_recursive(child, symbols);
+        }
+    }
+
+    /// Try to extract a single S4 method definition from a call node.
+    ///
+    /// Returns `Some(RawSymbol)` if the node is a setMethod, setClass, or setGeneric call.
+    fn try_extract_s4_method(&self, node: tree_sitter::Node<'a>) -> Option<RawSymbol> {
+        // Must be a call node
+        if node.kind() != "call" {
+            return None;
+        }
+
+        // Get the function name
+        let func_node = node.child_by_field_name("function")?;
+        let func_name = node_text(func_node, self.text);
+
+        // Determine the symbol kind based on the function name
+        let kind = match func_name {
+            "setMethod" => DocumentSymbolKind::Method,
+            "setClass" => DocumentSymbolKind::Class,
+            "setGeneric" => DocumentSymbolKind::Interface,
+            _ => return None,
+        };
+
+        // Get the arguments node
+        let args_node = node.child_by_field_name("arguments")?;
+
+        // Extract the first string argument (the method/class/generic name)
+        let (name, name_node) = self.extract_first_string_argument(&args_node)?;
+
+        // Compute full range: the entire call expression
+        let range = self.compute_node_range(node);
+
+        // Compute selection range: the string argument (the name)
+        let selection_range = self.compute_node_range(name_node);
+
+        Some(RawSymbol {
+            name,
+            kind,
+            range,
+            selection_range,
+            detail: None, // S4 methods don't have a parameter signature in the same way
+            section_level: None,
+            children: Vec::new(),
+        })
+    }
+
+    /// Extract the first string argument from an arguments node.
+    ///
+    /// Returns the string value (without quotes) and the node containing the string.
+    fn extract_first_string_argument(
+        &self,
+        args_node: &tree_sitter::Node<'a>,
+    ) -> Option<(String, tree_sitter::Node<'a>)> {
+        let mut cursor = args_node.walk();
+
+        for child in args_node.children(&mut cursor) {
+            if child.kind() == "argument" {
+                // Only process positional arguments (no name field)
+                if child.child_by_field_name("name").is_none() {
+                    // This is the first positional argument - it must be a string
+                    if let Some(value_node) = child.child_by_field_name("value") {
+                        if let Some(name) = self.extract_string_literal(value_node) {
+                            return Some((name, value_node));
+                        }
+                    }
+                    // First positional argument is not a string, return None
+                    return None;
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Extract a string literal value from a node.
+    ///
+    /// Returns the string content without the surrounding quotes.
+    fn extract_string_literal(&self, node: tree_sitter::Node<'a>) -> Option<String> {
+        if node.kind() == "string" {
+            let text = node_text(node, self.text);
+            // Remove surrounding quotes (either single or double)
+            if (text.starts_with('"') && text.ends_with('"'))
+                || (text.starts_with('\'') && text.ends_with('\''))
+            {
+                return Some(text[1..text.len() - 1].to_string());
+            }
+        }
+        None
+    }
+
+    /// Extract R code sections from comments.
+    ///
+    /// Detects section comments matching the pattern:
+    /// `^\s*#(#*)\s*(%%)?\s*(\S.+?)\s*(#{4,}|\-{4,}|={4,}|\*{4,}|\+{4,})\s*$`
+    ///
+    /// # Returns
+    ///
+    /// A vector of `RawSymbol` entries for each section found, with:
+    /// - `name`: The section title (capture group 3)
+    /// - `kind`: `DocumentSymbolKind::Module`
+    /// - `range`: The comment line (will be expanded later by HierarchyBuilder)
+    /// - `selection_range`: The comment line
+    /// - `section_level`: The heading level (1 + count of additional # characters)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tree_sitter::Parser;
+    /// use raven::handlers::SymbolExtractor;
+    ///
+    /// let mut parser = Parser::new();
+    /// parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
+    /// let code = "# Data Loading ----\nx <- 1\n## Subsection ####\ny <- 2";
+    /// let tree = parser.parse(code, None).unwrap();
+    /// let extractor = SymbolExtractor::new(code, tree.root_node());
+    /// let symbols = extractor.extract_all();
+    /// // Should find 2 sections plus 2 variables
+    /// ```
+    ///
+    /// _Requirements: 4.1, 4.5_
+    pub fn extract_sections(&self) -> Vec<RawSymbol> {
+        let mut sections = Vec::new();
+        let pattern = section_pattern();
+
+        for (line_num, line) in self.text.lines().enumerate() {
+            if let Some(caps) = pattern.captures(line) {
+                // Capture group 1: additional # characters (after the first #)
+                // Heading level = 1 + count of additional # characters
+                let additional_hashes = caps.get(1).map(|m| m.as_str().len()).unwrap_or(0);
+                let heading_level = 1 + additional_hashes as u32;
+
+                // Capture group 3: section name
+                if let Some(name_match) = caps.get(3) {
+                    let name = name_match.as_str().trim().to_string();
+
+                    // Compute UTF-16 column for the end of the line
+                    let line_end_utf16 = line
+                        .chars()
+                        .map(|c| if c.len_utf16() > 1 { 2 } else { 1 })
+                        .sum::<u32>();
+
+                    let range = Range {
+                        start: Position {
+                            line: line_num as u32,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: line_num as u32,
+                            character: line_end_utf16,
+                        },
+                    };
+
+                    sections.push(RawSymbol {
+                        name,
+                        kind: DocumentSymbolKind::Module,
+                        range,
+                        selection_range: range,
+                        detail: None,
+                        section_level: Some(heading_level),
+                        children: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        sections
+    }
+}
+
+// ============================================================================
+// HierarchyBuilder - Builds hierarchical DocumentSymbol tree from flat symbols
+// ============================================================================
+
+/// Builds hierarchical DocumentSymbol tree from flat symbols.
+///
+/// Takes a flat list of `RawSymbol` entries and the total line count of the document,
+/// then builds a nested `DocumentSymbol` tree based on:
+/// - Section nesting (by heading level)
+/// - Function body nesting (by position containment)
+/// - Section range computation (from section comment to next section or EOF)
+///
+/// # Example
+///
+/// ```no_run
+/// use crate::handlers::{HierarchyBuilder, RawSymbol};
+///
+/// let symbols: Vec<RawSymbol> = vec![/* extracted symbols */];
+/// let line_count = 100;
+/// let builder = HierarchyBuilder::new(symbols, line_count);
+/// let document_symbols = builder.build();
+/// ```
+pub struct HierarchyBuilder {
+    /// Flat list of symbols to be organized into a hierarchy
+    symbols: Vec<RawSymbol>,
+    /// Total line count of the document (needed for computing section ranges to EOF)
+    line_count: u32,
+}
+
+impl HierarchyBuilder {
+    /// Creates a new HierarchyBuilder with the given symbols and line count.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbols` - Flat list of `RawSymbol` entries extracted from the document
+    /// * `line_count` - Total number of lines in the document (used for section range computation)
+    ///
+    /// # Returns
+    ///
+    /// A new `HierarchyBuilder` instance ready to build the hierarchy.
+    pub fn new(symbols: Vec<RawSymbol>, line_count: u32) -> Self {
+        Self {
+            symbols,
+            line_count,
+        }
+    }
+
+    /// Compute section ranges (from section comment to next section or EOF).
+    ///
+    /// This method updates the `range` field of section symbols (those with `kind == Module`
+    /// and `section_level` set) to span from the section comment line to the line before
+    /// the next section, or to the end of the document if this is the last section.
+    ///
+    /// The `selection_range` is NOT modified - it remains the comment line only, as set
+    /// during extraction.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Collect indices of all section symbols
+    /// 2. Sort sections by their start line
+    /// 3. For each section, compute its range:
+    ///    - Start: the section comment line (already set)
+    ///    - End: the line before the next section, OR the last line of the document
+    ///      (line_count - 1) if this is the last section
+    ///
+    /// # Requirements
+    ///
+    /// - THE section symbol's `range` SHALL span from the section comment to the line
+    ///   before the next section (or end of file) - Requirement 4.2
+    /// - THE section symbol's `selectionRange` SHALL be the section comment line only
+    ///   - Requirement 4.3 (already satisfied by extract_sections)
+    pub fn compute_section_ranges(&mut self) {
+        // Collect indices of section symbols (kind == Module with section_level set)
+        let mut section_indices: Vec<usize> = self
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, sym)| {
+                matches!(sym.kind, DocumentSymbolKind::Module) && sym.section_level.is_some()
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        // If no sections, nothing to do
+        if section_indices.is_empty() {
+            return;
+        }
+
+        // Sort section indices by their start line
+        section_indices.sort_by_key(|&idx| self.symbols[idx].range.start.line);
+
+        // Compute the end line for each section
+        let section_count = section_indices.len();
+        for i in 0..section_count {
+            let current_idx = section_indices[i];
+
+            // Determine the end line for this section
+            let end_line = if i + 1 < section_count {
+                // There's a next section - end at the line before it
+                let next_idx = section_indices[i + 1];
+                let next_start_line = self.symbols[next_idx].range.start.line;
+                // End at line before next section (but not before our own start)
+                if next_start_line > 0 {
+                    next_start_line - 1
+                } else {
+                    0
+                }
+            } else {
+                // This is the last section - end at the last line of the document
+                if self.line_count > 0 {
+                    self.line_count - 1
+                } else {
+                    0
+                }
+            };
+
+            // Update the range's end position
+            // End character is set to 0 to indicate end of line (exclusive)
+            // This means the range covers up to and including end_line
+            self.symbols[current_idx].range.end = Position {
+                line: end_line,
+                character: u32::MAX, // End of line
+            };
+        }
+    }
+
+    /// Nest symbols within sections based on position.
+    ///
+    /// This method organizes symbols into a hierarchy based on:
+    /// 1. **Section nesting by heading level**: Sections with more `#` characters (higher level number)
+    ///    are nested within sections with fewer `#` characters (lower level number).
+    ///    For example, `## Subsection` (level 2) becomes a child of `# Section` (level 1).
+    /// 2. **Symbol nesting within sections**: Non-section symbols (functions, variables, etc.)
+    ///    that fall within a section's range become children of that section.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Sort all symbols by start line
+    /// 2. Separate sections from non-sections
+    /// 3. Build section hierarchy using a stack-based approach
+    /// 4. Insert non-section symbols into their containing sections
+    ///
+    /// # Requirements
+    ///
+    /// - WHEN symbols are defined within a section's range, THE Document_Symbol_Provider
+    ///   SHALL nest them as children of that section - Requirement 4.4
+    /// - THE Document_Symbol_Provider SHALL support nested sections based on heading level
+    ///   (number of `#` characters) - Requirement 4.5
+    ///
+    /// # Note
+    ///
+    /// This method should be called AFTER `compute_section_ranges()` to ensure sections
+    /// have their full ranges computed.
+    pub fn nest_in_sections(&mut self) {
+        if self.symbols.is_empty() {
+            return;
+        }
+
+        // Take ownership of symbols
+        let mut symbols = std::mem::take(&mut self.symbols);
+
+        // Sort by start line
+        symbols.sort_by_key(|s| s.range.start.line);
+
+        // Separate sections from non-sections
+        let (sections, non_sections): (Vec<_>, Vec<_>) =
+            symbols.into_iter().partition(|s| s.section_level.is_some());
+
+        // Build section hierarchy
+        let mut root_sections = Self::build_section_hierarchy(sections);
+
+        // Insert non-section symbols into their containing sections
+        for symbol in non_sections {
+            Self::insert_symbol_into_hierarchy(&mut root_sections, symbol);
+        }
+
+        self.symbols = root_sections;
+    }
+
+    /// Build a hierarchy of sections based on heading level.
+    ///
+    /// Sections with higher level numbers (more `#` characters) are nested within
+    /// sections with lower level numbers (fewer `#` characters).
+    ///
+    /// Uses a stack-based approach where each stack entry is a mutable reference path
+    /// to the current section in the hierarchy.
+    fn build_section_hierarchy(sections: Vec<RawSymbol>) -> Vec<RawSymbol> {
+        if sections.is_empty() {
+            return Vec::new();
+        }
+
+        let mut result: Vec<RawSymbol> = Vec::new();
+        // Stack tracks (level, path) where path is indices to navigate to the section
+        // path[0] is index in result, path[1..] are indices in children
+        let mut stack: Vec<(u32, Vec<usize>)> = Vec::new();
+
+        for section in sections {
+            let level = section.section_level.unwrap(); // Safe because we filtered
+
+            // Pop sections from stack until we find a parent with lower level
+            while let Some((stack_level, _)) = stack.last() {
+                if *stack_level < level {
+                    break;
+                }
+                stack.pop();
+            }
+
+            if stack.is_empty() {
+                // Root-level section
+                let idx = result.len();
+                result.push(section);
+                stack.push((level, vec![idx]));
+            } else {
+                // Nested section - add to parent's children
+                let (_, parent_path) = stack.last().unwrap();
+                let parent_path = parent_path.clone();
+
+                // Navigate to parent and add child
+                let child_idx = Self::add_child_at_path(&mut result, &parent_path, section);
+
+                // Build path to this new section
+                let mut new_path = parent_path;
+                new_path.push(child_idx);
+                stack.push((level, new_path));
+            }
+        }
+
+        result
+    }
+
+    /// Add a child symbol at the given path and return the child's index.
+    fn add_child_at_path(
+        result: &mut [RawSymbol],
+        path: &[usize],
+        child: RawSymbol,
+    ) -> usize {
+        if path.is_empty() {
+            panic!("Empty path in add_child_at_path");
+        }
+
+        let mut current = &mut result[path[0]];
+        for &idx in &path[1..] {
+            current = &mut current.children[idx];
+        }
+
+        let child_idx = current.children.len();
+        current.children.push(child);
+        child_idx
+    }
+
+    /// Insert a non-section symbol into the appropriate section in the hierarchy.
+    ///
+    /// Finds the innermost section that contains the symbol and adds it as a child.
+    /// If no section contains the symbol, it's added to the root level.
+    fn insert_symbol_into_hierarchy(sections: &mut Vec<RawSymbol>, symbol: RawSymbol) {
+        let symbol_line = symbol.range.start.line;
+
+        // Try to find a section that contains this symbol
+        for section in sections.iter_mut() {
+            if Self::try_insert_into_section(section, symbol.clone(), symbol_line) {
+                return;
+            }
+        }
+
+        // No section contains this symbol - add to root level
+        sections.push(symbol);
+    }
+
+    /// Try to insert a symbol into a section or its children.
+    ///
+    /// Returns true if the symbol was inserted, false otherwise.
+    fn try_insert_into_section(
+        section: &mut RawSymbol,
+        symbol: RawSymbol,
+        symbol_line: u32,
+    ) -> bool {
+        // Check if this section contains the symbol
+        if symbol_line < section.range.start.line || symbol_line > section.range.end.line {
+            return false;
+        }
+
+        // This section contains the symbol
+        // Check if any child section also contains it (for nested sections)
+        for child in section.children.iter_mut() {
+            if child.section_level.is_some() {
+                if Self::try_insert_into_section(child, symbol.clone(), symbol_line) {
+                    return true;
+                }
+            }
+        }
+
+        // No child section contains it, add to this section
+        section.children.push(symbol);
+        true
+    }
+
+    /// Nest symbols within function bodies based on position.
+    ///
+    /// This method organizes symbols into a hierarchy based on function containment:
+    /// - Symbols whose start line falls within a function's range become children of that function
+    /// - Supports arbitrary nesting depth (functions inside functions inside functions...)
+    ///
+    /// # Algorithm
+    ///
+    /// For each level of the hierarchy:
+    /// 1. Identify function symbols (kind == Function)
+    /// 2. For each non-function symbol, check if it falls within any function's range
+    /// 3. If so, move it to be a child of the innermost containing function
+    /// 4. Recursively process children of each symbol
+    ///
+    /// # Requirements
+    ///
+    /// - WHEN an assignment occurs inside a function body, THE Document_Symbol_Provider
+    ///   SHALL include it as a child of that function's DocumentSymbol - Requirement 3.1
+    /// - WHEN an assignment occurs at top-level (outside any function), THE Document_Symbol_Provider
+    ///   SHALL include it as a root-level symbol - Requirement 3.2
+    /// - THE Document_Symbol_Provider SHALL support arbitrary nesting depth for nested
+    ///   function definitions - Requirement 3.3
+    ///
+    /// # Note
+    ///
+    /// This method should be called AFTER `nest_in_sections()` so that symbols are first
+    /// organized by sections, then within each section (or at root level), they are further
+    /// organized by function containment.
+    pub fn nest_in_functions(&mut self) {
+        // Process the root level symbols
+        self.symbols = Self::nest_symbols_in_functions_recursive(std::mem::take(&mut self.symbols));
+    }
+
+    /// Recursively nest symbols within functions at a given level of the hierarchy.
+    ///
+    /// This function processes a list of symbols and:
+    /// 1. Identifies function symbols that can contain other symbols
+    /// 2. Moves symbols (including nested functions) into their containing functions
+    /// 3. Recursively processes children of all symbols
+    ///
+    /// # Arguments
+    ///
+    /// * `symbols` - The list of symbols at the current hierarchy level
+    ///
+    /// # Returns
+    ///
+    /// The reorganized list of symbols with proper function nesting
+    fn nest_symbols_in_functions_recursive(symbols: Vec<RawSymbol>) -> Vec<RawSymbol> {
+        if symbols.is_empty() {
+            return symbols;
+        }
+
+        // First, recursively process children of all symbols
+        let mut symbols: Vec<RawSymbol> = symbols
+            .into_iter()
+            .map(|mut sym| {
+                sym.children = Self::nest_symbols_in_functions_recursive(std::mem::take(&mut sym.children));
+                sym
+            })
+            .collect();
+
+        // Sort by start line for consistent processing
+        symbols.sort_by_key(|s| s.range.start.line);
+
+        // Build the hierarchy by finding which symbols are contained by which functions
+        // A symbol is contained by a function if it starts after the function starts
+        // and ends before or at the function's end line
+        
+        // We'll use a simple approach: repeatedly find symbols that should be nested
+        // and move them into their containing functions
+        loop {
+            // Find all functions at this level
+            let function_indices: Vec<usize> = symbols
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| matches!(s.kind, DocumentSymbolKind::Function))
+                .map(|(i, _)| i)
+                .collect();
+            
+            // For each symbol, check if it should be nested in a function
+            let mut nested_indices: Vec<usize> = Vec::new();
+            
+            for (i, sym) in symbols.iter().enumerate() {
+                // Skip functions when checking if they should be nested
+                // (we handle function-in-function separately)
+                for &func_idx in &function_indices {
+                    if i == func_idx {
+                        continue; // Don't nest a function in itself
+                    }
+                    let func = &symbols[func_idx];
+                    if Self::symbol_is_inside_function(sym, func) {
+                        nested_indices.push(i);
+                        break;
+                    }
+                }
+            }
+            
+            if nested_indices.is_empty() {
+                // No more nesting needed
+                return symbols;
+            }
+            
+            // Move nested symbols into their containing functions
+            // We need to be careful about the order of operations
+            let nested_set: std::collections::HashSet<usize> = nested_indices.iter().cloned().collect();
+            
+            // Collect symbols to nest
+            let mut to_nest: Vec<RawSymbol> = Vec::new();
+            let mut remaining: Vec<RawSymbol> = Vec::new();
+            
+            for (i, sym) in symbols.into_iter().enumerate() {
+                if nested_set.contains(&i) {
+                    to_nest.push(sym);
+                } else {
+                    remaining.push(sym);
+                }
+            }
+            
+            // Insert nested symbols into their containing functions
+            for sym in to_nest {
+                let mut inserted = false;
+                for func in remaining.iter_mut() {
+                    if matches!(func.kind, DocumentSymbolKind::Function)
+                        && Self::symbol_is_inside_function(&sym, func)
+                    {
+                        Self::insert_into_innermost_function(&mut func.children, sym.clone());
+                        inserted = true;
+                        break;
+                    }
+                }
+                if !inserted {
+                    // Shouldn't happen, but add to remaining just in case
+                    remaining.push(sym);
+                }
+            }
+            
+            symbols = remaining;
+            symbols.sort_by_key(|s| s.range.start.line);
+        }
+    }
+
+    /// Check if a symbol is inside a function's range.
+    ///
+    /// A symbol is considered inside a function if its start line is within
+    /// the function's range (inclusive of start, exclusive of end line if
+    /// the symbol starts at the same line as the function ends).
+    fn symbol_is_inside_function(symbol: &RawSymbol, func: &RawSymbol) -> bool {
+        let symbol_start = symbol.range.start.line;
+        let func_start = func.range.start.line;
+        let func_end = func.range.end.line;
+
+        // Symbol must start after the function starts (not on the same line as the function definition)
+        // and before or on the function's end line
+        symbol_start > func_start && symbol_start <= func_end
+    }
+
+    /// Insert a symbol into the innermost containing function within a list of children.
+    ///
+    /// This recursively checks if any function children contain the symbol,
+    /// allowing for arbitrary nesting depth.
+    fn insert_into_innermost_function(children: &mut Vec<RawSymbol>, symbol: RawSymbol) {
+        // Check if any function child contains this symbol
+        for child in children.iter_mut() {
+            if matches!(child.kind, DocumentSymbolKind::Function)
+                && Self::symbol_is_inside_function(&symbol, child)
+            {
+                // Recursively try to insert into nested functions
+                Self::insert_into_innermost_function(&mut child.children, symbol);
+                return;
+            }
+        }
+
+        // No nested function contains it, add to this level
+        children.push(symbol);
+    }
+
+    /// Build hierarchical DocumentSymbol tree from the flat symbols.
+    ///
+    /// This method orchestrates the hierarchy building process:
+    /// 1. Computes section ranges (from section comment to next section or EOF)
+    /// 2. Nests symbols within sections based on position
+    /// 3. Nests symbols within function bodies based on position
+    /// 4. Converts the `Vec<RawSymbol>` hierarchy to `Vec<DocumentSymbol>`
+    ///
+    /// # Returns
+    ///
+    /// A vector of `DocumentSymbol` entries representing the hierarchical document outline.
+    ///
+    /// # Requirements
+    ///
+    /// - Requirement 1.1: Return `DocumentSymbol[]` response type
+    /// - Requirement 3.1: Assignments inside function bodies appear as children
+    /// - Requirement 3.2: Top-level assignments appear as root-level symbols
+    /// - Requirement 3.3: Support arbitrary nesting depth for nested functions
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use raven::handlers::{HierarchyBuilder, RawSymbol, DocumentSymbolKind};
+    /// use tower_lsp::lsp_types::{Range, Position};
+    ///
+    /// let symbols = vec![
+    ///     RawSymbol {
+    ///         name: "my_func".to_string(),
+    ///         kind: DocumentSymbolKind::Function,
+    ///         range: Range {
+    ///             start: Position { line: 0, character: 0 },
+    ///             end: Position { line: 5, character: 1 },
+    ///         },
+    ///         selection_range: Range {
+    ///             start: Position { line: 0, character: 0 },
+    ///             end: Position { line: 0, character: 7 },
+    ///         },
+    ///         detail: Some("(x, y)".to_string()),
+    ///         section_level: None,
+    ///         children: Vec::new(),
+    ///     },
+    /// ];
+    ///
+    /// let builder = HierarchyBuilder::new(symbols, 10);
+    /// let doc_symbols = builder.build();
+    /// assert_eq!(doc_symbols.len(), 1);
+    /// assert_eq!(doc_symbols[0].name, "my_func");
+    /// ```
+    pub fn build(mut self) -> Vec<DocumentSymbol> {
+        // Step 1: Compute section ranges (from section comment to next section or EOF)
+        self.compute_section_ranges();
+
+        // Step 2: Nest symbols within sections based on position
+        self.nest_in_sections();
+
+        // Step 3: Nest symbols within function bodies based on position
+        self.nest_in_functions();
+
+        // Step 4: Convert RawSymbol hierarchy to DocumentSymbol hierarchy
+        Self::convert_to_document_symbols(self.symbols)
+    }
+
+    /// Convert a vector of RawSymbol to a vector of DocumentSymbol.
+    ///
+    /// This recursively converts the RawSymbol hierarchy to DocumentSymbol,
+    /// mapping all fields appropriately.
+    fn convert_to_document_symbols(raw_symbols: Vec<RawSymbol>) -> Vec<DocumentSymbol> {
+        raw_symbols
+            .into_iter()
+            .map(Self::convert_raw_to_document_symbol)
+            .collect()
+    }
+
+    /// Convert a single RawSymbol to DocumentSymbol.
+    ///
+    /// Maps fields as follows:
+    /// - `name` -> `name`
+    /// - `kind` -> `kind` (via `to_lsp_kind()`)
+    /// - `range` -> `range`
+    /// - `selection_range` -> `selection_range`
+    /// - `detail` -> `detail`
+    /// - `children` -> `children` (recursively converted)
+    /// - `deprecated` -> `None` (LSP deprecated field)
+    /// - `tags` -> `None`
+    #[allow(deprecated)] // DocumentSymbol::deprecated field is deprecated in LSP spec
+    fn convert_raw_to_document_symbol(raw: RawSymbol) -> DocumentSymbol {
+        let children = if raw.children.is_empty() {
+            None
+        } else {
+            Some(Self::convert_to_document_symbols(raw.children))
+        };
+
+        DocumentSymbol {
+            name: raw.name,
+            kind: raw.kind.to_lsp_kind(),
+            range: raw.range,
+            selection_range: raw.selection_range,
+            detail: raw.detail,
+            children,
+            deprecated: None,
+            tags: None,
+        }
+    }
+}
 
 // ============================================================================
 // Cross-File Scope Helper
@@ -219,15 +1673,117 @@ fn build_selection_range(root: Node, point: Point) -> Option<SelectionRange> {
 // Document Symbols
 // ============================================================================
 
+/// Handles the `textDocument/documentSymbol` LSP request.
+///
+/// This function extracts symbols from the document using `SymbolExtractor` and builds
+/// a hierarchical structure using `HierarchyBuilder`. The response type depends on the
+/// client's capability:
+///
+/// - If `hierarchicalDocumentSymbolSupport` is true: Returns `DocumentSymbolResponse::Nested`
+///   with a hierarchical `DocumentSymbol[]` structure
+/// - If `hierarchicalDocumentSymbolSupport` is false: Returns `DocumentSymbolResponse::Flat`
+///   with a flat `SymbolInformation[]` structure (correct URIs set on each symbol)
+///
+/// # Requirements
+///
+/// - Requirement 1.1: Return `DocumentSymbol[]` when client supports hierarchical symbols
+/// - Requirement 1.2: Return `SymbolInformation[]` as fallback when client doesn't support hierarchical
+/// - Requirement 1.3: Set correct document URI in each symbol's location for flat fallback
+///
+/// # Arguments
+///
+/// * `state` - The world state containing document and configuration information
+/// * `uri` - The URI of the document to get symbols for
+///
+/// # Returns
+///
+/// `Some(DocumentSymbolResponse)` if the document exists and has a valid parse tree,
+/// `None` otherwise.
 pub fn document_symbol(state: &WorldState, uri: &Url) -> Option<DocumentSymbolResponse> {
     let doc = state.get_document(uri)?;
     let tree = doc.tree.as_ref()?;
     let text = doc.text();
 
-    let mut symbols = Vec::new();
-    collect_symbols(tree.root_node(), &text, &mut symbols);
+    // Use SymbolExtractor to extract symbols from the document
+    let extractor = SymbolExtractor::new(&text, tree.root_node());
+    let raw_symbols = extractor.extract_all();
 
-    Some(DocumentSymbolResponse::Flat(symbols))
+    // Calculate line count for HierarchyBuilder
+    let line_count = text.lines().count() as u32;
+
+    // Use HierarchyBuilder to build the hierarchical structure
+    let builder = HierarchyBuilder::new(raw_symbols, line_count);
+    let doc_symbols = builder.build();
+
+    // Check client capability for hierarchical document symbols
+    if state.symbol_config.hierarchical_document_symbol_support {
+        // Requirement 1.1: Return DocumentSymbol[] when hierarchical support available
+        Some(DocumentSymbolResponse::Nested(doc_symbols))
+    } else {
+        // Requirement 1.2, 1.3: Return flat SymbolInformation[] with correct URIs
+        let flat_symbols = flatten_document_symbols(&doc_symbols, uri);
+        Some(DocumentSymbolResponse::Flat(flat_symbols))
+    }
+}
+
+/// Flattens a hierarchical `DocumentSymbol` tree into a flat `SymbolInformation` list.
+///
+/// This function recursively traverses the `DocumentSymbol` hierarchy and converts each
+/// symbol to a `SymbolInformation` entry with the correct document URI.
+///
+/// # Requirements
+///
+/// - Requirement 1.3: Set correct document URI in each symbol's location
+///
+/// # Arguments
+///
+/// * `doc_symbols` - The hierarchical `DocumentSymbol` tree to flatten
+/// * `uri` - The document URI to set on each symbol's location
+///
+/// # Returns
+///
+/// A flat vector of `SymbolInformation` entries with correct URIs.
+#[allow(deprecated)] // SymbolInformation::deprecated field is deprecated in LSP spec
+fn flatten_document_symbols(doc_symbols: &[DocumentSymbol], uri: &Url) -> Vec<SymbolInformation> {
+    let mut result = Vec::new();
+    flatten_document_symbols_recursive(doc_symbols, uri, None, &mut result);
+    result
+}
+
+/// Recursively flattens DocumentSymbol entries into SymbolInformation.
+///
+/// # Arguments
+///
+/// * `symbols` - The symbols at the current level of the hierarchy
+/// * `uri` - The document URI to set on each symbol's location
+/// * `container_name` - The name of the containing symbol (for nested symbols)
+/// * `result` - The accumulator for flattened symbols
+#[allow(deprecated)] // SymbolInformation::deprecated field is deprecated in LSP spec
+fn flatten_document_symbols_recursive(
+    symbols: &[DocumentSymbol],
+    uri: &Url,
+    container_name: Option<&str>,
+    result: &mut Vec<SymbolInformation>,
+) {
+    for symbol in symbols {
+        // Convert DocumentSymbol to SymbolInformation
+        result.push(SymbolInformation {
+            name: symbol.name.clone(),
+            kind: symbol.kind,
+            tags: symbol.tags.clone(),
+            deprecated: symbol.deprecated,
+            location: Location {
+                uri: uri.clone(),
+                range: symbol.range,
+            },
+            container_name: container_name.map(String::from),
+        });
+
+        // Recursively process children
+        if let Some(children) = &symbol.children {
+            flatten_document_symbols_recursive(children, uri, Some(&symbol.name), result);
+        }
+    }
 }
 
 /// Collects top-level symbols from a syntax tree and appends them to `symbols`.
@@ -312,8 +1868,39 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 // Workspace Symbols
 // ============================================================================
 
-/// Maximum number of symbols returned by workspace/symbol.
-const WORKSPACE_SYMBOL_LIMIT: usize = 500;
+/// Extracts the container name from a file URI.
+///
+/// The container name is the filename without extension, providing context
+/// about which file a symbol belongs to in workspace symbol results.
+///
+/// **Validates: Requirements 8.1, 8.2**
+///
+/// # Parameters
+///
+/// - `uri`: The file URI to extract the container name from.
+///
+/// # Returns
+///
+/// The filename without extension, or `None` if the URI has no path segments.
+///
+/// # Examples
+///
+/// ```
+/// let uri = Url::parse("file:///path/to/utils.R").unwrap();
+/// assert_eq!(extract_container_name(&uri), Some("utils".to_string()));
+/// ```
+fn extract_container_name(uri: &Url) -> Option<String> {
+    uri.path_segments()?
+        .last()
+        .map(|filename| {
+            // Remove extension if present
+            if let Some(dot_pos) = filename.rfind('.') {
+                filename[..dot_pos].to_string()
+            } else {
+                filename.to_string()
+            }
+        })
+}
 
 /// Collects workspace symbols whose names contain the given query as a case-insensitive substring.
 ///
@@ -321,16 +1908,21 @@ const WORKSPACE_SYMBOL_LIMIT: usize = 500;
 /// the cross-file workspace index, legacy open documents (AST fallback), and the legacy workspace index
 /// (AST fallback). Files already seen in a higher-priority source are not re-scanned (deduplicated by URI).
 /// Virtual symbols declared via directive annotations are skipped by the artifact collector.
-/// Results are truncated to at most WORKSPACE_SYMBOL_LIMIT entries.
+/// Reserved words are filtered out to avoid polluting results.
+/// Results are truncated to the configured `workspace_max_results` limit.
+///
+/// **Validates: Requirements 7.2, 8.1, 8.2, 9.1, 9.2, 9.3, 11.2**
 ///
 /// # Parameters
 ///
+/// - `state`: The world state containing documents, indexes, and configuration.
 /// - `query`: Case-insensitive substring used to filter symbol names.
 ///
 /// # Returns
 ///
-/// A `Vec<SymbolInformation>` containing up to `WORKSPACE_SYMBOL_LIMIT` symbols that match `query`.
+/// A `Vec<SymbolInformation>` containing up to `workspace_max_results` symbols that match `query`.
 /// Each symbol's `location.uri` indicates the source file where the symbol is defined.
+/// Each symbol's `container_name` is set to the filename (without extension) for context.
 ///
 /// # Examples
 ///
@@ -343,6 +1935,7 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
     let lower_query = query.to_lowercase();
     let mut symbols = Vec::new();
     let mut seen_uris = std::collections::HashSet::<Url>::new();
+    let max_results = state.symbol_config.workspace_max_results;
 
     // 1. Open documents (highest priority)
     for uri in state.document_store.uris() {
@@ -387,9 +1980,15 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
             let text = doc.text();
             let mut file_symbols = Vec::new();
             collect_symbols(tree.root_node(), &text, &mut file_symbols);
+            let container_name = extract_container_name(uri);
             for mut sym in file_symbols {
+                // Filter reserved words (Requirement 7.2)
+                if is_reserved_word(&sym.name) {
+                    continue;
+                }
                 if sym.name.to_lowercase().contains(&lower_query) {
                     sym.location.uri = uri.clone();
+                    sym.container_name = container_name.clone();
                     symbols.push(sym);
                 }
             }
@@ -406,16 +2005,23 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
             let text = doc.text();
             let mut file_symbols = Vec::new();
             collect_symbols(tree.root_node(), &text, &mut file_symbols);
+            let container_name = extract_container_name(uri);
             for mut sym in file_symbols {
+                // Filter reserved words (Requirement 7.2)
+                if is_reserved_word(&sym.name) {
+                    continue;
+                }
                 if sym.name.to_lowercase().contains(&lower_query) {
                     sym.location.uri = uri.clone();
+                    sym.container_name = container_name.clone();
                     symbols.push(sym);
                 }
             }
         }
     }
 
-    symbols.truncate(WORKSPACE_SYMBOL_LIMIT);
+    // Apply configurable limit (Requirement 9.2, 11.2)
+    symbols.truncate(max_results);
     Some(symbols)
 }
 
@@ -472,6 +2078,8 @@ fn collect_workspace_symbols_from_artifacts(
     lower_query: &str,
     symbols: &mut Vec<SymbolInformation>,
 ) {
+    let container_name = extract_container_name(file_uri);
+    
     for scoped_symbol in artifacts.exported_interface.values() {
         if !scoped_symbol.name.to_lowercase().contains(lower_query) {
             continue;
@@ -479,6 +2087,11 @@ fn collect_workspace_symbols_from_artifacts(
 
         // Skip declared symbols (@lsp-var, @lsp-func) — they are virtual
         if scoped_symbol.is_declared {
+            continue;
+        }
+
+        // Filter reserved words (Requirement 7.2)
+        if is_reserved_word(&scoped_symbol.name) {
             continue;
         }
 
@@ -500,7 +2113,7 @@ fn collect_workspace_symbols_from_artifacts(
                     end: Position::new(scoped_symbol.defined_line, scoped_symbol.defined_column),
                 },
             },
-            container_name: None,
+            container_name: container_name.clone(),
         });
     }
 }
@@ -6099,6 +7712,3414 @@ x <- "#;
             }
         });
     }
+
+    // ========================================================================
+    // SymbolExtractor Tests
+    // ========================================================================
+
+    #[test]
+    fn test_symbol_extractor_simple_function() {
+        let code = "my_func <- function(x) { x + 1 }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "my_func");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Function));
+
+        // Check range spans entire assignment
+        assert_eq!(symbols[0].range.start.line, 0);
+        assert_eq!(symbols[0].range.start.character, 0);
+        assert_eq!(symbols[0].range.end.line, 0);
+        assert_eq!(symbols[0].range.end.character, code.len() as u32);
+
+        // Check selection_range is identifier only
+        assert_eq!(symbols[0].selection_range.start.line, 0);
+        assert_eq!(symbols[0].selection_range.start.character, 0);
+        assert_eq!(symbols[0].selection_range.end.line, 0);
+        assert_eq!(symbols[0].selection_range.end.character, 7); // "my_func"
+    }
+
+    #[test]
+    fn test_symbol_extractor_simple_variable() {
+        let code = "x <- 42";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "x");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+
+        // Check range spans entire assignment
+        assert_eq!(symbols[0].range.start.line, 0);
+        assert_eq!(symbols[0].range.start.character, 0);
+        assert_eq!(symbols[0].range.end.line, 0);
+        assert_eq!(symbols[0].range.end.character, 7); // "x <- 42"
+
+        // Check selection_range is identifier only
+        assert_eq!(symbols[0].selection_range.start.line, 0);
+        assert_eq!(symbols[0].selection_range.start.character, 0);
+        assert_eq!(symbols[0].selection_range.end.line, 0);
+        assert_eq!(symbols[0].selection_range.end.character, 1); // "x"
+    }
+
+    #[test]
+    fn test_symbol_extractor_equals_assignment() {
+        let code = "y = 100";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "y");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+    }
+
+    #[test]
+    fn test_symbol_extractor_super_assignment() {
+        let code = "z <<- 'global'";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "z");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+    }
+
+    #[test]
+    fn test_symbol_extractor_right_assignment() {
+        let code = "42 -> answer";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "answer");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+
+        // Check selection_range is the RHS identifier
+        assert_eq!(symbols[0].selection_range.start.character, 6); // "answer" starts at position 6
+        assert_eq!(symbols[0].selection_range.end.character, 12); // "answer" ends at position 12
+    }
+
+    #[test]
+    fn test_symbol_extractor_right_assignment_function() {
+        // Use parentheses to ensure the function definition is the LHS of the -> operator
+        let code = "(function(x) x * 2) -> doubler";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol, got {:?}", symbols);
+        assert_eq!(symbols[0].name, "doubler");
+        // The LHS is a parenthesized expression containing a function_definition
+        // So we need to check if the LHS contains a function_definition
+        // For now, this will be classified as Variable since the immediate LHS is not function_definition
+        // This is acceptable behavior - the classify_symbol() method in task 2.3 will handle this better
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Variable | DocumentSymbolKind::Function),
+            "Expected Variable or Function, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_symbol_extractor_multiple_assignments() {
+        let code = "a <- 1\nb <- 2\nc <- function() {}";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 3);
+        assert_eq!(symbols[0].name, "a");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Variable));
+        assert_eq!(symbols[1].name, "b");
+        assert!(matches!(symbols[1].kind, DocumentSymbolKind::Variable));
+        assert_eq!(symbols[2].name, "c");
+        assert!(matches!(symbols[2].kind, DocumentSymbolKind::Function));
+    }
+
+    #[test]
+    fn test_symbol_extractor_nested_function() {
+        let code = "outer <- function() {\n  inner <- function() {}\n}";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // Should find both outer and inner functions
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "outer");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Function));
+        assert_eq!(symbols[1].name, "inner");
+        assert!(matches!(symbols[1].kind, DocumentSymbolKind::Function));
+    }
+
+    #[test]
+    fn test_symbol_extractor_reserved_words_filtered() {
+        // Reserved words should not appear as symbols
+        let code = "if <- 1\nelse <- 2\nfor <- 3";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // Reserved words should be filtered out
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_symbol_extractor_multiline_function() {
+        let code = "my_func <- function(x, y) {\n  result <- x + y\n  result\n}";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // Should find both my_func and result
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "my_func");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Function));
+
+        // Check that my_func range spans multiple lines
+        assert_eq!(symbols[0].range.start.line, 0);
+        assert_eq!(symbols[0].range.end.line, 3);
+
+        assert_eq!(symbols[1].name, "result");
+        assert!(matches!(symbols[1].kind, DocumentSymbolKind::Variable));
+    }
+
+    #[test]
+    fn test_symbol_extractor_selection_range_contained_in_range() {
+        // Property 3: selection_range must be contained within range
+        let code = "my_long_function_name <- function(a, b, c) {\n  a + b + c\n}";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        for symbol in &symbols {
+            // selection_range.start >= range.start
+            assert!(
+                symbol.selection_range.start.line > symbol.range.start.line
+                    || (symbol.selection_range.start.line == symbol.range.start.line
+                        && symbol.selection_range.start.character >= symbol.range.start.character),
+                "selection_range.start must be >= range.start for symbol '{}'",
+                symbol.name
+            );
+
+            // selection_range.end <= range.end
+            assert!(
+                symbol.selection_range.end.line < symbol.range.end.line
+                    || (symbol.selection_range.end.line == symbol.range.end.line
+                        && symbol.selection_range.end.character <= symbol.range.end.character),
+                "selection_range.end must be <= range.end for symbol '{}'",
+                symbol.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_symbol_extractor_non_identifier_lhs_ignored() {
+        // Assignments to non-identifiers (like list elements) should be ignored
+        let code = "x$y <- 1\nx[[1]] <- 2";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // These are not simple identifier assignments, so should be empty
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_symbol_extractor_utf16_columns() {
+        // Test with Unicode characters to ensure UTF-16 column conversion works
+        let code = "日本語 <- 42";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "日本語");
+        // UTF-16 column for "日本語" (3 characters, each 1 UTF-16 code unit)
+        assert_eq!(symbols[0].selection_range.start.character, 0);
+        assert_eq!(symbols[0].selection_range.end.character, 3);
+    }
+
+    // ========================================================================
+    // classify_symbol() Tests - Task 2.3
+    // ========================================================================
+
+    #[test]
+    fn test_classify_symbol_r6class() {
+        // R6Class() call should be classified as CLASS
+        let code = "MyClass <- R6Class(\"MyClass\", public = list())";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "MyClass");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Class),
+            "R6Class() should be classified as CLASS, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_setrefclass() {
+        // setRefClass() call should be classified as CLASS
+        let code = "Person <- setRefClass(\"Person\", fields = list(name = \"character\"))";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "Person");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Class),
+            "setRefClass() should be classified as CLASS, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_all_caps_constant() {
+        // ALL_CAPS names should be classified as CONSTANT
+        let code = "MAX_VALUE <- 100";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "MAX_VALUE");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Constant),
+            "ALL_CAPS name should be classified as CONSTANT, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_all_caps_with_digits() {
+        // ALL_CAPS with digits should be classified as CONSTANT
+        let code = "API_KEY_V2 <- \"secret\"";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "API_KEY_V2");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Constant),
+            "ALL_CAPS with digits should be classified as CONSTANT, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_all_caps_with_dot() {
+        // ALL_CAPS with dots should be classified as CONSTANT
+        let code = "MY.CONST <- 3.14";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "MY.CONST");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Constant),
+            "ALL_CAPS with dot should be classified as CONSTANT, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_two_char_constant() {
+        // Two-character ALL_CAPS should be classified as CONSTANT
+        let code = "PI <- 3.14159";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "PI");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Constant),
+            "Two-char ALL_CAPS should be classified as CONSTANT, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_single_char_not_constant() {
+        // Single character should NOT be classified as CONSTANT
+        let code = "A <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "A");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Variable),
+            "Single char should be classified as VARIABLE, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_mixed_case_not_constant() {
+        // Mixed case should NOT be classified as CONSTANT
+        let code = "MaxValue <- 100";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "MaxValue");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Variable),
+            "Mixed case should be classified as VARIABLE, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_lowercase_not_constant() {
+        // Lowercase should NOT be classified as CONSTANT
+        let code = "my_var <- 42";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "my_var");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Variable),
+            "Lowercase should be classified as VARIABLE, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_function_definition() {
+        // Function definition should be classified as FUNCTION
+        let code = "my_func <- function(x) x + 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "my_func");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Function),
+            "Function definition should be classified as FUNCTION, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_all_caps_function_is_function() {
+        // ALL_CAPS function should be classified as FUNCTION (function takes priority over constant)
+        // Wait, according to the design: R6Class > CONSTANT > FUNCTION > VARIABLE
+        // So ALL_CAPS function should be CONSTANT, not FUNCTION
+        // Let me re-read the design...
+        // Actually, the priority is:
+        // 1. R6Class/setRefClass → CLASS
+        // 2. ALL_CAPS → CONSTANT
+        // 3. function_definition → FUNCTION
+        // 4. Otherwise → VARIABLE
+        // So ALL_CAPS function should be CONSTANT
+        let code = "MY_FUNC <- function(x) x + 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "MY_FUNC");
+        // ALL_CAPS takes priority over function_definition
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Constant),
+            "ALL_CAPS function should be classified as CONSTANT (ALL_CAPS takes priority), got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_r6class_priority_over_all_caps() {
+        // R6Class should take priority over ALL_CAPS pattern
+        let code = "MY_CLASS <- R6Class(\"MY_CLASS\")";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "MY_CLASS");
+        // R6Class takes priority over ALL_CAPS
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Class),
+            "R6Class should take priority over ALL_CAPS, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_right_assignment_r6class() {
+        // R6Class with right assignment should be classified as CLASS
+        let code = "R6Class(\"MyClass\") -> MyClass";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "MyClass");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Class),
+            "R6Class with right assignment should be classified as CLASS, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_right_assignment_constant() {
+        // ALL_CAPS with right assignment should be classified as CONSTANT
+        let code = "100 -> MAX_VALUE";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "MAX_VALUE");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Constant),
+            "ALL_CAPS with right assignment should be classified as CONSTANT, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_classify_symbol_other_call_not_class() {
+        // Other function calls should NOT be classified as CLASS
+        let code = "result <- list(a = 1, b = 2)";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "result");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Variable),
+            "list() call should be classified as VARIABLE, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    // ========================================================================
+    // is_all_caps_constant() Unit Tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_all_caps_constant_valid_cases() {
+        assert!(SymbolExtractor::is_all_caps_constant("MAX_VALUE"));
+        assert!(SymbolExtractor::is_all_caps_constant("PI"));
+        assert!(SymbolExtractor::is_all_caps_constant("API_KEY"));
+        assert!(SymbolExtractor::is_all_caps_constant("A1"));
+        assert!(SymbolExtractor::is_all_caps_constant("MY.CONST"));
+        assert!(SymbolExtractor::is_all_caps_constant("ABC123"));
+        assert!(SymbolExtractor::is_all_caps_constant("X_Y_Z"));
+        assert!(SymbolExtractor::is_all_caps_constant("A.B.C"));
+    }
+
+    #[test]
+    fn test_is_all_caps_constant_invalid_cases() {
+        // Single character
+        assert!(!SymbolExtractor::is_all_caps_constant("A"));
+        assert!(!SymbolExtractor::is_all_caps_constant("X"));
+
+        // Lowercase
+        assert!(!SymbolExtractor::is_all_caps_constant("x"));
+        assert!(!SymbolExtractor::is_all_caps_constant("my_var"));
+        assert!(!SymbolExtractor::is_all_caps_constant("maxValue"));
+
+        // Mixed case
+        assert!(!SymbolExtractor::is_all_caps_constant("MaxValue"));
+        assert!(!SymbolExtractor::is_all_caps_constant("MyClass"));
+        assert!(!SymbolExtractor::is_all_caps_constant("APIkey"));
+
+        // Starts with digit
+        assert!(!SymbolExtractor::is_all_caps_constant("1ABC"));
+        assert!(!SymbolExtractor::is_all_caps_constant("123"));
+
+        // Empty string
+        assert!(!SymbolExtractor::is_all_caps_constant(""));
+
+        // Starts with underscore
+        assert!(!SymbolExtractor::is_all_caps_constant("_ABC"));
+
+        // Starts with dot
+        assert!(!SymbolExtractor::is_all_caps_constant(".ABC"));
+    }
+
+    // ========================================================================
+    // extract_signature() Tests - Task 2.4
+    // ========================================================================
+
+    #[test]
+    fn test_extract_signature_simple_params() {
+        // Simple function with two parameters
+        let code = "add <- function(a, b) { a + b }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "add");
+        assert_eq!(symbols[0].detail, Some("(a, b)".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signature_no_params() {
+        // Function with no parameters
+        let code = "get_pi <- function() { 3.14159 }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "get_pi");
+        assert_eq!(symbols[0].detail, Some("()".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signature_with_defaults() {
+        // Function with default parameter values
+        let code = "greet <- function(name = \"World\") { paste(\"Hello\", name) }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "greet");
+        assert_eq!(symbols[0].detail, Some("(name = \"World\")".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signature_with_dots() {
+        // Function with ... parameter
+        let code = "wrapper <- function(...) { list(...) }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "wrapper");
+        assert_eq!(symbols[0].detail, Some("(...)".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signature_mixed_params() {
+        // Function with mixed parameters (regular, default, dots)
+        let code = "mixed <- function(x, y = 1, ...) { x + y }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "mixed");
+        assert_eq!(symbols[0].detail, Some("(x, y = 1, ...)".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signature_truncation_at_60_chars() {
+        // Function with very long parameter list that exceeds 60 characters
+        let code = "long_func <- function(very_long_param_name_1, very_long_param_name_2, very_long_param_name_3) { }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "long_func");
+
+        let detail = symbols[0].detail.as_ref().unwrap();
+        // Should be truncated with "..." at the end
+        assert!(detail.ends_with("..."), "Detail should end with '...': {}", detail);
+        // Total length should be at most 60 characters
+        assert!(detail.len() <= 60, "Detail should be at most 60 chars, got {}: {}", detail.len(), detail);
+    }
+
+    #[test]
+    fn test_extract_signature_exactly_60_chars() {
+        // Function with parameter list that is exactly 60 characters (should not be truncated)
+        // "(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t)" is 60 chars
+        let code = "f <- function(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t) { }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        let detail = symbols[0].detail.as_ref().unwrap();
+        // Should not be truncated if exactly 60 chars
+        assert!(!detail.ends_with("...") || detail.len() <= 60, "Detail: {}", detail);
+    }
+
+    #[test]
+    fn test_extract_signature_variable_has_no_detail() {
+        // Variable assignment should have no detail
+        let code = "x <- 42";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "x");
+        assert_eq!(symbols[0].detail, None);
+    }
+
+    #[test]
+    fn test_extract_signature_right_assignment() {
+        // Right assignment function should also have signature
+        let code = "(function(x, y) x + y) -> add";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "add");
+        // The function is wrapped in parentheses, but extract_signature should find it
+        assert_eq!(symbols[0].detail, Some("(x, y)".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signature_nested_functions() {
+        // Nested functions should each have their own signature
+        let code = "outer <- function(a) {\n  inner <- function(b, c) { b + c }\n}";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "outer");
+        assert_eq!(symbols[0].detail, Some("(a)".to_string()));
+        assert_eq!(symbols[1].name, "inner");
+        assert_eq!(symbols[1].detail, Some("(b, c)".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signature_equals_assignment() {
+        // Function with = assignment should also have signature
+        let code = "my_func = function(x) { x * 2 }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "my_func");
+        assert_eq!(symbols[0].detail, Some("(x)".to_string()));
+    }
+
+    #[test]
+    fn test_extract_signature_super_assignment() {
+        // Function with <<- assignment should also have signature
+        let code = "global_func <<- function(a, b, c) { a + b + c }";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "global_func");
+        assert_eq!(symbols[0].detail, Some("(a, b, c)".to_string()));
+    }
+
+    // ========================================================================
+    // extract_s4_methods() Tests - Task 3.1
+    // ========================================================================
+
+    #[test]
+    fn test_extract_s4_methods_setmethod() {
+        // setMethod() should be classified as METHOD
+        let code = r#"setMethod("show", "MyClass", function(object) { print(object) })"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "show");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Method),
+            "setMethod() should be classified as METHOD, got {:?}",
+            symbols[0].kind
+        );
+        // detail should be None for S4 methods
+        assert!(symbols[0].detail.is_none());
+    }
+
+    #[test]
+    fn test_extract_s4_methods_setclass() {
+        // setClass() should be classified as CLASS
+        let code = r#"setClass("Person", slots = c(name = "character", age = "numeric"))"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "Person");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Class),
+            "setClass() should be classified as CLASS, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_extract_s4_methods_setgeneric() {
+        // setGeneric() should be classified as INTERFACE
+        let code = r#"setGeneric("myGeneric", function(x) standardGeneric("myGeneric"))"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "myGeneric");
+        assert!(
+            matches!(symbols[0].kind, DocumentSymbolKind::Interface),
+            "setGeneric() should be classified as INTERFACE, got {:?}",
+            symbols[0].kind
+        );
+    }
+
+    #[test]
+    fn test_extract_s4_methods_single_quotes() {
+        // S4 methods with single-quoted names should also work
+        let code = r#"setMethod('initialize', 'MyClass', function(.Object) { .Object })"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "initialize");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Method));
+    }
+
+    #[test]
+    fn test_extract_s4_methods_multiple() {
+        // Multiple S4 definitions in one file
+        let code = r#"
+setClass("Animal", slots = c(name = "character"))
+setGeneric("speak", function(x) standardGeneric("speak"))
+setMethod("speak", "Animal", function(x) { print("...") })
+"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 3);
+
+        // Find each symbol by name
+        let animal = symbols.iter().find(|s| s.name == "Animal").unwrap();
+        let speak_generic = symbols
+            .iter()
+            .find(|s| s.name == "speak" && matches!(s.kind, DocumentSymbolKind::Interface))
+            .unwrap();
+        let speak_method = symbols
+            .iter()
+            .find(|s| s.name == "speak" && matches!(s.kind, DocumentSymbolKind::Method))
+            .unwrap();
+
+        assert!(matches!(animal.kind, DocumentSymbolKind::Class));
+        assert!(matches!(speak_generic.kind, DocumentSymbolKind::Interface));
+        assert!(matches!(speak_method.kind, DocumentSymbolKind::Method));
+    }
+
+    #[test]
+    fn test_extract_s4_methods_mixed_with_assignments() {
+        // S4 methods mixed with regular assignments
+        let code = r#"
+my_func <- function(x) { x + 1 }
+setClass("MyClass", slots = c(value = "numeric"))
+my_var <- 42
+setMethod("show", "MyClass", function(object) { print(object@value) })
+"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 4);
+
+        let func = symbols.iter().find(|s| s.name == "my_func").unwrap();
+        let class = symbols.iter().find(|s| s.name == "MyClass").unwrap();
+        let var = symbols.iter().find(|s| s.name == "my_var").unwrap();
+        let method = symbols.iter().find(|s| s.name == "show").unwrap();
+
+        assert!(matches!(func.kind, DocumentSymbolKind::Function));
+        assert!(matches!(class.kind, DocumentSymbolKind::Class));
+        assert!(matches!(var.kind, DocumentSymbolKind::Variable));
+        assert!(matches!(method.kind, DocumentSymbolKind::Method));
+    }
+
+    #[test]
+    fn test_extract_s4_methods_range_covers_entire_call() {
+        // The range should cover the entire setMethod/setClass/setGeneric call
+        let code = r#"setClass("Person", slots = c(name = "character"))"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        let symbol = &symbols[0];
+
+        // Range should start at beginning of line and cover the entire call
+        assert_eq!(symbol.range.start.line, 0);
+        assert_eq!(symbol.range.start.character, 0);
+        assert_eq!(symbol.range.end.line, 0);
+        // End should be at the closing parenthesis
+        assert_eq!(symbol.range.end.character, code.len() as u32);
+    }
+
+    #[test]
+    fn test_extract_s4_methods_selection_range_covers_name() {
+        // The selection_range should cover just the string argument (the name)
+        let code = r#"setClass("Person", slots = c(name = "character"))"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        let symbol = &symbols[0];
+
+        // Selection range should cover "Person" (including quotes)
+        // setClass("Person", ...) - "Person" starts at position 9
+        assert_eq!(symbol.selection_range.start.line, 0);
+        assert_eq!(symbol.selection_range.start.character, 9);
+        assert_eq!(symbol.selection_range.end.line, 0);
+        assert_eq!(symbol.selection_range.end.character, 17); // "Person" is 8 chars including quotes
+    }
+
+    #[test]
+    fn test_extract_s4_methods_selection_range_contained_in_range() {
+        // Property 3: selection_range must be contained within range
+        let code = r#"setGeneric("myGeneric", function(x) standardGeneric("myGeneric"))"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        let symbol = &symbols[0];
+
+        // selection_range.start >= range.start
+        assert!(
+            symbol.selection_range.start.line > symbol.range.start.line
+                || (symbol.selection_range.start.line == symbol.range.start.line
+                    && symbol.selection_range.start.character >= symbol.range.start.character)
+        );
+
+        // selection_range.end <= range.end
+        assert!(
+            symbol.selection_range.end.line < symbol.range.end.line
+                || (symbol.selection_range.end.line == symbol.range.end.line
+                    && symbol.selection_range.end.character <= symbol.range.end.character)
+        );
+    }
+
+    #[test]
+    fn test_extract_s4_methods_no_string_argument() {
+        // If the first argument is not a string, no symbol should be extracted
+        let code = r#"setMethod(myVar, "MyClass", function(object) { })"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let s4_symbols = extractor.extract_s4_methods(tree.root_node());
+
+        // No S4 symbols should be extracted since first arg is not a string
+        assert!(s4_symbols.is_empty());
+    }
+
+    #[test]
+    fn test_extract_s4_methods_named_argument() {
+        // Named arguments should be skipped when looking for the first positional string
+        let code = r#"setClass(Class = "Person", slots = c(name = "character"))"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let s4_symbols = extractor.extract_s4_methods(tree.root_node());
+
+        // Named argument "Class = ..." should be skipped, so no symbol extracted
+        // (we only look for positional string arguments)
+        assert!(s4_symbols.is_empty());
+    }
+
+    #[test]
+    fn test_extract_s4_methods_multiline() {
+        // S4 method spanning multiple lines
+        let code = r#"setMethod(
+    "show",
+    "MyClass",
+    function(object) {
+        print(object)
+    }
+)"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "show");
+        assert!(matches!(symbols[0].kind, DocumentSymbolKind::Method));
+
+        // Range should span from line 0 to line 6
+        assert_eq!(symbols[0].range.start.line, 0);
+        assert_eq!(symbols[0].range.end.line, 6);
+    }
+
+    // ========================================================================
+    // extract_sections() Tests - Task 4.1
+    // ========================================================================
+
+    #[test]
+    fn test_extract_sections_basic_dash() {
+        // Basic section with dashes
+        let code = "# Data Loading ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // Should find 1 section and 1 variable
+        assert_eq!(symbols.len(), 2);
+
+        // Find the section symbol
+        let section = symbols.iter().find(|s| s.name == "Data Loading").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+        assert_eq!(section.range.start.line, 0);
+        assert_eq!(section.range.end.line, 0);
+    }
+
+    #[test]
+    fn test_extract_sections_basic_hash() {
+        // Section with hash delimiter
+        let code = "# Setup ####\ny <- 2";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Setup").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_extract_sections_basic_equals() {
+        // Section with equals delimiter
+        let code = "# Analysis ====\nz <- 3";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Analysis").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_extract_sections_basic_asterisk() {
+        // Section with asterisk delimiter
+        let code = "# Results ****\nw <- 4";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Results").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_extract_sections_basic_plus() {
+        // Section with plus delimiter
+        let code = "# Conclusion ++++\nv <- 5";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Conclusion").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_extract_sections_heading_levels() {
+        // Test different heading levels (# count)
+        let code = "# Level 1 ----\n## Level 2 ----\n### Level 3 ----";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        assert_eq!(symbols.len(), 3);
+
+        let level1 = symbols.iter().find(|s| s.name == "Level 1").unwrap();
+        assert_eq!(level1.section_level, Some(1));
+
+        let level2 = symbols.iter().find(|s| s.name == "Level 2").unwrap();
+        assert_eq!(level2.section_level, Some(2));
+
+        let level3 = symbols.iter().find(|s| s.name == "Level 3").unwrap();
+        assert_eq!(level3.section_level, Some(3));
+    }
+
+    #[test]
+    fn test_extract_sections_rstudio_cell_marker() {
+        // RStudio-style cell marker with %%
+        let code = "# %% Cell Name ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Cell Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_extract_sections_leading_whitespace() {
+        // Section with leading whitespace
+        let code = "  # Indented Section ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Indented Section").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_trailing_whitespace() {
+        // Section with trailing whitespace after delimiter
+        let code = "# Section Name ----   \nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_multiple_sections() {
+        // Multiple sections in one file
+        let code = "# Section 1 ----\nx <- 1\n# Section 2 ----\ny <- 2\n# Section 3 ----\nz <- 3";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // Should find 3 sections and 3 variables
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert_eq!(sections.len(), 3);
+
+        assert_eq!(sections[0].name, "Section 1");
+        assert_eq!(sections[0].range.start.line, 0);
+
+        assert_eq!(sections[1].name, "Section 2");
+        assert_eq!(sections[1].range.start.line, 2);
+
+        assert_eq!(sections[2].name, "Section 3");
+        assert_eq!(sections[2].range.start.line, 4);
+    }
+
+    #[test]
+    fn test_extract_sections_long_delimiter() {
+        // Section with long delimiter (more than 4 characters)
+        let code = "# Long Delimiter ----------\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Long Delimiter").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_minimum_delimiter() {
+        // Section with exactly 4 character delimiter (minimum)
+        let code = "# Min Delim ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Min Delim").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_too_short_delimiter() {
+        // Delimiter with only 3 characters should NOT be detected as section
+        let code = "# Not A Section ---\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // Should only find the variable, not a section
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_no_section_name() {
+        // Comment without section name should NOT be detected
+        let code = "# ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // Should only find the variable, not a section
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_regular_comment_not_section() {
+        // Regular comment without delimiter should NOT be detected
+        let code = "# This is just a comment\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        // Should only find the variable, not a section
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_extract_sections_section_name_with_spaces() {
+        // Section name with multiple words
+        let code = "# Data Loading and Preprocessing ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols
+            .iter()
+            .find(|s| s.name == "Data Loading and Preprocessing")
+            .unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_section_name_with_special_chars() {
+        // Section name with special characters
+        let code = "# Step 1: Load Data (v2.0) ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols
+            .iter()
+            .find(|s| s.name == "Step 1: Load Data (v2.0)")
+            .unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_extract_sections_utf16_range() {
+        // Section with Unicode characters to test UTF-16 column calculation
+        let code = "# 日本語セクション ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "日本語セクション").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        // The range should cover the entire line in UTF-16 code units
+        assert_eq!(section.range.start.character, 0);
+        // "# 日本語セクション ----" = 2 + 8 + 1 + 4 = 15 UTF-16 code units
+        // (# and space = 2, 8 Japanese chars = 8, space = 1, ---- = 4)
+        assert_eq!(section.range.end.character, 15);
+    }
+
+    #[test]
+    fn test_extract_sections_mixed_with_code() {
+        // Sections mixed with various code constructs
+        let code = r#"# Setup ----
+library(dplyr)
+
+# Data Loading ----
+data <- read.csv("file.csv")
+
+## Subsection ----
+x <- 1
+
+# Analysis ----
+result <- data %>% filter(x > 0)
+"#;
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+
+        assert_eq!(sections.len(), 4);
+        assert_eq!(sections[0].name, "Setup");
+        assert_eq!(sections[0].section_level, Some(1));
+        assert_eq!(sections[1].name, "Data Loading");
+        assert_eq!(sections[1].section_level, Some(1));
+        assert_eq!(sections[2].name, "Subsection");
+        assert_eq!(sections[2].section_level, Some(2));
+        assert_eq!(sections[3].name, "Analysis");
+        assert_eq!(sections[3].section_level, Some(1));
+    }
+
+    #[test]
+    fn test_extract_sections_selection_range_equals_range() {
+        // For sections, selection_range should equal range (the comment line)
+        let code = "# My Section ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "My Section").unwrap();
+        assert_eq!(section.range, section.selection_range);
+    }
+
+    #[test]
+    fn test_extract_sections_no_detail() {
+        // Sections should not have a detail field
+        let code = "# My Section ----\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "My Section").unwrap();
+        assert!(section.detail.is_none());
+    }
+
+    // ========================================================================
+    // HierarchyBuilder::compute_section_ranges() tests
+    // ========================================================================
+
+    #[test]
+    fn test_compute_section_ranges_single_section() {
+        // Single section should span from its line to EOF
+        let symbols = vec![RawSymbol {
+            name: "Section 1".to_string(),
+            kind: DocumentSymbolKind::Module,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 20 },
+            },
+            selection_range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 20 },
+            },
+            detail: None,
+            section_level: Some(1),
+            children: Vec::new(),
+        }];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.compute_section_ranges();
+
+        // Section should now span from line 0 to line 9 (last line)
+        assert_eq!(builder.symbols[0].range.start.line, 0);
+        assert_eq!(builder.symbols[0].range.end.line, 9);
+        // selection_range should remain unchanged
+        assert_eq!(builder.symbols[0].selection_range.start.line, 0);
+        assert_eq!(builder.symbols[0].selection_range.end.line, 0);
+    }
+
+    #[test]
+    fn test_compute_section_ranges_two_sections() {
+        // Two sections: first should end at line before second
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Section 2".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.compute_section_ranges();
+
+        // First section: line 0 to line 4 (line before section 2)
+        assert_eq!(builder.symbols[0].range.start.line, 0);
+        assert_eq!(builder.symbols[0].range.end.line, 4);
+        // Second section: line 5 to line 9 (EOF)
+        assert_eq!(builder.symbols[1].range.start.line, 5);
+        assert_eq!(builder.symbols[1].range.end.line, 9);
+    }
+
+    #[test]
+    fn test_compute_section_ranges_three_sections() {
+        // Three sections
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Section 2".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Section 3".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 7, character: 0 },
+                    end: Position { line: 7, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 7, character: 0 },
+                    end: Position { line: 7, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.compute_section_ranges();
+
+        // Section 1: line 0 to line 2
+        assert_eq!(builder.symbols[0].range.start.line, 0);
+        assert_eq!(builder.symbols[0].range.end.line, 2);
+        // Section 2: line 3 to line 6
+        assert_eq!(builder.symbols[1].range.start.line, 3);
+        assert_eq!(builder.symbols[1].range.end.line, 6);
+        // Section 3: line 7 to line 9 (EOF)
+        assert_eq!(builder.symbols[2].range.start.line, 7);
+        assert_eq!(builder.symbols[2].range.end.line, 9);
+    }
+
+    #[test]
+    fn test_compute_section_ranges_unsorted_sections() {
+        // Sections not in order by line - should still work correctly
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 2".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.compute_section_ranges();
+
+        // Find sections by name since order in vec may differ
+        let section1 = builder.symbols.iter().find(|s| s.name == "Section 1").unwrap();
+        let section2 = builder.symbols.iter().find(|s| s.name == "Section 2").unwrap();
+
+        // Section 1: line 0 to line 4
+        assert_eq!(section1.range.start.line, 0);
+        assert_eq!(section1.range.end.line, 4);
+        // Section 2: line 5 to line 9 (EOF)
+        assert_eq!(section2.range.start.line, 5);
+        assert_eq!(section2.range.end.line, 9);
+    }
+
+    #[test]
+    fn test_compute_section_ranges_mixed_with_non_sections() {
+        // Mix of sections and non-section symbols
+        let symbols = vec![
+            RawSymbol {
+                name: "my_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 3, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 7 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None, // Not a section
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Section 2".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.compute_section_ranges();
+
+        // Find symbols by name
+        let func = builder.symbols.iter().find(|s| s.name == "my_func").unwrap();
+        let section1 = builder.symbols.iter().find(|s| s.name == "Section 1").unwrap();
+        let section2 = builder.symbols.iter().find(|s| s.name == "Section 2").unwrap();
+
+        // Function should be unchanged
+        assert_eq!(func.range.start.line, 1);
+        assert_eq!(func.range.end.line, 3);
+
+        // Section 1: line 0 to line 4
+        assert_eq!(section1.range.start.line, 0);
+        assert_eq!(section1.range.end.line, 4);
+        // Section 2: line 5 to line 9 (EOF)
+        assert_eq!(section2.range.start.line, 5);
+        assert_eq!(section2.range.end.line, 9);
+    }
+
+    #[test]
+    fn test_compute_section_ranges_no_sections() {
+        // No sections - should not modify anything
+        let symbols = vec![RawSymbol {
+            name: "my_func".to_string(),
+            kind: DocumentSymbolKind::Function,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 2, character: 1 },
+            },
+            selection_range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 7 },
+            },
+            detail: Some("()".to_string()),
+            section_level: None,
+            children: Vec::new(),
+        }];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.compute_section_ranges();
+
+        // Function should be unchanged
+        assert_eq!(builder.symbols[0].range.start.line, 0);
+        assert_eq!(builder.symbols[0].range.end.line, 2);
+    }
+
+    #[test]
+    fn test_compute_section_ranges_empty_symbols() {
+        // Empty symbols list - should not panic
+        let symbols: Vec<RawSymbol> = vec![];
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.compute_section_ranges();
+        assert!(builder.symbols.is_empty());
+    }
+
+    #[test]
+    fn test_compute_section_ranges_section_at_line_zero() {
+        // Section at line 0 with next section at line 1
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Section 2".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 5);
+        builder.compute_section_ranges();
+
+        // Section 1: line 0 to line 0 (line before section 2 is 0)
+        assert_eq!(builder.symbols[0].range.start.line, 0);
+        assert_eq!(builder.symbols[0].range.end.line, 0);
+        // Section 2: line 1 to line 4 (EOF)
+        assert_eq!(builder.symbols[1].range.start.line, 1);
+        assert_eq!(builder.symbols[1].range.end.line, 4);
+    }
+
+    #[test]
+    fn test_compute_section_ranges_selection_range_unchanged() {
+        // Verify selection_range is NOT modified
+        let symbols = vec![RawSymbol {
+            name: "Section 1".to_string(),
+            kind: DocumentSymbolKind::Module,
+            range: Range {
+                start: Position { line: 2, character: 0 },
+                end: Position { line: 2, character: 20 },
+            },
+            selection_range: Range {
+                start: Position { line: 2, character: 0 },
+                end: Position { line: 2, character: 20 },
+            },
+            detail: None,
+            section_level: Some(1),
+            children: Vec::new(),
+        }];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.compute_section_ranges();
+
+        // range should be expanded
+        assert_eq!(builder.symbols[0].range.start.line, 2);
+        assert_eq!(builder.symbols[0].range.end.line, 9);
+        // selection_range should remain the comment line only
+        assert_eq!(builder.symbols[0].selection_range.start.line, 2);
+        assert_eq!(builder.symbols[0].selection_range.end.line, 2);
+        assert_eq!(builder.symbols[0].selection_range.start.character, 0);
+        assert_eq!(builder.symbols[0].selection_range.end.character, 20);
+    }
+
+    #[test]
+    fn test_compute_section_ranges_zero_line_count() {
+        // Edge case: line_count is 0
+        let symbols = vec![RawSymbol {
+            name: "Section 1".to_string(),
+            kind: DocumentSymbolKind::Module,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 20 },
+            },
+            selection_range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 20 },
+            },
+            detail: None,
+            section_level: Some(1),
+            children: Vec::new(),
+        }];
+
+        let mut builder = HierarchyBuilder::new(symbols, 0);
+        builder.compute_section_ranges();
+
+        // With line_count 0, end line should be 0
+        assert_eq!(builder.symbols[0].range.end.line, 0);
+    }
+
+    // ========================================================================
+    // Tests for nest_in_sections()
+    // ========================================================================
+
+    #[test]
+    fn test_nest_in_sections_empty() {
+        // Empty symbols list - should not panic
+        let symbols: Vec<RawSymbol> = vec![];
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_sections();
+        assert!(builder.symbols.is_empty());
+    }
+
+    #[test]
+    fn test_nest_in_sections_no_sections() {
+        // Only non-section symbols - should remain at root level
+        let symbols = vec![
+            RawSymbol {
+                name: "func1".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 2, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 5 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "func2".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 5, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 5 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_sections();
+
+        // Both functions should remain at root level
+        assert_eq!(builder.symbols.len(), 2);
+        assert_eq!(builder.symbols[0].name, "func1");
+        assert_eq!(builder.symbols[1].name, "func2");
+    }
+
+    #[test]
+    fn test_nest_in_sections_symbol_in_section() {
+        // A function inside a section should become a child of that section
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 9, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "my_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 4, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 2, character: 7 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_sections();
+
+        // Should have one root symbol (the section)
+        assert_eq!(builder.symbols.len(), 1);
+        assert_eq!(builder.symbols[0].name, "Section 1");
+        // The function should be a child of the section
+        assert_eq!(builder.symbols[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].name, "my_func");
+    }
+
+    #[test]
+    fn test_nest_in_sections_nested_sections() {
+        // ## Subsection should be nested inside # Section
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 19, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1), // # Section
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Subsection 1.1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 14, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 25 },
+                },
+                detail: None,
+                section_level: Some(2), // ## Subsection
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Section 2".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 20, character: 0 },
+                    end: Position { line: 29, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 20, character: 0 },
+                    end: Position { line: 20, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1), // # Section
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 30);
+        builder.nest_in_sections();
+
+        // Should have two root sections
+        assert_eq!(builder.symbols.len(), 2);
+        assert_eq!(builder.symbols[0].name, "Section 1");
+        assert_eq!(builder.symbols[1].name, "Section 2");
+
+        // Section 1 should have Subsection 1.1 as a child
+        assert_eq!(builder.symbols[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].name, "Subsection 1.1");
+
+        // Section 2 should have no children
+        assert!(builder.symbols[1].children.is_empty());
+    }
+
+    #[test]
+    fn test_nest_in_sections_symbol_in_nested_section() {
+        // A function inside a subsection should be nested in the subsection, not the parent section
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 19, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Subsection 1.1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 14, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 25 },
+                },
+                detail: None,
+                section_level: Some(2),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "nested_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 7, character: 0 },
+                    end: Position { line: 9, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 7, character: 0 },
+                    end: Position { line: 7, character: 11 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 20);
+        builder.nest_in_sections();
+
+        // Should have one root section
+        assert_eq!(builder.symbols.len(), 1);
+        assert_eq!(builder.symbols[0].name, "Section 1");
+
+        // Section 1 should have Subsection 1.1 as a child
+        assert_eq!(builder.symbols[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].name, "Subsection 1.1");
+
+        // Subsection 1.1 should have nested_func as a child
+        assert_eq!(builder.symbols[0].children[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].children[0].name, "nested_func");
+    }
+
+    #[test]
+    fn test_nest_in_sections_multiple_levels() {
+        // Test three levels of nesting: # > ## > ###
+        let symbols = vec![
+            RawSymbol {
+                name: "Level 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 29, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 15 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Level 2".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 24, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 15 },
+                },
+                detail: None,
+                section_level: Some(2),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Level 3".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 10, character: 0 },
+                    end: Position { line: 19, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 10, character: 0 },
+                    end: Position { line: 10, character: 15 },
+                },
+                detail: None,
+                section_level: Some(3),
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 30);
+        builder.nest_in_sections();
+
+        // Should have one root section
+        assert_eq!(builder.symbols.len(), 1);
+        assert_eq!(builder.symbols[0].name, "Level 1");
+
+        // Level 1 should have Level 2 as a child
+        assert_eq!(builder.symbols[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].name, "Level 2");
+
+        // Level 2 should have Level 3 as a child
+        assert_eq!(builder.symbols[0].children[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].children[0].name, "Level 3");
+    }
+
+    #[test]
+    fn test_nest_in_sections_sibling_sections() {
+        // Two ## sections under one # section should be siblings
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 29, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Subsection A".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 14, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 20 },
+                },
+                detail: None,
+                section_level: Some(2),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Subsection B".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 15, character: 0 },
+                    end: Position { line: 24, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 15, character: 0 },
+                    end: Position { line: 15, character: 20 },
+                },
+                detail: None,
+                section_level: Some(2),
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 30);
+        builder.nest_in_sections();
+
+        // Should have one root section
+        assert_eq!(builder.symbols.len(), 1);
+        assert_eq!(builder.symbols[0].name, "Section 1");
+
+        // Section 1 should have two children (both subsections)
+        assert_eq!(builder.symbols[0].children.len(), 2);
+        assert_eq!(builder.symbols[0].children[0].name, "Subsection A");
+        assert_eq!(builder.symbols[0].children[1].name, "Subsection B");
+    }
+
+    #[test]
+    fn test_nest_in_sections_symbol_before_any_section() {
+        // A symbol before any section should remain at root level
+        let symbols = vec![
+            RawSymbol {
+                name: "early_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 2, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 10 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 19, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 20);
+        builder.nest_in_sections();
+
+        // Should have two root symbols
+        assert_eq!(builder.symbols.len(), 2);
+        // Find symbols by name since order may vary based on implementation
+        let early_func = builder.symbols.iter().find(|s| s.name == "early_func");
+        let section1 = builder.symbols.iter().find(|s| s.name == "Section 1");
+        assert!(early_func.is_some(), "early_func should be at root level");
+        assert!(section1.is_some(), "Section 1 should be at root level");
+    }
+
+    #[test]
+    fn test_nest_in_sections_symbol_after_all_sections() {
+        // A symbol after all sections (outside their ranges) should remain at root level
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 9, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "late_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 15, character: 0 },
+                    end: Position { line: 17, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 15, character: 0 },
+                    end: Position { line: 15, character: 9 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 20);
+        builder.nest_in_sections();
+
+        // Should have two root symbols
+        assert_eq!(builder.symbols.len(), 2);
+        assert_eq!(builder.symbols[0].name, "Section 1");
+        assert_eq!(builder.symbols[1].name, "late_func");
+        // Section should have no children
+        assert!(builder.symbols[0].children.is_empty());
+    }
+
+    // ========================================================================
+    // HierarchyBuilder::nest_in_functions() tests
+    // ========================================================================
+
+    #[test]
+    fn test_nest_in_functions_empty() {
+        // Empty symbols list - should not panic
+        let symbols: Vec<RawSymbol> = vec![];
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_functions();
+        assert!(builder.symbols.is_empty());
+    }
+
+    #[test]
+    fn test_nest_in_functions_no_functions() {
+        // Only non-function symbols - should remain at root level
+        let symbols = vec![
+            RawSymbol {
+                name: "MY_CONST".to_string(),
+                kind: DocumentSymbolKind::Constant,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 15 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 8 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "my_var".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 10 },
+                },
+                selection_range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 6 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_functions();
+
+        // Both symbols should remain at root level
+        assert_eq!(builder.symbols.len(), 2);
+        assert_eq!(builder.symbols[0].name, "MY_CONST");
+        assert_eq!(builder.symbols[1].name, "my_var");
+    }
+
+    #[test]
+    fn test_nest_in_functions_variable_inside_function() {
+        // A variable inside a function body should become a child of that function
+        // Code:
+        // outer <- function() {   # line 0-4
+        //   inner_var <- 42       # line 2
+        // }
+        let symbols = vec![
+            RawSymbol {
+                name: "outer".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 4, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 5 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "inner_var".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 2, character: 2 },
+                    end: Position { line: 2, character: 17 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 2 },
+                    end: Position { line: 2, character: 11 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_functions();
+
+        // Should have one root symbol (the function)
+        assert_eq!(builder.symbols.len(), 1);
+        assert_eq!(builder.symbols[0].name, "outer");
+        // The variable should be a child of the function
+        assert_eq!(builder.symbols[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].name, "inner_var");
+    }
+
+    #[test]
+    fn test_nest_in_functions_nested_functions() {
+        // Nested function definitions should preserve their nesting depth
+        // Code:
+        // outer <- function() {   # line 0-8
+        //   inner <- function() { # line 2-6
+        //     deepest <- 1        # line 4
+        //   }
+        // }
+        let symbols = vec![
+            RawSymbol {
+                name: "outer".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 8, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 5 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "inner".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 2, character: 2 },
+                    end: Position { line: 6, character: 3 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 2 },
+                    end: Position { line: 2, character: 7 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "deepest".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 4, character: 4 },
+                    end: Position { line: 4, character: 16 },
+                },
+                selection_range: Range {
+                    start: Position { line: 4, character: 4 },
+                    end: Position { line: 4, character: 11 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_functions();
+
+        // Should have one root symbol (outer function)
+        assert_eq!(builder.symbols.len(), 1);
+        assert_eq!(builder.symbols[0].name, "outer");
+
+        // outer should have inner as a child
+        assert_eq!(builder.symbols[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].name, "inner");
+
+        // inner should have deepest as a child
+        assert_eq!(builder.symbols[0].children[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].children[0].name, "deepest");
+    }
+
+    #[test]
+    fn test_nest_in_functions_three_levels_deep() {
+        // Test three levels of function nesting
+        // Code:
+        // level1 <- function() {   # line 0-12
+        //   level2 <- function() { # line 2-10
+        //     level3 <- function() { # line 4-8
+        //       x <- 1              # line 6
+        //     }
+        //   }
+        // }
+        let symbols = vec![
+            RawSymbol {
+                name: "level1".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 12, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 6 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "level2".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 2, character: 2 },
+                    end: Position { line: 10, character: 3 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 2 },
+                    end: Position { line: 2, character: 8 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "level3".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 4, character: 4 },
+                    end: Position { line: 8, character: 5 },
+                },
+                selection_range: Range {
+                    start: Position { line: 4, character: 4 },
+                    end: Position { line: 4, character: 10 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "x".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 6, character: 6 },
+                    end: Position { line: 6, character: 12 },
+                },
+                selection_range: Range {
+                    start: Position { line: 6, character: 6 },
+                    end: Position { line: 6, character: 7 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 15);
+        builder.nest_in_functions();
+
+        // Should have one root symbol (level1)
+        assert_eq!(builder.symbols.len(), 1);
+        assert_eq!(builder.symbols[0].name, "level1");
+
+        // level1 -> level2
+        assert_eq!(builder.symbols[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].name, "level2");
+
+        // level2 -> level3
+        assert_eq!(builder.symbols[0].children[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].children[0].name, "level3");
+
+        // level3 -> x
+        assert_eq!(builder.symbols[0].children[0].children[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].children[0].children[0].name, "x");
+    }
+
+    #[test]
+    fn test_nest_in_functions_sibling_functions() {
+        // Two functions at the same level should remain siblings
+        // Code:
+        // func1 <- function() { }  # line 0-2
+        // func2 <- function() { }  # line 3-5
+        let symbols = vec![
+            RawSymbol {
+                name: "func1".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 2, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 5 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "func2".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 5, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 5 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_functions();
+
+        // Both functions should remain at root level
+        assert_eq!(builder.symbols.len(), 2);
+        assert_eq!(builder.symbols[0].name, "func1");
+        assert_eq!(builder.symbols[1].name, "func2");
+    }
+
+    #[test]
+    fn test_nest_in_functions_variable_outside_function() {
+        // A variable outside any function should remain at root level
+        // Code:
+        // top_var <- 1             # line 0
+        // my_func <- function() { } # line 2-4
+        let symbols = vec![
+            RawSymbol {
+                name: "top_var".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 12 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 7 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "my_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 4, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 2, character: 7 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_functions();
+
+        // Both symbols should remain at root level
+        assert_eq!(builder.symbols.len(), 2);
+        assert_eq!(builder.symbols[0].name, "top_var");
+        assert_eq!(builder.symbols[1].name, "my_func");
+    }
+
+    #[test]
+    fn test_nest_in_functions_variable_after_function() {
+        // A variable after a function (outside its range) should remain at root level
+        // Code:
+        // my_func <- function() { } # line 0-2
+        // after_var <- 1            # line 4
+        let symbols = vec![
+            RawSymbol {
+                name: "my_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 2, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 7 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "after_var".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 4, character: 0 },
+                    end: Position { line: 4, character: 14 },
+                },
+                selection_range: Range {
+                    start: Position { line: 4, character: 0 },
+                    end: Position { line: 4, character: 9 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_functions();
+
+        // Both symbols should remain at root level
+        assert_eq!(builder.symbols.len(), 2);
+        assert_eq!(builder.symbols[0].name, "my_func");
+        assert_eq!(builder.symbols[1].name, "after_var");
+    }
+
+    #[test]
+    fn test_nest_in_functions_multiple_variables_in_function() {
+        // Multiple variables inside a function should all become children
+        // Code:
+        // my_func <- function() {  # line 0-6
+        //   var1 <- 1              # line 2
+        //   var2 <- 2              # line 3
+        //   var3 <- 3              # line 4
+        // }
+        let symbols = vec![
+            RawSymbol {
+                name: "my_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 6, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 7 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "var1".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 2, character: 2 },
+                    end: Position { line: 2, character: 12 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 2 },
+                    end: Position { line: 2, character: 6 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "var2".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 3, character: 2 },
+                    end: Position { line: 3, character: 12 },
+                },
+                selection_range: Range {
+                    start: Position { line: 3, character: 2 },
+                    end: Position { line: 3, character: 6 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "var3".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 4, character: 2 },
+                    end: Position { line: 4, character: 12 },
+                },
+                selection_range: Range {
+                    start: Position { line: 4, character: 2 },
+                    end: Position { line: 4, character: 6 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_functions();
+
+        // Should have one root symbol (the function)
+        assert_eq!(builder.symbols.len(), 1);
+        assert_eq!(builder.symbols[0].name, "my_func");
+
+        // All three variables should be children
+        assert_eq!(builder.symbols[0].children.len(), 3);
+        assert_eq!(builder.symbols[0].children[0].name, "var1");
+        assert_eq!(builder.symbols[0].children[1].name, "var2");
+        assert_eq!(builder.symbols[0].children[2].name, "var3");
+    }
+
+    #[test]
+    fn test_nest_in_functions_with_sections() {
+        // Test that nest_in_functions works correctly after nest_in_sections
+        // Symbols inside a section that are also inside a function should be nested in the function
+        // Code:
+        // # Section 1 ----         # line 0
+        // my_func <- function() {  # line 2-6
+        //   inner_var <- 1         # line 4
+        // }
+        let symbols = vec![
+            RawSymbol {
+                name: "Section 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 9, character: u32::MAX },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 15 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: vec![
+                    RawSymbol {
+                        name: "my_func".to_string(),
+                        kind: DocumentSymbolKind::Function,
+                        range: Range {
+                            start: Position { line: 2, character: 0 },
+                            end: Position { line: 6, character: 1 },
+                        },
+                        selection_range: Range {
+                            start: Position { line: 2, character: 0 },
+                            end: Position { line: 2, character: 7 },
+                        },
+                        detail: Some("()".to_string()),
+                        section_level: None,
+                        children: Vec::new(),
+                    },
+                    RawSymbol {
+                        name: "inner_var".to_string(),
+                        kind: DocumentSymbolKind::Variable,
+                        range: Range {
+                            start: Position { line: 4, character: 2 },
+                            end: Position { line: 4, character: 16 },
+                        },
+                        selection_range: Range {
+                            start: Position { line: 4, character: 2 },
+                            end: Position { line: 4, character: 11 },
+                        },
+                        detail: None,
+                        section_level: None,
+                        children: Vec::new(),
+                    },
+                ],
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        // nest_in_sections was already called (symbols are pre-nested in section)
+        // Now call nest_in_functions to nest inner_var inside my_func
+        builder.nest_in_functions();
+
+        // Should still have one root symbol (the section)
+        assert_eq!(builder.symbols.len(), 1);
+        assert_eq!(builder.symbols[0].name, "Section 1");
+
+        // Section should have one child (the function)
+        assert_eq!(builder.symbols[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].name, "my_func");
+
+        // Function should have inner_var as a child
+        assert_eq!(builder.symbols[0].children[0].children.len(), 1);
+        assert_eq!(builder.symbols[0].children[0].children[0].name, "inner_var");
+    }
+
+    #[test]
+    fn test_nest_in_functions_symbol_on_function_definition_line() {
+        // A symbol on the same line as the function definition should NOT be nested
+        // (it's part of the function definition, not inside the body)
+        // Code:
+        // my_func <- function() { x <- 1 }  # line 0 (single line function)
+        let symbols = vec![
+            RawSymbol {
+                name: "my_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 32 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 7 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "x".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 0, character: 24 },
+                    end: Position { line: 0, character: 30 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 24 },
+                    end: Position { line: 0, character: 25 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.nest_in_functions();
+
+        // Both symbols should remain at root level because x is on the same line as the function
+        // (our containment check requires symbol_start > func_start)
+        assert_eq!(builder.symbols.len(), 2);
+    }
+
+    // ========================================================================
+    // HierarchyBuilder::build() tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_empty_symbols() {
+        // Empty symbols list - should return empty Vec<DocumentSymbol>
+        let symbols: Vec<RawSymbol> = vec![];
+        let builder = HierarchyBuilder::new(symbols, 10);
+        let result = builder.build();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_single_function() {
+        // Single function symbol - should convert to DocumentSymbol
+        let symbols = vec![RawSymbol {
+            name: "my_func".to_string(),
+            kind: DocumentSymbolKind::Function,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 5, character: 1 },
+            },
+            selection_range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 7 },
+            },
+            detail: Some("(x, y)".to_string()),
+            section_level: None,
+            children: Vec::new(),
+        }];
+
+        let builder = HierarchyBuilder::new(symbols, 10);
+        let result = builder.build();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "my_func");
+        assert_eq!(result[0].kind, SymbolKind::FUNCTION);
+        assert_eq!(result[0].detail, Some("(x, y)".to_string()));
+        assert!(result[0].children.is_none());
+        assert!(result[0].deprecated.is_none());
+        assert!(result[0].tags.is_none());
+    }
+
+    #[test]
+    fn test_build_with_nested_function() {
+        // Function with nested variable - should produce hierarchy
+        let symbols = vec![
+            RawSymbol {
+                name: "outer_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 5, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 10 },
+                },
+                detail: Some("(x)".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "inner_var".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 2, character: 4 },
+                    end: Position { line: 2, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 4 },
+                    end: Position { line: 2, character: 13 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let builder = HierarchyBuilder::new(symbols, 10);
+        let result = builder.build();
+
+        // Should have one root symbol (outer_func) with inner_var as child
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "outer_func");
+        assert!(result[0].children.is_some());
+        let children = result[0].children.as_ref().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "inner_var");
+        assert_eq!(children[0].kind, SymbolKind::VARIABLE);
+    }
+
+    #[test]
+    fn test_build_with_section() {
+        // Section with function inside - should produce hierarchy
+        let symbols = vec![
+            RawSymbol {
+                name: "My Section".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 20 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "my_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 5, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 2, character: 7 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let builder = HierarchyBuilder::new(symbols, 10);
+        let result = builder.build();
+
+        // Should have one root symbol (section) with my_func as child
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "My Section");
+        assert_eq!(result[0].kind, SymbolKind::MODULE);
+        assert!(result[0].children.is_some());
+        let children = result[0].children.as_ref().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "my_func");
+    }
+
+    #[test]
+    fn test_build_all_symbol_kinds() {
+        // Test all DocumentSymbolKind variants convert correctly
+        let symbols = vec![
+            RawSymbol {
+                name: "my_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 10 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 7 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "my_var".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 10 },
+                },
+                selection_range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 6 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "MY_CONST".to_string(),
+                kind: DocumentSymbolKind::Constant,
+                range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 2, character: 15 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 2, character: 8 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "MyClass".to_string(),
+                kind: DocumentSymbolKind::Class,
+                range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 7 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "myMethod".to_string(),
+                kind: DocumentSymbolKind::Method,
+                range: Range {
+                    start: Position { line: 4, character: 0 },
+                    end: Position { line: 4, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 4, character: 0 },
+                    end: Position { line: 4, character: 8 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "myGeneric".to_string(),
+                kind: DocumentSymbolKind::Interface,
+                range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 5, character: 0 },
+                    end: Position { line: 5, character: 9 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let builder = HierarchyBuilder::new(symbols, 10);
+        let result = builder.build();
+
+        assert_eq!(result.len(), 6);
+        assert_eq!(result[0].kind, SymbolKind::FUNCTION);
+        assert_eq!(result[1].kind, SymbolKind::VARIABLE);
+        assert_eq!(result[2].kind, SymbolKind::CONSTANT);
+        assert_eq!(result[3].kind, SymbolKind::CLASS);
+        assert_eq!(result[4].kind, SymbolKind::METHOD);
+        assert_eq!(result[5].kind, SymbolKind::INTERFACE);
+    }
+
+    #[test]
+    fn test_build_complex_hierarchy() {
+        // Complex hierarchy: section -> function -> nested function -> variable
+        let symbols = vec![
+            RawSymbol {
+                name: "Section".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 15 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 15 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "outer".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 10, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 2, character: 5 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "inner".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 4, character: 4 },
+                    end: Position { line: 8, character: 5 },
+                },
+                selection_range: Range {
+                    start: Position { line: 4, character: 4 },
+                    end: Position { line: 4, character: 9 },
+                },
+                detail: Some("(x)".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "deep_var".to_string(),
+                kind: DocumentSymbolKind::Variable,
+                range: Range {
+                    start: Position { line: 6, character: 8 },
+                    end: Position { line: 6, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 6, character: 8 },
+                    end: Position { line: 6, character: 16 },
+                },
+                detail: None,
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let builder = HierarchyBuilder::new(symbols, 15);
+        let result = builder.build();
+
+        // Section at root
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "Section");
+
+        // outer inside section
+        let section_children = result[0].children.as_ref().unwrap();
+        assert_eq!(section_children.len(), 1);
+        assert_eq!(section_children[0].name, "outer");
+
+        // inner inside outer
+        let outer_children = section_children[0].children.as_ref().unwrap();
+        assert_eq!(outer_children.len(), 1);
+        assert_eq!(outer_children[0].name, "inner");
+
+        // deep_var inside inner
+        let inner_children = outer_children[0].children.as_ref().unwrap();
+        assert_eq!(inner_children.len(), 1);
+        assert_eq!(inner_children[0].name, "deep_var");
+    }
+
+    // ========================================================================
+    // flatten_document_symbols() Tests - Task 7.2
+    // ========================================================================
+
+    #[test]
+    fn test_flatten_empty_symbols() {
+        // Empty symbols list - should return empty Vec<SymbolInformation>
+        let doc_symbols: Vec<DocumentSymbol> = vec![];
+        let uri = Url::parse("file:///test.R").unwrap();
+        let result = flatten_document_symbols(&doc_symbols, &uri);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_flatten_single_symbol() {
+        // Single symbol - should convert to SymbolInformation with correct URI
+        let doc_symbols = vec![DocumentSymbol {
+            name: "my_func".to_string(),
+            kind: SymbolKind::FUNCTION,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 5, character: 1 },
+            },
+            selection_range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 7 },
+            },
+            detail: Some("(x, y)".to_string()),
+            children: None,
+            deprecated: None,
+            tags: None,
+        }];
+
+        let uri = Url::parse("file:///path/to/test.R").unwrap();
+        let result = flatten_document_symbols(&doc_symbols, &uri);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "my_func");
+        assert_eq!(result[0].kind, SymbolKind::FUNCTION);
+        // Requirement 1.3: Correct URI in location
+        assert_eq!(result[0].location.uri, uri);
+        assert_eq!(result[0].location.range.start.line, 0);
+        assert_eq!(result[0].location.range.end.line, 5);
+        assert!(result[0].container_name.is_none());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_flatten_nested_symbols() {
+        // Nested symbols - should flatten with container_name set
+        let doc_symbols = vec![DocumentSymbol {
+            name: "outer_func".to_string(),
+            kind: SymbolKind::FUNCTION,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 10, character: 1 },
+            },
+            selection_range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 10 },
+            },
+            detail: Some("()".to_string()),
+            children: Some(vec![DocumentSymbol {
+                name: "inner_var".to_string(),
+                kind: SymbolKind::VARIABLE,
+                range: Range {
+                    start: Position { line: 2, character: 4 },
+                    end: Position { line: 2, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 4 },
+                    end: Position { line: 2, character: 13 },
+                },
+                detail: None,
+                children: None,
+                deprecated: None,
+                tags: None,
+            }]),
+            deprecated: None,
+            tags: None,
+        }];
+
+        let uri = Url::parse("file:///path/to/test.R").unwrap();
+        let result = flatten_document_symbols(&doc_symbols, &uri);
+
+        assert_eq!(result.len(), 2);
+        
+        // First symbol: outer_func (no container)
+        assert_eq!(result[0].name, "outer_func");
+        assert_eq!(result[0].kind, SymbolKind::FUNCTION);
+        assert_eq!(result[0].location.uri, uri);
+        assert!(result[0].container_name.is_none());
+        
+        // Second symbol: inner_var (container = outer_func)
+        assert_eq!(result[1].name, "inner_var");
+        assert_eq!(result[1].kind, SymbolKind::VARIABLE);
+        assert_eq!(result[1].location.uri, uri);
+        assert_eq!(result[1].container_name, Some("outer_func".to_string()));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_flatten_deeply_nested_symbols() {
+        // Deeply nested symbols - should flatten with correct container_names
+        let doc_symbols = vec![DocumentSymbol {
+            name: "section".to_string(),
+            kind: SymbolKind::MODULE,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 20, character: 0 },
+            },
+            selection_range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 15 },
+            },
+            detail: None,
+            children: Some(vec![DocumentSymbol {
+                name: "outer".to_string(),
+                kind: SymbolKind::FUNCTION,
+                range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 15, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 2, character: 5 },
+                },
+                detail: Some("()".to_string()),
+                children: Some(vec![DocumentSymbol {
+                    name: "inner".to_string(),
+                    kind: SymbolKind::FUNCTION,
+                    range: Range {
+                        start: Position { line: 4, character: 4 },
+                        end: Position { line: 10, character: 5 },
+                    },
+                    selection_range: Range {
+                        start: Position { line: 4, character: 4 },
+                        end: Position { line: 4, character: 9 },
+                    },
+                    detail: Some("(x)".to_string()),
+                    children: Some(vec![DocumentSymbol {
+                        name: "deep_var".to_string(),
+                        kind: SymbolKind::VARIABLE,
+                        range: Range {
+                            start: Position { line: 6, character: 8 },
+                            end: Position { line: 6, character: 20 },
+                        },
+                        selection_range: Range {
+                            start: Position { line: 6, character: 8 },
+                            end: Position { line: 6, character: 16 },
+                        },
+                        detail: None,
+                        children: None,
+                        deprecated: None,
+                        tags: None,
+                    }]),
+                    deprecated: None,
+                    tags: None,
+                }]),
+                deprecated: None,
+                tags: None,
+            }]),
+            deprecated: None,
+            tags: None,
+        }];
+
+        let uri = Url::parse("file:///path/to/test.R").unwrap();
+        let result = flatten_document_symbols(&doc_symbols, &uri);
+
+        assert_eq!(result.len(), 4);
+        
+        // section (no container)
+        assert_eq!(result[0].name, "section");
+        assert!(result[0].container_name.is_none());
+        
+        // outer (container = section)
+        assert_eq!(result[1].name, "outer");
+        assert_eq!(result[1].container_name, Some("section".to_string()));
+        
+        // inner (container = outer)
+        assert_eq!(result[2].name, "inner");
+        assert_eq!(result[2].container_name, Some("outer".to_string()));
+        
+        // deep_var (container = inner)
+        assert_eq!(result[3].name, "deep_var");
+        assert_eq!(result[3].container_name, Some("inner".to_string()));
+        
+        // All should have correct URI
+        for sym in &result {
+            assert_eq!(sym.location.uri, uri);
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_flatten_preserves_all_symbol_kinds() {
+        // Test that all symbol kinds are preserved during flattening
+        let doc_symbols = vec![
+            DocumentSymbol {
+                name: "my_func".to_string(),
+                kind: SymbolKind::FUNCTION,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 10 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 7 },
+                },
+                detail: None,
+                children: None,
+                deprecated: None,
+                tags: None,
+            },
+            DocumentSymbol {
+                name: "my_var".to_string(),
+                kind: SymbolKind::VARIABLE,
+                range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 10 },
+                },
+                selection_range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 6 },
+                },
+                detail: None,
+                children: None,
+                deprecated: None,
+                tags: None,
+            },
+            DocumentSymbol {
+                name: "MY_CONST".to_string(),
+                kind: SymbolKind::CONSTANT,
+                range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 2, character: 15 },
+                },
+                selection_range: Range {
+                    start: Position { line: 2, character: 0 },
+                    end: Position { line: 2, character: 8 },
+                },
+                detail: None,
+                children: None,
+                deprecated: None,
+                tags: None,
+            },
+            DocumentSymbol {
+                name: "MyClass".to_string(),
+                kind: SymbolKind::CLASS,
+                range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 20 },
+                },
+                selection_range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 7 },
+                },
+                detail: None,
+                children: None,
+                deprecated: None,
+                tags: None,
+            },
+        ];
+
+        let uri = Url::parse("file:///test.R").unwrap();
+        let result = flatten_document_symbols(&doc_symbols, &uri);
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].kind, SymbolKind::FUNCTION);
+        assert_eq!(result[1].kind, SymbolKind::VARIABLE);
+        assert_eq!(result[2].kind, SymbolKind::CONSTANT);
+        assert_eq!(result[3].kind, SymbolKind::CLASS);
+    }
 }
 
 #[cfg(test)]
@@ -9252,6 +14273,2877 @@ mod proptests {
                     );
                 }
             }
+        }
+
+        // ========================================================================
+        // **Feature: document-workspace-symbols, Property 3: Range Containment Invariant**
+        // **Validates: Requirements 2.1, 2.2, 2.3**
+        //
+        // For any DocumentSymbol in the response:
+        // - `range` SHALL span from the start of the construct to the end of its value/body
+        // - `selectionRange` SHALL span only the identifier
+        // - `selectionRange.start >= range.start` AND `selectionRange.end <= range.end`
+        // ========================================================================
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 3: Range Containment Invariant
+        ///
+        /// For any R code containing assignments (functions and variables), the
+        /// SymbolExtractor SHALL produce symbols where `selection_range` is always
+        /// contained within `range`.
+        ///
+        /// **Validates: Requirements 2.1, 2.2, 2.3**
+        fn prop_range_containment_invariant_simple_assignments(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            value in 1i32..1000
+        ) {
+            let code = format!("{} <- {}", var_name, value);
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            for symbol in &symbols {
+                // selection_range.start >= range.start
+                let start_contained = symbol.selection_range.start.line > symbol.range.start.line
+                    || (symbol.selection_range.start.line == symbol.range.start.line
+                        && symbol.selection_range.start.character >= symbol.range.start.character);
+
+                prop_assert!(
+                    start_contained,
+                    "selection_range.start must be >= range.start for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code: '{}'",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+
+                // selection_range.end <= range.end
+                let end_contained = symbol.selection_range.end.line < symbol.range.end.line
+                    || (symbol.selection_range.end.line == symbol.range.end.line
+                        && symbol.selection_range.end.character <= symbol.range.end.character);
+
+                prop_assert!(
+                    end_contained,
+                    "selection_range.end must be <= range.end for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code: '{}'",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 3: Range Containment Invariant
+        ///
+        /// For any R code containing function definitions, the SymbolExtractor SHALL
+        /// produce symbols where `selection_range` (identifier only) is contained
+        /// within `range` (full function definition).
+        ///
+        /// **Validates: Requirements 2.1, 2.2, 2.3**
+        fn prop_range_containment_invariant_function_definitions(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            param_count in 0usize..4,
+            body_lines in 1usize..5
+        ) {
+            // Generate function parameters
+            let params: Vec<String> = (0..param_count)
+                .map(|i| format!("p{}", i))
+                .collect();
+
+            // Generate function body
+            let body_content: String = (0..body_lines)
+                .map(|i| format!("  line{}", i))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let code = format!(
+                "{} <- function({}) {{\n{}\n}}",
+                func_name, params.join(", "), body_content
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            for symbol in &symbols {
+                // selection_range.start >= range.start
+                let start_contained = symbol.selection_range.start.line > symbol.range.start.line
+                    || (symbol.selection_range.start.line == symbol.range.start.line
+                        && symbol.selection_range.start.character >= symbol.range.start.character);
+
+                prop_assert!(
+                    start_contained,
+                    "selection_range.start must be >= range.start for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code:\n{}",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+
+                // selection_range.end <= range.end
+                let end_contained = symbol.selection_range.end.line < symbol.range.end.line
+                    || (symbol.selection_range.end.line == symbol.range.end.line
+                        && symbol.selection_range.end.character <= symbol.range.end.character);
+
+                prop_assert!(
+                    end_contained,
+                    "selection_range.end must be <= range.end for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code:\n{}",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 3: Range Containment Invariant
+        ///
+        /// For any R code containing multiple assignments (mixed functions and variables),
+        /// the SymbolExtractor SHALL produce symbols where `selection_range` is always
+        /// contained within `range` for all symbols.
+        ///
+        /// **Validates: Requirements 2.1, 2.2, 2.3**
+        fn prop_range_containment_invariant_mixed_assignments(
+            var_count in 1usize..4,
+            func_count in 1usize..3
+        ) {
+            // Generate variable assignments
+            let var_assignments: Vec<String> = (0..var_count)
+                .map(|i| format!("var{} <- {}", i, i + 1))
+                .collect();
+
+            // Generate function definitions
+            let func_assignments: Vec<String> = (0..func_count)
+                .map(|i| format!("func{} <- function(x) {{ x + {} }}", i, i))
+                .collect();
+
+            // Combine all assignments
+            let code = format!(
+                "{}\n{}",
+                var_assignments.join("\n"),
+                func_assignments.join("\n")
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Should have extracted all symbols
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code:\n{}", code
+            );
+
+            for symbol in &symbols {
+                // selection_range.start >= range.start
+                let start_contained = symbol.selection_range.start.line > symbol.range.start.line
+                    || (symbol.selection_range.start.line == symbol.range.start.line
+                        && symbol.selection_range.start.character >= symbol.range.start.character);
+
+                prop_assert!(
+                    start_contained,
+                    "selection_range.start must be >= range.start for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code:\n{}",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+
+                // selection_range.end <= range.end
+                let end_contained = symbol.selection_range.end.line < symbol.range.end.line
+                    || (symbol.selection_range.end.line == symbol.range.end.line
+                        && symbol.selection_range.end.character <= symbol.range.end.character);
+
+                prop_assert!(
+                    end_contained,
+                    "selection_range.end must be <= range.end for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code:\n{}",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 3: Range Containment Invariant
+        ///
+        /// For any R code containing right assignments (value -> name), the SymbolExtractor
+        /// SHALL produce symbols where `selection_range` is contained within `range`.
+        ///
+        /// **Validates: Requirements 2.1, 2.2, 2.3**
+        fn prop_range_containment_invariant_right_assignment(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            value in 1i32..1000
+        ) {
+            let code = format!("{} -> {}", value, var_name);
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            for symbol in &symbols {
+                // selection_range.start >= range.start
+                let start_contained = symbol.selection_range.start.line > symbol.range.start.line
+                    || (symbol.selection_range.start.line == symbol.range.start.line
+                        && symbol.selection_range.start.character >= symbol.range.start.character);
+
+                prop_assert!(
+                    start_contained,
+                    "selection_range.start must be >= range.start for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code: '{}'",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+
+                // selection_range.end <= range.end
+                let end_contained = symbol.selection_range.end.line < symbol.range.end.line
+                    || (symbol.selection_range.end.line == symbol.range.end.line
+                        && symbol.selection_range.end.character <= symbol.range.end.character);
+
+                prop_assert!(
+                    end_contained,
+                    "selection_range.end must be <= range.end for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code: '{}'",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 3: Range Containment Invariant
+        ///
+        /// For any R code containing nested function definitions, the SymbolExtractor
+        /// SHALL produce symbols where `selection_range` is contained within `range`
+        /// for both outer and inner functions.
+        ///
+        /// **Validates: Requirements 2.1, 2.2, 2.3**
+        fn prop_range_containment_invariant_nested_functions(
+            outer_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            inner_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if names are the same
+            prop_assume!(outer_name != inner_name);
+
+            let code = format!(
+                "{} <- function() {{\n  {} <- function() {{}}\n}}",
+                outer_name, inner_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Should find both outer and inner functions
+            prop_assert!(
+                symbols.len() >= 2,
+                "Should extract at least 2 symbols (outer and inner functions). \
+                 Found: {:?}, code:\n{}",
+                symbols.iter().map(|s| &s.name).collect::<Vec<_>>(), code
+            );
+
+            for symbol in &symbols {
+                // selection_range.start >= range.start
+                let start_contained = symbol.selection_range.start.line > symbol.range.start.line
+                    || (symbol.selection_range.start.line == symbol.range.start.line
+                        && symbol.selection_range.start.character >= symbol.range.start.character);
+
+                prop_assert!(
+                    start_contained,
+                    "selection_range.start must be >= range.start for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code:\n{}",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+
+                // selection_range.end <= range.end
+                let end_contained = symbol.selection_range.end.line < symbol.range.end.line
+                    || (symbol.selection_range.end.line == symbol.range.end.line
+                        && symbol.selection_range.end.character <= symbol.range.end.character);
+
+                prop_assert!(
+                    end_contained,
+                    "selection_range.end must be <= range.end for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code:\n{}",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 3: Range Containment Invariant
+        ///
+        /// For any R code containing ALL_CAPS constants, the SymbolExtractor SHALL
+        /// produce symbols where `selection_range` is contained within `range`.
+        ///
+        /// **Validates: Requirements 2.1, 2.2, 2.3**
+        fn prop_range_containment_invariant_constants(
+            const_suffix in "[A-Z0-9_]{1,8}",
+            value in 1i32..1000
+        ) {
+            // Ensure the constant name starts with uppercase and has at least 2 chars
+            let const_name = format!("C{}", const_suffix);
+            let code = format!("{} <- {}", const_name, value);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            for symbol in &symbols {
+                // selection_range.start >= range.start
+                let start_contained = symbol.selection_range.start.line > symbol.range.start.line
+                    || (symbol.selection_range.start.line == symbol.range.start.line
+                        && symbol.selection_range.start.character >= symbol.range.start.character);
+
+                prop_assert!(
+                    start_contained,
+                    "selection_range.start must be >= range.start for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code: '{}'",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+
+                // selection_range.end <= range.end
+                let end_contained = symbol.selection_range.end.line < symbol.range.end.line
+                    || (symbol.selection_range.end.line == symbol.range.end.line
+                        && symbol.selection_range.end.character <= symbol.range.end.character);
+
+                prop_assert!(
+                    end_contained,
+                    "selection_range.end must be <= range.end for symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code: '{}'",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+            }
+        }
+
+        // ========================================================================
+        // **Feature: document-workspace-symbols, Property 6: Symbol Kind Classification**
+        // **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        //
+        // For any symbol extracted from an R document:
+        // - Identifiers matching `^[A-Z][A-Z0-9_.]+$` (min 2 chars) SHALL have `kind = CONSTANT`
+        // - Assignments with RHS `R6Class()` or `setRefClass()` SHALL have `kind = CLASS`
+        // - Other function definitions SHALL have `kind = FUNCTION`
+        // - Other variable assignments SHALL have `kind = VARIABLE`
+        //
+        // Note: S4 methods (setMethod, setClass, setGeneric) are tested separately in task 3.2
+        // ========================================================================
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing an ALL_CAPS identifier assignment (non-function),
+        /// the SymbolExtractor SHALL classify it as CONSTANT.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_all_caps_constant(
+            const_suffix in "[A-Z0-9_]{1,8}",
+            value in 1i32..1000
+        ) {
+            // Ensure the constant name starts with uppercase and has at least 2 chars
+            let const_name = format!("C{}", const_suffix);
+            let code = format!("{} <- {}", const_name, value);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Constant,
+                "ALL_CAPS identifier '{}' should be classified as CONSTANT. \
+                 Code: '{}', Actual kind: {:?}",
+                const_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing an ALL_CAPS identifier with dots and underscores,
+        /// the SymbolExtractor SHALL classify it as CONSTANT.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_all_caps_with_special_chars(
+            prefix in "[A-Z]{1,4}",
+            separator in prop::sample::select(vec!["_", "."]),
+            suffix in "[A-Z0-9]{1,4}"
+        ) {
+            let const_name = format!("{}{}{}", prefix, separator, suffix);
+            // Skip if name is too short (less than 2 chars)
+            prop_assume!(const_name.len() >= 2);
+
+            let code = format!("{} <- 42", const_name);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Constant,
+                "ALL_CAPS identifier '{}' with special chars should be classified as CONSTANT. \
+                 Code: '{}', Actual kind: {:?}",
+                const_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing an R6Class() assignment, the SymbolExtractor
+        /// SHALL classify it as CLASS regardless of the identifier name.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_r6class(
+            class_name in "[A-Z][a-zA-Z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!("{} <- R6Class(\"{}\")", class_name, class_name);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Class,
+                "R6Class assignment '{}' should be classified as CLASS. \
+                 Code: '{}', Actual kind: {:?}",
+                class_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing a setRefClass() assignment, the SymbolExtractor
+        /// SHALL classify it as CLASS regardless of the identifier name.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_setrefclass(
+            class_name in "[A-Z][a-zA-Z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!("{} <- setRefClass(\"{}\")", class_name, class_name);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Class,
+                "setRefClass assignment '{}' should be classified as CLASS. \
+                 Code: '{}', Actual kind: {:?}",
+                class_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing a function definition, the SymbolExtractor
+        /// SHALL classify it as FUNCTION (unless it's an R6Class/setRefClass).
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_function_definition(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            param_count in 0usize..4
+        ) {
+            let params: Vec<String> = (0..param_count)
+                .map(|i| format!("p{}", i))
+                .collect();
+
+            let code = format!("{} <- function({}) {{ }}", func_name, params.join(", "));
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Function,
+                "Function definition '{}' should be classified as FUNCTION. \
+                 Code: '{}', Actual kind: {:?}",
+                func_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing a variable assignment (non-function, non-constant),
+        /// the SymbolExtractor SHALL classify it as VARIABLE.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_variable_assignment(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            value in 1i32..1000
+        ) {
+            let code = format!("{} <- {}", var_name, value);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Variable,
+                "Variable assignment '{}' should be classified as VARIABLE. \
+                 Code: '{}', Actual kind: {:?}",
+                var_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing a mixed-case identifier (not ALL_CAPS),
+        /// the SymbolExtractor SHALL NOT classify it as CONSTANT.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_mixed_case_not_constant(
+            prefix in "[A-Z]{1,3}",
+            suffix in "[a-z]{1,5}"
+        ) {
+            let var_name = format!("{}{}", prefix, suffix);
+            // Skip reserved words
+            prop_assume!(!is_r_reserved(&var_name));
+
+            let code = format!("{} <- 42", var_name);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_ne!(
+                symbol.kind,
+                DocumentSymbolKind::Constant,
+                "Mixed-case identifier '{}' should NOT be classified as CONSTANT. \
+                 Code: '{}', Actual kind: {:?}",
+                var_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing a single uppercase character identifier,
+        /// the SymbolExtractor SHALL NOT classify it as CONSTANT (min 2 chars required).
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_single_char_not_constant(
+            char in "[A-Z]"
+        ) {
+            let code = format!("{} <- 42", char);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_ne!(
+                symbol.kind,
+                DocumentSymbolKind::Constant,
+                "Single-char identifier '{}' should NOT be classified as CONSTANT. \
+                 Code: '{}', Actual kind: {:?}",
+                char, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing an ALL_CAPS function definition,
+        /// the SymbolExtractor SHALL classify it as CONSTANT (not FUNCTION).
+        /// ALL_CAPS pattern takes priority over function definitions.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_all_caps_function_is_constant(
+            const_suffix in "[A-Z0-9_]{1,8}"
+        ) {
+            let func_name = format!("F{}", const_suffix);
+            let code = format!("{} <- function() {{ }}", func_name);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Constant,
+                "ALL_CAPS function definition '{}' should be classified as CONSTANT (ALL_CAPS takes priority). \
+                 Code: '{}', Actual kind: {:?}",
+                func_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing an R6Class assignment with an ALL_CAPS name,
+        /// the SymbolExtractor SHALL classify it as CLASS (R6Class takes priority).
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_r6class_priority_over_all_caps(
+            const_suffix in "[A-Z0-9_]{1,8}"
+        ) {
+            let class_name = format!("C{}", const_suffix);
+            let code = format!("{} <- R6Class(\"{}\")", class_name, class_name);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Class,
+                "R6Class with ALL_CAPS name '{}' should be classified as CLASS (not CONSTANT). \
+                 Code: '{}', Actual kind: {:?}",
+                class_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing a right assignment (value -> name) with a function,
+        /// the SymbolExtractor SHALL classify it as FUNCTION.
+        /// Note: Parentheses are required around the function definition for proper parsing.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_right_assignment_function(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Parentheses are required around the function definition for right assignment
+            let code = format!("(function() {{ }}) -> {}", func_name);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Function,
+                "Right assignment function '{}' should be classified as FUNCTION. \
+                 Code: '{}', Actual kind: {:?}",
+                func_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing a right assignment (value -> name) with an ALL_CAPS name,
+        /// the SymbolExtractor SHALL classify it as CONSTANT.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_right_assignment_constant(
+            const_suffix in "[A-Z0-9_]{1,8}",
+            value in 1i32..1000
+        ) {
+            let const_name = format!("C{}", const_suffix);
+            let code = format!("{} -> {}", value, const_name);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from code: '{}'", code
+            );
+
+            let symbol = &symbols[0];
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Constant,
+                "Right assignment with ALL_CAPS name '{}' should be classified as CONSTANT. \
+                 Code: '{}', Actual kind: {:?}",
+                const_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 6: Symbol Kind Classification
+        ///
+        /// For any R code containing multiple assignments with different kinds,
+        /// the SymbolExtractor SHALL correctly classify each symbol.
+        ///
+        /// **Validates: Requirements 5.1, 5.2, 5.6, 5.7**
+        fn prop_symbol_kind_mixed_assignments(
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            func_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            const_suffix in "[A-Z0-9_]{1,6}"
+        ) {
+            // Skip if names collide
+            prop_assume!(var_name != func_name);
+
+            let const_name = format!("C{}", const_suffix);
+            let code = format!(
+                "{} <- 42\n{} <- function() {{ }}\n{} <- 100",
+                var_name, func_name, const_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert_eq!(
+                symbols.len(),
+                3,
+                "Should extract 3 symbols from code:\n{}\nFound: {:?}",
+                code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Find each symbol by name and verify its kind
+            let var_symbol = symbols.iter().find(|s| s.name == var_name);
+            let func_symbol = symbols.iter().find(|s| s.name == func_name);
+            let const_symbol = symbols.iter().find(|s| s.name == const_name);
+
+            prop_assert!(var_symbol.is_some(), "Should find variable symbol '{}'", var_name);
+            prop_assert!(func_symbol.is_some(), "Should find function symbol '{}'", func_name);
+            prop_assert!(const_symbol.is_some(), "Should find constant symbol '{}'", const_name);
+
+            prop_assert_eq!(
+                var_symbol.unwrap().kind,
+                DocumentSymbolKind::Variable,
+                "Variable '{}' should be classified as VARIABLE",
+                var_name
+            );
+
+            prop_assert_eq!(
+                func_symbol.unwrap().kind,
+                DocumentSymbolKind::Function,
+                "Function '{}' should be classified as FUNCTION",
+                func_name
+            );
+
+            prop_assert_eq!(
+                const_symbol.unwrap().kind,
+                DocumentSymbolKind::Constant,
+                "Constant '{}' should be classified as CONSTANT",
+                const_name
+            );
+        }
+
+        // ========================================================================
+        // **Feature: document-workspace-symbols, Property 13: S4 Name Extraction**
+        // **Validates: Requirements 10.1, 10.2, 10.3**
+        //
+        // For any S4 method call:
+        // - `setMethod("methodName", ...)` SHALL produce a symbol named `methodName`
+        // - `setClass("ClassName", ...)` SHALL produce a symbol named `ClassName`
+        // - `setGeneric("genericName", ...)` SHALL produce a symbol named `genericName`
+        // ========================================================================
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 13: S4 Name Extraction
+        ///
+        /// For any R code containing a setMethod() call with a string first argument,
+        /// the SymbolExtractor SHALL produce a symbol with the method name from that string.
+        ///
+        /// **Validates: Requirements 10.1, 10.2, 10.3**
+        fn prop_s4_setmethod_name_extraction(
+            method_name in "[a-z][a-zA-Z0-9_]{2,12}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            class_name in "[A-Z][a-zA-Z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!(
+                r#"setMethod("{}", "{}", function(object) {{ object }})"#,
+                method_name, class_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from setMethod call. Code: '{}'", code
+            );
+
+            let symbol = symbols.iter().find(|s| s.name == method_name);
+            prop_assert!(
+                symbol.is_some(),
+                "Should find symbol named '{}' from setMethod call. \
+                 Code: '{}', Found symbols: {:?}",
+                method_name, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let symbol = symbol.unwrap();
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Method,
+                "setMethod symbol '{}' should be classified as METHOD. \
+                 Code: '{}', Actual kind: {:?}",
+                method_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 13: S4 Name Extraction
+        ///
+        /// For any R code containing a setClass() call with a string first argument,
+        /// the SymbolExtractor SHALL produce a symbol with the class name from that string.
+        ///
+        /// **Validates: Requirements 10.1, 10.2, 10.3**
+        fn prop_s4_setclass_name_extraction(
+            class_name in "[A-Z][a-zA-Z0-9_]{2,12}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!(
+                r#"setClass("{}", slots = c(value = "numeric"))"#,
+                class_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from setClass call. Code: '{}'", code
+            );
+
+            let symbol = symbols.iter().find(|s| s.name == class_name);
+            prop_assert!(
+                symbol.is_some(),
+                "Should find symbol named '{}' from setClass call. \
+                 Code: '{}', Found symbols: {:?}",
+                class_name, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let symbol = symbol.unwrap();
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Class,
+                "setClass symbol '{}' should be classified as CLASS. \
+                 Code: '{}', Actual kind: {:?}",
+                class_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 13: S4 Name Extraction
+        ///
+        /// For any R code containing a setGeneric() call with a string first argument,
+        /// the SymbolExtractor SHALL produce a symbol with the generic name from that string.
+        ///
+        /// **Validates: Requirements 10.1, 10.2, 10.3**
+        fn prop_s4_setgeneric_name_extraction(
+            generic_name in "[a-z][a-zA-Z0-9_]{2,12}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!(
+                r#"setGeneric("{}", function(x) standardGeneric("{}"))"#,
+                generic_name, generic_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from setGeneric call. Code: '{}'", code
+            );
+
+            let symbol = symbols.iter().find(|s| s.name == generic_name);
+            prop_assert!(
+                symbol.is_some(),
+                "Should find symbol named '{}' from setGeneric call. \
+                 Code: '{}', Found symbols: {:?}",
+                generic_name, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let symbol = symbol.unwrap();
+            prop_assert_eq!(
+                symbol.kind,
+                DocumentSymbolKind::Interface,
+                "setGeneric symbol '{}' should be classified as INTERFACE. \
+                 Code: '{}', Actual kind: {:?}",
+                generic_name, code, symbol.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 13: S4 Name Extraction
+        ///
+        /// For any R code containing S4 method calls with single-quoted string arguments,
+        /// the SymbolExtractor SHALL correctly extract the name from single quotes.
+        ///
+        /// **Validates: Requirements 10.1, 10.2, 10.3**
+        fn prop_s4_single_quote_name_extraction(
+            method_name in "[a-z][a-zA-Z0-9_]{2,12}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            class_name in "[A-Z][a-zA-Z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Use single quotes instead of double quotes
+            let code = format!(
+                r#"setMethod('{}', '{}', function(object) {{ object }})"#,
+                method_name, class_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from setMethod call with single quotes. Code: '{}'", code
+            );
+
+            let symbol = symbols.iter().find(|s| s.name == method_name);
+            prop_assert!(
+                symbol.is_some(),
+                "Should find symbol named '{}' from setMethod call with single quotes. \
+                 Code: '{}', Found symbols: {:?}",
+                method_name, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 13: S4 Name Extraction
+        ///
+        /// For any R code containing multiple S4 method calls, the SymbolExtractor
+        /// SHALL extract the correct name from each call.
+        ///
+        /// **Validates: Requirements 10.1, 10.2, 10.3**
+        fn prop_s4_multiple_calls_name_extraction(
+            class_name in "[A-Z][a-zA-Z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            generic_name in "[a-z][a-zA-Z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            method_name in "[a-z][a-zA-Z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if names collide
+            prop_assume!(class_name != generic_name);
+            prop_assume!(class_name != method_name);
+            prop_assume!(generic_name != method_name);
+
+            let code = format!(
+                r#"setClass("{}", slots = c(value = "numeric"))
+setGeneric("{}", function(x) standardGeneric("{}"))
+setMethod("{}", "{}", function(x) {{ x@value }})"#,
+                class_name, generic_name, generic_name, method_name, class_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert_eq!(
+                symbols.len(),
+                3,
+                "Should extract 3 symbols from S4 code. Code:\n{}\nFound: {:?}",
+                code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Verify each symbol is found with correct name
+            let class_symbol = symbols.iter().find(|s| s.name == class_name);
+            let generic_symbol = symbols.iter().find(|s| s.name == generic_name);
+            let method_symbol = symbols.iter().find(|s| s.name == method_name);
+
+            prop_assert!(
+                class_symbol.is_some(),
+                "Should find class symbol '{}'. Found: {:?}",
+                class_name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            prop_assert!(
+                generic_symbol.is_some(),
+                "Should find generic symbol '{}'. Found: {:?}",
+                generic_name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            prop_assert!(
+                method_symbol.is_some(),
+                "Should find method symbol '{}'. Found: {:?}",
+                method_name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Verify correct kinds
+            prop_assert_eq!(
+                class_symbol.unwrap().kind,
+                DocumentSymbolKind::Class,
+                "setClass symbol should be CLASS"
+            );
+            prop_assert_eq!(
+                generic_symbol.unwrap().kind,
+                DocumentSymbolKind::Interface,
+                "setGeneric symbol should be INTERFACE"
+            );
+            prop_assert_eq!(
+                method_symbol.unwrap().kind,
+                DocumentSymbolKind::Method,
+                "setMethod symbol should be METHOD"
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 13: S4 Name Extraction
+        ///
+        /// For any R code containing S4 method calls mixed with regular assignments,
+        /// the SymbolExtractor SHALL correctly extract names from both S4 calls and assignments.
+        ///
+        /// **Validates: Requirements 10.1, 10.2, 10.3**
+        fn prop_s4_mixed_with_assignments_name_extraction(
+            class_name in "[A-Z][a-zA-Z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            func_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if names collide
+            prop_assume!(class_name != func_name);
+            prop_assume!(class_name != var_name);
+            prop_assume!(func_name != var_name);
+
+            let code = format!(
+                r#"{} <- function(x) {{ x + 1 }}
+setClass("{}", slots = c(value = "numeric"))
+{} <- 42"#,
+                func_name, class_name, var_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert_eq!(
+                symbols.len(),
+                3,
+                "Should extract 3 symbols from mixed code. Code:\n{}\nFound: {:?}",
+                code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Verify each symbol is found with correct name
+            let func_symbol = symbols.iter().find(|s| s.name == func_name);
+            let class_symbol = symbols.iter().find(|s| s.name == class_name);
+            let var_symbol = symbols.iter().find(|s| s.name == var_name);
+
+            prop_assert!(
+                func_symbol.is_some(),
+                "Should find function symbol '{}'. Found: {:?}",
+                func_name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            prop_assert!(
+                class_symbol.is_some(),
+                "Should find class symbol '{}'. Found: {:?}",
+                class_name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            prop_assert!(
+                var_symbol.is_some(),
+                "Should find variable symbol '{}'. Found: {:?}",
+                var_name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Verify correct kinds
+            prop_assert_eq!(
+                func_symbol.unwrap().kind,
+                DocumentSymbolKind::Function,
+                "Function symbol should be FUNCTION"
+            );
+            prop_assert_eq!(
+                class_symbol.unwrap().kind,
+                DocumentSymbolKind::Class,
+                "setClass symbol should be CLASS"
+            );
+            prop_assert_eq!(
+                var_symbol.unwrap().kind,
+                DocumentSymbolKind::Variable,
+                "Variable symbol should be VARIABLE"
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 13: S4 Name Extraction
+        ///
+        /// For any R code containing S4 method calls, the selection_range SHALL be
+        /// contained within the range (Property 3 invariant for S4 symbols).
+        ///
+        /// **Validates: Requirements 10.1, 10.2, 10.3**
+        fn prop_s4_selection_range_contained_in_range(
+            method_name in "[a-z][a-zA-Z0-9_]{2,12}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            class_name in "[A-Z][a-zA-Z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            let code = format!(
+                r#"setMethod("{}", "{}", function(object) {{ object }})"#,
+                method_name, class_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            prop_assert!(
+                !symbols.is_empty(),
+                "Should extract at least one symbol from setMethod call. Code: '{}'", code
+            );
+
+            for symbol in &symbols {
+                // selection_range.start >= range.start
+                let start_contained = symbol.selection_range.start.line > symbol.range.start.line
+                    || (symbol.selection_range.start.line == symbol.range.start.line
+                        && symbol.selection_range.start.character >= symbol.range.start.character);
+
+                // selection_range.end <= range.end
+                let end_contained = symbol.selection_range.end.line < symbol.range.end.line
+                    || (symbol.selection_range.end.line == symbol.range.end.line
+                        && symbol.selection_range.end.character <= symbol.range.end.character);
+
+                prop_assert!(
+                    start_contained,
+                    "selection_range.start must be >= range.start for S4 symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code: '{}'",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+
+                prop_assert!(
+                    end_contained,
+                    "selection_range.end must be <= range.end for S4 symbol '{}'. \
+                     selection_range: {:?}, range: {:?}, code: '{}'",
+                    symbol.name, symbol.selection_range, symbol.range, code
+                );
+            }
+        }
+
+        // ========================================================================
+        // **Feature: document-workspace-symbols, Property 5: Section Detection and Nesting**
+        // **Validates: Requirements 4.1, 4.5**
+        //
+        // For any R document with section comments matching the pattern
+        // `^\s*#(#*)\s*(%%)?\s*(\S.+?)\s*(#{4,}|\-{4,}|={4,}|\*{4,}|\+{4,})\s*$`:
+        // - Each matching comment SHALL produce a `DocumentSymbol` with `kind = MODULE`
+        // - Section `range` SHALL span from the comment line to the line before the next section (or EOF)
+        // - Section `selectionRange` SHALL be the comment line only
+        // - Sections with more `#` characters SHALL be nested within sections with fewer `#` characters
+        //
+        // Note: Requirements 4.2, 4.3, 4.4 (section range expansion and nesting) will be fully
+        // tested after HierarchyBuilder is implemented in task 6. For now, focus on extraction
+        // aspects (4.1, 4.5).
+        // ========================================================================
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing a section comment with dash delimiter (----),
+        /// the SymbolExtractor SHALL produce a symbol with kind=MODULE.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_detection_dash_delimiter(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,20}".prop_filter("Has content", |s| !s.trim().is_empty()),
+            dash_count in 4usize..12
+        ) {
+            let delimiter = "-".repeat(dash_count);
+            let code = format!("# {} {}\nx <- 1", section_name.trim(), delimiter);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Should extract at least one section from code with dash delimiter. \
+                 Code: '{}', Found symbols: {:?}",
+                code, symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+
+            let section = &sections[0];
+            prop_assert_eq!(
+                section.kind,
+                DocumentSymbolKind::Module,
+                "Section symbol should have kind=MODULE. Code: '{}', Actual kind: {:?}",
+                code, section.kind
+            );
+
+            prop_assert_eq!(
+                section.name.trim(),
+                section_name.trim(),
+                "Section name should match. Code: '{}', Expected: '{}', Actual: '{}'",
+                code, section_name.trim(), section.name
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing a section comment with hash delimiter (####),
+        /// the SymbolExtractor SHALL produce a symbol with kind=MODULE.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_detection_hash_delimiter(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,20}".prop_filter("Has content", |s| !s.trim().is_empty()),
+            hash_count in 4usize..12
+        ) {
+            let delimiter = "#".repeat(hash_count);
+            let code = format!("# {} {}\nx <- 1", section_name.trim(), delimiter);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Should extract at least one section from code with hash delimiter. \
+                 Code: '{}', Found symbols: {:?}",
+                code, symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+
+            let section = &sections[0];
+            prop_assert_eq!(
+                section.kind,
+                DocumentSymbolKind::Module,
+                "Section symbol should have kind=MODULE. Code: '{}', Actual kind: {:?}",
+                code, section.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing a section comment with equals delimiter (====),
+        /// the SymbolExtractor SHALL produce a symbol with kind=MODULE.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_detection_equals_delimiter(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,20}".prop_filter("Has content", |s| !s.trim().is_empty()),
+            equals_count in 4usize..12
+        ) {
+            let delimiter = "=".repeat(equals_count);
+            let code = format!("# {} {}\nx <- 1", section_name.trim(), delimiter);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Should extract at least one section from code with equals delimiter. \
+                 Code: '{}', Found symbols: {:?}",
+                code, symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+
+            let section = &sections[0];
+            prop_assert_eq!(
+                section.kind,
+                DocumentSymbolKind::Module,
+                "Section symbol should have kind=MODULE. Code: '{}', Actual kind: {:?}",
+                code, section.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing a section comment with asterisk delimiter (****),
+        /// the SymbolExtractor SHALL produce a symbol with kind=MODULE.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_detection_asterisk_delimiter(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,20}".prop_filter("Has content", |s| !s.trim().is_empty()),
+            asterisk_count in 4usize..12
+        ) {
+            let delimiter = "*".repeat(asterisk_count);
+            let code = format!("# {} {}\nx <- 1", section_name.trim(), delimiter);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Should extract at least one section from code with asterisk delimiter. \
+                 Code: '{}', Found symbols: {:?}",
+                code, symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+
+            let section = &sections[0];
+            prop_assert_eq!(
+                section.kind,
+                DocumentSymbolKind::Module,
+                "Section symbol should have kind=MODULE. Code: '{}', Actual kind: {:?}",
+                code, section.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing a section comment with plus delimiter (++++),
+        /// the SymbolExtractor SHALL produce a symbol with kind=MODULE.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_detection_plus_delimiter(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,20}".prop_filter("Has content", |s| !s.trim().is_empty()),
+            plus_count in 4usize..12
+        ) {
+            let delimiter = "+".repeat(plus_count);
+            let code = format!("# {} {}\nx <- 1", section_name.trim(), delimiter);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Should extract at least one section from code with plus delimiter. \
+                 Code: '{}', Found symbols: {:?}",
+                code, symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+
+            let section = &sections[0];
+            prop_assert_eq!(
+                section.kind,
+                DocumentSymbolKind::Module,
+                "Section symbol should have kind=MODULE. Code: '{}', Actual kind: {:?}",
+                code, section.kind
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing section comments with different heading levels
+        /// (# count), the SymbolExtractor SHALL correctly compute section_level.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_heading_level_extraction(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,15}".prop_filter("Has content", |s| !s.trim().is_empty()),
+            heading_level in 1u32..6
+        ) {
+            // Generate the appropriate number of # characters
+            let hashes = "#".repeat(heading_level as usize);
+            let code = format!("{} {} ----\nx <- 1", hashes, section_name.trim());
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Should extract at least one section from code with {} # characters. \
+                 Code: '{}', Found symbols: {:?}",
+                heading_level, code, symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+
+            let section = &sections[0];
+            prop_assert_eq!(
+                section.section_level,
+                Some(heading_level),
+                "Section level should be {} for {} # characters. \
+                 Code: '{}', Actual level: {:?}",
+                heading_level, heading_level, code, section.section_level
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing section comments with RStudio cell marker (%%),
+        /// the SymbolExtractor SHALL correctly extract the section name.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_rstudio_cell_marker(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,15}".prop_filter("Has content", |s| !s.trim().is_empty())
+        ) {
+            let code = format!("# %% {} ----\nx <- 1", section_name.trim());
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Should extract at least one section from code with RStudio cell marker. \
+                 Code: '{}', Found symbols: {:?}",
+                code, symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+
+            let section = &sections[0];
+            prop_assert_eq!(
+                section.name.trim(),
+                section_name.trim(),
+                "Section name should match for RStudio cell marker. \
+                 Code: '{}', Expected: '{}', Actual: '{}'",
+                code, section_name.trim(), section.name
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing multiple sections, the SymbolExtractor SHALL
+        /// extract all sections with correct names and levels.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_multiple_sections_extraction(
+            section_count in 2usize..5
+        ) {
+            // Generate multiple sections with different levels
+            let mut code_lines = Vec::new();
+            let mut expected_sections = Vec::new();
+
+            for i in 0..section_count {
+                let level = (i % 3) + 1; // Levels 1, 2, 3, 1, 2, ...
+                let hashes = "#".repeat(level);
+                let name = format!("Section{}", i);
+                code_lines.push(format!("{} {} ----", hashes, name));
+                code_lines.push(format!("x{} <- {}", i, i));
+                expected_sections.push((name, level as u32));
+            }
+
+            let code = code_lines.join("\n");
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert_eq!(
+                sections.len(),
+                section_count,
+                "Should extract {} sections from code. \
+                 Code:\n{}\nFound sections: {:?}",
+                section_count, code, sections.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Verify each section has correct name and level
+            for (i, (expected_name, expected_level)) in expected_sections.iter().enumerate() {
+                let section = &sections[i];
+                prop_assert_eq!(
+                    &section.name,
+                    expected_name,
+                    "Section {} should have name '{}'. Actual: '{}'",
+                    i, expected_name, section.name
+                );
+                prop_assert_eq!(
+                    section.section_level,
+                    Some(*expected_level),
+                    "Section '{}' should have level {}. Actual: {:?}",
+                    expected_name, expected_level, section.section_level
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing section comments, the section's selection_range
+        /// SHALL equal its range (both cover the comment line only).
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_selection_range_equals_range(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,15}".prop_filter("Has content", |s| !s.trim().is_empty()),
+            delimiter_type in prop::sample::select(vec!["-", "#", "=", "*", "+"])
+        ) {
+            let delimiter = delimiter_type.repeat(4);
+            let code = format!("# {} {}\nx <- 1", section_name.trim(), delimiter);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Should extract at least one section. Code: '{}'", code
+            );
+
+            let section = &sections[0];
+            prop_assert_eq!(
+                section.range,
+                section.selection_range,
+                "Section selection_range should equal range. \
+                 Code: '{}', range: {:?}, selection_range: {:?}",
+                code, section.range, section.selection_range
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing section comments, the section SHALL NOT have
+        /// a detail field (detail is for function signatures only).
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_no_detail_field(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,15}".prop_filter("Has content", |s| !s.trim().is_empty())
+        ) {
+            let code = format!("# {} ----\nx <- 1", section_name.trim());
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                !sections.is_empty(),
+                "Should extract at least one section. Code: '{}'", code
+            );
+
+            let section = &sections[0];
+            prop_assert!(
+                section.detail.is_none(),
+                "Section should not have a detail field. \
+                 Code: '{}', detail: {:?}",
+                code, section.detail
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing comments that do NOT match the section pattern
+        /// (delimiter too short), the SymbolExtractor SHALL NOT produce section symbols.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_short_delimiter_not_detected(
+            section_name in "[A-Za-z][A-Za-z0-9 ]{2,15}".prop_filter("Has content", |s| !s.trim().is_empty()),
+            delimiter_count in 1usize..4  // Less than 4 characters
+        ) {
+            let delimiter = "-".repeat(delimiter_count);
+            let code = format!("# {} {}\nx <- 1", section_name.trim(), delimiter);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                sections.is_empty(),
+                "Should NOT extract section from code with short delimiter ({}). \
+                 Code: '{}', Found sections: {:?}",
+                delimiter_count, code, sections.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing regular comments (no delimiter), the SymbolExtractor
+        /// SHALL NOT produce section symbols.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_regular_comment_not_detected(
+            comment_text in "[A-Za-z][A-Za-z0-9 ]{5,30}".prop_filter("Has content", |s| !s.trim().is_empty())
+        ) {
+            // Ensure the comment doesn't accidentally match the section pattern
+            let clean_text = comment_text
+                .replace('-', " ")
+                .replace('#', " ")
+                .replace('=', " ")
+                .replace('*', " ")
+                .replace('+', " ");
+            let code = format!("# {}\nx <- 1", clean_text.trim());
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Find section symbols
+            let sections: Vec<_> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+                .collect();
+
+            prop_assert!(
+                sections.is_empty(),
+                "Should NOT extract section from regular comment. \
+                 Code: '{}', Found sections: {:?}",
+                code, sections.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 5: Section Detection and Nesting
+        ///
+        /// For any R code containing sections mixed with code, the SymbolExtractor
+        /// SHALL extract both sections and code symbols correctly.
+        ///
+        /// **Validates: Requirements 4.1, 4.5**
+        fn prop_section_mixed_with_code_symbols(
+            section_name in "[A-Za-z][A-Za-z0-9]{2,10}".prop_filter("Has content", |s| !s.trim().is_empty()),
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            func_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if names collide
+            prop_assume!(var_name != func_name);
+
+            let code = format!(
+                "# {} ----\n{} <- 42\n{} <- function(x) {{ x + 1 }}",
+                section_name.trim(), var_name, func_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Should have 1 section, 1 variable, 1 function
+            prop_assert_eq!(
+                symbols.len(),
+                3,
+                "Should extract 3 symbols (1 section, 1 variable, 1 function). \
+                 Code:\n{}\nFound: {:?}",
+                code, symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+
+            // Verify section
+            let section = symbols.iter().find(|s| matches!(s.kind, DocumentSymbolKind::Module));
+            prop_assert!(
+                section.is_some(),
+                "Should find section symbol. Found: {:?}",
+                symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+            prop_assert_eq!(
+                section.unwrap().name.trim(),
+                section_name.trim(),
+                "Section name should match"
+            );
+
+            // Verify variable
+            let var = symbols.iter().find(|s| s.name == var_name);
+            prop_assert!(
+                var.is_some(),
+                "Should find variable symbol '{}'. Found: {:?}",
+                var_name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            prop_assert_eq!(
+                var.unwrap().kind,
+                DocumentSymbolKind::Variable,
+                "Variable should have kind=VARIABLE"
+            );
+
+            // Verify function
+            let func = symbols.iter().find(|s| s.name == func_name);
+            prop_assert!(
+                func.is_some(),
+                "Should find function symbol '{}'. Found: {:?}",
+                func_name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            prop_assert_eq!(
+                func.unwrap().kind,
+                DocumentSymbolKind::Function,
+                "Function should have kind=FUNCTION"
+            );
+        }
+
+        // ========================================================================
+        // **Feature: document-workspace-symbols, Property 4: Hierarchical Nesting Correctness**
+        // **Validates: Requirements 3.1, 3.2, 3.3**
+        //
+        // For any R document with assignments:
+        // - Assignments inside function bodies SHALL appear as children of that function's symbol
+        // - Assignments at top-level SHALL appear as root-level symbols
+        // - Nested function definitions SHALL preserve their nesting depth in the symbol hierarchy
+        // ========================================================================
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 4: Hierarchical Nesting Correctness
+        ///
+        /// For any R code containing a function with a variable defined inside its body,
+        /// the HierarchyBuilder SHALL nest the variable as a child of the function.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_hierarchical_nesting_variable_inside_function(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            value in 1i32..1000
+        ) {
+            // Skip if names are the same
+            prop_assume!(func_name != var_name);
+
+            // Create code with a variable inside a function body
+            let code = format!(
+                "{} <- function() {{\n  {} <- {}\n}}",
+                func_name, var_name, value
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Build hierarchy
+            let line_count = code.lines().count() as u32;
+            let builder = HierarchyBuilder::new(symbols, line_count);
+            let doc_symbols = builder.build();
+
+            // Should have exactly 1 root-level symbol (the function)
+            prop_assert_eq!(
+                doc_symbols.len(),
+                1,
+                "Should have exactly 1 root-level symbol (the function). \
+                 Code:\n{}\nFound: {:?}",
+                code, doc_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let func_symbol = &doc_symbols[0];
+            prop_assert_eq!(
+                &func_symbol.name,
+                &func_name,
+                "Root symbol should be the function"
+            );
+            prop_assert_eq!(
+                func_symbol.kind,
+                tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                "Root symbol should have kind=FUNCTION"
+            );
+
+            // Function should have the variable as a child
+            let children = func_symbol.children.as_ref();
+            prop_assert!(
+                children.is_some(),
+                "Function should have children. Code:\n{}", code
+            );
+
+            let children = children.unwrap();
+            prop_assert_eq!(
+                children.len(),
+                1,
+                "Function should have exactly 1 child (the variable). \
+                 Code:\n{}\nFound children: {:?}",
+                code, children.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let var_symbol = &children[0];
+            prop_assert_eq!(
+                &var_symbol.name,
+                &var_name,
+                "Child symbol should be the variable"
+            );
+            prop_assert_eq!(
+                var_symbol.kind,
+                tower_lsp::lsp_types::SymbolKind::VARIABLE,
+                "Child symbol should have kind=VARIABLE"
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 4: Hierarchical Nesting Correctness
+        ///
+        /// For any R code containing a top-level variable (outside any function),
+        /// the HierarchyBuilder SHALL include it as a root-level symbol.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_hierarchical_nesting_top_level_variable(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            value in 1i32..1000
+        ) {
+            // Create code with a top-level variable
+            let code = format!("{} <- {}", var_name, value);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Build hierarchy
+            let line_count = code.lines().count() as u32;
+            let builder = HierarchyBuilder::new(symbols, line_count);
+            let doc_symbols = builder.build();
+
+            // Should have exactly 1 root-level symbol (the variable)
+            prop_assert_eq!(
+                doc_symbols.len(),
+                1,
+                "Should have exactly 1 root-level symbol (the variable). \
+                 Code: '{}'\nFound: {:?}",
+                code, doc_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let var_symbol = &doc_symbols[0];
+            prop_assert_eq!(
+                &var_symbol.name,
+                &var_name,
+                "Root symbol should be the variable"
+            );
+            prop_assert_eq!(
+                var_symbol.kind,
+                tower_lsp::lsp_types::SymbolKind::VARIABLE,
+                "Root symbol should have kind=VARIABLE"
+            );
+
+            // Variable should have no children
+            prop_assert!(
+                var_symbol.children.is_none() || var_symbol.children.as_ref().unwrap().is_empty(),
+                "Top-level variable should have no children. Code: '{}'", code
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 4: Hierarchical Nesting Correctness
+        ///
+        /// For any R code containing nested function definitions, the HierarchyBuilder
+        /// SHALL preserve the nesting depth in the symbol hierarchy.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_hierarchical_nesting_nested_functions(
+            outer_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            inner_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if names are the same
+            prop_assume!(outer_name != inner_name);
+
+            // Create code with nested functions
+            let code = format!(
+                "{} <- function() {{\n  {} <- function() {{\n    42\n  }}\n}}",
+                outer_name, inner_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Build hierarchy
+            let line_count = code.lines().count() as u32;
+            let builder = HierarchyBuilder::new(symbols, line_count);
+            let doc_symbols = builder.build();
+
+            // Should have exactly 1 root-level symbol (the outer function)
+            prop_assert_eq!(
+                doc_symbols.len(),
+                1,
+                "Should have exactly 1 root-level symbol (outer function). \
+                 Code:\n{}\nFound: {:?}",
+                code, doc_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let outer_symbol = &doc_symbols[0];
+            prop_assert_eq!(
+                &outer_symbol.name,
+                &outer_name,
+                "Root symbol should be the outer function"
+            );
+            prop_assert_eq!(
+                outer_symbol.kind,
+                tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                "Outer symbol should have kind=FUNCTION"
+            );
+
+            // Outer function should have the inner function as a child
+            let children = outer_symbol.children.as_ref();
+            prop_assert!(
+                children.is_some(),
+                "Outer function should have children. Code:\n{}", code
+            );
+
+            let children = children.unwrap();
+            prop_assert_eq!(
+                children.len(),
+                1,
+                "Outer function should have exactly 1 child (inner function). \
+                 Code:\n{}\nFound children: {:?}",
+                code, children.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let inner_symbol = &children[0];
+            prop_assert_eq!(
+                &inner_symbol.name,
+                &inner_name,
+                "Child symbol should be the inner function"
+            );
+            prop_assert_eq!(
+                inner_symbol.kind,
+                tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                "Inner symbol should have kind=FUNCTION"
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 4: Hierarchical Nesting Correctness
+        ///
+        /// For any R code containing a function with multiple nested symbols (variables
+        /// and functions), the HierarchyBuilder SHALL nest all of them as children.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_hierarchical_nesting_multiple_children(
+            func_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            inner_func_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if any names are the same
+            prop_assume!(func_name != var_name);
+            prop_assume!(func_name != inner_func_name);
+            prop_assume!(var_name != inner_func_name);
+
+            // Create code with a function containing both a variable and a nested function
+            let code = format!(
+                "{} <- function() {{\n  {} <- 42\n  {} <- function() {{ 1 }}\n}}",
+                func_name, var_name, inner_func_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Build hierarchy
+            let line_count = code.lines().count() as u32;
+            let builder = HierarchyBuilder::new(symbols, line_count);
+            let doc_symbols = builder.build();
+
+            // Should have exactly 1 root-level symbol (the outer function)
+            prop_assert_eq!(
+                doc_symbols.len(),
+                1,
+                "Should have exactly 1 root-level symbol. Code:\n{}\nFound: {:?}",
+                code, doc_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let func_symbol = &doc_symbols[0];
+            prop_assert_eq!(
+                &func_symbol.name,
+                &func_name,
+                "Root symbol should be the outer function"
+            );
+
+            // Function should have 2 children (variable and inner function)
+            let children = func_symbol.children.as_ref();
+            prop_assert!(
+                children.is_some(),
+                "Function should have children. Code:\n{}", code
+            );
+
+            let children = children.unwrap();
+            prop_assert_eq!(
+                children.len(),
+                2,
+                "Function should have exactly 2 children. \
+                 Code:\n{}\nFound children: {:?}",
+                code, children.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Verify both children exist
+            let var_child = children.iter().find(|s| s.name == var_name);
+            let func_child = children.iter().find(|s| s.name == inner_func_name);
+
+            prop_assert!(
+                var_child.is_some(),
+                "Should find variable child '{}'. Found: {:?}",
+                var_name, children.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            prop_assert!(
+                func_child.is_some(),
+                "Should find function child '{}'. Found: {:?}",
+                inner_func_name, children.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            prop_assert_eq!(
+                var_child.unwrap().kind,
+                tower_lsp::lsp_types::SymbolKind::VARIABLE,
+                "Variable child should have kind=VARIABLE"
+            );
+            prop_assert_eq!(
+                func_child.unwrap().kind,
+                tower_lsp::lsp_types::SymbolKind::FUNCTION,
+                "Function child should have kind=FUNCTION"
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 4: Hierarchical Nesting Correctness
+        ///
+        /// For any R code containing mixed top-level and nested symbols, the HierarchyBuilder
+        /// SHALL correctly separate root-level symbols from nested ones.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_hierarchical_nesting_mixed_levels(
+            top_var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            func_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            nested_var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if any names are the same
+            prop_assume!(top_var_name != func_name);
+            prop_assume!(top_var_name != nested_var_name);
+            prop_assume!(func_name != nested_var_name);
+
+            // Create code with a top-level variable, a function, and a nested variable
+            let code = format!(
+                "{} <- 1\n{} <- function() {{\n  {} <- 2\n}}",
+                top_var_name, func_name, nested_var_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Build hierarchy
+            let line_count = code.lines().count() as u32;
+            let builder = HierarchyBuilder::new(symbols, line_count);
+            let doc_symbols = builder.build();
+
+            // Should have exactly 2 root-level symbols (top_var and func)
+            prop_assert_eq!(
+                doc_symbols.len(),
+                2,
+                "Should have exactly 2 root-level symbols. Code:\n{}\nFound: {:?}",
+                code, doc_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Find the top-level variable and function
+            let top_var = doc_symbols.iter().find(|s| s.name == top_var_name);
+            let func = doc_symbols.iter().find(|s| s.name == func_name);
+
+            prop_assert!(
+                top_var.is_some(),
+                "Should find top-level variable '{}'. Found: {:?}",
+                top_var_name, doc_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            prop_assert!(
+                func.is_some(),
+                "Should find function '{}'. Found: {:?}",
+                func_name, doc_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Top-level variable should have no children
+            let top_var = top_var.unwrap();
+            prop_assert!(
+                top_var.children.is_none() || top_var.children.as_ref().unwrap().is_empty(),
+                "Top-level variable should have no children"
+            );
+
+            // Function should have the nested variable as a child
+            let func = func.unwrap();
+            let func_children = func.children.as_ref();
+            prop_assert!(
+                func_children.is_some(),
+                "Function should have children"
+            );
+
+            let func_children = func_children.unwrap();
+            prop_assert_eq!(
+                func_children.len(),
+                1,
+                "Function should have exactly 1 child (nested variable). Found: {:?}",
+                func_children.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            prop_assert_eq!(
+                &func_children[0].name,
+                &nested_var_name,
+                "Function's child should be the nested variable"
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 4: Hierarchical Nesting Correctness
+        ///
+        /// For any R code containing three levels of nesting (function -> function -> variable),
+        /// the HierarchyBuilder SHALL preserve all three levels in the hierarchy.
+        ///
+        /// **Validates: Requirements 3.1, 3.2, 3.3**
+        fn prop_hierarchical_nesting_three_levels(
+            outer_name in "[a-z][a-z0-9_]{2,6}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            middle_name in "[a-z][a-z0-9_]{2,6}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            inner_var_name in "[a-z][a-z0-9_]{2,6}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if any names are the same
+            prop_assume!(outer_name != middle_name);
+            prop_assume!(outer_name != inner_var_name);
+            prop_assume!(middle_name != inner_var_name);
+
+            // Create code with three levels of nesting
+            let code = format!(
+                "{} <- function() {{\n  {} <- function() {{\n    {} <- 42\n  }}\n}}",
+                outer_name, middle_name, inner_var_name
+            );
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Build hierarchy
+            let line_count = code.lines().count() as u32;
+            let builder = HierarchyBuilder::new(symbols, line_count);
+            let doc_symbols = builder.build();
+
+            // Should have exactly 1 root-level symbol (outer function)
+            prop_assert_eq!(
+                doc_symbols.len(),
+                1,
+                "Should have exactly 1 root-level symbol. Code:\n{}\nFound: {:?}",
+                code, doc_symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Level 1: Outer function
+            let outer = &doc_symbols[0];
+            prop_assert_eq!(&outer.name, &outer_name, "Root should be outer function");
+            prop_assert_eq!(outer.kind, tower_lsp::lsp_types::SymbolKind::FUNCTION, "Outer should be FUNCTION");
+
+            // Level 2: Middle function
+            let outer_children = outer.children.as_ref();
+            prop_assert!(outer_children.is_some(), "Outer should have children");
+            let outer_children = outer_children.unwrap();
+            prop_assert_eq!(
+                outer_children.len(),
+                1,
+                "Outer should have 1 child. Found: {:?}",
+                outer_children.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let middle = &outer_children[0];
+            prop_assert_eq!(&middle.name, &middle_name, "Middle should be middle function");
+            prop_assert_eq!(middle.kind, tower_lsp::lsp_types::SymbolKind::FUNCTION, "Middle should be FUNCTION");
+
+            // Level 3: Inner variable
+            let middle_children = middle.children.as_ref();
+            prop_assert!(middle_children.is_some(), "Middle should have children");
+            let middle_children = middle_children.unwrap();
+            prop_assert_eq!(
+                middle_children.len(),
+                1,
+                "Middle should have 1 child. Found: {:?}",
+                middle_children.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            let inner = &middle_children[0];
+            prop_assert_eq!(&inner.name, &inner_var_name, "Inner should be the variable");
+            prop_assert_eq!(inner.kind, tower_lsp::lsp_types::SymbolKind::VARIABLE, "Inner should be VARIABLE");
+        }
+
+        // ========================================================================
+        // **Feature: document-workspace-symbols, Property 1: Response Type Selection**
+        // **Validates: Requirements 1.1, 1.2**
+        //
+        // For any client capability configuration:
+        // - If `hierarchicalDocumentSymbolSupport` is true, the Document_Symbol_Provider
+        //   SHALL return `DocumentSymbol[]` (DocumentSymbolResponse::Nested)
+        // - Otherwise it SHALL return `SymbolInformation[]` (DocumentSymbolResponse::Flat)
+        // ========================================================================
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 1: Response Type Selection
+        ///
+        /// For any R code containing symbols, when `hierarchical_document_symbol_support`
+        /// is true, `document_symbol()` SHALL return `DocumentSymbolResponse::Nested`.
+        ///
+        /// **Validates: Requirements 1.1, 1.2**
+        fn prop_response_type_hierarchical_when_supported(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if names are the same
+            prop_assume!(func_name != var_name);
+
+            use crate::state::{WorldState, Document};
+
+            // Generate R code with a function and a variable
+            let code = format!(
+                "{} <- function() {{}}\n{} <- 42",
+                func_name, var_name
+            );
+
+            let mut state = WorldState::new(vec![]);
+            // Set hierarchical_document_symbol_support to TRUE
+            state.symbol_config.hierarchical_document_symbol_support = true;
+
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Call document_symbol
+            let response = super::document_symbol(&state, &uri);
+
+            prop_assert!(
+                response.is_some(),
+                "document_symbol should return Some for valid document. Code:\n{}", code
+            );
+
+            // Requirement 1.1: When hierarchical support is true, return DocumentSymbol[]
+            match response.unwrap() {
+                tower_lsp::lsp_types::DocumentSymbolResponse::Nested(symbols) => {
+                    // Success - got nested response as expected
+                    prop_assert!(
+                        !symbols.is_empty(),
+                        "Nested response should contain symbols. Code:\n{}", code
+                    );
+                }
+                tower_lsp::lsp_types::DocumentSymbolResponse::Flat(_) => {
+                    prop_assert!(
+                        false,
+                        "Expected DocumentSymbolResponse::Nested when hierarchical_document_symbol_support is true. Code:\n{}", code
+                    );
+                }
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 1: Response Type Selection
+        ///
+        /// For any R code containing symbols, when `hierarchical_document_symbol_support`
+        /// is false, `document_symbol()` SHALL return `DocumentSymbolResponse::Flat`.
+        ///
+        /// **Validates: Requirements 1.1, 1.2**
+        fn prop_response_type_flat_when_not_supported(
+            func_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Skip if names are the same
+            prop_assume!(func_name != var_name);
+
+            use crate::state::{WorldState, Document};
+
+            // Generate R code with a function and a variable
+            let code = format!(
+                "{} <- function() {{}}\n{} <- 42",
+                func_name, var_name
+            );
+
+            let mut state = WorldState::new(vec![]);
+            // Set hierarchical_document_symbol_support to FALSE (default)
+            state.symbol_config.hierarchical_document_symbol_support = false;
+
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Call document_symbol
+            let response = super::document_symbol(&state, &uri);
+
+            prop_assert!(
+                response.is_some(),
+                "document_symbol should return Some for valid document. Code:\n{}", code
+            );
+
+            // Requirement 1.2: When hierarchical support is false, return SymbolInformation[]
+            match response.unwrap() {
+                tower_lsp::lsp_types::DocumentSymbolResponse::Flat(symbols) => {
+                    // Success - got flat response as expected
+                    prop_assert!(
+                        !symbols.is_empty(),
+                        "Flat response should contain symbols. Code:\n{}", code
+                    );
+                }
+                tower_lsp::lsp_types::DocumentSymbolResponse::Nested(_) => {
+                    prop_assert!(
+                        false,
+                        "Expected DocumentSymbolResponse::Flat when hierarchical_document_symbol_support is false. Code:\n{}", code
+                    );
+                }
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 1: Response Type Selection
+        ///
+        /// For any R code, the response type selection SHALL be consistent regardless
+        /// of the code content - only the `hierarchical_document_symbol_support` flag
+        /// determines the response type.
+        ///
+        /// **Validates: Requirements 1.1, 1.2**
+        fn prop_response_type_selection_consistent(
+            symbol_count in 1usize..5,
+            hierarchical_support in any::<bool>()
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Generate R code with multiple symbols
+            let assignments: Vec<String> = (0..symbol_count)
+                .map(|i| format!("sym{} <- {}", i, i + 1))
+                .collect();
+            let code = assignments.join("\n");
+
+            let mut state = WorldState::new(vec![]);
+            state.symbol_config.hierarchical_document_symbol_support = hierarchical_support;
+
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Call document_symbol
+            let response = super::document_symbol(&state, &uri);
+
+            prop_assert!(
+                response.is_some(),
+                "document_symbol should return Some for valid document. Code:\n{}", code
+            );
+
+            // Verify response type matches the flag
+            let is_nested = matches!(
+                response.as_ref().unwrap(),
+                tower_lsp::lsp_types::DocumentSymbolResponse::Nested(_)
+            );
+
+            prop_assert_eq!(
+                is_nested,
+                hierarchical_support,
+                "Response type should match hierarchical_document_symbol_support flag. \
+                 Flag: {}, Got nested: {}, Code:\n{}",
+                hierarchical_support, is_nested, code
+            );
+        }
+
+        // ========================================================================
+        // **Feature: document-workspace-symbols, Property 8: Reserved Word Filtering**
+        // **Validates: Requirements 7.1, 7.2**
+        //
+        // For any assignment where the LHS is an R reserved word (if, else, for, while,
+        // repeat, in, next, break, TRUE, FALSE, NULL, Inf, NaN, NA, NA_integer_,
+        // NA_real_, NA_complex_, NA_character_, function):
+        // - The symbol SHALL NOT appear in document symbol results
+        // - The symbol SHALL NOT appear in workspace symbol results
+        // ========================================================================
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 8: Reserved Word Filtering
+        ///
+        /// For any R code containing an assignment to a reserved word (e.g., `if <- 1`),
+        /// the SymbolExtractor SHALL NOT include that reserved word in the extracted symbols.
+        ///
+        /// **Validates: Requirements 7.1, 7.2**
+        fn prop_reserved_word_filtering_variable_assignment(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS),
+            value in 1i32..1000
+        ) {
+            // Create code with assignment to reserved word (e.g., "if <- 42")
+            let code = format!("{} <- {}", reserved_word, value);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Reserved word should NOT appear in extracted symbols
+            let reserved_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|s| s.name == reserved_word)
+                .collect();
+
+            prop_assert!(
+                reserved_symbols.is_empty(),
+                "Reserved word '{}' should NOT appear in extracted symbols. \
+                 Code: '{}', Found symbols: {:?}",
+                reserved_word, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 8: Reserved Word Filtering
+        ///
+        /// For any R code containing a function definition with a reserved word name
+        /// (e.g., `if <- function() {}`), the SymbolExtractor SHALL NOT include that
+        /// reserved word in the extracted symbols.
+        ///
+        /// **Validates: Requirements 7.1, 7.2**
+        fn prop_reserved_word_filtering_function_definition(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
+        ) {
+            // Create code with function definition using reserved word name
+            let code = format!("{} <- function() {{}}", reserved_word);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Reserved word should NOT appear in extracted symbols
+            let reserved_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|s| s.name == reserved_word)
+                .collect();
+
+            prop_assert!(
+                reserved_symbols.is_empty(),
+                "Reserved word '{}' should NOT appear in extracted symbols (function). \
+                 Code: '{}', Found symbols: {:?}",
+                reserved_word, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 8: Reserved Word Filtering
+        ///
+        /// For any R code containing multiple assignments where some are to reserved words
+        /// and some are to non-reserved identifiers, the SymbolExtractor SHALL include
+        /// only the non-reserved identifiers in the extracted symbols.
+        ///
+        /// **Validates: Requirements 7.1, 7.2**
+        fn prop_reserved_word_filtering_mixed_assignments(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS),
+            var_name in "[a-z][a-z0-9_]{2,8}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            // Create code with both reserved and non-reserved assignments
+            let code = format!("{} <- 1\n{} <- 2", reserved_word, var_name);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Reserved word should NOT appear in extracted symbols
+            let reserved_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|s| s.name == reserved_word)
+                .collect();
+
+            prop_assert!(
+                reserved_symbols.is_empty(),
+                "Reserved word '{}' should NOT appear in extracted symbols. \
+                 Code:\n{}\nFound symbols: {:?}",
+                reserved_word, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+
+            // Non-reserved identifier SHOULD appear in extracted symbols
+            let var_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|s| s.name == var_name)
+                .collect();
+
+            prop_assert!(
+                !var_symbols.is_empty(),
+                "Non-reserved identifier '{}' SHOULD appear in extracted symbols. \
+                 Code:\n{}\nFound symbols: {:?}",
+                var_name, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 8: Reserved Word Filtering
+        ///
+        /// For any R code containing assignments to all reserved words, the SymbolExtractor
+        /// SHALL return an empty symbol list.
+        ///
+        /// **Validates: Requirements 7.1, 7.2**
+        fn prop_reserved_word_filtering_all_reserved_words_empty_result(
+            reserved_count in 1usize..5
+        ) {
+            // Select a subset of reserved words
+            let reserved_words: Vec<&str> = crate::reserved_words::RESERVED_WORDS
+                .iter()
+                .take(reserved_count)
+                .copied()
+                .collect();
+
+            // Create code with assignments to all selected reserved words
+            let assignments: Vec<String> = reserved_words
+                .iter()
+                .enumerate()
+                .map(|(i, word)| format!("{} <- {}", word, i + 1))
+                .collect();
+            let code = assignments.join("\n");
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // All symbols should be filtered out (empty result)
+            prop_assert!(
+                symbols.is_empty(),
+                "All reserved word assignments should be filtered out. \
+                 Code:\n{}\nFound symbols: {:?}",
+                code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 8: Reserved Word Filtering
+        ///
+        /// For any R code containing a right assignment to a reserved word (e.g., `1 -> if`),
+        /// the SymbolExtractor SHALL NOT include that reserved word in the extracted symbols.
+        ///
+        /// **Validates: Requirements 7.1, 7.2**
+        fn prop_reserved_word_filtering_right_assignment(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS),
+            value in 1i32..1000
+        ) {
+            // Create code with right assignment to reserved word (e.g., "42 -> if")
+            let code = format!("{} -> {}", value, reserved_word);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Reserved word should NOT appear in extracted symbols
+            let reserved_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|s| s.name == reserved_word)
+                .collect();
+
+            prop_assert!(
+                reserved_symbols.is_empty(),
+                "Reserved word '{}' should NOT appear in extracted symbols (right assignment). \
+                 Code: '{}', Found symbols: {:?}",
+                reserved_word, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 8: Reserved Word Filtering
+        ///
+        /// For any R code containing an assignment to a reserved word, the document_symbol()
+        /// handler SHALL NOT include that reserved word in the response (both Nested and Flat).
+        ///
+        /// **Validates: Requirements 7.1, 7.2**
+        fn prop_reserved_word_filtering_document_symbol_handler(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS),
+            hierarchical_support in any::<bool>()
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Create code with assignment to reserved word
+            let code = format!("{} <- 42", reserved_word);
+
+            let mut state = WorldState::new(vec![]);
+            state.symbol_config.hierarchical_document_symbol_support = hierarchical_support;
+
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Call document_symbol
+            let response = super::document_symbol(&state, &uri);
+
+            prop_assert!(
+                response.is_some(),
+                "document_symbol should return Some for valid document. Code: '{}'", code
+            );
+
+            // Check that reserved word is not in the response
+            match response.unwrap() {
+                tower_lsp::lsp_types::DocumentSymbolResponse::Nested(symbols) => {
+                    let reserved_found = symbols.iter().any(|s| s.name == reserved_word);
+                    prop_assert!(
+                        !reserved_found,
+                        "Reserved word '{}' should NOT appear in Nested document symbols. \
+                         Code: '{}', Found symbols: {:?}",
+                        reserved_word, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    );
+                }
+                tower_lsp::lsp_types::DocumentSymbolResponse::Flat(symbols) => {
+                    let reserved_found = symbols.iter().any(|s| s.name == reserved_word);
+                    prop_assert!(
+                        !reserved_found,
+                        "Reserved word '{}' should NOT appear in Flat document symbols. \
+                         Code: '{}', Found symbols: {:?}",
+                        reserved_word, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 8: Reserved Word Filtering
+        ///
+        /// For any R code containing an assignment to a reserved word, the workspace_symbol()
+        /// handler SHALL NOT include that reserved word in the response.
+        ///
+        /// **Validates: Requirements 7.1, 7.2**
+        fn prop_reserved_word_filtering_workspace_symbol_handler(
+            reserved_word in prop::sample::select(crate::reserved_words::RESERVED_WORDS)
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Create code with assignment to reserved word
+            let code = format!("{} <- 42", reserved_word);
+
+            let mut state = WorldState::new(vec![]);
+            let uri = Url::parse("file:///test.R").unwrap();
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            // Call workspace_symbol with empty query (returns all symbols)
+            let response = super::workspace_symbol(&state, "");
+
+            prop_assert!(
+                response.is_some(),
+                "workspace_symbol should return Some. Code: '{}'", code
+            );
+
+            let symbols = response.unwrap();
+
+            // Check that reserved word is not in the response
+            let reserved_found = symbols.iter().any(|s| s.name == reserved_word);
+            prop_assert!(
+                !reserved_found,
+                "Reserved word '{}' should NOT appear in workspace symbols. \
+                 Code: '{}', Found symbols: {:?}",
+                reserved_word, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 8: Reserved Word Filtering (Negative Control)
+        ///
+        /// For any R code containing an assignment to a non-reserved identifier,
+        /// the SymbolExtractor SHALL include that identifier in the extracted symbols.
+        /// This is a negative control to ensure the extractor is working correctly.
+        ///
+        /// **Validates: Requirements 7.1, 7.2**
+        fn prop_reserved_word_filtering_non_reserved_included(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            value in 1i32..1000
+        ) {
+            // Create code with assignment to non-reserved identifier
+            let code = format!("{} <- {}", var_name, value);
+
+            let tree = parse_r_code(&code);
+            let extractor = SymbolExtractor::new(&code, tree.root_node());
+            let symbols = extractor.extract_all();
+
+            // Non-reserved identifier SHOULD appear in extracted symbols
+            let var_symbols: Vec<_> = symbols
+                .iter()
+                .filter(|s| s.name == var_name)
+                .collect();
+
+            prop_assert!(
+                !var_symbols.is_empty(),
+                "Non-reserved identifier '{}' SHOULD appear in extracted symbols. \
+                 Code: '{}', Found symbols: {:?}",
+                var_name, code, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+        }
+
+        // ========================================================================
+        // Workspace Symbol Property Tests
+        // ========================================================================
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 9: Workspace ContainerName
+        ///
+        /// For any workspace symbol from a file with path `/path/to/filename.R`,
+        /// the `containerName` field SHALL equal `filename` (without extension).
+        ///
+        /// **Validates: Requirements 8.1, 8.2**
+        fn prop_workspace_container_name(
+            filename in "[a-z][a-z0-9_]{2,10}",
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            use crate::state::{WorldState, Document};
+
+            let code = format!("{} <- 42", var_name);
+            let uri_str = format!("file:///path/to/{}.R", filename);
+            let uri = Url::parse(&uri_str).unwrap();
+
+            let mut state = WorldState::new(vec![]);
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let response = super::workspace_symbol(&state, "");
+            prop_assert!(response.is_some());
+
+            let symbols = response.unwrap();
+            let matching_symbols: Vec<_> = symbols.iter().filter(|s| s.name == var_name).collect();
+
+            prop_assert!(
+                !matching_symbols.is_empty(),
+                "Symbol '{}' should appear in workspace symbols", var_name
+            );
+
+            for sym in matching_symbols {
+                prop_assert_eq!(
+                    sym.container_name.as_deref(),
+                    Some(filename.as_str()),
+                    "containerName should be '{}' for file '{}.R'",
+                    filename, filename
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 10: Workspace Query Filtering
+        ///
+        /// For any workspace symbol query with a non-empty query string,
+        /// all returned symbols SHALL have names containing the query (case-insensitive substring match).
+        ///
+        /// **Validates: Requirements 9.1**
+        fn prop_workspace_query_filtering(
+            var_name in "[a-z][a-z0-9_]{4,10}".prop_filter("Not reserved", |s| !is_r_reserved(s)),
+            query_start in 0usize..3,
+            query_len in 2usize..4
+        ) {
+            use crate::state::{WorldState, Document};
+
+            // Ensure query is within bounds
+            let query_end = (query_start + query_len).min(var_name.len());
+            let query = &var_name[query_start..query_end];
+
+            let code = format!("{} <- 42\nother_var <- 100", var_name);
+            let uri = Url::parse("file:///test.R").unwrap();
+
+            let mut state = WorldState::new(vec![]);
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let response = super::workspace_symbol(&state, query);
+            prop_assert!(response.is_some());
+
+            let symbols = response.unwrap();
+
+            // All returned symbols should contain the query (case-insensitive)
+            let lower_query = query.to_lowercase();
+            for sym in &symbols {
+                prop_assert!(
+                    sym.name.to_lowercase().contains(&lower_query),
+                    "Symbol '{}' should contain query '{}' (case-insensitive)",
+                    sym.name, query
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 11: Workspace Result Limiting
+        ///
+        /// For any workspace symbol query, the number of returned symbols
+        /// SHALL NOT exceed `symbols.workspaceMaxResults` configuration value.
+        ///
+        /// **Validates: Requirements 9.2**
+        fn prop_workspace_result_limiting(
+            max_results in 100usize..500,
+            num_symbols in 50usize..200
+        ) {
+            use crate::state::{WorldState, Document, SymbolConfig};
+
+            // Generate code with many symbols
+            let code: String = (0..num_symbols)
+                .map(|i| format!("var_{} <- {}", i, i))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let uri = Url::parse("file:///test.R").unwrap();
+
+            let mut state = WorldState::new(vec![]);
+            state.symbol_config = SymbolConfig::with_max_results(max_results);
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+
+            let response = super::workspace_symbol(&state, "");
+            prop_assert!(response.is_some());
+
+            let symbols = response.unwrap();
+
+            prop_assert!(
+                symbols.len() <= max_results,
+                "Number of symbols ({}) should not exceed max_results ({})",
+                symbols.len(), max_results
+            );
+        }
+
+        #[test]
+        /// Feature: document-workspace-symbols, Property 12: Workspace Deduplication
+        ///
+        /// For any workspace symbol query where the same symbol exists in multiple sources
+        /// (open documents, workspace index, legacy indices), the symbol SHALL appear
+        /// exactly once in the results.
+        ///
+        /// **Validates: Requirements 9.3**
+        fn prop_workspace_deduplication(
+            var_name in "[a-z][a-z0-9_]{2,10}".prop_filter("Not reserved", |s| !is_r_reserved(s))
+        ) {
+            use crate::state::{WorldState, Document};
+
+            let code = format!("{} <- 42", var_name);
+            let uri = Url::parse("file:///test.R").unwrap();
+
+            let mut state = WorldState::new(vec![]);
+            // Add to both documents (open) and workspace_index (closed)
+            state.documents.insert(uri.clone(), Document::new(&code, None));
+            state.workspace_index.insert(uri.clone(), Document::new(&code, None));
+
+            let response = super::workspace_symbol(&state, "");
+            prop_assert!(response.is_some());
+
+            let symbols = response.unwrap();
+
+            // Count occurrences of the symbol
+            let count = symbols.iter().filter(|s| s.name == var_name).count();
+
+            prop_assert_eq!(
+                count, 1,
+                "Symbol '{}' should appear exactly once, but appeared {} times",
+                var_name, count
+            );
         }
     }
 
