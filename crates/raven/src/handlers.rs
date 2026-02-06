@@ -1180,37 +1180,56 @@ impl HierarchyBuilder {
         // Sort section indices by their start line
         section_indices.sort_by_key(|&idx| self.symbols[idx].range.start.line);
 
-        // Compute the end line for each section
-        let section_count = section_indices.len();
-        for i in 0..section_count {
+        // Compute the end line for each section (level-aware, stack-based O(n)).
+        // Stack holds indices into section_indices for "open" sections whose end
+        // line hasn't been determined yet. Each section is pushed and popped at
+        // most once, so the total work is O(n).
+        let eof_line = if self.line_count > 0 {
+            self.line_count - 1
+        } else {
+            0
+        };
+        let mut stack: Vec<usize> = Vec::new();
+
+        for i in 0..section_indices.len() {
             let current_idx = section_indices[i];
+            let current_level = self.symbols[current_idx]
+                .section_level
+                .expect("section_level must be Some for symbols in section_indices");
+            let current_start = self.symbols[current_idx].range.start.line;
 
-            // Determine the end line for this section
-            let end_line = if i + 1 < section_count {
-                // There's a next section - end at the line before it
-                let next_idx = section_indices[i + 1];
-                let next_start_line = self.symbols[next_idx].range.start.line;
-                // End at line before next section (but not before our own start)
-                if next_start_line > 0 {
-                    next_start_line - 1
+            // Pop all stack entries with level >= current_level
+            // (they are siblings or children that end before this section)
+            while let Some(&top_i) = stack.last() {
+                let top_idx = section_indices[top_i];
+                let top_level = self.symbols[top_idx]
+                    .section_level
+                    .expect("section_level must be Some for symbols in section_indices");
+                if top_level >= current_level {
+                    let end_line = if current_start > 0 {
+                        current_start - 1
+                    } else {
+                        0
+                    };
+                    self.symbols[top_idx].range.end = Position {
+                        line: end_line,
+                        character: LSP_EOL_CHARACTER,
+                    };
+                    stack.pop();
                 } else {
-                    0
+                    break;
                 }
-            } else {
-                // This is the last section - end at the last line of the document
-                if self.line_count > 0 {
-                    self.line_count - 1
-                } else {
-                    0
-                }
-            };
+            }
 
-            // Update the range's end position
-            // End character is set to 0 to indicate end of line (exclusive)
-            // This means the range covers up to and including end_line
-            self.symbols[current_idx].range.end = Position {
-                line: end_line,
-                character: LSP_EOL_CHARACTER, // End of line
+            stack.push(i);
+        }
+
+        // Remaining stack entries extend to EOF
+        while let Some(top_i) = stack.pop() {
+            let top_idx = section_indices[top_i];
+            self.symbols[top_idx].range.end = Position {
+                line: eof_line,
+                character: LSP_EOL_CHARACTER,
             };
         }
     }
@@ -10330,6 +10349,246 @@ y <- 2";
         assert_eq!(builder.symbols[0].range.end.line, 0);
     }
 
+    #[test]
+    fn test_compute_section_ranges_parent_spans_subsection() {
+        // Core bug scenario: level-1 section at line 0, level-2 subsection at line 3,
+        // non-section symbol (function) at line 6, line_count = 10.
+        // The level-1 section's range must span over the subsection to EOF,
+        // NOT end at line 2 (before the subsection).
+        let symbols = vec![
+            RawSymbol {
+                name: "Parent Section".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 25 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 25 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Child Subsection".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 28 },
+                },
+                selection_range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 28 },
+                },
+                detail: None,
+                section_level: Some(2),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "my_func".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 6, character: 0 },
+                    end: Position { line: 8, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 6, character: 0 },
+                    end: Position { line: 6, character: 7 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+        ];
+
+        let mut builder = HierarchyBuilder::new(symbols, 10);
+        builder.compute_section_ranges();
+
+        // Find symbols by name
+        let parent = builder.symbols.iter().find(|s| s.name == "Parent Section").unwrap();
+        let child = builder.symbols.iter().find(|s| s.name == "Child Subsection").unwrap();
+        let func = builder.symbols.iter().find(|s| s.name == "my_func").unwrap();
+
+        // Level-1 parent section: should span from line 0 to line 9 (EOF)
+        // because there is no subsequent section at level <= 1
+        assert_eq!(parent.range.start.line, 0);
+        assert_eq!(parent.range.end.line, 9, "Parent section must span to EOF over subsection");
+
+        // Level-2 child subsection: should also span to line 9 (EOF)
+        // because there is no subsequent section at level <= 2
+        assert_eq!(child.range.start.line, 3);
+        assert_eq!(child.range.end.line, 9, "Child subsection must span to EOF");
+
+        // Non-section function symbol should be unchanged
+        assert_eq!(func.range.start.line, 6);
+        assert_eq!(func.range.end.line, 8);
+
+        // Selection ranges must remain unchanged (Requirement 3.1)
+        assert_eq!(parent.selection_range.start.line, 0);
+        assert_eq!(parent.selection_range.end.line, 0);
+        assert_eq!(child.selection_range.start.line, 3);
+        assert_eq!(child.selection_range.end.line, 3);
+    }
+
+    #[test]
+    fn test_build_three_level_nesting_with_symbols() {
+        // Three-level nesting: level 1 > level 2 > level 3 with symbols at each level.
+        // Verifies correct hierarchy after build() (Requirements 2.1, 2.2).
+        //
+        // Layout:
+        //   Line 0:  # Level 1 Section ----       (level 1)
+        //   Line 1:  func_in_l1 <- function() {}  (function, should nest under level 1)
+        //   Line 3:  ## Level 2 Section ----       (level 2)
+        //   Line 4:  func_in_l2 <- function() {}  (function, should nest under level 2)
+        //   Line 6:  ### Level 3 Section ----      (level 3)
+        //   Line 7:  func_in_l3 <- function() {}  (function, should nest under level 3)
+        //   Line 10: # Another Level 1 ----        (level 1, terminates first level 1)
+        //   line_count = 12
+
+        let symbols = vec![
+            RawSymbol {
+                name: "Level 1 Section".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 25 },
+                },
+                selection_range: Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 25 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "func_in_l1".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 2, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 1, character: 0 },
+                    end: Position { line: 1, character: 10 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Level 2 Section".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 25 },
+                },
+                selection_range: Range {
+                    start: Position { line: 3, character: 0 },
+                    end: Position { line: 3, character: 25 },
+                },
+                detail: None,
+                section_level: Some(2),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "func_in_l2".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 4, character: 0 },
+                    end: Position { line: 5, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 4, character: 0 },
+                    end: Position { line: 4, character: 10 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Level 3 Section".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 6, character: 0 },
+                    end: Position { line: 6, character: 25 },
+                },
+                selection_range: Range {
+                    start: Position { line: 6, character: 0 },
+                    end: Position { line: 6, character: 25 },
+                },
+                detail: None,
+                section_level: Some(3),
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "func_in_l3".to_string(),
+                kind: DocumentSymbolKind::Function,
+                range: Range {
+                    start: Position { line: 7, character: 0 },
+                    end: Position { line: 8, character: 1 },
+                },
+                selection_range: Range {
+                    start: Position { line: 7, character: 0 },
+                    end: Position { line: 7, character: 10 },
+                },
+                detail: Some("()".to_string()),
+                section_level: None,
+                children: Vec::new(),
+            },
+            RawSymbol {
+                name: "Another Level 1".to_string(),
+                kind: DocumentSymbolKind::Module,
+                range: Range {
+                    start: Position { line: 10, character: 0 },
+                    end: Position { line: 10, character: 25 },
+                },
+                selection_range: Range {
+                    start: Position { line: 10, character: 0 },
+                    end: Position { line: 10, character: 25 },
+                },
+                detail: None,
+                section_level: Some(1),
+                children: Vec::new(),
+            },
+        ];
+
+        let builder = HierarchyBuilder::new(symbols, 12);
+        let result = builder.build();
+
+        // Root level: two level-1 sections
+        assert_eq!(result.len(), 2, "Should have 2 root-level sections");
+        assert_eq!(result[0].name, "Level 1 Section");
+        assert_eq!(result[1].name, "Another Level 1");
+
+        // Level 1 Section should contain: func_in_l1 and Level 2 Section
+        let l1_children = result[0].children.as_ref().unwrap();
+        assert_eq!(l1_children.len(), 2, "Level 1 should have 2 children (func + level-2 section)");
+        assert_eq!(l1_children[0].name, "func_in_l1");
+        assert_eq!(l1_children[1].name, "Level 2 Section");
+
+        // Level 2 Section should contain: func_in_l2 and Level 3 Section
+        let l2_children = l1_children[1].children.as_ref().unwrap();
+        assert_eq!(l2_children.len(), 2, "Level 2 should have 2 children (func + level-3 section)");
+        assert_eq!(l2_children[0].name, "func_in_l2");
+        assert_eq!(l2_children[1].name, "Level 3 Section");
+
+        // Level 3 Section should contain: func_in_l3
+        let l3_children = l2_children[1].children.as_ref().unwrap();
+        assert_eq!(l3_children.len(), 1, "Level 3 should have 1 child (func)");
+        assert_eq!(l3_children[0].name, "func_in_l3");
+
+        // Another Level 1 section should have no children (no symbols after it before EOF)
+        let l1b_children = result[1].children.as_ref();
+        assert!(
+            l1b_children.is_none() || l1b_children.unwrap().is_empty(),
+            "Second level-1 section should have no children"
+        );
+    }
+
+
     // ========================================================================
     // Tests for nest_in_sections()
     // ========================================================================
@@ -18292,6 +18551,498 @@ setClass("{}", slots = c(value = "numeric"))
 
         let var_sym = result.iter().find(|s| s.name == "my_var").unwrap();
         assert_eq!(var_sym.kind, tower_lsp::lsp_types::SymbolKind::VARIABLE);
+    }
+
+    // ========================================================================
+    // Feature: section-range-hierarchy-fix
+    // Property-based tests for level-aware section range computation
+    // ========================================================================
+
+    /// Strategy to generate a list of section `RawSymbol`s with unique start lines
+    /// and random section levels (1–4).
+    fn section_symbols_strategy(
+        max_line_count: u32,
+    ) -> impl Strategy<Value = (Vec<RawSymbol>, u32)> {
+        // Generate line_count in [1, max_line_count]
+        (1u32..=max_line_count).prop_flat_map(move |line_count| {
+            // Generate 0..min(line_count, 20) unique start lines
+            let max_sections = std::cmp::min(line_count, 20) as usize;
+            (
+                proptest::collection::hash_set(0..line_count, 0..=max_sections),
+                Just(line_count),
+            )
+                .prop_flat_map(move |(start_lines_set, lc)| {
+                    let start_lines: Vec<u32> = start_lines_set.into_iter().collect();
+                    let n = start_lines.len();
+                    // Generate a level (1..=4) for each section
+                    (
+                        proptest::collection::vec(1u32..=4, n),
+                        Just(start_lines),
+                        Just(lc),
+                    )
+                })
+                .prop_map(|(levels, start_lines, lc)| {
+                    let symbols: Vec<RawSymbol> = start_lines
+                        .iter()
+                        .zip(levels.iter())
+                        .enumerate()
+                        .map(|(i, (&line, &level))| RawSymbol {
+                            name: format!("Section_{}", i),
+                            kind: DocumentSymbolKind::Module,
+                            range: Range {
+                                start: Position {
+                                    line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line,
+                                    character: 20,
+                                },
+                            },
+                            selection_range: Range {
+                                start: Position {
+                                    line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line,
+                                    character: 20,
+                                },
+                            },
+                            detail: None,
+                            section_level: Some(level),
+                            children: Vec::new(),
+                        })
+                        .collect();
+                    (symbols, lc)
+                })
+        })
+    }
+
+    /// Strategy that generates a mix of section and non-section symbols for property testing.
+    ///
+    /// Returns `(Vec<RawSymbol>, u32)` where the symbols include both sections (with
+    /// `section_level = Some(1..=4)`) and non-section symbols (with `section_level = None`),
+    /// all with unique start lines, plus the line_count.
+    fn mixed_symbols_strategy(
+        max_line_count: u32,
+    ) -> impl Strategy<Value = (Vec<RawSymbol>, u32)> {
+        (1u32..=max_line_count).prop_flat_map(move |line_count| {
+            // Generate 0..min(line_count, 20) unique start lines for all symbols
+            let max_symbols = std::cmp::min(line_count, 20) as usize;
+            (
+                proptest::collection::hash_set(0..line_count, 0..=max_symbols),
+                Just(line_count),
+            )
+                .prop_flat_map(move |(start_lines_set, lc)| {
+                    let start_lines: Vec<u32> = start_lines_set.into_iter().collect();
+                    let n = start_lines.len();
+                    // For each symbol, generate: is_section (bool), level (1..=4)
+                    (
+                        proptest::collection::vec(proptest::bool::ANY, n),
+                        proptest::collection::vec(1u32..=4, n),
+                        // Generate varied selection_range characters to ensure they differ
+                        proptest::collection::vec(0u32..=80, n),
+                        proptest::collection::vec(1u32..=80, n),
+                        Just(start_lines),
+                        Just(lc),
+                    )
+                })
+                .prop_map(
+                    |(is_sections, levels, sel_starts, sel_lengths, start_lines, lc)| {
+                        let symbols: Vec<RawSymbol> = start_lines
+                            .iter()
+                            .zip(is_sections.iter())
+                            .zip(levels.iter())
+                            .zip(sel_starts.iter())
+                            .zip(sel_lengths.iter())
+                            .enumerate()
+                            .map(|(i, ((((&line, &is_section), &level), &sel_start), &sel_len))| {
+                                let sel_end = sel_start + sel_len;
+                                RawSymbol {
+                                    name: format!("Symbol_{}", i),
+                                    kind: if is_section {
+                                        DocumentSymbolKind::Module
+                                    } else {
+                                        DocumentSymbolKind::Function
+                                    },
+                                    range: Range {
+                                        start: Position {
+                                            line,
+                                            character: 0,
+                                        },
+                                        end: Position {
+                                            line,
+                                            character: 20,
+                                        },
+                                    },
+                                    selection_range: Range {
+                                        start: Position {
+                                            line,
+                                            character: sel_start,
+                                        },
+                                        end: Position {
+                                            line,
+                                            character: sel_end,
+                                        },
+                                    },
+                                    detail: None,
+                                    section_level: if is_section { Some(level) } else { None },
+                                    children: Vec::new(),
+                                }
+                            })
+                            .collect();
+                        (symbols, lc)
+                    },
+                )
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        /// Feature: section-range-hierarchy-fix, Property 1: Level-aware section range end lines
+        ///
+        /// For any list of sections with arbitrary levels and start lines, after calling
+        /// `compute_section_ranges()`, each section at level N shall have its end line
+        /// equal to `next_sibling_or_ancestor.start_line - 1` where the next sibling or
+        /// ancestor is the first subsequent section with level <= N, or `line_count - 1`
+        /// (EOF) if no such section exists.
+        ///
+        /// **Validates: Requirements 1.1, 1.2, 1.3, 1.4**
+        fn prop_level_aware_section_range_end_lines(
+            (symbols, line_count) in section_symbols_strategy(100)
+        ) {
+            // Skip trivial case where line_count is 0 (no meaningful ranges)
+            prop_assume!(line_count > 0);
+
+            // Clone symbols to compute expected values independently
+            let mut expected_sections: Vec<(u32, u32)> = symbols
+                .iter()
+                .filter(|s| s.section_level.is_some())
+                .map(|s| (s.range.start.line, s.section_level.unwrap()))
+                .collect();
+            expected_sections.sort_by_key(|&(line, _)| line);
+
+            // Compute expected end lines using the specification algorithm
+            let mut expected_end_lines: Vec<(u32, u32)> = Vec::new(); // (start_line, expected_end_line)
+            for i in 0..expected_sections.len() {
+                let (current_start, current_level) = expected_sections[i];
+                let mut end_line = line_count - 1; // default: EOF
+                for j in (i + 1)..expected_sections.len() {
+                    let (next_start, next_level) = expected_sections[j];
+                    if next_level <= current_level {
+                        // Found sibling or ancestor
+                        end_line = if next_start > 0 { next_start - 1 } else { 0 };
+                        break;
+                    }
+                }
+                expected_end_lines.push((current_start, end_line));
+            }
+
+            // Run the actual implementation
+            let mut builder = HierarchyBuilder::new(symbols, line_count);
+            builder.compute_section_ranges();
+
+            // Verify each section's end line matches expected
+            for &(start_line, expected_end) in &expected_end_lines {
+                let section = builder
+                    .symbols
+                    .iter()
+                    .find(|s| {
+                        s.section_level.is_some() && s.range.start.line == start_line
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Section at start_line {} not found in builder symbols",
+                            start_line
+                        )
+                    });
+
+                prop_assert_eq!(
+                    section.range.end.line,
+                    expected_end,
+                    "Section at line {} (level {}) should have end_line={}, got end_line={}. \
+                     Sections (sorted): {:?}",
+                    start_line,
+                    section.section_level.unwrap(),
+                    expected_end,
+                    section.range.end.line,
+                    expected_sections
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: section-range-hierarchy-fix, Property 3: Selection range preservation
+        ///
+        /// For any list of symbols (sections and non-sections), after calling
+        /// `compute_section_ranges()`, the `selection_range` of every symbol shall be
+        /// identical to its `selection_range` before the call.
+        ///
+        /// **Validates: Requirements 3.1**
+        fn prop_selection_range_preservation(
+            (symbols, line_count) in mixed_symbols_strategy(100)
+        ) {
+            // Snapshot all selection_ranges before compute_section_ranges
+            let selection_ranges_before: Vec<(String, Range)> = symbols
+                .iter()
+                .map(|s| (s.name.clone(), s.selection_range))
+                .collect();
+
+            // Run compute_section_ranges
+            let mut builder = HierarchyBuilder::new(symbols, line_count);
+            builder.compute_section_ranges();
+
+            // Verify every symbol's selection_range is unchanged
+            prop_assert_eq!(
+                builder.symbols.len(),
+                selection_ranges_before.len(),
+                "Symbol count changed after compute_section_ranges"
+            );
+
+            for (i, (name, expected_sel_range)) in selection_ranges_before.iter().enumerate() {
+                let actual = &builder.symbols[i];
+                prop_assert_eq!(
+                    &actual.name,
+                    name,
+                    "Symbol order changed at index {}: expected '{}', got '{}'",
+                    i,
+                    name,
+                    actual.name
+                );
+                prop_assert_eq!(
+                    actual.selection_range,
+                    *expected_sel_range,
+                    "selection_range changed for symbol '{}' at index {}. \
+                     Before: {:?}, After: {:?}",
+                    name,
+                    i,
+                    expected_sel_range,
+                    actual.selection_range
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: section-range-hierarchy-fix, Property 4: Input order independence (confluence)
+        ///
+        /// For any list of sections, the computed section ranges after
+        /// `compute_section_ranges()` shall be identical regardless of the initial
+        /// ordering of sections in the input list.
+        ///
+        /// **Validates: Requirements 4.4**
+        fn prop_input_order_independence(
+            (symbols, line_count) in section_symbols_strategy(100)
+        ) {
+            // Skip trivial cases
+            prop_assume!(line_count > 0);
+            prop_assume!(symbols.len() >= 2);
+
+            // Create a shuffled copy by reversing the symbol order
+            let reversed_symbols: Vec<RawSymbol> = symbols.iter().rev().cloned().collect();
+
+            // Run compute_section_ranges on the original order
+            let mut builder_original = HierarchyBuilder::new(symbols, line_count);
+            builder_original.compute_section_ranges();
+
+            // Run compute_section_ranges on the reversed order
+            let mut builder_reversed = HierarchyBuilder::new(reversed_symbols, line_count);
+            builder_reversed.compute_section_ranges();
+
+            // Extract section ranges from both, sorted by start line for comparison
+            let mut ranges_original: Vec<(u32, u32, u32)> = builder_original
+                .symbols
+                .iter()
+                .filter(|s| s.section_level.is_some())
+                .map(|s| (s.range.start.line, s.range.end.line, s.section_level.unwrap()))
+                .collect();
+            ranges_original.sort_by_key(|&(start, _, _)| start);
+
+            let mut ranges_reversed: Vec<(u32, u32, u32)> = builder_reversed
+                .symbols
+                .iter()
+                .filter(|s| s.section_level.is_some())
+                .map(|s| (s.range.start.line, s.range.end.line, s.section_level.unwrap()))
+                .collect();
+            ranges_reversed.sort_by_key(|&(start, _, _)| start);
+
+            // Both orderings must produce identical ranges
+            prop_assert_eq!(
+                ranges_original.len(),
+                ranges_reversed.len(),
+                "Different number of sections after compute_section_ranges: original={}, reversed={}",
+                ranges_original.len(),
+                ranges_reversed.len()
+            );
+
+            for (i, (orig, rev)) in ranges_original.iter().zip(ranges_reversed.iter()).enumerate() {
+                prop_assert_eq!(
+                    orig,
+                    rev,
+                    "Section ranges differ at index {} between original and reversed input order. \
+                     Original: (start={}, end={}, level={}), Reversed: (start={}, end={}, level={})",
+                    i,
+                    orig.0, orig.1, orig.2,
+                    rev.0, rev.1, rev.2
+                );
+            }
+        }
+
+        #[test]
+        /// Feature: section-range-hierarchy-fix, Property 2: Correct symbol nesting after build
+        ///
+        /// For any valid configuration of sections (with varying levels) and non-section
+        /// symbols, after calling `build()`, every non-section symbol whose start line
+        /// falls within a section's computed range shall appear as a descendant of that
+        /// section (nested in the deepest containing section), and symbols outside all
+        /// section ranges shall appear at the root level.
+        ///
+        /// **Validates: Requirements 2.1, 2.2, 2.3**
+        fn prop_correct_symbol_nesting(
+            (symbols, line_count) in mixed_symbols_strategy(100)
+        ) {
+            prop_assume!(line_count > 0);
+
+            // --- Step 1: Independently compute expected section ranges ---
+            // Extract sections sorted by start line
+            let mut sections_info: Vec<(u32, u32, String)> = symbols
+                .iter()
+                .filter(|s| s.section_level.is_some())
+                .map(|s| (s.range.start.line, s.section_level.unwrap(), s.name.clone()))
+                .collect();
+            sections_info.sort_by_key(|&(line, _, _)| line);
+
+            // Compute expected end lines for each section using the level-aware algorithm
+            let mut section_ranges: Vec<(u32, u32, u32, String)> = Vec::new(); // (start, end, level, name)
+            for i in 0..sections_info.len() {
+                let (start, level, ref name) = sections_info[i];
+                let mut end_line = line_count - 1; // default: EOF
+                for j in (i + 1)..sections_info.len() {
+                    let (next_start, next_level, _) = sections_info[j];
+                    if next_level <= level {
+                        end_line = if next_start > 0 { next_start - 1 } else { 0 };
+                        break;
+                    }
+                }
+                section_ranges.push((start, end_line, level, name.clone()));
+            }
+
+            // --- Step 2: For each non-section symbol, compute expected deepest containing section ---
+            let non_section_symbols: Vec<(u32, String)> = symbols
+                .iter()
+                .filter(|s| s.section_level.is_none())
+                .map(|s| (s.range.start.line, s.name.clone()))
+                .collect();
+
+            // For each non-section symbol, find the deepest containing section.
+            // "Deepest" means the section with the smallest range that contains the symbol.
+            // Among sections that contain the symbol, the one with the latest start line
+            // and highest level is the deepest.
+            let mut expected_parent: std::collections::HashMap<String, Option<String>> =
+                std::collections::HashMap::new();
+
+            for &(sym_line, ref sym_name) in &non_section_symbols {
+                let mut best_section: Option<&(u32, u32, u32, String)> = None;
+                for sr in &section_ranges {
+                    let (sec_start, sec_end, _sec_level, _) = sr;
+                    // Symbol must be strictly after section start (sections start on
+                    // their comment line; symbols on the same line as a section comment
+                    // are the section itself, but non-section symbols on the same line
+                    // would be at the section start line).
+                    // The nesting logic uses: symbol_line >= section.range.start.line
+                    // && symbol_line <= section.range.end.line
+                    // But sections themselves occupy their start line, so a non-section
+                    // symbol on the same line as a section start IS within that section's range.
+                    if sym_line >= *sec_start && sym_line <= *sec_end {
+                        // This section contains the symbol. Pick the deepest one:
+                        // the one with the latest start line (most nested).
+                        // If same start line, pick higher level (more nested).
+                        match best_section {
+                            None => best_section = Some(sr),
+                            Some(best) => {
+                                let (best_start, _, best_level, _) = best;
+                                if *sec_start > *best_start
+                                    || (*sec_start == *best_start && _sec_level > best_level)
+                                {
+                                    best_section = Some(sr);
+                                }
+                            }
+                        }
+                    }
+                }
+                expected_parent.insert(
+                    sym_name.clone(),
+                    best_section.map(|(_, _, _, name)| name.clone()),
+                );
+            }
+
+            // --- Step 3: Run build() ---
+            let result = HierarchyBuilder::new(symbols, line_count).build();
+
+            // --- Step 4: Flatten the hierarchy to find actual parent of each non-section symbol ---
+            // Walk the DocumentSymbol tree and record (symbol_name -> parent_section_name)
+            let mut actual_parent: std::collections::HashMap<String, Option<String>> =
+                std::collections::HashMap::new();
+
+            fn collect_parents(
+                symbols: &[DocumentSymbol],
+                current_section_parent: Option<&str>,
+                actual: &mut std::collections::HashMap<String, Option<String>>,
+            ) {
+                for sym in symbols {
+                    let is_section = sym.kind == tower_lsp::lsp_types::SymbolKind::MODULE;
+                    if !is_section {
+                        // This is a non-section symbol; record its parent section
+                        actual.insert(
+                            sym.name.clone(),
+                            current_section_parent.map(|s| s.to_string()),
+                        );
+                    }
+                    // Recurse into children
+                    if let Some(ref children) = sym.children {
+                        let parent_for_children = if is_section {
+                            Some(sym.name.as_str())
+                        } else {
+                            current_section_parent
+                        };
+                        collect_parents(children, parent_for_children, actual);
+                    }
+                }
+            }
+
+            collect_parents(&result, None, &mut actual_parent);
+
+            // --- Step 5: Verify each non-section symbol is in the correct section ---
+            for (sym_name, expected) in &expected_parent {
+                let actual = actual_parent.get(sym_name);
+                match actual {
+                    Some(actual_val) => {
+                        prop_assert_eq!(
+                            actual_val,
+                            expected,
+                            "Symbol '{}' expected parent section {:?}, but found {:?}. \
+                             Section ranges: {:?}",
+                            sym_name,
+                            expected,
+                            actual_val,
+                            section_ranges
+                        );
+                    }
+                    None => {
+                        // Symbol not found in output at all - this shouldn't happen
+                        // unless build() dropped it (which would be a bug)
+                        prop_assert!(
+                            false,
+                            "Symbol '{}' not found in build() output. Expected parent: {:?}",
+                            sym_name,
+                            expected
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

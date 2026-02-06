@@ -17,3 +17,4 @@ cc c0b2cf15ea48569706570f3e444704e5a16f7b732710c9e755b0abfc5587279c # shrinks to
 cc f6422bed12b3fd769eb1097db70cbbd7a66d07437fd0c4f8e2ce1a2801dfdbd2 # shrinks to symbol_name = "x", is_function = false
 cc 22f5803b605fb07455ff1a5ab6b25c60190d8499f4404eb03c707b8e98a2ade5 # shrinks to symbol_name = "y", is_function = false, prefix_lines = 0
 cc 44c37ae5d05d04862537acce37c6faf634169b54c37af5c402776be7983ca036 # shrinks to old_symbol = "a", new_symbol = "y", is_function = false
+cc 9532908ec73c1feeb9ba3b79344c577909065889a153eda5b70f3b7097bbe16d # shrinks to symbol_name = "x", declaration_count = 4
