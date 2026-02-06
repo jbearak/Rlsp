@@ -1722,7 +1722,7 @@ fn get_cross_file_symbols(
     uri: &Url,
     line: u32,
     column: u32,
-) -> HashMap<String, ScopedSymbol> {
+) -> HashMap<std::sync::Arc<str>, ScopedSymbol> {
     get_cross_file_scope(state, uri, line, column).symbols
 }
 
@@ -2357,7 +2357,7 @@ fn collect_workspace_symbols_from_artifacts(
         };
 
         symbols.push(SymbolInformation {
-            name: scoped_symbol.name.clone(),
+            name: scoped_symbol.name.to_string(),
             kind,
             tags: None,
             deprecated: None,
@@ -3633,7 +3633,7 @@ fn collect_out_of_scope_diagnostics(
             };
 
             get_artifacts(&source_uri)
-                .map(|a| a.exported_interface.keys().cloned().collect())
+                .map(|a| a.exported_interface.keys().map(|k| k.to_string()).collect())
                 .unwrap_or_default()
         };
 
@@ -4038,7 +4038,7 @@ pub(crate) fn collect_undefined_variables_position_aware(
         });
 
         // Check if symbol is in cross-file scope
-        if scope.symbols.contains_key(&name) {
+        if scope.symbols.contains_key(name.as_str()) {
             continue;
         }
 
@@ -4602,10 +4602,11 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     // Add cross-file symbols (from scope resolution)
     // Requirement 9.5: Package exports > cross-file symbols
     for (name, symbol) in scope.symbols {
-        if seen_names.contains(&name) {
+        if seen_names.contains(name.as_ref()) {
             continue; // Local definitions and package exports take precedence
         }
-        seen_names.insert(name.clone());
+        let name_string = name.to_string();
+        seen_names.insert(name_string.clone());
 
         let kind = match symbol.kind {
             crate::cross_file::SymbolKind::Function => CompletionItemKind::FUNCTION,
@@ -4621,7 +4622,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         };
 
         items.push(CompletionItem {
-            label: name,
+            label: name_string,
             kind: Some(kind),
             detail,
             ..Default::default()
@@ -12370,6 +12371,7 @@ mod proptests {
     use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
     use crate::state::Document;
     use proptest::prelude::*;
+    use std::sync::Arc;
     use std::collections::HashSet;
 
     // Helper to parse R code for property tests
@@ -12586,7 +12588,7 @@ mod proptests {
         let tree = parse_r_code(code);
 
         let symbol = ScopedSymbol {
-            name: "x".to_string(),
+            name: Arc::from("x"),
             kind: SymbolKind::Variable,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
@@ -12607,7 +12609,7 @@ mod proptests {
         let tree = parse_r_code(code);
 
         let symbol = ScopedSymbol {
-            name: "f".to_string(),
+            name: Arc::from("f"),
             kind: SymbolKind::Function,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
@@ -12633,7 +12635,7 @@ mod proptests {
         let tree = parse_r_code(&code);
 
         let symbol = ScopedSymbol {
-            name: "long_func".to_string(),
+            name: Arc::from("long_func"),
             kind: SymbolKind::Function,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
@@ -12665,7 +12667,7 @@ mod proptests {
             let var_name = code.split_whitespace().next().unwrap();
 
             let symbol = ScopedSymbol {
-                name: var_name.to_string(),
+                name: Arc::from(var_name),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -12691,7 +12693,7 @@ mod proptests {
         let tree = parse_r_code(code);
 
         let symbol = ScopedSymbol {
-            name: "i".to_string(),
+            name: Arc::from("i"),
             kind: SymbolKind::Variable,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
@@ -12797,7 +12799,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: var_name.clone(),
+                name: Arc::from(var_name.as_str()),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -12827,7 +12829,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: func_name.clone(),
+                name: Arc::from(func_name.as_str()),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -12863,7 +12865,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: func_name.clone(),
+                name: Arc::from(func_name.as_str()),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -12999,7 +13001,7 @@ mod proptests {
 
             let tree = parse_r_code(&statement);
             let symbol = ScopedSymbol {
-                name: "long_func".to_string(),
+                name: Arc::from("long_func"),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13033,7 +13035,7 @@ mod proptests {
 
             let tree = parse_r_code(&statement);
             let symbol = ScopedSymbol {
-                name: "func".to_string(),
+                name: Arc::from("func"),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13085,7 +13087,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: var_name.clone(),
+                name: Arc::from(var_name.as_str()),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13117,7 +13119,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: func_name.clone(),
+                name: Arc::from(func_name.as_str()),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13144,7 +13146,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: iterator.clone(),
+                name: Arc::from(iterator.as_str()),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13178,7 +13180,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: param_name.clone(),
+                name: Arc::from(param_name.as_str()),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13295,9 +13297,9 @@ mod proptests {
             let position = Position::new(1, 10); // Position after source() call
             let cross_file_symbols = get_cross_file_symbols(&state, &main_uri, position.line, position.character);
 
-            prop_assert!(cross_file_symbols.contains_key(&func_name), "Should resolve cross-file symbol using dependency graph");
+            prop_assert!(cross_file_symbols.contains_key(func_name.as_str()), "Should resolve cross-file symbol using dependency graph");
 
-            if let Some(symbol) = cross_file_symbols.get(&func_name) {
+            if let Some(symbol) = cross_file_symbols.get(func_name.as_str()) {
                 prop_assert_eq!(&symbol.source_uri, &utils_uri, "Should locate definition in sourced file");
             }
         }
@@ -13331,9 +13333,9 @@ mod proptests {
             let position = Position::new(3, 10); // Position of function usage
             let cross_file_symbols = get_cross_file_symbols(&state, &uri, position.line, position.character);
 
-            prop_assert!(cross_file_symbols.contains_key(&func_name), "Should find symbol definition");
+            prop_assert!(cross_file_symbols.contains_key(func_name.as_str()), "Should find symbol definition");
 
-            if let Some(symbol) = cross_file_symbols.get(&func_name) {
+            if let Some(symbol) = cross_file_symbols.get(func_name.as_str()) {
                 // Should select the local definition (line 2) that's in scope, not the earlier one or utils.R
                 prop_assert_eq!(&symbol.source_uri, &uri, "Should select definition from same file");
                 prop_assert_eq!(symbol.defined_line, 2, "Should select the definition that's in scope at reference position");
@@ -19117,6 +19119,7 @@ mod integration_tests {
     use super::*;
     use crate::r_env;
     use crate::state::{Document, WorldState};
+    use std::sync::Arc;
 
     #[test]
     fn test_base_package_functions() {
@@ -19205,7 +19208,7 @@ mod integration_tests {
 
         // Create a scoped symbol with definition info
         let symbol = ScopedSymbol {
-            name: "my_var".to_string(),
+            name: Arc::from("my_var"),
             kind: SymbolKind::Variable,
             source_uri: uri.clone(),
             defined_line: 0,
@@ -19333,7 +19336,7 @@ mod integration_tests {
 
         // Create a declared variable symbol
         let symbol = ScopedSymbol {
-            name: "myvar".to_string(),
+            name: Arc::from("myvar"),
             kind: SymbolKind::Variable,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 4, // 0-based line 4 = display line 5
@@ -19374,7 +19377,7 @@ mod integration_tests {
 
         // Create a declared function symbol
         let symbol = ScopedSymbol {
-            name: "myfunc".to_string(),
+            name: Arc::from("myfunc"),
             kind: SymbolKind::Function,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 9, // 0-based line 9 = display line 10
@@ -19422,7 +19425,7 @@ mod integration_tests {
 
         for (defined_line, expected_display_line) in test_cases {
             let symbol = ScopedSymbol {
-                name: "test_symbol".to_string(),
+                name: Arc::from("test_symbol"),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line,
@@ -19754,7 +19757,7 @@ result <- missing_func(42)"#;
 
         // Create a scoped symbol that references a missing file
         let symbol = ScopedSymbol {
-            name: "missing_func".to_string(),
+            name: Arc::from("missing_func"),
             kind: crate::cross_file::SymbolKind::Function,
             source_uri: missing_uri, // This file doesn't exist in state
             defined_line: 0,
@@ -20369,7 +20372,7 @@ result <- helper_with_spaces(42)"#;
         // Create a symbol with a package URI
         let package_uri = Url::parse("package:dplyr").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Variable,
             source_uri: package_uri,
             defined_line: 0,
@@ -20445,7 +20448,7 @@ result <- helper_with_spaces(42)"#;
         // Create a symbol with a file URI (local definition)
         let file_uri = Url::parse("file:///workspace/main.R").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Function,
             source_uri: file_uri.clone(),
             defined_line: 5,
@@ -20903,7 +20906,7 @@ result <- filter(c(1, -2, 3))"#;
         // Create a symbol that represents a package export
         let package_uri = Url::parse("package:dplyr").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Function,
             source_uri: package_uri.clone(),
             defined_line: 0,
@@ -21049,7 +21052,7 @@ z <- mutate(5)  # Uses local definition"#;
         // Create a symbol with a package URI
         let package_uri = Url::parse("package:dplyr").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Function,
             source_uri: package_uri.clone(),
             defined_line: 0,
@@ -21083,7 +21086,7 @@ z <- mutate(5)  # Uses local definition"#;
         // Create a symbol with a file URI (local definition)
         let file_uri = Url::parse("file:///workspace/main.R").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Function,
             source_uri: file_uri.clone(),
             defined_line: 5,

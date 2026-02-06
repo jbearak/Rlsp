@@ -7,6 +7,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::Url;
@@ -503,7 +504,7 @@ pub enum SymbolKind {
 /// A symbol with its definition location
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedSymbol {
-    pub name: String,
+    pub name: Arc<str>,
     pub kind: SymbolKind,
     pub source_uri: Url,
     /// 0-based line of definition
@@ -582,7 +583,7 @@ pub enum ScopeEvent {
 #[derive(Debug, Clone)]
 pub struct ScopeArtifacts {
     /// Exported interface (all symbols defined in this file)
-    pub exported_interface: HashMap<String, ScopedSymbol>,
+    pub exported_interface: HashMap<Arc<str>, ScopedSymbol>,
     /// Timeline of scope events in document order
     pub timeline: Vec<ScopeEvent>,
     /// Hash of exported interface for change detection
@@ -618,7 +619,7 @@ impl Default for ScopeArtifacts {
 /// Computed scope at a position
 #[derive(Debug, Clone, Default)]
 pub struct ScopeAtPosition {
-    pub symbols: HashMap<String, ScopedSymbol>,
+    pub symbols: HashMap<Arc<str>, ScopedSymbol>,
     pub chain: Vec<Url>,
     /// URIs where max depth was exceeded, with the source call position (line, col)
     pub depth_exceeded: Vec<(Url, u32, u32)>,
@@ -710,12 +711,12 @@ fn apply_removal(
     match removal_scope {
         None => {
             for sym in symbols {
-                scope.symbols.remove(sym);
+                scope.symbols.remove(sym.as_str());
             }
         }
         Some(rm_scope) if active_function_scopes.contains(&rm_scope) => {
             for sym in symbols {
-                scope.symbols.remove(sym);
+                scope.symbols.remove(sym.as_str());
             }
         }
         _ => {}
@@ -968,7 +969,7 @@ pub fn compute_artifacts_with_metadata(
         // Also add to exported_interface (later declarations will overwrite earlier ones)
         for decl in &meta.declared_variables {
             let symbol = ScopedSymbol {
-                name: decl.name.clone(),
+                name: Arc::from(decl.name.as_str()),
                 kind: SymbolKind::Variable,
                 source_uri: uri.clone(),
                 defined_line: decl.line,
@@ -990,7 +991,7 @@ pub fn compute_artifacts_with_metadata(
         // Also add to exported_interface (later declarations will overwrite earlier ones)
         for decl in &meta.declared_functions {
             let symbol = ScopedSymbol {
-                name: decl.name.clone(),
+                name: Arc::from(decl.name.as_str()),
                 kind: SymbolKind::Function,
                 source_uri: uri.clone(),
                 defined_line: decl.line,
@@ -1345,10 +1346,11 @@ where
     let base_uri =
         Url::parse("package:base").unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
     for export_name in base_exports {
+        let name: Arc<str> = Arc::from(export_name.as_str());
         scope.symbols.insert(
-            export_name.clone(),
+            name.clone(),
             ScopedSymbol {
-                name: export_name.clone(),
+                name,
                 kind: SymbolKind::Variable, // Base exports are treated as variables
                 source_uri: base_uri.clone(),
                 defined_line: 0,
@@ -1480,7 +1482,7 @@ where
 
                         for export_name in exports {
                             // Check if symbol already exists
-                            let should_insert = match scope.symbols.get(&export_name) {
+                            let should_insert = match scope.symbols.get(export_name.as_str()) {
                                 None => true, // No existing symbol, insert
                                 Some(existing) => {
                                     // Only override if existing is from base package
@@ -1490,10 +1492,11 @@ where
                             };
 
                             if should_insert {
+                                let name: Arc<str> = Arc::from(export_name);
                                 scope.symbols.insert(
-                                    export_name.clone(),
+                                    name.clone(),
                                     ScopedSymbol {
-                                        name: export_name,
+                                        name,
                                         kind: SymbolKind::Variable, // Package exports are treated as variables
                                         source_uri: package_uri.clone(),
                                         defined_line: 0,
@@ -1947,7 +1950,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
             // Look for identifier or dots child.
             for child in param_node.children(&mut param_node.walk()) {
                 if child.kind() == "identifier" {
-                    let name = node_text(child, content).to_string();
+                    let name: Arc<str> = Arc::from(node_text(child, content));
                     let start = child.start_position();
                     let line_text = content.lines().nth(start.row).unwrap_or("");
                     let column = byte_offset_to_utf16_column(line_text, start.column);
@@ -1967,7 +1970,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
                     let column = byte_offset_to_utf16_column(line_text, start.column);
 
                     return Some(ScopedSymbol {
-                        name: "...".to_string(),
+                        name: Arc::from("..."),
                         kind: SymbolKind::Parameter,
                         source_uri: uri.clone(),
                         defined_line: start.row as u32,
@@ -1980,7 +1983,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
         }
         "identifier" => {
             // Direct identifier (some grammars may use this directly under parameters)
-            let name = node_text(param_node, content).to_string();
+            let name: Arc<str> = Arc::from(node_text(param_node, content));
             let start = param_node.start_position();
             let line_text = content.lines().nth(start.row).unwrap_or("");
             let column = byte_offset_to_utf16_column(line_text, start.column);
@@ -2002,7 +2005,7 @@ fn extract_parameter_symbol(param_node: Node, content: &str, uri: &Url) -> Optio
             let column = byte_offset_to_utf16_column(line_text, start.column);
 
             return Some(ScopedSymbol {
-                name: "...".to_string(),
+                name: Arc::from("..."),
                 kind: SymbolKind::Parameter,
                 source_uri: uri.clone(),
                 defined_line: start.row as u32,
@@ -2060,11 +2063,10 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
 
     // Extract the string content (remove quotes)
     let name_text = node_text(name_node, content);
-    let name = name_text
-        .trim_matches(|c| c == '"' || c == '\'')
-        .to_string();
+    let name_str = name_text
+        .trim_matches(|c| c == '"' || c == '\'');
 
-    if name.is_empty() {
+    if name_str.is_empty() {
         return None;
     }
 
@@ -2074,7 +2076,7 @@ fn try_extract_assign_call(node: Node, content: &str, uri: &Url) -> Option<Scope
     let column = byte_offset_to_utf16_column(line_text, start.column);
 
     Some(ScopedSymbol {
-        name,
+        name: Arc::from(name_str),
         kind: SymbolKind::Variable,
         source_uri: uri.clone(),
         defined_line: start.row as u32,
@@ -2095,7 +2097,7 @@ fn try_extract_for_loop_iterator(node: Node, content: &str, uri: &Url) -> Option
         return None;
     }
 
-    let name = node_text(var_node, content).to_string();
+    let name: Arc<str> = Arc::from(node_text(var_node, content));
 
     // Get position with UTF-16 column
     let start = var_node.start_position();
@@ -2134,15 +2136,15 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
         if rhs.kind() != "identifier" {
             return None;
         }
-        let name = node_text(rhs, content).to_string();
+        let name_str = node_text(rhs, content);
 
         // Skip reserved words - they cannot be defined (Requirement 2.1, 2.2)
-        if crate::reserved_words::is_reserved_word(&name) {
+        if crate::reserved_words::is_reserved_word(name_str) {
             return None;
         }
 
         let (kind, signature) = if lhs.kind() == "function_definition" {
-            let sig = extract_function_signature(lhs, &name, content);
+            let sig = extract_function_signature(lhs, name_str, content);
             (SymbolKind::Function, Some(sig))
         } else {
             (SymbolKind::Variable, None)
@@ -2154,7 +2156,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
         let column = byte_offset_to_utf16_column(line_text, start.column);
 
         return Some(ScopedSymbol {
-            name,
+            name: Arc::from(name_str),
             kind,
             source_uri: uri.clone(),
             defined_line: start.row as u32,
@@ -2173,16 +2175,16 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
     if lhs.kind() != "identifier" {
         return None;
     }
-    let name = node_text(lhs, content).to_string();
+    let name_str = node_text(lhs, content);
 
     // Skip reserved words - they cannot be defined (Requirement 2.1, 2.2)
-    if crate::reserved_words::is_reserved_word(&name) {
+    if crate::reserved_words::is_reserved_word(name_str) {
         return None;
     }
 
     // Get the right-hand side to determine kind
     let (kind, signature) = if rhs.kind() == "function_definition" {
-        let sig = extract_function_signature(rhs, &name, content);
+        let sig = extract_function_signature(rhs, name_str, content);
         (SymbolKind::Function, Some(sig))
     } else {
         (SymbolKind::Variable, None)
@@ -2194,7 +2196,7 @@ fn try_extract_assignment(node: Node, content: &str, uri: &Url) -> Option<Scoped
     let column = byte_offset_to_utf16_column(line_text, start.column);
 
     Some(ScopedSymbol {
-        name,
+        name: Arc::from(name_str),
         kind,
         source_uri: uri.clone(),
         defined_line: start.row as u32,
@@ -2255,7 +2257,7 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
 /// assert_eq!(h1, h2);
 /// ```
 fn compute_interface_hash(
-    interface: &HashMap<String, ScopedSymbol>,
+    interface: &HashMap<Arc<str>, ScopedSymbol>,
     packages: &[String],
     declared_symbols: &[super::types::DeclaredSymbol],
 ) -> u64 {
@@ -2423,10 +2425,11 @@ where
         let base_uri =
             Url::parse("package:base").unwrap_or_else(|_| Url::parse("package:unknown").unwrap());
         for export_name in base_exports {
+            let name: Arc<str> = Arc::from(export_name.as_str());
             scope.symbols.insert(
-                export_name.clone(),
+                name.clone(),
                 ScopedSymbol {
-                    name: export_name.clone(),
+                    name,
                     kind: SymbolKind::Variable, // Base exports are treated as variables
                     source_uri: base_uri.clone(),
                     defined_line: 0,
@@ -3035,7 +3038,7 @@ mod tests {
         assert_eq!(artifacts.exported_interface.len(), 1);
         let symbol = artifacts.exported_interface.get("i").unwrap();
         assert_eq!(symbol.kind, SymbolKind::Variable);
-        assert_eq!(symbol.name, "i");
+        assert_eq!(&*symbol.name, "i");
         assert!(symbol.signature.is_none());
     }
 
@@ -3503,7 +3506,7 @@ mod tests {
             line: 0,
             column: u32::MAX, // End-of-line sentinel
             symbol: ScopedSymbol {
-                name: "declared_var".to_string(),
+                name: Arc::from("declared_var"),
                 kind: SymbolKind::Variable,
                 source_uri: parent_uri.clone(),
                 defined_line: 0,
@@ -3618,7 +3621,7 @@ mod tests {
             line: 0,
             column: u32::MAX,
             symbol: ScopedSymbol {
-                name: "before_var".to_string(),
+                name: Arc::from("before_var"),
                 kind: SymbolKind::Variable,
                 source_uri: parent_uri.clone(),
                 defined_line: 0,
@@ -3631,7 +3634,7 @@ mod tests {
             line: 2,
             column: u32::MAX,
             symbol: ScopedSymbol {
-                name: "after_var".to_string(),
+                name: Arc::from("after_var"),
                 kind: SymbolKind::Variable,
                 source_uri: parent_uri.clone(),
                 defined_line: 2,
@@ -4427,7 +4430,7 @@ mod tests {
 
         if let Some(ScopeEvent::FunctionScope { parameters, .. }) = function_scope_event {
             assert_eq!(parameters.len(), 2);
-            let param_names: Vec<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
+            let param_names: Vec<&str> = parameters.iter().map(|p| &*p.name).collect();
             assert!(param_names.contains(&"x"));
             assert!(param_names.contains(&"y"));
         }
@@ -4453,7 +4456,7 @@ mod tests {
 
         if let Some(ScopeEvent::FunctionScope { parameters, .. }) = function_scope_event {
             assert_eq!(parameters.len(), 2);
-            let param_names: Vec<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
+            let param_names: Vec<&str> = parameters.iter().map(|p| &*p.name).collect();
             assert!(param_names.contains(&"x"));
             assert!(param_names.contains(&"..."));
         }
@@ -4735,7 +4738,7 @@ mod tests {
                 line: 1,
                 column: 0,
                 symbol: ScopedSymbol {
-                    name: "x".to_string(),
+                    name: Arc::from("x"),
                     kind: SymbolKind::Variable,
                     source_uri: uri.clone(),
                     defined_line: 1,
@@ -4748,7 +4751,7 @@ mod tests {
                 line: 5,
                 column: 0,
                 symbol: ScopedSymbol {
-                    name: "y".to_string(),
+                    name: Arc::from("y"),
                     kind: SymbolKind::Variable,
                     source_uri: uri.clone(),
                     defined_line: 5,
@@ -4874,7 +4877,7 @@ mod tests {
                 line: 1,
                 column: 0,
                 symbol: ScopedSymbol {
-                    name: "x".to_string(),
+                    name: Arc::from("x"),
                     kind: SymbolKind::Variable,
                     source_uri: uri.clone(),
                     defined_line: 1,
@@ -4975,7 +4978,7 @@ mod tests {
                 line: 2,
                 column: 0,
                 symbol: ScopedSymbol {
-                    name: "y".to_string(),
+                    name: Arc::from("y"),
                     kind: SymbolKind::Variable,
                     source_uri: uri.clone(),
                     defined_line: 2,
@@ -5082,7 +5085,7 @@ mod tests {
         // Verify Def event for x on line 0
         assert_eq!(def_events.len(), 1, "Should have one Def event");
         assert_eq!(def_events[0].0, 0, "Def should be on line 0");
-        assert_eq!(def_events[0].1, "x", "Def should be for symbol 'x'");
+        assert_eq!(&*def_events[0].1, "x", "Def should be for symbol 'x'");
 
         // Verify Removal event for x on line 1
         assert_eq!(removal_events.len(), 1, "Should have one Removal event");
@@ -5155,7 +5158,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 ScopeEvent::Def { line, symbol, .. } => {
-                    Some(("Def", *line, vec![symbol.name.clone()]))
+                    Some(("Def", *line, vec![symbol.name.to_string()]))
                 }
                 ScopeEvent::Removal { line, symbols, .. } => {
                     Some(("Removal", *line, symbols.clone()))
@@ -7750,7 +7753,7 @@ mod tests {
             .timeline
             .iter()
             .filter_map(|e| match e {
-                ScopeEvent::Def { line, symbol, .. } => Some((*line, symbol.name.as_str())),
+                ScopeEvent::Def { line, symbol, .. } => Some((*line, &*symbol.name)),
                 ScopeEvent::PackageLoad { line, package, .. } => Some((*line, package.as_str())),
                 _ => None,
             })
@@ -9381,7 +9384,7 @@ y <- filter(df)"#;
                 // Check that no Def event in the timeline has the reserved word as its name
                 let has_reserved_def = artifacts.timeline.iter().any(|event| {
                     if let ScopeEvent::Def { symbol, .. } = event {
-                        symbol.name == reserved
+                        &*symbol.name == reserved
                     } else {
                         false
                     }
@@ -9425,7 +9428,7 @@ y <- filter(df)"#;
                 // Verify exclusion from timeline
                 let has_reserved_def = artifacts.timeline.iter().any(|event| {
                     if let ScopeEvent::Def { symbol, .. } = event {
-                        symbol.name == reserved
+                        &*symbol.name == reserved
                     } else {
                         false
                     }
@@ -9456,7 +9459,7 @@ y <- filter(df)"#;
 
                 // Non-reserved identifier SHOULD be in exported interface
                 prop_assert!(
-                    artifacts.exported_interface.contains_key(&ident),
+                    artifacts.exported_interface.contains_key(ident.as_str()),
                     "Non-reserved identifier '{}' SHOULD be in exported_interface for code: {}",
                     ident,
                     code
@@ -9489,7 +9492,7 @@ y <- filter(df)"#;
 
                 // Valid identifier SHOULD be in exported interface
                 prop_assert!(
-                    artifacts.exported_interface.contains_key(&valid_ident),
+                    artifacts.exported_interface.contains_key(valid_ident.as_str()),
                     "Valid identifier '{}' SHOULD be in exported_interface",
                     valid_ident
                 );
