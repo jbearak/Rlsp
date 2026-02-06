@@ -1485,9 +1485,9 @@ where
                             let should_insert = match scope.symbols.get(export_name.as_str()) {
                                 None => true, // No existing symbol, insert
                                 Some(existing) => {
-                                    // Only override if existing is from base package
+                                    // Override if existing is from any package (later library() masks earlier)
                                     // Local definitions (non-package URIs) take precedence
-                                    existing.source_uri.as_str() == "package:base"
+                                    existing.source_uri.as_str().starts_with("package:")
                                 }
                             };
 

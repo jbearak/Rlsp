@@ -12,6 +12,11 @@ use tower_lsp::lsp_types::Url;
 
 use super::types::CrossFileMetadata;
 
+/// Convert a `usize` to `NonZeroUsize`, falling back to `default` if zero.
+pub(crate) fn non_zero_or(value: usize, default: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).unwrap_or(NonZeroUsize::new(default).unwrap())
+}
+
 /// Default capacity for the metadata cache
 const DEFAULT_METADATA_CACHE_CAPACITY: usize = 1000;
 
@@ -42,8 +47,7 @@ impl MetadataCache {
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        let cap = NonZeroUsize::new(cap)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_METADATA_CACHE_CAPACITY).unwrap());
+        let cap = non_zero_or(cap, DEFAULT_METADATA_CACHE_CAPACITY);
         Self {
             inner: RwLock::new(LruCache::new(cap)),
         }
@@ -93,8 +97,7 @@ impl MetadataCache {
 
     /// Resize the cache capacity. If shrinking, LRU entries are evicted.
     pub fn resize(&self, cap: usize) {
-        let cap = NonZeroUsize::new(cap)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_METADATA_CACHE_CAPACITY).unwrap());
+        let cap = non_zero_or(cap, DEFAULT_METADATA_CACHE_CAPACITY);
         if let Ok(mut guard) = self.inner.write() {
             guard.resize(cap);
         }

@@ -6,13 +6,14 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::SystemTime;
 
 use lru::LruCache;
 use tower_lsp::lsp_types::Url;
+
+use super::cache::non_zero_or;
 
 /// Snapshot metadata for a closed file, used to determine cache validity
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -94,10 +95,8 @@ impl CrossFileFileCache {
     }
 
     pub fn with_capacities(content_cap: usize, existence_cap: usize) -> Self {
-        let content_cap = NonZeroUsize::new(content_cap)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_FILE_CACHE_CAPACITY).unwrap());
-        let existence_cap = NonZeroUsize::new(existence_cap)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_EXISTENCE_CACHE_CAPACITY).unwrap());
+        let content_cap = non_zero_or(content_cap, DEFAULT_FILE_CACHE_CAPACITY);
+        let existence_cap = non_zero_or(existence_cap, DEFAULT_EXISTENCE_CACHE_CAPACITY);
         Self {
             inner: RwLock::new(LruCache::new(content_cap)),
             existence: RwLock::new(LruCache::new(existence_cap)),
@@ -170,10 +169,8 @@ impl CrossFileFileCache {
 
     /// Resize both caches. If shrinking, LRU entries are evicted.
     pub fn resize(&self, content_cap: usize, existence_cap: usize) {
-        let content_cap = NonZeroUsize::new(content_cap)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_FILE_CACHE_CAPACITY).unwrap());
-        let existence_cap = NonZeroUsize::new(existence_cap)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_EXISTENCE_CACHE_CAPACITY).unwrap());
+        let content_cap = non_zero_or(content_cap, DEFAULT_FILE_CACHE_CAPACITY);
+        let existence_cap = non_zero_or(existence_cap, DEFAULT_EXISTENCE_CACHE_CAPACITY);
         if let Ok(mut guard) = self.inner.write() {
             guard.resize(content_cap);
         }

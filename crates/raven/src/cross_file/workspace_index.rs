@@ -5,13 +5,13 @@
 //
 
 use std::collections::HashSet;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use lru::LruCache;
 use tower_lsp::lsp_types::Url;
 
+use super::cache::non_zero_or;
 use super::file_cache::FileSnapshot;
 use super::scope::ScopeArtifacts;
 use super::types::CrossFileMetadata;
@@ -62,8 +62,7 @@ impl CrossFileWorkspaceIndex {
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        let cap = NonZeroUsize::new(cap)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_WORKSPACE_INDEX_CAPACITY).unwrap());
+        let cap = non_zero_or(cap, DEFAULT_WORKSPACE_INDEX_CAPACITY);
         Self {
             inner: RwLock::new(LruCache::new(cap)),
             version: AtomicU64::new(0),
@@ -180,8 +179,7 @@ impl CrossFileWorkspaceIndex {
 
     /// Resize the cache capacity. If shrinking, LRU entries are evicted.
     pub fn resize(&self, cap: usize) {
-        let cap = NonZeroUsize::new(cap)
-            .unwrap_or(NonZeroUsize::new(DEFAULT_WORKSPACE_INDEX_CAPACITY).unwrap());
+        let cap = non_zero_or(cap, DEFAULT_WORKSPACE_INDEX_CAPACITY);
         if let Ok(mut guard) = self.inner.write() {
             guard.resize(cap);
         }

@@ -8,7 +8,6 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -150,8 +149,7 @@ impl WorkspaceIndex {
     /// # Returns
     /// A new WorkspaceIndex instance
     pub fn new(config: WorkspaceIndexConfig) -> Self {
-        let cap = NonZeroUsize::new(config.max_files)
-            .unwrap_or(NonZeroUsize::new(1000).unwrap());
+        let cap = crate::cross_file::cache::non_zero_or(config.max_files, 1000);
         Self {
             inner: RwLock::new(LruCache::new(cap)),
             version: AtomicU64::new(0),

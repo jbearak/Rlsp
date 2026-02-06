@@ -10770,10 +10770,11 @@ proptest! {
     /// Feature: package-function-awareness, Property 11 extended: Same export from multiple packages
     /// **Validates: Requirements 8.1, 8.2**
     ///
-    /// When multiple packages export the same symbol, the first loaded package's
-    /// export should be used (but either way, diagnostics are suppressed).
+    /// When multiple packages export the same symbol, the last loaded package's
+    /// export should mask earlier ones (matching R's search path behavior where
+    /// later library() calls attach higher on the search path).
     #[test]
-    fn prop_package_export_first_loaded_wins(
+    fn prop_package_export_last_loaded_wins(
         pkg1 in pkg_name(),
         pkg2 in pkg_name(),
         export_name in r_identifier(),
@@ -10781,7 +10782,7 @@ proptest! {
         // Ensure packages are distinct
         prop_assume!(pkg1 != pkg2);
 
-        let uri = make_url("test_first_pkg_wins");
+        let uri = make_url("test_last_pkg_wins");
 
         // Code with two library calls, both packages export same symbol
         let code = format!(
@@ -10818,14 +10819,14 @@ proptest! {
             export_name, code
         );
 
-        // The symbol should be from pkg1 (first loaded) since pkg2's export
-        // doesn't override non-base exports
+        // The symbol should be from pkg2 (last loaded) since later library()
+        // calls mask earlier ones, matching R's search path behavior
         let symbol = scope.symbols.get(export_name.as_str()).unwrap();
-        let expected_uri = format!("package:{}", pkg1);
+        let expected_uri = format!("package:{}", pkg2);
         prop_assert_eq!(
             symbol.source_uri.as_str(), expected_uri.as_str(),
-            "Export '{}' should be from first loaded package '{}', got '{}'. Code:\n{}",
-            export_name, pkg1, symbol.source_uri.as_str(), code
+            "Export '{}' should be from last loaded package '{}', got '{}'. Code:\n{}",
+            export_name, pkg2, symbol.source_uri.as_str(), code
         );
     }
 }
@@ -11842,8 +11843,8 @@ proptest! {
     /// Feature: package-function-awareness, Property 14 extended: Duplicate exports
     /// **Validates: Requirements 9.2, 9.3**
     ///
-    /// When multiple packages export the same symbol, the first loaded package's
-    /// export should be used (but both would be shown in completions with attribution).
+    /// When multiple packages export the same symbol, the last loaded package's
+    /// export should mask earlier ones (matching R's search path behavior).
     /// This test verifies the scope resolution behavior for duplicate exports.
     #[test]
     fn prop_package_completion_duplicate_exports(
@@ -11891,14 +11892,14 @@ proptest! {
             shared_export, code
         );
 
-        // The first loaded package (pkg1) should win for the symbol attribution
-        // This is because scope_at_position_with_packages processes PackageLoad events
-        // in order and only overrides base package exports, not other package exports
+        // The last loaded package (pkg2) should win for the symbol attribution
+        // This matches R's search path behavior where later library() calls
+        // attach higher on the search path and mask earlier packages
         let symbol = scope.symbols.get(shared_export.as_str()).unwrap();
-        let expected_uri = format!("package:{}", pkg1);
+        let expected_uri = format!("package:{}", pkg2);
         prop_assert_eq!(
             symbol.source_uri.as_str(), expected_uri.as_str(),
-            "Shared export '{}' should have URI '{}' (first loaded package), got '{}'. Code:\n{}",
+            "Shared export '{}' should have URI '{}' (last loaded package), got '{}'. Code:\n{}",
             shared_export, expected_uri, symbol.source_uri.as_str(), code
         );
     }
