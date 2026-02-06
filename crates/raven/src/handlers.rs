@@ -2216,67 +2216,68 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
 
     // 4. Legacy documents (AST fallback)
     if symbols.len() < max_results {
-        for (uri, doc) in &state.documents {
-            if symbols.len() >= max_results {
-                break;
-            }
-            if seen_uris.contains(uri) {
-                continue;
-            }
-            seen_uris.insert(uri.clone());
-            if let Some(tree) = &doc.tree {
-                let text = doc.text();
-                let mut file_symbols = Vec::new();
-                collect_symbols(tree.root_node(), &text, &mut file_symbols);
-                let container_name = extract_container_name(uri);
-                for mut sym in file_symbols {
-                    // Filter reserved words (Requirement 7.2)
-                    if is_reserved_word(&sym.name) {
-                        continue;
-                    }
-                    if sym.name.to_lowercase().contains(&lower_query) {
-                        sym.location.uri = uri.clone();
-                        sym.container_name = container_name.clone();
-                        symbols.push(sym);
-                    }
-                }
-            }
-        }
+        collect_legacy_ast_symbols(
+            &state.documents,
+            &lower_query,
+            max_results,
+            &mut seen_uris,
+            &mut symbols,
+        );
     }
 
     // 5. Legacy workspace index (AST fallback)
     if symbols.len() < max_results {
-        for (uri, doc) in &state.workspace_index {
-            if symbols.len() >= max_results {
-                break;
-            }
-            if seen_uris.contains(uri) {
-                continue;
-            }
-            seen_uris.insert(uri.clone());
-            if let Some(tree) = &doc.tree {
-                let text = doc.text();
-                let mut file_symbols = Vec::new();
-                collect_symbols(tree.root_node(), &text, &mut file_symbols);
-                let container_name = extract_container_name(uri);
-                for mut sym in file_symbols {
-                    // Filter reserved words (Requirement 7.2)
-                    if is_reserved_word(&sym.name) {
-                        continue;
-                    }
-                    if sym.name.to_lowercase().contains(&lower_query) {
-                        sym.location.uri = uri.clone();
-                        sym.container_name = container_name.clone();
-                        symbols.push(sym);
-                    }
-                }
-            }
-        }
+        collect_legacy_ast_symbols(
+            &state.workspace_index,
+            &lower_query,
+            max_results,
+            &mut seen_uris,
+            &mut symbols,
+        );
     }
 
     // Apply configurable limit as final guard (Requirement 9.2, 11.2)
     symbols.truncate(max_results);
     Some(symbols)
+}
+
+/// Collect matching workspace symbols from a legacy `HashMap<Url, Document>` (AST fallback).
+///
+/// Iterates the map, skips URIs already in `seen_uris`, and collects symbols whose names
+/// (case-insensitively) contain `lower_query`, stopping once `max_results` is reached.
+fn collect_legacy_ast_symbols(
+    docs: &std::collections::HashMap<Url, crate::state::Document>,
+    lower_query: &str,
+    max_results: usize,
+    seen_uris: &mut std::collections::HashSet<Url>,
+    symbols: &mut Vec<SymbolInformation>,
+) {
+    for (uri, doc) in docs {
+        if symbols.len() >= max_results {
+            break;
+        }
+        if seen_uris.contains(uri) {
+            continue;
+        }
+        seen_uris.insert(uri.clone());
+        if let Some(tree) = &doc.tree {
+            let text = doc.text();
+            let mut file_symbols = Vec::new();
+            collect_symbols(tree.root_node(), &text, &mut file_symbols);
+            let container_name = extract_container_name(uri);
+            for mut sym in file_symbols {
+                // Filter reserved words (Requirement 7.2)
+                if is_reserved_word(&sym.name) {
+                    continue;
+                }
+                if sym.name.to_lowercase().contains(lower_query) {
+                    sym.location.uri = uri.clone();
+                    sym.container_name = container_name.clone();
+                    symbols.push(sym);
+                }
+            }
+        }
+    }
 }
 
 /// Collect matching symbols from precomputed `ScopeArtifacts` and append them to `symbols`.
@@ -3980,6 +3981,13 @@ pub(crate) fn collect_undefined_variables_position_aware(
     // identifiers. This avoids calling get_cross_file_scope() N times per file
     // where N is the number of identifiers — instead we call it at most once per
     // unique line that has an identifier needing a scope check.
+    //
+    // Note: Keying by line alone means two identifiers at different columns on
+    // the same line reuse the first identifier's column for function-scope
+    // filtering. In theory this is incorrect when multiple function bodies
+    // start/end on one line, but in practice R code is one-statement-per-line
+    // and the performance benefit (avoiding per-identifier scope resolution)
+    // outweighs the risk of this edge case.
     let mut scope_cache: std::collections::HashMap<u32, crate::cross_file::scope::ScopeAtPosition> =
         std::collections::HashMap::new();
 

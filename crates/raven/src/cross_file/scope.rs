@@ -1472,6 +1472,18 @@ where
                     };
 
                     if should_include {
+                        // Validate package name before URI construction to avoid
+                        // malformed URIs or collisions at "package:unknown".
+                        // Note: dots (including "..") are valid in R package names
+                        // (e.g., data.table) and safe in package: URIs.
+                        if package.is_empty()
+                            || package.contains('/')
+                            || package.contains('\\')
+                            || package.contains(char::is_whitespace)
+                        {
+                            continue;
+                        }
+
                         // Get package exports and add them to scope
                         let exports = get_package_exports(package);
 

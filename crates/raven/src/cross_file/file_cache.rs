@@ -157,7 +157,11 @@ impl CrossFileFileCache {
         }
     }
 
-    /// Read file from disk and cache it (synchronous, for use outside lock)
+    /// Read file from disk and cache it (synchronous, for use outside lock).
+    ///
+    /// **Warning**: This performs blocking filesystem I/O. Callers on LSP
+    /// request threads should use `spawn_blocking` or an equivalent async
+    /// wrapper to avoid blocking the event loop.
     pub fn read_and_cache(&self, uri: &Url) -> Option<String> {
         let path = uri.to_file_path().ok()?;
         let content = std::fs::read_to_string(&path).ok()?;
