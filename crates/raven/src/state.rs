@@ -104,9 +104,8 @@ use tree_sitter::Tree;
 use crate::content_provider::DefaultContentProvider;
 use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
 use crate::cross_file::{
-    ArtifactsCache, CrossFileActivityState, CrossFileConfig, CrossFileFileCache,
-    CrossFileRevalidationState, CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
-    ParentSelectionCache,
+    CrossFileActivityState, CrossFileConfig, CrossFileFileCache, CrossFileRevalidationState,
+    CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
 };
 use crate::document_store::DocumentStore;
 use crate::package_library::PackageLibrary;
@@ -509,12 +508,9 @@ pub struct WorldState {
     pub symbol_config: SymbolConfig,
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
-    pub cross_file_cache: ArtifactsCache,
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
-    #[allow(dead_code)]
-    pub cross_file_parent_cache: ParentSelectionCache,
     pub package_library_ready: bool,
 }
 
@@ -601,11 +597,9 @@ impl WorldState {
             symbol_config: SymbolConfig::default(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
-            cross_file_cache: ArtifactsCache::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
-            cross_file_parent_cache: ParentSelectionCache::new(),
             package_library_ready: false,
         }
     }

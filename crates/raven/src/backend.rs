@@ -1952,9 +1952,6 @@ impl LanguageServer for Backend {
         // Remove from activity tracking
         state.cross_file_activity.remove(uri);
 
-        // Invalidate parent selection cache for this file (stale after close)
-        state.cross_file_parent_cache.invalidate(uri);
-
         // Close the document (legacy)
         state.close_document(uri);
     }
@@ -2063,10 +2060,6 @@ impl LanguageServer for Backend {
                     state.symbol_config.hierarchical_document_symbol_support;
                 state.symbol_config = config;
             }
-
-            // Invalidate all scope caches since config affects resolution
-            state.cross_file_cache.invalidate_all();
-            state.cross_file_parent_cache.invalidate_all();
 
             // Mark all open documents for force republish
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
@@ -2221,7 +2214,6 @@ impl LanguageServer for Backend {
                         state.cross_file_graph.remove_file(uri);
                         state.cross_file_file_cache.invalidate(uri);
                         state.cross_file_workspace_index.invalidate(uri);
-                        state.cross_file_cache.invalidate(uri);
                         state.cross_file_meta.remove(uri);
                         log::trace!("Removed deleted file from cross-file state: {}", uri);
                     }
