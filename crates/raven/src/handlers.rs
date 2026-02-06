@@ -1400,10 +1400,10 @@ impl HierarchyBuilder {
         // This section contains the symbol
         // Check if any child section also contains it (for nested sections)
         for child in section.children.iter_mut() {
-            if child.section_level.is_some() {
-                if Self::try_insert_into_section(child, symbol.clone(), symbol_line) {
-                    return true;
-                }
+            if child.section_level.is_some()
+                && Self::try_insert_into_section(child, symbol.clone(), symbol_line)
+            {
+                return true;
             }
         }
 
@@ -2112,7 +2112,7 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 /// ```
 fn extract_container_name(uri: &Url) -> Option<String> {
     uri.path_segments()?
-        .last()
+        .next_back()
         .map(|filename| {
             // Remove extension if present
             if let Some(dot_pos) = filename.rfind('.') {
@@ -2280,51 +2280,28 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
 }
 
 /// Collect matching symbols from precomputed `ScopeArtifacts` and append them to `symbols`.
-
 ///
-
 /// This filters exported symbols by whether their name (case-insensitively) contains `lower_query`,
-
 /// skips declared (virtual) symbols such as `@lsp-var`/`@lsp-func`, and maps internal symbol kinds
-
 /// to LSP `SymbolKind` values. Each matched symbol is appended as a `SymbolInformation` with the
-
 /// provided `file_uri` and the symbol's definition position.
-
 ///
-
 /// - `file_uri`: URI to assign to each returned `SymbolInformation`.
-
 /// - `artifacts`: Precomputed `ScopeArtifacts` containing `exported_interface`.
-
 /// - `lower_query`: a lowercased query string used for substring matching against symbol names.
-
 /// - `symbols`: output vector to which matching `SymbolInformation` entries will be appended.
-
 ///
-
 /// # Examples
-
 ///
-
 /// ```no_run
-
 /// # use lsp_types::{Location, Range, Position, SymbolInformation, SymbolKind};
-
 /// # use url::Url;
-
 /// # // Assume `artifacts` is a prepared ScopeArtifacts instance and `symbols` is an empty Vec.
-
 /// # let file_uri = Url::parse("file:///path/to/file.R").unwrap();
-
 /// # let lower_query = "foo";
-
 /// # let mut symbols: Vec<SymbolInformation> = Vec::new();
-
 /// # // collect_workspace_symbols_from_artifacts(&file_uri, &artifacts, lower_query, &mut symbols);
-
 /// // After calling, `symbols` will contain any exported symbols whose names contain "foo".
-
 /// ```
 #[allow(deprecated)] // SymbolInformation::deprecated is deprecated in favor of tags
 fn collect_workspace_symbols_from_artifacts(
@@ -5316,18 +5293,13 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             // Try to get full help documentation from R
             let name_owned = name.to_string();
             let pkg_owned = pkg_name.to_string();
-            if let Ok(help_result) = tokio::task::spawn_blocking(move || {
+            if let Ok(Some(help_text)) = tokio::task::spawn_blocking(move || {
                 crate::help::get_help(&name_owned, Some(&pkg_owned))
             })
             .await
             {
-                if let Some(help_text) = help_result {
-                    // Show full R documentation
-                    value.push_str(&format!("```\n{}\n```", help_text));
-                } else {
-                    value.push_str(&format!("```r\n{}\n```\n", name));
-                    value.push_str(&format!("\nfrom {{{}}}", pkg_name));
-                }
+                // Show full R documentation
+                value.push_str(&format!("```\n{}\n```", help_text));
             } else {
                 value.push_str(&format!("```r\n{}\n```\n", name));
                 value.push_str(&format!("\nfrom {{{}}}", pkg_name));
@@ -5361,23 +5333,21 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 
     // Try to get help from R subprocess
     let name_owned = name.to_string();
-    if let Ok(help_text) =
+    if let Ok(Some(help_text)) =
         tokio::task::spawn_blocking(move || crate::help::get_help(&name_owned, None)).await
     {
-        if let Some(help_text) = help_text {
-            // Cache successful result
-            state
-                .help_cache
-                .insert(name.to_string(), Some(help_text.clone()));
+        // Cache successful result
+        state
+            .help_cache
+            .insert(name.to_string(), Some(help_text.clone()));
 
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("```\n{}\n```", help_text),
-                }),
-                range: Some(node_range),
-            });
-        }
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```\n{}\n```", help_text),
+            }),
+            range: Some(node_range),
+        });
     }
 
     // Cache negative result to avoid repeated failed lookups

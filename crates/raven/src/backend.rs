@@ -797,7 +797,7 @@ impl LanguageServer for Backend {
         let init_duration = init_start.elapsed();
         if crate::perf::is_enabled() {
             log::info!("[PERF] Total initialization: {:?}", init_duration);
-            crate::perf::startup_metrics().lock().ok().map(|m| m.log_summary());
+            if let Ok(m) = crate::perf::startup_metrics().lock() { m.log_summary() }
         }
         log::info!(
             "Initialization complete (workspace scan running in background)"
