@@ -267,7 +267,24 @@ impl RSubprocess {
     /// let out = rt.block_on(r.execute_r_code(r#"cat("ok")"#)).unwrap();
     /// assert_eq!(out.trim(), "ok");
     /// ```
+    /// Default timeout for R subprocess calls (30 seconds).
+    const SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     pub async fn execute_r_code(&self, r_code: &str) -> Result<String> {
+        self.execute_r_code_with_timeout(r_code, Self::SUBPROCESS_TIMEOUT)
+            .await
+    }
+
+    /// Execute R code with a configurable timeout.
+    ///
+    /// Returns an error if the subprocess does not complete within the given
+    /// duration. This prevents hung R processes from blocking the LSP
+    /// indefinitely (e.g. during initialization or package queries).
+    pub async fn execute_r_code_with_timeout(
+        &self,
+        r_code: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String> {
         let start = std::time::Instant::now();
         crate::perf::increment_r_subprocess_calls();
 
@@ -278,10 +295,17 @@ impl RSubprocess {
             cmd.current_dir(wd);
         }
 
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| anyhow!("Failed to execute R subprocess: {}", e))?;
+        let output = match tokio::time::timeout(timeout, cmd.output()).await {
+            Ok(result) => {
+                result.map_err(|e| anyhow!("Failed to execute R subprocess: {}", e))?
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "R subprocess timed out after {:?}",
+                    timeout
+                ));
+            }
+        };
 
         let elapsed = start.elapsed();
         if crate::perf::is_enabled() {

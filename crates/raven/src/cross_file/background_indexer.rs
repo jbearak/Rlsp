@@ -37,6 +37,8 @@ pub struct IndexTask {
 pub struct BackgroundIndexer {
     state: Arc<RwLock<WorldState>>,
     queue: Arc<Mutex<VecDeque<IndexTask>>>,
+    /// Set of URIs currently in the queue, for O(1) duplicate detection.
+    pending: Arc<Mutex<HashSet<Url>>>,
     worker_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     cancellation_token: CancellationToken,
     canceled: Arc<Mutex<HashSet<Url>>>,
@@ -46,25 +48,28 @@ impl BackgroundIndexer {
     /// Creates new indexer and starts worker
     pub fn new(state: Arc<RwLock<WorldState>>) -> Self {
         let canceled = Arc::new(Mutex::new(HashSet::new()));
+        let pending = Arc::new(Mutex::new(HashSet::new()));
         let indexer = Self {
             state,
             queue: Arc::new(Mutex::new(VecDeque::new())),
+            pending: pending.clone(),
             worker_handle: Arc::new(Mutex::new(None)),
             cancellation_token: CancellationToken::new(),
             canceled: canceled.clone(),
         };
-        indexer.start_worker(canceled);
+        indexer.start_worker(canceled, pending);
         indexer
     }
 
     /// Cancels pending indexing for a URI
     pub fn cancel_uri(&self, uri: &Url) {
-        // Remove from queue
+        // Remove from queue and pending set
         {
             let mut queue = self.queue.lock().unwrap();
             let before = queue.len();
             queue.retain(|task| task.uri != *uri);
             if queue.len() < before {
+                self.pending.lock().unwrap().remove(uri);
                 log::trace!("Removed queued indexing task for canceled URI: {}", uri);
             }
         }
@@ -83,6 +88,12 @@ impl BackgroundIndexer {
         {
             let mut queue = self.queue.lock().unwrap();
             queue.retain(|task| !uri_set.contains(&task.uri));
+        }
+        {
+            let mut pending = self.pending.lock().unwrap();
+            for uri in &uris {
+                pending.remove(uri);
+            }
         }
         let mut canceled = self.canceled.lock().unwrap();
         for uri in &uris {
@@ -112,13 +123,16 @@ impl BackgroundIndexer {
             return;
         }
 
-        let mut queue = self.queue.lock().unwrap();
-
-        // Check if already queued
-        if queue.iter().any(|task| task.uri == uri) {
-            log::trace!("Skipping indexing task for {} - already queued", uri);
-            return;
+        // O(1) duplicate check via pending set
+        {
+            let pending = self.pending.lock().unwrap();
+            if pending.contains(&uri) {
+                log::trace!("Skipping indexing task for {} - already queued", uri);
+                return;
+            }
         }
+
+        let mut queue = self.queue.lock().unwrap();
 
         // Check queue size limit (use blocking try_read to avoid deadlock)
         let max_size = self
@@ -144,18 +158,23 @@ impl BackgroundIndexer {
         };
 
         // Simple FIFO ordering
-        queue.push_back(task);
+        queue.push_back(task.clone());
+        self.pending.lock().unwrap().insert(uri);
 
         log::trace!(
             "Submitted indexing task for {} (depth={}, queue_size={})",
-            uri,
+            task.uri,
             depth,
             queue.len()
         );
     }
 
     /// Starts background worker
-    fn start_worker(&self, canceled: Arc<Mutex<HashSet<Url>>>) {
+    fn start_worker(
+        &self,
+        canceled: Arc<Mutex<HashSet<Url>>>,
+        pending: Arc<Mutex<HashSet<Url>>>,
+    ) {
         let state = self.state.clone();
         let queue = self.queue.clone();
         let token = self.cancellation_token.clone();
@@ -172,11 +191,16 @@ impl BackgroundIndexer {
                     _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                         let task_opt = {
                             let mut q = queue.lock().unwrap();
-                            q.pop_front()
+                            let task = q.pop_front();
+                            // Remove from pending set when dequeued
+                            if let Some(ref t) = task {
+                                pending.lock().unwrap().remove(&t.uri);
+                            }
+                            task
                         };
 
                         if let Some(task) = task_opt {
-                            Self::process_task(state.clone(), queue.clone(), canceled.clone(), task).await;
+                            Self::process_task(state.clone(), queue.clone(), pending.clone(), canceled.clone(), task).await;
                         }
                     }
                 }
@@ -190,6 +214,7 @@ impl BackgroundIndexer {
     async fn process_task(
         state: Arc<RwLock<WorldState>>,
         queue: Arc<Mutex<VecDeque<IndexTask>>>,
+        pending: Arc<Mutex<HashSet<Url>>>,
         canceled: Arc<Mutex<HashSet<Url>>>,
         task: IndexTask,
     ) {
@@ -239,7 +264,7 @@ impl BackgroundIndexer {
 
                 // Queue transitive dependencies for both Priority 2 and Priority 3 tasks
                 // (as long as depth limit allows)
-                Self::queue_transitive_deps(state, queue, &task.uri, &metadata, task.depth).await;
+                Self::queue_transitive_deps(state, queue, pending, &task.uri, &metadata, task.depth).await;
             }
             Err(e) => {
                 log::warn!("Failed to index {}: {}", task.uri, e);
@@ -350,6 +375,7 @@ impl BackgroundIndexer {
     async fn queue_transitive_deps(
         state: Arc<RwLock<WorldState>>,
         queue: Arc<Mutex<VecDeque<IndexTask>>>,
+        pending: Arc<Mutex<HashSet<Url>>>,
         uri: &Url,
         metadata: &CrossFileMetadata,
         current_depth: usize,
@@ -388,6 +414,13 @@ impl BackgroundIndexer {
                         };
 
                         if needs_indexing {
+                            // O(1) duplicate check via pending set
+                            let already_pending =
+                                pending.lock().unwrap().contains(&source_uri);
+                            if already_pending {
+                                continue;
+                            }
+
                             let mut q = queue.lock().unwrap();
 
                             // Check queue size limit
@@ -401,20 +434,19 @@ impl BackgroundIndexer {
                                 continue;
                             }
 
-                            if !q.iter().any(|t| t.uri == source_uri) {
-                                // Use saturating_add to prevent integer overflow at max depth
-                                let next_depth = current_depth.saturating_add(1);
-                                q.push_back(IndexTask {
-                                    uri: source_uri.clone(),
-                                    depth: next_depth,
-                                    submitted_at: Instant::now(),
-                                });
-                                log::trace!(
-                                    "Queued transitive dependency: {} (depth {})",
-                                    source_uri,
-                                    next_depth
-                                );
-                            }
+                            // Use saturating_add to prevent integer overflow at max depth
+                            let next_depth = current_depth.saturating_add(1);
+                            q.push_back(IndexTask {
+                                uri: source_uri.clone(),
+                                depth: next_depth,
+                                submitted_at: Instant::now(),
+                            });
+                            pending.lock().unwrap().insert(source_uri.clone());
+                            log::trace!(
+                                "Queued transitive dependency: {} (depth {})",
+                                source_uri,
+                                next_depth
+                            );
                         }
                     }
                 }

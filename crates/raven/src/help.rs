@@ -3,19 +3,29 @@
 // This module calls R as a subprocess to get help documentation.
 // It's "static" in that it doesn't embed R, but can still access help.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 
-/// Cache for help content
+/// Maximum number of entries in the help cache. When this limit is reached,
+/// the oldest entries are evicted to make room for new ones.
+const HELP_CACHE_MAX_ENTRIES: usize = 512;
+
+/// Bounded cache for help content. Uses insertion-order eviction (FIFO) to
+/// prevent unbounded memory growth in long-running LSP sessions.
 pub struct HelpCache {
     cache: Arc<RwLock<HashMap<String, Option<String>>>>,
+    /// Insertion order for FIFO eviction
+    order: Arc<RwLock<VecDeque<String>>>,
+    max_entries: usize,
 }
 
 impl HelpCache {
     pub fn new() -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
+            order: Arc::new(RwLock::new(VecDeque::new())),
+            max_entries: HELP_CACHE_MAX_ENTRIES,
         }
     }
 
@@ -25,8 +35,32 @@ impl HelpCache {
 
     pub fn insert(&self, topic: String, content: Option<String>) {
         if let Ok(mut cache) = self.cache.write() {
+            // If key already present, just update the value (no reorder needed
+            // for a simple bounded cache)
+            if cache.contains_key(&topic) {
+                cache.insert(topic, content);
+                return;
+            }
+
+            // Evict oldest entries if at capacity
+            if let Ok(mut order) = self.order.write() {
+                while cache.len() >= self.max_entries {
+                    if let Some(oldest) = order.pop_front() {
+                        cache.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+                order.push_back(topic.clone());
+            }
+
             cache.insert(topic, content);
         }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.cache.read().map(|c| c.len()).unwrap_or(0)
     }
 }
 
@@ -322,5 +356,42 @@ Arguments:
         // Should return the S3 method signature since there's no generic
         let sig = extract_signature_from_help(help_text);
         assert_eq!(sig, Some("bar(x, y = 1)".to_string()));
+    }
+
+    #[test]
+    fn test_help_cache_bounded() {
+        let cache = HelpCache {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            order: Arc::new(RwLock::new(VecDeque::new())),
+            max_entries: 3,
+        };
+
+        cache.insert("a".to_string(), Some("help_a".to_string()));
+        cache.insert("b".to_string(), Some("help_b".to_string()));
+        cache.insert("c".to_string(), Some("help_c".to_string()));
+        assert_eq!(cache.len(), 3);
+
+        // Inserting a 4th entry should evict the oldest ("a")
+        cache.insert("d".to_string(), Some("help_d".to_string()));
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get("a").is_none());
+        assert!(cache.get("d").is_some());
+    }
+
+    #[test]
+    fn test_help_cache_update_existing() {
+        let cache = HelpCache {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            order: Arc::new(RwLock::new(VecDeque::new())),
+            max_entries: 3,
+        };
+
+        cache.insert("a".to_string(), None);
+        assert_eq!(cache.get("a"), Some(None));
+
+        // Updating same key should not grow the cache
+        cache.insert("a".to_string(), Some("updated".to_string()));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get("a"), Some(Some("updated".to_string())));
     }
 }

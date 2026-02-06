@@ -155,6 +155,8 @@ Key methods for querying R (used selectively):
 
 All methods validate package names to prevent R code injection.
 
+**Timeout**: All R subprocess calls are wrapped with a 30-second `tokio::time::timeout()` via `execute_r_code()` → `execute_r_code_with_timeout()`. This prevents hung R processes from blocking the LSP indefinitely. The timeout is configurable per-call via `execute_r_code_with_timeout()`.
+
 ### Project Environment Support (`renv`)
 Raven supports project-local package libraries (like `renv`):
 - **Working Directory**: The R subprocess is spawned with the workspace root as its working directory.
@@ -471,6 +473,14 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - INDEX files provide ~95% accuracy for packages using `exportPattern()` when R subprocess is unavailable - they list documented exports.
 - Tiered loading (static → R → INDEX fallback) provides both speed and accuracy: sub-5ms for 94% of packages, accurate exports for all.
 - When parsing structured R output (markers like `__PKG:name__`), handle missing end markers gracefully to avoid losing partial results.
+- Always wrap R subprocess calls with `tokio::time::timeout()` to prevent hung R processes from blocking the LSP indefinitely.
+- When iterating over identifiers in a file for diagnostics, cache scope resolution results by line number — the cross-file scope is identical for all identifiers on the same line, so calling `get_cross_file_scope()` per-identifier is wasteful.
+- Pre-compute a line-offset index (`Vec<usize>` of line start positions) to avoid repeated `text.lines().nth(row)` calls, which are O(n) each time.
+- Use `HashSet` for membership checks in hot loops (package deduplication, workspace imports); `Vec::contains()` is O(n) and adds up quickly in completion/diagnostic paths.
+- For background work queues, maintain a companion `HashSet` of pending URIs alongside the `VecDeque` to enable O(1) duplicate detection instead of O(n) `iter().any()` scans.
+- Unbounded caches (`HashMap` with no eviction) are a memory leak in long-running LSP sessions. Always set a maximum size or use time-based expiry.
+- When multiple AST traversals extract different kinds of symbols (assignments, S4 methods), merge them into a single recursive walk to avoid redundant tree iteration.
+- Add early termination to workspace symbol collection (`break` when `max_results` reached) to avoid collecting thousands of symbols only to truncate them.
 
 ### Performance & Profiling
 

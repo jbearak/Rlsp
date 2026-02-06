@@ -348,18 +348,19 @@ impl<'a> SymbolExtractor<'a> {
     /// A vector of `RawSymbol` entries representing all symbols found in the document.
     pub fn extract_all(&self) -> Vec<RawSymbol> {
         let mut symbols = Vec::new();
-        self.extract_assignments_recursive(self.root, &mut symbols);
-        // Extract S4 method definitions (setMethod, setClass, setGeneric)
-        let s4_symbols = self.extract_s4_methods(self.root);
-        symbols.extend(s4_symbols);
-        // Extract R code sections (# Section ----)
+        // Single combined AST walk for assignments and S4 methods
+        self.extract_ast_symbols_recursive(self.root, &mut symbols);
+        // Extract R code sections (text-based, not tree-sitter)
         let section_symbols = self.extract_sections();
         symbols.extend(section_symbols);
         symbols
     }
 
-    /// Recursively extract assignments from the AST.
-    fn extract_assignments_recursive(
+    /// Recursively extract assignments and S4 methods in a single AST walk.
+    ///
+    /// This combines what was previously two separate full-tree traversals
+    /// into one pass, reducing symbol extraction time for large files.
+    fn extract_ast_symbols_recursive(
         &self,
         node: tree_sitter::Node<'a>,
         symbols: &mut Vec<RawSymbol>,
@@ -369,10 +370,15 @@ impl<'a> SymbolExtractor<'a> {
             symbols.push(symbol);
         }
 
+        // Try to extract an S4 method from this node
+        if let Some(symbol) = self.try_extract_s4_method(node) {
+            symbols.push(symbol);
+        }
+
         // Recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.extract_assignments_recursive(child, symbols);
+            self.extract_ast_symbols_recursive(child, symbols);
         }
     }
 
@@ -825,6 +831,7 @@ impl<'a> SymbolExtractor<'a> {
     /// // setGeneric("myGeneric", function(x) standardGeneric("myGeneric"))
     /// // → RawSymbol { name: "myGeneric", kind: Interface, ... }
     /// ```
+    #[allow(dead_code)] // Used in tests; production code uses extract_ast_symbols_recursive
     pub fn extract_s4_methods(&self, node: tree_sitter::Node<'a>) -> Vec<RawSymbol> {
         let mut symbols = Vec::new();
         self.extract_s4_methods_recursive(node, &mut symbols);
@@ -832,6 +839,7 @@ impl<'a> SymbolExtractor<'a> {
     }
 
     /// Recursively extract S4 method definitions from the AST.
+    #[allow(dead_code)] // Used in tests; production code uses extract_ast_symbols_recursive
     fn extract_s4_methods_recursive(
         &self,
         node: tree_sitter::Node<'a>,
@@ -2152,6 +2160,9 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
 
     // 1. Open documents (highest priority)
     for uri in state.document_store.uris() {
+        if symbols.len() >= max_results {
+            break;
+        }
         seen_uris.insert(uri.clone());
         if let Some(doc) = state.document_store.get_without_touch(&uri) {
             collect_workspace_symbols_from_artifacts(
@@ -2164,76 +2175,106 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
     }
 
     // 2. New workspace index (closed files)
-    for (uri, entry) in state.workspace_index_new.iter() {
-        if seen_uris.contains(&uri) {
-            continue;
+    if symbols.len() < max_results {
+        for (uri, entry) in state.workspace_index_new.iter() {
+            if symbols.len() >= max_results {
+                break;
+            }
+            if seen_uris.contains(&uri) {
+                continue;
+            }
+            seen_uris.insert(uri.clone());
+            collect_workspace_symbols_from_artifacts(
+                &uri,
+                &entry.artifacts,
+                &lower_query,
+                &mut symbols,
+            );
         }
-        seen_uris.insert(uri.clone());
-        collect_workspace_symbols_from_artifacts(&uri, &entry.artifacts, &lower_query, &mut symbols);
     }
 
     // 3. Cross-file workspace index
-    for uri in state.cross_file_workspace_index.uris() {
-        if seen_uris.contains(&uri) {
-            continue;
-        }
-        seen_uris.insert(uri.clone());
-        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(&uri) {
-            collect_workspace_symbols_from_artifacts(&uri, &artifacts, &lower_query, &mut symbols);
+    if symbols.len() < max_results {
+        for uri in state.cross_file_workspace_index.uris() {
+            if symbols.len() >= max_results {
+                break;
+            }
+            if seen_uris.contains(&uri) {
+                continue;
+            }
+            seen_uris.insert(uri.clone());
+            if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(&uri) {
+                collect_workspace_symbols_from_artifacts(
+                    &uri,
+                    &artifacts,
+                    &lower_query,
+                    &mut symbols,
+                );
+            }
         }
     }
 
     // 4. Legacy documents (AST fallback)
-    for (uri, doc) in &state.documents {
-        if seen_uris.contains(uri) {
-            continue;
-        }
-        seen_uris.insert(uri.clone());
-        if let Some(tree) = &doc.tree {
-            let text = doc.text();
-            let mut file_symbols = Vec::new();
-            collect_symbols(tree.root_node(), &text, &mut file_symbols);
-            let container_name = extract_container_name(uri);
-            for mut sym in file_symbols {
-                // Filter reserved words (Requirement 7.2)
-                if is_reserved_word(&sym.name) {
-                    continue;
-                }
-                if sym.name.to_lowercase().contains(&lower_query) {
-                    sym.location.uri = uri.clone();
-                    sym.container_name = container_name.clone();
-                    symbols.push(sym);
+    if symbols.len() < max_results {
+        for (uri, doc) in &state.documents {
+            if symbols.len() >= max_results {
+                break;
+            }
+            if seen_uris.contains(uri) {
+                continue;
+            }
+            seen_uris.insert(uri.clone());
+            if let Some(tree) = &doc.tree {
+                let text = doc.text();
+                let mut file_symbols = Vec::new();
+                collect_symbols(tree.root_node(), &text, &mut file_symbols);
+                let container_name = extract_container_name(uri);
+                for mut sym in file_symbols {
+                    // Filter reserved words (Requirement 7.2)
+                    if is_reserved_word(&sym.name) {
+                        continue;
+                    }
+                    if sym.name.to_lowercase().contains(&lower_query) {
+                        sym.location.uri = uri.clone();
+                        sym.container_name = container_name.clone();
+                        symbols.push(sym);
+                    }
                 }
             }
         }
     }
 
     // 5. Legacy workspace index (AST fallback)
-    for (uri, doc) in &state.workspace_index {
-        if seen_uris.contains(uri) {
-            continue;
-        }
-        seen_uris.insert(uri.clone());
-        if let Some(tree) = &doc.tree {
-            let text = doc.text();
-            let mut file_symbols = Vec::new();
-            collect_symbols(tree.root_node(), &text, &mut file_symbols);
-            let container_name = extract_container_name(uri);
-            for mut sym in file_symbols {
-                // Filter reserved words (Requirement 7.2)
-                if is_reserved_word(&sym.name) {
-                    continue;
-                }
-                if sym.name.to_lowercase().contains(&lower_query) {
-                    sym.location.uri = uri.clone();
-                    sym.container_name = container_name.clone();
-                    symbols.push(sym);
+    if symbols.len() < max_results {
+        for (uri, doc) in &state.workspace_index {
+            if symbols.len() >= max_results {
+                break;
+            }
+            if seen_uris.contains(uri) {
+                continue;
+            }
+            seen_uris.insert(uri.clone());
+            if let Some(tree) = &doc.tree {
+                let text = doc.text();
+                let mut file_symbols = Vec::new();
+                collect_symbols(tree.root_node(), &text, &mut file_symbols);
+                let container_name = extract_container_name(uri);
+                for mut sym in file_symbols {
+                    // Filter reserved words (Requirement 7.2)
+                    if is_reserved_word(&sym.name) {
+                        continue;
+                    }
+                    if sym.name.to_lowercase().contains(&lower_query) {
+                        sym.location.uri = uri.clone();
+                        sym.container_name = container_name.clone();
+                        symbols.push(sym);
+                    }
                 }
             }
         }
     }
 
-    // Apply configurable limit (Requirement 9.2, 11.2)
+    // Apply configurable limit as final guard (Requirement 9.2, 11.2)
     symbols.truncate(max_results);
     Some(symbols)
 }
@@ -3933,11 +3974,45 @@ pub(crate) fn collect_undefined_variables_position_aware(
     // Second pass: collect all usages with NSE-aware context
     collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
 
+    // Pre-compute line start offsets for O(1) line lookups instead of repeated
+    // text.lines().nth() which is O(n) each time.
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
+    // Helper closure: get a line's text from pre-computed offsets
+    let get_line = |row: usize| -> &str {
+        if row >= line_starts.len() {
+            return "";
+        }
+        let start = line_starts[row];
+        let end = if row + 1 < line_starts.len() {
+            // Exclude the trailing newline
+            line_starts[row + 1].saturating_sub(1).min(text.len())
+        } else {
+            text.len()
+        };
+        if start > text.len() || end > text.len() || start > end {
+            return "";
+        }
+        &text[start..end]
+    };
+
+    // Cache scope resolution by line number. Within a single line, the cross-file
+    // scope (symbols, inherited_packages, loaded_packages) is identical for all
+    // identifiers. This avoids calling get_cross_file_scope() N times per file
+    // where N is the number of identifiers — instead we call it at most once per
+    // unique line that has an identifier needing a scope check.
+    let mut scope_cache: std::collections::HashMap<u32, crate::cross_file::scope::ScopeAtPosition> =
+        std::collections::HashMap::new();
+
+    // Pre-compute workspace_imports as a HashSet for O(1) lookups
+    let workspace_imports_set: std::collections::HashSet<&str> =
+        workspace_imports.iter().map(|s| s.as_str()).collect();
+
     // Report undefined variables with position-aware cross-file scope
     for (name, usage_node) in used {
         // Skip reserved words BEFORE any other checks (Requirement 3.4)
-        // Reserved words like `if`, `else`, `TRUE`, etc. should never produce
-        // "Undefined variable" diagnostics regardless of their position in code
         if crate::reserved_words::is_reserved_word(&name) {
             continue;
         }
@@ -3950,21 +4025,17 @@ pub(crate) fn collect_undefined_variables_position_aware(
         }
 
         // Skip if builtin or workspace import
-        // Local definitions are checked via position-aware scope below
-        if is_builtin(&name) || workspace_imports.contains(&name) {
+        if is_builtin(&name) || workspace_imports_set.contains(name.as_str()) {
             continue;
         }
 
-        // Convert byte column to UTF-16 for cross-file scope lookup
-        let line_text = text
-            .lines()
-            .nth(usage_node.start_position().row)
-            .unwrap_or("");
-        let usage_col = byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
-
-        // Get full scope at position, including position-aware loaded packages
-        // Requirements 8.1, 8.3, 8.4: Position-aware package checking
-        let scope = get_cross_file_scope(state, uri, usage_line, usage_col);
+        // Get or compute the scope for this line (cached)
+        let scope = scope_cache.entry(usage_line).or_insert_with(|| {
+            let line_text = get_line(usage_node.start_position().row);
+            let usage_col =
+                byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
+            get_cross_file_scope(state, uri, usage_line, usage_col)
+        });
 
         // Check if symbol is in cross-file scope
         if scope.symbols.contains_key(&name) {
@@ -3990,15 +4061,9 @@ pub(crate) fn collect_undefined_variables_position_aware(
         }
 
         // Symbol is undefined - emit diagnostic
-        // Convert byte columns to UTF-16 for diagnostic range
-        let start_line_text = text
-            .lines()
-            .nth(usage_node.start_position().row)
-            .unwrap_or("");
-        let end_line_text = text
-            .lines()
-            .nth(usage_node.end_position().row)
-            .unwrap_or("");
+        // Convert byte columns to UTF-16 for diagnostic range using pre-computed line offsets
+        let start_line_text = get_line(usage_node.start_position().row);
+        let end_line_text = get_line(usage_node.end_position().row);
         let start_col =
             byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
         let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
@@ -4500,10 +4565,11 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
 
     // Add package exports only if packages feature is enabled
     if state.cross_file_config.packages_enabled {
-        // Combine inherited and loaded packages
-        let mut all_packages: Vec<String> = scope.inherited_packages.clone();
-        for pkg in &scope.loaded_packages {
-            if !all_packages.contains(pkg) {
+        // Combine inherited and loaded packages using a set for O(1) dedup
+        let mut pkg_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut all_packages: Vec<String> = Vec::new();
+        for pkg in scope.inherited_packages.iter().chain(scope.loaded_packages.iter()) {
+            if pkg_set.insert(pkg.as_str()) {
                 all_packages.push(pkg.clone());
             }
         }
