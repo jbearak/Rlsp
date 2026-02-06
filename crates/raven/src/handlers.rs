@@ -5,7 +5,7 @@
 // Modifications copyright (C) 2026 Jonathan Marc Bearak
 //
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -69,6 +69,97 @@ fn section_pattern() -> &'static Regex {
 fn is_delimiter_only(s: &str) -> bool {
     const DELIMITER_CHARS: &[char] = &['#', '-', '=', '*', '+'];
     s.chars().all(|c| c.is_whitespace() || DELIMITER_CHARS.contains(&c))
+}
+
+// ============================================================================
+// Banner-Style Section Helpers
+// ============================================================================
+
+/// Delimiter character types used in banner-style section detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelimiterKind {
+    Hash,
+    Dash,
+    Equals,
+    Asterisk,
+    Plus,
+}
+
+/// Classifies a line as a delimiter line for banner-style section detection.
+///
+/// A delimiter line is a comment line consisting entirely of a single repeated
+/// delimiter character (4+). Two forms are recognized:
+/// - `################` (all hashes)
+/// - `# ================` (leading `#` + space + 4+ of one delimiter)
+///
+/// Returns `Some(kind)` if the line is a delimiter line, `None` otherwise.
+fn classify_delimiter_line(line: &str) -> Option<DelimiterKind> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('#') {
+        return None;
+    }
+
+    let after_first_hash = &trimmed[1..];
+
+    // Case 1: all hashes (e.g., "################") — need 4+ total
+    if !after_first_hash.is_empty()
+        && after_first_hash.chars().all(|c| c == '#')
+        && trimmed.len() >= 4
+    {
+        return Some(DelimiterKind::Hash);
+    }
+
+    // Case 2: "# <delimiters>" — leading # then space then 4+ of one delimiter
+    let content = if let Some(rest) = after_first_hash.strip_prefix(' ') {
+        rest.trim()
+    } else {
+        return None;
+    };
+
+    if content.len() < 4 {
+        return None;
+    }
+
+    let first_char = content.chars().next()?;
+    let kind = match first_char {
+        '-' => DelimiterKind::Dash,
+        '=' => DelimiterKind::Equals,
+        '*' => DelimiterKind::Asterisk,
+        '+' => DelimiterKind::Plus,
+        '#' => DelimiterKind::Hash,
+        _ => return None,
+    };
+
+    if content.chars().all(|c| c == first_char) {
+        Some(kind)
+    } else {
+        None
+    }
+}
+
+/// Extracts a section name from the middle line of a banner-style section.
+///
+/// Strips leading `#` characters and whitespace, then strips trailing delimiter
+/// characters (`#`, `-`, `=`, `*`, `+`) and whitespace. Returns `None` if the
+/// result is empty or consists only of delimiter characters.
+fn extract_banner_name(line: &str) -> Option<String> {
+    const DELIMITER_CHARS: &[char] = &['#', '-', '=', '*', '+'];
+
+    let trimmed = line.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('#') {
+        return None;
+    }
+
+    // Strip leading # characters, then whitespace
+    let content = trimmed.trim_start_matches('#').trim();
+    // Strip trailing delimiter characters and whitespace
+    let name = content.trim_end_matches(DELIMITER_CHARS).trim();
+
+    if name.is_empty() || is_delimiter_only(name) {
+        return None;
+    }
+
+    Some(name.to_string())
 }
 
 // ============================================================================
@@ -869,9 +960,12 @@ impl<'a> SymbolExtractor<'a> {
     /// _Requirements: 4.1, 4.5_
     pub fn extract_sections(&self) -> Vec<RawSymbol> {
         let mut sections = Vec::new();
+        let mut consumed_lines: HashSet<usize> = HashSet::new();
         let pattern = section_pattern();
+        let lines: Vec<&str> = self.text.lines().collect();
 
-        for (line_num, line) in self.text.lines().enumerate() {
+        // Phase 1: Single-line section detection (existing logic)
+        for (line_num, line) in lines.iter().enumerate() {
             if let Some(caps) = pattern.captures(line) {
                 // Capture group 1: additional # characters (after the first #)
                 // Heading level = 1 + count of additional # characters
@@ -905,6 +999,7 @@ impl<'a> SymbolExtractor<'a> {
                         },
                     };
 
+                    consumed_lines.insert(line_num);
                     sections.push(RawSymbol {
                         name,
                         kind: DocumentSymbolKind::Module,
@@ -917,6 +1012,78 @@ impl<'a> SymbolExtractor<'a> {
                 }
             }
         }
+
+        // Phase 2: Banner-style section detection (3-line pattern)
+        // Look for: delimiter line / name line / delimiter line
+        // where both delimiter lines use the same delimiter type.
+        if lines.len() >= 3 {
+            for i in 1..lines.len() - 1 {
+                // Skip if any of the 3 lines are already consumed
+                if consumed_lines.contains(&(i - 1))
+                    || consumed_lines.contains(&i)
+                    || consumed_lines.contains(&(i + 1))
+                {
+                    continue;
+                }
+
+                let kind_top = classify_delimiter_line(lines[i - 1]);
+                let kind_bottom = classify_delimiter_line(lines[i + 1]);
+
+                if let (Some(top), Some(bottom)) = (kind_top, kind_bottom) {
+                    if top != bottom {
+                        continue;
+                    }
+
+                    if let Some(name) = extract_banner_name(lines[i]) {
+                        let name_line_end_utf16: u32 = lines[i]
+                            .chars()
+                            .map(|c| if c.len_utf16() > 1 { 2 } else { 1 })
+                            .sum();
+                        let bottom_line_end_utf16: u32 = lines[i + 1]
+                            .chars()
+                            .map(|c| if c.len_utf16() > 1 { 2 } else { 1 })
+                            .sum();
+
+                        let range = Range {
+                            start: Position {
+                                line: (i - 1) as u32,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: (i + 1) as u32,
+                                character: bottom_line_end_utf16,
+                            },
+                        };
+                        let selection_range = Range {
+                            start: Position {
+                                line: i as u32,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: i as u32,
+                                character: name_line_end_utf16,
+                            },
+                        };
+
+                        consumed_lines.insert(i - 1);
+                        consumed_lines.insert(i);
+                        consumed_lines.insert(i + 1);
+                        sections.push(RawSymbol {
+                            name,
+                            kind: DocumentSymbolKind::Module,
+                            range,
+                            selection_range,
+                            detail: None,
+                            section_level: Some(1),
+                            children: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort by start line so single-line and banner sections interleave correctly
+        sections.sort_by_key(|s| s.range.start.line);
 
         sections
     }
@@ -9295,6 +9462,387 @@ result <- data %>% filter(x > 0)
     #[test]
     fn test_is_delimiter_only_false_for_unicode() {
         assert!(!is_delimiter_only("日本"));
+    }
+
+    // ========================================================================
+    // classify_delimiter_line() unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_classify_delimiter_line_all_hashes() {
+        assert_eq!(classify_delimiter_line("################"), Some(DelimiterKind::Hash));
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_min_hashes() {
+        assert_eq!(classify_delimiter_line("####"), Some(DelimiterKind::Hash));
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_too_few_hashes() {
+        assert_eq!(classify_delimiter_line("###"), None);
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_equals() {
+        assert_eq!(classify_delimiter_line("# ================"), Some(DelimiterKind::Equals));
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_dashes() {
+        assert_eq!(classify_delimiter_line("# ----------------"), Some(DelimiterKind::Dash));
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_asterisks() {
+        assert_eq!(classify_delimiter_line("# ****************"), Some(DelimiterKind::Asterisk));
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_plus() {
+        assert_eq!(classify_delimiter_line("# ++++++++++++++++"), Some(DelimiterKind::Plus));
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_hash_after_hash_space() {
+        assert_eq!(classify_delimiter_line("# ################"), Some(DelimiterKind::Hash));
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_too_few_delimiters() {
+        assert_eq!(classify_delimiter_line("# ==="), None);
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_mixed_chars() {
+        assert_eq!(classify_delimiter_line("# =-==-="), None);
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_not_comment() {
+        assert_eq!(classify_delimiter_line("x <- 1"), None);
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_empty() {
+        assert_eq!(classify_delimiter_line(""), None);
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_with_text() {
+        assert_eq!(classify_delimiter_line("# Section Name ----"), None);
+    }
+
+    #[test]
+    fn test_classify_delimiter_line_leading_whitespace() {
+        assert_eq!(classify_delimiter_line("  ################"), Some(DelimiterKind::Hash));
+        assert_eq!(classify_delimiter_line("  # ================"), Some(DelimiterKind::Equals));
+    }
+
+    // ========================================================================
+    // extract_banner_name() unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_banner_name_basic() {
+        assert_eq!(extract_banner_name("# Section Name"), Some("Section Name".to_string()));
+    }
+
+    #[test]
+    fn test_extract_banner_name_with_trailing_hash() {
+        assert_eq!(extract_banner_name("# Section Name #"), Some("Section Name".to_string()));
+    }
+
+    #[test]
+    fn test_extract_banner_name_with_trailing_hashes() {
+        assert_eq!(extract_banner_name("# Section Name ###"), Some("Section Name".to_string()));
+    }
+
+    #[test]
+    fn test_extract_banner_name_padded() {
+        assert_eq!(extract_banner_name("#  My Analysis  "), Some("My Analysis".to_string()));
+    }
+
+    #[test]
+    fn test_extract_banner_name_delimiter_only() {
+        assert_eq!(extract_banner_name("# ===="), None);
+    }
+
+    #[test]
+    fn test_extract_banner_name_all_hashes() {
+        assert_eq!(extract_banner_name("################"), None);
+    }
+
+    #[test]
+    fn test_extract_banner_name_empty() {
+        assert_eq!(extract_banner_name(""), None);
+    }
+
+    #[test]
+    fn test_extract_banner_name_not_comment() {
+        assert_eq!(extract_banner_name("Section Name"), None);
+    }
+
+    #[test]
+    fn test_extract_banner_name_just_hash() {
+        assert_eq!(extract_banner_name("#"), None);
+    }
+
+    #[test]
+    fn test_extract_banner_name_multiple_leading_hashes() {
+        assert_eq!(extract_banner_name("## Section Name ##"), Some("Section Name".to_string()));
+    }
+
+    // ========================================================================
+    // Banner-style section detection tests
+    // ========================================================================
+
+    #[test]
+    fn test_banner_section_equals() {
+        let code = "# ================\n# Section Name\n# ================\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_banner_section_hashes() {
+        let code = "################\n# Section Name #\n################\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_banner_section_asterisks() {
+        let code = "# ****************\n# Section Name\n# ****************\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_banner_section_dashes() {
+        let code = "# ----------------\n# Section Name\n# ----------------\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_banner_section_plus() {
+        let code = "# ++++++++++++++++\n# Section Name\n# ++++++++++++++++\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_banner_section_decorative_inner() {
+        // Inner line has trailing # decoration
+        let code = "################\n# Section Name #\n################\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_banner_section_mismatched_lengths() {
+        // Different lengths should still be detected
+        let code = "# ====================\n# Section Name\n# ==================\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+    }
+
+    #[test]
+    fn test_banner_section_mismatched_types_rejected() {
+        // Different delimiter types should NOT be detected
+        let code = "# ================\n# Section Name\n# ----------------\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_banner_section_only_above_rejected() {
+        // Delimiter only above, not below
+        let code = "# ================\n# Section Name\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_banner_section_only_below_rejected() {
+        // Delimiter only below, not above
+        let code = "# Section Name\n# ================\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_banner_section_at_start_of_file() {
+        let code = "# ================\n# Section Name\n# ================";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.range.start.line, 0);
+        assert_eq!(section.range.end.line, 2);
+    }
+
+    #[test]
+    fn test_banner_section_at_end_of_file() {
+        let code = "x <- 1\n# ================\n# Section Name\n# ================";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert!(matches!(section.kind, DocumentSymbolKind::Module));
+        assert_eq!(section.range.start.line, 1);
+        assert_eq!(section.range.end.line, 3);
+    }
+
+    #[test]
+    fn test_banner_section_coexists_with_single_line() {
+        let code = "# ================\n# Banner Section\n# ================\nx <- 1\n# Inline Section ----\ny <- 2";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name, "Banner Section");
+        assert_eq!(sections[1].name, "Inline Section");
+    }
+
+    #[test]
+    fn test_banner_section_delimiter_only_name_rejected() {
+        // Name line that is all delimiters should NOT be detected
+        let code = "# ================\n# ===\n# ================\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn test_banner_section_level_always_one() {
+        // Banner sections always have heading level 1
+        let code = "# ================\n# Section Name\n# ================";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        assert_eq!(section.section_level, Some(1));
+    }
+
+    #[test]
+    fn test_banner_section_range_spans_three_lines() {
+        let code = "x <- 1\n# ================\n# Section Name\n# ================\ny <- 2";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let section = symbols.iter().find(|s| s.name == "Section Name").unwrap();
+        // range spans all 3 lines
+        assert_eq!(section.range.start.line, 1);
+        assert_eq!(section.range.end.line, 3);
+        // selection_range is just the name line
+        assert_eq!(section.selection_range.start.line, 2);
+        assert_eq!(section.selection_range.end.line, 2);
+    }
+
+    #[test]
+    fn test_banner_section_no_duplicate_with_single_line() {
+        // A single-line section that happens to be between delimiters should
+        // be detected once (by single-line), not duplicated by banner detection
+        let code = "# ================\n# Section Name ----\n# ================\nx <- 1";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        // Should be detected exactly once (by single-line pattern)
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name, "Section Name");
+    }
+
+    #[test]
+    fn test_banner_section_two_consecutive_banners() {
+        let code = "# ====\n# A\n# ====\n# ----\n# B\n# ----";
+        let tree = parse_r_code(code);
+        let extractor = SymbolExtractor::new(code, tree.root_node());
+        let symbols = extractor.extract_all();
+
+        let sections: Vec<_> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, DocumentSymbolKind::Module))
+            .collect();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].name, "A");
+        assert_eq!(sections[1].name, "B");
     }
 
     // ========================================================================

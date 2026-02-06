@@ -671,7 +671,7 @@ The document symbol and workspace symbol providers use a two-phase extraction an
    - Extracts raw symbols from parsed R documents
    - Detects assignments (functions, variables, constants)
    - Detects S4 methods (`setMethod`, `setClass`, `setGeneric`)
-   - Detects R code sections (`# Section ----` pattern)
+   - Detects R code sections (single-line `# Section ----` and banner-style)
    - Classifies symbol kinds (ALL_CAPS → CONSTANT, R6Class → CLASS, etc.)
    - Extracts function signatures for detail field
 
@@ -694,7 +694,8 @@ The document symbol and workspace symbol providers use a two-phase extraction an
 
 **Key Patterns:**
 
-- R code sections use regex: `^\s*#(#*)\s*(%%)?\s*(\S.+?)\s*(#{4,}|-{4,}|={4,}|\*{4,}|\+{4,})\s*$`
+- Single-line R code sections use regex: `^\s*#(#*)\s*(%%)?\s*(\S.+?)\s*(#{4,}|-{4,}|={4,}|\*{4,}|\+{4,})\s*$`
+- Banner-style sections: delimiter line above and below a comment name line (e.g., `# ====` / `# Name` / `# ====`). Delimiters must use the same character type (`#`, `-`, `=`, `*`, `+`) but don't need to be the same length. Banner sections are always heading level 1.
 - ALL_CAPS constants: `^[A-Z][A-Z0-9_.]+$` (min 2 chars)
 - Reserved words are filtered from both document and workspace symbols
 - Workspace symbols include `containerName` (filename without extension)
