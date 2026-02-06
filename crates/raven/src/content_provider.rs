@@ -417,6 +417,7 @@ mod tests {
     use crate::document_store::DocumentStoreConfig;
     use crate::workspace_index::WorkspaceIndexConfig;
     use proptest::prelude::*;
+    use std::sync::Arc;
 
     /// Mock content provider for testing
     struct MockContentProvider {
@@ -755,9 +756,9 @@ mod tests {
         // Add to workspace index with artifacts
         let mut index_artifacts = ScopeArtifacts::default();
         index_artifacts.exported_interface.insert(
-            "workspace_func".to_string(),
+            Arc::from("workspace_func"),
             crate::cross_file::scope::ScopedSymbol {
-                name: "workspace_func".to_string(),
+                name: Arc::from("workspace_func"),
                 kind: crate::cross_file::scope::SymbolKind::Function,
                 source_uri: uri.clone(),
                 defined_line: 0,
@@ -1093,9 +1094,9 @@ mod tests {
                 // Add to workspace index with index_func in artifacts
                 let mut index_artifacts = ScopeArtifacts::default();
                 index_artifacts.exported_interface.insert(
-                    index_func.clone(),
+                    Arc::<str>::from(index_func.clone()),
                     crate::cross_file::scope::ScopedSymbol {
-                        name: index_func.clone(),
+                        name: Arc::<str>::from(index_func.clone()),
                         kind: crate::cross_file::scope::SymbolKind::Function,
                         source_uri: uri.clone(),
                         defined_line: 0,
@@ -1130,12 +1131,12 @@ mod tests {
                 // INVARIANT: get_artifacts() must return open document artifacts
                 let artifacts = provider.get_artifacts(&uri).unwrap();
                 assert!(
-                    artifacts.exported_interface.contains_key(&open_func),
+                    artifacts.exported_interface.contains_key(open_func.as_str()),
                     "get_artifacts() should contain open document function '{}', but it doesn't",
                     open_func
                 );
                 assert!(
-                    !artifacts.exported_interface.contains_key(&index_func),
+                    !artifacts.exported_interface.contains_key(index_func.as_str()),
                     "get_artifacts() should NOT contain workspace index function '{}', but it does",
                     index_func
                 );
@@ -1175,9 +1176,9 @@ mod tests {
                 index_metadata.working_directory = Some(index_wd.clone());
                 let mut index_artifacts = ScopeArtifacts::default();
                 index_artifacts.exported_interface.insert(
-                    index_func.clone(),
+                    Arc::<str>::from(index_func.clone()),
                     crate::cross_file::scope::ScopedSymbol {
-                        name: index_func.clone(),
+                        name: Arc::<str>::from(index_func.clone()),
                         kind: crate::cross_file::scope::SymbolKind::Function,
                         source_uri: uri.clone(),
                         defined_line: 0,
@@ -1231,7 +1232,7 @@ mod tests {
                 // Check artifacts
                 let artifacts = provider.get_artifacts(&uri).unwrap();
                 assert!(
-                    artifacts.exported_interface.contains_key(&open_func),
+                    artifacts.exported_interface.contains_key(open_func.as_str()),
                     "Artifacts should contain open doc function"
                 );
 
@@ -1353,7 +1354,7 @@ mod tests {
                 // INVARIANT 4: Artifacts are consistent with content
                 let artifacts = got_artifacts.unwrap();
                 assert!(
-                    artifacts.exported_interface.contains_key(&func_name),
+                    artifacts.exported_interface.contains_key(func_name.as_str()),
                     "Artifacts should contain function '{}' from content",
                     func_name
                 );
@@ -1386,9 +1387,9 @@ mod tests {
                 metadata.working_directory = Some(wd_name.clone());
                 let mut artifacts = ScopeArtifacts::default();
                 artifacts.exported_interface.insert(
-                    func_name.clone(),
+                    Arc::<str>::from(func_name.clone()),
                     crate::cross_file::scope::ScopedSymbol {
-                        name: func_name.clone(),
+                        name: Arc::<str>::from(func_name.clone()),
                         kind: crate::cross_file::scope::SymbolKind::Function,
                         source_uri: uri.clone(),
                         defined_line: 1,
@@ -1446,7 +1447,7 @@ mod tests {
                 // INVARIANT 4: Artifacts are consistent with indexed data
                 let got_arts = got_artifacts.unwrap();
                 assert!(
-                    got_arts.exported_interface.contains_key(&func_name),
+                    got_arts.exported_interface.contains_key(func_name.as_str()),
                     "Artifacts should contain function '{}' from indexed data",
                     func_name
                 );
@@ -1534,9 +1535,9 @@ mod tests {
                 index_metadata.working_directory = Some(index_wd.clone());
                 let mut index_artifacts = ScopeArtifacts::default();
                 index_artifacts.exported_interface.insert(
-                    index_func.clone(),
+                    Arc::<str>::from(index_func.clone()),
                     crate::cross_file::scope::ScopedSymbol {
-                        name: index_func.clone(),
+                        name: Arc::<str>::from(index_func.clone()),
                         kind: crate::cross_file::scope::SymbolKind::Function,
                         source_uri: uri.clone(),
                         defined_line: 1,
@@ -1603,7 +1604,7 @@ mod tests {
                         "Metadata should come from open doc when is_open=true"
                     );
                     assert!(
-                        got_artifacts.exported_interface.contains_key(&open_func),
+                        got_artifacts.exported_interface.contains_key(open_func.as_str()),
                         "Artifacts should come from open doc when is_open=true"
                     );
                 } else {
@@ -1618,7 +1619,7 @@ mod tests {
                         "Metadata should come from workspace index when is_open=false"
                     );
                     assert!(
-                        got_artifacts.exported_interface.contains_key(&index_func),
+                        got_artifacts.exported_interface.contains_key(index_func.as_str()),
                         "Artifacts should come from workspace index when is_open=false"
                     );
                 }
@@ -1636,6 +1637,7 @@ mod integration_tests {
     use super::*;
     use crate::document_store::DocumentStoreConfig;
     use crate::workspace_index::WorkspaceIndexConfig;
+    use std::sync::Arc;
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///{}", name)).unwrap()
@@ -1745,9 +1747,9 @@ mod integration_tests {
         // Add utils.R to workspace index with exported function
         let mut utils_artifacts = ScopeArtifacts::default();
         utils_artifacts.exported_interface.insert(
-            "helper_func".to_string(),
+            std::sync::Arc::from("helper_func"),
             crate::cross_file::scope::ScopedSymbol {
-                name: "helper_func".to_string(),
+                name: std::sync::Arc::from("helper_func"),
                 kind: crate::cross_file::scope::SymbolKind::Function,
                 source_uri: utils_uri.clone(),
                 defined_line: 0,
@@ -1903,7 +1905,7 @@ mod integration_tests {
         
         // Add a declared variable to the timeline
         let declared_var = ScopedSymbol {
-            name: "declared_var".to_string(),
+            name: std::sync::Arc::from("declared_var"),
             kind: SymbolKind::Variable,
             source_uri: uri.clone(),
             defined_line: 0,
@@ -1916,11 +1918,11 @@ mod integration_tests {
             column: u32::MAX,
             symbol: declared_var.clone(),
         });
-        artifacts.exported_interface.insert("declared_var".to_string(), declared_var);
+        artifacts.exported_interface.insert(std::sync::Arc::from("declared_var"), declared_var);
 
         // Add a declared function to the timeline
         let declared_func = ScopedSymbol {
-            name: "declared_func".to_string(),
+            name: std::sync::Arc::from("declared_func"),
             kind: SymbolKind::Function,
             source_uri: uri.clone(),
             defined_line: 1,
@@ -1933,7 +1935,7 @@ mod integration_tests {
             column: u32::MAX,
             symbol: declared_func.clone(),
         });
-        artifacts.exported_interface.insert("declared_func".to_string(), declared_func);
+        artifacts.exported_interface.insert(std::sync::Arc::from("declared_func"), declared_func);
 
         // Create metadata with declared symbols
         let metadata = CrossFileMetadata {
@@ -2017,7 +2019,7 @@ mod integration_tests {
         // Create artifacts with old declared symbol (simulating stale workspace index)
         let mut old_artifacts = ScopeArtifacts::default();
         let old_symbol = ScopedSymbol {
-            name: "old_declared".to_string(),
+            name: std::sync::Arc::from("old_declared"),
             kind: SymbolKind::Variable,
             source_uri: uri.clone(),
             defined_line: 0,
@@ -2030,7 +2032,7 @@ mod integration_tests {
             column: u32::MAX,
             symbol: old_symbol.clone(),
         });
-        old_artifacts.exported_interface.insert("old_declared".to_string(), old_symbol);
+        old_artifacts.exported_interface.insert(std::sync::Arc::from("old_declared"), old_symbol);
 
         let old_metadata = CrossFileMetadata {
             declared_variables: vec![DeclaredSymbol {
@@ -2119,7 +2121,7 @@ mod integration_tests {
         // Create child file with declared symbol (indexed, not open)
         let mut child_artifacts = ScopeArtifacts::default();
         let child_declared = ScopedSymbol {
-            name: "child_declared".to_string(),
+            name: std::sync::Arc::from("child_declared"),
             kind: SymbolKind::Function,
             source_uri: child_uri.clone(),
             defined_line: 0,
@@ -2132,7 +2134,7 @@ mod integration_tests {
             column: u32::MAX,
             symbol: child_declared.clone(),
         });
-        child_artifacts.exported_interface.insert("child_declared".to_string(), child_declared);
+        child_artifacts.exported_interface.insert(std::sync::Arc::from("child_declared"), child_declared);
 
         let child_metadata = CrossFileMetadata {
             declared_functions: vec![DeclaredSymbol {

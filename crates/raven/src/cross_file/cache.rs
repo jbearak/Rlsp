@@ -4,31 +4,41 @@
 // Caching structures with interior mutability for cross-file awareness
 //
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::RwLock;
 
+use lru::LruCache;
 use tower_lsp::lsp_types::Url;
 
-use super::scope::ScopeArtifacts;
 use super::types::CrossFileMetadata;
 
-/// Fingerprint for cache validity checking
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ScopeFingerprint {
-    /// Hash of the file's own contents
-    pub self_hash: u64,
-    /// Hash of the dependency edge set
-    pub edges_hash: u64,
-    /// Hash of upstream exported interfaces
-    pub upstream_interfaces_hash: u64,
-    /// Workspace index version
-    pub workspace_index_version: u64,
+/// Convert a `usize` to `NonZeroUsize`, falling back to `default` if zero.
+pub(crate) fn non_zero_or(value: usize, default: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).unwrap_or(NonZeroUsize::new(default).unwrap())
 }
 
-/// Metadata cache with interior mutability
-#[derive(Debug, Default)]
+/// Default capacity for the metadata cache
+const DEFAULT_METADATA_CACHE_CAPACITY: usize = 1000;
+
+/// Metadata cache with LRU eviction and interior mutability.
+///
+/// Uses `peek()` for reads (no LRU promotion, works under read lock) and
+/// `push()` for writes (promotes/evicts under write lock). This makes eviction
+/// "LRU by insertion/update time" which keeps the read path fully concurrent.
 pub struct MetadataCache {
-    inner: RwLock<HashMap<Url, CrossFileMetadata>>,
+    inner: RwLock<LruCache<Url, CrossFileMetadata>>,
+}
+
+impl std::fmt::Debug for MetadataCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataCache").finish_non_exhaustive()
+    }
+}
+
+impl Default for MetadataCache {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_METADATA_CACHE_CAPACITY)
+    }
 }
 
 impl MetadataCache {
@@ -36,19 +46,26 @@ impl MetadataCache {
         Self::default()
     }
 
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = non_zero_or(cap, DEFAULT_METADATA_CACHE_CAPACITY);
+        Self {
+            inner: RwLock::new(LruCache::new(cap)),
+        }
+    }
+
     pub fn get(&self, uri: &Url) -> Option<CrossFileMetadata> {
-        self.inner.read().ok()?.get(uri).cloned()
+        self.inner.read().ok()?.peek(uri).cloned()
     }
 
     pub fn insert(&self, uri: Url, meta: CrossFileMetadata) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.insert(uri, meta);
+            guard.push(uri, meta);
         }
     }
 
     pub fn remove(&self, uri: &Url) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.remove(uri);
+            guard.pop(uri);
         }
     }
 
@@ -68,7 +85,7 @@ impl MetadataCache {
         if let Ok(mut guard) = self.inner.write() {
             let mut count = 0;
             for uri in uris {
-                if guard.remove(uri).is_some() {
+                if guard.pop(uri).is_some() {
                     count += 1;
                 }
             }
@@ -77,65 +94,14 @@ impl MetadataCache {
             0
         }
     }
-}
 
-/// Artifacts cache with interior mutability
-#[derive(Debug, Default)]
-pub struct ArtifactsCache {
-    inner: RwLock<HashMap<Url, (ScopeFingerprint, ScopeArtifacts)>>,
-}
-
-impl ArtifactsCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Get cached artifacts if fingerprint matches
-    pub fn get_if_fresh(&self, uri: &Url, fp: &ScopeFingerprint) -> Option<ScopeArtifacts> {
-        let guard = self.inner.read().ok()?;
-        guard.get(uri).and_then(|(cached_fp, artifacts)| {
-            if cached_fp == fp {
-                Some(artifacts.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Get cached artifacts without fingerprint check
-    pub fn get(&self, uri: &Url) -> Option<ScopeArtifacts> {
-        self.inner.read().ok()?.get(uri).map(|(_, a)| a.clone())
-    }
-
-    /// Insert or update cache entry
-    pub fn insert(&self, uri: Url, fp: ScopeFingerprint, artifacts: ScopeArtifacts) {
+    /// Resize the cache capacity. If shrinking, LRU entries are evicted.
+    pub fn resize(&self, cap: usize) {
+        let cap = non_zero_or(cap, DEFAULT_METADATA_CACHE_CAPACITY);
         if let Ok(mut guard) = self.inner.write() {
-            guard.insert(uri, (fp, artifacts));
+            guard.resize(cap);
         }
     }
-
-    /// Invalidate a specific entry
-    pub fn invalidate(&self, uri: &Url) {
-        if let Ok(mut guard) = self.inner.write() {
-            guard.remove(uri);
-        }
-    }
-
-    /// Invalidate all entries
-    pub fn invalidate_all(&self) {
-        if let Ok(mut guard) = self.inner.write() {
-            guard.clear();
-        }
-    }
-}
-
-/// Cache key for parent selection stability
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ParentCacheKey {
-    /// Hash of the child's CrossFileMetadata (backward directives)
-    pub metadata_fingerprint: u64,
-    /// Hash of the reverse edges pointing to this child
-    pub reverse_edges_hash: u64,
 }
 
 /// Result of parent resolution
@@ -156,45 +122,6 @@ pub enum ParentResolution {
     },
     /// No parent found
     None,
-}
-
-/// Parent selection cache with interior mutability
-#[derive(Debug, Default)]
-pub struct ParentSelectionCache {
-    inner: RwLock<HashMap<(Url, ParentCacheKey), ParentResolution>>,
-}
-
-impl ParentSelectionCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Get cached parent resolution if available
-    pub fn get(&self, child_uri: &Url, cache_key: &ParentCacheKey) -> Option<ParentResolution> {
-        let guard = self.inner.read().ok()?;
-        guard.get(&(child_uri.clone(), cache_key.clone())).cloned()
-    }
-
-    /// Insert parent resolution into cache
-    pub fn insert(&self, child_uri: Url, cache_key: ParentCacheKey, resolution: ParentResolution) {
-        if let Ok(mut guard) = self.inner.write() {
-            guard.insert((child_uri, cache_key), resolution);
-        }
-    }
-
-    /// Invalidate cache for a child
-    pub fn invalidate(&self, child_uri: &Url) {
-        if let Ok(mut guard) = self.inner.write() {
-            guard.retain(|(uri, _), _| uri != child_uri);
-        }
-    }
-
-    /// Invalidate all entries
-    pub fn invalidate_all(&self) {
-        if let Ok(mut guard) = self.inner.write() {
-            guard.clear();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -219,68 +146,45 @@ mod tests {
     }
 
     #[test]
-    fn test_artifacts_cache_fresh() {
-        let cache = ArtifactsCache::new();
-        let uri = test_uri("test.R");
-        let fp = ScopeFingerprint {
-            self_hash: 123,
-            edges_hash: 456,
-            upstream_interfaces_hash: 789,
-            workspace_index_version: 1,
-        };
-        let artifacts = ScopeArtifacts::default();
+    fn test_metadata_cache_lru_eviction() {
+        let cache = MetadataCache::with_capacity(3);
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+        let uri4 = test_uri("d.R");
 
-        cache.insert(uri.clone(), fp.clone(), artifacts);
+        cache.insert(uri1.clone(), CrossFileMetadata::default());
+        cache.insert(uri2.clone(), CrossFileMetadata::default());
+        cache.insert(uri3.clone(), CrossFileMetadata::default());
 
-        // Same fingerprint should return cached
-        assert!(cache.get_if_fresh(&uri, &fp).is_some());
+        // All three should be present
+        assert!(cache.get(&uri1).is_some());
+        assert!(cache.get(&uri2).is_some());
+        assert!(cache.get(&uri3).is_some());
 
-        // Different fingerprint should not return cached
-        let fp2 = ScopeFingerprint {
-            self_hash: 999,
-            ..fp
-        };
-        assert!(cache.get_if_fresh(&uri, &fp2).is_none());
+        // Inserting a 4th evicts the LRU (uri1, oldest by insertion time)
+        cache.insert(uri4.clone(), CrossFileMetadata::default());
+        assert!(cache.get(&uri1).is_none(), "LRU entry should be evicted");
+        assert!(cache.get(&uri2).is_some());
+        assert!(cache.get(&uri3).is_some());
+        assert!(cache.get(&uri4).is_some());
     }
 
     #[test]
-    fn test_artifacts_cache_invalidate() {
-        let cache = ArtifactsCache::new();
-        let uri = test_uri("test.R");
-        let fp = ScopeFingerprint {
-            self_hash: 123,
-            edges_hash: 456,
-            upstream_interfaces_hash: 789,
-            workspace_index_version: 1,
-        };
+    fn test_metadata_cache_resize() {
+        let cache = MetadataCache::with_capacity(5);
+        for i in 0..5 {
+            cache.insert(test_uri(&format!("{}.R", i)), CrossFileMetadata::default());
+        }
 
-        cache.insert(uri.clone(), fp, ScopeArtifacts::default());
-        assert!(cache.get(&uri).is_some());
-
-        cache.invalidate(&uri);
-        assert!(cache.get(&uri).is_none());
-    }
-
-    #[test]
-    fn test_parent_selection_cache() {
-        let cache = ParentSelectionCache::new();
-        let child = test_uri("child.R");
-        let parent = test_uri("parent.R");
-        let key = ParentCacheKey {
-            metadata_fingerprint: 123,
-            reverse_edges_hash: 456,
-        };
-        let resolution = ParentResolution::Single {
-            parent_uri: parent,
-            call_site_line: Some(10),
-            call_site_column: Some(0),
-        };
-
-        cache.insert(child.clone(), key.clone(), resolution);
-        assert!(cache.get(&child, &key).is_some());
-
-        cache.invalidate(&child);
-        assert!(cache.get(&child, &key).is_none());
+        // Shrink to 2 — oldest 3 entries evicted
+        cache.resize(2);
+        // Only the 2 most recently inserted (3.R, 4.R) should remain
+        assert!(cache.get(&test_uri("0.R")).is_none());
+        assert!(cache.get(&test_uri("1.R")).is_none());
+        assert!(cache.get(&test_uri("2.R")).is_none());
+        assert!(cache.get(&test_uri("3.R")).is_some());
+        assert!(cache.get(&test_uri("4.R")).is_some());
     }
 
     #[test]

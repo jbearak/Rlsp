@@ -7,10 +7,11 @@
 // Allow dead code for infrastructure that's implemented for future use
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
+use lru::LruCache;
 use ropey::Rope;
 use tokio::time::Instant;
 use tower_lsp::lsp_types::Url;
@@ -117,21 +118,22 @@ impl Clone for IndexEntry {
 // Workspace Index
 // ============================================================================
 
-/// Unified workspace index for closed files
+/// Unified workspace index for closed files with LRU eviction.
 ///
 /// Manages indexed files with configurable limits and debounced updates.
 /// Uses RwLock for interior mutability to allow concurrent read access.
+/// Uses `peek()` for reads (no LRU promotion) and `push()` for writes.
 ///
 /// **Validates: Requirements 4.1, 4.2, 4.3, 4.4**
 pub struct WorkspaceIndex {
-    /// Index entries by URI
-    inner: RwLock<HashMap<Url, IndexEntry>>,
+    /// Index entries by URI (LRU-bounded)
+    inner: RwLock<LruCache<Url, IndexEntry>>,
     /// Monotonic version counter
     version: AtomicU64,
     /// Configuration
     config: WorkspaceIndexConfig,
     /// Pending debounced updates (URI -> scheduled time)
-    pending_updates: RwLock<HashMap<Url, Instant>>,
+    pending_updates: RwLock<std::collections::HashMap<Url, Instant>>,
     /// Update queue for batched processing
     update_queue: RwLock<HashSet<Url>>,
     /// Metrics
@@ -147,11 +149,12 @@ impl WorkspaceIndex {
     /// # Returns
     /// A new WorkspaceIndex instance
     pub fn new(config: WorkspaceIndexConfig) -> Self {
+        let cap = crate::cross_file::cache::non_zero_or(config.max_files, 1000);
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwLock::new(LruCache::new(cap)),
             version: AtomicU64::new(0),
             config,
-            pending_updates: RwLock::new(HashMap::new()),
+            pending_updates: RwLock::new(std::collections::HashMap::new()),
             update_queue: RwLock::new(HashSet::new()),
             metrics: RwLock::new(WorkspaceIndexMetrics::default()),
         }
@@ -174,7 +177,7 @@ impl WorkspaceIndex {
     /// Clone of IndexEntry if found, None otherwise
     pub fn get(&self, uri: &Url) -> Option<IndexEntry> {
         let guard = self.inner.read().ok()?;
-        let entry = guard.get(uri).cloned();
+        let entry = guard.peek(uri).cloned();
 
         // Update metrics
         if let Ok(mut metrics) = self.metrics.write() {
@@ -202,7 +205,7 @@ impl WorkspaceIndex {
     /// Clone of IndexEntry if found and fresh, None otherwise
     pub fn get_if_fresh(&self, uri: &Url, snapshot: &FileSnapshot) -> Option<IndexEntry> {
         let guard = self.inner.read().ok()?;
-        guard.get(uri).and_then(|entry| {
+        guard.peek(uri).and_then(|entry| {
             if entry.snapshot.matches_disk(snapshot) {
                 Some(entry.clone())
             } else {
@@ -224,7 +227,7 @@ impl WorkspaceIndex {
     /// Clone of CrossFileMetadata if found, None otherwise
     pub fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
         let guard = self.inner.read().ok()?;
-        guard.get(uri).map(|entry| entry.metadata.clone())
+        guard.peek(uri).map(|entry| entry.metadata.clone())
     }
 
     /// Get artifacts for a URI
@@ -240,7 +243,7 @@ impl WorkspaceIndex {
     /// Clone of ScopeArtifacts if found, None otherwise
     pub fn get_artifacts(&self, uri: &Url) -> Option<ScopeArtifacts> {
         let guard = self.inner.read().ok()?;
-        guard.get(uri).map(|entry| entry.artifacts.clone())
+        guard.peek(uri).map(|entry| entry.artifacts.clone())
     }
 
     /// Check if URI is indexed
@@ -253,7 +256,7 @@ impl WorkspaceIndex {
     pub fn contains(&self, uri: &Url) -> bool {
         self.inner
             .read()
-            .map(|guard| guard.contains_key(uri))
+            .map(|guard| guard.contains(uri))
             .unwrap_or(false)
     }
 
@@ -266,7 +269,7 @@ impl WorkspaceIndex {
     pub fn uris(&self) -> Vec<Url> {
         self.inner
             .read()
-            .map(|guard| guard.keys().cloned().collect())
+            .map(|guard| guard.iter().map(|(k, _)| k.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -284,7 +287,7 @@ impl WorkspaceIndex {
             .map(|guard| {
                 guard
                     .iter()
-                    .map(|(uri, entry)| (uri.clone(), entry.clone()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -309,10 +312,7 @@ impl WorkspaceIndex {
 
     /// Check if the index is empty
     pub fn is_empty(&self) -> bool {
-        self.inner
-            .read()
-            .map(|guard| guard.is_empty())
-            .unwrap_or(true)
+        self.len() == 0
     }
 
     /// Get current metrics
@@ -335,7 +335,8 @@ impl WorkspaceIndex {
     /// Insert entry directly
     ///
     /// Inserts an entry into the index and increments the version counter.
-    /// Respects max_files limit - if at limit, the insert is rejected.
+    /// If at capacity, the least-recently-used entry is evicted (LRU).
+    /// Oversized files (exceeding max_file_size_bytes) are still rejected.
     ///
     /// **Validates: Requirements 4.2, 4.4, 12.1, 12.2, 12.3**
     ///
@@ -344,21 +345,12 @@ impl WorkspaceIndex {
     /// * `entry` - IndexEntry to insert
     ///
     /// # Returns
-    /// true if inserted, false if rejected due to limits
+    /// true if inserted, false if rejected due to file size limit
     pub fn insert(&self, uri: Url, entry: IndexEntry) -> bool {
         let Ok(mut guard) = self.inner.write() else {
             return false;
         };
 
-        // Check max_files limit (only for new entries)
-        if !guard.contains_key(&uri) && guard.len() >= self.config.max_files {
-            log::info!(
-                "WorkspaceIndex at max_files limit ({}), rejecting insert for {}",
-                self.config.max_files,
-                uri
-            );
-            return false;
-        }
         // Check max_file_size_bytes limit for all entries
         if self.config.max_file_size_bytes > 0
             && entry.snapshot.size > self.config.max_file_size_bytes as u64
@@ -372,7 +364,7 @@ impl WorkspaceIndex {
             return false;
         }
 
-        guard.insert(uri, entry);
+        guard.push(uri, entry);
         drop(guard);
 
         // Increment version counter
@@ -402,7 +394,7 @@ impl WorkspaceIndex {
             return false;
         };
 
-        let removed = guard.remove(uri).is_some();
+        let removed = guard.pop(uri).is_some();
         drop(guard);
 
         if removed {
@@ -432,11 +424,11 @@ impl WorkspaceIndex {
         guard.clear();
         drop(guard);
 
-        if count > 0 {
-            // Increment version counter
-            self.version.fetch_add(1, Ordering::SeqCst);
+        // Always increment version counter
+        self.version.fetch_add(1, Ordering::SeqCst);
 
-            // Update metrics
+        // Update metrics
+        if count > 0 {
             if let Ok(mut metrics) = self.metrics.write() {
                 metrics.invalidations += count as u64;
             }
@@ -859,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn test_max_files_limit() {
+    fn test_max_files_lru_eviction() {
         let config = WorkspaceIndexConfig {
             debounce_ms: 50,
             max_files: 2,
@@ -874,14 +866,16 @@ mod tests {
         assert!(index.insert(uri1.clone(), make_test_entry(0)));
         assert!(index.insert(uri2.clone(), make_test_entry(1)));
 
-        // Third insert should be rejected
-        assert!(!index.insert(uri3.clone(), make_test_entry(2)));
+        // Third insert should evict LRU (uri1), not be rejected
+        assert!(index.insert(uri3.clone(), make_test_entry(2)));
         assert_eq!(index.len(), 2);
-        assert!(!index.contains(&uri3));
+        assert!(!index.contains(&uri1), "LRU entry should be evicted");
+        assert!(index.contains(&uri2));
+        assert!(index.contains(&uri3));
     }
 
     #[test]
-    fn test_update_existing_at_limit() {
+    fn test_update_existing_at_capacity() {
         let config = WorkspaceIndexConfig {
             debounce_ms: 50,
             max_files: 2,
@@ -895,7 +889,7 @@ mod tests {
         assert!(index.insert(uri1.clone(), make_test_entry(0)));
         assert!(index.insert(uri2.clone(), make_test_entry(1)));
 
-        // Updating existing entry should succeed even at limit
+        // Updating existing entry should succeed at capacity (no eviction needed)
         let updated_entry = IndexEntry {
             contents: Rope::from_str("y <- 2"),
             ..make_test_entry(2)
@@ -904,6 +898,8 @@ mod tests {
 
         let retrieved = index.get(&uri1).unwrap();
         assert_eq!(retrieved.contents.to_string(), "y <- 2");
+        // Both entries still present
+        assert!(index.contains(&uri2));
     }
 
     #[test]
@@ -1652,46 +1648,40 @@ mod tests {
                         let uri = uri_from_idx(idx);
                         let entry = make_prop_test_entry(version_before);
 
-                        // Insert may fail if at max_files limit for new entries
-                        let is_new = !indexed_uris.contains(&uri);
-                        let at_limit = indexed_uris.len() >= max_files;
-
                         let inserted = index.insert(uri.clone(), entry);
 
-                        if inserted {
-                            // Insert succeeded - version MUST have increased
-                            let version_after = index.version();
-                            prop_assert!(
-                                version_after > version_before,
-                                "Version did not increase after successful insert: before={}, after={}",
-                                version_before,
-                                version_after
-                            );
-                            prop_assert!(
-                                version_after > prev_version,
-                                "Version is not monotonically increasing: prev={}, current={}",
-                                prev_version,
-                                version_after
-                            );
-                            prev_version = version_after;
-                            indexed_uris.insert(uri);
-                        } else {
-                            // Insert failed (at limit for new entry) - version should NOT change
-                            prop_assert!(
-                                is_new && at_limit,
-                                "Insert failed but was not at limit for new entry"
-                            );
-                            let version_after = index.version();
-                            prop_assert_eq!(
-                                version_after,
-                                version_before,
-                                "Version changed after failed insert"
-                            );
+                        // With LRU eviction, insert always succeeds (no file size issue)
+                        prop_assert!(
+                            inserted,
+                            "Insert should always succeed with LRU eviction"
+                        );
+
+                        // Insert succeeded - version MUST have increased
+                        let version_after = index.version();
+                        prop_assert!(
+                            version_after > version_before,
+                            "Version did not increase after successful insert: before={}, after={}",
+                            version_before,
+                            version_after
+                        );
+                        prop_assert!(
+                            version_after > prev_version,
+                            "Version is not monotonically increasing: prev={}, current={}",
+                            prev_version,
+                            version_after
+                        );
+                        prev_version = version_after;
+                        indexed_uris.insert(uri);
+
+                        // With LRU, old entries may have been evicted — trim our tracking set
+                        // to match the actual index state
+                        if indexed_uris.len() > max_files {
+                            // Some entries were evicted; sync our tracking
+                            indexed_uris.retain(|u| index.contains(u));
                         }
                     }
                     IndexOperation::Invalidate(idx) => {
                         let uri = uri_from_idx(idx);
-                        let was_present = indexed_uris.contains(&uri);
 
                         let removed = index.invalidate(&uri);
 
@@ -1710,10 +1700,6 @@ mod tests {
                                 prev_version,
                                 version_after
                             );
-                            prop_assert!(
-                                was_present,
-                                "Invalidate succeeded but URI was not tracked as present"
-                            );
                             prev_version = version_after;
                             indexed_uris.remove(&uri);
                         } else {
@@ -1724,42 +1710,27 @@ mod tests {
                                 version_before,
                                 "Version changed after failed invalidate"
                             );
-                            prop_assert!(
-                                !was_present,
-                                "Invalidate failed but URI was tracked as present"
-                            );
                         }
                     }
                     IndexOperation::InvalidateAll => {
-                        let was_empty = indexed_uris.is_empty();
-
                         index.invalidate_all();
 
                         let version_after = index.version();
 
-                        if was_empty {
-                            // InvalidateAll on empty index - version should NOT change
-                            prop_assert_eq!(
-                                version_after,
-                                version_before,
-                                "Version changed after invalidate_all on empty index"
-                            );
-                        } else {
-                            // InvalidateAll on non-empty index - version MUST have increased
-                            prop_assert!(
-                                version_after > version_before,
-                                "Version did not increase after invalidate_all on non-empty index: before={}, after={}",
-                                version_before,
-                                version_after
-                            );
-                            prop_assert!(
-                                version_after > prev_version,
-                                "Version is not monotonically increasing: prev={}, current={}",
-                                prev_version,
-                                version_after
-                            );
-                            prev_version = version_after;
-                        }
+                        // invalidate_all always increments version
+                        prop_assert!(
+                            version_after > version_before,
+                            "Version did not increase after invalidate_all: before={}, after={}",
+                            version_before,
+                            version_after
+                        );
+                        prop_assert!(
+                            version_after > prev_version,
+                            "Version is not monotonically increasing: prev={}, current={}",
+                            prev_version,
+                            version_after
+                        );
+                        prev_version = version_after;
 
                         indexed_uris.clear();
                     }

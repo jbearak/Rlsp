@@ -206,6 +206,30 @@
           "minimum": 1,
           "description": "Maximum number of files that can be queued for background indexing. Limits memory usage and prevents excessive background work in projects with many transitive dependencies."
         },
+        "raven.crossFile.cache.metadataMaxEntries": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 100,
+          "description": "Maximum entries in the metadata cache. Uses LRU eviction when full."
+        },
+        "raven.crossFile.cache.fileContentMaxEntries": {
+          "type": "number",
+          "default": 500,
+          "minimum": 50,
+          "description": "Maximum file contents cached for cross-file resolution. Each entry stores full file text. Uses LRU eviction when full."
+        },
+        "raven.crossFile.cache.existenceMaxEntries": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 100,
+          "description": "Maximum file existence check results cached. These are small (path + boolean). Uses LRU eviction when full."
+        },
+        "raven.crossFile.cache.workspaceIndexMaxEntries": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 100,
+          "description": "Maximum closed files in the cross-file workspace index. Each entry includes parsed metadata and scope artifacts. Uses LRU eviction when full."
+        },
         "raven.diagnostics.enabled": {
           "type": "boolean",
           "default": true,
@@ -283,7 +307,7 @@
     "@types/vscode": "^1.75.0",
     "@vscode/test-cli": "^0.0.8",
     "@vscode/test-electron": "^2.3.9",
-    "@vscode/vsce": "^2.22.0",
+    "@vscode/vsce": "^3.7.1",
     "esbuild": "^0.27.2",
     "fast-check": "^4.5.3",
     "mocha": "^10.2.0",

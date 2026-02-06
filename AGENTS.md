@@ -155,6 +155,8 @@ Key methods for querying R (used selectively):
 
 All methods validate package names to prevent R code injection.
 
+**Timeout**: All R subprocess calls are wrapped with a 30-second `tokio::time::timeout()` via `execute_r_code()` → `execute_r_code_with_timeout()`. This prevents hung R processes from blocking the LSP indefinitely. The timeout is configurable per-call via `execute_r_code_with_timeout()`.
+
 ### Project Environment Support (`renv`)
 Raven supports project-local package libraries (like `renv`):
 - **Working Directory**: The R subprocess is spawned with the workspace root as its working directory.
@@ -365,7 +367,21 @@ source("helpers.r")
 
 ### Caching Strategy
 
-- Three caches with interior mutability: MetadataCache, ArtifactsCache, ParentSelectionCache
+All cross-file caches use **LRU eviction** via the `lru` crate (v0.14) with configurable capacity limits:
+
+| Cache | Default Capacity | Storage |
+|-------|-----------------|---------|
+| `MetadataCache` | 1000 | Per-file `CrossFileMetadata` (directives, source calls, symbols) |
+| `CrossFileFileCache` (content) | 500 | Full file text for cross-file resolution |
+| `CrossFileFileCache` (existence) | 2000 | Path existence checks (path + boolean) |
+| `CrossFileWorkspaceIndex` | 5000 | Parsed metadata + scope artifacts for closed files |
+| `WorkspaceIndex` | Configurable via `max_files` | Document symbols for workspace symbol search |
+
+**Configuration**: All cache limits are configurable via `raven.crossFile.cache.*` VS Code settings, parsed in `backend.rs` and applied via `state.resize_caches()` at initialization and on configuration change.
+
+**RwLock compatibility**: Reads use `peek()` (takes `&self`, no LRU promotion) under read locks for full concurrency. Writes use `push()` (takes `&mut self`, auto-evicts LRU entry) under write locks. This means eviction is "LRU by insertion/update time" not "LRU by access time."
+
+**Additional cache metadata**:
 - Fingerprinted entries: self_hash, edges_hash, upstream_interfaces_hash, workspace_index_version
 - Invalidation triggers: interface hash change OR edge set change
 
@@ -450,7 +466,7 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - Avoid duplicating local-scoping condition logic across functions; centralize to reduce drift.
 - Be careful with hover/definition range calculations at line boundaries to avoid off-by-one bugs or invalid points.
 - For removal events, use strict position comparisons (before, not at) to avoid removing symbols at their definition position.
-- In hot scope-resolution paths, avoid repeated scans over large lists (e.g., function scopes per event); precompute mappings or cache lookups to prevent O(R·F) regressions.
+- In hot scope-resolution paths, avoid repeated scans over large lists (e.g., function scopes per event); pre-compute mappings or cache lookups to prevent O(R·F) regressions.
 - Keep doc comments and markdown examples aligned with current behavior (e.g., list= string literals support).
 - Normalize markdown table spacing to match project lint expectations when adding spec tables.
 - Avoid interpolating user-controlled strings into R code; pass help topics/packages as command args instead.
@@ -471,7 +487,21 @@ The BackgroundIndexer handles asynchronous indexing of files not currently open 
 - INDEX files provide ~95% accuracy for packages using `exportPattern()` when R subprocess is unavailable - they list documented exports.
 - Tiered loading (static → R → INDEX fallback) provides both speed and accuracy: sub-5ms for 94% of packages, accurate exports for all.
 - When parsing structured R output (markers like `__PKG:name__`), handle missing end markers gracefully to avoid losing partial results.
-
+- Always wrap R subprocess calls with `tokio::time::timeout()` to prevent hung R processes from blocking the LSP indefinitely.
+- When iterating over identifiers in a file for diagnostics, cache scope resolution results by line number — the cross-file scope is identical for all identifiers on the same line, so calling `get_cross_file_scope()` per-identifier is wasteful.
+- Pre-compute a line-offset index (`Vec<usize>` of line start positions) to avoid repeated `text.lines().nth(row)` calls, which are O(n) each time.
+- Use `HashSet` for membership checks in hot loops (package deduplication, workspace imports); `Vec::contains()` is O(n) and adds up quickly in completion/diagnostic paths.
+- For background work queues, maintain a companion `HashSet` of pending URIs alongside the `VecDeque` to enable O(1) duplicate detection instead of O(n) `iter().any()` scans.
+- Unbounded caches (`HashMap` with no eviction) are a memory leak in long-running LSP sessions. Always set a maximum size or use time-based expiry.
+- When multiple AST traversals extract different kinds of symbols (assignments, S4 methods), merge them into a single recursive walk to avoid redundant tree iteration.
+- Add early termination to workspace symbol collection (`break` when `max_results` reached) to avoid collecting thousands of symbols only to truncate them.
+- Use `Arc<str>` for frequently-cloned string fields (like `ScopedSymbol.name`) and corresponding HashMap keys to reduce O(n) String allocations to O(1) atomic refcount increments.
+- When converting a HashMap key type from `String` to `Arc<str>`, lookups via `.get()` and `.contains_key()` need `&str` arguments (e.g., `var.as_str()`) since `HashMap<Arc<str>, _>` implements `Borrow<str>`.
+- `Arc<str>` does NOT have a stable `.as_str()` method (it's behind the `str_as_str` feature gate); use `&*arc` instead to get a `&str` reference.
+- The `lru` crate's `LruCache::new()` requires `NonZeroUsize`; always clamp capacity with `.unwrap_or()` to a sensible default to avoid panics.
+- `LruCache` doesn't derive `Debug`; implement `Debug` manually using `finish_non_exhaustive()` when wrapping in a struct.
+- Use `peek()` (not `get()`) for LRU reads under `RwLock` read locks — `get()` promotes the entry (mutates) and requires `&mut self`, while `peek()` takes `&self` and keeps reads concurrent.
+- When migrating from reject-at-limit to LRU eviction, update property tests: entries can be silently evicted, so "was_present" tracking based on prior inserts becomes unreliable.
 ### Performance & Profiling
 
 - R subprocess spawning is expensive (~75-350ms each); batch multiple queries into single R invocations where possible.

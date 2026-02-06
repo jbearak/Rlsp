@@ -104,9 +104,8 @@ use tree_sitter::Tree;
 use crate::content_provider::DefaultContentProvider;
 use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
 use crate::cross_file::{
-    ArtifactsCache, CrossFileActivityState, CrossFileConfig, CrossFileFileCache,
-    CrossFileRevalidationState, CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
-    ParentSelectionCache,
+    CrossFileActivityState, CrossFileConfig, CrossFileFileCache, CrossFileRevalidationState,
+    CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
 };
 use crate::document_store::DocumentStore;
 use crate::package_library::PackageLibrary;
@@ -509,12 +508,9 @@ pub struct WorldState {
     pub symbol_config: SymbolConfig,
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
-    pub cross_file_cache: ArtifactsCache,
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
-    #[allow(dead_code)]
-    pub cross_file_parent_cache: ParentSelectionCache,
     pub package_library_ready: bool,
 }
 
@@ -601,11 +597,9 @@ impl WorldState {
             symbol_config: SymbolConfig::default(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
-            cross_file_cache: ArtifactsCache::new(),
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
-            cross_file_parent_cache: ParentSelectionCache::new(),
             package_library_ready: false,
         }
     }
@@ -630,6 +624,18 @@ impl WorldState {
             &self.workspace_index,
             &self.cross_file_workspace_index,
         )
+    }
+
+    /// Resize all LRU caches based on configuration.
+    /// Called after parsing initialization options.
+    pub fn resize_caches(&self, config: &crate::cross_file::config::CrossFileConfig) {
+        self.cross_file_meta.resize(config.cache_metadata_max_entries);
+        self.cross_file_file_cache.resize(
+            config.cache_file_content_max_entries,
+            config.cache_existence_max_entries,
+        );
+        self.cross_file_workspace_index
+            .resize(config.cache_workspace_index_max_entries);
     }
 
     pub fn open_document(&mut self, uri: Url, text: &str, version: Option<i32>) {

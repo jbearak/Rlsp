@@ -1610,8 +1610,8 @@ proptest! {
         );
 
         // Local definition should take precedence (defined in parent, not child)
-        prop_assert!(scope.symbols.contains_key(&symbol_name));
-        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()));
+        let symbol = scope.symbols.get(symbol_name.as_str()).unwrap();
         prop_assert_eq!(&symbol.source_uri, &parent_uri);
     }
 }
@@ -1681,7 +1681,7 @@ proptest! {
             &resolve_path,
             10,
         );
-        prop_assert!(!scope_before.symbols.contains_key(&symbol_name));
+        prop_assert!(!scope_before.symbols.contains_key(symbol_name.as_str()));
 
         // After source() call - symbol SHOULD be available
         let scope_after = scope_at_position_with_deps(
@@ -1692,7 +1692,7 @@ proptest! {
             &resolve_path,
             10,
         );
-        prop_assert!(scope_after.symbols.contains_key(&symbol_name));
+        prop_assert!(scope_after.symbols.contains_key(symbol_name.as_str()));
     }
 }
 
@@ -1753,13 +1753,13 @@ proptest! {
         let scope_shallow = scope_at_position_with_deps(
             &uri_a, 10, 0, &get_artifacts, &resolve_path, 2,
         );
-        prop_assert!(!scope_shallow.symbols.contains_key(&symbol_name));
+        prop_assert!(!scope_shallow.symbols.contains_key(symbol_name.as_str()));
 
         // With max_depth=10, should reach d
         let scope_deep = scope_at_position_with_deps(
             &uri_a, 10, 0, &get_artifacts, &resolve_path, 10,
         );
-        prop_assert!(scope_deep.symbols.contains_key(&symbol_name));
+        prop_assert!(scope_deep.symbols.contains_key(symbol_name.as_str()));
     }
 }
 
@@ -1814,9 +1814,9 @@ proptest! {
         );
 
         // Should have symbol_a (defined locally)
-        prop_assert!(scope.symbols.contains_key(&symbol_a));
+        prop_assert!(scope.symbols.contains_key(symbol_a.as_str()));
         // Should have symbol_b (from sourced file, before cycle detected)
-        prop_assert!(scope.symbols.contains_key(&symbol_b));
+        prop_assert!(scope.symbols.contains_key(symbol_b.as_str()));
     }
 }
 
@@ -1863,7 +1863,7 @@ proptest! {
         );
 
         // Symbol from local=TRUE source should NOT be in scope
-        prop_assert!(!scope.symbols.contains_key(&symbol_name));
+        prop_assert!(!scope.symbols.contains_key(symbol_name.as_str()));
     }
 }
 
@@ -1924,14 +1924,14 @@ proptest! {
             let scope_before = scope_at_position_with_deps(
                 &parent_uri, 0, source_col - 1, &get_artifacts, &resolve_path, 10,
             );
-            prop_assert!(!scope_before.symbols.contains_key(&symbol_name));
+            prop_assert!(!scope_before.symbols.contains_key(symbol_name.as_str()));
         }
 
         // After source() call - symbol SHOULD be available
         let scope_after = scope_at_position_with_deps(
             &parent_uri, 0, source_col + 20, &get_artifacts, &resolve_path, 10,
         );
-        prop_assert!(scope_after.symbols.contains_key(&symbol_name));
+        prop_assert!(scope_after.symbols.contains_key(symbol_name.as_str()));
     }
 }
 
@@ -1989,7 +1989,7 @@ proptest! {
             &parent_uri, 10, 0, &get_artifacts, &resolve_path, 10,
         );
         // Symbol should be available (sys.source with globalenv() is not local)
-        prop_assert!(scope.symbols.contains_key(&symbol_name));
+        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()));
     }
 }
 
@@ -2028,16 +2028,16 @@ proptest! {
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
         // All three should be in exported interface
-        prop_assert!(artifacts.exported_interface.contains_key(&func_name));
-        prop_assert!(artifacts.exported_interface.contains_key(&var_name));
-        prop_assert!(artifacts.exported_interface.contains_key(&assign_name));
+        prop_assert!(artifacts.exported_interface.contains_key(func_name.as_str()));
+        prop_assert!(artifacts.exported_interface.contains_key(var_name.as_str()));
+        prop_assert!(artifacts.exported_interface.contains_key(assign_name.as_str()));
 
         // Function should have Function kind
-        let func_symbol = artifacts.exported_interface.get(&func_name).unwrap();
+        let func_symbol = artifacts.exported_interface.get(func_name.as_str()).unwrap();
         prop_assert_eq!(func_symbol.kind, super::scope::SymbolKind::Function);
 
         // Variable should have Variable kind
-        let var_symbol = artifacts.exported_interface.get(&var_name).unwrap();
+        let var_symbol = artifacts.exported_interface.get(var_name.as_str()).unwrap();
         prop_assert_eq!(var_symbol.kind, super::scope::SymbolKind::Variable);
     }
 
@@ -2068,7 +2068,7 @@ proptest! {
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
-        prop_assert!(artifacts.exported_interface.contains_key(&name));
+        prop_assert!(artifacts.exported_interface.contains_key(name.as_str()));
     }
 
     /// V1 R Symbol Model: Equals assignment (=) is recognized
@@ -2082,7 +2082,7 @@ proptest! {
         let tree = parse_r_tree(&code);
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
-        prop_assert!(artifacts.exported_interface.contains_key(&name));
+        prop_assert!(artifacts.exported_interface.contains_key(name.as_str()));
     }
 }
 
@@ -2117,23 +2117,23 @@ proptest! {
         // At end of file (outside function), local variable should NOT be available
         let scope_outside = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+        prop_assert!(scope_outside.symbols.contains_key(func_name.as_str()),
             "Function name should be available outside function");
-        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+        prop_assert!(scope_outside.symbols.contains_key(global_var.as_str()),
             "Global variable should be available outside function");
-        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+        prop_assert!(!scope_outside.symbols.contains_key(local_var.as_str()),
             "Function-local variable should NOT be available outside function");
 
         // Inside function body, local variable SHOULD be available
         // Use a position derived from the generated code so it is always within the braces.
         let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
         let scope_inside = scope_at_position(&artifacts, 0, col_in_body);
-        prop_assert!(scope_inside.symbols.contains_key(&func_name),
+        prop_assert!(scope_inside.symbols.contains_key(func_name.as_str()),
             "Function name should be available inside function");
-        prop_assert!(scope_inside.symbols.contains_key(&local_var),
+        prop_assert!(scope_inside.symbols.contains_key(local_var.as_str()),
             "Function-local variable should be available inside function");
         // Global variable defined after function should NOT be available inside
-        prop_assert!(!scope_inside.symbols.contains_key(&global_var),
+        prop_assert!(!scope_inside.symbols.contains_key(global_var.as_str()),
             "Global variable defined after function should NOT be available inside function");
     }
 
@@ -2161,13 +2161,13 @@ proptest! {
 
         // Outside all functions - only outer function should be available
         let scope_outside = scope_at_position(&artifacts, 10, 0);
-        prop_assert!(scope_outside.symbols.contains_key(&outer_func),
+        prop_assert!(scope_outside.symbols.contains_key(outer_func.as_str()),
             "Outer function should be available outside");
-        prop_assert!(!scope_outside.symbols.contains_key(&inner_func),
+        prop_assert!(!scope_outside.symbols.contains_key(inner_func.as_str()),
             "Inner function should NOT be available outside outer function");
-        prop_assert!(!scope_outside.symbols.contains_key(&outer_var),
+        prop_assert!(!scope_outside.symbols.contains_key(outer_var.as_str()),
             "Outer function variable should NOT be available outside");
-        prop_assert!(!scope_outside.symbols.contains_key(&inner_var),
+        prop_assert!(!scope_outside.symbols.contains_key(inner_var.as_str()),
             "Inner function variable should NOT be available outside");
 
         // Inside outer function but outside inner function
@@ -2183,13 +2183,13 @@ proptest! {
             .or_else(|| code.rfind(&inner_func).map(|i| (i + 1) as u32))
             .unwrap_or(0);
         let scope_outer = scope_at_position(&artifacts, 0, col_in_outer_after_inner_def);
-        prop_assert!(scope_outer.symbols.contains_key(&outer_func),
+        prop_assert!(scope_outer.symbols.contains_key(outer_func.as_str()),
             "Outer function should be available inside itself");
-        prop_assert!(scope_outer.symbols.contains_key(&outer_var),
+        prop_assert!(scope_outer.symbols.contains_key(outer_var.as_str()),
             "Outer function variable should be available inside outer function");
-        prop_assert!(scope_outer.symbols.contains_key(&inner_func),
+        prop_assert!(scope_outer.symbols.contains_key(inner_func.as_str()),
             "Inner function should be available inside outer function");
-        prop_assert!(!scope_outer.symbols.contains_key(&inner_var),
+        prop_assert!(!scope_outer.symbols.contains_key(inner_var.as_str()),
             "Inner function variable should NOT be available outside inner function");
 
         // Inside inner function
@@ -2201,13 +2201,13 @@ proptest! {
             .map(|i| (i + 1) as u32)
             .unwrap_or(0);
         let scope_inner = scope_at_position(&artifacts, 0, col_in_inner_after_inner_var_def);
-        prop_assert!(scope_inner.symbols.contains_key(&outer_func),
+        prop_assert!(scope_inner.symbols.contains_key(outer_func.as_str()),
             "Outer function should be available inside inner function");
-        prop_assert!(scope_inner.symbols.contains_key(&outer_var),
+        prop_assert!(scope_inner.symbols.contains_key(outer_var.as_str()),
             "Outer function variable should be available inside inner function");
-        prop_assert!(scope_inner.symbols.contains_key(&inner_func),
+        prop_assert!(scope_inner.symbols.contains_key(inner_func.as_str()),
             "Inner function should be available inside itself");
-        prop_assert!(scope_inner.symbols.contains_key(&inner_var),
+        prop_assert!(scope_inner.symbols.contains_key(inner_var.as_str()),
             "Inner function variable should be available inside inner function");
     }
 }
@@ -2244,27 +2244,27 @@ proptest! {
 
         // Outside function - parameters should NOT be available
         let scope_outside = scope_at_position(&artifacts, 10, 0);
-        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+        prop_assert!(scope_outside.symbols.contains_key(func_name.as_str()),
             "Function name should be available outside function");
-        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+        prop_assert!(scope_outside.symbols.contains_key(global_var.as_str()),
             "Global variable should be available outside function");
-        prop_assert!(!scope_outside.symbols.contains_key(&param1),
+        prop_assert!(!scope_outside.symbols.contains_key(param1.as_str()),
             "Function parameter 1 should NOT be available outside function");
-        prop_assert!(!scope_outside.symbols.contains_key(&param2),
+        prop_assert!(!scope_outside.symbols.contains_key(param2.as_str()),
             "Function parameter 2 should NOT be available outside function");
 
         // Inside function - parameters SHOULD be available
         // Use a position derived from the generated code so it is always within the braces.
         let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
         let scope_inside = scope_at_position(&artifacts, 0, col_in_body);
-        prop_assert!(scope_inside.symbols.contains_key(&func_name),
+        prop_assert!(scope_inside.symbols.contains_key(func_name.as_str()),
             "Function name should be available inside function");
-        prop_assert!(scope_inside.symbols.contains_key(&param1),
+        prop_assert!(scope_inside.symbols.contains_key(param1.as_str()),
             "Function parameter 1 should be available inside function");
-        prop_assert!(scope_inside.symbols.contains_key(&param2),
+        prop_assert!(scope_inside.symbols.contains_key(param2.as_str()),
             "Function parameter 2 should be available inside function");
         // Global variable defined after function should NOT be available inside
-        prop_assert!(!scope_inside.symbols.contains_key(&global_var),
+        prop_assert!(!scope_inside.symbols.contains_key(global_var.as_str()),
             "Global variable defined after function should NOT be available inside function");
     }
 
@@ -2284,16 +2284,16 @@ proptest! {
 
         // Outside function - parameter should NOT be available
         let scope_outside = scope_at_position(&artifacts, 10, 0);
-        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+        prop_assert!(scope_outside.symbols.contains_key(func_name.as_str()),
             "Function name should be available outside function");
-        prop_assert!(!scope_outside.symbols.contains_key(&param_name),
+        prop_assert!(!scope_outside.symbols.contains_key(param_name.as_str()),
             "Function parameter with default should NOT be available outside function");
 
         // Inside function - parameter SHOULD be available
         // Use a position derived from the generated code so it is always within the braces.
         let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
         let scope_inside = scope_at_position(&artifacts, 0, col_in_body);
-        prop_assert!(scope_inside.symbols.contains_key(&param_name),
+        prop_assert!(scope_inside.symbols.contains_key(param_name.as_str()),
             "Function parameter with default should be available inside function");
     }
 
@@ -2313,9 +2313,9 @@ proptest! {
 
         // Outside function - parameters should NOT be available
         let scope_outside = scope_at_position(&artifacts, 10, 0);
-        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+        prop_assert!(scope_outside.symbols.contains_key(func_name.as_str()),
             "Function name should be available outside function");
-        prop_assert!(!scope_outside.symbols.contains_key(&param_name),
+        prop_assert!(!scope_outside.symbols.contains_key(param_name.as_str()),
             "Named parameter should NOT be available outside function");
         prop_assert!(!scope_outside.symbols.contains_key("..."),
             "Ellipsis parameter should NOT be available outside function");
@@ -2324,7 +2324,7 @@ proptest! {
         // Use a position derived from the generated code so it is always within the braces.
         let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
         let scope_inside = scope_at_position(&artifacts, 0, col_in_body);
-        prop_assert!(scope_inside.symbols.contains_key(&param_name),
+        prop_assert!(scope_inside.symbols.contains_key(param_name.as_str()),
             "Named parameter should be available inside function");
         prop_assert!(scope_inside.symbols.contains_key("..."),
             "Ellipsis parameter should be available inside function");
@@ -2522,7 +2522,7 @@ proptest! {
         let scope_after_first = scope_at_position_with_deps(
             &parent_uri, first_line + 1, 0, &get_artifacts, &resolve_path, 10,
         );
-        prop_assert!(scope_after_first.symbols.contains_key(&symbol_name));
+        prop_assert!(scope_after_first.symbols.contains_key(symbol_name.as_str()));
     }
 }
 
@@ -2616,31 +2616,31 @@ proptest! {
         let scope_at_start = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_at_start.symbols.contains_key(&parent_symbol),
+        prop_assert!(scope_at_start.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol should be available at start due to backward directive");
-        prop_assert!(!scope_at_start.symbols.contains_key(&sibling_symbol),
+        prop_assert!(!scope_at_start.symbols.contains_key(sibling_symbol.as_str()),
             "Sibling symbol should NOT be available at start (before source() call)");
 
         // At line 1 (after child_symbol definition, before source() call)
         let scope_at_middle = scope_at_position_with_graph(
             &child_uri, 1, 10, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_at_middle.symbols.contains_key(&parent_symbol),
+        prop_assert!(scope_at_middle.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol should still be available");
-        prop_assert!(scope_at_middle.symbols.contains_key(&child_symbol),
+        prop_assert!(scope_at_middle.symbols.contains_key(child_symbol.as_str()),
             "Child symbol should be available after its definition");
-        prop_assert!(!scope_at_middle.symbols.contains_key(&sibling_symbol),
+        prop_assert!(!scope_at_middle.symbols.contains_key(sibling_symbol.as_str()),
             "Sibling symbol should NOT be available (before source() call)");
 
         // At line 3 (after source() call), all symbols should be available
         let scope_at_end = scope_at_position_with_graph(
             &child_uri, 3, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_at_end.symbols.contains_key(&parent_symbol),
+        prop_assert!(scope_at_end.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol should be available at end");
-        prop_assert!(scope_at_end.symbols.contains_key(&child_symbol),
+        prop_assert!(scope_at_end.symbols.contains_key(child_symbol.as_str()),
             "Child symbol should be available at end");
-        prop_assert!(scope_at_end.symbols.contains_key(&sibling_symbol),
+        prop_assert!(scope_at_end.symbols.contains_key(sibling_symbol.as_str()),
             "Sibling symbol should be available after source() call");
     }
 
@@ -2702,7 +2702,7 @@ proptest! {
         let scope = scope_at_position_with_graph(
             &child_uri, 0, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope.symbols.contains_key(&parent_symbol),
+        prop_assert!(scope.symbols.contains_key(parent_symbol.as_str()),
             "Parent symbol from backward directive should be available at (0, 0)");
     }
 }
@@ -2794,12 +2794,12 @@ proptest! {
         );
 
         // symbol_before (defined on line 0) should be available (before call site)
-        prop_assert!(scope.symbols.contains_key(&symbol_before),
+        prop_assert!(scope.symbols.contains_key(symbol_before.as_str()),
             "Symbol defined before call site should be available");
 
         // symbol_after (defined on line call_site_line + 1) should NOT be available
         // because it's defined AFTER the call site line
-        prop_assert!(!scope.symbols.contains_key(&symbol_after),
+        prop_assert!(!scope.symbols.contains_key(symbol_after.as_str()),
             "Symbol defined after call site should NOT be available");
     }
 }
@@ -2874,7 +2874,7 @@ proptest! {
         );
 
         // Default is "end", so all parent symbols should be included
-        prop_assert!(scope.symbols.contains_key(&parent_symbol),
+        prop_assert!(scope.symbols.contains_key(parent_symbol.as_str()),
             "With default call site (end), parent symbol should be available");
     }
 }
@@ -2951,7 +2951,7 @@ proptest! {
         let scope_with_end = scope_at_position_with_graph(
             &child_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_with_end.symbols.contains_key(&parent_symbol),
+        prop_assert!(scope_with_end.symbols.contains_key(parent_symbol.as_str()),
             "With assume_call_site=End, parent symbol should be available");
 
         // Verify that scope_settings_changed detects the change
@@ -3729,7 +3729,7 @@ proptest! {
         );
 
         // Symbol from child should be in scope (available for completion)
-        prop_assert!(scope.symbols.contains_key(&symbol_name),
+        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()),
             "Symbol from sourced file should be available for completion");
     }
 }
@@ -3776,7 +3776,7 @@ proptest! {
         );
 
         // Symbol should have source_uri pointing to child
-        if let Some(symbol) = scope.symbols.get(&symbol_name) {
+        if let Some(symbol) = scope.symbols.get(symbol_name.as_str()) {
             prop_assert_eq!(&symbol.source_uri, &child_uri,
                 "Symbol should have source_uri pointing to the sourced file");
         } else {
@@ -3827,7 +3827,7 @@ proptest! {
         );
 
         // Function should be in scope with signature
-        if let Some(symbol) = scope.symbols.get(&func_name) {
+        if let Some(symbol) = scope.symbols.get(func_name.as_str()) {
             prop_assert_eq!(&symbol.source_uri, &child_uri,
                 "Function should have source_uri pointing to the sourced file");
             prop_assert!(symbol.signature.is_some(),
@@ -3882,7 +3882,7 @@ proptest! {
         );
 
         // Symbol should have definition location in child file
-        if let Some(symbol) = scope.symbols.get(&symbol_name) {
+        if let Some(symbol) = scope.symbols.get(symbol_name.as_str()) {
             prop_assert_eq!(&symbol.source_uri, &child_uri,
                 "Symbol should be defined in child file");
             prop_assert_eq!(symbol.defined_line, 0,
@@ -3936,7 +3936,7 @@ proptest! {
         );
 
         // Symbol should be in scope, so no undefined variable diagnostic
-        prop_assert!(scope.symbols.contains_key(&symbol_name),
+        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()),
             "Symbol from sourced file should be in scope (no undefined variable diagnostic)");
     }
 }
@@ -3984,7 +3984,7 @@ proptest! {
         );
 
         // Symbol should NOT be in scope before source() call
-        prop_assert!(!scope_before.symbols.contains_key(&symbol_name),
+        prop_assert!(!scope_before.symbols.contains_key(symbol_name.as_str()),
             "Symbol should NOT be in scope before source() call (out of scope)");
 
         // Get scope AFTER source() call (line 6)
@@ -3993,7 +3993,7 @@ proptest! {
         );
 
         // Symbol SHOULD be in scope after source() call
-        prop_assert!(scope_after.symbols.contains_key(&symbol_name),
+        prop_assert!(scope_after.symbols.contains_key(symbol_name.as_str()),
             "Symbol should be in scope after source() call");
     }
 }
@@ -4282,14 +4282,14 @@ proptest! {
         let scope_before = scope_at_position_with_deps(
             &parent_uri, 0, 0, &get_artifacts, &resolve_path, 10,
         );
-        prop_assert!(!scope_before.symbols.contains_key(&symbol_name),
+        prop_assert!(!scope_before.symbols.contains_key(symbol_name.as_str()),
             "Symbol should NOT be available before source() call");
 
         // At column 30 (after source()), child symbol SHOULD be available
         let scope_after = scope_at_position_with_deps(
             &parent_uri, 0, 30, &get_artifacts, &resolve_path, 10,
         );
-        prop_assert!(scope_after.symbols.contains_key(&symbol_name),
+        prop_assert!(scope_after.symbols.contains_key(symbol_name.as_str()),
             "Symbol should be available after source() call");
     }
 }
@@ -4310,7 +4310,7 @@ proptest! {
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
         // assign() with string literal should be recognized
-        prop_assert!(artifacts.exported_interface.contains_key(&symbol_name),
+        prop_assert!(artifacts.exported_interface.contains_key(symbol_name.as_str()),
             "assign() with string literal should be recognized");
     }
 
@@ -4325,7 +4325,7 @@ proptest! {
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
         // assign() with variable should NOT be recognized (dynamic)
-        prop_assert!(!artifacts.exported_interface.contains_key(&var_name),
+        prop_assert!(!artifacts.exported_interface.contains_key(var_name.as_str()),
             "assign() with variable should NOT be recognized (dynamic)");
     }
 }
@@ -4355,17 +4355,17 @@ proptest! {
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
         // Iterator should be in exported interface
-        prop_assert!(artifacts.exported_interface.contains_key(&iterator_name),
+        prop_assert!(artifacts.exported_interface.contains_key(iterator_name.as_str()),
             "Loop iterator should be in exported interface");
 
         // Iterator should have Variable kind
-        let symbol = artifacts.exported_interface.get(&iterator_name).unwrap();
+        let symbol = artifacts.exported_interface.get(iterator_name.as_str()).unwrap();
         prop_assert_eq!(symbol.kind, super::scope::SymbolKind::Variable,
             "Loop iterator should have Variable kind");
 
         // Iterator should be available in timeline as Def event
         let has_def_event = artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if symbol.name == iterator_name)
+            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if *symbol.name == *iterator_name)
         });
         prop_assert!(has_def_event, "Loop iterator should have Def event in timeline");
     }
@@ -4389,16 +4389,16 @@ proptest! {
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
         // Both iterator and variable should be in exported interface
-        prop_assert!(artifacts.exported_interface.contains_key(&iterator_name),
+        prop_assert!(artifacts.exported_interface.contains_key(iterator_name.as_str()),
             "Loop iterator should persist after loop");
-        prop_assert!(artifacts.exported_interface.contains_key(&var_name),
+        prop_assert!(artifacts.exported_interface.contains_key(var_name.as_str()),
             "Variable should be in exported interface");
 
         // Get scope at end of code - iterator should be available
         let scope = scope_at_position(&artifacts, 10, 0);
-        prop_assert!(scope.symbols.contains_key(&iterator_name),
+        prop_assert!(scope.symbols.contains_key(iterator_name.as_str()),
             "Loop iterator should be available in scope after loop");
-        prop_assert!(scope.symbols.contains_key(&var_name),
+        prop_assert!(scope.symbols.contains_key(var_name.as_str()),
             "Variable should be available in scope");
     }
 
@@ -4421,17 +4421,17 @@ proptest! {
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
         // Both iterators should be in exported interface
-        prop_assert!(artifacts.exported_interface.contains_key(&outer_iterator),
+        prop_assert!(artifacts.exported_interface.contains_key(outer_iterator.as_str()),
             "Outer loop iterator should be in exported interface");
-        prop_assert!(artifacts.exported_interface.contains_key(&inner_iterator),
+        prop_assert!(artifacts.exported_interface.contains_key(inner_iterator.as_str()),
             "Inner loop iterator should be in exported interface");
 
         // Both should have Def events
         let outer_has_def = artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if symbol.name == outer_iterator)
+            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if *symbol.name == *outer_iterator)
         });
         let inner_has_def = artifacts.timeline.iter().any(|event| {
-            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if symbol.name == inner_iterator)
+            matches!(event, super::scope::ScopeEvent::Def { symbol, .. } if *symbol.name == *inner_iterator)
         });
         prop_assert!(outer_has_def, "Outer iterator should have Def event");
         prop_assert!(inner_has_def, "Inner iterator should have Def event");
@@ -4464,14 +4464,14 @@ proptest! {
         let artifacts = compute_artifacts(&uri, &tree, &code);
 
         // Function should be in exported interface
-        prop_assert!(artifacts.exported_interface.contains_key(&func_name),
+        prop_assert!(artifacts.exported_interface.contains_key(func_name.as_str()),
             "Function should be in exported interface");
 
         // Should have FunctionScope event in timeline
         let has_function_scope = artifacts.timeline.iter().any(|event| {
             matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. }
-                if parameters.iter().any(|p| p.name == param1) &&
-                   parameters.iter().any(|p| p.name == param2))
+                if parameters.iter().any(|p| *p.name == *param1) &&
+                   parameters.iter().any(|p| *p.name == *param2))
         });
         prop_assert!(has_function_scope, "Should have FunctionScope event with parameters");
 
@@ -4479,11 +4479,11 @@ proptest! {
         // Use a position derived from the generated code so it is always within the braces.
         let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
         let scope_in_body = scope_at_position(&artifacts, 0, col_in_body);
-        prop_assert!(scope_in_body.symbols.contains_key(&param1),
+        prop_assert!(scope_in_body.symbols.contains_key(param1.as_str()),
             "Parameter 1 should be available within function body");
-        prop_assert!(scope_in_body.symbols.contains_key(&param2),
+        prop_assert!(scope_in_body.symbols.contains_key(param2.as_str()),
             "Parameter 2 should be available within function body");
-        prop_assert!(scope_in_body.symbols.contains_key(&func_name),
+        prop_assert!(scope_in_body.symbols.contains_key(func_name.as_str()),
             "Function name should be available within function body");
     }
 
@@ -4523,7 +4523,7 @@ proptest! {
         // Should have FunctionScope event with parameter
         let has_function_scope = artifacts.timeline.iter().any(|event| {
             matches!(event, super::scope::ScopeEvent::FunctionScope { parameters, .. }
-                if parameters.iter().any(|p| p.name == param_name))
+                if parameters.iter().any(|p| *p.name == *param_name))
         });
         prop_assert!(has_function_scope, "Should have FunctionScope event with default parameter");
 
@@ -4531,7 +4531,7 @@ proptest! {
         // Use a position derived from the generated code so it is always within the braces.
         let col_in_body = code.find('{').map(|i| (i + 2) as u32).unwrap_or(0);
         let scope_in_body = scope_at_position(&artifacts, 0, col_in_body);
-        prop_assert!(scope_in_body.symbols.contains_key(&param_name),
+        prop_assert!(scope_in_body.symbols.contains_key(param_name.as_str()),
             "Parameter with default value should be available within function body");
     }
 }
@@ -4579,7 +4579,7 @@ proptest! {
         );
 
         // Symbol from child should be available in global scope (local=FALSE)
-        prop_assert!(scope.symbols.contains_key(&symbol_name),
+        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()),
             "Symbol from file sourced with local=FALSE should be available in global scope");
     }
 
@@ -4631,7 +4631,7 @@ proptest! {
         );
 
         // Symbol should be available within function scope (local=TRUE)
-        prop_assert!(scope_in_function.symbols.contains_key(&symbol_name),
+        prop_assert!(scope_in_function.symbols.contains_key(symbol_name.as_str()),
             "Symbol from file sourced with local=TRUE should be available within function scope");
 
         // Get scope outside function (global scope)
@@ -4640,11 +4640,11 @@ proptest! {
         );
 
         // Symbol should NOT be available in global scope (local=TRUE isolates it)
-        prop_assert!(!scope_global.symbols.contains_key(&symbol_name),
+        prop_assert!(!scope_global.symbols.contains_key(symbol_name.as_str()),
             "Symbol from file sourced with local=TRUE should NOT be available in global scope");
 
         // Function name should be available in global scope
-        prop_assert!(scope_global.symbols.contains_key(&func_name),
+        prop_assert!(scope_global.symbols.contains_key(func_name.as_str()),
             "Function name should be available in global scope");
     }
 
@@ -4684,7 +4684,7 @@ proptest! {
         );
 
         // Symbol should be available (default local=FALSE means global scope)
-        prop_assert!(scope.symbols.contains_key(&symbol_name),
+        prop_assert!(scope.symbols.contains_key(symbol_name.as_str()),
             "Symbol from file sourced without explicit local parameter should be available (default local=FALSE)");
 
         // Verify the source() call was detected with local=false by default
@@ -4721,7 +4721,7 @@ proptest! {
         let scope_after_loop = scope_at_position(&artifacts, 10, 0);
 
         // Iterator variable should still be included in available symbols
-        prop_assert!(scope_after_loop.symbols.contains_key(&iterator_name),
+        prop_assert!(scope_after_loop.symbols.contains_key(iterator_name.as_str()),
             "Loop iterator should persist in scope after loop completes");
     }
 
@@ -4747,9 +4747,9 @@ proptest! {
         let scope_after_loops = scope_at_position(&artifacts, 10, 0);
 
         // Both outer and inner iterator variables should be available in scope
-        prop_assert!(scope_after_loops.symbols.contains_key(&outer_iterator),
+        prop_assert!(scope_after_loops.symbols.contains_key(outer_iterator.as_str()),
             "Outer loop iterator should be available after nested loops complete");
-        prop_assert!(scope_after_loops.symbols.contains_key(&inner_iterator),
+        prop_assert!(scope_after_loops.symbols.contains_key(inner_iterator.as_str()),
             "Inner loop iterator should be available after nested loops complete");
     }
 
@@ -4772,11 +4772,11 @@ proptest! {
         let scope_after_for = scope_at_position(&artifacts, 10, 0);
 
         // Iterator definition should take precedence over original variable
-        prop_assert!(scope_after_for.symbols.contains_key(&var_name),
+        prop_assert!(scope_after_for.symbols.contains_key(var_name.as_str()),
             "Variable should be in scope after for loop");
 
         // The symbol should be the iterator (most recent definition)
-        let symbol = scope_after_for.symbols.get(&var_name).unwrap();
+        let symbol = scope_after_for.symbols.get(var_name.as_str()).unwrap();
         prop_assert_eq!(symbol.kind, super::scope::SymbolKind::Variable,
             "Symbol should be Variable kind (iterator)");
     }
@@ -4804,11 +4804,11 @@ proptest! {
         let scope_outside = scope_at_position(&artifacts, 1, 15);
 
         // Function-local variable should NOT be available outside function
-        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+        prop_assert!(!scope_outside.symbols.contains_key(local_var.as_str()),
             "Function-local variable should NOT be available outside function body");
 
         // Function name should be available
-        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+        prop_assert!(scope_outside.symbols.contains_key(func_name.as_str()),
             "Function name should be available outside function");
     }
 
@@ -4837,14 +4837,14 @@ proptest! {
         let scope_in_body = scope_at_position(&artifacts, 0, col_in_body);
 
         // Both parameters should be recognized and included in function body scope
-        prop_assert!(scope_in_body.symbols.contains_key(&param_with_default),
+        prop_assert!(scope_in_body.symbols.contains_key(param_with_default.as_str()),
             "Parameter with default value should be recognized in function body scope");
-        prop_assert!(scope_in_body.symbols.contains_key(&param_without_default),
+        prop_assert!(scope_in_body.symbols.contains_key(param_without_default.as_str()),
             "Parameter without default value should be recognized in function body scope");
 
         // Both should have Parameter kind
-        let param_with_default_symbol = scope_in_body.symbols.get(&param_with_default).unwrap();
-        let param_without_default_symbol = scope_in_body.symbols.get(&param_without_default).unwrap();
+        let param_with_default_symbol = scope_in_body.symbols.get(param_with_default.as_str()).unwrap();
+        let param_without_default_symbol = scope_in_body.symbols.get(param_without_default.as_str()).unwrap();
 
         prop_assert_eq!(param_with_default_symbol.kind, super::scope::SymbolKind::Parameter,
             "Parameter with default should have Parameter kind");
@@ -6175,11 +6175,11 @@ proptest! {
         // The rm() inside the function should NOT affect global scope
         let scope_outside = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+        prop_assert!(scope_outside.symbols.contains_key(global_var.as_str()),
             "Global variable should be available outside function (rm inside function should not affect it)");
-        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+        prop_assert!(scope_outside.symbols.contains_key(func_name.as_str()),
             "Function name should be available outside function");
-        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+        prop_assert!(!scope_outside.symbols.contains_key(local_var.as_str()),
             "Function-local variable should NOT be available outside function (never exported)");
     }
 
@@ -6219,9 +6219,9 @@ proptest! {
         // Use the line after rm() which should be the comment line
         let scope_after_rm = scope_at_position(&artifacts, rm_line + 1, 5);
 
-        prop_assert!(scope_after_rm.symbols.contains_key(&func_name),
+        prop_assert!(scope_after_rm.symbols.contains_key(func_name.as_str()),
             "Function name should be available inside function");
-        prop_assert!(!scope_after_rm.symbols.contains_key(&local_var),
+        prop_assert!(!scope_after_rm.symbols.contains_key(local_var.as_str()),
             "Local variable should NOT be in scope after rm() within function body");
     }
 
@@ -6247,7 +6247,7 @@ proptest! {
         // Query scope at position after rm() at global level
         let scope_after_rm = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(!scope_after_rm.symbols.contains_key(&var_name),
+        prop_assert!(!scope_after_rm.symbols.contains_key(var_name.as_str()),
             "Variable should NOT be in scope after rm() at global level");
     }
 
@@ -6278,9 +6278,9 @@ proptest! {
         // Query scope at position after function definition (global scope)
         let scope_after_func = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(scope_after_func.symbols.contains_key(&var_name),
+        prop_assert!(scope_after_func.symbols.contains_key(var_name.as_str()),
             "Global variable should still be in scope after function with rm() inside");
-        prop_assert!(scope_after_func.symbols.contains_key(&func_name),
+        prop_assert!(scope_after_func.symbols.contains_key(func_name.as_str()),
             "Function name should be available");
     }
 
@@ -6319,14 +6319,14 @@ proptest! {
 
         let scope_outer_after_inner = scope_at_position(&artifacts, comment_line, 5);
 
-        prop_assert!(scope_outer_after_inner.symbols.contains_key(&outer_func),
+        prop_assert!(scope_outer_after_inner.symbols.contains_key(outer_func.as_str()),
             "Outer function should be available inside itself");
-        prop_assert!(scope_outer_after_inner.symbols.contains_key(&outer_var),
+        prop_assert!(scope_outer_after_inner.symbols.contains_key(outer_var.as_str()),
             "Outer variable should still be in scope (rm in inner function should not affect it)");
-        prop_assert!(scope_outer_after_inner.symbols.contains_key(&inner_func),
+        prop_assert!(scope_outer_after_inner.symbols.contains_key(inner_func.as_str()),
             "Inner function should be available inside outer function");
         // inner_var is local to inner function, so it should NOT be available in outer function
-        prop_assert!(!scope_outer_after_inner.symbols.contains_key(&inner_var),
+        prop_assert!(!scope_outer_after_inner.symbols.contains_key(inner_var.as_str()),
             "Inner variable should NOT be available outside inner function");
     }
 
@@ -6356,11 +6356,11 @@ proptest! {
         // At end of file (outside function), global variable should still be in scope
         let scope_outside = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+        prop_assert!(scope_outside.symbols.contains_key(global_var.as_str()),
             "Global variable should be available outside function (remove inside function should not affect it)");
-        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+        prop_assert!(scope_outside.symbols.contains_key(func_name.as_str()),
             "Function name should be available outside function");
-        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+        prop_assert!(!scope_outside.symbols.contains_key(local_var.as_str()),
             "Function-local variable should NOT be available outside function");
     }
 
@@ -6390,11 +6390,11 @@ proptest! {
         // At end of file (outside function), global variable should still be in scope
         let scope_outside = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(scope_outside.symbols.contains_key(&global_var),
+        prop_assert!(scope_outside.symbols.contains_key(global_var.as_str()),
             "Global variable should be available outside function (rm(list=...) inside function should not affect it)");
-        prop_assert!(scope_outside.symbols.contains_key(&func_name),
+        prop_assert!(scope_outside.symbols.contains_key(func_name.as_str()),
             "Function name should be available outside function");
-        prop_assert!(!scope_outside.symbols.contains_key(&local_var),
+        prop_assert!(!scope_outside.symbols.contains_key(local_var.as_str()),
             "Function-local variable should NOT be available outside function");
     }
 }
@@ -6437,7 +6437,7 @@ proptest! {
         // Query scope at position after rm() - symbol should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm() (define then remove)");
     }
 
@@ -6467,7 +6467,7 @@ proptest! {
         // Query scope at position after definition - symbol SHOULD be in scope
         let scope_after_define = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(scope_after_define.symbols.contains_key(&symbol),
+        prop_assert!(scope_after_define.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope after definition (remove then define)");
     }
 
@@ -6498,7 +6498,7 @@ proptest! {
         // Query scope at position after second definition - symbol SHOULD be in scope
         let scope_after_second_define = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(scope_after_second_define.symbols.contains_key(&symbol),
+        prop_assert!(scope_after_second_define.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope after second definition (define, remove, define)");
     }
 
@@ -6528,12 +6528,12 @@ proptest! {
 
         // Query scope at line 1 (between definition and removal) - symbol SHOULD be in scope
         let scope_between = scope_at_position(&artifacts, 1, 0);
-        prop_assert!(scope_between.symbols.contains_key(&symbol),
+        prop_assert!(scope_between.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope between definition and removal");
 
         // Query scope at line 3 (after removal) - symbol should NOT be in scope
         let scope_after = scope_at_position(&artifacts, 3, 0);
-        prop_assert!(!scope_after.symbols.contains_key(&symbol),
+        prop_assert!(!scope_after.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after removal");
     }
 
@@ -6565,17 +6565,17 @@ proptest! {
 
         // Line 1: after first definition, before removal - symbol SHOULD be in scope
         let scope_after_first_def = scope_at_position(&artifacts, 1, 0);
-        prop_assert!(scope_after_first_def.symbols.contains_key(&symbol),
+        prop_assert!(scope_after_first_def.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope after first definition");
 
         // Line 3: after removal, before second definition - symbol should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 3, 0);
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after removal");
 
         // Line 5: after second definition - symbol SHOULD be in scope
         let scope_after_second_def = scope_at_position(&artifacts, 5, 0);
-        prop_assert!(scope_after_second_def.symbols.contains_key(&symbol),
+        prop_assert!(scope_after_second_def.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope after second definition");
     }
 
@@ -6610,9 +6610,9 @@ proptest! {
         // Query scope at end - x should NOT be in scope, y SHOULD be in scope
         let scope_end = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(!scope_end.symbols.contains_key(&symbol_x),
+        prop_assert!(!scope_end.symbols.contains_key(symbol_x.as_str()),
             "Symbol x should NOT be in scope after rm(x)");
-        prop_assert!(scope_end.symbols.contains_key(&symbol_y),
+        prop_assert!(scope_end.symbols.contains_key(symbol_y.as_str()),
             "Symbol y should still be in scope (not removed)");
     }
 
@@ -6643,7 +6643,7 @@ proptest! {
         // Query scope at end - symbol should NOT be in scope
         let scope_end = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+        prop_assert!(!scope_end.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after multiple removals");
     }
 
@@ -6673,7 +6673,7 @@ proptest! {
         // Query scope at end - symbol should NOT be in scope
         let scope_end = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+        prop_assert!(!scope_end.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after remove() (same as rm())");
     }
 
@@ -6703,7 +6703,7 @@ proptest! {
         // Query scope at end - symbol should NOT be in scope
         let scope_end = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+        prop_assert!(!scope_end.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm(list=...) (same as rm())");
     }
 
@@ -6738,9 +6738,9 @@ proptest! {
         // Query scope at end - neither symbol should be in scope
         let scope_end = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(!scope_end.symbols.contains_key(&symbol_x),
+        prop_assert!(!scope_end.symbols.contains_key(symbol_x.as_str()),
             "Symbol x should NOT be in scope after rm(x, y)");
-        prop_assert!(!scope_end.symbols.contains_key(&symbol_y),
+        prop_assert!(!scope_end.symbols.contains_key(symbol_y.as_str()),
             "Symbol y should NOT be in scope after rm(x, y)");
     }
 
@@ -6777,9 +6777,9 @@ proptest! {
         // Query scope at end
         let scope_end = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(scope_end.symbols.contains_key(&symbol_x),
+        prop_assert!(scope_end.symbols.contains_key(symbol_x.as_str()),
             "Symbol x should be in scope (redefined after removal)");
-        prop_assert!(!scope_end.symbols.contains_key(&symbol_y),
+        prop_assert!(!scope_end.symbols.contains_key(symbol_y.as_str()),
             "Symbol y should NOT be in scope (removed and not redefined)");
     }
 
@@ -6808,7 +6808,7 @@ proptest! {
         // Query scope at end - symbol should NOT be in scope (was never defined)
         let scope_end = scope_at_position(&artifacts, 10, 0);
 
-        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+        prop_assert!(!scope_end.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope (was never defined, rm had no effect)");
     }
 
@@ -6837,7 +6837,7 @@ proptest! {
         // Query scope at end of line - symbol should NOT be in scope
         let scope_end = scope_at_position(&artifacts, 0, 100);
 
-        prop_assert!(!scope_end.symbols.contains_key(&symbol),
+        prop_assert!(!scope_end.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope at end of line after same-line rm()");
     }
 
@@ -6867,12 +6867,12 @@ proptest! {
 
         // Query scope just before rm() - symbol SHOULD be in scope
         let scope_before_rm = scope_at_position(&artifacts, 0, rm_pos.saturating_sub(1));
-        prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
+        prop_assert!(scope_before_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope between definition and rm() on same line");
 
         // Query scope after rm() - symbol should NOT be in scope
         let scope_after_rm = scope_at_position(&artifacts, 0, rm_pos + 10);
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm() on same line");
     }
 }
@@ -6938,21 +6938,21 @@ proptest! {
         let scope_before_rm = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
+        prop_assert!(scope_before_rm.symbols.contains_key(symbol.as_str()),
             "Symbol from sourced file should be in scope after source() but before rm()");
 
         // After rm() (line 1), symbol should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm()");
 
         // At end of file, symbol should NOT be in scope
         let scope_eof = scope_at_position_with_graph(
             &parent_uri, 10, 0, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(!scope_eof.symbols.contains_key(&symbol),
+        prop_assert!(!scope_eof.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope at end of file after rm()");
     }
 
@@ -7005,9 +7005,9 @@ proptest! {
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_to_remove),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol_to_remove.as_str()),
             "Removed symbol should NOT be in scope after rm()");
-        prop_assert!(scope_after_rm.symbols.contains_key(&symbol_to_keep),
+        prop_assert!(scope_after_rm.symbols.contains_key(symbol_to_keep.as_str()),
             "Non-removed symbol should still be in scope after rm()");
     }
 
@@ -7061,22 +7061,22 @@ proptest! {
         let scope_before_rm = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_before_rm.symbols.contains_key(&symbol_a),
+        prop_assert!(scope_before_rm.symbols.contains_key(symbol_a.as_str()),
             "symbol_a should be in scope before rm()");
-        prop_assert!(scope_before_rm.symbols.contains_key(&symbol_b),
+        prop_assert!(scope_before_rm.symbols.contains_key(symbol_b.as_str()),
             "symbol_b should be in scope before rm()");
-        prop_assert!(scope_before_rm.symbols.contains_key(&symbol_c),
+        prop_assert!(scope_before_rm.symbols.contains_key(symbol_c.as_str()),
             "symbol_c should be in scope before rm()");
 
         // After rm() (line 1), symbol_a and symbol_b should NOT be in scope, but symbol_c should be
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_a),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol_a.as_str()),
             "symbol_a should NOT be in scope after rm()");
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_b),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol_b.as_str()),
             "symbol_b should NOT be in scope after rm()");
-        prop_assert!(scope_after_rm.symbols.contains_key(&symbol_c),
+        prop_assert!(scope_after_rm.symbols.contains_key(symbol_c.as_str()),
             "symbol_c should still be in scope after rm()");
     }
 
@@ -7122,14 +7122,14 @@ proptest! {
         let scope_before_remove = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_before_remove.symbols.contains_key(&symbol),
+        prop_assert!(scope_before_remove.symbols.contains_key(symbol.as_str()),
             "Symbol from sourced file should be in scope after source() but before remove()");
 
         // After remove() (line 1), symbol should NOT be in scope
         let scope_after_remove = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(!scope_after_remove.symbols.contains_key(&symbol),
+        prop_assert!(!scope_after_remove.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after remove()");
     }
 
@@ -7175,14 +7175,14 @@ proptest! {
         let scope_before_rm = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_before_rm.symbols.contains_key(&symbol),
+        prop_assert!(scope_before_rm.symbols.contains_key(symbol.as_str()),
             "Symbol from sourced file should be in scope after source() but before rm(list=...)");
 
         // After rm(list=...) (line 1), symbol should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm(list=...)");
     }
 
@@ -7239,11 +7239,11 @@ proptest! {
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_a),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol_a.as_str()),
             "symbol_a should NOT be in scope after rm(list=c(...))");
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol_b),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol_b.as_str()),
             "symbol_b should NOT be in scope after rm(list=c(...))");
-        prop_assert!(scope_after_rm.symbols.contains_key(&symbol_c),
+        prop_assert!(scope_after_rm.symbols.contains_key(symbol_c.as_str()),
             "symbol_c should still be in scope after rm(list=c(...))");
     }
 
@@ -7292,21 +7292,21 @@ proptest! {
         let scope_after_source = scope_at_position_with_graph(
             &parent_uri, 0, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_after_source.symbols.contains_key(&symbol),
+        prop_assert!(scope_after_source.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope after source() but before rm()");
 
         // After rm() but before redefinition (line 1), symbol should NOT be in scope
         let scope_after_rm = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(!scope_after_rm.symbols.contains_key(&symbol),
+        prop_assert!(!scope_after_rm.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope after rm() but before redefinition");
 
         // After redefinition (line 2), symbol should be in scope again
         let scope_after_redef = scope_at_position_with_graph(
             &parent_uri, 2, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_after_redef.symbols.contains_key(&symbol),
+        prop_assert!(scope_after_redef.symbols.contains_key(symbol.as_str()),
             "Symbol should be in scope after redefinition");
     }
 
@@ -7353,14 +7353,14 @@ proptest! {
         let scope_in_child = scope_at_position_with_graph(
             &child_uri, 0, 40, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(scope_in_child.symbols.contains_key(&symbol),
+        prop_assert!(scope_in_child.symbols.contains_key(symbol.as_str()),
             "Symbol should still be in scope in child file (child's own definition)");
 
         // In parent file after rm(), the symbol should NOT be in scope
         let scope_in_parent = scope_at_position_with_graph(
             &parent_uri, 1, 20, &get_artifacts, &get_metadata, &graph, Some(&workspace_root), 10, &HashSet::new(),
         );
-        prop_assert!(!scope_in_parent.symbols.contains_key(&symbol),
+        prop_assert!(!scope_in_parent.symbols.contains_key(symbol.as_str()),
             "Symbol should NOT be in scope in parent file after rm()");
     }
 }
@@ -9249,14 +9249,14 @@ proptest! {
         // (either from base package or shadowed by local definition)
         for export in &base_exports {
             prop_assert!(
-                scope.symbols.contains_key(export),
+                scope.symbols.contains_key(export.as_str()),
                 "Base export '{}' should be available at position ({}, {}) in code:\n{}",
                 export, query_line, query_column, code
             );
 
             // Verify the symbol has the correct package:base URI
             // (since we use exports unlikely to be shadowed)
-            let symbol = scope.symbols.get(export).unwrap();
+            let symbol = scope.symbols.get(export.as_str()).unwrap();
             prop_assert_eq!(
                 symbol.source_uri.as_str(), "package:base",
                 "Base export '{}' should have package:base URI, got '{}'. Code:\n{}",
@@ -9290,7 +9290,7 @@ proptest! {
         // All base exports should be available
         for export in &base_exports {
             prop_assert!(
-                scope.symbols.contains_key(export),
+                scope.symbols.contains_key(export.as_str()),
                 "Base export '{}' should be available at file start (0, 0). Code:\n{}",
                 export, code
             );
@@ -9324,7 +9324,7 @@ proptest! {
         // All base exports should be available
         for export in &base_exports {
             prop_assert!(
-                scope.symbols.contains_key(export),
+                scope.symbols.contains_key(export.as_str()),
                 "Base export '{}' should be available at file end ({}, {}). Code:\n{}",
                 export, last_line, last_line_len, code
             );
@@ -9367,7 +9367,7 @@ proptest! {
         // All base exports should be available inside the function
         for export in &base_exports {
             prop_assert!(
-                scope.symbols.contains_key(export),
+                scope.symbols.contains_key(export.as_str()),
                 "Base export '{}' should be available inside function. Code:\n{}",
                 export, code
             );
@@ -9408,7 +9408,7 @@ proptest! {
         // All base exports should be available before library()
         for export in &base_exports {
             prop_assert!(
-                scope.symbols.contains_key(export),
+                scope.symbols.contains_key(export.as_str()),
                 "Base export '{}' should be available before library() call. Code:\n{}",
                 export, code
             );
@@ -9443,7 +9443,7 @@ proptest! {
         // Base exports should still be available
         for export in &base_exports {
             prop_assert!(
-                scope.symbols.contains_key(export),
+                scope.symbols.contains_key(export.as_str()),
                 "Base export '{}' should still be available after loading package '{}'. Code:\n{}",
                 export, pkg, code
             );
@@ -10201,7 +10201,7 @@ proptest! {
 
         // Symbols from child SHOULD be available in parent
         prop_assert!(
-            scope.symbols.contains_key(&func_name),
+            scope.symbols.contains_key(func_name.as_str()),
             "Parent should have '{}' symbol from child (symbols propagate). Got symbols: {:?}",
             func_name, scope.symbols.keys().collect::<Vec<_>>()
         );
@@ -10507,14 +10507,14 @@ proptest! {
         // Requirement 8.1, 8.2: The symbol should be in scope after the library() call
         // This means the Diagnostic_Engine would NOT emit an "undefined variable" warning
         prop_assert!(
-            scope.symbols.contains_key(&export_name),
+            scope.symbols.contains_key(export_name.as_str()),
             "Package export '{}' from package '{}' should be in scope at line {} (after library() on line {}). \
              This means no 'undefined variable' warning would be emitted. Code:\n{}",
             export_name, package, usage_line, library_line, code
         );
 
         // Verify the symbol has the correct package URI
-        let symbol = scope.symbols.get(&export_name).unwrap();
+        let symbol = scope.symbols.get(export_name.as_str()).unwrap();
         let expected_uri = format!("package:{}", package);
         prop_assert_eq!(
             symbol.source_uri.as_str(), expected_uri.as_str(),
@@ -10576,12 +10576,12 @@ proptest! {
 
         // Both exports should be in scope
         prop_assert!(
-            scope.symbols.contains_key(&export1),
+            scope.symbols.contains_key(export1.as_str()),
             "Export '{}' from package '{}' should be in scope. Code:\n{}",
             export1, pkg1, code
         );
         prop_assert!(
-            scope.symbols.contains_key(&export2),
+            scope.symbols.contains_key(export2.as_str()),
             "Export '{}' from package '{}' should be in scope. Code:\n{}",
             export2, pkg2, code
         );
@@ -10641,7 +10641,7 @@ proptest! {
         // The export should NOT be in scope before the library() call
         // This means the Diagnostic_Engine WOULD emit an "undefined variable" warning
         prop_assert!(
-            !scope.symbols.contains_key(&export_name),
+            !scope.symbols.contains_key(export_name.as_str()),
             "Package export '{}' from package '{}' should NOT be in scope at line 0 (before library()). \
              This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
             export_name, package, code
@@ -10694,7 +10694,7 @@ proptest! {
 
         // Export should be in scope inside the function
         prop_assert!(
-            scope_inside.symbols.contains_key(&export_name),
+            scope_inside.symbols.contains_key(export_name.as_str()),
             "Package export '{}' should be in scope inside function after library(). Code:\n{}",
             export_name, code
         );
@@ -10705,7 +10705,7 @@ proptest! {
         // Export should NOT be in scope outside the function
         // (function-scoped library() doesn't affect global scope)
         prop_assert!(
-            !scope_outside.symbols.contains_key(&export_name),
+            !scope_outside.symbols.contains_key(export_name.as_str()),
             "Package export '{}' should NOT be in scope outside function (function-scoped library). Code:\n{}",
             export_name, code
         );
@@ -10752,14 +10752,14 @@ proptest! {
 
         // Symbol should be in scope (either from package or local definition)
         prop_assert!(
-            scope.symbols.contains_key(&symbol_name),
+            scope.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should be in scope (from local definition or package). Code:\n{}",
             symbol_name, code
         );
 
         // The symbol should be from the local definition, not the package
         // (local definitions take precedence)
-        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        let symbol = scope.symbols.get(symbol_name.as_str()).unwrap();
         prop_assert!(
             !symbol.source_uri.as_str().starts_with("package:"),
             "Symbol '{}' should be from local definition, not package. Got URI: '{}'. Code:\n{}",
@@ -10770,10 +10770,11 @@ proptest! {
     /// Feature: package-function-awareness, Property 11 extended: Same export from multiple packages
     /// **Validates: Requirements 8.1, 8.2**
     ///
-    /// When multiple packages export the same symbol, the first loaded package's
-    /// export should be used (but either way, diagnostics are suppressed).
+    /// When multiple packages export the same symbol, the last loaded package's
+    /// export should mask earlier ones (matching R's search path behavior where
+    /// later library() calls attach higher on the search path).
     #[test]
-    fn prop_package_export_first_loaded_wins(
+    fn prop_package_export_last_loaded_wins(
         pkg1 in pkg_name(),
         pkg2 in pkg_name(),
         export_name in r_identifier(),
@@ -10781,7 +10782,7 @@ proptest! {
         // Ensure packages are distinct
         prop_assume!(pkg1 != pkg2);
 
-        let uri = make_url("test_first_pkg_wins");
+        let uri = make_url("test_last_pkg_wins");
 
         // Code with two library calls, both packages export same symbol
         let code = format!(
@@ -10813,19 +10814,19 @@ proptest! {
 
         // Symbol should be in scope (diagnostics suppressed)
         prop_assert!(
-            scope.symbols.contains_key(&export_name),
+            scope.symbols.contains_key(export_name.as_str()),
             "Export '{}' should be in scope (from either package). Code:\n{}",
             export_name, code
         );
 
-        // The symbol should be from pkg1 (first loaded) since pkg2's export
-        // doesn't override non-base exports
-        let symbol = scope.symbols.get(&export_name).unwrap();
-        let expected_uri = format!("package:{}", pkg1);
+        // The symbol should be from pkg2 (last loaded) since later library()
+        // calls mask earlier ones, matching R's search path behavior
+        let symbol = scope.symbols.get(export_name.as_str()).unwrap();
+        let expected_uri = format!("package:{}", pkg2);
         prop_assert_eq!(
             symbol.source_uri.as_str(), expected_uri.as_str(),
-            "Export '{}' should be from first loaded package '{}', got '{}'. Code:\n{}",
-            export_name, pkg1, symbol.source_uri.as_str(), code
+            "Export '{}' should be from last loaded package '{}', got '{}'. Code:\n{}",
+            export_name, pkg2, symbol.source_uri.as_str(), code
         );
     }
 }
@@ -10915,7 +10916,7 @@ proptest! {
         // Requirement 8.3: The symbol should NOT be in scope before the library() call
         // This means the Diagnostic_Engine WOULD emit an "undefined variable" warning
         prop_assert!(
-            !scope.symbols.contains_key(&export_name),
+            !scope.symbols.contains_key(export_name.as_str()),
             "Package export '{}' from package '{}' should NOT be in scope at line 0 (before library() on line {}). \
              This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
             export_name, package, library_line, code
@@ -10980,7 +10981,7 @@ proptest! {
 
             // Requirement 8.3: Symbol should NOT be in scope at any position before library()
             prop_assert!(
-                !scope.symbols.contains_key(&export_name),
+                !scope.symbols.contains_key(export_name.as_str()),
                 "Package export '{}' should NOT be in scope at line {} (before library() on line {}). \
                  This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
                 export_name, check_line, library_line, code
@@ -10990,7 +10991,7 @@ proptest! {
         // Verify it IS in scope after the library call (sanity check)
         let scope_after = scope_at_position_with_packages(&artifacts, (library_line + 1) as u32, 10, &get_exports, &base_exports);
         prop_assert!(
-            scope_after.symbols.contains_key(&export_name),
+            scope_after.symbols.contains_key(export_name.as_str()),
             "Package export '{}' SHOULD be in scope at line {} (after library() on line {}). Code:\n{}",
             export_name, library_line + 1, library_line, code
         );
@@ -11037,7 +11038,7 @@ proptest! {
         // Requirement 8.3: Symbol should NOT be in scope before the library() call
         // even on the same line
         prop_assert!(
-            !scope.symbols.contains_key(&export_name),
+            !scope.symbols.contains_key(export_name.as_str()),
             "Package export '{}' should NOT be in scope at column 0 (before library() call on same line). \
              This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
             export_name, code
@@ -11090,7 +11091,7 @@ proptest! {
 
         // Requirement 8.3: Symbol should NOT be in scope before library() inside function
         prop_assert!(
-            !scope_before.symbols.contains_key(&export_name),
+            !scope_before.symbols.contains_key(export_name.as_str()),
             "Package export '{}' should NOT be in scope at line 1 (before library() inside function). \
              This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
             export_name, code
@@ -11101,7 +11102,7 @@ proptest! {
 
         // Sanity check: Symbol SHOULD be in scope after library() inside function
         prop_assert!(
-            scope_after.symbols.contains_key(&export_name),
+            scope_after.symbols.contains_key(export_name.as_str()),
             "Package export '{}' SHOULD be in scope at line 3 (after library() inside function). Code:\n{}",
             export_name, code
         );
@@ -11158,12 +11159,12 @@ proptest! {
         // Line 0: Before both library calls - neither export should be in scope
         let scope_0 = scope_at_position_with_packages(&artifacts, 0, 0, &get_exports, &base_exports);
         prop_assert!(
-            !scope_0.symbols.contains_key(&export1),
+            !scope_0.symbols.contains_key(export1.as_str()),
             "Export '{}' from pkg1 should NOT be in scope at line 0 (before library(pkg1)). Code:\n{}",
             export1, code
         );
         prop_assert!(
-            !scope_0.symbols.contains_key(&export2),
+            !scope_0.symbols.contains_key(export2.as_str()),
             "Export '{}' from pkg2 should NOT be in scope at line 0 (before library(pkg2)). Code:\n{}",
             export2, code
         );
@@ -11171,12 +11172,12 @@ proptest! {
         // Line 2: After pkg1, before pkg2 - only export1 should be in scope
         let scope_2 = scope_at_position_with_packages(&artifacts, 2, 0, &get_exports, &base_exports);
         prop_assert!(
-            scope_2.symbols.contains_key(&export1),
+            scope_2.symbols.contains_key(export1.as_str()),
             "Export '{}' from pkg1 SHOULD be in scope at line 2 (after library(pkg1)). Code:\n{}",
             export1, code
         );
         prop_assert!(
-            !scope_2.symbols.contains_key(&export2),
+            !scope_2.symbols.contains_key(export2.as_str()),
             "Export '{}' from pkg2 should NOT be in scope at line 2 (before library(pkg2)). Code:\n{}",
             export2, code
         );
@@ -11184,12 +11185,12 @@ proptest! {
         // Line 4: After both library calls - both exports should be in scope
         let scope_4 = scope_at_position_with_packages(&artifacts, 4, 0, &get_exports, &base_exports);
         prop_assert!(
-            scope_4.symbols.contains_key(&export1),
+            scope_4.symbols.contains_key(export1.as_str()),
             "Export '{}' from pkg1 SHOULD be in scope at line 4 (after both library calls). Code:\n{}",
             export1, code
         );
         prop_assert!(
-            scope_4.symbols.contains_key(&export2),
+            scope_4.symbols.contains_key(export2.as_str()),
             "Export '{}' from pkg2 SHOULD be in scope at line 4 (after both library calls). Code:\n{}",
             export2, code
         );
@@ -11297,7 +11298,7 @@ proptest! {
         // Requirement 8.4: The NON-exported symbol should NOT be in scope
         // This means the Diagnostic_Engine WOULD emit an "undefined variable" warning
         prop_assert!(
-            !scope.symbols.contains_key(&non_exported_name),
+            !scope.symbols.contains_key(non_exported_name.as_str()),
             "Non-exported symbol '{}' should NOT be in scope at line {} (after library({}) on line {}). \
              Package '{}' only exports '{}'. \
              This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
@@ -11306,7 +11307,7 @@ proptest! {
 
         // Sanity check: The exported symbol SHOULD be in scope
         prop_assert!(
-            scope.symbols.contains_key(&exported_name),
+            scope.symbols.contains_key(exported_name.as_str()),
             "Exported symbol '{}' SHOULD be in scope at line {} (after library({}) on line {}). Code:\n{}",
             exported_name, usage_line, package, library_line, code
         );
@@ -11368,7 +11369,7 @@ proptest! {
 
         // Requirement 8.4: Non-exported symbol should NOT be in scope
         prop_assert!(
-            !scope.symbols.contains_key(&non_exported),
+            !scope.symbols.contains_key(non_exported.as_str()),
             "Non-exported symbol '{}' should NOT be in scope even after loading packages '{}' and '{}'. \
              Package '{}' exports '{}', package '{}' exports '{}'. \
              This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
@@ -11377,12 +11378,12 @@ proptest! {
 
         // Sanity check: Both exported symbols SHOULD be in scope
         prop_assert!(
-            scope.symbols.contains_key(&export1),
+            scope.symbols.contains_key(export1.as_str()),
             "Exported symbol '{}' from package '{}' SHOULD be in scope. Code:\n{}",
             export1, pkg1, code
         );
         prop_assert!(
-            scope.symbols.contains_key(&export2),
+            scope.symbols.contains_key(export2.as_str()),
             "Exported symbol '{}' from package '{}' SHOULD be in scope. Code:\n{}",
             export2, pkg2, code
         );
@@ -11426,7 +11427,7 @@ proptest! {
 
         // Requirement 8.4: Symbol should NOT be in scope (package has no exports)
         prop_assert!(
-            !scope.symbols.contains_key(&symbol_name),
+            !scope.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should NOT be in scope after loading package '{}' with empty exports. \
              This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
             symbol_name, package, code
@@ -11481,7 +11482,7 @@ proptest! {
 
         // Requirement 8.4: Non-exported symbol should NOT be in scope inside function
         prop_assert!(
-            !scope_inside.symbols.contains_key(&non_exported_name),
+            !scope_inside.symbols.contains_key(non_exported_name.as_str()),
             "Non-exported symbol '{}' should NOT be in scope inside function after library({}). \
              Package only exports '{}'. Code:\n{}",
             non_exported_name, package, exported_name, code
@@ -11492,7 +11493,7 @@ proptest! {
 
         // Non-exported symbol should NOT be in scope outside function either
         prop_assert!(
-            !scope_outside.symbols.contains_key(&non_exported_name),
+            !scope_outside.symbols.contains_key(non_exported_name.as_str()),
             "Non-exported symbol '{}' should NOT be in scope outside function. Code:\n{}",
             non_exported_name, code
         );
@@ -11543,7 +11544,7 @@ proptest! {
 
         // Requirement 8.4: Similar-but-different symbol should NOT be in scope
         prop_assert!(
-            !scope.symbols.contains_key(&similar_name),
+            !scope.symbols.contains_key(similar_name.as_str()),
             "Similar symbol '{}' should NOT be in scope (only '{}' is exported by '{}'). \
              This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
             similar_name, exported_name, package, code
@@ -11551,7 +11552,7 @@ proptest! {
 
         // Sanity check: The exact exported name SHOULD be in scope
         prop_assert!(
-            scope.symbols.contains_key(&exported_name),
+            scope.symbols.contains_key(exported_name.as_str()),
             "Exported symbol '{}' SHOULD be in scope. Code:\n{}",
             exported_name, code
         );
@@ -11608,7 +11609,7 @@ proptest! {
         // Requirement 8.4: Non-exported symbol should NOT be in scope
         // (even though base packages are available)
         prop_assert!(
-            !scope.symbols.contains_key(&non_exported_name),
+            !scope.symbols.contains_key(non_exported_name.as_str()),
             "Non-exported symbol '{}' should NOT be in scope (not in package '{}' exports or base). \
              This means an 'undefined variable' warning WOULD be emitted. Code:\n{}",
             non_exported_name, package, code
@@ -11616,12 +11617,12 @@ proptest! {
 
         // Sanity checks
         prop_assert!(
-            scope.symbols.contains_key(&exported_name),
+            scope.symbols.contains_key(exported_name.as_str()),
             "Exported symbol '{}' from package '{}' SHOULD be in scope. Code:\n{}",
             exported_name, package, code
         );
         prop_assert!(
-            scope.symbols.contains_key(&base_export),
+            scope.symbols.contains_key(base_export.as_str()),
             "Base export '{}' SHOULD be in scope. Code:\n{}",
             base_export, code
         );
@@ -11715,19 +11716,19 @@ proptest! {
 
         // Requirement 9.1: All exports from the loaded package should be in scope
         prop_assert!(
-            scope.symbols.contains_key(&export1),
+            scope.symbols.contains_key(export1.as_str()),
             "Package export '{}' from package '{}' should be in scope at line {} (after library() on line {}). \
              This means it would appear in completions. Code:\n{}",
             export1, package, query_line, library_line, code
         );
         prop_assert!(
-            scope.symbols.contains_key(&export2),
+            scope.symbols.contains_key(export2.as_str()),
             "Package export '{}' from package '{}' should be in scope at line {} (after library() on line {}). \
              This means it would appear in completions. Code:\n{}",
             export2, package, query_line, library_line, code
         );
         prop_assert!(
-            scope.symbols.contains_key(&export3),
+            scope.symbols.contains_key(export3.as_str()),
             "Package export '{}' from package '{}' should be in scope at line {} (after library() on line {}). \
              This means it would appear in completions. Code:\n{}",
             export3, package, query_line, library_line, code
@@ -11736,21 +11737,21 @@ proptest! {
         // Requirement 9.2: Each export should have the correct package attribution
         let expected_uri = format!("package:{}", package);
 
-        let symbol1 = scope.symbols.get(&export1).unwrap();
+        let symbol1 = scope.symbols.get(export1.as_str()).unwrap();
         prop_assert_eq!(
             symbol1.source_uri.as_str(), expected_uri.as_str(),
             "Package export '{}' should have URI '{}' for package attribution, got '{}'. Code:\n{}",
             export1, expected_uri, symbol1.source_uri.as_str(), code
         );
 
-        let symbol2 = scope.symbols.get(&export2).unwrap();
+        let symbol2 = scope.symbols.get(export2.as_str()).unwrap();
         prop_assert_eq!(
             symbol2.source_uri.as_str(), expected_uri.as_str(),
             "Package export '{}' should have URI '{}' for package attribution, got '{}'. Code:\n{}",
             export2, expected_uri, symbol2.source_uri.as_str(), code
         );
 
-        let symbol3 = scope.symbols.get(&export3).unwrap();
+        let symbol3 = scope.symbols.get(export3.as_str()).unwrap();
         prop_assert_eq!(
             symbol3.source_uri.as_str(), expected_uri.as_str(),
             "Package export '{}' should have URI '{}' for package attribution, got '{}'. Code:\n{}",
@@ -11811,18 +11812,18 @@ proptest! {
 
         // Requirement 9.1: Both exports should be in scope
         prop_assert!(
-            scope.symbols.contains_key(&export1),
+            scope.symbols.contains_key(export1.as_str()),
             "Export '{}' from package '{}' should be in scope. Code:\n{}",
             export1, pkg1, code
         );
         prop_assert!(
-            scope.symbols.contains_key(&export2),
+            scope.symbols.contains_key(export2.as_str()),
             "Export '{}' from package '{}' should be in scope. Code:\n{}",
             export2, pkg2, code
         );
 
         // Requirement 9.2: Each export should have correct package attribution
-        let symbol1 = scope.symbols.get(&export1).unwrap();
+        let symbol1 = scope.symbols.get(export1.as_str()).unwrap();
         let expected_uri1 = format!("package:{}", pkg1);
         prop_assert_eq!(
             symbol1.source_uri.as_str(), expected_uri1.as_str(),
@@ -11830,7 +11831,7 @@ proptest! {
             export1, expected_uri1, symbol1.source_uri.as_str(), code
         );
 
-        let symbol2 = scope.symbols.get(&export2).unwrap();
+        let symbol2 = scope.symbols.get(export2.as_str()).unwrap();
         let expected_uri2 = format!("package:{}", pkg2);
         prop_assert_eq!(
             symbol2.source_uri.as_str(), expected_uri2.as_str(),
@@ -11842,8 +11843,8 @@ proptest! {
     /// Feature: package-function-awareness, Property 14 extended: Duplicate exports
     /// **Validates: Requirements 9.2, 9.3**
     ///
-    /// When multiple packages export the same symbol, the first loaded package's
-    /// export should be used (but both would be shown in completions with attribution).
+    /// When multiple packages export the same symbol, the last loaded package's
+    /// export should mask earlier ones (matching R's search path behavior).
     /// This test verifies the scope resolution behavior for duplicate exports.
     #[test]
     fn prop_package_completion_duplicate_exports(
@@ -11886,19 +11887,19 @@ proptest! {
 
         // The symbol should be in scope
         prop_assert!(
-            scope.symbols.contains_key(&shared_export),
+            scope.symbols.contains_key(shared_export.as_str()),
             "Shared export '{}' should be in scope. Code:\n{}",
             shared_export, code
         );
 
-        // The first loaded package (pkg1) should win for the symbol attribution
-        // This is because scope_at_position_with_packages processes PackageLoad events
-        // in order and only overrides base package exports, not other package exports
-        let symbol = scope.symbols.get(&shared_export).unwrap();
-        let expected_uri = format!("package:{}", pkg1);
+        // The last loaded package (pkg2) should win for the symbol attribution
+        // This matches R's search path behavior where later library() calls
+        // attach higher on the search path and mask earlier packages
+        let symbol = scope.symbols.get(shared_export.as_str()).unwrap();
+        let expected_uri = format!("package:{}", pkg2);
         prop_assert_eq!(
             symbol.source_uri.as_str(), expected_uri.as_str(),
-            "Shared export '{}' should have URI '{}' (first loaded package), got '{}'. Code:\n{}",
+            "Shared export '{}' should have URI '{}' (last loaded package), got '{}'. Code:\n{}",
             shared_export, expected_uri, symbol.source_uri.as_str(), code
         );
     }
@@ -11957,7 +11958,7 @@ proptest! {
 
         // Export should NOT be in scope before library() call
         prop_assert!(
-            !scope_before.symbols.contains_key(&export_name),
+            !scope_before.symbols.contains_key(export_name.as_str()),
             "Package export '{}' should NOT be in scope at line 0 (before library() on line {}). \
              This means it would NOT appear in completions before the library call. Code:\n{}",
             export_name, library_line, code
@@ -11968,7 +11969,7 @@ proptest! {
 
         // Export SHOULD be in scope after library() call
         prop_assert!(
-            scope_after.symbols.contains_key(&export_name),
+            scope_after.symbols.contains_key(export_name.as_str()),
             "Package export '{}' should be in scope at line {} (after library() on line {}). \
              This means it would appear in completions after the library call. Code:\n{}",
             export_name, library_line + 1, library_line, code
@@ -12015,14 +12016,14 @@ proptest! {
 
         // Symbol should be in scope
         prop_assert!(
-            scope.symbols.contains_key(&symbol_name),
+            scope.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should be in scope. Code:\n{}",
             symbol_name, code
         );
 
         // Requirement 9.4: Local definition should take precedence
         // The symbol should have the file URI, not the package URI
-        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        let symbol = scope.symbols.get(symbol_name.as_str()).unwrap();
         prop_assert_eq!(
             &symbol.source_uri, &uri,
             "Symbol '{}' should have local file URI (local definition takes precedence), got '{}'. Code:\n{}",
@@ -19701,7 +19702,7 @@ proptest! {
             );
 
             prop_assert!(
-                !scope_before.symbols.contains_key(&symbol_name),
+                !scope_before.symbols.contains_key(symbol_name.as_str()),
                 "Symbol '{}' should NOT be available before @lsp-source directive at line {} \
                  (checked at line {})",
                 symbol_name,
@@ -19724,7 +19725,7 @@ proptest! {
         );
 
         prop_assert!(
-            scope_after.symbols.contains_key(&symbol_name),
+            scope_after.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should be available after @lsp-source directive at line {} \
              (checked at line {})",
             symbol_name,
@@ -19873,7 +19874,7 @@ proptest! {
             );
 
             prop_assert!(
-                !scope_before.symbols.contains_key(&symbol_name),
+                !scope_before.symbols.contains_key(symbol_name.as_str()),
                 "Symbol '{}' should NOT be available before effective line {} \
                  (line={} parameter, checked at line {})",
                 symbol_name,
@@ -19897,7 +19898,7 @@ proptest! {
         );
 
         prop_assert!(
-            scope_after.symbols.contains_key(&symbol_name),
+            scope_after.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should be available after effective line {} \
              (line={} parameter, checked at line {})",
             symbol_name,
@@ -20040,12 +20041,12 @@ proptest! {
         );
 
         prop_assert!(
-            scope_after.symbols.contains_key(&symbol1),
+            scope_after.symbols.contains_key(symbol1.as_str()),
             "Symbol '{}' should be available after @lsp-source directive",
             symbol1
         );
         prop_assert!(
-            scope_after.symbols.contains_key(&symbol2),
+            scope_after.symbols.contains_key(symbol2.as_str()),
             "Symbol '{}' should be available after @lsp-source directive",
             symbol2
         );
@@ -20065,12 +20066,12 @@ proptest! {
             );
 
             prop_assert!(
-                !scope_before.symbols.contains_key(&symbol1),
+                !scope_before.symbols.contains_key(symbol1.as_str()),
                 "Symbol '{}' should NOT be available before @lsp-source directive",
                 symbol1
             );
             prop_assert!(
-                !scope_before.symbols.contains_key(&symbol2),
+                !scope_before.symbols.contains_key(symbol2.as_str()),
                 "Symbol '{}' should NOT be available before @lsp-source directive",
                 symbol2
             );
@@ -20207,7 +20208,7 @@ proptest! {
         );
 
         prop_assert!(
-            !scope_at_directive_start.symbols.contains_key(&symbol_name),
+            !scope_at_directive_start.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should NOT be available at start of directive line {}",
             symbol_name,
             directive_line
@@ -20228,7 +20229,7 @@ proptest! {
         );
 
         prop_assert!(
-            scope_after.symbols.contains_key(&symbol_name),
+            scope_after.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should be available at line {} (after directive at line {})",
             symbol_name,
             directive_line + 1,
@@ -21780,7 +21781,7 @@ proptest! {
         // Test 1: Symbol should NOT be in scope on the directive line itself
         let scope_on_directive_line = scope_at_position(&artifacts, directive_line, 0);
         prop_assert!(
-            !scope_on_directive_line.symbols.contains_key(&symbol_name),
+            !scope_on_directive_line.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should NOT be in scope on directive line {}. Content:\n{}",
             symbol_name, directive_line, content
         );
@@ -21789,7 +21790,7 @@ proptest! {
         // This tests that the end-of-line sentinel works correctly
         let scope_at_end_of_directive_line = scope_at_position(&artifacts, directive_line, u32::MAX - 1);
         prop_assert!(
-            !scope_at_end_of_directive_line.symbols.contains_key(&symbol_name),
+            !scope_at_end_of_directive_line.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should NOT be in scope at end of directive line {}. Content:\n{}",
             symbol_name, directive_line, content
         );
@@ -21797,13 +21798,13 @@ proptest! {
         // Test 3: Symbol SHOULD be in scope on the line after the directive
         let scope_after_directive = scope_at_position(&artifacts, directive_line + 1, 0);
         prop_assert!(
-            scope_after_directive.symbols.contains_key(&symbol_name),
+            scope_after_directive.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' SHOULD be in scope on line {} (after directive on line {}). Content:\n{}",
             symbol_name, directive_line + 1, directive_line, content
         );
 
         // Test 4: Verify the symbol has the correct kind
-        if let Some(symbol) = scope_after_directive.symbols.get(&symbol_name) {
+        if let Some(symbol) = scope_after_directive.symbols.get(symbol_name.as_str()) {
             if is_function {
                 prop_assert_eq!(
                     symbol.kind,
@@ -21895,7 +21896,7 @@ proptest! {
             // Should NOT be in scope on declaration line
             let scope_on_decl = scope_at_position(&artifacts, *decl_line, 0);
             prop_assert!(
-                !scope_on_decl.symbols.contains_key(name),
+                !scope_on_decl.symbols.contains_key(name.as_str()),
                 "Symbol '{}' should NOT be in scope on its declaration line {}. Content:\n{}",
                 name, decl_line, content
             );
@@ -21903,7 +21904,7 @@ proptest! {
             // Should be in scope on line after declaration
             let scope_after_decl = scope_at_position(&artifacts, decl_line + 1, 0);
             prop_assert!(
-                scope_after_decl.symbols.contains_key(name),
+                scope_after_decl.symbols.contains_key(name.as_str()),
                 "Symbol '{}' SHOULD be in scope on line {} (after declaration on line {}). Content:\n{}",
                 name, decl_line + 1, decl_line, content
             );
@@ -21961,7 +21962,7 @@ proptest! {
         // The declared symbol should NOT be in scope on the same line as the directive
         let scope_on_directive_line = scope_at_position(&artifacts, directive_line, 0);
         prop_assert!(
-            !scope_on_directive_line.symbols.contains_key(&symbol_name),
+            !scope_on_directive_line.symbols.contains_key(symbol_name.as_str()),
             "Declared symbol '{}' should NOT be in scope on directive line {} (same line as code). Content:\n{}",
             symbol_name, directive_line, content
         );
@@ -21969,7 +21970,7 @@ proptest! {
         // The declared symbol SHOULD be in scope on the next line
         let scope_after_directive = scope_at_position(&artifacts, directive_line + 1, 0);
         prop_assert!(
-            scope_after_directive.symbols.contains_key(&symbol_name),
+            scope_after_directive.symbols.contains_key(symbol_name.as_str()),
             "Declared symbol '{}' SHOULD be in scope on line {} (after directive on line {}). Content:\n{}",
             symbol_name, directive_line + 1, directive_line, content
         );
@@ -21978,7 +21979,7 @@ proptest! {
         // (at a position after the assignment)
         let scope_after_assignment = scope_at_position(&artifacts, directive_line, 10);
         prop_assert!(
-            scope_after_assignment.symbols.contains_key(&code_var_name),
+            scope_after_assignment.symbols.contains_key(code_var_name.as_str()),
             "Code variable '{}' SHOULD be in scope on line {} after assignment. Content:\n{}",
             code_var_name, directive_line, content
         );
@@ -22334,7 +22335,7 @@ proptest! {
 
         // Child should have inherited the declared symbol from parent (Requirement 9.1)
         prop_assert!(
-            scope.symbols.contains_key(&symbol_name),
+            scope.symbols.contains_key(symbol_name.as_str()),
             "Declared symbol '{}' should be available in child file when declaration is BEFORE source() call. Parent code:\n{}",
             symbol_name, parent_code
         );
@@ -22420,7 +22421,7 @@ proptest! {
 
         // Child should NOT have the declared symbol (declaration is after source() call)
         prop_assert!(
-            !scope.symbols.contains_key(&symbol_name),
+            !scope.symbols.contains_key(symbol_name.as_str()),
             "Declared symbol '{}' should NOT be available in child file when declaration is AFTER source() call. Parent code:\n{}",
             symbol_name, parent_code
         );
@@ -22505,7 +22506,7 @@ proptest! {
 
         // Child should have inherited the declared symbol even with local=TRUE (Requirement 9.4)
         prop_assert!(
-            scope.symbols.contains_key(&symbol_name),
+            scope.symbols.contains_key(symbol_name.as_str()),
             "Declared symbol '{}' should be available in child file even with local=TRUE (Requirement 9.4). Parent code:\n{}",
             symbol_name, parent_code
         );
@@ -22595,14 +22596,14 @@ proptest! {
 
         // Declared symbol should be available (Requirement 9.4)
         prop_assert!(
-            scope.symbols.contains_key(&declared_symbol),
+            scope.symbols.contains_key(declared_symbol.as_str()),
             "Declared symbol '{}' should be available in child file with local=TRUE (Requirement 9.4). Parent code:\n{}",
             declared_symbol, parent_code
         );
 
         // Regular symbol should NOT be available (local=TRUE blocks regular symbols)
         prop_assert!(
-            !scope.symbols.contains_key(&regular_symbol),
+            !scope.symbols.contains_key(regular_symbol.as_str()),
             "Regular symbol '{}' should NOT be available in child file with local=TRUE. Parent code:\n{}",
             regular_symbol, parent_code
         );
@@ -22715,7 +22716,7 @@ proptest! {
 
         // Child should have inherited the declared symbol from grandparent through parent (Requirement 9.3)
         prop_assert!(
-            scope.symbols.contains_key(&symbol_name),
+            scope.symbols.contains_key(symbol_name.as_str()),
             "Declared symbol '{}' should be available in child file through transitive inheritance (Requirement 9.3). Grandparent code:\n{}",
             symbol_name, grandparent_code
         );
@@ -22797,12 +22798,12 @@ proptest! {
 
         // Both declared symbols should be available in child file
         prop_assert!(
-            scope.symbols.contains_key(&symbol1),
+            scope.symbols.contains_key(symbol1.as_str()),
             "Declared variable '{}' should be available in child file. Parent code:\n{}",
             symbol1, parent_code
         );
         prop_assert!(
-            scope.symbols.contains_key(&symbol2),
+            scope.symbols.contains_key(symbol2.as_str()),
             "Declared function '{}' should be available in child file. Parent code:\n{}",
             symbol2, parent_code
         );
@@ -22888,14 +22889,14 @@ proptest! {
 
         // Symbol declared BEFORE source() should be available (Requirement 9.1)
         prop_assert!(
-            scope.symbols.contains_key(&symbol_before),
+            scope.symbols.contains_key(symbol_before.as_str()),
             "Declared symbol '{}' (before source()) should be available in child file. Parent code:\n{}",
             symbol_before, parent_code
         );
 
         // Symbol declared AFTER source() should NOT be available (Requirement 9.2)
         prop_assert!(
-            !scope.symbols.contains_key(&symbol_after),
+            !scope.symbols.contains_key(symbol_after.as_str()),
             "Declared symbol '{}' (after source()) should NOT be available in child file. Parent code:\n{}",
             symbol_after, parent_code
         );
@@ -22947,7 +22948,7 @@ proptest! {
         let artifacts = compute_artifacts_with_metadata(&uri, &tree, &code, Some(&metadata));
 
         // Check exported interface - later declaration should win
-        let exported_symbol = artifacts.exported_interface.get(&symbol_name);
+        let exported_symbol = artifacts.exported_interface.get(symbol_name.as_str());
         prop_assert!(
             exported_symbol.is_some(),
             "Symbol '{}' should be in exported interface. Code:\n{}",
@@ -22962,7 +22963,7 @@ proptest! {
 
         // Check scope at position after both declarations (line 2)
         let scope = scope_at_position(&artifacts, 2, 0);
-        let scoped_symbol = scope.symbols.get(&symbol_name);
+        let scoped_symbol = scope.symbols.get(symbol_name.as_str());
         prop_assert!(
             scoped_symbol.is_some(),
             "Symbol '{}' should be in scope at line 2. Code:\n{}",
@@ -23025,7 +23026,7 @@ proptest! {
 
         // Symbol should be in scope regardless of declaration order (Requirement 11.2)
         prop_assert!(
-            scope.symbols.contains_key(&symbol_name),
+            scope.symbols.contains_key(symbol_name.as_str()),
             "Symbol '{}' should be in scope at usage line {} (after conflicting declarations). \
              First: {}, Second: {}. Code:\n{}",
             symbol_name, usage_line, first_directive, second_directive, code
@@ -23076,7 +23077,7 @@ proptest! {
         let query_line = second_decl_line + 1;
         let scope = scope_at_position(&artifacts, query_line, 0);
 
-        let scoped_symbol = scope.symbols.get(&symbol_name);
+        let scoped_symbol = scope.symbols.get(symbol_name.as_str());
         prop_assert!(
             scoped_symbol.is_some(),
             "Symbol '{}' should be in scope at line {}. Code:\n{}",
@@ -23169,7 +23170,7 @@ proptest! {
         let query_line = (lines.len() - 1) as u32;
         let scope = scope_at_position(&artifacts, query_line, 0);
 
-        let scoped_symbol = scope.symbols.get(&symbol_name);
+        let scoped_symbol = scope.symbols.get(symbol_name.as_str());
         prop_assert!(
             scoped_symbol.is_some(),
             "Symbol '{}' should be in scope. Code:\n{}",
@@ -23209,7 +23210,16 @@ proptest! {
             last_is_function = is_function;
         }
         
-        lines.push("x <- 42".to_string());
+        // Use a dummy variable name that cannot collide with the declared symbol_name.
+        // If symbol_name happens to be "x", a plain `x <- 42` would create a real
+        // definition that overrides the declared kind (real definitions take precedence
+        // over declarations). Using a guaranteed-unique name avoids this.
+        let dummy_var = if symbol_name == "dummy_var_placeholder" {
+            "dummy_var_placeholder2".to_string()
+        } else {
+            "dummy_var_placeholder".to_string()
+        };
+        lines.push(format!("{} <- 42", dummy_var));
 
         let code = lines.join("\n");
         let tree = parse_r_tree(&code);
@@ -23227,7 +23237,7 @@ proptest! {
         let query_line = (lines.len() - 1) as u32;
         let scope = scope_at_position(&artifacts, query_line, 0);
 
-        let scoped_symbol = scope.symbols.get(&symbol_name);
+        let scoped_symbol = scope.symbols.get(symbol_name.as_str());
         prop_assert!(
             scoped_symbol.is_some(),
             "Symbol '{}' should be in scope. Code:\n{}",
@@ -23290,7 +23300,7 @@ proptest! {
         // Query scope at line 2
         let scope = scope_at_position(&artifacts, 2, 0);
 
-        let scoped_symbol = scope.symbols.get(&symbol_name);
+        let scoped_symbol = scope.symbols.get(symbol_name.as_str());
         prop_assert!(
             scoped_symbol.is_some(),
             "Symbol '{}' should be in scope with syntax variants. Code:\n{}",
@@ -23371,12 +23381,12 @@ proptest! {
         // Requirement 12.1: Declared symbols should be extracted and stored
         // Check that the declared symbol is in the exported interface
         prop_assert!(
-            artifacts.exported_interface.contains_key(&symbol_name),
+            artifacts.exported_interface.contains_key(symbol_name.as_str()),
             "Declared symbol '{}' should be in exported interface after indexing. Code:\n{}",
             symbol_name, code
         );
 
-        let symbol = artifacts.exported_interface.get(&symbol_name).unwrap();
+        let symbol = artifacts.exported_interface.get(symbol_name.as_str()).unwrap();
         prop_assert!(
             symbol.is_declared,
             "Symbol '{}' should be marked as declared. Code:\n{}",
@@ -23396,7 +23406,7 @@ proptest! {
 
         // Check that the timeline contains a Declaration event
         let declaration_events: Vec<_> = artifacts.timeline.iter()
-            .filter(|e| matches!(e, ScopeEvent::Declaration { symbol, .. } if symbol.name == symbol_name))
+            .filter(|e| matches!(e, ScopeEvent::Declaration { symbol, .. } if *symbol.name == *symbol_name))
             .collect();
         prop_assert_eq!(
             declaration_events.len(), 1,
@@ -23492,13 +23502,13 @@ proptest! {
 
         // Requirement 12.2: Declared symbol from indexed child should be available in parent's scope
         prop_assert!(
-            scope.symbols.contains_key(&symbol_name),
+            scope.symbols.contains_key(symbol_name.as_str()),
             "Declared symbol '{}' from indexed child file should be available in parent's scope. \
              Parent code:\n{}\nChild code:\n{}",
             symbol_name, parent_code, child_code
         );
 
-        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        let symbol = scope.symbols.get(symbol_name.as_str()).unwrap();
         prop_assert!(
             symbol.is_declared,
             "Symbol '{}' should be marked as declared. Parent code:\n{}\nChild code:\n{}",
@@ -23604,12 +23614,12 @@ proptest! {
 
         // First, verify old artifacts have old symbol (simulating workspace index state)
         prop_assert!(
-            old_child_artifacts.exported_interface.contains_key(&old_symbol),
+            old_child_artifacts.exported_interface.contains_key(old_symbol.as_str()),
             "Old artifacts should contain old symbol '{}'. Old code:\n{}",
             old_symbol, old_child_code
         );
         prop_assert!(
-            !old_child_artifacts.exported_interface.contains_key(&new_symbol),
+            !old_child_artifacts.exported_interface.contains_key(new_symbol.as_str()),
             "Old artifacts should NOT contain new symbol '{}'. Old code:\n{}",
             new_symbol, old_child_code
         );
@@ -23634,7 +23644,7 @@ proptest! {
 
         // Requirement 12.3: After opening, new declared symbol should be available
         prop_assert!(
-            scope.symbols.contains_key(&new_symbol),
+            scope.symbols.contains_key(new_symbol.as_str()),
             "New declared symbol '{}' should be available after re-extraction from live content. \
              New code:\n{}",
             new_symbol, new_child_code
@@ -23642,13 +23652,13 @@ proptest! {
 
         // Old symbol should NOT be available (it was in the old content)
         prop_assert!(
-            !scope.symbols.contains_key(&old_symbol),
+            !scope.symbols.contains_key(old_symbol.as_str()),
             "Old declared symbol '{}' should NOT be available after re-extraction. \
              Old code:\n{}\nNew code:\n{}",
             old_symbol, old_child_code, new_child_code
         );
 
-        let symbol = scope.symbols.get(&new_symbol).unwrap();
+        let symbol = scope.symbols.get(new_symbol.as_str()).unwrap();
         prop_assert!(
             symbol.is_declared,
             "New symbol '{}' should be marked as declared",
@@ -23759,11 +23769,11 @@ proptest! {
         // All declared variables should be available
         for name in &var_names {
             prop_assert!(
-                scope.symbols.contains_key(name),
+                scope.symbols.contains_key(name.as_str()),
                 "Declared variable '{}' should be available in parent's scope. Child code:\n{}",
                 name, child_code
             );
-            let symbol = scope.symbols.get(name).unwrap();
+            let symbol = scope.symbols.get(name.as_str()).unwrap();
             prop_assert!(symbol.is_declared, "Variable '{}' should be marked as declared", name);
             prop_assert_eq!(symbol.kind, SymbolKind::Variable, "Variable '{}' should have Variable kind", name);
         }
@@ -23771,11 +23781,11 @@ proptest! {
         // All declared functions should be available
         for name in &func_names {
             prop_assert!(
-                scope.symbols.contains_key(name),
+                scope.symbols.contains_key(name.as_str()),
                 "Declared function '{}' should be available in parent's scope. Child code:\n{}",
                 name, child_code
             );
-            let symbol = scope.symbols.get(name).unwrap();
+            let symbol = scope.symbols.get(name.as_str()).unwrap();
             prop_assert!(symbol.is_declared, "Function '{}' should be marked as declared", name);
             prop_assert_eq!(symbol.kind, SymbolKind::Function, "Function '{}' should have Function kind", name);
         }
@@ -23893,13 +23903,13 @@ proptest! {
         // Declared symbol from child should be available in grandparent's scope
         // (through transitive dependency chain)
         prop_assert!(
-            scope.symbols.contains_key(&symbol_name),
+            scope.symbols.contains_key(symbol_name.as_str()),
             "Declared symbol '{}' from child should be available in grandparent's scope \
              through transitive dependency chain. Child code:\n{}",
             symbol_name, child_code
         );
 
-        let symbol = scope.symbols.get(&symbol_name).unwrap();
+        let symbol = scope.symbols.get(symbol_name.as_str()).unwrap();
         prop_assert!(
             symbol.is_declared,
             "Symbol '{}' should be marked as declared",

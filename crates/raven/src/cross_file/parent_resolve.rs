@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 
 use tower_lsp::lsp_types::Url;
 
-use super::cache::{ParentCacheKey, ParentResolution};
+use super::cache::ParentResolution;
 use super::config::{CallSiteDefault, CrossFileConfig};
 use super::dependency::DependencyGraph;
 #[cfg(test)]
@@ -367,19 +367,6 @@ pub fn resolve_parent(
     // Delegate to resolve_parent_with_content with a no-content provider
     // This means match= patterns will fall back to config default
     resolve_parent_with_content(metadata, graph, child_uri, config, resolve_path, |_| None)
-}
-
-/// Create a cache key for parent resolution.
-/// Combines metadata fingerprint and reverse edges hash for efficient cache lookups.
-pub fn make_parent_cache_key(
-    metadata: &CrossFileMetadata,
-    graph: &DependencyGraph,
-    child_uri: &Url,
-) -> ParentCacheKey {
-    ParentCacheKey {
-        metadata_fingerprint: compute_metadata_fingerprint(metadata),
-        reverse_edges_hash: compute_reverse_edges_hash(graph, child_uri),
-    }
 }
 
 #[cfg(test)]

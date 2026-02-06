@@ -3,29 +3,48 @@
 // This module calls R as a subprocess to get help documentation.
 // It's "static" in that it doesn't embed R, but can still access help.
 
-use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 
-/// Cache for help content
+use lru::LruCache;
+
+/// Maximum number of entries in the help cache. When this limit is reached,
+/// the least-recently-used entries are evicted to make room for new ones.
+const HELP_CACHE_MAX_ENTRIES: usize = 512;
+
+/// Bounded cache for help content. Uses LRU eviction to prevent unbounded
+/// memory growth in long-running LSP sessions.
+///
+/// Uses `peek()` for reads (no LRU promotion, works under read lock) and
+/// `push()` for writes (promotes/evicts under write lock).
 pub struct HelpCache {
-    cache: Arc<RwLock<HashMap<String, Option<String>>>>,
+    inner: Arc<RwLock<LruCache<String, Option<String>>>>,
 }
 
 impl HelpCache {
     pub fn new() -> Self {
-        Self {
-            cache: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self::with_max_entries(HELP_CACHE_MAX_ENTRIES)
     }
 
     pub fn get(&self, topic: &str) -> Option<Option<String>> {
-        self.cache.read().ok()?.get(topic).cloned()
+        self.inner.read().ok()?.peek(topic).cloned()
     }
 
     pub fn insert(&self, topic: String, content: Option<String>) {
-        if let Ok(mut cache) = self.cache.write() {
-            cache.insert(topic, content);
+        if let Ok(mut guard) = self.inner.write() {
+            guard.push(topic, content);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.read().map(|c| c.len()).unwrap_or(0)
+    }
+
+    fn with_max_entries(cap: usize) -> Self {
+        let cap = crate::cross_file::cache::non_zero_or(cap, HELP_CACHE_MAX_ENTRIES);
+        Self {
+            inner: Arc::new(RwLock::new(LruCache::new(cap))),
         }
     }
 }
@@ -244,10 +263,10 @@ Description:
 Usage:
 
      mean(x, ...)
-     
+
      ## Default S3 method:
      mean(x, trim = 0, na.rm = FALSE, ...)
-     
+
 Arguments:
 
        x: an R object.
@@ -268,14 +287,14 @@ Description:
 Usage:
 
      mutate(.data, ...)
-     
+
      ## S3 method for class 'data.frame'
      mutate(
        .data,
        ...,
        .by = NULL
      )
-     
+
 Arguments:
 
    .data: A data frame.
@@ -313,7 +332,7 @@ Usage:
 
      ## S3 method for class 'foo'
      bar(x, y = 1)
-     
+
 Arguments:
 
        x: an object.
@@ -322,5 +341,34 @@ Arguments:
         // Should return the S3 method signature since there's no generic
         let sig = extract_signature_from_help(help_text);
         assert_eq!(sig, Some("bar(x, y = 1)".to_string()));
+    }
+
+    #[test]
+    fn test_help_cache_bounded() {
+        let cache = HelpCache::with_max_entries(3);
+
+        cache.insert("a".to_string(), Some("help_a".to_string()));
+        cache.insert("b".to_string(), Some("help_b".to_string()));
+        cache.insert("c".to_string(), Some("help_c".to_string()));
+        assert_eq!(cache.len(), 3);
+
+        // Inserting a 4th entry should evict the LRU ("a")
+        cache.insert("d".to_string(), Some("help_d".to_string()));
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get("a").is_none());
+        assert!(cache.get("d").is_some());
+    }
+
+    #[test]
+    fn test_help_cache_update_existing() {
+        let cache = HelpCache::with_max_entries(3);
+
+        cache.insert("a".to_string(), None);
+        assert_eq!(cache.get("a"), Some(None));
+
+        // Updating same key should not grow the cache
+        cache.insert("a".to_string(), Some("updated".to_string()));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get("a"), Some(Some("updated".to_string())));
     }
 }

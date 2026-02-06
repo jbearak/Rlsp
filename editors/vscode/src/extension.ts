@@ -36,6 +36,12 @@ interface RavenInitializationOptions {
             maxTransitiveDepth?: number;
             maxQueueSize?: number;
         };
+        cache?: {
+            metadataMaxEntries?: number;
+            fileContentMaxEntries?: number;
+            existenceMaxEntries?: number;
+            workspaceIndexMaxEntries?: number;
+        };
     };
     diagnostics?: {
         enabled?: boolean;
@@ -127,6 +133,36 @@ function getInitializationOptions(): RavenInitializationOptions {
         }
     }
 
+    // Read cache settings
+    const cacheMetadataMaxEntries = getExplicitSetting<number>(config, 'crossFile.cache.metadataMaxEntries');
+    const cacheFileContentMaxEntries = getExplicitSetting<number>(config, 'crossFile.cache.fileContentMaxEntries');
+    const cacheExistenceMaxEntries = getExplicitSetting<number>(config, 'crossFile.cache.existenceMaxEntries');
+    const cacheWorkspaceIndexMaxEntries = getExplicitSetting<number>(config, 'crossFile.cache.workspaceIndexMaxEntries');
+
+    // Build cache object only if any cache setting is configured
+    let cache: {
+        metadataMaxEntries?: number;
+        fileContentMaxEntries?: number;
+        existenceMaxEntries?: number;
+        workspaceIndexMaxEntries?: number;
+    } | undefined = undefined;
+    if (cacheMetadataMaxEntries !== undefined || cacheFileContentMaxEntries !== undefined ||
+        cacheExistenceMaxEntries !== undefined || cacheWorkspaceIndexMaxEntries !== undefined) {
+        cache = {};
+        if (cacheMetadataMaxEntries !== undefined) {
+            cache.metadataMaxEntries = cacheMetadataMaxEntries;
+        }
+        if (cacheFileContentMaxEntries !== undefined) {
+            cache.fileContentMaxEntries = cacheFileContentMaxEntries;
+        }
+        if (cacheExistenceMaxEntries !== undefined) {
+            cache.existenceMaxEntries = cacheExistenceMaxEntries;
+        }
+        if (cacheWorkspaceIndexMaxEntries !== undefined) {
+            cache.workspaceIndexMaxEntries = cacheWorkspaceIndexMaxEntries;
+        }
+    }
+
     // Build crossFile object only if any setting is configured
     if (
         maxBackwardDepth !== undefined ||
@@ -141,7 +177,8 @@ function getInitializationOptions(): RavenInitializationOptions {
         outOfScopeSeverity !== undefined ||
         ambiguousParentSeverity !== undefined ||
         maxChainDepthSeverity !== undefined ||
-        onDemandIndexing !== undefined
+        onDemandIndexing !== undefined ||
+        cache !== undefined
     ) {
         options.crossFile = {};
         if (maxBackwardDepth !== undefined) {
@@ -182,6 +219,9 @@ function getInitializationOptions(): RavenInitializationOptions {
         }
         if (onDemandIndexing !== undefined) {
             options.crossFile.onDemandIndexing = onDemandIndexing;
+        }
+        if (cache !== undefined) {
+            options.crossFile.cache = cache;
         }
     }
 

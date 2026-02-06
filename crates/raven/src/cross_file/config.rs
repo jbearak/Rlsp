@@ -67,6 +67,14 @@ pub struct CrossFileConfig {
     /// same file as earlier source() call)
     /// _Requirements: 6.2_
     pub redundant_directive_severity: Option<DiagnosticSeverity>,
+    /// Maximum entries in the metadata cache (LRU eviction)
+    pub cache_metadata_max_entries: usize,
+    /// Maximum entries in the file content cache (LRU eviction)
+    pub cache_file_content_max_entries: usize,
+    /// Maximum entries in the file existence cache (LRU eviction)
+    pub cache_existence_max_entries: usize,
+    /// Maximum entries in the cross-file workspace index (LRU eviction)
+    pub cache_workspace_index_max_entries: usize,
 }
 
 impl Default for CrossFileConfig {
@@ -111,6 +119,10 @@ impl Default for CrossFileConfig {
             packages_r_path: None,
             packages_missing_package_severity: DiagnosticSeverity::WARNING,
             redundant_directive_severity: Some(DiagnosticSeverity::HINT),
+            cache_metadata_max_entries: 1000,
+            cache_file_content_max_entries: 500,
+            cache_existence_max_entries: 2000,
+            cache_workspace_index_max_entries: 5000,
         }
     }
 }

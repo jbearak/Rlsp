@@ -3,7 +3,7 @@
 /// This module provides a centralized list of R reserved words and a function
 /// to check if a given name is a reserved word. Reserved words cannot be used
 /// as user-defined identifiers in R.
-
+///
 /// Complete list of R reserved words for this feature.
 /// These words cannot be used as user-defined identifiers.
 #[allow(dead_code)] // Used in tests to verify consistency with is_reserved_word()

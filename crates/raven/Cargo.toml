@@ -30,6 +30,7 @@ dashmap = "5.4.0"
 indexmap = "2.2"
 regex = "1.10.0"
 ropey = "1.6"
+lru = "0.16"
 
 [target.'cfg(unix)'.dependencies]
 xdg = "2.5.2"

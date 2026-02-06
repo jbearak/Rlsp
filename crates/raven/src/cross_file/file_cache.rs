@@ -5,13 +5,15 @@
 //
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::SystemTime;
 
+use lru::LruCache;
 use tower_lsp::lsp_types::Url;
+
+use super::cache::non_zero_or;
 
 /// Snapshot metadata for a closed file, used to determine cache validity
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -58,39 +60,66 @@ struct CachedFile {
     content: String,
 }
 
-/// Disk file cache for closed files
-#[derive(Debug, Default)]
+/// Default capacity for the file content cache
+const DEFAULT_FILE_CACHE_CAPACITY: usize = 500;
+
+/// Default capacity for the existence cache
+const DEFAULT_EXISTENCE_CACHE_CAPACITY: usize = 2000;
+
+/// Disk file cache for closed files with LRU eviction.
+///
+/// Uses `peek()` for reads (no LRU promotion, works under read lock) and
+/// `push()` for writes (promotes/evicts under write lock).
 pub struct CrossFileFileCache {
-    /// Cached file contents by URI
-    inner: RwLock<HashMap<Url, CachedFile>>,
-    /// Cached file existence by path (canonical)
-    existence: RwLock<HashMap<std::path::PathBuf, bool>>,
+    /// Cached file contents by URI (LRU-bounded)
+    inner: RwLock<LruCache<Url, CachedFile>>,
+    /// Cached file existence by path (LRU-bounded)
+    existence: RwLock<LruCache<PathBuf, bool>>,
+}
+
+impl std::fmt::Debug for CrossFileFileCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossFileFileCache").finish_non_exhaustive()
+    }
+}
+
+impl Default for CrossFileFileCache {
+    fn default() -> Self {
+        Self::with_capacities(DEFAULT_FILE_CACHE_CAPACITY, DEFAULT_EXISTENCE_CACHE_CAPACITY)
+    }
 }
 
 impl CrossFileFileCache {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacities(content_cap: usize, existence_cap: usize) -> Self {
+        let content_cap = non_zero_or(content_cap, DEFAULT_FILE_CACHE_CAPACITY);
+        let existence_cap = non_zero_or(existence_cap, DEFAULT_EXISTENCE_CACHE_CAPACITY);
         Self {
-            inner: RwLock::new(HashMap::new()),
-            existence: RwLock::new(HashMap::new()),
+            inner: RwLock::new(LruCache::new(content_cap)),
+            existence: RwLock::new(LruCache::new(existence_cap)),
         }
     }
 
     /// Check if a path exists (cached, non-blocking read)
     pub fn path_exists(&self, path: &Path) -> Option<bool> {
-        self.existence.read().ok()?.get(path).copied()
+        self.existence.read().ok()?.peek(path).copied()
     }
 
-    /// Update existence cache (called after background check)
+    /// Update existence cache (called after background check).
+    /// LRU eviction automatically bounds memory.
     pub fn cache_existence(&self, path: &Path, exists: bool) {
         if let Ok(mut guard) = self.existence.write() {
-            guard.insert(path.to_path_buf(), exists);
+            guard.push(path.to_path_buf(), exists);
         }
     }
 
     /// Get cached content if snapshot is still fresh
     pub fn get_if_fresh(&self, uri: &Url, current_snapshot: &FileSnapshot) -> Option<String> {
         let guard = self.inner.read().ok()?;
-        guard.get(uri).and_then(|cached| {
+        guard.peek(uri).and_then(|cached| {
             if cached.snapshot.matches_disk(current_snapshot) {
                 Some(cached.content.clone())
             } else {
@@ -101,20 +130,20 @@ impl CrossFileFileCache {
 
     /// Get cached content without freshness check
     pub fn get(&self, uri: &Url) -> Option<String> {
-        self.inner.read().ok()?.get(uri).map(|c| c.content.clone())
+        self.inner.read().ok()?.peek(uri).map(|c| c.content.clone())
     }
 
-    /// Insert content into cache
+    /// Insert content into cache. LRU eviction automatically bounds memory.
     pub fn insert(&self, uri: Url, snapshot: FileSnapshot, content: String) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.insert(uri, CachedFile { snapshot, content });
+            guard.push(uri, CachedFile { snapshot, content });
         }
     }
 
     /// Invalidate cache entry for a URI
     pub fn invalidate(&self, uri: &Url) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.remove(uri);
+            guard.pop(uri);
         }
     }
 
@@ -123,9 +152,16 @@ impl CrossFileFileCache {
         if let Ok(mut guard) = self.inner.write() {
             guard.clear();
         }
+        if let Ok(mut guard) = self.existence.write() {
+            guard.clear();
+        }
     }
 
-    /// Read file from disk and cache it (synchronous, for use outside lock)
+    /// Read file from disk and cache it (synchronous, for use outside lock).
+    ///
+    /// **Warning**: This performs blocking filesystem I/O. Callers on LSP
+    /// request threads should use `spawn_blocking` or an equivalent async
+    /// wrapper to avoid blocking the event loop.
     pub fn read_and_cache(&self, uri: &Url) -> Option<String> {
         let path = uri.to_file_path().ok()?;
         let content = std::fs::read_to_string(&path).ok()?;
@@ -133,6 +169,18 @@ impl CrossFileFileCache {
         let snapshot = FileSnapshot::with_content_hash(&metadata, &content);
         self.insert(uri.clone(), snapshot, content.clone());
         Some(content)
+    }
+
+    /// Resize both caches. If shrinking, LRU entries are evicted.
+    pub fn resize(&self, content_cap: usize, existence_cap: usize) {
+        let content_cap = non_zero_or(content_cap, DEFAULT_FILE_CACHE_CAPACITY);
+        let existence_cap = non_zero_or(existence_cap, DEFAULT_EXISTENCE_CACHE_CAPACITY);
+        if let Ok(mut guard) = self.inner.write() {
+            guard.resize(content_cap);
+        }
+        if let Ok(mut guard) = self.existence.write() {
+            guard.resize(existence_cap);
+        }
     }
 }
 
@@ -259,5 +307,47 @@ mod tests {
 
         // Should be cached now
         assert!(cache.get(&uri).is_some());
+    }
+
+    #[test]
+    fn test_content_cache_lru_eviction() {
+        let cache = CrossFileFileCache::with_capacities(2, 100);
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+        let uri3 = test_uri("c.R");
+        let snap = FileSnapshot {
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 10,
+            content_hash: None,
+        };
+
+        cache.insert(uri1.clone(), snap.clone(), "a".to_string());
+        cache.insert(uri2.clone(), snap.clone(), "b".to_string());
+
+        // Both present
+        assert!(cache.get(&uri1).is_some());
+        assert!(cache.get(&uri2).is_some());
+
+        // Third evicts uri1 (oldest by insertion time)
+        cache.insert(uri3.clone(), snap, "c".to_string());
+        assert!(cache.get(&uri1).is_none(), "LRU entry should be evicted");
+        assert!(cache.get(&uri2).is_some());
+        assert!(cache.get(&uri3).is_some());
+    }
+
+    #[test]
+    fn test_existence_cache_lru_eviction() {
+        let cache = CrossFileFileCache::with_capacities(100, 2);
+
+        cache.cache_existence(Path::new("/a"), true);
+        cache.cache_existence(Path::new("/b"), false);
+        assert_eq!(cache.path_exists(Path::new("/a")), Some(true));
+        assert_eq!(cache.path_exists(Path::new("/b")), Some(false));
+
+        // Third evicts /a (oldest)
+        cache.cache_existence(Path::new("/c"), true);
+        assert_eq!(cache.path_exists(Path::new("/a")), None);
+        assert_eq!(cache.path_exists(Path::new("/b")), Some(false));
+        assert_eq!(cache.path_exists(Path::new("/c")), Some(true));
     }
 }

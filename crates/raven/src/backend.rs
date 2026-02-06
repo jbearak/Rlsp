@@ -252,6 +252,22 @@ pub(crate) fn parse_cross_file_config(
                 config.on_demand_indexing_max_queue_size = v as usize;
             }
         }
+
+        // Parse cache settings
+        if let Some(cache) = cross_file.get("cache") {
+            if let Some(v) = cache.get("metadataMaxEntries").and_then(|v| v.as_u64()) {
+                config.cache_metadata_max_entries = (v as usize).max(1);
+            }
+            if let Some(v) = cache.get("fileContentMaxEntries").and_then(|v| v.as_u64()) {
+                config.cache_file_content_max_entries = (v as usize).max(1);
+            }
+            if let Some(v) = cache.get("existenceMaxEntries").and_then(|v| v.as_u64()) {
+                config.cache_existence_max_entries = (v as usize).max(1);
+            }
+            if let Some(v) = cache.get("workspaceIndexMaxEntries").and_then(|v| v.as_u64()) {
+                config.cache_workspace_index_max_entries = (v as usize).max(1);
+            }
+        }
     }
 
     // Parse diagnostics settings
@@ -350,6 +366,23 @@ pub(crate) fn parse_cross_file_config(
     log::info!(
         "    missing_package_severity: {:?}",
         config.packages_missing_package_severity
+    );
+    log::info!("  Cache settings (LRU):");
+    log::info!(
+        "    metadata_max_entries: {}",
+        config.cache_metadata_max_entries
+    );
+    log::info!(
+        "    file_content_max_entries: {}",
+        config.cache_file_content_max_entries
+    );
+    log::info!(
+        "    existence_max_entries: {}",
+        config.cache_existence_max_entries
+    );
+    log::info!(
+        "    workspace_index_max_entries: {}",
+        config.cache_workspace_index_max_entries
     );
 
     Some(config)
@@ -550,6 +583,7 @@ impl LanguageServer for Backend {
         if let Some(ref init_options) = params.initialization_options {
             // Parse cross-file configuration
             if let Some(config) = parse_cross_file_config(init_options) {
+                state.resize_caches(&config);
                 state.cross_file_config = config;
             }
 
@@ -763,7 +797,7 @@ impl LanguageServer for Backend {
         let init_duration = init_start.elapsed();
         if crate::perf::is_enabled() {
             log::info!("[PERF] Total initialization: {:?}", init_duration);
-            crate::perf::startup_metrics().lock().ok().map(|m| m.log_summary());
+            if let Ok(m) = crate::perf::startup_metrics().lock() { m.log_summary() }
         }
         log::info!(
             "Initialization complete (workspace scan running in background)"
@@ -1384,12 +1418,9 @@ impl LanguageServer for Backend {
                     &empty_base_exports,
                 );
 
-                let mut pkgs: Vec<String> = scope.inherited_packages;
-                for pkg in scope.loaded_packages {
-                    if !pkgs.contains(&pkg) {
-                        pkgs.push(pkg);
-                    }
-                }
+                let mut pkgs = scope.inherited_packages;
+                pkgs.extend(scope.loaded_packages);
+                let pkgs: Vec<String> = pkgs.into_iter().collect();
 
                 (state.package_library.clone(), pkgs)
             };
@@ -2018,6 +2049,7 @@ impl LanguageServer for Backend {
 
             // Apply new config if parsed
             if let Some(config) = new_config {
+                state.resize_caches(&config);
                 state.cross_file_config = config;
             }
 
@@ -2028,10 +2060,6 @@ impl LanguageServer for Backend {
                     state.symbol_config.hierarchical_document_symbol_support;
                 state.symbol_config = config;
             }
-
-            // Invalidate all scope caches since config affects resolution
-            state.cross_file_cache.invalidate_all();
-            state.cross_file_parent_cache.invalidate_all();
 
             // Mark all open documents for force republish
             let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
@@ -2186,7 +2214,6 @@ impl LanguageServer for Backend {
                         state.cross_file_graph.remove_file(uri);
                         state.cross_file_file_cache.invalidate(uri);
                         state.cross_file_workspace_index.invalidate(uri);
-                        state.cross_file_cache.invalidate(uri);
                         state.cross_file_meta.remove(uri);
                         log::trace!("Removed deleted file from cross-file state: {}", uri);
                     }

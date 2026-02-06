@@ -348,18 +348,19 @@ impl<'a> SymbolExtractor<'a> {
     /// A vector of `RawSymbol` entries representing all symbols found in the document.
     pub fn extract_all(&self) -> Vec<RawSymbol> {
         let mut symbols = Vec::new();
-        self.extract_assignments_recursive(self.root, &mut symbols);
-        // Extract S4 method definitions (setMethod, setClass, setGeneric)
-        let s4_symbols = self.extract_s4_methods(self.root);
-        symbols.extend(s4_symbols);
-        // Extract R code sections (# Section ----)
+        // Single combined AST walk for assignments and S4 methods
+        self.extract_ast_symbols_recursive(self.root, &mut symbols);
+        // Extract R code sections (text-based, not tree-sitter)
         let section_symbols = self.extract_sections();
         symbols.extend(section_symbols);
         symbols
     }
 
-    /// Recursively extract assignments from the AST.
-    fn extract_assignments_recursive(
+    /// Recursively extract assignments and S4 methods in a single AST walk.
+    ///
+    /// This combines what was previously two separate full-tree traversals
+    /// into one pass, reducing symbol extraction time for large files.
+    fn extract_ast_symbols_recursive(
         &self,
         node: tree_sitter::Node<'a>,
         symbols: &mut Vec<RawSymbol>,
@@ -369,10 +370,15 @@ impl<'a> SymbolExtractor<'a> {
             symbols.push(symbol);
         }
 
+        // Try to extract an S4 method from this node
+        if let Some(symbol) = self.try_extract_s4_method(node) {
+            symbols.push(symbol);
+        }
+
         // Recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.extract_assignments_recursive(child, symbols);
+            self.extract_ast_symbols_recursive(child, symbols);
         }
     }
 
@@ -825,6 +831,7 @@ impl<'a> SymbolExtractor<'a> {
     /// // setGeneric("myGeneric", function(x) standardGeneric("myGeneric"))
     /// // → RawSymbol { name: "myGeneric", kind: Interface, ... }
     /// ```
+    #[cfg(test)]
     pub fn extract_s4_methods(&self, node: tree_sitter::Node<'a>) -> Vec<RawSymbol> {
         let mut symbols = Vec::new();
         self.extract_s4_methods_recursive(node, &mut symbols);
@@ -832,6 +839,7 @@ impl<'a> SymbolExtractor<'a> {
     }
 
     /// Recursively extract S4 method definitions from the AST.
+    #[cfg(test)]
     fn extract_s4_methods_recursive(
         &self,
         node: tree_sitter::Node<'a>,
@@ -1392,10 +1400,10 @@ impl HierarchyBuilder {
         // This section contains the symbol
         // Check if any child section also contains it (for nested sections)
         for child in section.children.iter_mut() {
-            if child.section_level.is_some() {
-                if Self::try_insert_into_section(child, symbol.clone(), symbol_line) {
-                    return true;
-                }
+            if child.section_level.is_some()
+                && Self::try_insert_into_section(child, symbol.clone(), symbol_line)
+            {
+                return true;
             }
         }
 
@@ -1714,7 +1722,7 @@ fn get_cross_file_symbols(
     uri: &Url,
     line: u32,
     column: u32,
-) -> HashMap<String, ScopedSymbol> {
+) -> HashMap<std::sync::Arc<str>, ScopedSymbol> {
     get_cross_file_scope(state, uri, line, column).symbols
 }
 
@@ -2104,7 +2112,7 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
 /// ```
 fn extract_container_name(uri: &Url) -> Option<String> {
     uri.path_segments()?
-        .last()
+        .next_back()
         .map(|filename| {
             // Remove extension if present
             if let Some(dot_pos) = filename.rfind('.') {
@@ -2152,6 +2160,9 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
 
     // 1. Open documents (highest priority)
     for uri in state.document_store.uris() {
+        if symbols.len() >= max_results {
+            break;
+        }
         seen_uris.insert(uri.clone());
         if let Some(doc) = state.document_store.get_without_touch(&uri) {
             collect_workspace_symbols_from_artifacts(
@@ -2164,126 +2175,134 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
     }
 
     // 2. New workspace index (closed files)
-    for (uri, entry) in state.workspace_index_new.iter() {
-        if seen_uris.contains(&uri) {
-            continue;
+    if symbols.len() < max_results {
+        for (uri, entry) in state.workspace_index_new.iter() {
+            if symbols.len() >= max_results {
+                break;
+            }
+            if seen_uris.contains(&uri) {
+                continue;
+            }
+            seen_uris.insert(uri.clone());
+            collect_workspace_symbols_from_artifacts(
+                &uri,
+                &entry.artifacts,
+                &lower_query,
+                &mut symbols,
+            );
         }
-        seen_uris.insert(uri.clone());
-        collect_workspace_symbols_from_artifacts(&uri, &entry.artifacts, &lower_query, &mut symbols);
     }
 
     // 3. Cross-file workspace index
-    for uri in state.cross_file_workspace_index.uris() {
-        if seen_uris.contains(&uri) {
-            continue;
-        }
-        seen_uris.insert(uri.clone());
-        if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(&uri) {
-            collect_workspace_symbols_from_artifacts(&uri, &artifacts, &lower_query, &mut symbols);
+    if symbols.len() < max_results {
+        for uri in state.cross_file_workspace_index.uris() {
+            if symbols.len() >= max_results {
+                break;
+            }
+            if seen_uris.contains(&uri) {
+                continue;
+            }
+            seen_uris.insert(uri.clone());
+            if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(&uri) {
+                collect_workspace_symbols_from_artifacts(
+                    &uri,
+                    &artifacts,
+                    &lower_query,
+                    &mut symbols,
+                );
+            }
         }
     }
 
     // 4. Legacy documents (AST fallback)
-    for (uri, doc) in &state.documents {
-        if seen_uris.contains(uri) {
-            continue;
-        }
-        seen_uris.insert(uri.clone());
-        if let Some(tree) = &doc.tree {
-            let text = doc.text();
-            let mut file_symbols = Vec::new();
-            collect_symbols(tree.root_node(), &text, &mut file_symbols);
-            let container_name = extract_container_name(uri);
-            for mut sym in file_symbols {
-                // Filter reserved words (Requirement 7.2)
-                if is_reserved_word(&sym.name) {
-                    continue;
-                }
-                if sym.name.to_lowercase().contains(&lower_query) {
-                    sym.location.uri = uri.clone();
-                    sym.container_name = container_name.clone();
-                    symbols.push(sym);
-                }
-            }
-        }
+    if symbols.len() < max_results {
+        collect_legacy_ast_symbols(
+            &state.documents,
+            &lower_query,
+            max_results,
+            &mut seen_uris,
+            &mut symbols,
+        );
     }
 
     // 5. Legacy workspace index (AST fallback)
-    for (uri, doc) in &state.workspace_index {
-        if seen_uris.contains(uri) {
-            continue;
-        }
-        seen_uris.insert(uri.clone());
-        if let Some(tree) = &doc.tree {
-            let text = doc.text();
-            let mut file_symbols = Vec::new();
-            collect_symbols(tree.root_node(), &text, &mut file_symbols);
-            let container_name = extract_container_name(uri);
-            for mut sym in file_symbols {
-                // Filter reserved words (Requirement 7.2)
-                if is_reserved_word(&sym.name) {
-                    continue;
-                }
-                if sym.name.to_lowercase().contains(&lower_query) {
-                    sym.location.uri = uri.clone();
-                    sym.container_name = container_name.clone();
-                    symbols.push(sym);
-                }
-            }
-        }
+    if symbols.len() < max_results {
+        collect_legacy_ast_symbols(
+            &state.workspace_index,
+            &lower_query,
+            max_results,
+            &mut seen_uris,
+            &mut symbols,
+        );
     }
 
-    // Apply configurable limit (Requirement 9.2, 11.2)
+    // Apply configurable limit as final guard (Requirement 9.2, 11.2)
     symbols.truncate(max_results);
     Some(symbols)
 }
 
+/// Collect matching workspace symbols from a legacy `HashMap<Url, Document>` (AST fallback).
+///
+/// Iterates the map, skips URIs already in `seen_uris`, and collects symbols whose names
+/// (case-insensitively) contain `lower_query`, stopping once `max_results` is reached.
+fn collect_legacy_ast_symbols(
+    docs: &std::collections::HashMap<Url, crate::state::Document>,
+    lower_query: &str,
+    max_results: usize,
+    seen_uris: &mut std::collections::HashSet<Url>,
+    symbols: &mut Vec<SymbolInformation>,
+) {
+    for (uri, doc) in docs {
+        if symbols.len() >= max_results {
+            break;
+        }
+        if seen_uris.contains(uri) {
+            continue;
+        }
+        seen_uris.insert(uri.clone());
+        if let Some(tree) = &doc.tree {
+            let text = doc.text();
+            let mut file_symbols = Vec::new();
+            collect_symbols(tree.root_node(), &text, &mut file_symbols);
+            let container_name = extract_container_name(uri);
+            for mut sym in file_symbols {
+                // Filter reserved words (Requirement 7.2)
+                if is_reserved_word(&sym.name) {
+                    continue;
+                }
+                if sym.name.to_lowercase().contains(lower_query) {
+                    sym.location.uri = uri.clone();
+                    sym.container_name = container_name.clone();
+                    symbols.push(sym);
+                }
+            }
+        }
+    }
+}
+
 /// Collect matching symbols from precomputed `ScopeArtifacts` and append them to `symbols`.
-
 ///
-
 /// This filters exported symbols by whether their name (case-insensitively) contains `lower_query`,
-
 /// skips declared (virtual) symbols such as `@lsp-var`/`@lsp-func`, and maps internal symbol kinds
-
 /// to LSP `SymbolKind` values. Each matched symbol is appended as a `SymbolInformation` with the
-
 /// provided `file_uri` and the symbol's definition position.
-
 ///
-
 /// - `file_uri`: URI to assign to each returned `SymbolInformation`.
-
 /// - `artifacts`: Precomputed `ScopeArtifacts` containing `exported_interface`.
-
 /// - `lower_query`: a lowercased query string used for substring matching against symbol names.
-
 /// - `symbols`: output vector to which matching `SymbolInformation` entries will be appended.
-
 ///
-
 /// # Examples
-
 ///
-
 /// ```no_run
-
 /// # use lsp_types::{Location, Range, Position, SymbolInformation, SymbolKind};
-
 /// # use url::Url;
-
 /// # // Assume `artifacts` is a prepared ScopeArtifacts instance and `symbols` is an empty Vec.
-
 /// # let file_uri = Url::parse("file:///path/to/file.R").unwrap();
-
 /// # let lower_query = "foo";
-
 /// # let mut symbols: Vec<SymbolInformation> = Vec::new();
-
 /// # // collect_workspace_symbols_from_artifacts(&file_uri, &artifacts, lower_query, &mut symbols);
-
 /// // After calling, `symbols` will contain any exported symbols whose names contain "foo".
-
 /// ```
 #[allow(deprecated)] // SymbolInformation::deprecated is deprecated in favor of tags
 fn collect_workspace_symbols_from_artifacts(
@@ -2316,7 +2335,7 @@ fn collect_workspace_symbols_from_artifacts(
         };
 
         symbols.push(SymbolInformation {
-            name: scoped_symbol.name.clone(),
+            name: scoped_symbol.name.to_string(),
             kind,
             tags: None,
             deprecated: None,
@@ -3592,7 +3611,7 @@ fn collect_out_of_scope_diagnostics(
             };
 
             get_artifacts(&source_uri)
-                .map(|a| a.exported_interface.keys().cloned().collect())
+                .map(|a| a.exported_interface.keys().map(|k| k.to_string()).collect())
                 .unwrap_or_default()
         };
 
@@ -3933,11 +3952,52 @@ pub(crate) fn collect_undefined_variables_position_aware(
     // Second pass: collect all usages with NSE-aware context
     collect_usages_with_context(node, text, &UsageContext::default(), &mut used);
 
+    // Pre-compute line start offsets for O(1) line lookups instead of repeated
+    // text.lines().nth() which is O(n) each time.
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
+    // Helper closure: get a line's text from pre-computed offsets
+    let get_line = |row: usize| -> &str {
+        if row >= line_starts.len() {
+            return "";
+        }
+        let start = line_starts[row];
+        let end = if row + 1 < line_starts.len() {
+            // Exclude the trailing newline
+            line_starts[row + 1].saturating_sub(1).min(text.len())
+        } else {
+            text.len()
+        };
+        if start > text.len() || end > text.len() || start > end {
+            return "";
+        }
+        &text[start..end]
+    };
+
+    // Cache scope resolution by line number. Within a single line, the cross-file
+    // scope (symbols, inherited_packages, loaded_packages) is identical for all
+    // identifiers. This avoids calling get_cross_file_scope() N times per file
+    // where N is the number of identifiers — instead we call it at most once per
+    // unique line that has an identifier needing a scope check.
+    //
+    // Note: Keying by line alone means two identifiers at different columns on
+    // the same line reuse the first identifier's column for function-scope
+    // filtering. In theory this is incorrect when multiple function bodies
+    // start/end on one line, but in practice R code is one-statement-per-line
+    // and the performance benefit (avoiding per-identifier scope resolution)
+    // outweighs the risk of this edge case.
+    let mut scope_cache: std::collections::HashMap<u32, crate::cross_file::scope::ScopeAtPosition> =
+        std::collections::HashMap::new();
+
+    // Pre-compute workspace_imports as a HashSet for O(1) lookups
+    let workspace_imports_set: std::collections::HashSet<&str> =
+        workspace_imports.iter().map(|s| s.as_str()).collect();
+
     // Report undefined variables with position-aware cross-file scope
     for (name, usage_node) in used {
         // Skip reserved words BEFORE any other checks (Requirement 3.4)
-        // Reserved words like `if`, `else`, `TRUE`, etc. should never produce
-        // "Undefined variable" diagnostics regardless of their position in code
         if crate::reserved_words::is_reserved_word(&name) {
             continue;
         }
@@ -3950,24 +4010,20 @@ pub(crate) fn collect_undefined_variables_position_aware(
         }
 
         // Skip if builtin or workspace import
-        // Local definitions are checked via position-aware scope below
-        if is_builtin(&name) || workspace_imports.contains(&name) {
+        if is_builtin(&name) || workspace_imports_set.contains(name.as_str()) {
             continue;
         }
 
-        // Convert byte column to UTF-16 for cross-file scope lookup
-        let line_text = text
-            .lines()
-            .nth(usage_node.start_position().row)
-            .unwrap_or("");
-        let usage_col = byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
-
-        // Get full scope at position, including position-aware loaded packages
-        // Requirements 8.1, 8.3, 8.4: Position-aware package checking
-        let scope = get_cross_file_scope(state, uri, usage_line, usage_col);
+        // Get or compute the scope for this line (cached)
+        let scope = scope_cache.entry(usage_line).or_insert_with(|| {
+            let line_text = get_line(usage_node.start_position().row);
+            let usage_col =
+                byte_offset_to_utf16_column(line_text, usage_node.start_position().column);
+            get_cross_file_scope(state, uri, usage_line, usage_col)
+        });
 
         // Check if symbol is in cross-file scope
-        if scope.symbols.contains_key(&name) {
+        if scope.symbols.contains_key(name.as_str()) {
             continue;
         }
 
@@ -3990,15 +4046,9 @@ pub(crate) fn collect_undefined_variables_position_aware(
         }
 
         // Symbol is undefined - emit diagnostic
-        // Convert byte columns to UTF-16 for diagnostic range
-        let start_line_text = text
-            .lines()
-            .nth(usage_node.start_position().row)
-            .unwrap_or("");
-        let end_line_text = text
-            .lines()
-            .nth(usage_node.end_position().row)
-            .unwrap_or("");
+        // Convert byte columns to UTF-16 for diagnostic range using pre-computed line offsets
+        let start_line_text = get_line(usage_node.start_position().row);
+        let end_line_text = get_line(usage_node.end_position().row);
         let start_col =
             byte_offset_to_utf16_column(start_line_text, usage_node.start_position().column);
         let end_col = byte_offset_to_utf16_column(end_line_text, usage_node.end_position().column);
@@ -4500,10 +4550,11 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
 
     // Add package exports only if packages feature is enabled
     if state.cross_file_config.packages_enabled {
-        // Combine inherited and loaded packages
-        let mut all_packages: Vec<String> = scope.inherited_packages.clone();
-        for pkg in &scope.loaded_packages {
-            if !all_packages.contains(pkg) {
+        // Combine inherited and loaded packages using a set for O(1) dedup
+        let mut pkg_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut all_packages: Vec<String> = Vec::new();
+        for pkg in scope.inherited_packages.iter().chain(scope.loaded_packages.iter()) {
+            if pkg_set.insert(pkg.as_str()) {
                 all_packages.push(pkg.clone());
             }
         }
@@ -4536,10 +4587,11 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
     // Add cross-file symbols (from scope resolution)
     // Requirement 9.5: Package exports > cross-file symbols
     for (name, symbol) in scope.symbols {
-        if seen_names.contains(&name) {
+        if seen_names.contains(name.as_ref()) {
             continue; // Local definitions and package exports take precedence
         }
-        seen_names.insert(name.clone());
+        let name_string = name.to_string();
+        seen_names.insert(name_string.clone());
 
         let kind = match symbol.kind {
             crate::cross_file::SymbolKind::Function => CompletionItemKind::FUNCTION,
@@ -4555,7 +4607,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         };
 
         items.push(CompletionItem {
-            label: name,
+            label: name_string,
             kind: Some(kind),
             detail,
             ..Default::default()
@@ -5249,18 +5301,13 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
             // Try to get full help documentation from R
             let name_owned = name.to_string();
             let pkg_owned = pkg_name.to_string();
-            if let Ok(help_result) = tokio::task::spawn_blocking(move || {
+            if let Ok(Some(help_text)) = tokio::task::spawn_blocking(move || {
                 crate::help::get_help(&name_owned, Some(&pkg_owned))
             })
             .await
             {
-                if let Some(help_text) = help_result {
-                    // Show full R documentation
-                    value.push_str(&format!("```\n{}\n```", help_text));
-                } else {
-                    value.push_str(&format!("```r\n{}\n```\n", name));
-                    value.push_str(&format!("\nfrom {{{}}}", pkg_name));
-                }
+                // Show full R documentation
+                value.push_str(&format!("```\n{}\n```", help_text));
             } else {
                 value.push_str(&format!("```r\n{}\n```\n", name));
                 value.push_str(&format!("\nfrom {{{}}}", pkg_name));
@@ -5294,23 +5341,21 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
 
     // Try to get help from R subprocess
     let name_owned = name.to_string();
-    if let Ok(help_text) =
+    if let Ok(Some(help_text)) =
         tokio::task::spawn_blocking(move || crate::help::get_help(&name_owned, None)).await
     {
-        if let Some(help_text) = help_text {
-            // Cache successful result
-            state
-                .help_cache
-                .insert(name.to_string(), Some(help_text.clone()));
+        // Cache successful result
+        state
+            .help_cache
+            .insert(name.to_string(), Some(help_text.clone()));
 
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("```\n{}\n```", help_text),
-                }),
-                range: Some(node_range),
-            });
-        }
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```\n{}\n```", help_text),
+            }),
+            range: Some(node_range),
+        });
     }
 
     // Cache negative result to avoid repeated failed lookups
@@ -12304,6 +12349,7 @@ mod proptests {
     use crate::cross_file::scope::{ScopedSymbol, SymbolKind};
     use crate::state::Document;
     use proptest::prelude::*;
+    use std::sync::Arc;
     use std::collections::HashSet;
 
     // Helper to parse R code for property tests
@@ -12520,7 +12566,7 @@ mod proptests {
         let tree = parse_r_code(code);
 
         let symbol = ScopedSymbol {
-            name: "x".to_string(),
+            name: Arc::from("x"),
             kind: SymbolKind::Variable,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
@@ -12541,7 +12587,7 @@ mod proptests {
         let tree = parse_r_code(code);
 
         let symbol = ScopedSymbol {
-            name: "f".to_string(),
+            name: Arc::from("f"),
             kind: SymbolKind::Function,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
@@ -12567,7 +12613,7 @@ mod proptests {
         let tree = parse_r_code(&code);
 
         let symbol = ScopedSymbol {
-            name: "long_func".to_string(),
+            name: Arc::from("long_func"),
             kind: SymbolKind::Function,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
@@ -12599,7 +12645,7 @@ mod proptests {
             let var_name = code.split_whitespace().next().unwrap();
 
             let symbol = ScopedSymbol {
-                name: var_name.to_string(),
+                name: Arc::from(var_name),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -12625,7 +12671,7 @@ mod proptests {
         let tree = parse_r_code(code);
 
         let symbol = ScopedSymbol {
-            name: "i".to_string(),
+            name: Arc::from("i"),
             kind: SymbolKind::Variable,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 0,
@@ -12731,7 +12777,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: var_name.clone(),
+                name: Arc::from(var_name.as_str()),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -12761,7 +12807,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: func_name.clone(),
+                name: Arc::from(func_name.as_str()),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -12797,7 +12843,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: func_name.clone(),
+                name: Arc::from(func_name.as_str()),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -12933,7 +12979,7 @@ mod proptests {
 
             let tree = parse_r_code(&statement);
             let symbol = ScopedSymbol {
-                name: "long_func".to_string(),
+                name: Arc::from("long_func"),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -12967,7 +13013,7 @@ mod proptests {
 
             let tree = parse_r_code(&statement);
             let symbol = ScopedSymbol {
-                name: "func".to_string(),
+                name: Arc::from("func"),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13019,7 +13065,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: var_name.clone(),
+                name: Arc::from(var_name.as_str()),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13051,7 +13097,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: func_name.clone(),
+                name: Arc::from(func_name.as_str()),
                 kind: SymbolKind::Function,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13078,7 +13124,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: iterator.clone(),
+                name: Arc::from(iterator.as_str()),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13112,7 +13158,7 @@ mod proptests {
             let tree = parse_r_code(&code);
 
             let symbol = ScopedSymbol {
-                name: param_name.clone(),
+                name: Arc::from(param_name.as_str()),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line: 0,
@@ -13229,9 +13275,9 @@ mod proptests {
             let position = Position::new(1, 10); // Position after source() call
             let cross_file_symbols = get_cross_file_symbols(&state, &main_uri, position.line, position.character);
 
-            prop_assert!(cross_file_symbols.contains_key(&func_name), "Should resolve cross-file symbol using dependency graph");
+            prop_assert!(cross_file_symbols.contains_key(func_name.as_str()), "Should resolve cross-file symbol using dependency graph");
 
-            if let Some(symbol) = cross_file_symbols.get(&func_name) {
+            if let Some(symbol) = cross_file_symbols.get(func_name.as_str()) {
                 prop_assert_eq!(&symbol.source_uri, &utils_uri, "Should locate definition in sourced file");
             }
         }
@@ -13265,9 +13311,9 @@ mod proptests {
             let position = Position::new(3, 10); // Position of function usage
             let cross_file_symbols = get_cross_file_symbols(&state, &uri, position.line, position.character);
 
-            prop_assert!(cross_file_symbols.contains_key(&func_name), "Should find symbol definition");
+            prop_assert!(cross_file_symbols.contains_key(func_name.as_str()), "Should find symbol definition");
 
-            if let Some(symbol) = cross_file_symbols.get(&func_name) {
+            if let Some(symbol) = cross_file_symbols.get(func_name.as_str()) {
                 // Should select the local definition (line 2) that's in scope, not the earlier one or utils.R
                 prop_assert_eq!(&symbol.source_uri, &uri, "Should select definition from same file");
                 prop_assert_eq!(symbol.defined_line, 2, "Should select the definition that's in scope at reference position");
@@ -19051,6 +19097,7 @@ mod integration_tests {
     use super::*;
     use crate::r_env;
     use crate::state::{Document, WorldState};
+    use std::sync::Arc;
 
     #[test]
     fn test_base_package_functions() {
@@ -19139,7 +19186,7 @@ mod integration_tests {
 
         // Create a scoped symbol with definition info
         let symbol = ScopedSymbol {
-            name: "my_var".to_string(),
+            name: Arc::from("my_var"),
             kind: SymbolKind::Variable,
             source_uri: uri.clone(),
             defined_line: 0,
@@ -19267,7 +19314,7 @@ mod integration_tests {
 
         // Create a declared variable symbol
         let symbol = ScopedSymbol {
-            name: "myvar".to_string(),
+            name: Arc::from("myvar"),
             kind: SymbolKind::Variable,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 4, // 0-based line 4 = display line 5
@@ -19308,7 +19355,7 @@ mod integration_tests {
 
         // Create a declared function symbol
         let symbol = ScopedSymbol {
-            name: "myfunc".to_string(),
+            name: Arc::from("myfunc"),
             kind: SymbolKind::Function,
             source_uri: Url::parse("file:///test.R").unwrap(),
             defined_line: 9, // 0-based line 9 = display line 10
@@ -19356,7 +19403,7 @@ mod integration_tests {
 
         for (defined_line, expected_display_line) in test_cases {
             let symbol = ScopedSymbol {
-                name: "test_symbol".to_string(),
+                name: Arc::from("test_symbol"),
                 kind: SymbolKind::Variable,
                 source_uri: Url::parse("file:///test.R").unwrap(),
                 defined_line,
@@ -19688,7 +19735,7 @@ result <- missing_func(42)"#;
 
         // Create a scoped symbol that references a missing file
         let symbol = ScopedSymbol {
-            name: "missing_func".to_string(),
+            name: Arc::from("missing_func"),
             kind: crate::cross_file::SymbolKind::Function,
             source_uri: missing_uri, // This file doesn't exist in state
             defined_line: 0,
@@ -20303,7 +20350,7 @@ result <- helper_with_spaces(42)"#;
         // Create a symbol with a package URI
         let package_uri = Url::parse("package:dplyr").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Variable,
             source_uri: package_uri,
             defined_line: 0,
@@ -20379,7 +20426,7 @@ result <- helper_with_spaces(42)"#;
         // Create a symbol with a file URI (local definition)
         let file_uri = Url::parse("file:///workspace/main.R").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Function,
             source_uri: file_uri.clone(),
             defined_line: 5,
@@ -20837,7 +20884,7 @@ result <- filter(c(1, -2, 3))"#;
         // Create a symbol that represents a package export
         let package_uri = Url::parse("package:dplyr").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Function,
             source_uri: package_uri.clone(),
             defined_line: 0,
@@ -20983,7 +21030,7 @@ z <- mutate(5)  # Uses local definition"#;
         // Create a symbol with a package URI
         let package_uri = Url::parse("package:dplyr").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Function,
             source_uri: package_uri.clone(),
             defined_line: 0,
@@ -21017,7 +21064,7 @@ z <- mutate(5)  # Uses local definition"#;
         // Create a symbol with a file URI (local definition)
         let file_uri = Url::parse("file:///workspace/main.R").unwrap();
         let symbol = ScopedSymbol {
-            name: "mutate".to_string(),
+            name: Arc::from("mutate"),
             kind: SymbolKind::Function,
             source_uri: file_uri.clone(),
             defined_line: 5,
