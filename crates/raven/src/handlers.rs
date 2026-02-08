@@ -53,6 +53,14 @@ const R_CONSTANTS: &[&str] = &[
 ///
 /// Controls the display order of completion items to prioritize more relevant symbols.
 /// Lower prefixes appear first in the completion list. Aligns with R language server behavior.
+///
+/// Prefix allocation (matching R-LS conventions):
+///   "0-" — function arguments (reserved for future use)
+///   "1-" — local scope
+///   "2-" — workspace
+///   "3-" — imported objects (reserved for future use)
+///   "4-" — package globals
+///   "5-" — keywords / text tokens
 const SORT_PREFIX_SCOPE: &str = "1-";
 const SORT_PREFIX_WORKSPACE: &str = "2-";
 const SORT_PREFIX_PACKAGE: &str = "4-";
@@ -603,8 +611,11 @@ impl<'a> SymbolExtractor<'a> {
     /// // Function detection
     /// // my_func <- function(x) x + 1 → FUNCTION
     ///
-    /// // Variable detection
-    /// // x <- 42 → VARIABLE
+    /// // Value-based type detection
+    /// // x <- 42 → NUMBER
+    /// // flag <- TRUE → BOOLEAN
+    /// // name <- "hello" → STRING
+    /// // other <- some_call() → VARIABLE (fallback, maps to FIELD)
     /// ```
     fn classify_symbol(&self, name: &str, rhs: tree_sitter::Node<'a>) -> DocumentSymbolKind {
         // Priority 1: Check for R6Class() or setRefClass() call
@@ -693,7 +704,7 @@ impl<'a> SymbolExtractor<'a> {
             "parenthesized_expression" => {
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    if child.is_named() && child.kind() != "(" && child.kind() != ")" {
+                    if child.is_named() {
                         return self.detect_value_type(child);
                     }
                 }
@@ -2179,7 +2190,7 @@ fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>)
                     let kind = if rhs.kind() == "function_definition" {
                         SymbolKind::FUNCTION
                     } else {
-                        SymbolKind::VARIABLE
+                        SymbolKind::FIELD
                     };
 
                     symbols.push(SymbolInformation {
@@ -2457,8 +2468,8 @@ fn collect_workspace_symbols_from_artifacts(
 
         let kind = match scoped_symbol.kind {
             crate::cross_file::scope::SymbolKind::Function => SymbolKind::FUNCTION,
-            crate::cross_file::scope::SymbolKind::Variable => SymbolKind::VARIABLE,
-            crate::cross_file::scope::SymbolKind::Parameter => SymbolKind::VARIABLE,
+            crate::cross_file::scope::SymbolKind::Variable => SymbolKind::FIELD,
+            crate::cross_file::scope::SymbolKind::Parameter => SymbolKind::FIELD,
         };
 
         symbols.push(SymbolInformation {
@@ -20554,7 +20565,7 @@ setClass("{}", slots = c(value = "numeric"))
         assert_eq!(func_sym.kind, tower_lsp::lsp_types::SymbolKind::FUNCTION);
 
         let var_sym = result.iter().find(|s| s.name == "my_var").unwrap();
-        assert_eq!(var_sym.kind, tower_lsp::lsp_types::SymbolKind::VARIABLE);
+        assert_eq!(var_sym.kind, tower_lsp::lsp_types::SymbolKind::FIELD);
     }
 
     // ========================================================================
@@ -24763,7 +24774,6 @@ result <- undefined_var
             Some("function definition"),
         );
 
-        // If we got here without panicking, the utility works
-        assert!(true, "inspect_ast utility executed successfully");
+        // If we reached here without panicking, the utility works correctly.
     }
 }
