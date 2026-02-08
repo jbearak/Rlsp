@@ -810,22 +810,29 @@ impl PackageLibrary {
 
         // Step 3: Load base package exports statically with INDEX fallback
         // Base packages use exportPattern, but INDEX file provides documented exports
+        // Track per-package exports for completion attribution (e.g., {base}, {utils})
         let mut all_base_exports = HashSet::new();
+        let mut per_package_exports: HashMap<String, HashSet<String>> = HashMap::new();
         let mut pattern_packages: Vec<String> = Vec::new();
 
         for package in &base_packages_list {
             if let Some(pkg_dir) = self.find_package_directory(package) {
                 if let Some(parse_result) = self.parse_package_static(&pkg_dir) {
+                    let pkg_exports = per_package_exports.entry(package.clone()).or_default();
                     // Add explicit exports
                     for export in &parse_result.explicit_exports {
                         all_base_exports.insert(export.clone());
+                        pkg_exports.insert(export.clone());
                     }
 
                     if parse_result.has_export_pattern {
                         // Base packages use exportPattern - add INDEX exports and track for R fallback
                         let index_exports =
                             self.load_with_index_fallback(&pkg_dir, &parse_result).await;
-                        all_base_exports.extend(index_exports);
+                        for export in &index_exports {
+                            all_base_exports.insert(export.clone());
+                            pkg_exports.insert(export.clone());
+                        }
                         pattern_packages.push(package.clone());
                     }
                 }
@@ -845,9 +852,11 @@ impl PackageLibrary {
                     .await
                 {
                     Ok(exports_map) => {
-                        for (_pkg_name, exports) in exports_map {
+                        for (pkg_name, exports) in exports_map {
+                            let pkg_exports = per_package_exports.entry(pkg_name).or_default();
                             for export in exports {
-                                all_base_exports.insert(export);
+                                all_base_exports.insert(export.clone());
+                                pkg_exports.insert(export);
                             }
                         }
                     }
@@ -860,6 +869,14 @@ impl PackageLibrary {
                     }
                 }
             }
+        }
+
+        // Step 5: Store per-package exports in the packages cache for completion attribution
+        // This allows get_exports_for_completions() to find base packages with correct
+        // package names (e.g., {base}, {utils}, {stats})
+        for (pkg_name, exports) in per_package_exports {
+            let info = PackageInfo::new(pkg_name.clone(), exports);
+            self.insert_package(info).await;
         }
 
         log::trace!(
@@ -1795,11 +1812,11 @@ mod tests {
 
         let lib = PackageLibrary::new(Some(r_subprocess)).await;
 
-        // First call should load and cache
-        assert!(!lib.is_cached("stats").await);
+        // Base packages (like stats) are now pre-cached during initialization.
+        // Verify stats is cached and that repeated calls return the same Arc.
+        assert!(lib.is_cached("stats").await);
         let result1 = lib.get_package("stats").await;
         assert!(result1.is_some());
-        assert!(lib.is_cached("stats").await);
 
         // Second call should return cached version
         let result2 = lib.get_package("stats").await;

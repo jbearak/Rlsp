@@ -4689,9 +4689,21 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
 
     // Add package exports only if packages feature is enabled
     if state.cross_file_config.packages_enabled {
-        // Combine inherited and loaded packages using a set for O(1) dedup
+        // Combine base packages, inherited, and loaded packages using a set for O(1) dedup
+        // Requirement 6.3: Base packages SHALL be available at all positions
         let mut pkg_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut all_packages: Vec<String> = Vec::new();
+
+        // Base packages first (always available without library() calls)
+        if state.package_library_ready {
+            for pkg in state.package_library.base_packages() {
+                if pkg_set.insert(pkg.as_str()) {
+                    all_packages.push(pkg.clone());
+                }
+            }
+        }
+
+        // Then inherited and explicitly loaded packages
         for pkg in scope
             .inherited_packages
             .iter()
@@ -4699,23 +4711,6 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
         {
             if pkg_set.insert(pkg.as_str()) {
                 all_packages.push(pkg.clone());
-            }
-        }
-
-        // Add base package exports (always available in R without library() calls)
-        // Requirement 6.3: Base packages SHALL be available at all positions
-        if state.package_library_ready {
-            for export_name in state.package_library.base_exports() {
-                if seen_names.contains(export_name.as_str()) {
-                    continue; // Local definitions take precedence
-                }
-                seen_names.insert(export_name.clone());
-                items.push(CompletionItem {
-                    label: export_name.clone(),
-                    kind: Some(CompletionItemKind::FUNCTION),
-                    sort_text: Some(format!("{}{}", SORT_PREFIX_PACKAGE, export_name)),
-                    ..Default::default()
-                });
             }
         }
 
@@ -4727,7 +4722,7 @@ pub fn completion(state: &WorldState, uri: &Url, position: Position) -> Option<C
             .get_exports_for_completions(&all_packages);
         for (export_name, package_names) in package_exports {
             if seen_names.contains(&export_name) {
-                continue; // Local definitions or base exports take precedence
+                continue; // Local definitions take precedence
             }
             seen_names.insert(export_name.clone());
 
