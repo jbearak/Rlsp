@@ -1191,7 +1191,8 @@ fn make_meta_with_sources(sources: Vec<(&str, u32)>) -> CrossFileMetadata {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             })
             .collect(),
         ..Default::default()
@@ -11236,7 +11237,7 @@ proptest! {
     ) {
         // Ensure the exported and non-exported names are different
         prop_assume!(exported_name != non_exported_name);
-        
+
         // Ensure non_exported_name doesn't conflict with generated variable names
         for i in 0..lines_before {
             prop_assume!(non_exported_name != format!("x{}", i));
@@ -16397,7 +16398,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: lsp-source-directive, Property 1: Forward Directive Parsing Completeness
 // Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9
@@ -16409,35 +16409,24 @@ fn path_with_optional_spaces() -> impl Strategy<Value = String> {
         // Simple path without spaces
         relative_path(),
         // Path with spaces (requires quoting)
-        (path_component(), path_component()).prop_map(|(dir, file)| {
-            format!("{} folder/{}.R", dir, file)
-        }),
+        (path_component(), path_component())
+            .prop_map(|(dir, file)| { format!("{} folder/{}.R", dir, file) }),
     ]
 }
 
 /// Generate a forward directive synonym
 fn forward_directive_synonym() -> impl Strategy<Value = &'static str> {
-    prop_oneof![
-        Just("lsp-source"),
-        Just("lsp-run"),
-        Just("lsp-include"),
-    ]
+    prop_oneof![Just("lsp-source"), Just("lsp-run"), Just("lsp-include"),]
 }
 
 /// Generate optional @ prefix
 fn optional_at_prefix() -> impl Strategy<Value = &'static str> {
-    prop_oneof![
-        Just("@"),
-        Just(""),
-    ]
+    prop_oneof![Just("@"), Just(""),]
 }
 
 /// Generate optional colon separator
 fn optional_colon() -> impl Strategy<Value = &'static str> {
-    prop_oneof![
-        Just(":"),
-        Just(""),
-    ]
+    prop_oneof![Just(":"), Just(""),]
 }
 
 /// Quote style for paths
@@ -16467,10 +16456,7 @@ fn format_path_with_quotes(path: &str, style: QuoteStyle) -> String {
 
 /// Generate optional line=N parameter
 fn optional_line_param() -> impl Strategy<Value = Option<u32>> {
-    prop_oneof![
-        Just(None),
-        (1..1000u32).prop_map(Some),
-    ]
+    prop_oneof![Just(None), (1..1000u32).prop_map(Some),]
 }
 
 proptest! {
@@ -16816,7 +16802,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: lsp-source-directive, Property 3: Call-Site Line Conversion
 // Validates: Requirements 2.1
@@ -16979,7 +16964,6 @@ proptest! {
         );
     }
 }
-
 
 // ============================================================================
 // Feature: lsp-source-directive, Property 4: Default Call-Site Assignment
@@ -17261,7 +17245,6 @@ proptest! {
         prop_assert_eq!(&meta.sources[2].path, &path3);
     }
 }
-
 
 // ============================================================================
 // Feature: lsp-source-directive, Property 5: Multiple Directive Independence
@@ -17957,7 +17940,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: lsp-source-directive, Property 7: Directive Edge Creation
 // Validates: Requirements 4.1, 4.2
@@ -18345,7 +18327,6 @@ proptest! {
         );
     }
 }
-
 
 // ============================================================================
 // Feature: lsp-source-directive, Property 8: Same Call-Site Conflict Resolution
@@ -20701,7 +20682,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Property 12: Revalidation on Directive Change
 // Feature: lsp-source-directive
@@ -20716,7 +20696,11 @@ enum DirectiveChangeOp {
     /// Remove an existing forward directive
     Remove { target: String },
     /// Modify an existing forward directive's target
-    Modify { old_target: String, new_target: String, line: u32 },
+    Modify {
+        old_target: String,
+        new_target: String,
+        line: u32,
+    },
 }
 
 proptest! {
@@ -21394,7 +21378,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: lsp-declaration-directives, Property 1: Directive Parsing Completeness
 // Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 2.1, 2.2, 2.3, 2.4, 2.5
@@ -21721,7 +21704,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: lsp-declaration-directives, Property 4: Position-Aware Scope Inclusion
 // Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5, 4.6
@@ -21846,13 +21828,13 @@ proptest! {
         for (name, line, is_func) in &symbols {
             unique_symbols.entry(name.clone()).or_insert((*line, *is_func));
         }
-        
+
         // Also deduplicate by line (only one declaration per line)
         let mut line_to_symbol: std::collections::HashMap<u32, (String, bool)> = std::collections::HashMap::new();
         for (name, (line, is_func)) in &unique_symbols {
             line_to_symbol.entry(*line).or_insert((name.clone(), *is_func));
         }
-        
+
         let mut sorted_symbols: Vec<(String, u32, bool)> = line_to_symbol
             .into_iter()
             .map(|(line, (name, is_func))| (name, line, is_func))
@@ -22244,8 +22226,6 @@ proptest! {
         );
     }
 }
-
-
 
 // ============================================================================
 // Feature: lsp-declaration-directives, Property 7: Cross-File Declaration Inheritance
@@ -22903,7 +22883,6 @@ proptest! {
     }
 }
 
-
 // ============================================================================
 // Feature: lsp-declaration-directives, Property 9: Conflicting Declaration Resolution
 // Validates: Requirements 11.1, 11.2, 11.3, 11.4
@@ -23006,12 +22985,12 @@ proptest! {
             format!("# {} {}", first_directive, symbol_name),
             format!("# {} {}", second_directive, symbol_name),
         ];
-        
+
         // Add filler lines
         for i in 0..usage_line_offset {
             lines.push(format!("filler{} <- {}", i, i));
         }
-        
+
         // Add usage line
         lines.push(symbol_name.clone());
 
@@ -23060,10 +23039,10 @@ proptest! {
         let mut lines: Vec<String> = (0..prefix_lines)
             .map(|i| format!("prefix{} <- {}", i, i))
             .collect();
-        
+
         let first_decl_line = prefix_lines;
         let second_decl_line = prefix_lines + 1;
-        
+
         lines.push(format!("# {} {}", first_directive, symbol_name));
         lines.push(format!("# {} {}", second_directive, symbol_name));
         lines.push("x <- 42".to_string());
@@ -23088,7 +23067,7 @@ proptest! {
         // Note: The scope resolution uses the later declaration's kind but the first declaration's line
         // for go-to-definition purposes. However, the ScopedSymbol in scope stores the line from
         // the declaration that determined the kind (the later one).
-        // 
+        //
         // The actual go-to-definition behavior (navigating to first declaration) is implemented
         // in handlers.rs by scanning metadata for all declarations and finding the minimum line.
         // Here we verify that both declarations are present in metadata.
@@ -23151,12 +23130,12 @@ proptest! {
 
         // Build code with gap between declarations
         let mut lines = vec![format!("# {} {}", first_directive, symbol_name)];
-        
+
         // Add gap lines
         for i in 0..gap_lines {
             lines.push(format!("gap{} <- {}", i, i));
         }
-        
+
         lines.push(format!("# {} {}", second_directive, symbol_name));
         // Use a different variable name to avoid overwriting the declared symbol
         lines.push("other_var <- 42".to_string());
@@ -23202,14 +23181,14 @@ proptest! {
         // Generate alternating var/func declarations
         let mut lines = Vec::new();
         let mut last_is_function = false;
-        
+
         for i in 0..declaration_count {
             let is_function = i % 2 == 1;
             let directive = if is_function { "@lsp-func" } else { "@lsp-var" };
             lines.push(format!("# {} {}", directive, symbol_name));
             last_is_function = is_function;
         }
-        
+
         // Use a dummy variable name that cannot collide with the declared symbol_name.
         // If symbol_name happens to be "x", a plain `x <- 42` would create a real
         // definition that overrides the declared kind (real definitions take precedence
@@ -23314,7 +23293,6 @@ proptest! {
         );
     }
 }
-
 
 // ============================================================================
 // Feature: lsp-declaration-directives, Property 10: Workspace Index Declaration Extraction

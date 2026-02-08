@@ -285,7 +285,12 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
                     // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
                     // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
                     let metadata = crate::cross_file::extract_metadata(&text);
-                    return Some(scope::compute_artifacts_with_metadata(uri, tree, &text, Some(&metadata)));
+                    return Some(scope::compute_artifacts_with_metadata(
+                        uri,
+                        tree,
+                        &text,
+                        Some(&metadata),
+                    ));
                 }
             }
         }
@@ -310,7 +315,12 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
                     // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
                     // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
                     let metadata = crate::cross_file::extract_metadata(&text);
-                    return Some(scope::compute_artifacts_with_metadata(uri, tree, &text, Some(&metadata)));
+                    return Some(scope::compute_artifacts_with_metadata(
+                        uri,
+                        tree,
+                        &text,
+                        Some(&metadata),
+                    ));
                 }
             }
         }
@@ -1902,7 +1912,7 @@ mod integration_tests {
 
         // Create artifacts with declared symbols (simulating what workspace indexer produces)
         let mut artifacts = ScopeArtifacts::default();
-        
+
         // Add a declared variable to the timeline
         let declared_var = ScopedSymbol {
             name: std::sync::Arc::from("declared_var"),
@@ -1918,7 +1928,9 @@ mod integration_tests {
             column: u32::MAX,
             symbol: declared_var.clone(),
         });
-        artifacts.exported_interface.insert(std::sync::Arc::from("declared_var"), declared_var);
+        artifacts
+            .exported_interface
+            .insert(std::sync::Arc::from("declared_var"), declared_var);
 
         // Add a declared function to the timeline
         let declared_func = ScopedSymbol {
@@ -1935,7 +1947,9 @@ mod integration_tests {
             column: u32::MAX,
             symbol: declared_func.clone(),
         });
-        artifacts.exported_interface.insert(std::sync::Arc::from("declared_func"), declared_func);
+        artifacts
+            .exported_interface
+            .insert(std::sync::Arc::from("declared_func"), declared_func);
 
         // Create metadata with declared symbols
         let metadata = CrossFileMetadata {
@@ -1954,7 +1968,9 @@ mod integration_tests {
 
         // Add to workspace index (simulating indexed closed file)
         let index_entry = crate::workspace_index::IndexEntry {
-            contents: ropey::Rope::from_str("# @lsp-var declared_var\n# @lsp-func declared_func\nx <- 1"),
+            contents: ropey::Rope::from_str(
+                "# @lsp-var declared_var\n# @lsp-func declared_func\nx <- 1",
+            ),
             tree: None,
             loaded_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
@@ -1973,17 +1989,23 @@ mod integration_tests {
 
         // Requirement 12.2: Declared symbols from indexed file should be available
         let retrieved_artifacts = provider.get_artifacts(&uri);
-        assert!(retrieved_artifacts.is_some(), "Artifacts should be available from workspace index");
+        assert!(
+            retrieved_artifacts.is_some(),
+            "Artifacts should be available from workspace index"
+        );
 
         let artifacts = retrieved_artifacts.unwrap();
-        
+
         // Verify declared variable is in exported interface
         assert!(
             artifacts.exported_interface.contains_key("declared_var"),
             "Declared variable should be in exported interface"
         );
         let var_symbol = artifacts.exported_interface.get("declared_var").unwrap();
-        assert!(var_symbol.is_declared, "Symbol should be marked as declared");
+        assert!(
+            var_symbol.is_declared,
+            "Symbol should be marked as declared"
+        );
         assert_eq!(var_symbol.kind, SymbolKind::Variable);
 
         // Verify declared function is in exported interface
@@ -1992,14 +2014,23 @@ mod integration_tests {
             "Declared function should be in exported interface"
         );
         let func_symbol = artifacts.exported_interface.get("declared_func").unwrap();
-        assert!(func_symbol.is_declared, "Symbol should be marked as declared");
+        assert!(
+            func_symbol.is_declared,
+            "Symbol should be marked as declared"
+        );
         assert_eq!(func_symbol.kind, SymbolKind::Function);
 
         // Verify timeline contains Declaration events
-        let declaration_events: Vec<_> = artifacts.timeline.iter()
+        let declaration_events: Vec<_> = artifacts
+            .timeline
+            .iter()
             .filter(|e| matches!(e, ScopeEvent::Declaration { .. }))
             .collect();
-        assert_eq!(declaration_events.len(), 2, "Timeline should contain 2 Declaration events");
+        assert_eq!(
+            declaration_events.len(),
+            2,
+            "Timeline should contain 2 Declaration events"
+        );
     }
 
     /// Test that when an indexed file is opened, declared symbols are re-extracted from live content
@@ -2032,7 +2063,9 @@ mod integration_tests {
             column: u32::MAX,
             symbol: old_symbol.clone(),
         });
-        old_artifacts.exported_interface.insert(std::sync::Arc::from("old_declared"), old_symbol);
+        old_artifacts
+            .exported_interface
+            .insert(std::sync::Arc::from("old_declared"), old_symbol);
 
         let old_metadata = CrossFileMetadata {
             declared_variables: vec![DeclaredSymbol {
@@ -2063,11 +2096,15 @@ mod integration_tests {
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
         let old_artifacts = provider.get_artifacts(&uri).unwrap();
         assert!(
-            old_artifacts.exported_interface.contains_key("old_declared"),
+            old_artifacts
+                .exported_interface
+                .contains_key("old_declared"),
             "Workspace index should have old declared symbol"
         );
         assert!(
-            !old_artifacts.exported_interface.contains_key("new_declared"),
+            !old_artifacts
+                .exported_interface
+                .contains_key("new_declared"),
             "Workspace index should NOT have new declared symbol yet"
         );
 
@@ -2081,19 +2118,33 @@ mod integration_tests {
 
         // Verify open document takes precedence and has new declared symbol
         let new_artifacts = provider.get_artifacts(&uri).unwrap();
-        
+
         // New declared symbol should be present
         assert!(
-            new_artifacts.exported_interface.contains_key("new_declared"),
+            new_artifacts
+                .exported_interface
+                .contains_key("new_declared"),
             "Open document should have new declared symbol (re-extracted from live content)"
         );
-        let new_symbol = new_artifacts.exported_interface.get("new_declared").unwrap();
-        assert!(new_symbol.is_declared, "New symbol should be marked as declared");
-        assert_eq!(new_symbol.kind, SymbolKind::Function, "New symbol should be a function");
+        let new_symbol = new_artifacts
+            .exported_interface
+            .get("new_declared")
+            .unwrap();
+        assert!(
+            new_symbol.is_declared,
+            "New symbol should be marked as declared"
+        );
+        assert_eq!(
+            new_symbol.kind,
+            SymbolKind::Function,
+            "New symbol should be a function"
+        );
 
         // Old declared symbol should NOT be present (it was in the old content)
         assert!(
-            !new_artifacts.exported_interface.contains_key("old_declared"),
+            !new_artifacts
+                .exported_interface
+                .contains_key("old_declared"),
             "Open document should NOT have old declared symbol (live content doesn't have it)"
         );
     }
@@ -2103,10 +2154,10 @@ mod integration_tests {
     /// **Validates: Requirements 12.2**
     #[tokio::test]
     async fn test_scope_resolution_uses_indexed_file_declarations() {
+        use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::scope::{
             scope_at_position_with_graph, ScopeArtifacts, ScopeEvent, ScopedSymbol, SymbolKind,
         };
-        use crate::cross_file::dependency::DependencyGraph;
         use crate::cross_file::types::{CrossFileMetadata, DeclaredSymbol, ForwardSource};
         use std::collections::HashSet;
 
@@ -2134,7 +2185,9 @@ mod integration_tests {
             column: u32::MAX,
             symbol: child_declared.clone(),
         });
-        child_artifacts.exported_interface.insert(std::sync::Arc::from("child_declared"), child_declared);
+        child_artifacts
+            .exported_interface
+            .insert(std::sync::Arc::from("child_declared"), child_declared);
 
         let child_metadata = CrossFileMetadata {
             declared_functions: vec![DeclaredSymbol {
@@ -2181,18 +2234,16 @@ mod integration_tests {
             }],
             ..Default::default()
         };
-        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), |_| None);
+        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), |_| {
+            None
+        });
 
         // Create provider
         let provider = DefaultContentProvider::new(&doc_store, &workspace_index, &file_cache);
 
         // Create closures for scope resolution
-        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
-            provider.get_artifacts(uri)
-        };
-        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> {
-            provider.get_metadata(uri)
-        };
+        let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> { provider.get_artifacts(uri) };
+        let get_metadata = |uri: &Url| -> Option<CrossFileMetadata> { provider.get_metadata(uri) };
 
         // Query scope at end of parent file
         let scope = scope_at_position_with_graph(
@@ -2217,6 +2268,10 @@ mod integration_tests {
 
         let symbol = scope.symbols.get("child_declared").unwrap();
         assert!(symbol.is_declared, "Symbol should be marked as declared");
-        assert_eq!(symbol.kind, SymbolKind::Function, "Symbol should be a function");
+        assert_eq!(
+            symbol.kind,
+            SymbolKind::Function,
+            "Symbol should be a function"
+        );
     }
 }

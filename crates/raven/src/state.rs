@@ -89,13 +89,14 @@ impl SymbolConfig {
     /// ```
     pub fn with_max_results(value: usize) -> Self {
         Self {
-            workspace_max_results: value
-                .clamp(Self::MIN_WORKSPACE_MAX_RESULTS, Self::MAX_WORKSPACE_MAX_RESULTS),
+            workspace_max_results: value.clamp(
+                Self::MIN_WORKSPACE_MAX_RESULTS,
+                Self::MAX_WORKSPACE_MAX_RESULTS,
+            ),
             hierarchical_document_symbol_support: false,
         }
     }
 }
-
 
 use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
@@ -629,7 +630,8 @@ impl WorldState {
     /// Resize all LRU caches based on configuration.
     /// Called after parsing initialization options.
     pub fn resize_caches(&self, config: &crate::cross_file::config::CrossFileConfig) {
-        self.cross_file_meta.resize(config.cache_metadata_max_entries);
+        self.cross_file_meta
+            .resize(config.cache_metadata_max_entries);
         self.cross_file_file_cache.resize(
             config.cache_file_content_max_entries,
             config.cache_existence_max_entries,
@@ -841,7 +843,10 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
 
     for iteration in 0..max_chain_depth {
         if files_needing_enrichment.is_empty() {
-            log::trace!("Workspace scan enrichment converged after {} iteration(s)", iteration + 1);
+            log::trace!(
+                "Workspace scan enrichment converged after {} iteration(s)",
+                iteration + 1
+            );
             break;
         }
 
@@ -886,7 +891,10 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
         }
 
         if newly_enriched.is_empty() {
-            log::trace!("Workspace scan enrichment converged after {} iteration(s)", iteration + 1);
+            log::trace!(
+                "Workspace scan enrichment converged after {} iteration(s)",
+                iteration + 1
+            );
             break;
         }
     }
@@ -962,7 +970,12 @@ fn scan_directory(
                             // Use compute_artifacts_with_metadata to include declared symbols from directives
                             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
                             let artifacts = if let Some(tree) = doc.tree.as_ref() {
-                                crate::cross_file::scope::compute_artifacts_with_metadata(&uri, tree, &text, Some(&cross_file_meta))
+                                crate::cross_file::scope::compute_artifacts_with_metadata(
+                                    &uri,
+                                    tree,
+                                    &text,
+                                    Some(&cross_file_meta),
+                                )
                             } else {
                                 crate::cross_file::scope::ScopeArtifacts::default()
                             };

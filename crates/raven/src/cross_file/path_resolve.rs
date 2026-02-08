@@ -185,7 +185,11 @@ pub fn resolve_path_with_workspace_fallback(path: &str, context: &PathContext) -
 }
 
 /// Internal implementation of path resolution with optional workspace fallback
-fn resolve_path_impl(path: &str, context: &PathContext, try_workspace_fallback: bool) -> Option<PathBuf> {
+fn resolve_path_impl(
+    path: &str,
+    context: &PathContext,
+    try_workspace_fallback: bool,
+) -> Option<PathBuf> {
     if path.is_empty() {
         log::trace!("Path resolution: empty path provided");
         return None;

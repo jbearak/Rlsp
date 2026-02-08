@@ -302,9 +302,7 @@ impl RSubprocess {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn R subprocess: {e}"))?;
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(result) => {
-                result.map_err(|e| anyhow!("Failed to execute R subprocess: {e}"))?
-            }
+            Ok(result) => result.map_err(|e| anyhow!("Failed to execute R subprocess: {e}"))?,
             Err(_) => {
                 return Err(anyhow!("R subprocess timed out after {timeout:?}"));
             }
@@ -872,10 +870,7 @@ fn parse_multi_exports_output(
         result.insert(pkg, std::mem::take(&mut current_exports));
     }
 
-    log::trace!(
-        "Multi-export query: {} packages with exports",
-        result.len()
-    );
+    log::trace!("Multi-export query: {} packages with exports", result.len());
 
     Ok(result)
 }

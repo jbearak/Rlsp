@@ -148,7 +148,11 @@ impl PerfMetrics {
         log::info!("[PERF] === Startup Performance Summary ===");
 
         if let Some(d) = self.workspace_scan_duration {
-            log::info!("[PERF] Workspace scan: {:?} ({} files)", d, self.files_scanned);
+            log::info!(
+                "[PERF] Workspace scan: {:?} ({} files)",
+                d,
+                self.files_scanned
+            );
         }
 
         if let Some(d) = self.package_init_duration {
@@ -212,8 +216,7 @@ pub fn record_first_diagnostic(duration: Duration) {
 }
 
 /// Atomic counter for R subprocess calls
-static R_SUBPROCESS_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static R_SUBPROCESS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Increment the R subprocess call counter
 pub fn increment_r_subprocess_calls() {

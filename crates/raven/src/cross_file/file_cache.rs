@@ -85,7 +85,10 @@ impl std::fmt::Debug for CrossFileFileCache {
 
 impl Default for CrossFileFileCache {
     fn default() -> Self {
-        Self::with_capacities(DEFAULT_FILE_CACHE_CAPACITY, DEFAULT_EXISTENCE_CACHE_CAPACITY)
+        Self::with_capacities(
+            DEFAULT_FILE_CACHE_CAPACITY,
+            DEFAULT_EXISTENCE_CACHE_CAPACITY,
+        )
     }
 }
 

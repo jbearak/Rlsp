@@ -284,12 +284,7 @@ impl WorkspaceIndex {
     pub fn iter(&self) -> Vec<(Url, IndexEntry)> {
         self.inner
             .read()
-            .map(|guard| {
-                guard
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            })
+            .map(|guard| guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default()
     }
 

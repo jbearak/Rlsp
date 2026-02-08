@@ -94,8 +94,7 @@ mod tests {
         // 1. Start with a lowercase letter (to avoid case-sensitivity edge cases)
         // 2. Contain only valid R identifier characters
         // 3. Are NOT in the reserved word set
-        "[a-z][a-z0-9_.]{0,15}"
-            .prop_filter("Must not be a reserved word", |s| !is_reserved_word(s))
+        "[a-z][a-z0-9_.]{0,15}".prop_filter("Must not be a reserved word", |s| !is_reserved_word(s))
     }
 
     /// Strategy to generate arbitrary strings (including edge cases).

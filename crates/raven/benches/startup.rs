@@ -295,13 +295,9 @@ fn bench_tree_sitter_parsing(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("parse_medium", |b| {
-        b.iter(|| black_box(medium_code.len()))
-    });
+    group.bench_function("parse_medium", |b| b.iter(|| black_box(medium_code.len())));
 
-    group.bench_function("parse_large", |b| {
-        b.iter(|| black_box(large_code.len()))
-    });
+    group.bench_function("parse_large", |b| b.iter(|| black_box(large_code.len())));
 
     group.finish();
 }

@@ -93,7 +93,11 @@ impl CrossFileWorkspaceIndex {
 
     /// Get metadata for a URI (without freshness check)
     pub fn get_metadata(&self, uri: &Url) -> Option<CrossFileMetadata> {
-        self.inner.read().ok()?.peek(uri).map(|e| e.metadata.clone())
+        self.inner
+            .read()
+            .ok()?
+            .peek(uri)
+            .map(|e| e.metadata.clone())
     }
 
     /// Get artifacts for a URI (without freshness check)

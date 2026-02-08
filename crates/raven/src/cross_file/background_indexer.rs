@@ -170,11 +170,7 @@ impl BackgroundIndexer {
     }
 
     /// Starts background worker
-    fn start_worker(
-        &self,
-        canceled: Arc<Mutex<HashSet<Url>>>,
-        pending: Arc<Mutex<HashSet<Url>>>,
-    ) {
+    fn start_worker(&self, canceled: Arc<Mutex<HashSet<Url>>>, pending: Arc<Mutex<HashSet<Url>>>) {
         let state = self.state.clone();
         let queue = self.queue.clone();
         let token = self.cancellation_token.clone();
@@ -264,7 +260,10 @@ impl BackgroundIndexer {
 
                 // Queue transitive dependencies for both Priority 2 and Priority 3 tasks
                 // (as long as depth limit allows)
-                Self::queue_transitive_deps(state, queue, pending, &task.uri, &metadata, task.depth).await;
+                Self::queue_transitive_deps(
+                    state, queue, pending, &task.uri, &metadata, task.depth,
+                )
+                .await;
             }
             Err(e) => {
                 log::warn!("Failed to index {}: {}", task.uri, e);
@@ -310,7 +309,12 @@ impl BackgroundIndexer {
         // **Validates: Requirements 12.1** (Workspace index declaration extraction)
         let artifacts = crate::parser_pool::with_parser(|parser| {
             if let Some(tree) = parser.parse(&content, None) {
-                crate::cross_file::scope::compute_artifacts_with_metadata(uri, &tree, &content, Some(&cross_file_meta))
+                crate::cross_file::scope::compute_artifacts_with_metadata(
+                    uri,
+                    &tree,
+                    &content,
+                    Some(&cross_file_meta),
+                )
             } else {
                 crate::cross_file::scope::ScopeArtifacts::default()
             }
@@ -415,8 +419,7 @@ impl BackgroundIndexer {
 
                         if needs_indexing {
                             // O(1) duplicate check via pending set
-                            let already_pending =
-                                pending.lock().unwrap().contains(&source_uri);
+                            let already_pending = pending.lock().unwrap().contains(&source_uri);
                             if already_pending {
                                 continue;
                             }

@@ -4535,7 +4535,10 @@ child_function <- function() {
             expected_parent_wd.display(),
             effective_wd.display()
         );
-        println!("  ✓ effective_working_directory() returns {}", expected_child_wd.display());
+        println!(
+            "  ✓ effective_working_directory() returns {}",
+            expected_child_wd.display()
+        );
 
         // Verify it's NOT the parent's working directory
         assert_ne!(
@@ -4545,7 +4548,10 @@ child_function <- function() {
             expected_parent_wd.display(),
             effective_wd.display()
         );
-        println!("  ✓ effective_working_directory() is NOT {}", expected_parent_wd.display());
+        println!(
+            "  ✓ effective_working_directory() is NOT {}",
+            expected_parent_wd.display()
+        );
 
         println!("\nStep 5: Verify source() resolution uses child's explicit @lsp-cd");
 
@@ -4579,7 +4585,10 @@ child_function <- function() {
             expected_parent_utils.display(),
             resolved.display()
         );
-        println!("  ✓ source('utils.r') does NOT resolve to {}", expected_parent_utils.display());
+        println!(
+            "  ✓ source('utils.r') does NOT resolve to {}",
+            expected_parent_utils.display()
+        );
 
         println!("\nStep 6: Verify precedence even when inherited_working_directory is set");
 
@@ -4613,7 +4622,10 @@ child_function <- function() {
             expected_child_utils.display(),
             resolved_with_both.display()
         );
-        println!("  ✓ source('utils.r') still resolves to {}", expected_child_utils.display());
+        println!(
+            "  ✓ source('utils.r') still resolves to {}",
+            expected_child_utils.display()
+        );
 
         println!("\n=== Test Passed ===");
         println!("Summary:");
@@ -4650,7 +4662,10 @@ child_function <- function() {
 mod lsp_source_scope_tests {
     use super::*;
     use crate::cross_file::dependency::DependencyGraph;
-    use crate::cross_file::scope::{compute_artifacts, compute_artifacts_with_metadata, scope_at_position_with_graph, ScopeArtifacts};
+    use crate::cross_file::scope::{
+        compute_artifacts, compute_artifacts_with_metadata, scope_at_position_with_graph,
+        ScopeArtifacts,
+    };
     use crate::cross_file::types::CrossFileMetadata;
     use std::collections::HashSet;
     use tree_sitter::Parser;
@@ -4694,23 +4709,40 @@ child_var <- 100
         // Use compute_artifacts_with_metadata to include forward directive sources in timeline
         let parent_tree = parse_r_tree(parent_content);
         let parent_metadata = extract_metadata_for_file(&workspace, "parent.r").unwrap();
-        let parent_artifacts = compute_artifacts_with_metadata(&parent_uri, &parent_tree, parent_content, Some(&parent_metadata));
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            parent_content,
+            Some(&parent_metadata),
+        );
 
         let child_tree = parse_r_tree(child_content);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
 
         // Verify parent has the forward directive in its sources
-        println!("  Parent sources: {:?}", parent_artifacts.timeline.iter()
-            .filter_map(|e| if let crate::cross_file::scope::ScopeEvent::Source { source, .. } = e {
-                Some(&source.path)
-            } else { None })
-            .collect::<Vec<_>>());
+        println!(
+            "  Parent sources: {:?}",
+            parent_artifacts
+                .timeline
+                .iter()
+                .filter_map(|e| {
+                    if let crate::cross_file::scope::ScopeEvent::Source { source, .. } = e {
+                        Some(&source.path)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        );
 
         // Verify metadata has forward directive
         println!("  Parent metadata sources: {:?}", parent_metadata.sources);
 
         assert!(
-            parent_metadata.sources.iter().any(|s| s.is_directive && s.path == "child.r"),
+            parent_metadata
+                .sources
+                .iter()
+                .any(|s| s.is_directive && s.path == "child.r"),
             "Parent should have @lsp-source directive for child.r"
         );
         println!("  ✓ Parent has @lsp-source directive for child.r");
@@ -4731,7 +4763,12 @@ child_var <- 100
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), content_provider);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata,
+            Some(&workspace_root),
+            content_provider,
+        );
 
         // Verify edge was created
         let children = get_children(&graph, &parent_uri);
@@ -4870,12 +4907,15 @@ x <- 1
         let parent_metadata = extract_metadata_for_file(&workspace, "parent.r").unwrap();
 
         // The directive is at line 1, but line=5 means call site is at line 4 (0-based)
-        let forward_source = parent_metadata.sources.iter()
+        let forward_source = parent_metadata
+            .sources
+            .iter()
             .find(|s| s.is_directive && s.path == "child.r")
             .expect("Should have @lsp-source directive");
 
         assert_eq!(
-            forward_source.line, 4, // line=5 converts to 0-based line 4
+            forward_source.line,
+            4, // line=5 converts to 0-based line 4
             "line=5 parameter should convert to 0-based line 4"
         );
         println!("  ✓ line=5 parameter correctly converted to 0-based line 4");
@@ -4885,7 +4925,12 @@ x <- 1
         // Parse and compute artifacts
         // Use compute_artifacts_with_metadata to include forward directive sources in timeline
         let parent_tree = parse_r_tree(parent_content);
-        let parent_artifacts = compute_artifacts_with_metadata(&parent_uri, &parent_tree, parent_content, Some(&parent_metadata));
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            parent_content,
+            Some(&parent_metadata),
+        );
 
         let child_tree = parse_r_tree(child_content);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
@@ -4903,7 +4948,12 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), content_provider);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata,
+            Some(&workspace_root),
+            content_provider,
+        );
 
         let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
             if uri == &parent_uri {
@@ -5001,7 +5051,10 @@ x <- 1
             let parent_metadata = extract_metadata_for_file(&workspace, "parent.r").unwrap();
 
             assert!(
-                parent_metadata.sources.iter().any(|s| s.is_directive && s.path == "child.r"),
+                parent_metadata
+                    .sources
+                    .iter()
+                    .any(|s| s.is_directive && s.path == "child.r"),
                 "{} should create a forward directive for child.r",
                 synonym
             );
@@ -5009,7 +5062,12 @@ x <- 1
             // Parse and compute artifacts
             // Use compute_artifacts_with_metadata to include forward directive sources in timeline
             let parent_tree = parse_r_tree(&parent_content);
-            let parent_artifacts = compute_artifacts_with_metadata(&parent_uri, &parent_tree, &parent_content, Some(&parent_metadata));
+            let parent_artifacts = compute_artifacts_with_metadata(
+                &parent_uri,
+                &parent_tree,
+                &parent_content,
+                Some(&parent_metadata),
+            );
 
             let child_tree = parse_r_tree(child_content);
             let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
@@ -5027,7 +5085,12 @@ x <- 1
                     None
                 }
             };
-            graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), content_provider);
+            graph.update_file(
+                &parent_uri,
+                &parent_metadata,
+                Some(&workspace_root),
+                content_provider,
+            );
 
             let get_artifacts = |uri: &Url| -> Option<ScopeArtifacts> {
                 if uri == &parent_uri {
@@ -5115,7 +5178,12 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v1,
+            Some(&workspace_root),
+            content_provider,
+        );
 
         // Verify no edge exists
         let children_v1 = get_children(&graph, &parent_uri);
@@ -5131,7 +5199,9 @@ x <- 1
         let parent_content_v2 = r#"# @lsp-source child.r
 x <- 1
 "#;
-        workspace.update_file("parent.r", parent_content_v2).unwrap();
+        workspace
+            .update_file("parent.r", parent_content_v2)
+            .unwrap();
 
         // Extract new metadata and update graph
         let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
@@ -5145,24 +5215,30 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v2,
+            Some(&workspace_root),
+            content_provider_v2,
+        );
 
         // Verify edge was created
         let children_v2 = get_children(&graph, &parent_uri);
         assert_eq!(
-            children_v2.len(), 1,
+            children_v2.len(),
+            1,
             "After adding directive, parent should have one child"
         );
-        assert_eq!(
-            children_v2[0], child_uri,
-            "Child should be child.r"
-        );
+        assert_eq!(children_v2[0], child_uri, "Child should be child.r");
         println!("  ✓ Dependency edge created after adding @lsp-source directive");
 
         // Verify edge properties
         let edges = graph.get_dependencies(&parent_uri);
         assert!(edges[0].is_directive, "Edge should be marked as directive");
-        assert!(!edges[0].is_backward_directive, "Edge should NOT be marked as backward directive");
+        assert!(
+            !edges[0].is_backward_directive,
+            "Edge should NOT be marked as backward directive"
+        );
         println!("  ✓ Edge has correct is_directive=true, is_backward_directive=false");
 
         println!("\n=== Test Passed ===");
@@ -5207,12 +5283,18 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v1,
+            Some(&workspace_root),
+            content_provider,
+        );
 
         // Verify edge exists
         let children_v1 = get_children(&graph, &parent_uri);
         assert_eq!(
-            children_v1.len(), 1,
+            children_v1.len(),
+            1,
             "Initially, parent should have one child"
         );
         println!("  ✓ Dependency edge exists initially");
@@ -5223,7 +5305,9 @@ x <- 1
         let parent_content_v2 = r#"# No directive anymore
 x <- 1
 "#;
-        workspace.update_file("parent.r", parent_content_v2).unwrap();
+        workspace
+            .update_file("parent.r", parent_content_v2)
+            .unwrap();
 
         // Extract new metadata and update graph
         let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
@@ -5237,7 +5321,12 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v2,
+            Some(&workspace_root),
+            content_provider_v2,
+        );
 
         // Verify edge was removed
         let children_v2 = get_children(&graph, &parent_uri);
@@ -5295,7 +5384,12 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v1,
+            Some(&workspace_root),
+            content_provider,
+        );
 
         // Verify edge to child_a exists
         let children_v1 = get_children(&graph, &parent_uri);
@@ -5309,7 +5403,9 @@ x <- 1
         let parent_content_v2 = r#"# @lsp-source child_b.r
 x <- 1
 "#;
-        workspace.update_file("parent.r", parent_content_v2).unwrap();
+        workspace
+            .update_file("parent.r", parent_content_v2)
+            .unwrap();
 
         // Extract new metadata and update graph
         let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
@@ -5325,7 +5421,12 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v2,
+            Some(&workspace_root),
+            content_provider_v2,
+        );
 
         // Verify edge now points to child_b
         let children_v2 = get_children(&graph, &parent_uri);
@@ -5390,18 +5491,32 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata, Some(&workspace_root), content_provider);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata,
+            Some(&workspace_root),
+            content_provider,
+        );
 
         // Verify both edges exist
         let children = get_children(&graph, &parent_uri);
         assert_eq!(children.len(), 2, "Parent should have two children");
-        assert!(children.contains(&child_a_uri), "Should have edge to child_a.r");
-        assert!(children.contains(&child_b_uri), "Should have edge to child_b.r");
+        assert!(
+            children.contains(&child_a_uri),
+            "Should have edge to child_a.r"
+        );
+        assert!(
+            children.contains(&child_b_uri),
+            "Should have edge to child_b.r"
+        );
         println!("  ✓ Both dependency edges created");
 
         // Verify both edges are directive edges
         let edges = graph.get_dependencies(&parent_uri);
-        assert!(edges.iter().all(|e| e.is_directive), "All edges should be directive edges");
+        assert!(
+            edges.iter().all(|e| e.is_directive),
+            "All edges should be directive edges"
+        );
         println!("  ✓ All edges marked as directive edges");
 
         println!("\n=== Test Passed ===");
@@ -5436,7 +5551,12 @@ x <- 1
         // Parse and compute artifacts
         let parent_tree_v1 = parse_r_tree(parent_content_v1);
         let parent_metadata_v1 = extract_metadata_from_content(parent_content_v1);
-        let parent_artifacts_v1 = compute_artifacts_with_metadata(&parent_uri, &parent_tree_v1, parent_content_v1, Some(&parent_metadata_v1));
+        let parent_artifacts_v1 = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree_v1,
+            parent_content_v1,
+            Some(&parent_metadata_v1),
+        );
 
         let child_tree = parse_r_tree(child_content);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
@@ -5454,7 +5574,12 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider_v1);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v1,
+            Some(&workspace_root),
+            content_provider_v1,
+        );
 
         // Test scope - child symbols should NOT be available
         let get_artifacts_v1 = |uri: &Url| -> Option<ScopeArtifacts> {
@@ -5499,12 +5624,19 @@ x <- 1
         let parent_content_v2 = r#"# @lsp-source child.r
 x <- 1
 "#;
-        workspace.update_file("parent.r", parent_content_v2).unwrap();
+        workspace
+            .update_file("parent.r", parent_content_v2)
+            .unwrap();
 
         // Re-parse and compute artifacts
         let parent_tree_v2 = parse_r_tree(parent_content_v2);
         let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
-        let parent_artifacts_v2 = compute_artifacts_with_metadata(&parent_uri, &parent_tree_v2, parent_content_v2, Some(&parent_metadata_v2));
+        let parent_artifacts_v2 = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree_v2,
+            parent_content_v2,
+            Some(&parent_metadata_v2),
+        );
 
         // Update graph
         let content_provider_v2 = |uri: &Url| -> Option<String> {
@@ -5516,7 +5648,12 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v2,
+            Some(&workspace_root),
+            content_provider_v2,
+        );
 
         // Test scope - child symbols SHOULD now be available
         let get_artifacts_v2 = |uri: &Url| -> Option<ScopeArtifacts> {
@@ -5587,7 +5724,12 @@ x <- 1
         // Parse and compute artifacts
         let parent_tree_v1 = parse_r_tree(parent_content_v1);
         let parent_metadata_v1 = extract_metadata_from_content(parent_content_v1);
-        let parent_artifacts_v1 = compute_artifacts_with_metadata(&parent_uri, &parent_tree_v1, parent_content_v1, Some(&parent_metadata_v1));
+        let parent_artifacts_v1 = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree_v1,
+            parent_content_v1,
+            Some(&parent_metadata_v1),
+        );
 
         let child_tree = parse_r_tree(child_content);
         let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_content);
@@ -5605,7 +5747,12 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v1, Some(&workspace_root), content_provider_v1);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v1,
+            Some(&workspace_root),
+            content_provider_v1,
+        );
 
         // Test scope - child symbols SHOULD be available
         let get_artifacts_v1 = |uri: &Url| -> Option<ScopeArtifacts> {
@@ -5650,12 +5797,19 @@ x <- 1
         let parent_content_v2 = r#"# No directive anymore
 x <- 1
 "#;
-        workspace.update_file("parent.r", parent_content_v2).unwrap();
+        workspace
+            .update_file("parent.r", parent_content_v2)
+            .unwrap();
 
         // Re-parse and compute artifacts
         let parent_tree_v2 = parse_r_tree(parent_content_v2);
         let parent_metadata_v2 = extract_metadata_from_content(parent_content_v2);
-        let parent_artifacts_v2 = compute_artifacts_with_metadata(&parent_uri, &parent_tree_v2, parent_content_v2, Some(&parent_metadata_v2));
+        let parent_artifacts_v2 = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree_v2,
+            parent_content_v2,
+            Some(&parent_metadata_v2),
+        );
 
         // Update graph
         let content_provider_v2 = |uri: &Url| -> Option<String> {
@@ -5667,7 +5821,12 @@ x <- 1
                 None
             }
         };
-        graph.update_file(&parent_uri, &parent_metadata_v2, Some(&workspace_root), content_provider_v2);
+        graph.update_file(
+            &parent_uri,
+            &parent_metadata_v2,
+            Some(&workspace_root),
+            content_provider_v2,
+        );
 
         // Test scope - child symbols should NOT be available anymore
         let get_artifacts_v2 = |uri: &Url| -> Option<ScopeArtifacts> {

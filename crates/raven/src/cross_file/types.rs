@@ -258,7 +258,8 @@ mod tests {
             local: true,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true, ..Default::default()
+            sys_source_global_env: true,
+            ..Default::default()
         };
         let uri = Url::parse("file:///test.R").unwrap();
         let key = source.to_key(uri.clone());
@@ -287,7 +288,8 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             working_directory: Some("/data".to_string()),
             inherited_working_directory: None,
@@ -367,7 +369,8 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             working_directory: Some("/child/explicit".to_string()),
             inherited_working_directory: Some("/parent/inherited".to_string()),
@@ -420,7 +423,8 @@ mod tests {
             local: true,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true, ..Default::default()
+            sys_source_global_env: true,
+            ..Default::default()
         };
         assert!(!source.inherits_symbols());
     }
@@ -435,7 +439,8 @@ mod tests {
             local: false,
             chdir: false,
             is_sys_source: true,
-            sys_source_global_env: false, ..Default::default()
+            sys_source_global_env: false,
+            ..Default::default()
         };
         assert!(!source.inherits_symbols());
     }
@@ -450,7 +455,8 @@ mod tests {
             local: false,
             chdir: false,
             is_sys_source: true,
-            sys_source_global_env: true, ..Default::default()
+            sys_source_global_env: true,
+            ..Default::default()
         };
         assert!(source.inherits_symbols());
     }
@@ -465,7 +471,8 @@ mod tests {
             local: false,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true, ..Default::default()
+            sys_source_global_env: true,
+            ..Default::default()
         };
         assert!(source.inherits_symbols());
     }

@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use super::parent_resolve::{infer_call_site_from_parent, resolve_match_pattern};
-use super::path_resolve::{path_to_uri, resolve_path, resolve_path_with_workspace_fallback, PathContext};
+use super::path_resolve::{
+    path_to_uri, resolve_path, resolve_path_with_workspace_fallback, PathContext,
+};
 use super::types::{CallSiteSpec, CrossFileMetadata};
 
 /// Resolve the effective working directory of a parent file for inheritance.
@@ -852,7 +854,7 @@ impl DependencyGraph {
                             } else {
                                 // Directive has no explicit call site
                                 // (Requirement 4.5)
-                                
+
                                 // Get the directive's line (where it appears in the file)
                                 let directive_line = meta
                                     .sources
@@ -862,13 +864,13 @@ impl DependencyGraph {
                                             && do_resolve(&s.path) == Some(to_uri.clone())
                                     })
                                     .map(|s| s.line);
-                                
+
                                 // Check if AST edge is at an earlier line than the directive
                                 let ast_is_earlier = match directive_line {
                                     Some(dir_line) => source.line < dir_line,
                                     None => false, // If we can't determine directive line, don't treat AST as earlier
                                 };
-                                
+
                                 if ast_is_earlier {
                                     // Case 3: Directive without line=, AST at earlier line
                                     // Keep AST edge (earliest call site wins), store redundancy info
@@ -1300,7 +1302,8 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             ..Default::default()
         }
@@ -1388,7 +1391,8 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -1398,7 +1402,8 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1532,7 +1537,8 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -1542,7 +1548,8 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1582,7 +1589,8 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1615,7 +1623,8 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -1625,7 +1634,8 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1660,7 +1670,8 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "helpers.R".to_string(),
@@ -1670,7 +1681,8 @@ mod tests {
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1705,7 +1717,8 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1746,7 +1759,8 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1756,7 +1770,11 @@ mod tests {
         // AST edges are still created even for non-existent files
         // (diagnostics are handled separately in handlers.rs)
         let deps = graph.get_dependencies(&main);
-        assert_eq!(deps.len(), 1, "AST edge should be created even for non-existent file");
+        assert_eq!(
+            deps.len(),
+            1,
+            "AST edge should be created even for non-existent file"
+        );
 
         // No unresolved paths tracked for AST sources
         assert!(
@@ -1787,7 +1805,8 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1908,7 +1927,8 @@ z <- 3
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 super::super::types::ForwardSource {
                     path: "helpers.R".to_string(),
@@ -1918,7 +1938,8 @@ z <- 3
                     local: true,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2812,7 +2833,8 @@ z <- 3
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -2822,7 +2844,8 @@ z <- 3
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2832,11 +2855,21 @@ z <- 3
 
         // Should have ONE edge (directive wins at same call site)
         let deps = graph.get_dependencies(&main);
-        assert_eq!(deps.len(), 1, "Should have exactly one edge when directive and AST at same call site");
-        assert!(deps[0].is_directive, "The edge should be the directive edge");
+        assert_eq!(
+            deps.len(),
+            1,
+            "Should have exactly one edge when directive and AST at same call site"
+        );
+        assert!(
+            deps[0].is_directive,
+            "The edge should be the directive edge"
+        );
 
         // No diagnostics for same call site
-        assert!(result.diagnostics.is_empty(), "No diagnostics for same call site");
+        assert!(
+            result.diagnostics.is_empty(),
+            "No diagnostics for same call site"
+        );
     }
 
     /// Test Case 2: Same file, different call sites - keep both edges
@@ -2862,7 +2895,8 @@ z <- 3
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -2872,7 +2906,8 @@ z <- 3
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2882,10 +2917,17 @@ z <- 3
 
         // Should have TWO edges (different call sites, keep both)
         let deps = graph.get_dependencies(&main);
-        assert_eq!(deps.len(), 2, "Should have both edges when at different call sites");
+        assert_eq!(
+            deps.len(),
+            2,
+            "Should have both edges when at different call sites"
+        );
 
         // No diagnostics for different call sites with explicit line
-        assert!(result.diagnostics.is_empty(), "No diagnostics for different call sites");
+        assert!(
+            result.diagnostics.is_empty(),
+            "No diagnostics for different call sites"
+        );
     }
 
     /// Test Case 3: Directive without explicit call site, AST at earlier line - keep AST edge
@@ -2915,7 +2957,8 @@ z <- 3
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -2925,7 +2968,8 @@ z <- 3
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2936,10 +2980,17 @@ z <- 3
         // Should have TWO edges: both directive and AST are kept because they have different call sites
         // (This is Case 2: different call sites, keep both)
         let deps = graph.get_dependencies(&main);
-        assert_eq!(deps.len(), 2, "Should keep both edges when at different call sites");
+        assert_eq!(
+            deps.len(),
+            2,
+            "Should keep both edges when at different call sites"
+        );
 
         // No diagnostics because both have explicit call sites
-        assert!(result.diagnostics.is_empty(), "No diagnostics when both have explicit call sites");
+        assert!(
+            result.diagnostics.is_empty(),
+            "No diagnostics when both have explicit call sites"
+        );
     }
 
     /// Test: Directive without explicit call site, AST at later line - directive wins
@@ -2965,7 +3016,8 @@ z <- 3
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: "utils.R".to_string(),
@@ -2975,7 +3027,8 @@ z <- 3
                     local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    sys_source_global_env: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2987,7 +3040,11 @@ z <- 3
         // The directive at line 5 has a known call site, so it only overrides AST at same site
         // AST at line 10 is at different site, so it's kept
         let deps = graph.get_dependencies(&main);
-        assert_eq!(deps.len(), 2, "Should have both edges when directive has explicit call site");
+        assert_eq!(
+            deps.len(),
+            2,
+            "Should have both edges when directive has explicit call site"
+        );
 
         // No diagnostics
         assert!(result.diagnostics.is_empty());
@@ -3014,7 +3071,8 @@ z <- 3
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3023,8 +3081,14 @@ z <- 3
 
         let deps = graph.get_dependencies(&main);
         assert_eq!(deps.len(), 1);
-        assert!(deps[0].is_directive, "Forward directive edge should have is_directive=true");
-        assert!(!deps[0].is_backward_directive, "Forward directive edge should have is_backward_directive=false");
+        assert!(
+            deps[0].is_directive,
+            "Forward directive edge should have is_directive=true"
+        );
+        assert!(
+            !deps[0].is_backward_directive,
+            "Forward directive edge should have is_backward_directive=false"
+        );
     }
 
     /// Test: Backward directive without call site (inference failed), AST at earlier line
@@ -3071,7 +3135,8 @@ z <- 3
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3080,11 +3145,14 @@ z <- 3
 
         // Should have edges from main to child
         let deps = graph.get_dependencies(&main);
-        
+
         // The backward directive edge (no call site) and AST edge (line 5) should both exist
         // because they're processed separately (backward directive in child, AST in main)
         // The conflict resolution only applies when both are in the same file's metadata
-        assert!(!deps.is_empty(), "Should have at least one edge from main to child");
+        assert!(
+            !deps.is_empty(),
+            "Should have at least one edge from main to child"
+        );
 
         // In this case, since the backward directive was processed when updating child,
         // and the AST was processed when updating main, they don't conflict directly.

@@ -254,7 +254,12 @@ impl DocumentStore {
             // Use compute_artifacts_with_metadata to include declared symbols from directives
             // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            crate::cross_file::scope::compute_artifacts_with_metadata(&uri, tree, content, Some(&metadata))
+            crate::cross_file::scope::compute_artifacts_with_metadata(
+                &uri,
+                tree,
+                content,
+                Some(&metadata),
+            )
         } else {
             ScopeArtifacts::default()
         };
@@ -336,7 +341,12 @@ impl DocumentStore {
             // Use compute_artifacts_with_metadata to include declared symbols from directives
             // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
             // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            crate::cross_file::scope::compute_artifacts_with_metadata(&uri, tree, content, Some(&metadata))
+            crate::cross_file::scope::compute_artifacts_with_metadata(
+                &uri,
+                tree,
+                content,
+                Some(&metadata),
+            )
         } else {
             ScopeArtifacts::default()
         };
@@ -421,7 +431,12 @@ impl DocumentStore {
                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                 // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
                 // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                crate::cross_file::scope::compute_artifacts_with_metadata(uri, tree, &content, Some(&state.metadata))
+                crate::cross_file::scope::compute_artifacts_with_metadata(
+                    uri,
+                    tree,
+                    &content,
+                    Some(&state.metadata),
+                )
             } else {
                 ScopeArtifacts::default()
             };
@@ -462,7 +477,12 @@ impl DocumentStore {
                 // Use compute_artifacts_with_metadata to include declared symbols from directives
                 // This ensures @lsp-var and @lsp-func declarations are included in scope resolution
                 // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                crate::cross_file::scope::compute_artifacts_with_metadata(uri, tree, &content, Some(&state.metadata))
+                crate::cross_file::scope::compute_artifacts_with_metadata(
+                    uri,
+                    tree,
+                    &content,
+                    Some(&state.metadata),
+                )
             } else {
                 ScopeArtifacts::default()
             };

@@ -789,7 +789,8 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1019,7 +1020,8 @@ mod tests {
                 local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                sys_source_global_env: true,
+                ..Default::default()
             }],
             ..Default::default()
         };
