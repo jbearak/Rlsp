@@ -2708,12 +2708,21 @@ async fn resync_file_from_disk(
 }
 
 /// `did_close`'s disk-resync driver (issue #558): converge `uri`'s cross-file
-/// state back to disk truth via [`resync_file_from_disk`], union the caller's
-/// pre-close dependent walk (over the buffer-derived edges, captured before
-/// the document stores were wiped) with the post-commit walk, then cap,
-/// force-mark, and publish through the bounded fanout — the same tail the
-/// watched-files async pass uses.
+/// state back to disk truth via [`resync_file_from_disk`], union a
+/// pre-commit dependent walk (over the buffer-derived edges, which stay in
+/// the graph until this resync's commit replaces them) with the post-commit
+/// walks, then cap, force-mark, and publish through the bounded fanout — the
+/// same tail the watched-files async pass uses.
 ///
+/// Global bound on concurrent close-resync tasks. Each `did_close` of an R
+/// document spawns one `run_close_resync` (disk read, parse, write-lock
+/// commit, bounded diagnostics fanout); without a server-wide cap, a "close
+/// all" of N files runs N of those concurrently — N write-lock commits
+/// contending with keystrokes and up to N x `DIAGNOSTIC_FANOUT_CONCURRENCY`
+/// diagnostic workers. Queued resyncs stay correct: a file reopened while
+/// its resync waits is caught by the preflight/commit vetoes.
+static CLOSE_RESYNC_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 /// `package_sibling_fanout` carries `did_close`'s package-visibility fanout
 /// (open siblings whose diagnostics depend on the closed buffer's package
 /// symbols). Folding it in here — instead of `did_close` marking and
@@ -2738,9 +2747,34 @@ async fn run_close_resync(
     chunk_kind: Option<crate::chunks::ChunkKind>,
     old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
     old_interface_hash: Option<u64>,
-    pre_affected: Vec<Url>,
     package_sibling_fanout: Vec<Url>,
 ) {
+    // Bound close-burst concurrency server-wide (see CLOSE_RESYNC_PERMITS).
+    // The permit covers the dependent walk, the disk read, the commit, AND
+    // the publish fanout.
+    let _permit = CLOSE_RESYNC_PERMITS
+        .acquire()
+        .await
+        .expect("static close-resync semaphore is never closed");
+
+    // Pre-commit dependent walk (bounded, up to
+    // `max_transitive_dependents_visited` nodes), off the handler path so a
+    // close never delays the next queued LSP message with it. The graph
+    // still holds the closed buffer's edges: this resync is the only thing
+    // that replaces them, and it runs strictly after this walk.
+    let pre_affected: Vec<Url> = {
+        let state = state_arc.read().await;
+        crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+            &uri,
+            true,
+            false,
+            &state.cross_file_graph,
+            |u| state.documents.contains_key(u),
+            state.cross_file_config.max_chain_depth,
+            state.cross_file_config.max_transitive_dependents_visited,
+        )
+    };
+
     let (post, interface_changed, committed) =
         match resync_file_from_disk(&state_arc, &uri, chunk_kind, old_meta).await {
             ResyncOutcome::Updated {
@@ -5686,6 +5720,12 @@ impl LanguageServer for Backend {
         // from `package_inputs` — so a file deleted from disk while its
         // buffer was open drops its package-internal symbols on close
         // instead of retaining them until an (never-coming) watcher event.
+        //
+        // Deliberate double read: the spawned cross-file resync re-reads the
+        // same file. Handing this snapshot to the resync would trade
+        // commit-time freshness (the resync's read happens right before its
+        // veto+commit) for one saved small-file read on a warm page cache —
+        // not worth the coupling.
         let close_text: Option<Arc<str>> = if package_close_path {
             match uri.to_file_path() {
                 Ok(path) => {
@@ -5724,7 +5764,6 @@ impl LanguageServer for Backend {
             None;
         let mut resync_old_interface_hash: Option<u64> = None;
         let mut resync_chunk_kind: Option<crate::chunks::ChunkKind> = None;
-        let mut resync_pre_affected: Vec<Url> = Vec::new();
 
         let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
             let mut state = self.state.write().await;
@@ -5752,17 +5791,11 @@ impl LanguageServer for Backend {
                 // languageId (#343); the resync must mask disk content the
                 // same way — path reclassification would parse an
                 // extensionless Rmd/Quarto document as plain R.
+                // (The pre-commit dependent WALK deliberately lives inside
+                // `run_close_resync`, off the handler path: it needs only
+                // the pre-commit graph — the buffer-derived edges stay in
+                // place until that resync's own commit replaces them.)
                 resync_chunk_kind = state.documents.get(uri).map(|doc| doc.chunk_kind);
-                resync_pre_affected =
-                    crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                        uri,
-                        true,
-                        false,
-                        &state.cross_file_graph,
-                        |u| state.documents.contains_key(u),
-                        state.cross_file_config.max_chain_depth,
-                        state.cross_file_config.max_transitive_dependents_visited,
-                    );
             }
 
             // Close in new DocumentStore (Requirement 1.5)
@@ -5884,7 +5917,6 @@ impl LanguageServer for Backend {
                 resync_chunk_kind,
                 resync_old_meta,
                 resync_old_interface_hash,
-                resync_pre_affected,
                 sibling_uris,
             ));
         } else {
@@ -16416,7 +16448,11 @@ mod project_config_initialize_tests {
     /// dependent of the closing document must be force-marked exactly once:
     /// the sibling fanout rides the close resync instead of being marked and
     /// scheduled separately (a second schedule cancels the first pending
-    /// debounced task and strands its marker).
+    /// debounced task and strands its marker). A second, package-ONLY
+    /// sibling (`c.R`, no graph edge to the closed file) pins the fold
+    /// itself: it can only be marked through `package_sibling_fanout`, so an
+    /// implementation that drops the sibling set from `run_close_resync`
+    /// fails its stage-1 assertion.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_marks_overlapping_package_sibling_and_dependent_once() {
         let tmp = TempDir::new().unwrap();
@@ -16424,14 +16460,29 @@ mod project_config_initialize_tests {
         fs::write(tmp.path().join("R").join("a.R"), "a_fn <- function() 1\n").unwrap();
         let b_disk = "source(\"a.R\")\nb_fn <- function() 2\n";
         fs::write(tmp.path().join("R").join("b.R"), b_disk).unwrap();
+        // Package-only sibling: open R/ file with NO edge to a.R.
+        let c_disk = "c_fn <- function() 3\n";
+        fs::write(tmp.path().join("R").join("c.R"), c_disk).unwrap();
         let (svc, b_uri) = open_in_workspace(&tmp, "R/b.R", "r", b_disk).await;
         let backend = svc.inner();
         let a_uri = Url::from_file_path(tmp.path().join("R").join("a.R")).unwrap();
+        let c_uri = Url::from_file_path(tmp.path().join("R").join("c.R")).unwrap();
         open_doc(backend, &a_uri, "r", 1, "a_fn <- function() 1\n").await;
+        open_doc(backend, &c_uri, "r", 1, c_disk).await;
 
-        // Activate package mode, then make a's close change package
-        // visibility (buffer-only symbol discarded on close).
-        backend.state.write().await.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+        // Activate REAL package mode (a bare workspace_root without a
+        // DESCRIPTION never derives a scope contribution, so
+        // pkg_visibility_changed would stay false and the sibling fanout
+        // would be empty), then make a's close change package visibility
+        // (buffer-only symbol discarded on close).
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+            state.package_inputs.description = Some(crate::package_state::DescriptionInput {
+                text: "Package: testpkg\nVersion: 1.0\n".into(),
+            });
+            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+        }
         change_doc(
             backend,
             &a_uri,
@@ -16439,25 +16490,35 @@ mod project_config_initialize_tests {
             "a_fn <- function() 1\nbuffer_only_fn <- function() 2\n",
         )
         .await;
-        // Drain did_change's own dependent fanout so the assertion below
-        // observes only the close's marking.
+        // Drain the open/change fanout so the assertions below observe only
+        // the close's marking.
         let drained = wait_for_state(backend, 5_000, |state| {
             state
                 .diagnostics_gate
                 .force_republish_count_for_test(&b_uri)
                 == 0
+                && state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&c_uri)
+                    == 0
         })
         .await;
-        assert!(drained, "did_change's dependent fanout must drain");
+        assert!(
+            drained,
+            "the open/change fanout must drain before the close"
+        );
 
         close_doc(backend, &a_uri).await;
 
         // b.R is in the sibling fanout (open R/ file, package visibility
-        // changed) AND in the resync's dependent walk (it sources a.R).
-        // Stage 1: observe the resync actually MARK b (the publish rides a
-        // 200ms debounce after marking, so the counter is visibly >= 1 in
-        // between) — without this the final `== 0` would pass vacuously,
-        // since the counter was already drained before the close.
+        // changed) AND in the resync's dependent walk (it sources a.R);
+        // c.R is in the sibling fanout ONLY. Stage 1: observe the resync
+        // actually MARK both (the publish rides a 200ms debounce after
+        // marking, so the counters are visibly >= 1 in between) — without
+        // this the final `== 0` would pass vacuously, since the counters
+        // were drained before the close. The c.R half fails if the sibling
+        // set is dropped from `run_close_resync` (nothing else marks a
+        // package-only sibling).
         let marked = wait_for_state(backend, 5_000, |state| {
             state
                 .diagnostics_gate
@@ -16469,19 +16530,34 @@ mod project_config_initialize_tests {
             marked,
             "the close resync must force-mark the overlapping sibling/dependent"
         );
-        // Stage 2: the single publish must consume the single marker. A
-        // double mark (sibling path + resync path) would leave the counter
-        // stuck at 1 after the publish.
+        let sibling_marked = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&c_uri)
+                >= 1
+        })
+        .await;
+        assert!(
+            sibling_marked,
+            "the close resync must force-mark the package-only sibling (the fold itself)"
+        );
+        // Stage 2: each single publish must consume each single marker. A
+        // double mark (sibling path + resync path) would leave a counter
+        // stuck at 1 after its publish.
         let settled = wait_for_state(backend, 5_000, |state| {
             state
                 .diagnostics_gate
                 .force_republish_count_for_test(&b_uri)
                 == 0
+                && state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&c_uri)
+                    == 0
         })
         .await;
         assert!(
             settled,
-            "the overlapping sibling/dependent must be force-marked exactly once and consumed"
+            "both siblings must be force-marked exactly once and consumed"
         );
     }
 
