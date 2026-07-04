@@ -136,6 +136,20 @@ impl CrossFileFileCache {
         self.inner.read().ok()?.peek(uri).map(|c| c.content.clone())
     }
 
+    /// Get the stored snapshot for a URI (no promotion, no content clone).
+    ///
+    /// Used by the disk-resync staleness veto: a resync compares the mtime
+    /// of the disk state it read against the snapshot a concurrent resync
+    /// may have already committed, and aborts rather than overwrite fresher
+    /// state with an older read.
+    pub fn get_snapshot(&self, uri: &Url) -> Option<FileSnapshot> {
+        self.inner
+            .read()
+            .ok()?
+            .peek(uri)
+            .map(|c| c.snapshot.clone())
+    }
+
     /// Insert content into cache. LRU eviction automatically bounds memory.
     pub fn insert(&self, uri: Url, snapshot: FileSnapshot, content: String) {
         if let Ok(mut guard) = self.inner.write() {
