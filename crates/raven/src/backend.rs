@@ -2507,12 +2507,20 @@ async fn resync_missing_file(state_arc: &Arc<RwLock<WorldState>>, uri: &Url) -> 
 /// read/write acquisitions with no open-at-commit check on the graph update,
 /// so a reopen during the async gap could clobber fresh buffer state.)
 ///
-/// Rmd/Quarto disk content is masked via `analysis_text_for_path` before
-/// metadata/artifact extraction (chunk bodies only, never prose); the file
-/// cache stores the RAW content — its readers mask on read.
+/// Rmd/Quarto disk content is masked before metadata/artifact extraction
+/// (chunk bodies only, never prose); the file cache stores the RAW content —
+/// its readers mask on read. `chunk_kind` preserves the closing document's
+/// editor-language classification: a file-backed document without an
+/// `.Rmd`/`.qmd` extension opened with `languageId: rmd` was chunk-masked
+/// while open, and path-only reclassification here would parse the same disk
+/// text as plain R and mint prose `source()` edges. The close path passes
+/// the tracked `Document`'s `chunk_kind`; the watched-files path passes
+/// `None` (no editor signal exists for an external disk event) and falls
+/// back to path classification.
 async fn resync_file_from_disk(
     state_arc: &Arc<RwLock<WorldState>>,
     uri: &Url,
+    chunk_kind: Option<crate::chunks::ChunkKind>,
     old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
 ) -> ResyncOutcome {
     let Ok(path) = uri.to_file_path() else {
@@ -2550,7 +2558,10 @@ async fn resync_file_from_disk(
     // Mask Rmd/Quarto prose so directives/source()/library() come from chunk
     // bodies only (#343), then parse ONCE and derive both metadata and
     // artifacts from the same tree.
-    let analysis = crate::cross_file::analysis_text_for_path(uri.path(), &content);
+    let analysis = match chunk_kind {
+        Some(kind) => crate::cross_file::analysis_text_for_kind(kind, &content),
+        None => crate::cross_file::analysis_text_for_path(uri.path(), &content),
+    };
     let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None));
     let mut cross_file_meta =
         crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
@@ -2703,42 +2714,62 @@ async fn resync_file_from_disk(
 /// force-mark, and publish through the bounded fanout — the same tail the
 /// watched-files async pass uses.
 ///
-/// On [`ResyncOutcome::Vetoed`] (closed-then-reopened: the reopened buffer's
-/// own `did_open` pipeline has already rebuilt graph state and owns
-/// diagnostics) and [`ResyncOutcome::Skipped`] (no disk truth / unreadable),
-/// publishes nothing. The closed file itself is never in the affected set —
-/// `compute_affected_dependents_after_edit` excludes its root — so a close
-/// never publishes for the closed document.
+/// `package_sibling_fanout` carries `did_close`'s package-visibility fanout
+/// (open siblings whose diagnostics depend on the closed buffer's package
+/// symbols). Folding it in here — instead of `did_close` marking and
+/// scheduling it separately — guarantees each URI is force-marked at most
+/// once per close (two independent marks would race: the second
+/// `run_debounced_diagnostics` schedule cancels the first pending task and
+/// strands its marker) and publishes the siblings AFTER the disk commit.
+/// The sibling set publishes even on [`ResyncOutcome::Vetoed`] /
+/// [`ResyncOutcome::Skipped`]: the package `DidClose` event already committed
+/// synchronously inside `did_close`, independent of the cross-file commit.
+/// Graph-derived sets (`pre_affected` and the post-commit walks) publish only
+/// after a successful commit — on a veto the reopened buffer's own `did_open`
+/// pipeline owns them, and on a skip nothing changed. The closed file itself
+/// is never in the affected set — `compute_affected_dependents_after_edit`
+/// excludes its root — so a close never publishes for the closed document.
+#[allow(clippy::too_many_arguments)]
 async fn run_close_resync(
     state_arc: Arc<RwLock<WorldState>>,
     client: Client,
     traversal_truncation: Arc<TraversalTruncationState>,
     uri: Url,
+    chunk_kind: Option<crate::chunks::ChunkKind>,
     old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
     old_interface_hash: Option<u64>,
     pre_affected: Vec<Url>,
+    package_sibling_fanout: Vec<Url>,
 ) {
-    let (post, interface_changed) = match resync_file_from_disk(&state_arc, &uri, old_meta).await {
-        ResyncOutcome::Updated {
-            affected_after_commit,
-            new_interface_hash,
-        } => {
-            // `None` (no buffer artifacts survived to the capture) is treated
-            // as changed — the safe direction.
-            let changed = old_interface_hash != Some(new_interface_hash);
-            (affected_after_commit, changed)
-        }
-        ResyncOutcome::Removed {
-            affected_dependents,
-        } => (affected_dependents, false),
-        ResyncOutcome::Vetoed | ResyncOutcome::Skipped => return,
-    };
+    let (post, interface_changed, committed) =
+        match resync_file_from_disk(&state_arc, &uri, chunk_kind, old_meta).await {
+            ResyncOutcome::Updated {
+                affected_after_commit,
+                new_interface_hash,
+            } => {
+                // `None` (no buffer artifacts survived to the capture) is
+                // treated as changed — the safe direction.
+                let changed = old_interface_hash != Some(new_interface_hash);
+                (affected_after_commit, changed, true)
+            }
+            ResyncOutcome::Removed {
+                affected_dependents,
+            } => (affected_dependents, false, true),
+            ResyncOutcome::Vetoed | ResyncOutcome::Skipped => (Vec::new(), false, false),
+        };
 
-    let mut affected = pre_affected;
-    let mut seen: std::collections::HashSet<Url> = affected.iter().cloned().collect();
-    for dep in post {
+    let mut affected: Vec<Url> = Vec::new();
+    let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
+    for dep in package_sibling_fanout {
         if seen.insert(dep.clone()) {
             affected.push(dep);
+        }
+    }
+    if committed {
+        for dep in pre_affected.into_iter().chain(post) {
+            if seen.insert(dep.clone()) {
+                affected.push(dep);
+            }
         }
     }
 
@@ -2751,7 +2782,7 @@ async fn run_close_resync(
         // through edges another concurrent resync restored between the
         // capture and this commit — e.g. closing a parent and child together
         // where the parent's disk content re-adds the parent -> child edge.
-        if interface_changed {
+        if committed && interface_changed {
             let post_commit_deps =
                 crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                     &uri,
@@ -5692,6 +5723,7 @@ impl LanguageServer for Backend {
         let mut resync_old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> =
             None;
         let mut resync_old_interface_hash: Option<u64> = None;
+        let mut resync_chunk_kind: Option<crate::chunks::ChunkKind> = None;
         let mut resync_pre_affected: Vec<Url> = Vec::new();
 
         let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
@@ -5716,6 +5748,11 @@ impl LanguageServer for Backend {
                     .document_store
                     .get_without_touch(uri)
                     .map(|doc| doc.artifacts.interface_hash);
+                // The buffer's chunk classification came from the editor's
+                // languageId (#343); the resync must mask disk content the
+                // same way — path reclassification would parse an
+                // extensionless Rmd/Quarto document as plain R.
+                resync_chunk_kind = state.documents.get(uri).map(|doc| doc.chunk_kind);
                 resync_pre_affected =
                     crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                         uri,
@@ -5791,7 +5828,13 @@ impl LanguageServer for Backend {
                 if let Some(root) = state.package_inputs.workspace_root.clone() {
                     sibling_fanout = collect_close_fanout_siblings(&state, uri, &root);
                 }
-                if !sibling_fanout.is_empty() {
+                // When the disk resync runs, it owns the siblings' marking and
+                // publishing (folded into run_close_resync so an open file
+                // that is both a package sibling and a graph dependent is
+                // force-marked exactly once, and publishes post-commit).
+                // Marking here as well would strand a counter: the resync's
+                // debounced schedule cancels the pending sibling task.
+                if !sibling_fanout.is_empty() && !close_resync {
                     state
                         .diagnostics_gate
                         .mark_force_republish_many(sibling_fanout.iter().map(|(u, _, _)| u));
@@ -5821,41 +5864,49 @@ impl LanguageServer for Backend {
             self.refresh_rprofile_prelude_from_disk(root).await;
         }
 
-        // Schedule revalidation for affected open siblings outside the write
-        // lock. The debounce window collapses bursts (e.g. "close all" closing
-        // many files in quick succession) into a single republish per sibling.
-        for (sibling_uri, trigger_version, trigger_revision) in sibling_fanout {
-            let state_arc = self.state.clone();
-            let client = self.client.clone();
-            let traversal_truncation = self.traversal_truncation.clone();
-            tokio::spawn(run_debounced_diagnostics(
-                state_arc,
-                client,
-                sibling_uri,
-                debounce_ms,
-                trigger_version,
-                trigger_revision,
-                Some(traversal_truncation),
-            ));
-        }
-
-        // Issue #558: converge cross-file state back to disk truth off-lock.
-        // The buffer-derived graph edges were deliberately left untouched in
-        // the write-lock block above; the spawned resync replaces them
-        // atomically from disk (or removes the file's entry if it is gone),
-        // then republishes affected open dependents through the normal gate.
-        // A close-then-reopen race is handled by the resync's commit-time
-        // veto. Never calls `scan_workspace` — this re-reads exactly one file.
         if close_resync {
+            // Issue #558: converge cross-file state back to disk truth
+            // off-lock. The buffer-derived graph edges were deliberately left
+            // untouched in the write-lock block above; the spawned resync
+            // replaces them atomically from disk (or removes the file's entry
+            // if it is gone), then republishes affected open dependents —
+            // including the package-visibility siblings, which ride the
+            // resync so each URI is marked exactly once and published after
+            // the commit — through the normal gate. A close-then-reopen race
+            // is handled by the resync's commit-time veto. Never calls
+            // `scan_workspace` — this re-reads exactly one file.
+            let sibling_uris: Vec<Url> = sibling_fanout.into_iter().map(|(u, _, _)| u).collect();
             tokio::spawn(run_close_resync(
                 self.state.clone(),
                 self.client.clone(),
                 self.traversal_truncation.clone(),
                 uri.clone(),
+                resync_chunk_kind,
                 resync_old_meta,
                 resync_old_interface_hash,
                 resync_pre_affected,
+                sibling_uris,
             ));
+        } else {
+            // No disk resync for this close (non-file URI or non-R document):
+            // schedule the package-sibling revalidation directly, outside the
+            // write lock. The debounce window collapses bursts (e.g. "close
+            // all" closing many files in quick succession) into a single
+            // republish per sibling.
+            for (sibling_uri, trigger_version, trigger_revision) in sibling_fanout {
+                let state_arc = self.state.clone();
+                let client = self.client.clone();
+                let traversal_truncation = self.traversal_truncation.clone();
+                tokio::spawn(run_debounced_diagnostics(
+                    state_arc,
+                    client,
+                    sibling_uri,
+                    debounce_ms,
+                    trigger_version,
+                    trigger_revision,
+                    Some(traversal_truncation),
+                ));
+            }
         }
     }
 
@@ -6550,7 +6601,7 @@ impl LanguageServer for Backend {
                     // yet: marking is deferred until after the full async
                     // union is capped, avoiding both duplicate markers and
                     // cap bypasses from post-update fanout.
-                    match resync_file_from_disk(&state_arc, uri, old_meta).await {
+                    match resync_file_from_disk(&state_arc, uri, None, old_meta).await {
                         ResyncOutcome::Updated {
                             affected_after_commit: deps,
                             ..
@@ -16018,7 +16069,7 @@ mod project_config_initialize_tests {
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
-        let outcome = resync_file_from_disk(&backend.state, &helper_uri, None).await;
+        let outcome = resync_file_from_disk(&backend.state, &helper_uri, None, None).await;
         assert!(
             matches!(outcome, ResyncOutcome::Vetoed),
             "resync must veto while the document is open"
@@ -16290,6 +16341,131 @@ mod project_config_initialize_tests {
         assert!(
             removed,
             "closing a deleted file must remove its graph edges and index entry"
+        );
+    }
+
+    /// The close resync masks disk content with the closing document's
+    /// editor-language classification, not the path: a file-backed document
+    /// WITHOUT an `.Rmd`/`.qmd` extension opened as `languageId: rmd` is
+    /// chunk-masked while open, and the resync must not reclassify the same
+    /// disk text as plain R (which would mint prose `source()` edges).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_resync_respects_language_mode_chunk_classification() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helpers.R"), "helper_fn <- function() 1\n").unwrap();
+        // Both decoy targets exist, so an unmasked (plain-R) parse of the
+        // prose line would resolve a real edge.
+        fs::write(tmp.path().join("prose_decoy.R"), "d <- 1\n").unwrap();
+        // `.Rmarkdown` is NOT matched by the path classifier (only .rmd/.qmd),
+        // so only the languageId can classify this document as R Markdown.
+        let content = concat!(
+            "# Report\n",
+            "\n",
+            "source(\"prose_decoy.R\")\n",
+            "\n",
+            "```{r}\n",
+            "source(\"helpers.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("report.Rmarkdown"), content).unwrap();
+        let (svc, report_uri) = open_in_workspace(&tmp, "report.Rmarkdown", "rmd", content).await;
+        let backend = svc.inner();
+        let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
+        let decoy_uri = Url::from_file_path(tmp.path().join("prose_decoy.R")).unwrap();
+
+        // Sanity: while open (languageId-classified, masked), only the chunk
+        // edge exists.
+        {
+            let state = backend.state.read().await;
+            let deps = state.cross_file_graph.get_dependencies(&report_uri);
+            assert!(
+                deps.iter().any(|e| e.to == helpers_uri),
+                "chunk source() must produce an edge while open"
+            );
+            assert!(
+                !deps.iter().any(|e| e.to == decoy_uri),
+                "prose source() must not produce an edge while open"
+            );
+        }
+
+        close_doc(backend, &report_uri).await;
+
+        // The resync installs disk-derived index metadata; wait for it, then
+        // assert the classification survived the close.
+        let resynced = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_workspace_index
+                .get_metadata(&report_uri)
+                .is_some()
+        })
+        .await;
+        assert!(resynced, "close resync must install index metadata");
+        let state = backend.state.read().await;
+        let deps = state.cross_file_graph.get_dependencies(&report_uri);
+        assert!(
+            deps.iter().any(|e| e.to == helpers_uri),
+            "the chunk edge must survive the close resync"
+        );
+        assert!(
+            !deps.iter().any(|e| e.to == decoy_uri),
+            "the resync must keep the editor-language chunk masking — prose must never become an edge"
+        );
+    }
+
+    /// An open file that is BOTH a package-visibility sibling and a graph
+    /// dependent of the closing document must be force-marked exactly once:
+    /// the sibling fanout rides the close resync instead of being marked and
+    /// scheduled separately (a second schedule cancels the first pending
+    /// debounced task and strands its marker).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_marks_overlapping_package_sibling_and_dependent_once() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(tmp.path().join("R").join("a.R"), "a_fn <- function() 1\n").unwrap();
+        let b_disk = "source(\"a.R\")\nb_fn <- function() 2\n";
+        fs::write(tmp.path().join("R").join("b.R"), b_disk).unwrap();
+        let (svc, b_uri) = open_in_workspace(&tmp, "R/b.R", "r", b_disk).await;
+        let backend = svc.inner();
+        let a_uri = Url::from_file_path(tmp.path().join("R").join("a.R")).unwrap();
+        open_doc(backend, &a_uri, "r", 1, "a_fn <- function() 1\n").await;
+
+        // Activate package mode, then make a's close change package
+        // visibility (buffer-only symbol discarded on close).
+        backend.state.write().await.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+        change_doc(
+            backend,
+            &a_uri,
+            2,
+            "a_fn <- function() 1\nbuffer_only_fn <- function() 2\n",
+        )
+        .await;
+        // Drain did_change's own dependent fanout so the assertion below
+        // observes only the close's marking.
+        let drained = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&b_uri)
+                == 0
+        })
+        .await;
+        assert!(drained, "did_change's dependent fanout must drain");
+
+        close_doc(backend, &a_uri).await;
+
+        // b.R is in the sibling fanout (open R/ file, package visibility
+        // changed) AND in the resync's dependent walk (it sources a.R). A
+        // double mark would leave the counter stuck at 1 after the single
+        // publish; the folded path must settle at 0.
+        let settled = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&b_uri)
+                == 0
+        })
+        .await;
+        assert!(
+            settled,
+            "the overlapping sibling/dependent must be force-marked exactly once and consumed"
         );
     }
 
