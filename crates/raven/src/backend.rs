@@ -2523,11 +2523,20 @@ async fn resync_missing_file(state_arc: &Arc<RwLock<WorldState>>, uri: &Url) -> 
 /// the tracked `Document`'s `chunk_kind`; the watched-files path passes
 /// `None` (no editor signal exists for an external disk event) and falls
 /// back to path classification.
+/// `undecodable_as_missing` splits `SourceReadError::InvalidEncoding`
+/// handling by caller: the close path passes `true` (the user closed a file
+/// whose disk content is not R-readable — converge like a deletion, matching
+/// the package `DidClose` which read the same bytes), while the watched path
+/// passes `false` (a non-atomic external write can transiently present
+/// invalid UTF-8, and removal would strip closed parents' incoming edges,
+/// which only OPEN parents can recover — skip instead and let the completing
+/// write's next CHANGED event converge).
 async fn resync_file_from_disk(
     state_arc: &Arc<RwLock<WorldState>>,
     uri: &Url,
     chunk_kind: Option<crate::chunks::ChunkKind>,
     old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
+    undecodable_as_missing: bool,
 ) -> ResyncOutcome {
     let Ok(path) = uri.to_file_path() else {
         return ResyncOutcome::Skipped;
@@ -2548,13 +2557,15 @@ async fn resync_file_from_disk(
             return resync_missing_file(state_arc, uri).await;
         }
         Err(e @ crate::state::SourceReadError::InvalidEncoding { .. }) => {
-            // Undecodable content is deterministic (not a transient IO
-            // failure): the startup scan never indexes such files and the
-            // package close path treats them as removed inputs — converge
-            // the cross-file state the same way instead of stranding the
-            // discarded buffer's graph entry.
-            log::trace!("Disk resync removing undecodable file state {}: {}", uri, e);
-            return resync_missing_file(state_arc, uri).await;
+            // See the doc comment: removal for the close path (converge with
+            // the package DidClose that read the same bytes), skip for the
+            // watched path (transient non-atomic writes).
+            if undecodable_as_missing {
+                log::trace!("Disk resync removing undecodable file state {}: {}", uri, e);
+                return resync_missing_file(state_arc, uri).await;
+            }
+            log::trace!("Disk resync skipping undecodable file {}: {}", uri, e);
+            return ResyncOutcome::Skipped;
         }
         Err(e) => {
             // Transient IO errors (permissions, interrupted reads): mutate
@@ -2659,21 +2670,35 @@ async fn resync_file_from_disk(
         );
     }
 
+    // Replace the unified-index entry IN PLACE with fresh disk state.
+    // `workspace_index_new` outranks `cross_file_workspace_index` in
+    // `get_enriched_metadata` and the content provider, so a stale scan-time
+    // entry would shadow the commit below — but merely invalidating it would
+    // drop the file from reference search, which walks this index for closed
+    // files and nothing repopulates it outside the scan / on-demand
+    // indexing. Mirrors the on-demand insert (including its empty
+    // `loaded_packages` precedent); raw contents + analysis-tree pair is the
+    // scan's own convention (masking is geometry-preserving).
+    let fresh_entry = crate::workspace_index::IndexEntry {
+        contents: ropey::Rope::from_str(&content),
+        tree,
+        loaded_packages: Vec::new(),
+        snapshot: snapshot.clone(),
+        metadata: std::sync::Arc::new(cross_file_meta.clone()),
+        artifacts: artifacts.clone(),
+        indexed_at_version: 0,
+    };
+    state.workspace_index_new.insert(uri.clone(), fresh_entry);
+
     // Cache RAW content for future match/inference resolution (readers mask).
     state
         .cross_file_file_cache
         .insert(uri.clone(), snapshot.clone(), content);
 
-    // Drop any stale unified-index entry (startup scan / on-demand indexing).
-    // `workspace_index_new` outranks `cross_file_workspace_index` in
-    // `get_enriched_metadata` and the content provider, and its debounced
-    // update queue has no production consumer — so a stale entry left in
-    // place would shadow the fresh disk state committed below and dependents
-    // would keep resolving the pre-resync interface.
-    state.workspace_index_new.invalidate(uri);
-    // Same for the legacy startup-scan document map: `DefaultContentProvider`
-    // consults it above the file cache, so a stale scan-time entry would
-    // shadow the fresh content committed below.
+    // Drop the legacy startup-scan document map entry:
+    // `DefaultContentProvider` consults it above the file cache, so a stale
+    // scan-time entry would shadow the fresh content committed above. The
+    // fresh unified-index entry keeps reference search fed.
     state.workspace_index.remove(uri);
 
     // `update_from_disk`'s open-document guard only ever tests THIS uri,
@@ -2887,7 +2912,7 @@ async fn run_close_resync(
     };
 
     let (post, interface_changed, committed) =
-        match resync_file_from_disk(&state_arc, &uri, chunk_kind, old_meta).await {
+        match resync_file_from_disk(&state_arc, &uri, chunk_kind, old_meta, true).await {
             ResyncOutcome::Updated {
                 affected_after_commit,
                 new_interface_hash,
@@ -6785,7 +6810,7 @@ impl LanguageServer for Backend {
                     // yet: marking is deferred until after the full async
                     // union is capped, avoiding both duplicate markers and
                     // cap bypasses from post-update fanout.
-                    match resync_file_from_disk(&state_arc, uri, None, old_meta).await {
+                    match resync_file_from_disk(&state_arc, uri, None, old_meta, false).await {
                         ResyncOutcome::Updated {
                             affected_after_commit: deps,
                             ..
@@ -16253,7 +16278,7 @@ mod project_config_initialize_tests {
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
-        let outcome = resync_file_from_disk(&backend.state, &helper_uri, None, None).await;
+        let outcome = resync_file_from_disk(&backend.state, &helper_uri, None, None, true).await;
         assert!(
             matches!(outcome, ResyncOutcome::Vetoed),
             "resync must veto while the document is open"
@@ -16302,7 +16327,7 @@ mod project_config_initialize_tests {
             );
         }
 
-        let outcome = resync_file_from_disk(&backend.state, &helper_uri, None, None).await;
+        let outcome = resync_file_from_disk(&backend.state, &helper_uri, None, None, true).await;
         assert!(
             matches!(outcome, ResyncOutcome::Skipped),
             "an older disk read must not overwrite a newer committed snapshot"
@@ -16320,6 +16345,118 @@ mod project_config_initialize_tests {
                 .iter()
                 .any(|e| e.to == extra_uri),
             "the stale read's edges must not be committed"
+        );
+    }
+
+    /// Opening a document invalidates its closed-file cache entry, so a
+    /// poisoned (newer-mtime) snapshot from before the open cannot wrongly
+    /// win the staleness veto at the next close — e.g. a `git checkout`
+    /// restoring older mtimes while the buffer was open, when watcher
+    /// events (and their invalidation) are skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_clears_cached_snapshot_so_close_resync_commits() {
+        use tower_lsp::lsp_types::{DidCloseTextDocumentParams, TextDocumentIdentifier};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "x <- 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        fs::write(tmp.path().join("other.R"), "y <- 1\n").unwrap();
+        let (svc, _other) = open_in_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        // Poison the cache with a future-mtime snapshot (as a fresher commit
+        // would leave), then open the file — the open must clear it.
+        {
+            let state = backend.state.read().await;
+            state.cross_file_file_cache.insert(
+                helper_uri.clone(),
+                crate::cross_file::file_cache::FileSnapshot {
+                    mtime: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                    size: 1,
+                    content_hash: None,
+                },
+                "poisoned <- 1\n".to_string(),
+            );
+        }
+        open_doc(backend, &helper_uri, "r", 1, "x <- 1\n").await;
+
+        // Simulate the checkout: disk now has an edge; its mtime is "older"
+        // than the poisoned snapshot would have been.
+        fs::write(tmp.path().join("helper.R"), "source(\"extra.R\")\nx <- 1\n").unwrap();
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: helper_uri.clone(),
+                },
+            })
+            .await;
+
+        let committed = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri)
+        })
+        .await;
+        assert!(
+            committed,
+            "the close resync must commit disk state — the pre-open snapshot must not veto it"
+        );
+    }
+
+    /// A watched CHANGED that reads transiently-invalid UTF-8 (a non-atomic
+    /// external write in progress) must NOT remove the file's cross-file
+    /// state: removal would strip a closed parent's incoming edge, which
+    /// nothing could restore. It skips; the completing write's next CHANGED
+    /// converges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_transient_invalid_encoding_does_not_remove_state() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "child_fn <- function() 1\n").unwrap();
+        let parent = "source(\"child.R\")\nchild_fn()\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&parent_uri)
+                    .iter()
+                    .any(|e| e.to == child_uri),
+                "precondition: parent -> child edge exists"
+            );
+        }
+
+        // Mid-write garbage on disk, then the watcher fires.
+        std::fs::write(tmp.path().join("child.R"), [0x78u8, 0x80, 0x79]).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: child_uri.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // Give the async resync time to (incorrectly) act, then assert the
+        // edge survived the transient garbage.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .any(|e| e.to == child_uri),
+            "transiently-undecodable watched content must not strip the parent's edge"
         );
     }
 

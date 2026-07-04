@@ -979,6 +979,13 @@ impl WorldState {
         version: Option<i32>,
         language_id: Option<&str>,
     ) {
+        // The disk-content cache is a CLOSED-file tier. A snapshot surviving
+        // into the open lifetime can wrongly win the disk-resync staleness
+        // veto at the next close — e.g. a `git checkout` restoring older
+        // mtimes while the buffer is open, when watcher events (and their
+        // cache invalidation) are skipped because open docs are
+        // authoritative. No reader consults this cache for open documents.
+        self.cross_file_file_cache.invalidate(&uri);
         self.documents.insert(
             uri.clone(),
             Document::new_with_language_id(text, version, &uri, language_id),
