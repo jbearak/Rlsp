@@ -16453,9 +16453,25 @@ mod project_config_initialize_tests {
         close_doc(backend, &a_uri).await;
 
         // b.R is in the sibling fanout (open R/ file, package visibility
-        // changed) AND in the resync's dependent walk (it sources a.R). A
-        // double mark would leave the counter stuck at 1 after the single
-        // publish; the folded path must settle at 0.
+        // changed) AND in the resync's dependent walk (it sources a.R).
+        // Stage 1: observe the resync actually MARK b (the publish rides a
+        // 200ms debounce after marking, so the counter is visibly >= 1 in
+        // between) — without this the final `== 0` would pass vacuously,
+        // since the counter was already drained before the close.
+        let marked = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&b_uri)
+                >= 1
+        })
+        .await;
+        assert!(
+            marked,
+            "the close resync must force-mark the overlapping sibling/dependent"
+        );
+        // Stage 2: the single publish must consume the single marker. A
+        // double mark (sibling path + resync path) would leave the counter
+        // stuck at 1 after the publish.
         let settled = wait_for_state(backend, 5_000, |state| {
             state
                 .diagnostics_gate
@@ -16518,9 +16534,10 @@ mod project_config_initialize_tests {
             .r_files
             .get(&helper_path)
             .expect("the file still exists on disk, so its input must remain");
-        assert!(
-            !input.text.contains("buffer_only_fn"),
-            "close must revert the package input to disk text, discarding buffer-only symbols"
+        assert_eq!(
+            input.text.as_ref(),
+            disk,
+            "close must revert the package input to exactly the disk text"
         );
     }
 
