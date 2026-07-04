@@ -2678,7 +2678,11 @@ async fn resync_file_from_disk(
     // files and nothing repopulates it outside the scan / on-demand
     // indexing. Mirrors the on-demand insert (including its empty
     // `loaded_packages` precedent); raw contents + analysis-tree pair is the
-    // scan's own convention (masking is geometry-preserving).
+    // scan's own convention (masking is geometry-preserving). Known residual
+    // (issue #563): the entry does not persist `chunk_kind`, so for an
+    // extension-mismatched Rmd document (languageId-classified) tree
+    // consumers that reconstruct analysis text by path pair this masked
+    // tree with raw text.
     let fresh_entry = crate::workspace_index::IndexEntry {
         contents: ropey::Rope::from_str(&content),
         tree,
