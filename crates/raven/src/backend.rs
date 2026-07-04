@@ -2408,6 +2408,36 @@ fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<U
     neighbors
 }
 
+/// Resolve a file's `# raven: sourced-by` targets and pre-collect their
+/// content (open buffer first, then the disk-content cache) into a map, so
+/// `DependencyGraph::update_file`'s `get_content` closure can run while the
+/// graph is mutably borrowed. Backward directives always resolve relative to
+/// the file's own directory — `PathContext::new`, never `# raven: cd` (the
+/// CLAUDE.md path-resolution invariant). Shared by `did_open`, `did_change`,
+/// and `resync_file_from_disk` so backward parent lookup cannot drift.
+fn collect_backward_parent_content(
+    state: &WorldState,
+    uri: &Url,
+    workspace_root: Option<&Url>,
+    meta: &crate::cross_file::CrossFileMetadata,
+) -> std::collections::HashMap<Url, String> {
+    let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
+    meta.sourced_by
+        .iter()
+        .filter_map(|d| {
+            let ctx = backward_path_ctx.as_ref()?;
+            let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+            let parent_uri = Url::from_file_path(resolved).ok()?;
+            let content = state
+                .documents
+                .get(&parent_uri)
+                .map(|doc| doc.text())
+                .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+            Some((parent_uri, content))
+        })
+        .collect()
+}
+
 /// What a single-file disk resync did, so the caller can fold the affected
 /// open dependents into its own fanout batch (capping, force-republish
 /// marking, and publishing stay caller-owned — callers batch differently).
@@ -2415,8 +2445,14 @@ enum ResyncOutcome {
     /// Disk content was committed. `affected_after_commit` is the deduped
     /// union of open working-directory-invalidated children and — when the
     /// commit changed edges — the post-update
-    /// `compute_affected_dependents_after_edit` walk.
-    Updated { affected_after_commit: Vec<Url> },
+    /// `compute_affected_dependents_after_edit` walk. `new_interface_hash`
+    /// is the committed disk artifacts' `interface_hash`, so callers that
+    /// know the pre-resync hash (the close path captures the buffer's) can
+    /// widen their fanout on interface-only changes.
+    Updated {
+        affected_after_commit: Vec<Url>,
+        new_interface_hash: u64,
+    },
     /// The file no longer exists on disk; its cross-file state was removed
     /// via `remove_file_from_cross_file_state`. `affected_dependents` comes
     /// from the pre-removal graph.
@@ -2546,6 +2582,7 @@ async fn resync_file_from_disk(
         ),
         None => crate::cross_file::scope::ScopeArtifacts::default(),
     });
+    let new_interface_hash = artifacts.interface_hash;
 
     let snapshot =
         crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
@@ -2602,26 +2639,8 @@ async fn resync_file_from_disk(
 
     let workspace_root = state.workspace_folders.first().cloned();
 
-    // Pre-collect content for potential parent files to avoid borrow conflicts.
-    // IMPORTANT: Use PathContext WITHOUT `# raven: cd` for backward directives —
-    // backward directives always resolve relative to the file's directory.
-    let backward_path_ctx =
-        crate::cross_file::path_resolve::PathContext::new(uri, workspace_root.as_ref());
-    let parent_content: std::collections::HashMap<Url, String> = cross_file_meta
-        .sourced_by
-        .iter()
-        .filter_map(|d| {
-            let ctx = backward_path_ctx.as_ref()?;
-            let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-            let parent_uri = Url::from_file_path(resolved).ok()?;
-            let content = state
-                .documents
-                .get(&parent_uri)
-                .map(|doc| doc.text())
-                .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-            Some((parent_uri, content))
-        })
-        .collect();
+    let parent_content =
+        collect_backward_parent_content(&state, uri, workspace_root.as_ref(), &cross_file_meta);
 
     let graph_result = state.cross_file_graph.update_file(
         uri,
@@ -2673,6 +2692,7 @@ async fn resync_file_from_disk(
 
     ResyncOutcome::Updated {
         affected_after_commit: affected,
+        new_interface_hash,
     }
 }
 
@@ -2695,15 +2715,22 @@ async fn run_close_resync(
     traversal_truncation: Arc<TraversalTruncationState>,
     uri: Url,
     old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
+    old_interface_hash: Option<u64>,
     pre_affected: Vec<Url>,
 ) {
-    let post = match resync_file_from_disk(&state_arc, &uri, old_meta).await {
+    let (post, interface_changed) = match resync_file_from_disk(&state_arc, &uri, old_meta).await {
         ResyncOutcome::Updated {
             affected_after_commit,
-        } => affected_after_commit,
+            new_interface_hash,
+        } => {
+            // `None` (no buffer artifacts survived to the capture) is treated
+            // as changed — the safe direction.
+            let changed = old_interface_hash != Some(new_interface_hash);
+            (affected_after_commit, changed)
+        }
         ResyncOutcome::Removed {
             affected_dependents,
-        } => affected_dependents,
+        } => (affected_dependents, false),
         ResyncOutcome::Vetoed | ResyncOutcome::Skipped => return,
     };
 
@@ -2717,6 +2744,30 @@ async fn run_close_resync(
 
     {
         let state = state_arc.read().await;
+        // The pre-close walk saw the graph as it stood at close time; when
+        // the committed disk interface differs from the buffer's, re-walk
+        // over the POST-commit graph too (mirroring did_change's
+        // interface_changed fanout). This catches dependents reachable only
+        // through edges another concurrent resync restored between the
+        // capture and this commit — e.g. closing a parent and child together
+        // where the parent's disk content re-adds the parent -> child edge.
+        if interface_changed {
+            let post_commit_deps =
+                crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                    &uri,
+                    true,
+                    false,
+                    &state.cross_file_graph,
+                    |u| state.documents.contains_key(u),
+                    state.cross_file_config.max_chain_depth,
+                    state.cross_file_config.max_transitive_dependents_visited,
+                );
+            for dep in post_commit_deps {
+                if seen.insert(dep.clone()) {
+                    affected.push(dep);
+                }
+            }
+        }
         // Drop dependents that closed during the async gap: marking a closed
         // URI would leave an orphan force-republish counter for a later
         // reopen to inherit (`did_close` clears the gate only at ITS close).
@@ -4308,29 +4359,8 @@ impl LanguageServer for Backend {
                 }
             }
 
-            // Pre-collect content for potential parent files to avoid borrow conflicts
-            // The content provider needs to access documents/cache while graph is mutably borrowed
-            // IMPORTANT: Use PathContext WITHOUT `# raven: cd` for backward directives
-            // Backward directives should always be resolved relative to the file's directory
-            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                &uri_clone,
-                workspace_root.as_ref(),
-            );
-            let parent_content: std::collections::HashMap<Url, String> = meta
-                .sourced_by
-                .iter()
-                .filter_map(|d| {
-                    let ctx = backward_path_ctx.as_ref()?;
-                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                    let parent_uri = Url::from_file_path(resolved).ok()?;
-                    let content = state
-                        .documents
-                        .get(&parent_uri)
-                        .map(|doc| doc.text())
-                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                    Some((parent_uri, content))
-                })
-                .collect();
+            let parent_content =
+                collect_backward_parent_content(&state, &uri_clone, workspace_root.as_ref(), &meta);
 
             let result = state.cross_file_graph.update_file(
                 &uri,
@@ -5145,28 +5175,12 @@ impl LanguageServer for Backend {
                     Vec::new()
                 };
 
-                // Pre-collect content for potential parent files to avoid borrow conflicts
-                // IMPORTANT: Use PathContext WITHOUT `# raven: cd` for backward directives
-                // Backward directives should always be resolved relative to the file's directory
-                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                let parent_content = collect_backward_parent_content(
+                    &state,
                     &uri_clone,
                     workspace_root.as_ref(),
+                    &meta,
                 );
-                let parent_content: std::collections::HashMap<Url, String> = meta
-                    .sourced_by
-                    .iter()
-                    .filter_map(|d| {
-                        let ctx = backward_path_ctx.as_ref()?;
-                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                        let parent_uri = Url::from_file_path(resolved).ok()?;
-                        let content = state
-                            .documents
-                            .get(&parent_uri)
-                            .map(|doc| doc.text())
-                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                        Some((parent_uri, content))
-                    })
-                    .collect();
 
                 let graph_result = state.cross_file_graph.update_file(
                     &uri,
@@ -5620,9 +5634,9 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
 
-        let (package_close_path, close_text): (bool, Option<Arc<str>>) = {
+        let package_close_path: bool = {
             let state = self.state.read().await;
-            let package_close_path = state
+            state
                 .package_inputs
                 .workspace_root
                 .as_ref()
@@ -5630,32 +5644,33 @@ impl LanguageServer for Backend {
                 .is_some_and(|(root, path)| {
                     crate::package_state::is_r_source_path(&path, root).is_some()
                         || is_package_manifest_path(&path, root)
-                });
-            let in_memory_text = if package_close_path {
-                state.documents.get(uri).map(|doc| Arc::from(doc.text()))
-            } else {
-                None
-            };
-            (package_close_path, in_memory_text)
+                })
         };
 
-        let close_text = if package_close_path && close_text.is_none() {
-            let path = uri.to_file_path().ok();
-            if let Some(path) = path {
-                tokio::task::spawn_blocking(move || {
-                    // BOM-aware decode (read off the async runtime); an
-                    // undecodable closed file simply yields no text.
-                    crate::state::read_source(&path)
-                        .ok()
-                        .map(|text| Arc::from(text.as_str()))
-                })
-                .await
-                .unwrap_or(None)
-            } else {
-                None
+        // Closing reverts package inputs to DISK truth — never the discarded
+        // buffer (the same convergence rule the cross-file resync below
+        // follows, and what `refresh_rprofile_prelude_from_disk` documents
+        // for `.Rprofile`). A missing or undecodable file yields `None`,
+        // which `HandlerEvent::DidClose` translates into removing the file
+        // from `package_inputs` — so a file deleted from disk while its
+        // buffer was open drops its package-internal symbols on close
+        // instead of retaining them until an (never-coming) watcher event.
+        let close_text: Option<Arc<str>> = if package_close_path {
+            match uri.to_file_path() {
+                Ok(path) => {
+                    tokio::task::spawn_blocking(move || {
+                        // BOM-aware decode (read off the async runtime).
+                        crate::state::read_source(&path)
+                            .ok()
+                            .map(|text| Arc::from(text.as_str()))
+                    })
+                    .await
+                    .unwrap_or(None)
+                }
+                Err(_) => None,
             }
         } else {
-            close_text
+            None
         };
 
         // If the closed document is the workspace-root `.Rprofile`, its prelude
@@ -5676,6 +5691,7 @@ impl LanguageServer for Backend {
         let close_resync;
         let mut resync_old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> =
             None;
+        let mut resync_old_interface_hash: Option<u64> = None;
         let mut resync_pre_affected: Vec<Url> = Vec::new();
 
         let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
@@ -5696,6 +5712,10 @@ impl LanguageServer for Backend {
                     .is_some_and(|doc| doc.file_type == crate::file_type::FileType::R);
             if close_resync {
                 resync_old_meta = state.get_enriched_metadata(uri);
+                resync_old_interface_hash = state
+                    .document_store
+                    .get_without_touch(uri)
+                    .map(|doc| doc.artifacts.interface_hash);
                 resync_pre_affected =
                     crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                         uri,
@@ -5732,9 +5752,8 @@ impl LanguageServer for Backend {
             let old_ns_model = state.package_state.namespace_model().cloned();
             let old_contribution = state.package_state.scope_contribution().clone();
 
-            // In package mode, update package inputs on close from the
-            // authoritative snapshot captured above: the last in-memory
-            // document text when available, otherwise a fresh filesystem read.
+            // In package mode, update package inputs on close from the disk
+            // snapshot captured above (buffer edits are discarded on close).
             if package_close_path {
                 let event = crate::package_state::event::HandlerEvent::DidClose {
                     uri: uri.clone(),
@@ -5834,6 +5853,7 @@ impl LanguageServer for Backend {
                 self.traversal_truncation.clone(),
                 uri.clone(),
                 resync_old_meta,
+                resync_old_interface_hash,
                 resync_pre_affected,
             ));
         }
@@ -6533,6 +6553,7 @@ impl LanguageServer for Backend {
                     match resync_file_from_disk(&state_arc, uri, old_meta).await {
                         ResyncOutcome::Updated {
                             affected_after_commit: deps,
+                            ..
                         }
                         | ResyncOutcome::Removed {
                             affected_dependents: deps,
@@ -16269,6 +16290,99 @@ mod project_config_initialize_tests {
         assert!(
             removed,
             "closing a deleted file must remove its graph edges and index entry"
+        );
+    }
+
+    /// Closing a dirty package source reverts its package input to DISK
+    /// truth: symbols that existed only in the discarded buffer must leave
+    /// `package_inputs.r_files` (previously the close event installed the
+    /// buffer text, stranding buffer-only symbols until a watcher event that
+    /// never comes — disk was never touched).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_reverts_package_input_to_disk_text() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let disk = "pkg_fn <- function() 1\n";
+        fs::write(tmp.path().join("R").join("helper.R"), disk).unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "R/helper.R", "r", disk).await;
+        let backend = svc.inner();
+        let helper_path = tmp.path().join("R").join("helper.R");
+
+        // Activate package mode after open; the did_change below then routes
+        // through the package event pipeline.
+        backend.state.write().await.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+
+        change_doc(
+            backend,
+            &helper_uri,
+            2,
+            "pkg_fn <- function() 1\nbuffer_only_fn <- function() 2\n",
+        )
+        .await;
+        {
+            let state = backend.state.read().await;
+            let input = state
+                .package_inputs
+                .r_files
+                .get(&helper_path)
+                .expect("did_change must install the buffer text as a package input");
+            assert!(
+                input.text.contains("buffer_only_fn"),
+                "precondition: the live buffer text carries the buffer-only symbol"
+            );
+        }
+
+        close_doc(backend, &helper_uri).await;
+
+        // The DidClose translate runs synchronously inside did_close's write
+        // lock, so the post-close state is final.
+        let state = backend.state.read().await;
+        let input = state
+            .package_inputs
+            .r_files
+            .get(&helper_path)
+            .expect("the file still exists on disk, so its input must remain");
+        assert!(
+            !input.text.contains("buffer_only_fn"),
+            "close must revert the package input to disk text, discarding buffer-only symbols"
+        );
+    }
+
+    /// Closing a package source whose disk file was deleted while the buffer
+    /// was open removes it from `package_inputs.r_files` — the watcher's
+    /// DELETED event was skipped ("open docs are authoritative"), so the
+    /// close is the last chance to converge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_of_deleted_package_source_removes_package_input() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let disk = "pkg_fn <- function() 1\n";
+        fs::write(tmp.path().join("R").join("helper.R"), disk).unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "R/helper.R", "r", disk).await;
+        let backend = svc.inner();
+        let helper_path = tmp.path().join("R").join("helper.R");
+
+        backend.state.write().await.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+        // Seed the input through the live pipeline (buffer text).
+        change_doc(backend, &helper_uri, 2, "pkg_fn <- function() 1\nx <- 1\n").await;
+        assert!(
+            backend
+                .state
+                .read()
+                .await
+                .package_inputs
+                .r_files
+                .contains_key(&helper_path),
+            "precondition: the open buffer's input is tracked"
+        );
+
+        fs::remove_file(&helper_path).unwrap();
+        close_doc(backend, &helper_uri).await;
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.package_inputs.r_files.contains_key(&helper_path),
+            "closing a disk-deleted package source must drop its package input"
         );
     }
 
