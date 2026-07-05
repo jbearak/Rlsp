@@ -94,6 +94,9 @@ contributions still win over a name harvested from `.Rprofile`.
 
 Editing `.Rprofile` in the editor refreshes the prelude as you type. Open files
 that consume the prelude re-resolve immediately, without waiting for a save.
+This also works when the editor opened the workspace `.Rprofile` through a
+case or symlink alias; Raven keeps publishing diagnostics to the opened URI but
+uses the canonical workspace `.Rprofile` as the prelude authority.
 
 Closing `.Rprofile` with unsaved edits reverts the prelude to the on-disk
 content, because those edits have been discarded.

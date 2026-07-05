@@ -569,8 +569,14 @@ type SubgraphCache = std::sync::RwLock<
 /// directory-entry case. Full filesystem canonicalization was rejected because
 /// it follows symlinks, which can produce prefixes that no longer match the
 /// uncanonicalized workspace-index keys. The graph therefore preserves Raven's
-/// supported LSP identity model: open-document authority and graph reachability
-/// are exact-URI properties, not underlying-inode properties.
+/// supported LSP identity model: graph reachability is a raw-URI property, not
+/// an underlying-inode property.
+///
+/// Open-document aliasing lives outside the graph in
+/// [`crate::state::WorldState`]: when a client opens a case or symlink alias of
+/// a graph URI, the alias layer makes that open buffer authoritative for
+/// revalidation, content, and watched-file vetoes without rewriting graph keys
+/// or changing diagnostics publish URIs.
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
     forward: HashMap<Url, Vec<DependencyEdge>>,

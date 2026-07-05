@@ -359,6 +359,113 @@ impl Document {
     }
 }
 
+/// Alias map for open file documents whose client URI is not the spelling used
+/// by the source graph or closed-file indexes.
+///
+/// The authoritative document stores stay keyed by the exact URI the client
+/// opened so diagnostics can continue to publish to that spelling. This layer
+/// only answers boundary questions for equivalent on-disk paths: "is the
+/// canonical graph URI open?", "which client URI has the live buffer?", and
+/// "which graph URI roots should an edit to this open buffer revalidate?".
+///
+/// A single open URI can map to more than one canonical URI: the case-corrected
+/// spelling of the opened path and, on platforms with symlinks, the symlink
+/// target rebased into a registered workspace root when possible. When multiple
+/// alias buffers map to the same canonical URI, the oldest remaining alias is
+/// used as the live-buffer source; if the canonical URI itself is open, exact
+/// document-store lookup wins before this map is consulted.
+///
+/// Alias graph mirroring follows the same authority rule: an open buffer may
+/// update its own graph URI plus only the canonical roots for which
+/// [`WorldState::open_document_uri_for_authoritative_uri`] currently returns
+/// that buffer's URI. A newer non-authoritative alias can keep its own graph
+/// node fresh, but it must not overwrite the canonical node whose live content
+/// comes from an older alias or from the exact canonical open URI.
+///
+/// Package-mode and `.Rprofile` authority reuse this map too. A symlink/case
+/// alias may keep diagnostics published to the client URI while package
+/// membership checks, package-internal scope injection, self-package NSE policy,
+/// parameter/signature package scope, package sibling fanout, and workspace-root
+/// `.Rprofile` prelude ownership resolve through the authoritative canonical
+/// URI.
+#[derive(Debug, Default, Clone)]
+pub struct OpenDocumentAliases {
+    canonical_to_open: HashMap<Url, Vec<Url>>,
+    open_to_canonical: HashMap<Url, Vec<Url>>,
+}
+
+impl OpenDocumentAliases {
+    pub fn is_empty(&self) -> bool {
+        self.canonical_to_open.is_empty()
+    }
+
+    pub fn open(&mut self, open_uri: Url, canonical_uris: Vec<Url>) {
+        self.close(&open_uri);
+
+        let mut unique = Vec::new();
+        let mut seen = HashSet::new();
+        for canonical_uri in canonical_uris {
+            if canonical_uri == open_uri || !seen.insert(canonical_uri.clone()) {
+                continue;
+            }
+            self.canonical_to_open
+                .entry(canonical_uri.clone())
+                .or_default()
+                .push(open_uri.clone());
+            unique.push(canonical_uri);
+        }
+
+        if !unique.is_empty() {
+            self.open_to_canonical.insert(open_uri, unique);
+        }
+    }
+
+    pub fn close(&mut self, open_uri: &Url) -> Vec<Url> {
+        let Some(canonical_uris) = self.open_to_canonical.remove(open_uri) else {
+            return Vec::new();
+        };
+
+        for canonical_uri in &canonical_uris {
+            if let Some(open_uris) = self.canonical_to_open.get_mut(canonical_uri) {
+                open_uris.retain(|candidate| candidate != open_uri);
+                if open_uris.is_empty() {
+                    self.canonical_to_open.remove(canonical_uri);
+                }
+            }
+        }
+
+        canonical_uris
+    }
+
+    pub fn canonical_uris_for_open(&self, open_uri: &Url) -> Option<&[Url]> {
+        self.open_to_canonical
+            .get(open_uri)
+            .map(std::vec::Vec::as_slice)
+    }
+
+    pub fn open_uris_for_canonical(&self, canonical_uri: &Url) -> Option<&[Url]> {
+        self.canonical_to_open
+            .get(canonical_uri)
+            .map(std::vec::Vec::as_slice)
+    }
+}
+
+fn filesystem_root_base(path: &Path) -> Option<PathBuf> {
+    let mut base = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => base.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                base.push(component.as_os_str());
+                return Some(base);
+            }
+            std::path::Component::CurDir => return Some(PathBuf::from(".")),
+            std::path::Component::ParentDir | std::path::Component::Normal(_) => return Some(base),
+        }
+    }
+    None
+}
+
 fn utf16_offset_to_char_offset(line_text: &str, utf16_offset: usize) -> usize {
     let mut utf16_count = 0;
     let mut char_count = 0;
@@ -514,7 +621,20 @@ pub struct WorldState {
     pub workspace_index_new: WorkspaceIndex,
 
     // Legacy fields (kept for migration compatibility)
+    /// Open documents keyed by the exact URI spelling supplied by the client.
+    ///
+    /// # Raw URI Identity
+    ///
+    /// Raven keeps editor-facing document identity raw: diagnostics, versions,
+    /// revisions, and document text are stored under the client's `Url` so
+    /// publishes go back to the URI the editor owns. Cross-file graph and index
+    /// keys likewise stay uncanonicalized. [`Self::open_document_aliases`]
+    /// bridges only open-buffer authority for equivalent file paths (case
+    /// aliases and symlink targets discovered at open time): a graph URI that
+    /// aliases an open buffer is treated as open for revalidation, live content,
+    /// and watched-file vetoes, but publish work still targets the client URI.
     pub documents: HashMap<Url, Document>,
+    pub open_document_aliases: OpenDocumentAliases,
     pub workspace_index: HashMap<Url, Document>,
 
     // Workspace configuration
@@ -895,6 +1015,7 @@ impl WorldState {
 
             // Legacy fields (kept for migration compatibility)
             documents: HashMap::new(),
+            open_document_aliases: OpenDocumentAliases::default(),
             workspace_index: HashMap::new(),
 
             // Workspace configuration
@@ -956,6 +1077,229 @@ impl WorldState {
         self.html_help_cache.drain();
     }
 
+    fn open_alias_candidates_for_uri(&self, uri: &Url) -> Vec<Url> {
+        let Ok(path) = uri.to_file_path() else {
+            return Vec::new();
+        };
+
+        let mut candidates = Vec::new();
+        if let Some(case_path) = self.case_correct_open_path(&path)
+            && let Ok(case_uri) = Url::from_file_path(case_path)
+            && case_uri != *uri
+        {
+            candidates.push(case_uri);
+        }
+        if let Some(target_path) = self.symlink_target_open_path(&path)
+            && let Ok(target_uri) = Url::from_file_path(target_path)
+            && target_uri != *uri
+        {
+            candidates.push(target_uri);
+        }
+
+        let mut seen = HashSet::new();
+        candidates.retain(|candidate| seen.insert(candidate.clone()));
+        candidates
+    }
+
+    fn case_correct_open_path(&self, path: &Path) -> Option<PathBuf> {
+        let base = self
+            .workspace_base_for_path(path)
+            .or_else(|| filesystem_root_base(path))?;
+        crate::cross_file::path_resolve::canonicalize_case_below_unique(&base, path)
+    }
+
+    fn symlink_target_open_path(&self, path: &Path) -> Option<PathBuf> {
+        let canonical_path = fs::canonicalize(path).ok()?;
+        let rebased = self
+            .rebase_canonical_path_to_workspace(&canonical_path)
+            .unwrap_or(canonical_path);
+        self.case_correct_open_path(&rebased).or(Some(rebased))
+    }
+
+    fn workspace_base_for_path(&self, path: &Path) -> Option<PathBuf> {
+        self.workspace_folders
+            .iter()
+            .filter_map(|root| root.to_file_path().ok())
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+    }
+
+    fn rebase_canonical_path_to_workspace(&self, canonical_path: &Path) -> Option<PathBuf> {
+        let mut best: Option<(usize, PathBuf)> = None;
+        for root_url in &self.workspace_folders {
+            let Ok(root) = root_url.to_file_path() else {
+                continue;
+            };
+            let Ok(canonical_root) = fs::canonicalize(&root) else {
+                continue;
+            };
+            let Ok(suffix) = canonical_path.strip_prefix(&canonical_root) else {
+                continue;
+            };
+            let depth = canonical_root.components().count();
+            let rebased = root.join(suffix);
+            if best
+                .as_ref()
+                .is_none_or(|(best_depth, _)| depth > *best_depth)
+            {
+                best = Some((depth, rebased));
+            }
+        }
+        best.map(|(_, path)| path)
+    }
+
+    fn register_open_document_aliases(&mut self, uri: &Url) -> Vec<Url> {
+        let aliases = self.open_alias_candidates_for_uri(uri);
+        self.open_document_aliases
+            .open(uri.clone(), aliases.clone());
+        aliases
+    }
+
+    pub fn is_document_open_or_alias(&self, uri: &Url) -> bool {
+        self.documents.contains_key(uri)
+            || self
+                .open_document_aliases
+                .open_uris_for_canonical(uri)
+                .is_some_and(|open_uris| {
+                    open_uris
+                        .iter()
+                        .any(|open_uri| self.documents.contains_key(open_uri))
+                })
+    }
+
+    pub fn open_document_uri_for_authoritative_uri(&self, uri: &Url) -> Option<Url> {
+        if self.documents.contains_key(uri) {
+            return Some(uri.clone());
+        }
+        self.open_document_aliases
+            .open_uris_for_canonical(uri)?
+            .iter()
+            .find(|open_uri| self.documents.contains_key(*open_uri))
+            .cloned()
+    }
+
+    pub fn canonical_uris_for_open_document(&self, uri: &Url) -> Vec<Url> {
+        self.open_document_aliases
+            .canonical_uris_for_open(uri)
+            .map(<[Url]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// Return the canonical workspace URI that should be used for depth-0
+    /// scope-contribution path checks for `open_uri`, when `open_uri` is an
+    /// authoritative alias of a workspace file.
+    ///
+    /// This is broader than package-source membership: the same query URI gates
+    /// package symbols, testthat packages, self-package NSE policy, parameter
+    /// scope, and `.Rprofile` prelude applicability. Diagnostics and document
+    /// storage still use the raw client URI; callers use this only for
+    /// membership/scope resolution and fall back to `open_uri` on `None`.
+    ///
+    /// `None` is the no-alias fast path: callers should keep using `open_uri`.
+    pub(crate) fn authoritative_workspace_query_uri_for_open_document(
+        &self,
+        open_uri: &Url,
+        workspace_root: &std::path::Path,
+    ) -> Option<Url> {
+        if self.open_document_aliases.is_empty() {
+            return None;
+        }
+        let canonical_uris = self
+            .open_document_aliases
+            .canonical_uris_for_open(open_uri)?;
+        for canonical_uri in canonical_uris.iter().rev() {
+            let Ok(path) = canonical_uri.to_file_path() else {
+                continue;
+            };
+            if path.strip_prefix(workspace_root).is_err() {
+                continue;
+            }
+            if self
+                .open_document_uri_for_authoritative_uri(canonical_uri)
+                .as_ref()
+                == Some(open_uri)
+            {
+                return Some(canonical_uri.clone());
+            }
+        }
+        None
+    }
+
+    /// Return the authoritative URI root for `target_path` when `open_uri`
+    /// owns that path either directly or through an open-document alias.
+    pub(crate) fn authoritative_open_uri_for_path(
+        &self,
+        open_uri: &Url,
+        target_path: &std::path::Path,
+    ) -> Option<Url> {
+        if open_uri.to_file_path().ok().as_deref() == Some(target_path) {
+            return Some(open_uri.clone());
+        }
+        if self.open_document_aliases.is_empty() {
+            return None;
+        }
+        self.authoritative_revalidation_roots_for_uri(open_uri)
+            .into_iter()
+            .find(|root| root.to_file_path().ok().as_deref() == Some(target_path))
+    }
+
+    pub fn revalidation_roots_for_uri(&self, uri: &Url) -> Vec<Url> {
+        let mut roots = Vec::with_capacity(
+            self.open_document_aliases
+                .canonical_uris_for_open(uri)
+                .map_or(1, |aliases| aliases.len() + 1),
+        );
+        roots.push(uri.clone());
+        if let Some(aliases) = self.open_document_aliases.canonical_uris_for_open(uri) {
+            roots.extend(aliases.iter().cloned());
+        }
+        roots
+    }
+
+    pub fn authoritative_revalidation_roots_for_uri(&self, uri: &Url) -> Vec<Url> {
+        let roots = self.revalidation_roots_for_uri(uri);
+        if !self.documents.contains_key(uri) || self.open_document_aliases.is_empty() {
+            return roots;
+        }
+
+        roots
+            .into_iter()
+            .filter(|root| self.open_document_uri_for_authoritative_uri(root).as_ref() == Some(uri))
+            .collect()
+    }
+
+    pub fn affected_open_dependents_after_edit(
+        &self,
+        edited_uri: &Url,
+        interface_changed: bool,
+        edges_changed: bool,
+    ) -> Vec<Url> {
+        let mut affected = Vec::new();
+        let mut seen = HashSet::new();
+        for root in self.authoritative_revalidation_roots_for_uri(edited_uri) {
+            let dependents =
+                crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                    &root,
+                    interface_changed,
+                    edges_changed,
+                    &self.cross_file_graph,
+                    |u| self.is_document_open_or_alias(u),
+                    self.cross_file_config.max_chain_depth,
+                    self.cross_file_config.max_transitive_dependents_visited,
+                );
+            for dependent in dependents {
+                let Some(open_uri) = self.open_document_uri_for_authoritative_uri(&dependent)
+                else {
+                    continue;
+                };
+                if seen.insert(open_uri.clone()) {
+                    affected.push(open_uri);
+                }
+            }
+        }
+        affected
+    }
+
     /// Create a content provider for this state
     ///
     /// The content provider provides a unified interface for accessing file content,
@@ -990,6 +1334,7 @@ impl WorldState {
             documents,
             &self.workspace_index,
             &self.cross_file_workspace_index,
+            &self.open_document_aliases,
         )
     }
 
@@ -1047,6 +1392,19 @@ impl WorldState {
 
         crate::backend::ScopeProbeSnapshot {
             docs: docs.to_vec(),
+            package_query_uris: self
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .map(|root| {
+                    docs.iter()
+                        .filter_map(|(uri, _)| {
+                            self.authoritative_workspace_query_uri_for_open_document(uri, root)
+                                .map(|query_uri| (uri.clone(), query_uri))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             artifacts_map,
             metadata_map,
             doc_loaded_packages: self
@@ -1077,7 +1435,15 @@ impl WorldState {
     /// Call after the open set changes (`did_open` / `did_close`) or after a
     /// dependency-graph edge change touches an open file.
     pub fn recompute_open_neighborhood_pins(&mut self) {
-        let open_uris: Vec<Url> = self.document_store.uris();
+        let mut open_uris: Vec<Url> = self.document_store.uris();
+        let mut seen_open_roots: HashSet<Url> = open_uris.iter().cloned().collect();
+        for open_uri in self.document_store.uris() {
+            for canonical_uri in self.canonical_uris_for_open_document(&open_uri) {
+                if seen_open_roots.insert(canonical_uri.clone()) {
+                    open_uris.push(canonical_uri);
+                }
+            }
+        }
         if open_uris.is_empty() {
             self.document_store.set_pinned_uris(HashSet::new());
             self.workspace_index_new.set_pinned_uris(HashSet::new());
@@ -1128,6 +1494,11 @@ impl WorldState {
 
     #[cfg(test)]
     pub fn open_document(&mut self, uri: Url, text: &str, version: Option<i32>) {
+        let aliases = self.register_open_document_aliases(&uri);
+        self.cross_file_file_cache.invalidate(&uri);
+        for alias in aliases {
+            self.cross_file_file_cache.invalidate(&alias);
+        }
         self.documents
             .insert(uri.clone(), Document::new_with_uri(text, version, &uri));
     }
@@ -1145,14 +1516,20 @@ impl WorldState {
         // mtimes while the buffer is open, when watcher events (and their
         // cache invalidation) are skipped because open docs are
         // authoritative. No reader consults this cache for open documents.
+        let aliases = self.register_open_document_aliases(&uri);
         self.cross_file_file_cache.invalidate(&uri);
         let document = Document::new_with_language_id(text, version, &uri, language_id);
         self.record_editor_chunk_kind_override(&uri, document.chunk_kind);
+        for alias in aliases {
+            self.cross_file_file_cache.invalidate(&alias);
+        }
         self.documents.insert(uri.clone(), document);
     }
 
-    pub fn close_document(&mut self, uri: &Url) {
+    pub fn close_document(&mut self, uri: &Url) -> Vec<Url> {
+        let aliases = self.open_document_aliases.close(uri);
         self.documents.remove(uri);
+        aliases
     }
 
     /// Persist or clear the editor-derived chunk-kind override for a
@@ -1225,6 +1602,11 @@ impl WorldState {
     }
 
     pub fn apply_change(&mut self, uri: &Url, change: TextDocumentContentChangeEvent) {
+        let aliases = self.canonical_uris_for_open_document(uri);
+        self.cross_file_file_cache.invalidate(uri);
+        for alias in aliases {
+            self.cross_file_file_cache.invalidate(&alias);
+        }
         if let Some(doc) = self.documents.get_mut(uri) {
             doc.apply_change(change);
         }
@@ -1243,7 +1625,9 @@ impl WorldState {
         &self,
         uri: &Url,
     ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
-        if let Some(doc) = self.documents.get(uri) {
+        if let Some(open_uri) = self.open_document_uri_for_authoritative_uri(uri)
+            && let Some(doc) = self.documents.get(&open_uri)
+        {
             // Parse from `analysis_text()`: masked for Rmd/Quarto (so a
             // `# raven: cd` in prose is ignored while one inside a chunk is a
             // real directive), raw for everything else (behavior-neutral).
@@ -1291,9 +1675,17 @@ impl WorldState {
         &self,
         uri: &Url,
     ) -> Option<Arc<crate::cross_file::CrossFileMetadata>> {
-        self.document_store
-            .get_without_touch(uri)
-            .map(|doc| doc.metadata.clone())
+        self.open_document_uri_for_authoritative_uri(uri)
+            .and_then(|open_uri| {
+                self.document_store
+                    .get_without_touch(&open_uri)
+                    .map(|doc| doc.metadata.clone())
+                    .or_else(|| {
+                        self.documents.get(&open_uri).map(|doc| {
+                            Arc::new(crate::cross_file::extract_metadata(&doc.analysis_text()))
+                        })
+                    })
+            })
             .or_else(|| self.workspace_index_new.get_metadata(uri))
             .or_else(|| self.cross_file_workspace_index.get_metadata(uri))
             .or_else(|| {
@@ -1313,6 +1705,30 @@ impl WorldState {
                     .get(uri)
                     .map(|content| Arc::new(self.extract_metadata_for_uri(uri, &content)))
             })
+    }
+
+    fn metadata_for_open_graph_root<'a>(
+        &self,
+        root: &Url,
+        open_uri: &Url,
+        meta: &'a crate::cross_file::CrossFileMetadata,
+        workspace_root: Option<&Url>,
+    ) -> std::borrow::Cow<'a, crate::cross_file::CrossFileMetadata> {
+        if root == open_uri {
+            return self.metadata_for_dependency_graph(open_uri, meta, workspace_root);
+        }
+
+        let mut root_meta = meta.clone();
+        root_meta.inherited_working_directory = None;
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut root_meta,
+            root,
+            workspace_root,
+            |parent_uri| self.get_enriched_metadata(parent_uri),
+            self.cross_file_config.max_chain_depth,
+        );
+        let graph_meta = self.metadata_for_dependency_graph(root, &root_meta, workspace_root);
+        std::borrow::Cow::Owned(graph_meta.into_owned())
     }
 
     /// Apply pre-scanned workspace index results (for non-blocking initialization).
@@ -1606,25 +2022,29 @@ impl WorldState {
         // index-derived edges until the user edits the buffer.
         let index_rebuilt: std::collections::HashSet<Url> = changed_uris.iter().cloned().collect();
         for uri in open_affected {
-            let Some(doc) = self.document_store.get_without_touch(&uri) else {
+            let Some(doc_meta) = self
+                .document_store
+                .get_without_touch(&uri)
+                .map(|doc| doc.metadata.clone())
+            else {
                 continue;
             };
-            let mut new_sources = doc.metadata.sources.clone();
+            let mut new_sources = doc_meta.sources.clone();
             crate::cross_file::resolve_system_file_source_entries(
                 &mut new_sources,
                 ws_name.as_deref(),
                 ws_root.as_deref(),
                 &lib_paths,
             );
-            let resolution_changed = new_sources != doc.metadata.sources;
+            let resolution_changed = new_sources != doc_meta.sources;
             let meta = if resolution_changed {
                 old_targets.extend(
-                    doc.metadata
+                    doc_meta
                         .sources
                         .iter()
                         .filter_map(|s| s.resolved_uri.clone()),
                 );
-                let mut new_meta = (*doc.metadata).clone();
+                let mut new_meta = (*doc_meta).clone();
                 new_meta.sources = new_sources;
                 let new_meta = Arc::new(new_meta);
                 self.document_store.replace_metadata(&uri, new_meta.clone());
@@ -1632,23 +2052,30 @@ impl WorldState {
             } else if index_rebuilt.contains(&uri) {
                 // Unchanged buffer, but the index pass overwrote this file's
                 // edges from index metadata — re-assert the buffer's.
-                doc.metadata.clone()
+                doc_meta.clone()
             } else {
                 continue;
             };
-            let get_content = |parent_uri: &Url| -> Option<String> {
-                self.workspace_index_new
-                    .get(parent_uri)
-                    .map(|e| e.contents.to_string())
-            };
-            let graph_meta =
-                self.metadata_for_dependency_graph(&uri, meta.as_ref(), workspace_root.as_ref());
-            self.cross_file_graph.update_file(
-                &uri,
-                graph_meta.as_ref(),
-                workspace_root.as_ref(),
-                get_content,
-            );
+            let graph_roots = self.authoritative_revalidation_roots_for_uri(&uri);
+            for root in &graph_roots {
+                let root_meta = self.metadata_for_open_graph_root(
+                    root,
+                    &uri,
+                    meta.as_ref(),
+                    workspace_root.as_ref(),
+                );
+                let get_content = |parent_uri: &Url| -> Option<String> {
+                    self.workspace_index_new
+                        .get(parent_uri)
+                        .map(|e| e.contents.to_string())
+                };
+                self.cross_file_graph.update_file(
+                    root,
+                    root_meta.as_ref(),
+                    workspace_root.as_ref(),
+                    get_content,
+                );
+            }
             if resolution_changed && !changed_uris.contains(&uri) {
                 changed_uris.push(uri);
             }
@@ -1693,7 +2120,7 @@ impl WorldState {
                 continue;
             }
             if self.document_store.get_without_touch(&uri).is_some()
-                || self.documents.contains_key(&uri)
+                || self.is_document_open_or_alias(&uri)
             {
                 continue;
             }
@@ -1743,19 +2170,15 @@ impl WorldState {
         let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
         let mut out: Vec<Url> = Vec::new();
         for uri in changed {
-            if self.documents.contains_key(uri) && seen.insert(uri.clone()) {
-                out.push(uri.clone());
+            if let Some(open_uri) = self.open_document_uri_for_authoritative_uri(uri)
+                && seen.insert(open_uri.clone())
+            {
+                out.push(open_uri);
             }
-            let dependents =
-                crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                    uri,
-                    false, // the file's text (interface) did not change
-                    true,  // its dependency edges did
-                    &self.cross_file_graph,
-                    |u| self.documents.contains_key(u),
-                    self.cross_file_config.max_chain_depth,
-                    self.cross_file_config.max_transitive_dependents_visited,
-                );
+            let dependents = self.affected_open_dependents_after_edit(
+                uri, false, // the file's text (interface) did not change
+                true,  // its dependency edges did
+            );
             for dep in dependents {
                 if seen.insert(dep.clone()) {
                     out.push(dep);
@@ -3220,6 +3643,88 @@ mod tests {
         assert!(
             resolved_path.ends_with("otherpkg/helper.R"),
             "must resolve into the new lib path, got {resolved_path:?}"
+        );
+    }
+
+    /// Open buffers are authoritative for their canonical alias roots too. When
+    /// a package event resolves a deferred `system.file()` source on a symlink
+    /// spelling, the canonical graph node must be rebuilt from the same live
+    /// metadata so canonical parents see the new external edge.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_system_file_in_workspace_rebuilds_canonical_alias_open_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+
+        let content = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+        std::fs::write(real.join("child.R"), content).unwrap();
+
+        let libdir = tempfile::TempDir::new().unwrap();
+        let pkg_dir = libdir.path().join("otherpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+
+        let link_uri = Url::from_file_path(tmp.path().join("link").join("child.R")).unwrap();
+        let canonical_uri = Url::from_file_path(real.join("child.R")).unwrap();
+        let helper_uri = Url::from_file_path(pkg_dir.join("helper.R")).unwrap();
+
+        let mut state = WorldState::new();
+        state
+            .workspace_folders
+            .push(Url::from_file_path(tmp.path()).unwrap());
+        state.open_document_with_language_id(link_uri.clone(), content, Some(1), Some("r"));
+        state
+            .document_store
+            .open_with_metadata(
+                link_uri.clone(),
+                content,
+                1,
+                crate::chunks::ChunkKind::R,
+                crate::cross_file::extract_metadata(content),
+            )
+            .await;
+
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&canonical_uri),
+            Some(link_uri.clone()),
+            "canonical child URI must resolve to the symlink-open buffer"
+        );
+
+        state.resolve_system_file_in_workspace();
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&canonical_uri)
+                .is_empty(),
+            "precondition: canonical root has no resolved edge while lib_paths are empty"
+        );
+
+        let mut swapped = crate::package_library::PackageLibrary::new_empty();
+        swapped.set_lib_paths(vec![libdir.path().to_path_buf()]);
+        state.package_library = Arc::new(swapped);
+        let changed = state.resolve_system_file_in_workspace();
+
+        assert!(
+            changed.iter().any(|uri| uri == &link_uri),
+            "the raw open URI should report changed system.file resolution"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&link_uri)
+                .iter()
+                .any(|edge| edge.to == helper_uri),
+            "raw open graph root must gain the resolved system.file edge"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&canonical_uri)
+                .iter()
+                .any(|edge| edge.to == helper_uri),
+            "canonical alias graph root must gain the resolved system.file edge"
         );
     }
 
