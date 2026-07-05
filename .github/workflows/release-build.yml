@@ -342,6 +342,139 @@ jobs:
           version: ${{ github.ref_name }}
       - run: raven --version
 
+  # ── apt repository bump ─────────────────────────────────────────────
+  # After the GitHub Release is published, build Debian packages from the
+  # already-built Linux release artifacts and open a PR against the static apt
+  # repository (jbearak/apt-raven). That sibling repo is served by GitHub Pages
+  # as an apt repository; the PR lets its own CI validate the repository indexes
+  # and signatures before users can see the update.
+  #
+  # Setup (one-time), then this job activates itself:
+  #   gh secret   set APT_REPO_TOKEN            -R jbearak/raven   # paste token
+  #   gh secret   set APT_REPO_GPG_PRIVATE_KEY  -R jbearak/raven   # armored private key
+  #   gh secret   set APT_REPO_GPG_PASSPHRASE   -R jbearak/raven   # optional, may be empty
+  #   gh variable set ENABLE_APT_BUMP -R jbearak/raven --body true
+  # APT_REPO_TOKEN: a GitHub App installation token or fine-grained PAT scoped
+  # to jbearak/apt-raven with Contents:write + Pull requests:write.
+  bump-apt:
+    needs: github-release
+    if: vars.ENABLE_APT_BUMP == 'true' && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Debian packaging tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends binutils dpkg-dev gnupg unzip
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Linux x64 LSP artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: lsp-linux-x64
+          path: lsp-amd64
+          merge-multiple: true
+
+      - name: Download Linux arm64 LSP artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: lsp-linux-arm64
+          path: lsp-arm64
+          merge-multiple: true
+
+      - name: Build Debian packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p deb-input/amd64 deb-input/arm64 deb-dist
+          unzip -q lsp-amd64/raven-linux-x64.zip -d deb-input/amd64
+          unzip -q lsp-arm64/raven-linux-arm64.zip -d deb-input/arm64
+          scripts/debian/build-deb.sh "$VERSION" amd64 deb-input/amd64/raven deb-dist
+          scripts/debian/build-deb.sh "$VERSION" arm64 deb-input/arm64/raven deb-dist
+          dpkg-deb --info "deb-dist/raven_${VERSION}-1_amd64.deb"
+          dpkg-deb --info "deb-dist/raven_${VERSION}-1_arm64.deb"
+
+      - name: Checkout apt repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          repository: jbearak/apt-raven
+          persist-credentials: false
+          path: apt-repo
+
+      - name: Update apt repository
+        env:
+          APT_REPO_GPG_PRIVATE_KEY: ${{ secrets.APT_REPO_GPG_PRIVATE_KEY }}
+          APT_REPO_GPG_PASSPHRASE: ${{ secrets.APT_REPO_GPG_PASSPHRASE }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "${APT_REPO_GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::APT_REPO_GPG_PRIVATE_KEY is required when ENABLE_APT_BUMP is true" >&2
+            exit 1
+          fi
+          if [ -f "apt-repo/pool/main/r/raven/raven_${VERSION}-1_amd64.deb" ] &&
+             [ -f "apt-repo/pool/main/r/raven/raven_${VERSION}-1_arm64.deb" ]; then
+            echo "apt repository already contains Raven $VERSION packages."
+            exit 0
+          fi
+          export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$APT_REPO_GPG_PRIVATE_KEY" | gpg --batch --import
+          FINGERPRINT="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')"
+          if [ -z "$FINGERPRINT" ]; then
+            echo "::error::could not find imported apt repository signing key fingerprint" >&2
+            exit 1
+          fi
+          gpg --batch --yes --output apt-repo/raven-archive-keyring.gpg --export "$FINGERPRINT"
+          APT_GPG_KEY_FINGERPRINT="$FINGERPRINT" \
+          APT_GPG_PASSPHRASE="$APT_REPO_GPG_PASSPHRASE" \
+            scripts/debian/update-apt-repo.sh \
+              apt-repo \
+              "$VERSION" \
+              "deb-dist/raven_${VERSION}-1_amd64.deb" \
+              "deb-dist/raven_${VERSION}-1_arm64.deb"
+
+      - name: Open apt repository bump PR
+        working-directory: apt-repo
+        env:
+          GH_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::APT_REPO_TOKEN is required when ENABLE_APT_BUMP is true" >&2
+            exit 1
+          fi
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "apt repository already contains Raven $VERSION — nothing to do."
+            exit 0
+          fi
+          BRANCH="bump-raven-$VERSION"
+          git config user.name "raven-release-bot"
+          git config user.email "raven-release-bot@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add .
+          git commit -m "raven $VERSION"
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git -c http.extraheader="$AUTH_HEADER" push --force origin "HEAD:$BRANCH"
+          if ! gh pr create --base main --head "$BRANCH" \
+                --title "raven $VERSION" \
+                --body "Automated apt repository bump for [raven $VERSION](https://github.com/jbearak/raven/releases/tag/v$VERSION)."; then
+            if gh pr view "$BRANCH" --json url >/dev/null 2>&1; then
+              echo "PR for $BRANCH already exists; the force-push updated it."
+            else
+              echo "::error::gh pr create failed for $BRANCH" >&2
+              exit 1
+            fi
+          fi
+          gh pr merge "$BRANCH" --auto --squash \
+            || echo "::warning::could not enable auto-merge; merge $BRANCH manually."
+
   # ── Homebrew tap bump ───────────────────────────────────────────────
   # After the GitHub Release is published, open a PR against the Homebrew
   # tap (jbearak/homebrew-raven) bumping the formula to this version with the

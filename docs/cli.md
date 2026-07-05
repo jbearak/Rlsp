@@ -7,13 +7,11 @@ Raven ships a single binary that serves the LSP via stdio *and* exposes subcomma
 
 Run `raven`, `raven --help`, or `raven help` for top-level usage. Commands with options accept `--help`, including package-database commands such as `raven packages fetch --help` and the top-level aliases `raven fetch --help` / `raven freeze --help`.
 
-If your codebase imports any R packages — and it almost certainly does — Raven needs to know the symbols those packages export. Run `raven check` on the same machine where you run your R scripts and it reads them straight from your R installation.
-
-You may instead want to run Raven where R isn't installed — or where it is, but not all your packages are. The common case is an automated check on your pull requests: base images with R exist, but installing packages can take minutes or hours, expensive next to the moment `raven check` takes. So Raven can run without R: in GitHub Actions, install with `jbearak/setup-raven@v1` and then run `raven packages update` before `raven check`; elsewhere, run `raven packages update && raven check`, where `raven packages update` downloads a database of known R packages. Or commit `raven packages freeze`, which writes your packages' exports — read from your local R install — into a `.raven/` file in your repository, so CI needs no download.
+If your codebase imports R packages, Raven needs to know the symbols those packages export. On a machine with R and the project's packages installed, `raven check` reads that metadata directly from your R installation. In CI, where restoring the full package library can dominate the runtime of a static check, use the package database commands below instead.
 
 - `raven packages freeze` — generate a committed `.raven/packages.json` package symbol database. This is the reproducible, project-specific path for CI: it captures the exports your installed project dependencies expose and should be committed when you need version-pinned package metadata. Choose its scope with `--used` (default — only the packages the repo uses) or `--installed`/`--all` (every installed package). See [`raven packages freeze`](#raven-packages-freeze) and [Package database](package-database.md).
 - `raven packages fetch` — produce the same `.raven/packages.json` from CRAN/Bioconductor r-universe instead of a local R install. Needs no R, no installed packages, and no dependency on the `names-db` Release. See [`raven packages fetch`](#raven-packages-fetch) and [Package database](package-database.md).
-- `raven packages update` — download the CRAN/Bioconductor metadata Raven uses to recognize symbols from packages that are not installed. No install bundles this database, so run it whenever you want broad coverage without a local R install — in GitHub Actions as a step after `jbearak/setup-raven@v1`, or explicitly during a source-build or CI-image setup. See [`raven packages update`](#raven-packages-update).
+- `raven packages update` — download the CRAN/Bioconductor metadata Raven uses to recognize symbols from packages that are not installed. No install bundles this database, so run it whenever you want broad coverage without a local R install. See [`raven packages update`](#raven-packages-update).
 
 ## Why Raven analyzes R without running it
 
@@ -28,7 +26,7 @@ It still needs each package's **export names** to tell a real symbol from a typo
 - **`raven packages update` before `raven check`** (easiest) — downloads a package symbol database from Raven's GitHub repository. It is seeded from the maintainer's system and refreshed every Monday with all of CRAN and Bioconductor, retrieved from [r-universe](https://r-universe.dev).
 - **Commit `raven packages freeze`** (simplest if you'd rather not depend on Raven's database) — records the exports of just the packages your repo uses, read from your installed packages (via renv and/or your machine), into `.raven/packages.json`. Commit that file and CI needs only `raven check`.
 
-And if R *is* installed in CI with all the packages available, none of this is needed: Raven reads everything it needs straight from that R installation. The [four CI strategies](#four-ways-to-run-raven-check-in-ci) below lay out the trade-offs in detail.
+And if R *is* installed in CI with all the packages available, none of this is needed: Raven reads everything it needs straight from that R installation. The [CI package metadata strategies](#package-metadata-strategies) below lay out the trade-offs in detail.
 
 ## `raven check`
 
@@ -90,7 +88,21 @@ Knowing a package's exports is **separate** from knowing whether it is installed
 
 `--report-uninstalled` re-enables them. Reach for it whenever a `library(X)` call must really succeed at runtime: a pipeline that *does* install packages (e.g. `renv::restore()`) and wants to fail if any didn't, **or** any CI that **actually runs your R scripts** after `raven check` (e.g. R-package CI), where an uninstalled package is a genuine failure rather than CI noise. Gate-only CI that never executes the scripts wants the default (suppressed). It reports `library()` calls **not present in the local library paths** — **not** relative to the package symbol databases (`.raven/packages.json` or the `names.db` database). One consequence: with the default off, a genuine typo such as `library(dpylr)` is silent (no database knows it, but `raven check` isn't checking install status); it is reported only with `--report-uninstalled`. The language server is unchanged — it still fires missing-package whenever install state is known. See [Diagnostics](diagnostics.md#package-names-vs-install-status) for the full model.
 
-### Four ways to run `raven check` in CI
+### File encoding
+
+Source files must be UTF-8. A UTF-8 byte-order mark is stripped and BOM-marked UTF-16 (LE/BE) is decoded, but anything else must already be valid UTF-8 — Raven does not guess legacy single-byte encodings (Latin-1 / Windows-1252). Guessing would silently mis-decode: a non-breaking space (`0xA0`) inside a string comparison, for instance, would read as an ordinary space and quietly change what your code matches. A *reported* file that isn't valid UTF-8 is therefore flagged as an **error diagnostic** (`File is not valid UTF-8: first invalid byte 0x… at offset …`) that fails the build like any other error finding — it is **not** an operator error. Re-save the file as UTF-8 to fix it. A file that is only *indexed* for cross-file resolution (not itself reported) and can't be decoded is silently skipped, matching the editor. `raven lint` reads through the same decoder, so encoding handling is uniform across the user-facing CLI.
+
+### Exit codes
+
+- `0` — no diagnostic exceeded `--max-severity`.
+- `1` — at least one diagnostic exceeded `--max-severity`. An unknown flag is a usage error and also exits `1`. A reported file that isn't valid UTF-8 is an error diagnostic, so it also exits `1`.
+- `2` — operator error detected while running (config parse failure, an I/O failure reading a path, invalid workspace). A *readable* but mis-encoded file is a finding (exit `1`), not an operator error.
+
+## CI examples
+
+Use `raven check` in CI as a static gate for pull requests and pushes. The important setup choice is package metadata: Raven does not need to execute your R code, and CI usually does not need to install every package just to resolve exports. Installing R itself is not the expensive part; restoring and compiling the package dependency tree is.
+
+### Package metadata strategies
 
 There are four strategies for giving `raven check` package-export coverage in CI. Each trades off differently on R requirements, network use, coverage breadth, and version fidelity:
 
@@ -109,16 +121,6 @@ There are four strategies for giving `raven check` package-export coverage in CI
 Strategies 3 and 4 can be combined: commit a `freeze` file for version-exact coverage of installed packages, then run `fetch` in CI to top up whatever `freeze` missed — `fetch`'s additive merge preserves every `freeze` row untouched.
 
 See [`raven packages fetch`](#raven-packages-fetch), [`raven packages freeze`](#raven-packages-freeze), and [Package database](package-database.md) for details.
-
-### File encoding
-
-Source files must be UTF-8. A UTF-8 byte-order mark is stripped and BOM-marked UTF-16 (LE/BE) is decoded, but anything else must already be valid UTF-8 — Raven does not guess legacy single-byte encodings (Latin-1 / Windows-1252). Guessing would silently mis-decode: a non-breaking space (`0xA0`) inside a string comparison, for instance, would read as an ordinary space and quietly change what your code matches. A *reported* file that isn't valid UTF-8 is therefore flagged as an **error diagnostic** (`File is not valid UTF-8: first invalid byte 0x… at offset …`) that fails the build like any other error finding — it is **not** an operator error. Re-save the file as UTF-8 to fix it. A file that is only *indexed* for cross-file resolution (not itself reported) and can't be decoded is silently skipped, matching the editor. `raven lint` reads through the same decoder, so encoding handling is uniform across the user-facing CLI.
-
-### Exit codes
-
-- `0` — no diagnostic exceeded `--max-severity`.
-- `1` — at least one diagnostic exceeded `--max-severity`. An unknown flag is a usage error and also exits `1`. A reported file that isn't valid UTF-8 is an error diagnostic, so it also exits `1`.
-- `2` — operator error detected while running (config parse failure, an I/O failure reading a path, invalid workspace). A *readable* but mis-encoded file is a finding (exit `1`), not an operator error.
 
 ### GitHub Actions example
 
@@ -148,6 +150,39 @@ The [`jbearak/setup-raven`](https://github.com/jbearak/setup-raven) action insta
 For reproducible CI, commit `.raven/packages.json` generated by `raven packages freeze`. `raven packages update` restores broad CRAN/Bioconductor coverage, but it follows the moving `names-db` Release and is not version-pinned by the project.
 
 To get installed/local package awareness and exact local package metadata in CI, install R (e.g. `r-lib/actions/setup-r`) before running `raven check`. Base R-platform symbols are embedded in the binary even without R. Broad CRAN/Bioconductor coverage requires Raven's `names.db` database, downloaded with `raven packages update`. Run that update step after `setup-raven` (or, on a self-hosted/source install, during image setup or cache warmup) so normal `raven check`, LSP startup, completion, hover, and package lookup stay network-free.
+
+### Bitbucket Pipelines example
+
+Use Raven's signed apt repository from a normal Ubuntu build image. You can copy [`docs/examples/ci/bitbucket-pipelines.yml`](examples/ci/bitbucket-pipelines.yml) to `bitbucket-pipelines.yml`:
+
+```yaml
+image: ubuntu:24.04
+
+pipelines:
+  default:
+    - step:
+        name: Raven
+        script:
+          - apt-get update
+          - apt-get install -y ca-certificates curl
+          - install -d -m 0755 /etc/apt/keyrings
+          - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
+          - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
+          - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
+          - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
+          - apt-get update
+          - apt-get install -y raven
+          - raven packages update
+          - raven check
+```
+
+The apt repository is static HTTPS hosting for Debian repository metadata and `.deb` files; it is not a Docker image and does not run a remote installer script. The SHA-256 check pins the bootstrap keyring before apt trusts it, and the `signed-by=` keyring then makes apt verify Raven's repository metadata before it installs the package. Pin a specific Raven package version for reproducible CI:
+
+```yaml
+          - apt-get install -y raven=0.12.0-1
+```
+
+Use `latest`-style behavior by omitting the version pin. As with GitHub Actions, `raven packages update` restores broad CRAN/Bioconductor coverage but follows Raven's moving `names-db` Release; commit `.raven/packages.json` from `raven packages freeze` when package metadata should be project-pinned.
 
 ### Scope
 

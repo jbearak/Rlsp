@@ -152,6 +152,11 @@ This creates a GitHub Release with all binaries and `.vsix` files. If marketplac
 
 **Required secrets** (for marketplace publishing): `VSCE_PAT`, `OVSX_PAT`.
 
+Optional post-release packaging jobs are gated by repository variables:
+
+- `ENABLE_HOMEBREW_BUMP=true` opens a PR against `jbearak/homebrew-raven`.
+- `ENABLE_APT_BUMP=true` builds Debian packages from the Linux release artifacts and opens a PR against `jbearak/apt-raven`, a GitHub Pages-backed apt repository. This requires `APT_REPO_TOKEN`, `APT_REPO_GPG_PRIVATE_KEY`, and optionally `APT_REPO_GPG_PASSPHRASE`. The apt repository stores signed `dists/stable` metadata plus `pool/main/r/raven/*.deb`; `names.db` is still not bundled and remains user-provisioned with `raven packages update`, `fetch`, or a committed `.raven/packages.json`.
+
 ## Cross-file internals (high-level)
 
 Cross-file awareness is implemented under `crates/raven/src/cross_file/`.

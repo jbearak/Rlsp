@@ -329,6 +329,9 @@ jobs:
       - name: Check settings reference is up to date
         run: bun editors/vscode/scripts/generate-settings-reference.mjs --check
 
+      - name: Check apt packaging workflow and docs
+        run: bun test tests/bun/apt-packaging.test.ts
+
       # Electron (the runtime VS Code uses for integration tests) needs an
       # X server plus a handful of native libs that aren't in the default
       # `ubuntu-latest` image. The `*t64` package names target Ubuntu 24.04
@@ -362,8 +365,13 @@ jobs:
             libgbm1 \
             libsecret-1-0 \
             xdg-utils \
+            dpkg-dev \
+            gnupg \
             r-base-core \
             r-cran-plyr
+
+      - name: Run Debian packaging script tests
+        run: bash tests/shell/debian-packaging-test.sh
 
       # The extension uses `package-lock.json` (no `bun.lockb`), so `npm ci`
       # gives us a reproducible install. The test scripts themselves still
