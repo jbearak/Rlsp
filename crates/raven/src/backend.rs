@@ -1835,13 +1835,17 @@ enum WatchedManifestPayload {
 ///
 /// Content and `.Rprofile` scans run off-lock; the input mutation, package
 /// re-derive, workspace `system.file()` re-resolution, and gated affected-set
-/// extension happen under one write lock. `sync_publish_path` controls whether
+/// extension happen under one write lock. Delayed undecodable-retry callers
+/// attach per-entry generation expectations; each expectation is checked under
+/// that same write lock immediately before its package-input mutation, so a
+/// stale retry cannot apply captured manifest state after a newer watcher event
+/// has taken ownership of the URI. `sync_publish_path` controls whether
 /// newly-affected URIs are force-marked immediately, matching
 /// [`extend_affected_for_manifest_change`]'s publish-path contract.
 async fn apply_watched_manifest_changes(
     state_arc: &Arc<RwLock<WorldState>>,
     affected_open_docs: &mut Vec<Url>,
-    pkg_manifest_changes: &[(Url, bool)],
+    pkg_manifest_changes: &[WatchedManifestChange],
     sync_publish_path: bool,
 ) {
     if pkg_manifest_changes.is_empty() {
@@ -1864,11 +1868,16 @@ async fn apply_watched_manifest_changes(
     // DESCRIPTION/NAMESPACE carry on-disk text for `translate`; the
     // `.Rprofile` payload is a prelude scan precomputed off-lock (None when
     // deleted or modeling disabled — both clear the prelude).
-    let mut manifest_contents: Vec<(Url, WatchedManifestPayload, bool)> = Vec::new();
-    for (uri, deleted) in pkg_manifest_changes {
-        let is_rprofile = uri.to_file_path().ok().as_deref() == rprofile_path.as_deref();
+    let mut manifest_contents: Vec<(
+        Url,
+        WatchedManifestPayload,
+        bool,
+        Option<WatchedPackageInputGenerationExpectation>,
+    )> = Vec::new();
+    for change in pkg_manifest_changes {
+        let is_rprofile = change.uri.to_file_path().ok().as_deref() == rprofile_path.as_deref();
         let payload = if is_rprofile {
-            let scan = if *deleted || !model_rprofile {
+            let scan = if change.deleted || !model_rprofile {
                 None
             } else if let Some(root) = ws_root.clone() {
                 tokio::task::spawn_blocking(move || {
@@ -1880,9 +1889,9 @@ async fn apply_watched_manifest_changes(
                 None
             };
             WatchedManifestPayload::Rprofile(scan)
-        } else if *deleted {
+        } else if change.deleted {
             WatchedManifestPayload::Text(None)
-        } else if let Ok(path) = uri.to_file_path() {
+        } else if let Ok(path) = change.uri.to_file_path() {
             let on_disk_text = tokio::task::spawn_blocking(move || {
                 std::fs::read_to_string(path)
                     .ok()
@@ -1894,12 +1903,28 @@ async fn apply_watched_manifest_changes(
         } else {
             WatchedManifestPayload::Text(None)
         };
-        manifest_contents.push((uri.clone(), payload, *deleted));
+        manifest_contents.push((
+            change.uri.clone(),
+            payload,
+            change.deleted,
+            change.generation_expectation,
+        ));
     }
 
     let mut state = state_arc.write().await;
     let mut deltas = Vec::new();
-    for (uri, payload, deleted) in manifest_contents {
+    for (uri, payload, deleted, generation_expectation) in manifest_contents {
+        if !watched_package_input_generation_is_current(&state, &uri, generation_expectation) {
+            if let Some(expectation) = generation_expectation {
+                log::trace!(
+                    "Skipping stale watched manifest package-input event for {} ({:?}, generation {})",
+                    uri,
+                    expectation.kind,
+                    expectation.generation
+                );
+            }
+            continue;
+        }
         let delta = match payload {
             WatchedManifestPayload::Text(on_disk_text) => {
                 let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
@@ -2724,6 +2749,26 @@ struct WatchedPackageInputEvent {
     uri: Url,
     deleted: bool,
     committed: bool,
+    generation_expectation: Option<WatchedPackageInputGenerationExpectation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchedPackageInputOutcomeKind {
+    Updated,
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WatchedPackageInputGenerationExpectation {
+    generation: u64,
+    kind: WatchedPackageInputOutcomeKind,
+}
+
+#[derive(Clone)]
+struct WatchedManifestChange {
+    uri: Url,
+    deleted: bool,
+    generation_expectation: Option<WatchedPackageInputGenerationExpectation>,
 }
 
 const WATCHED_UNDECODABLE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -2753,6 +2798,83 @@ fn expected_watched_generation_is_current(
 ) -> bool {
     expected_generation
         .is_none_or(|generation| watched_file_resync_generation_matches(state, uri, generation))
+}
+
+fn watched_package_input_generation_is_current(
+    state: &WorldState,
+    uri: &Url,
+    expectation: Option<WatchedPackageInputGenerationExpectation>,
+) -> bool {
+    match expectation {
+        None => true,
+        Some(WatchedPackageInputGenerationExpectation {
+            generation,
+            kind: WatchedPackageInputOutcomeKind::Updated,
+        }) => watched_file_resync_generation_matches(state, uri, generation),
+        Some(WatchedPackageInputGenerationExpectation {
+            generation: _,
+            kind: WatchedPackageInputOutcomeKind::Removed,
+        }) => !state.watched_file_resync_generations.contains_key(uri),
+    }
+}
+
+#[cfg(test)]
+mod watched_package_input_generation_tests {
+    use super::*;
+
+    #[test]
+    fn watched_package_input_generation_currentness_matches_retry_outcome() {
+        let uri = Url::parse("file:///workspace/R/helper.R").unwrap();
+        let mut state = WorldState::new();
+        state.watched_file_resync_generations.insert(uri.clone(), 7);
+
+        assert!(
+            watched_package_input_generation_is_current(
+                &state,
+                &uri,
+                Some(WatchedPackageInputGenerationExpectation {
+                    generation: 7,
+                    kind: WatchedPackageInputOutcomeKind::Updated,
+                }),
+            ),
+            "Updated is current while the table still holds the captured generation"
+        );
+        assert!(
+            !watched_package_input_generation_is_current(
+                &state,
+                &uri,
+                Some(WatchedPackageInputGenerationExpectation {
+                    generation: 6,
+                    kind: WatchedPackageInputOutcomeKind::Updated,
+                }),
+            ),
+            "Updated is stale after a newer event changes the table entry"
+        );
+        assert!(
+            !watched_package_input_generation_is_current(
+                &state,
+                &uri,
+                Some(WatchedPackageInputGenerationExpectation {
+                    generation: 7,
+                    kind: WatchedPackageInputOutcomeKind::Removed,
+                }),
+            ),
+            "Removed is stale when a newer CREATE/CHANGE reinserted the entry"
+        );
+
+        state.watched_file_resync_generations.remove(&uri);
+        assert!(
+            watched_package_input_generation_is_current(
+                &state,
+                &uri,
+                Some(WatchedPackageInputGenerationExpectation {
+                    generation: 7,
+                    kind: WatchedPackageInputOutcomeKind::Removed,
+                }),
+            ),
+            "Removed is current after its successful removal pruned the entry"
+        );
+    }
 }
 
 /// The "file is gone" tail of [`resync_file_from_disk`]: veto if the URI was
@@ -3374,9 +3496,13 @@ fn spawn_watched_undecodable_retry(
 /// [`WatchedResyncBatchMode::DelayedUndecodableRetry`] feeds only committed
 /// outcomes to package translation so superseded/skipped retries cannot touch
 /// package state; a newer watched event owns convergence. Committed delayed
-/// retry outcomes for DESCRIPTION, NAMESPACE, and the workspace `.Rprofile`
-/// also flow through the same manifest package-input path as the synchronous
-/// watcher handler, then publish via this batch tail after capping.
+/// retry package-input events carry the captured generation and commit outcome:
+/// `Updated` is current only while the URI's generation still equals the
+/// captured generation, while `Removed` is current only while the generation
+/// entry is absent after the removal commit pruned it. Both the manifest path
+/// and the R-file package loop re-check that currency under the same
+/// `WorldState` write lock that applies the package mutation, then publish via
+/// this batch tail after capping.
 async fn run_watched_resync_batch(
     state_arc: Arc<RwLock<WorldState>>,
     client: Client,
@@ -3425,6 +3551,14 @@ async fn run_watched_resync_batch(
                     uri: item.uri.clone(),
                     deleted: false,
                     committed: true,
+                    generation_expectation: matches!(
+                        mode,
+                        WatchedResyncBatchMode::DelayedUndecodableRetry
+                    )
+                    .then_some(WatchedPackageInputGenerationExpectation {
+                        generation: item.generation,
+                        kind: WatchedPackageInputOutcomeKind::Updated,
+                    }),
                 });
                 log::trace!("Updated workspace index for: {}", item.uri);
             }
@@ -3440,6 +3574,14 @@ async fn run_watched_resync_batch(
                     uri: item.uri.clone(),
                     deleted: true,
                     committed: true,
+                    generation_expectation: matches!(
+                        mode,
+                        WatchedResyncBatchMode::DelayedUndecodableRetry
+                    )
+                    .then_some(WatchedPackageInputGenerationExpectation {
+                        generation: item.generation,
+                        kind: WatchedPackageInputOutcomeKind::Removed,
+                    }),
                 });
                 log::trace!("Removed watched file state during resync: {}", item.uri);
             }
@@ -3454,6 +3596,7 @@ async fn run_watched_resync_batch(
                     uri: item.uri.clone(),
                     deleted: false,
                     committed: false,
+                    generation_expectation: None,
                 });
             }
             ResyncOutcome::Vetoed
@@ -3463,19 +3606,26 @@ async fn run_watched_resync_batch(
                     uri: item.uri.clone(),
                     deleted: false,
                     committed: false,
+                    generation_expectation: None,
                 });
             }
         }
     }
 
     if matches!(mode, WatchedResyncBatchMode::DelayedUndecodableRetry) {
-        let pkg_manifest_changes: Vec<(Url, bool)> = {
+        let pkg_manifest_changes: Vec<WatchedManifestChange> = {
             let state = state_arc.read().await;
             package_input_events
                 .iter()
                 .filter(|event| event.committed)
                 .filter_map(|event| {
-                    watched_manifest_change_for_uri(&state, &event.uri, event.deleted)
+                    watched_manifest_change_for_uri(&state, &event.uri, event.deleted).map(
+                        |(uri, deleted)| WatchedManifestChange {
+                            uri,
+                            deleted,
+                            generation_expectation: event.generation_expectation,
+                        },
+                    )
                 })
                 .collect()
         };
@@ -3502,6 +3652,24 @@ async fn run_watched_resync_batch(
             .filter(|event| {
                 !matches!(mode, WatchedResyncBatchMode::DelayedUndecodableRetry)
                     || watched_manifest_change_for_uri(&state, &event.uri, event.deleted).is_none()
+            })
+            .filter(|event| {
+                let current = watched_package_input_generation_is_current(
+                    &state,
+                    &event.uri,
+                    event.generation_expectation,
+                );
+                if !current
+                    && let Some(expectation) = event.generation_expectation
+                {
+                    log::trace!(
+                        "Skipping stale watched R-file package-input event for {} ({:?}, generation {})",
+                        event.uri,
+                        expectation.kind,
+                        expectation.generation
+                    );
+                }
+                current
             })
             .collect();
         // Gate on any package source file — `is_r_source_path` matches both
@@ -7044,7 +7212,7 @@ impl LanguageServer for Backend {
         let (uris_to_update, mut affected_open_docs, pkg_manifest_changes): (
             Vec<WatchedResyncItem>,
             Vec<Url>,
-            Vec<(Url, bool)>,
+            Vec<WatchedManifestChange>,
         ) = {
             let mut state = self.state.write().await;
             let mut to_update = Vec::new();
@@ -7230,7 +7398,7 @@ impl LanguageServer for Backend {
 
             // Identify DESCRIPTION/NAMESPACE changes for the event-driven path.
             // Content is read outside the lock (spawn_blocking) below.
-            let pkg_manifest_changes: Vec<(Url, bool)> = {
+            let pkg_manifest_changes: Vec<WatchedManifestChange> = {
                 params
                     .changes
                     .iter()
@@ -7240,6 +7408,11 @@ impl LanguageServer for Backend {
                             &c.uri,
                             c.typ == FileChangeType::DELETED,
                         )
+                        .map(|(uri, deleted)| WatchedManifestChange {
+                            uri,
+                            deleted,
+                            generation_expectation: None,
+                        })
                     })
                     .collect()
             };
@@ -17060,6 +17233,202 @@ mod project_config_initialize_tests {
         );
     }
 
+    /// A stale delayed retry that would have removed DESCRIPTION if current
+    /// must leave manifest package state untouched once a newer watcher event
+    /// has superseded its generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_manifest_retry_skips_superseded_final_invalid_description() {
+        let tmp = TempDir::new().unwrap();
+        let old_desc = "Package: oldpkg\nVersion: 0.1.0\n";
+        let desc_path = tmp.path().join("DESCRIPTION");
+        fs::write(&desc_path, [0x78u8, 0x80, 0x79]).unwrap();
+        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let desc_uri = Url::from_file_path(&desc_path).unwrap();
+        seed_package_description_input(backend, tmp.path(), old_desc).await;
+        let stale_generation = {
+            let mut state = backend.state.write().await;
+            let stale = bump_watched_file_resync_generation(&mut state, &desc_uri);
+            bump_watched_file_resync_generation(&mut state, &desc_uri);
+            stale
+        };
+
+        run_watched_resync_batch(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            vec![WatchedResyncItem {
+                uri: desc_uri,
+                generation: stale_generation,
+            }],
+            Vec::new(),
+            WatchedResyncBatchMode::DelayedUndecodableRetry,
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .package_inputs
+                .description
+                .as_ref()
+                .map(|input| input.text.as_ref()),
+            Some(old_desc),
+            "superseded final-invalid DESCRIPTION retry must not clear package inputs"
+        );
+        assert_eq!(
+            state.package_state.workspace().map(|ws| ws.name.as_str()),
+            Some("oldpkg"),
+            "superseded removal retry must not re-derive package state"
+        );
+    }
+
+    /// Pin the manifest apply-time guard: a removed retry outcome is current
+    /// only while the URI's generation entry is absent. If a newer event has
+    /// reinserted an entry, the stale `deleted: true` package event must not
+    /// clear DESCRIPTION.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_manifest_apply_skips_stale_removed_expectation() {
+        let tmp = TempDir::new().unwrap();
+        let old_desc = "Package: oldpkg\nVersion: 0.1.0\n";
+        let desc_path = tmp.path().join("DESCRIPTION");
+        fs::write(&desc_path, old_desc).unwrap();
+        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let desc_uri = Url::from_file_path(&desc_path).unwrap();
+        seed_package_description_input(backend, tmp.path(), old_desc).await;
+        let stale_generation = {
+            let mut state = backend.state.write().await;
+            let stale = bump_watched_file_resync_generation(&mut state, &desc_uri);
+            bump_watched_file_resync_generation(&mut state, &desc_uri);
+            stale
+        };
+
+        let mut affected = Vec::new();
+        apply_watched_manifest_changes(
+            &backend.state,
+            &mut affected,
+            &[WatchedManifestChange {
+                uri: desc_uri,
+                deleted: true,
+                generation_expectation: Some(WatchedPackageInputGenerationExpectation {
+                    generation: stale_generation,
+                    kind: WatchedPackageInputOutcomeKind::Removed,
+                }),
+            }],
+            false,
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .package_inputs
+                .description
+                .as_ref()
+                .map(|input| input.text.as_ref()),
+            Some(old_desc),
+            "stale removed manifest event must not clear DESCRIPTION at apply time"
+        );
+        assert_eq!(
+            state.package_state.workspace().map(|ws| ws.name.as_str()),
+            Some("oldpkg"),
+            "stale removed manifest event must not re-derive package state"
+        );
+        assert!(
+            affected.is_empty(),
+            "stale manifest event must not add publish fanout"
+        );
+    }
+
+    /// Direct retry-batch regression coverage for the plain R-file path:
+    /// a stale final-invalid retry must leave graph/index/file-cache/package
+    /// state intact without relying on timer coalescing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_r_file_retry_skips_superseded_final_invalid_state() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let helper_path = tmp.path().join("R").join("helper.R");
+        let old_helper = "helper_fn <- function() 1\n";
+        fs::write(&helper_path, old_helper).unwrap();
+        let parent = "source(\"R/helper.R\")\nhelper_fn()\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        let install =
+            resync_file_from_disk(&backend.state, &helper_uri, None, None, true, None).await;
+        assert!(
+            matches!(install, ResyncOutcome::Updated { .. }),
+            "precondition: helper disk state installed"
+        );
+        seed_package_r_file_input(backend, tmp.path(), "R/helper.R", old_helper).await;
+        let stale_generation = {
+            let mut state = backend.state.write().await;
+            let stale = bump_watched_file_resync_generation(&mut state, &helper_uri);
+            bump_watched_file_resync_generation(&mut state, &helper_uri);
+            stale
+        };
+
+        fs::write(&helper_path, [0x78u8, 0x80, 0x79]).unwrap();
+        run_watched_resync_batch(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            vec![WatchedResyncItem {
+                uri: helper_uri.clone(),
+                generation: stale_generation,
+            }],
+            Vec::new(),
+            WatchedResyncBatchMode::DelayedUndecodableRetry,
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .any(|e| e.to == helper_uri),
+            "superseded R-file retry must not remove graph edges"
+        );
+        assert!(
+            state
+                .cross_file_workspace_index
+                .get_metadata(&helper_uri)
+                .is_some(),
+            "superseded R-file retry must not remove workspace-index metadata"
+        );
+        assert!(
+            state.workspace_index_new.contains(&helper_uri),
+            "superseded R-file retry must not remove unified index state"
+        );
+        assert_eq!(
+            state.cross_file_file_cache.get(&helper_uri).as_deref(),
+            Some(old_helper),
+            "superseded R-file retry must not remove or replace file-cache content"
+        );
+        assert_eq!(
+            state
+                .package_inputs
+                .r_files
+                .get(&helper_path)
+                .map(|input| input.text.as_ref()),
+            Some(old_helper),
+            "superseded R-file retry must not remove package input"
+        );
+        assert!(
+            state
+                .watched_file_resync_generations
+                .get(&helper_uri)
+                .is_some_and(|generation| *generation != stale_generation),
+            "newer generation must remain the owner after the stale retry"
+        );
+    }
+
     /// Issue #564 coalescing: a newer watched CHANGED during the retry delay
     /// supersedes the older pending retry. The first retry's deadline passes
     /// while the file is still invalid; it must not remove state because the
@@ -17121,6 +17490,13 @@ mod project_config_initialize_tests {
             second_generation_seen,
             "second watched event must supersede the first generation"
         );
+        let second_generation = {
+            let state = backend.state.read().await;
+            *state
+                .watched_file_resync_generations
+                .get(&helper_uri)
+                .expect("second generation remains current before first retry deadline")
+        };
 
         let after_first_retry_deadline = first_event_at
             + WATCHED_UNDECODABLE_RETRY_DELAY
@@ -17130,6 +17506,14 @@ mod project_config_initialize_tests {
         }
         {
             let state = backend.state.read().await;
+            assert_eq!(
+                state
+                    .watched_file_resync_generations
+                    .get(&helper_uri)
+                    .copied(),
+                Some(second_generation),
+                "the second watched event's generation must still own the URI after the first retry deadline"
+            );
             assert!(
                 state
                     .cross_file_graph
