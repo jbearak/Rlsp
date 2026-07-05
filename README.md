@@ -2,7 +2,7 @@
 
 Raven is a static analyzer for R that resolves what's in scope at each line — catching undefined and used-before-defined variables even in a single script, and across files by following `source()` chains — without running your code. The same scope model drives the rest of its code intelligence — completions, go-to-definition, find-references, hover — so each reflects what's reachable at your cursor, not just what exists somewhere in the project. It also diagnoses syntax errors, and can optionally check code style and formatting.
 
-Raven is fast and runs all of this in realtime in your editor, with diagnostics updating instantly as you type. It also fills a gap at the other end of the workflow: automated checks in pull requests — running `raven check` flags undefined variables and other errors before code merges, the kind of automated review that's table stakes for other languages but has long been missing for R.
+Raven is fast and runs all of this in realtime in your editor, with diagnostics updating instantly as you type. It also fills a gap at the other end of the workflow: automated checks in pull requests. In CI (Continuous Integration), a service such as GitHub Actions or Bitbucket Pipelines runs checks on a clean machine whenever you push or open a pull request. Running `raven check` there flags undefined variables and other errors before code merges, the kind of automated review that's table stakes for other languages but has long been missing for R analysis projects.
 
 Doing this well in R is hard — part of why so little static tooling exists for the language. R leans heavily on [non-standard evaluation](docs/non-standard-evaluation.md) (NSE): a function can take its arguments as unevaluated code and decide what the symbols mean at runtime, so `col` in `dplyr::filter(df, col > 0)` is a data-frame column, not an undefined variable. A checker that didn't account for this would flag idiomatic R as errors; Raven recognizes these NSE contexts and leaves them unflagged — though code that pulls names into scope at runtime, such as `attach()`, can still draw a false positive, which you resolve by declaring those symbols with a [directive](docs/directives.md). The same analysis isn't only defensive: wherever it can determine an object's structure statically, Raven completes its fields — start typing `fruit$a` and it can suggest `apple` the moment you open the file, with no R session.
 
@@ -53,7 +53,7 @@ Raven takes a static-analysis approach rather than attaching to a live R session
 - **Available immediately, even for code you haven't run** — answers the moment you open a file, including code that errors halfway, is missing a dependency, or that you're only reading (onboarding to a repo, reviewing a pull request). A session-based tool can offer little until the code runs cleanly.
 - **Reflects what your code says, not what your session remembers** — a tool tied to a live session sees whatever is in `globalenv()` right now, possibly stale. Comment out `library(dplyr)` while it's still attached in your session and a session-based tool keeps completing `dplyr` functions; Raven reads the file and knows it isn't loaded there.
 - **Read-only and side-effect-free** — computing scope never runs your code, so nothing it does (writing files, hitting a database, a long job) can be triggered. This is also what makes Raven safe to run behind an agentic/AI tool.
-- **Runs in CI and other headless environments** — scope resolution needs no live R session, so Raven's diagnostics and lints run in a CI pipeline or any headless context. Use [`raven check`](docs/cli.md#raven-check) for the full diagnostic set (cross-file, undefined-variable, package) and [`raven lint`](docs/cli.md#raven-lint) for style-only gating.
+- **Runs in CI and other headless environments** — scope resolution needs no live R session, so Raven's diagnostics and lints run in CI (automated checks on pushes and pull requests) or any headless context. Use [`raven check`](docs/cli.md#raven-check) for the full diagnostic set (cross-file, undefined-variable, package) and [`raven lint`](docs/cli.md#raven-lint) for style-only gating. See [Automated checks in CI](docs/ci.md) for a beginner-friendly guide and GitHub Actions / Bitbucket Pipelines examples.
 
 See [Why Raven exists](docs/comparison.md#why-raven-exists) for the origin and rationale.
 
@@ -73,6 +73,8 @@ For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — c
 
 **Other editors:** Download a pre-built binary from the [releases page](https://github.com/jbearak/raven/releases), then run `raven --stdio` and connect via your editor's LSP client. See [Editor Integrations](docs/editor-integrations.md) for Zed, Neovim, and AI agent configurations.
 
+**Automated checks / CI:** Use `raven check` in GitHub Actions, Bitbucket Pipelines, or another CI system to catch analyzer diagnostics before code merges. See [Automated checks in CI](docs/ci.md).
+
 **GitHub Actions:** Use `jbearak/setup-raven@v1` to install the pre-built CLI, then run `raven check` with the flags you want. See [CLI](docs/cli.md#github-actions-example).
 
 **Bitbucket Pipelines and Ubuntu CI:** Install Raven from the signed apt repository in an Ubuntu image, then run `raven check`. See [CLI](docs/cli.md#bitbucket-pipelines-example).
@@ -85,6 +87,7 @@ Each feature above links to its own page. Beyond those:
 
 - [Editor Integrations](docs/editor-integrations.md) — VS Code, Zed, Neovim, AI agents
 - [Configuration](docs/configuration.md) — All settings and options ([alphabetical reference](docs/settings-reference.md))
+- [Automated checks in CI](docs/ci.md) — What CI is, why `raven check` belongs there, and GitHub Actions / Bitbucket Pipelines templates
 - [CLI](docs/cli.md) — `raven check` (full diagnostics) and `raven lint` (style) for CI and command-line usage
 - [R Package Development](docs/r-package-dev.md) — Package mode, visibility rules, and build commands
 - [`.Rprofile` Startup Prelude](docs/rprofile.md) — How Raven models project startup files for script scope

@@ -1,0 +1,17 @@
+name: Raven
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+
+jobs:
+  raven:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jbearak/setup-raven@v1
+        with:
+          version: latest
+      - run: raven packages update
+      - run: raven check
