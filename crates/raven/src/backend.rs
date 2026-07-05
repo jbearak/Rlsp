@@ -2389,13 +2389,14 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
     state.recompute_open_neighborhood_pins();
 }
 
-pub(crate) fn initialize_package_inputs_from_state(
+pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     state: &mut WorldState,
     root: std::path::PathBuf,
     desc_text: Option<Arc<str>>,
     ns_text: Option<Arc<str>>,
     disk_r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
     precomputed_rprofile_scan: Option<crate::package_state::rprofile::RprofileScan>,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) {
     state.package_inputs.workspace_root = Some(root.clone());
     state.package_inputs.package_mode = state.cross_file_config.package_mode;
@@ -2408,9 +2409,12 @@ pub(crate) fn initialize_package_inputs_from_state(
 
     let new_r_files = hydrate_package_r_files_from_state(state, &root, disk_r_files);
     state.package_inputs.r_files = new_r_files;
-    state.package_inputs.dataset_names = crate::package_state::scan_own_package_data_dir(&root);
+    state.package_inputs.dataset_names =
+        crate::package_state::scan_own_package_data_dir_with_exclusions(&root, exclusions);
     state.package_inputs.sysdata_names =
-        crate::package_state::sysdata::scan_sysdata_generating_scripts(&root);
+        crate::package_state::sysdata::scan_sysdata_generating_scripts_with_exclusions(
+            &root, exclusions,
+        );
 
     // If `.Rprofile` is currently OPEN as a live document, its prelude is owned
     // by the did_open/did_change path (sourced from the in-memory buffer). A
@@ -2435,8 +2439,11 @@ pub(crate) fn initialize_package_inputs_from_state(
         // non-contended callers (`raven check`, unit tests) pass `None` and let
         // it scan inline. When modeling is disabled the prelude is cleared.
         let rprofile_scan = if state.package_inputs.model_rprofile {
-            precomputed_rprofile_scan
-                .unwrap_or_else(|| crate::package_state::rprofile::scan_workspace_rprofile(&root))
+            precomputed_rprofile_scan.unwrap_or_else(|| {
+                crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                    &root, exclusions,
+                )
+            })
         } else {
             crate::package_state::rprofile::RprofileScan::default()
         };
@@ -3868,12 +3875,13 @@ impl LanguageServer for Backend {
         if index_workspace {
             tokio::task::spawn(async move {
                 // Run the blocking scan in a blocking task
+                let scan_workspace_exclusions = workspace_exclusions.clone();
                 let scan_result = tokio::task::spawn_blocking(move || {
                     let scan_start = std::time::Instant::now();
                     let result = crate::state::scan_workspace_with_exclusions(
                         &folders_clone,
                         max_chain_depth,
-                        &workspace_exclusions,
+                        &scan_workspace_exclusions,
                     );
                     let scan_duration = scan_start.elapsed();
                     let file_count = result.0.len();
@@ -3899,21 +3907,24 @@ impl LanguageServer for Backend {
                         // Also precompute the `.Rprofile` prelude scan here,
                         // OFF the write lock — it follows transitive source()
                         // chains and must not run under the lock (see
-                        // `initialize_package_inputs_from_state`).
-                        let (desc_text, ns_text, rprofile_scan) =
-                            if let Some(ref root) = root_for_pkg_inputs {
-                                let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
-                                    .ok()
-                                    .map(|t| std::sync::Arc::from(t.as_str()));
-                                let ns = std::fs::read_to_string(root.join("NAMESPACE"))
-                                    .ok()
-                                    .map(|t| std::sync::Arc::from(t.as_str()));
-                                let scan =
-                                    crate::package_state::rprofile::scan_workspace_rprofile(root);
-                                (desc, ns, Some(scan))
-                            } else {
-                                (None, None, None)
-                            };
+                        // `initialize_package_inputs_from_state_with_exclusions`).
+                        let (desc_text, ns_text, rprofile_scan) = if let Some(ref root) =
+                            root_for_pkg_inputs
+                        {
+                            let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
+                                .ok()
+                                .map(|t| std::sync::Arc::from(t.as_str()));
+                            let ns = std::fs::read_to_string(root.join("NAMESPACE"))
+                                .ok()
+                                .map(|t| std::sync::Arc::from(t.as_str()));
+                            let scan = crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                                    root,
+                                    &workspace_exclusions,
+                                );
+                            (desc, ns, Some(scan))
+                        } else {
+                            (None, None, None)
+                        };
 
                         // Apply index and snapshot trigger versions under a single write lock
                         let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
@@ -3928,13 +3939,14 @@ impl LanguageServer for Backend {
                                 // Populate package_inputs from the now-applied
                                 // workspace index and overlay open documents
                                 // (authoritative unsaved edits).
-                                initialize_package_inputs_from_state(
+                                initialize_package_inputs_from_state_with_exclusions(
                                     &mut state,
                                     root,
                                     desc_text,
                                     ns_text,
                                     Default::default(),
                                     rprofile_scan,
+                                    &workspace_exclusions,
                                 );
                             } else {
                                 state.apply_package_event(
@@ -4026,9 +4038,11 @@ impl LanguageServer for Backend {
         } else {
             let package_seed = if let Some(root) = root_for_pkg_inputs.clone() {
                 let root_clone = root.clone();
-                let workspace_exclusions = workspace_exclusions.clone();
+                let seed_exclusions = workspace_exclusions.clone();
+                let scan_exclusions = workspace_exclusions.clone();
                 Some((
                     root,
+                    seed_exclusions,
                     tokio::task::spawn_blocking(move || {
                         let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
                             .ok()
@@ -4038,13 +4052,16 @@ impl LanguageServer for Backend {
                             .map(|s| Arc::from(s.as_str()));
                         let disk_r_files = collect_package_r_file_inputs_from_disk_with_exclusions(
                             &root_clone,
-                            &workspace_exclusions,
+                            &scan_exclusions,
                         );
                         // Precompute the `.Rprofile` prelude scan OFF the write
                         // lock (it follows transitive source(); see
-                        // `initialize_package_inputs_from_state`).
+                        // `initialize_package_inputs_from_state_with_exclusions`).
                         let rprofile_scan =
-                            crate::package_state::rprofile::scan_workspace_rprofile(&root_clone);
+                            crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                                &root_clone,
+                                &scan_exclusions,
+                            );
                         (desc, ns, disk_r_files, rprofile_scan)
                     })
                     .await
@@ -4064,14 +4081,20 @@ impl LanguageServer for Backend {
             // with a derived state.
             let mut state = self.state.write().await;
             state.workspace_scan_complete = true;
-            if let Some((root, (desc_text, ns_text, disk_r_files, rprofile_scan))) = package_seed {
-                initialize_package_inputs_from_state(
+            if let Some((
+                root,
+                package_exclusions,
+                (desc_text, ns_text, disk_r_files, rprofile_scan),
+            )) = package_seed
+            {
+                initialize_package_inputs_from_state_with_exclusions(
                     &mut state,
                     root,
                     desc_text,
                     ns_text,
                     disk_r_files,
                     Some(rprofile_scan),
+                    &package_exclusions,
                 );
             }
         }
@@ -6626,6 +6649,7 @@ impl LanguageServer for Backend {
             // watched-file changes can otherwise spend the lock-hold time
             // doing Vec::contains scans per dependent.
             let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+            let workspace_exclusions = state.workspace_exclusions.clone();
             // Track whether any deletion touched `package_inputs`, so that
             // mixed batches (deletions + non-R creates/changes) still trigger
             // a re-derive. Without this, a batch like
@@ -6671,9 +6695,10 @@ impl LanguageServer for Backend {
                                     on_disk_text: None,
                                     deleted: true,
                                 };
-                            if crate::package_state::event::translate(
+                            if crate::package_state::event::translate_with_exclusions(
                                 &mut state.package_inputs,
                                 event,
+                                &workspace_exclusions,
                             )
                             .is_some()
                             {
@@ -6732,9 +6757,10 @@ impl LanguageServer for Backend {
                                     on_disk_text: None,
                                     deleted: true,
                                 };
-                            if crate::package_state::event::translate(
+                            if crate::package_state::event::translate_with_exclusions(
                                 &mut state.package_inputs,
                                 event,
+                                &workspace_exclusions,
                             )
                             .is_some()
                             {
@@ -6885,12 +6911,13 @@ impl LanguageServer for Backend {
             // Snapshot the root + modeling flag so the `.Rprofile` prelude scan
             // can run OFF-lock below (it follows transitive source(); the
             // locking-discipline invariant forbids that scan under the write
-            // lock — see `initialize_package_inputs_from_state`).
-            let (ws_root, model_rprofile) = {
+            // lock — see `initialize_package_inputs_from_state_with_exclusions`).
+            let (ws_root, model_rprofile, workspace_exclusions) = {
                 let state = self.state.read().await;
                 (
                     state.package_inputs.workspace_root.clone(),
                     state.package_inputs.model_rprofile,
+                    state.workspace_exclusions.clone(),
                 )
             };
             let rprofile_path = ws_root.as_ref().map(|r| r.join(".Rprofile"));
@@ -6910,8 +6937,12 @@ impl LanguageServer for Backend {
                     let scan = if *deleted || !model_rprofile {
                         None
                     } else if let Some(root) = ws_root.clone() {
+                        let workspace_exclusions = workspace_exclusions.clone();
                         tokio::task::spawn_blocking(move || {
-                            crate::package_state::rprofile::scan_workspace_rprofile(&root)
+                            crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                                &root,
+                                &workspace_exclusions,
+                            )
                         })
                         .await
                         .ok()
@@ -6938,6 +6969,7 @@ impl LanguageServer for Backend {
 
             // Apply manifest events under write lock
             let mut state = self.state.write().await;
+            let workspace_exclusions = state.workspace_exclusions.clone();
             let mut deltas = Vec::new();
             for (uri, payload, deleted) in manifest_contents {
                 let delta = match payload {
@@ -6947,7 +6979,11 @@ impl LanguageServer for Backend {
                             on_disk_text,
                             deleted,
                         };
-                        crate::package_state::event::translate(&mut state.package_inputs, event)
+                        crate::package_state::event::translate_with_exclusions(
+                            &mut state.package_inputs,
+                            event,
+                            &workspace_exclusions,
+                        )
                     }
                     // Apply the off-lock prelude scan via the lock-safe seam.
                     // `None` (delete/disabled) clears; the deletion delta is
@@ -7081,6 +7117,7 @@ impl LanguageServer for Backend {
                 // checkout) propagate to the namespace model and internal symbols.
                 {
                     let mut state = state_arc.write().await;
+                    let workspace_exclusions = state.workspace_exclusions.clone();
                     // Gate on any package source file — `is_r_source_path`
                     // matches both `R/` and `tests/testthat/`. Without the
                     // `tests/` branch, external edits that touch only test
@@ -7135,10 +7172,13 @@ impl LanguageServer for Backend {
                                     on_disk_text,
                                     deleted: false,
                                 };
-                            if let Some(delta) = crate::package_state::event::translate(
-                                &mut state.package_inputs,
-                                event,
-                            ) {
+                            if let Some(delta) =
+                                crate::package_state::event::translate_with_exclusions(
+                                    &mut state.package_inputs,
+                                    event,
+                                    &workspace_exclusions,
+                                )
+                            {
                                 deltas.push(delta);
                             }
                         }
@@ -8038,31 +8078,35 @@ impl Backend {
             if let Some((folders, max_chain_depth, workspace_exclusions, root_for_pkg_inputs)) =
                 scan_inputs.filter(|(folders, _, _, _)| !folders.is_empty())
             {
+                let scan_workspace_exclusions = workspace_exclusions.clone();
                 let scan_result = tokio::task::spawn_blocking(move || {
                     crate::state::scan_workspace_with_exclusions(
                         &folders,
                         max_chain_depth,
-                        &workspace_exclusions,
+                        &scan_workspace_exclusions,
                     )
                 })
                 .await;
 
                 match scan_result {
                     Ok((index, cross_file_entries, new_index_entries)) => {
-                        let (desc_text, ns_text, rprofile_scan) =
-                            if let Some(ref root) = root_for_pkg_inputs {
-                                let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
-                                    .ok()
-                                    .map(|s| Arc::from(s.as_str()));
-                                let ns = std::fs::read_to_string(root.join("NAMESPACE"))
-                                    .ok()
-                                    .map(|s| Arc::from(s.as_str()));
-                                let scan =
-                                    crate::package_state::rprofile::scan_workspace_rprofile(root);
-                                (desc, ns, Some(scan))
-                            } else {
-                                (None, None, None)
-                            };
+                        let (desc_text, ns_text, rprofile_scan) = if let Some(ref root) =
+                            root_for_pkg_inputs
+                        {
+                            let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
+                                .ok()
+                                .map(|s| Arc::from(s.as_str()));
+                            let ns = std::fs::read_to_string(root.join("NAMESPACE"))
+                                .ok()
+                                .map(|s| Arc::from(s.as_str()));
+                            let scan = crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                                    root,
+                                    &workspace_exclusions,
+                                );
+                            (desc, ns, Some(scan))
+                        } else {
+                            (None, None, None)
+                        };
 
                         let (package_library, packages_enabled) = {
                             let mut state = self.state.write().await;
@@ -8073,13 +8117,14 @@ impl Backend {
                             );
                             replay_open_documents_after_workspace_index_apply(&mut state).await;
                             if let Some(root) = root_for_pkg_inputs {
-                                initialize_package_inputs_from_state(
+                                initialize_package_inputs_from_state_with_exclusions(
                                     &mut state,
                                     root,
                                     desc_text,
                                     ns_text,
                                     Default::default(),
                                     rprofile_scan,
+                                    &workspace_exclusions,
                                 );
                                 package_inputs_initialized_by_exclusion_reload = true;
                             } else {
@@ -8112,6 +8157,7 @@ impl Backend {
                     workspace_exclusion_package_reseed.clone()
             {
                 let root_clone = root.clone();
+                let scan_exclusions = workspace_exclusions.clone();
                 let (desc_text, ns_text, disk_r_files, rprofile_scan) =
                     tokio::task::spawn_blocking(move || {
                         let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
@@ -8122,10 +8168,13 @@ impl Backend {
                             .map(|s| Arc::from(s.as_str()));
                         let disk_r_files = collect_package_r_file_inputs_from_disk_with_exclusions(
                             &root_clone,
-                            &workspace_exclusions,
+                            &scan_exclusions,
                         );
                         let rprofile_scan =
-                            crate::package_state::rprofile::scan_workspace_rprofile(&root_clone);
+                            crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                                &root_clone,
+                                &scan_exclusions,
+                            );
                         (desc, ns, disk_r_files, rprofile_scan)
                     })
                     .await
@@ -8137,13 +8186,14 @@ impl Backend {
                     ));
 
                 let mut state = self.state.write().await;
-                initialize_package_inputs_from_state(
+                initialize_package_inputs_from_state_with_exclusions(
                     &mut state,
                     root,
                     desc_text,
                     ns_text,
                     disk_r_files,
                     Some(rprofile_scan),
+                    &workspace_exclusions,
                 );
                 package_inputs_initialized_by_exclusion_reload = true;
             }
@@ -8158,6 +8208,7 @@ impl Backend {
         {
             let root_clone = root.clone();
             let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
+            let scan_exclusions = workspace_exclusions.clone();
             let (desc_text, ns_text, disk_r_files, rprofile_scan) =
                 tokio::task::spawn_blocking(move || {
                     let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
@@ -8168,13 +8219,16 @@ impl Backend {
                         .map(|s| std::sync::Arc::from(s.as_str()));
                     let disk_r_files = collect_package_r_file_inputs_from_disk_with_exclusions(
                         &root_clone,
-                        &workspace_exclusions,
+                        &scan_exclusions,
                     );
                     // Precompute the `.Rprofile` prelude scan OFF the write lock
                     // (it follows transitive source(); see
-                    // `initialize_package_inputs_from_state`).
+                    // `initialize_package_inputs_from_state_with_exclusions`).
                     let rprofile_scan =
-                        crate::package_state::rprofile::scan_workspace_rprofile(&root_clone);
+                        crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                            &root_clone,
+                            &scan_exclusions,
+                        );
                     (desc, ns, disk_r_files, rprofile_scan)
                 })
                 .await
@@ -8190,13 +8244,14 @@ impl Backend {
             // package_mode is a no-op: `translate(SettingChanged)` above already
             // set it to this same mode.)
             let mut state = self.state.write().await;
-            initialize_package_inputs_from_state(
+            initialize_package_inputs_from_state_with_exclusions(
                 &mut state,
                 root,
                 desc_text,
                 ns_text,
                 disk_r_files,
                 Some(rprofile_scan),
+                &workspace_exclusions,
             );
             log::info!("Rebuilt package state after packageMode change (event-driven)");
         }
@@ -9040,10 +9095,12 @@ impl Backend {
     /// buffer instead of disk so the prelude tracks edits as you type.
     async fn refresh_rprofile_prelude_from_buffer(&self, root: std::path::PathBuf, text: Arc<str>) {
         let root_for_scan = root.clone();
+        let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
         let Ok(scan) = tokio::task::spawn_blocking(move || {
-            crate::package_state::rprofile::scan_workspace_rprofile_with_root_text(
+            crate::package_state::rprofile::scan_workspace_rprofile_with_root_text_and_exclusions(
                 &root_for_scan,
                 &text,
+                &workspace_exclusions,
             )
         })
         .await
@@ -9061,8 +9118,12 @@ impl Backend {
     /// package R files from buffer to disk.
     async fn refresh_rprofile_prelude_from_disk(&self, root: std::path::PathBuf) {
         let root_for_scan = root.clone();
+        let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
         let Ok(scan) = tokio::task::spawn_blocking(move || {
-            crate::package_state::rprofile::scan_workspace_rprofile(&root_for_scan)
+            crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                &root_for_scan,
+                &workspace_exclusions,
+            )
         })
         .await
         else {
@@ -10593,7 +10654,7 @@ mod tests {
         use super::super::{
             collect_close_fanout_siblings, collect_package_r_file_inputs_from_disk,
             extend_with_open_package_docs, hydrate_package_r_files_from_state,
-            initialize_package_inputs_from_state, is_package_data_path,
+            initialize_package_inputs_from_state_with_exclusions, is_package_data_path,
             is_package_relevant_open_uri, is_package_source_dir, path_in_rprofile_sourced_set,
         };
         use crate::state::{Document, WorldState};
@@ -10789,13 +10850,15 @@ mod tests {
 
             let mut state = WorldState::new();
             let disk_seed = collect_package_r_file_inputs_from_disk(root);
-            initialize_package_inputs_from_state(
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
                 &mut state,
                 root.to_path_buf(),
                 Some("Package: pkg\n".into()),
                 None,
                 disk_seed,
                 None,
+                &exclusions,
             );
 
             assert_eq!(state.package_inputs.workspace_root.as_deref(), Some(root));
@@ -10831,13 +10894,15 @@ mod tests {
             let disk_seed = collect_package_r_file_inputs_from_disk(root);
             // `None` → the helper scans `.Rprofile` inline (the non-contended
             // path); this asserts that inline scan still harvests the prelude.
-            initialize_package_inputs_from_state(
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
                 &mut state,
                 root.to_path_buf(),
                 Some("Package: pkg\n".into()),
                 None,
                 disk_seed,
                 None,
+                &exclusions,
             );
 
             assert!(state.package_inputs.model_rprofile);
@@ -10864,13 +10929,15 @@ mod tests {
             // prelude must be cleared regardless of what the caller supplies.
             let mut precomputed = crate::package_state::rprofile::RprofileScan::default();
             precomputed.symbols.insert("my_helper".to_string());
-            initialize_package_inputs_from_state(
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
                 &mut state,
                 root.to_path_buf(),
                 None,
                 None,
                 Default::default(),
                 Some(precomputed),
+                &exclusions,
             );
             assert!(
                 state.package_inputs.rprofile_symbols.is_empty(),
@@ -14932,13 +14999,15 @@ mod project_config_initialize_tests {
         {
             let disk_r_files = collect_package_r_file_inputs_from_disk(tmp.path());
             let mut state = backend.state.write().await;
-            initialize_package_inputs_from_state(
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
                 &mut state,
                 tmp.path().to_path_buf(),
                 Some("Package: testpkg\nVersion: 1.0\n".into()),
                 None,
                 disk_r_files,
                 None,
+                &exclusions,
             );
         }
         {

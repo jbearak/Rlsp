@@ -42,6 +42,17 @@ pub enum HandlerEvent {
 /// mode data, so backend handlers may apply those variants while holding the
 /// `WorldState` write lock without introducing blocking disk work.
 pub fn translate(inputs: &mut PackageInputs, event: HandlerEvent) -> Option<PackageInputDelta> {
+    let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+    translate_with_exclusions(inputs, event, &exclusions)
+}
+
+/// Like [`translate`], but applies `[workspace].exclude` to package-input
+/// watcher rescans.
+pub fn translate_with_exclusions(
+    inputs: &mut PackageInputs,
+    event: HandlerEvent,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> Option<PackageInputDelta> {
     // Events that can fire before a workspace root is known (or that don't
     // require one) are handled up front. Previously, the early
     // `let Some(root) = ... else { return None }` dropped these silently.
@@ -108,7 +119,7 @@ pub fn translate(inputs: &mut PackageInputs, event: HandlerEvent) -> Option<Pack
             uri,
             on_disk_text,
             deleted,
-        } => translate_watched(inputs, &root, uri, on_disk_text, deleted),
+        } => translate_watched(inputs, &root, uri, on_disk_text, deleted, exclusions),
         // SettingChanged handled above.
         HandlerEvent::SettingChanged { .. } => None,
     }
@@ -166,9 +177,10 @@ fn fold_prelude_rescan(
     root: &Path,
     canonical_path: &Path,
     base: PackageInputDelta,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> Option<PackageInputDelta> {
     if inputs.model_rprofile && inputs.rprofile_sourced_files.contains(canonical_path) {
-        let scan = super::rprofile::scan_workspace_rprofile(root);
+        let scan = super::rprofile::scan_workspace_rprofile_with_exclusions(root, exclusions);
         apply_rprofile_scan(inputs, Some(scan));
         Some(PackageInputDelta::Batch(vec![
             base,
@@ -185,6 +197,7 @@ fn translate_watched(
     uri: tower_lsp::lsp_types::Url,
     on_disk_text: Option<Arc<str>>,
     deleted: bool,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> Option<PackageInputDelta> {
     let path = uri.to_file_path().ok()?;
 
@@ -208,6 +221,7 @@ fn translate_watched(
             });
     let canonical_desc = canonical_root.join("DESCRIPTION");
     let canonical_ns = canonical_root.join("NAMESPACE");
+    let deleted = deleted || (!exclusions.is_empty() && exclusions.is_excluded_path(&path));
 
     if canonical_path == canonical_desc || path == root.join("DESCRIPTION") {
         if deleted {
@@ -242,7 +256,9 @@ fn translate_watched(
         let scan = if deleted || !inputs.model_rprofile {
             None
         } else {
-            Some(super::rprofile::scan_workspace_rprofile(root))
+            Some(super::rprofile::scan_workspace_rprofile_with_exclusions(
+                root, exclusions,
+            ))
         };
         return apply_rprofile_scan(inputs, scan);
     }
@@ -286,7 +302,7 @@ fn translate_watched(
         // and `canonical_path` is canonicalized the same way at the top of this fn.
         // A package source file can ALSO be a `.Rprofile` helper — fold the
         // prelude rescan in as a Batch when so.
-        return fold_prelude_rescan(inputs, root, &canonical_path, base);
+        return fold_prelude_rescan(inputs, root, &canonical_path, base, exclusions);
     }
 
     // data/ directory file changes: rescan dataset names. A `data/` file can
@@ -295,12 +311,13 @@ fn translate_watched(
     // the other's expense).
     let data_dir = root.join("data");
     if path.starts_with(&data_dir) && path != data_dir {
-        inputs.dataset_names = super::scan_own_package_data_dir(root);
+        inputs.dataset_names = super::scan_own_package_data_dir_with_exclusions(root, exclusions);
         return fold_prelude_rescan(
             inputs,
             root,
             &canonical_path,
             PackageInputDelta::DataDirChanged,
+            exclusions,
         );
     }
 
@@ -308,12 +325,14 @@ fn translate_watched(
     // dual-concern fold as data/ above).
     let data_raw_dir = root.join("data-raw");
     if path.starts_with(&data_raw_dir) && path != data_raw_dir {
-        inputs.sysdata_names = super::sysdata::scan_sysdata_generating_scripts(root);
+        inputs.sysdata_names =
+            super::sysdata::scan_sysdata_generating_scripts_with_exclusions(root, exclusions);
         return fold_prelude_rescan(
             inputs,
             root,
             &canonical_path,
             PackageInputDelta::DataDirChanged,
+            exclusions,
         );
     }
 
@@ -325,11 +344,11 @@ fn translate_watched(
     // so the dual-concern folds above take precedence. Membership uses
     // `canonical_path` to match the canonical paths the scanner records.
     if inputs.model_rprofile && inputs.rprofile_sourced_files.contains(&canonical_path) {
-        let scan = super::rprofile::scan_workspace_rprofile(root);
+        let scan = super::rprofile::scan_workspace_rprofile_with_exclusions(root, exclusions);
         return apply_rprofile_scan(inputs, Some(scan));
     }
 
-    translate_watched_directory(inputs, root, &path, deleted)
+    translate_watched_directory(inputs, root, &path, deleted, exclusions)
 }
 
 fn translate_watched_directory(
@@ -337,6 +356,7 @@ fn translate_watched_directory(
     root: &Path,
     path: &Path,
     deleted: bool,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> Option<PackageInputDelta> {
     if !deleted && !path.is_dir() {
         return None;
@@ -348,14 +368,15 @@ fn translate_watched_directory(
     // data/ directory: rescan dataset names rather than collecting R source files.
     let data_dir = root.join("data");
     if path == data_dir || path.starts_with(&data_dir) {
-        inputs.dataset_names = super::scan_own_package_data_dir(root);
+        inputs.dataset_names = super::scan_own_package_data_dir_with_exclusions(root, exclusions);
         return Some(PackageInputDelta::DataDirChanged);
     }
 
     // data-raw/ directory: rescan sysdata generating scripts.
     let data_raw_dir = root.join("data-raw");
     if path == data_raw_dir || path.starts_with(&data_raw_dir) {
-        inputs.sysdata_names = super::sysdata::scan_sysdata_generating_scripts(root);
+        inputs.sysdata_names =
+            super::sysdata::scan_sysdata_generating_scripts_with_exclusions(root, exclusions);
         return Some(PackageInputDelta::DataDirChanged);
     }
 
@@ -370,8 +391,17 @@ fn translate_watched_directory(
 
     let complete_scan = if deleted {
         true
-    } else {
+    } else if exclusions.is_empty() {
         collect_r_file_inputs_from_dir(inputs, root, path, &mut seen, &mut deltas)
+    } else {
+        collect_r_file_inputs_from_dir_with_exclusions(
+            inputs,
+            root,
+            path,
+            exclusions,
+            &mut seen,
+            &mut deltas,
+        )
     };
 
     if complete_scan {
@@ -443,6 +473,76 @@ fn collect_r_file_inputs_from_dir(
         };
         // BOM-aware decode, matching the bulk scan; an undecodable file is
         // skipped (and marks the scan incomplete so prior inputs are preserved).
+        let text = match crate::state::read_source(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                complete_scan = false;
+                log::trace!(
+                    "Package R directory scan could not read {}: {}",
+                    path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        let text: Arc<str> = text.into();
+        let digest = ContentDigest::of(&text);
+        seen.insert(path.clone());
+        inputs.r_files.insert(
+            path.clone(),
+            RFileInput {
+                kind,
+                text,
+                content_digest: digest,
+            },
+        );
+        deltas.push(PackageInputDelta::RFileChanged { path, kind });
+    }
+    complete_scan
+}
+
+fn collect_r_file_inputs_from_dir_with_exclusions(
+    inputs: &mut PackageInputs,
+    root: &Path,
+    dir: &Path,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    seen: &mut BTreeSet<std::path::PathBuf>,
+    deltas: &mut Vec<PackageInputDelta>,
+) -> bool {
+    if exclusions.can_prune_directory(dir) {
+        return true;
+    }
+
+    let mut complete_scan = true;
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            !entry.file_type().is_dir() || !exclusions.can_prune_directory(entry.path())
+        })
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                complete_scan = false;
+                log::trace!(
+                    "Package R directory scan skipped entry in {}: {}",
+                    dir.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.into_path();
+        if exclusions.is_excluded_path(&path) {
+            continue;
+        }
+        let Some(kind) = is_r_source_path(&path, root) else {
+            continue;
+        };
         let text = match crate::state::read_source(&path) {
             Ok(text) => text,
             Err(err) => {
@@ -1334,6 +1434,46 @@ mod tests {
             inputs.sysdata_names.contains("my_internal"),
             "expected sysdata_names to contain 'my_internal', got: {:?}",
             inputs.sysdata_names
+        );
+    }
+
+    #[test]
+    fn watched_excluded_data_file_change_does_not_seed_dataset_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let excluded = data_dir.join("excluded.R");
+        std::fs::write(&excluded, "excluded_dataset <- 1\n").unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["data/**"] } }),
+            vec![root.to_path_buf()],
+        );
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+        inputs.dataset_names.insert("excluded_dataset".to_string());
+
+        let delta = translate_with_exclusions(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&excluded).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+            &exclusions,
+        );
+
+        assert!(
+            matches!(delta, Some(PackageInputDelta::DataDirChanged)),
+            "expected DataDirChanged, got: {:?}",
+            delta
+        );
+        assert!(
+            !inputs.dataset_names.contains("excluded_dataset"),
+            "excluded data/*.R change must not (re)seed dataset names: {:?}",
+            inputs.dataset_names
         );
     }
 }

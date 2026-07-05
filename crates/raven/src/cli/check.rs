@@ -436,7 +436,7 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
 /// drift is single-sourced through shared seams: config discovery+load
 /// ([`crate::config_file::discover_and_load`]), the workspace scan
 /// ([`crate::state::scan_workspace`] + [`crate::state::WorldState::apply_workspace_index`]),
-/// package-input seeding ([`crate::backend::initialize_package_inputs_from_state`]),
+/// package-input seeding ([`crate::backend::initialize_package_inputs_from_state_with_exclusions`]),
 /// and the R package library ([`crate::package_library::build_package_library`]).
 /// Keep new startup logic in those seams, not duplicated here.
 fn build_indexed_state(
@@ -476,7 +476,7 @@ fn build_indexed_state(
     // DESCRIPTION, and NAMESPACE — but MUST run after `apply_workspace_index`,
     // which resets package state.
     //
-    // The disk seed is empty: `initialize_package_inputs_from_state` hydrates
+    // The disk seed is empty: `initialize_package_inputs_from_state_with_exclusions` hydrates
     // every package R file from the workspace index we just applied, so reading
     // them from disk here would only be overwritten. This mirrors the LSP's
     // with-scan startup path, which seeds package inputs from disk only on the
@@ -487,7 +487,8 @@ fn build_indexed_state(
     let ns_text: Option<std::sync::Arc<str>> = std::fs::read_to_string(root.join("NAMESPACE"))
         .ok()
         .map(|t| t.into());
-    crate::backend::initialize_package_inputs_from_state(
+    let workspace_exclusions = state.workspace_exclusions.clone();
+    crate::backend::initialize_package_inputs_from_state_with_exclusions(
         &mut state,
         root.to_path_buf(),
         desc_text,
@@ -495,8 +496,9 @@ fn build_indexed_state(
         Default::default(),
         // `raven check` is a single-pass batch with no concurrent writers, so
         // it lets the helper scan `.Rprofile` inline (no off-lock precompute
-        // needed). See `initialize_package_inputs_from_state`.
+        // needed). See `initialize_package_inputs_from_state_with_exclusions`.
         None,
+        &workspace_exclusions,
     );
 
     Ok(state)
@@ -2134,6 +2136,68 @@ mod tests {
     }
 
     #[test]
+    fn package_data_excluded_r_script_does_not_seed_dataset_scope() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(
+            root.join("raven.toml"),
+            "[workspace]\nexclude = [\"data/**\"]\n[packages]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("R")).unwrap();
+        fs::create_dir(root.join("data")).unwrap();
+        fs::write(
+            root.join("data").join("excluded.R"),
+            "excluded_dataset <- 1\n",
+        )
+        .unwrap();
+        let target = root.join("R").join("use.R");
+        fs::write(&target, "f <- function() excluded_dataset\n").unwrap();
+
+        let mut args = base_args(root);
+        args.no_config = false;
+        args.paths = vec![target];
+        let diags = collect_diagnostics_blocking(&args);
+
+        assert!(
+            has_undefined(&diags, "excluded_dataset"),
+            "excluded data/*.R symbol must remain undefined; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn package_data_raw_excluded_script_does_not_seed_sysdata_scope() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(
+            root.join("raven.toml"),
+            "[workspace]\nexclude = [\"data-raw/**\"]\n[packages]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("R")).unwrap();
+        fs::create_dir(root.join("data-raw")).unwrap();
+        fs::write(
+            root.join("data-raw").join("generate.R"),
+            "usethis::use_data(excluded_sysdata, internal = TRUE)\n",
+        )
+        .unwrap();
+        let target = root.join("R").join("use.R");
+        fs::write(&target, "f <- function() excluded_sysdata\n").unwrap();
+
+        let mut args = base_args(root);
+        args.no_config = false;
+        args.paths = vec![target];
+        let diags = collect_diagnostics_blocking(&args);
+
+        assert!(
+            has_undefined(&diags, "excluded_sysdata"),
+            "excluded data-raw/*.R sysdata symbol must remain undefined; got {diags:?}"
+        );
+    }
+
+    #[test]
     fn walk_includes_rmd_and_qmd() {
         // The empty-PATHS workspace walk collects chunk-bearing documents
         // alongside R sources, including mixed-case extensions
@@ -3432,6 +3496,38 @@ mod tests {
         assert!(
             !has_undefined(&diags, "r_bind"),
             "prelude must resolve r_bind: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn rprofile_excluded_sourced_helper_does_not_seed_prelude_scope() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(
+            root.join("raven.toml"),
+            "[workspace]\nexclude = [\"helpers/**\"]\n[packages]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("helpers")).unwrap();
+        fs::write(
+            root.join("helpers").join("setup.R"),
+            "excluded_helper <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"helpers/setup.R\")\n").unwrap();
+        fs::create_dir(root.join("scripts")).unwrap();
+        let foo = root.join("scripts").join("foo.R");
+        fs::write(&foo, "excluded_helper()\n").unwrap();
+
+        let mut args = args_for(root, &foo);
+        args.no_config = false;
+        let diags = collect_diagnostics_blocking(&args);
+
+        assert!(
+            has_undefined(&diags, "excluded_helper"),
+            "excluded .Rprofile helper must not suppress undefined-variable: {:?}",
             diags
         );
     }
