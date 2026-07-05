@@ -1604,14 +1604,11 @@ fn remirror_authoritative_alias_roots_after_close(
         };
         let meta = open_doc.metadata.clone();
         let new_interface_hash = open_doc.artifacts.interface_hash;
-        let parent_content =
-            collect_backward_parent_content(state, &open_uri, workspace_root.as_ref(), &meta);
-
-        let result = state.cross_file_graph.update_file(
-            root,
+        let result = update_cross_file_graph_for_roots(
+            state,
+            std::slice::from_ref(root),
             &meta,
             workspace_root.as_ref(),
-            |parent_uri| parent_content.get(parent_uri).cloned(),
         );
         edges_changed |= result.edges_changed;
 
@@ -2852,6 +2849,39 @@ fn collect_backward_parent_content(
             Some((parent_uri, content))
         })
         .collect()
+}
+
+fn update_cross_file_graph_for_roots(
+    state: &mut WorldState,
+    graph_roots: &[Url],
+    meta: &crate::cross_file::CrossFileMetadata,
+    workspace_root: Option<&Url>,
+) -> crate::cross_file::dependency::UpdateResult {
+    let mut roots = graph_roots.iter();
+    let Some(first_root) = roots.next() else {
+        return crate::cross_file::dependency::UpdateResult::default();
+    };
+
+    let parent_content = collect_backward_parent_content(state, first_root, workspace_root, meta);
+    let mut result =
+        state
+            .cross_file_graph
+            .update_file(first_root, meta, workspace_root, |parent_uri| {
+                parent_content.get(parent_uri).cloned()
+            });
+
+    for root in roots {
+        let parent_content = collect_backward_parent_content(state, root, workspace_root, meta);
+        let root_result =
+            state
+                .cross_file_graph
+                .update_file(root, meta, workspace_root, |parent_uri| {
+                    parent_content.get(parent_uri).cloned()
+                });
+        result.edges_changed |= root_result.edges_changed;
+    }
+
+    result
 }
 
 /// What a single-file disk resync did, so the caller can fold the affected
@@ -5565,25 +5595,13 @@ impl LanguageServer for Backend {
                 }
             }
 
-            let parent_content =
-                collect_backward_parent_content(&state, &uri_clone, workspace_root.as_ref(), &meta);
-
             let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-            let mut result = state.cross_file_graph.update_file(
-                &uri,
+            let result = update_cross_file_graph_for_roots(
+                &mut state,
+                &graph_roots,
                 &meta,
                 workspace_root.as_ref(),
-                |parent_uri| parent_content.get(parent_uri).cloned(),
             );
-            for alias_uri in graph_roots.iter().filter(|alias_uri| *alias_uri != &uri) {
-                let alias_result = state.cross_file_graph.update_file(
-                    alias_uri,
-                    &meta,
-                    workspace_root.as_ref(),
-                    |parent_uri| parent_content.get(parent_uri).cloned(),
-                );
-                result.edges_changed |= alias_result.edges_changed;
-            }
 
             // Invalidate children affected by working directory change (Requirement 8)
             let mut wd_affected = Vec::new();
@@ -5887,27 +5905,6 @@ impl LanguageServer for Backend {
                     Some(language_id.as_str()),
                 );
 
-                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                    &uri,
-                    workspace_root.as_ref(),
-                );
-                let parent_content: std::collections::HashMap<Url, String> = meta
-                    .sourced_by
-                    .iter()
-                    .filter_map(|d| {
-                        let ctx = backward_path_ctx.as_ref()?;
-                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                        log::trace!(
-                            "did_open re-enrich: backward directive {} -> {}",
-                            d.path,
-                            resolved.display()
-                        );
-                        let parent_uri = Url::from_file_path(resolved).ok()?;
-                        let content = state.content_provider().get_content(&parent_uri)?;
-                        Some((parent_uri, content))
-                    })
-                    .collect();
-
                 if let Some(forward_ctx) =
                     crate::cross_file::path_resolve::PathContext::from_metadata(
                         &uri,
@@ -5937,21 +5934,12 @@ impl LanguageServer for Backend {
                 }
 
                 let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-                let mut second_result = state.cross_file_graph.update_file(
-                    &uri,
+                let second_result = update_cross_file_graph_for_roots(
+                    &mut state,
+                    &graph_roots,
                     &meta,
                     workspace_root.as_ref(),
-                    |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
-                for alias_uri in graph_roots.iter().filter(|alias_uri| *alias_uri != &uri) {
-                    let alias_result = state.cross_file_graph.update_file(
-                        alias_uri,
-                        &meta,
-                        workspace_root.as_ref(),
-                        |parent_uri| parent_content.get(parent_uri).cloned(),
-                    );
-                    second_result.edges_changed |= alias_result.edges_changed;
-                }
 
                 // If re-enrichment changed dependency edges (e.g., inherited WD
                 // altered path resolution), schedule newly affected open
@@ -6050,36 +6038,13 @@ impl LanguageServer for Backend {
                 Some(language_id.as_str()),
             );
 
-            let backward_path_ctx =
-                crate::cross_file::path_resolve::PathContext::new(&uri, workspace_root.as_ref());
-            let parent_content: std::collections::HashMap<Url, String> = meta
-                .sourced_by
-                .iter()
-                .filter_map(|d| {
-                    let ctx = backward_path_ctx.as_ref()?;
-                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                    let parent_uri = Url::from_file_path(resolved).ok()?;
-                    let content = state.content_provider().get_content(&parent_uri)?;
-                    Some((parent_uri, content))
-                })
-                .collect();
-
             let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-            let mut second_result = state.cross_file_graph.update_file(
-                &uri,
+            let second_result = update_cross_file_graph_for_roots(
+                &mut state,
+                &graph_roots,
                 &meta,
                 workspace_root.as_ref(),
-                |parent_uri| parent_content.get(parent_uri).cloned(),
             );
-            for alias_uri in graph_roots.iter().filter(|alias_uri| *alias_uri != &uri) {
-                let alias_result = state.cross_file_graph.update_file(
-                    alias_uri,
-                    &meta,
-                    workspace_root.as_ref(),
-                    |parent_uri| parent_content.get(parent_uri).cloned(),
-                );
-                second_result.edges_changed |= alias_result.edges_changed;
-            }
 
             if second_result.edges_changed {
                 let neighbors = state.affected_open_dependents_after_edit(&uri, false, true);
@@ -6384,29 +6349,13 @@ impl LanguageServer for Backend {
                     Vec::new()
                 };
 
-                let parent_content = collect_backward_parent_content(
-                    &state,
-                    &uri_clone,
-                    workspace_root.as_ref(),
-                    &meta,
-                );
-
                 let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
-                let mut graph_result = state.cross_file_graph.update_file(
-                    &uri,
+                let graph_result = update_cross_file_graph_for_roots(
+                    &mut state,
+                    &graph_roots,
                     &meta,
                     workspace_root.as_ref(),
-                    |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
-                for alias_uri in graph_roots.iter().filter(|alias_uri| *alias_uri != &uri) {
-                    let alias_result = state.cross_file_graph.update_file(
-                        alias_uri,
-                        &meta,
-                        workspace_root.as_ref(),
-                        |parent_uri| parent_content.get(parent_uri).cloned(),
-                    );
-                    graph_result.edges_changed |= alias_result.edges_changed;
-                }
 
                 // Invalidate children affected by working directory change (Requirement 8)
                 let mut wd_children = Vec::new();
@@ -17111,6 +17060,80 @@ mod project_config_initialize_tests {
         assert!(
             snapshot_diagnostics(&state, &parent_uri).is_empty(),
             "parent scope must see live content from the symlink alias buffer"
+        );
+    }
+
+    /// A backward directive opened through a directory symlink resolves to a
+    /// different parent URI for the raw and canonical graph roots. Each mirrored
+    /// root must therefore collect parent content with its own URI before
+    /// `update_file` infers the `source()` call site.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn symlink_backward_directive_mirror_infers_canonical_call_site() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+
+        let parent = "source(\"sub/child.R\")\npost_source_parent <- function() 2\n";
+        let child = "# raven: sourced-by ../parent.R\nchild_fn <- function() 1\n";
+        fs::write(real.join("parent.R"), parent).unwrap();
+        fs::write(real.join("sub").join("child.R"), child).unwrap();
+        fs::write(tmp.path().join("driver.R"), "driver <- 1\n").unwrap();
+
+        let (svc, _driver_uri) = open_in_workspace(&tmp, "driver.R", "r", "driver <- 1\n").await;
+        let backend = svc.inner();
+        let parent_uri = Url::from_file_path(real.join("parent.R")).unwrap();
+        let link_parent_uri =
+            Url::from_file_path(tmp.path().join("link").join("parent.R")).unwrap();
+        let child_uri = Url::from_file_path(real.join("sub").join("child.R")).unwrap();
+        let link_child_uri =
+            Url::from_file_path(tmp.path().join("link").join("sub").join("child.R")).unwrap();
+
+        for parent_root in [&link_parent_uri, &parent_uri] {
+            let outcome =
+                resync_file_from_disk(&backend.state, parent_root, None, None, true, None).await;
+            assert!(
+                matches!(outcome, ResyncOutcome::Updated { .. }),
+                "precondition: parent content must be available for {parent_root}"
+            );
+        }
+
+        open_doc(backend, &link_child_uri, "r", 1, child).await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&child_uri),
+            Some(link_child_uri.clone()),
+            "canonical child URI must resolve to the symlink-open buffer"
+        );
+
+        let raw_backward = state
+            .cross_file_graph
+            .get_dependents(&link_child_uri)
+            .into_iter()
+            .find(|edge| edge.from == link_parent_uri && edge.is_backward_directive)
+            .expect("raw symlink root must have a backward-directive edge");
+        assert_eq!(
+            raw_backward.call_site_line,
+            Some(0),
+            "precondition: raw symlink root must infer the source() call site"
+        );
+
+        let canonical_backward = state
+            .cross_file_graph
+            .get_dependents(&child_uri)
+            .into_iter()
+            .find(|edge| edge.from == parent_uri && edge.is_backward_directive)
+            .expect("canonical root must have a backward-directive edge");
+        assert_eq!(
+            canonical_backward.call_site_line,
+            Some(0),
+            "canonical mirror must infer the source() call site from the canonical parent"
+        );
+        assert!(
+            canonical_backward.call_site_column.is_some(),
+            "canonical mirror must retain a concrete inferred call-site column"
         );
     }
 
