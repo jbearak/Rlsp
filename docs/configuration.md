@@ -18,9 +18,12 @@ Per-key. For each setting, project values win over the LSP client's `initializat
 
 ### Schema
 
-Most `raven.toml` keys mirror the LSP `initializationOptions` shape. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`), plus a handful of client-only settings whose behavior is most useful to document alongside them. Those client-only rows have no `raven.toml` path and say so in their description. Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, `raven.pandoc.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
+Most `raven.toml` keys mirror the LSP `initializationOptions` shape. The reference tables below cover every key the server reads from `raven.toml` (top-level sections: `workspace`, `linting`, `crossFile`, `packages`, `diagnostics`, `indentation`, `symbols`, `completion`), plus a handful of client-only settings whose behavior is most useful to document alongside them. Those client-only rows have no `raven.toml` path and say so in their description. Other VS Code-only client settings — `raven.sendToR.*`, `raven.rTerminal.*`, `raven.dataViewer.*`, `raven.chunks.*`, `raven.knit.*`, `raven.pandoc.*` — only apply inside VS Code and aren't read from `raven.toml`; they're documented on their feature pages ([R Console](r-console.md), [Data Viewer](data-viewer.md), [Chunks](chunks.md), [Knit](knit.md)). `raven.trace.server` is the standard `vscode-languageclient` LSP-trace setting (`off` / `messages` / `verbose`) — useful when filing bug reports, but otherwise not Raven-specific. The same key in `raven.toml` is at the path indicated.
 
 ```toml
+[workspace]
+exclude = ["generated/**", "archive/**", "!generated/keep.R"]
+
 [linting]
 enabled = true
 lineLength = 100
@@ -45,9 +48,21 @@ undefinedVariableSeverity = "warning"
 
 `[[linting.overrides]]` is an array of glob → patch entries. Globs are anchored at the project root. Order matters: later entries win on conflicts. Setting `enabled = false` in an override skips matching files entirely.
 
+### Project exclusions
+
+`[workspace].exclude` is a `raven.toml`-only list of project-root-relative globs. It is not exposed as a VS Code/LSP client setting. The default is `[]`.
+
+These exclusions are broader than lint overrides: Raven ignores matching files for background workspace indexing, dependency discovery, file-watcher/on-demand indexing, editor diagnostics, package-mode disk seeding, and default `raven check` discovery. Existing index entries that become excluded after a live `raven.toml` reload are removed from Raven's indexes and dependency graph.
+
+Use directory globs such as `generated/**`, `archive/**`, or `**/cache/**` to ignore whole trees. Raven compiles the glob list once when config is recomputed and matches paths relative to the containing workspace root. `*` and `?` do not cross `/`; use `**` for recursive matches, such as `**/*.log` for `.log` files at any depth. Patterns are evaluated in order; a leading `!` re-includes matching paths, so `["generated/**", "!generated/keep.R"]` excludes the generated tree except `generated/keep.R`.
+
+Raven prunes directories during the serial workspace walk only when a positive directory glob proves every descendant is excluded, such as `generated/**`. If any negated pattern is present, directory pruning is disabled for the list so re-included files are never dropped before they can match. Files are still filtered by the full ordered matcher.
+
+Explicit CLI file arguments bypass `[workspace].exclude`: `raven check generated/one.R` reports that file even if it matches an exclusion. Directory arguments are discovery walks, so exclusions still apply inside them.
+
 ### Live reload
 
-In the LSP/editor, edits to `raven.toml` are picked up live for every section: `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. The discovered `.lintr` is also watched and live-reloaded, but only for the supported linting subset described in [Linting](linting.md#migrating-from-lintr). Workspace and non-home ancestor `.lintr` files are discovered by default; the literal home-directory `~/.lintr` is discovered only when the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled. Open documents re-publish diagnostics automatically — no Raven restart required. The CLI reads config once per command invocation; pass `--config ~/.lintr` to opt into a literal home `.lintr` for that run.
+In the LSP/editor, edits to `raven.toml` are picked up live for every section: `[workspace]` (`exclude`), `[linting]` (including `overrides`), `[crossFile]`, `[packages]` (including `packageMode`, `watchLibraryPaths`, `watchDebounceMs`), `[diagnostics]`, `[indentation]`, `[symbols]`, `[completion]`. The discovered `.lintr` is also watched and live-reloaded, but only for the supported linting subset described in [Linting](linting.md#migrating-from-lintr). Workspace and non-home ancestor `.lintr` files are discovered by default; the literal home-directory `~/.lintr` is discovered only when the VS Code/LSP-client setting `raven.linting.readHomeLintr = true` is enabled. Open documents re-publish diagnostics automatically — no Raven restart required. The CLI reads config once per command invocation; pass `--config ~/.lintr` to opt into a literal home `.lintr` for that run.
 
 Package-affecting changes (toggling `[packages].enabled`, `packageMode`, `rprofilePrelude`, `rPath`, `additionalLibraryPaths`, or the watcher knobs) reuse the same reconciliation path as `workspace/didChangeConfiguration`: the package library is rebuilt via R if needed, the libpath watcher is restarted, and any updated completion-trigger registration is re-applied — all asynchronously, off the LSP write lock.
 

@@ -5,6 +5,7 @@
 // Modifications copyright (C) 2026 Jonathan Marc Bearak
 //
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -564,6 +565,11 @@ pub struct WorldState {
     /// are configured. Per-document resolution scans this list.
     pub lint_overrides: Vec<crate::config_file::CompiledLintOverride>,
 
+    /// Compiled `[workspace].exclude` entries. Empty when no project-level
+    /// exclusions are configured. These apply to workspace/default discovery,
+    /// indexing, watcher resync, on-demand indexing, and LSP diagnostics.
+    pub workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions,
+
     /// Per-document `indentation_unit` overrides sent by the client via
     /// `raven/documentIndentUnitsChanged` when the user sets
     /// `raven.linting.indentationUnit` to `"auto"`. Keyed by URI string.
@@ -710,6 +716,98 @@ impl WorldState {
         self.package_library.set_local_dev_overlay(overlay);
     }
 
+    /// Whether `uri` is covered by the project-level `[workspace].exclude`
+    /// matcher. Empty exclusions are a fast false path.
+    pub(crate) fn is_project_excluded_uri(&self, uri: &tower_lsp::lsp_types::Url) -> bool {
+        self.workspace_exclusions.is_excluded_uri(uri)
+    }
+
+    /// Return metadata suitable for dependency-graph edge construction under
+    /// the current project exclusions.
+    ///
+    /// Open project-excluded documents remain in the document stores so their
+    /// buffers can stay authoritative and publish empty diagnostics, but they
+    /// must not lend symbols to non-excluded files. The graph is intentionally
+    /// exclusion-agnostic, so callers pass this filtered view when updating
+    /// graph edges. The original metadata is preserved for diagnostics such as
+    /// missing-file checks on the active document's literal `source()` path.
+    pub(crate) fn metadata_for_dependency_graph<'a>(
+        &self,
+        uri: &Url,
+        meta: &'a crate::cross_file::CrossFileMetadata,
+        workspace_root: Option<&Url>,
+    ) -> Cow<'a, crate::cross_file::CrossFileMetadata> {
+        Self::metadata_for_dependency_graph_with_exclusions(
+            &self.workspace_exclusions,
+            uri,
+            meta,
+            workspace_root,
+        )
+    }
+
+    pub(crate) fn metadata_for_dependency_graph_with_exclusions<'a>(
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+        uri: &Url,
+        meta: &'a crate::cross_file::CrossFileMetadata,
+        workspace_root: Option<&Url>,
+    ) -> Cow<'a, crate::cross_file::CrossFileMetadata> {
+        if exclusions.is_empty() {
+            return Cow::Borrowed(meta);
+        }
+
+        let forward_ctx =
+            crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_root);
+        let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
+
+        let forward_target_excluded = |source: &crate::cross_file::ForwardSource| {
+            let target_uri = source.resolved_uri.clone().or_else(|| {
+                let ctx = forward_ctx.as_ref()?;
+                let resolved =
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        ctx,
+                    )?;
+                Url::from_file_path(resolved).ok()
+            });
+            target_uri
+                .as_ref()
+                .is_some_and(|target| exclusions.is_excluded_uri(target))
+        };
+
+        let backward_parent_excluded = |directive: &crate::cross_file::types::BackwardDirective| {
+            let Some(ctx) = backward_ctx.as_ref() else {
+                return false;
+            };
+            let Some(resolved) =
+                crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
+            else {
+                return false;
+            };
+            Url::from_file_path(resolved)
+                .ok()
+                .is_some_and(|parent| exclusions.is_excluded_uri(&parent))
+        };
+
+        let sources_changed = meta.sources.iter().any(forward_target_excluded);
+        let sourced_by_changed = meta.sourced_by.iter().any(backward_parent_excluded);
+        if !sources_changed && !sourced_by_changed {
+            return Cow::Borrowed(meta);
+        }
+
+        let mut filtered = meta.clone();
+        if sources_changed {
+            filtered
+                .sources
+                .retain(|source| !forward_target_excluded(source));
+        }
+        if sourced_by_changed {
+            filtered
+                .sourced_by
+                .retain(|directive| !backward_parent_excluded(directive));
+        }
+        Cow::Owned(filtered)
+    }
+
     /// Snapshot the owned inputs `resolve_system_file_sources` needs (workspace
     /// name + root, and the library search paths) so a caller can drop the state
     /// lock before resolving system.file() source edges (AGENTS.md locking
@@ -824,6 +922,7 @@ impl WorldState {
             raw_project_settings: None,
             project_config_path: None,
             lint_overrides: Vec::new(),
+            workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions::default(),
             per_document_indent_unit: std::collections::HashMap::new(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
@@ -1323,6 +1422,8 @@ impl WorldState {
         // URIs are unique, so a stable sort buys nothing; use the faster unstable.
         entries.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
 
+        let workspace_exclusions = self.workspace_exclusions.clone();
+
         // Destructure self to split borrows: cross_file_graph (mutable) and
         // workspace_index_new (shared) can coexist without pre-cloning all contents.
         let Self {
@@ -1347,9 +1448,15 @@ impl WorldState {
                     .get(parent_uri)
                     .map(|e| e.contents.to_string())
             };
-            let _result = cross_file_graph.update_file(
+            let graph_meta = Self::metadata_for_dependency_graph_with_exclusions(
+                &workspace_exclusions,
                 uri,
                 meta.as_ref(),
+                workspace_root.as_ref(),
+            );
+            let _result = cross_file_graph.update_file(
+                uri,
+                graph_meta.as_ref(),
                 workspace_root.as_ref(),
                 get_content,
             );
@@ -1477,9 +1584,11 @@ impl WorldState {
                         .get(parent_uri)
                         .map(|e| e.contents.to_string())
                 };
+                let graph_meta =
+                    self.metadata_for_dependency_graph(uri, meta.as_ref(), workspace_root.as_ref());
                 self.cross_file_graph.update_file(
                     uri,
-                    meta.as_ref(),
+                    graph_meta.as_ref(),
                     workspace_root.as_ref(),
                     get_content,
                 );
@@ -1532,9 +1641,11 @@ impl WorldState {
                     .get(parent_uri)
                     .map(|e| e.contents.to_string())
             };
+            let graph_meta =
+                self.metadata_for_dependency_graph(&uri, meta.as_ref(), workspace_root.as_ref());
             self.cross_file_graph.update_file(
                 &uri,
-                meta.as_ref(),
+                graph_meta.as_ref(),
                 workspace_root.as_ref(),
                 get_content,
             );
@@ -1781,13 +1892,36 @@ pub(crate) fn collect_files_matching(
     out: &mut Vec<PathBuf>,
     accept: fn(&Path) -> bool,
 ) {
+    collect_files_matching_impl(dir, out, accept, None);
+}
+
+pub(crate) fn collect_files_matching_with_exclusions(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    accept: fn(&Path) -> bool,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) {
+    collect_files_matching_impl(
+        dir,
+        out,
+        accept,
+        (!exclusions.is_empty()).then_some(exclusions),
+    );
+}
+
+fn collect_files_matching_impl(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    accept: fn(&Path) -> bool,
+    exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
+) {
     let mut visited = HashSet::new();
     // Seed with the canonical root so a symlink pointing back at the root (or
     // any already-visited directory) is detected as a cycle and skipped.
     if let Ok(canonical) = fs::canonicalize(dir) {
         visited.insert(canonical);
     }
-    collect_files_matching_inner(dir, out, &mut visited, accept);
+    collect_files_matching_inner(dir, out, &mut visited, accept, exclusions);
 }
 
 fn collect_files_matching_inner(
@@ -1795,6 +1929,7 @@ fn collect_files_matching_inner(
     out: &mut Vec<PathBuf>,
     visited: &mut HashSet<PathBuf>,
     accept: fn(&Path) -> bool,
+    exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
 ) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -1815,6 +1950,10 @@ fn collect_files_matching_inner(
                 .is_some_and(should_skip_directory)
             {
                 log::trace!("Skipping directory: {}", path.display());
+                continue;
+            }
+            if exclusions.is_some_and(|exclusions| exclusions.can_prune_directory(&path)) {
+                log::trace!("Skipping excluded directory: {}", path.display());
                 continue;
             }
             let canonical = match fs::canonicalize(&path) {
@@ -1843,8 +1982,10 @@ fn collect_files_matching_inner(
                 log::trace!("Skipping symlink cycle: {}", path.display());
                 continue;
             }
-            collect_files_matching_inner(&path, out, visited, accept);
-        } else if accept(&path) {
+            collect_files_matching_inner(&path, out, visited, accept, exclusions);
+        } else if accept(&path)
+            && !exclusions.is_some_and(|exclusions| exclusions.is_excluded_path(&path))
+        {
             out.push(path);
         }
     }
@@ -2037,6 +2178,15 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
 }
 
 pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanResult {
+    let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+    scan_workspace_with_exclusions(folders, max_chain_depth, &exclusions)
+}
+
+pub fn scan_workspace_with_exclusions(
+    folders: &[Url],
+    max_chain_depth: usize,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> WorkspaceScanResult {
     use rayon::prelude::*;
 
     // Get workspace root for path resolution
@@ -2047,7 +2197,12 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
-            collect_files_matching(&path, &mut file_paths, is_stat_model_extension);
+            collect_files_matching_with_exclusions(
+                &path,
+                &mut file_paths,
+                is_stat_model_extension,
+                exclusions,
+            );
         }
     }
 
@@ -2342,6 +2497,65 @@ mod tests {
         // name) and via the symlink (deps' canonical target name).
         assert_eq!(out.len(), 1, "got {out:?}");
         assert!(out[0].ends_with("real.R"), "got {out:?}");
+    }
+
+    #[test]
+    fn workspace_scan_skips_project_excluded_directory() {
+        use serde_json::json;
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("main.R"), "main <- 1\n").unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(tmp.path().join("generated/ignored.R"), "ignored <- 1\n").unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &json!({ "workspace": { "exclude": ["generated/**"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+        let root = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
+
+        let (index, _, _) = scan_workspace_with_exclusions(&[root], 20, &exclusions);
+        let indexed_paths: Vec<_> = index
+            .keys()
+            .filter_map(|uri| uri.to_file_path().ok())
+            .collect();
+
+        assert!(
+            indexed_paths.iter().any(|path| path.ends_with("main.R")),
+            "included file should be indexed; got {indexed_paths:?}"
+        );
+        assert!(
+            !indexed_paths
+                .iter()
+                .any(|path| path.ends_with("generated/ignored.R")),
+            "excluded generated directory must be skipped; got {indexed_paths:?}"
+        );
+    }
+
+    #[test]
+    fn collect_files_matching_negated_exclusion_does_not_prune_reincluded_file() {
+        use serde_json::json;
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(tmp.path().join("generated/drop.R"), "drop <- 1\n").unwrap();
+        fs::write(tmp.path().join("generated/keep.R"), "keep <- 1\n").unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &json!({ "workspace": { "exclude": ["generated/**", "!generated/keep.R"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+
+        let mut out = Vec::new();
+        collect_files_matching_with_exclusions(
+            tmp.path(),
+            &mut out,
+            is_stat_model_extension,
+            &exclusions,
+        );
+
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert!(out[0].ends_with("generated/keep.R"), "got {out:?}");
     }
 
     // Include workspace scanning tests

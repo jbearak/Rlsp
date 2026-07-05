@@ -27,6 +27,24 @@ pub fn scan_sysdata_generating_scripts(workspace_root: &Path) -> BTreeSet<String
     symbols
 }
 
+/// Like [`scan_sysdata_generating_scripts`], but skips files and prunable
+/// directories matched by `[workspace].exclude`.
+pub fn scan_sysdata_generating_scripts_with_exclusions(
+    workspace_root: &Path,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> BTreeSet<String> {
+    if exclusions.is_empty() {
+        return scan_sysdata_generating_scripts(workspace_root);
+    }
+
+    let mut symbols = BTreeSet::new();
+    let data_raw = workspace_root.join("data-raw");
+    if data_raw.is_dir() && !exclusions.can_prune_directory(&data_raw) {
+        scan_dir_recursive_with_exclusions(&data_raw, exclusions, &mut symbols);
+    }
+    symbols
+}
+
 fn scan_dir_recursive(dir: &Path, symbols: &mut BTreeSet<String>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -41,6 +59,35 @@ fn scan_dir_recursive(dir: &Path, symbols: &mut BTreeSet<String>) {
         if ft.is_dir() && !ft.is_symlink() {
             scan_dir_recursive(&path, symbols);
         } else if (ft.is_file() || (ft.is_symlink() && path.is_file()))
+            && matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"))
+            && let Ok(content) = fs::read_to_string(&path)
+        {
+            extract_sysdata_names_from_source(&content, symbols);
+        }
+    }
+}
+
+fn scan_dir_recursive_with_exclusions(
+    dir: &Path,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    symbols: &mut BTreeSet<String>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if ft.is_dir() && !ft.is_symlink() {
+            if !exclusions.can_prune_directory(&path) {
+                scan_dir_recursive_with_exclusions(&path, exclusions, symbols);
+            }
+        } else if (ft.is_file() || (ft.is_symlink() && path.is_file()))
+            && !exclusions.is_excluded_path(&path)
             && matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r"))
             && let Ok(content) = fs::read_to_string(&path)
         {
@@ -1337,6 +1384,36 @@ bar <- 42
         let syms = scan_sysdata_generating_scripts(tmp.path());
         assert!(syms.contains("x"), "got: {:?}", syms);
         assert!(syms.contains("y"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn scan_sysdata_generating_scripts_with_exclusions_skips_data_raw_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_raw = tmp.path().join("data-raw");
+        std::fs::create_dir(&data_raw).unwrap();
+        std::fs::write(
+            data_raw.join("included.R"),
+            "usethis::use_data(included_sysdata, internal = TRUE)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            data_raw.join("excluded.R"),
+            "usethis::use_data(excluded_sysdata, internal = TRUE)\n",
+        )
+        .unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["data-raw/excluded.R"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+
+        let syms = scan_sysdata_generating_scripts_with_exclusions(tmp.path(), &exclusions);
+
+        assert!(syms.contains("included_sysdata"), "got: {:?}", syms);
+        assert!(
+            !syms.contains("excluded_sysdata"),
+            "excluded data-raw/*.R must not seed sysdata names: {:?}",
+            syms
+        );
     }
 
     #[test]
