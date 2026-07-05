@@ -2310,6 +2310,85 @@ fn hydrate_package_r_files_from_state(
     r_files
 }
 
+/// Re-assert live open-buffer metadata and dependency edges after a disk
+/// workspace index has been applied.
+///
+/// `apply_workspace_index` rebuilds the graph from scanned disk entries. Any
+/// open buffer that changed since its last save must then be replayed from
+/// `state.documents`, and any open buffer that was previously project-excluded
+/// must be recomputed when it becomes included again. Keep this helper shared by
+/// startup post-scan completion and live `[workspace].exclude` reloads so their
+/// open-buffer-authoritative behavior cannot drift.
+async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldState) {
+    let mut open_docs: Vec<_> = state
+        .documents
+        .iter()
+        .map(|(uri, doc)| {
+            (
+                uri.clone(),
+                doc.text(),
+                doc.version.unwrap_or(0),
+                doc.chunk_kind,
+            )
+        })
+        .collect();
+    open_docs.sort_unstable_by(|(a, ..), (b, ..)| a.as_str().cmp(b.as_str()));
+
+    for (uri, text, version, chunk_kind) in open_docs {
+        if state.is_project_excluded_uri(&uri) {
+            state
+                .document_store
+                .open_with_metadata(
+                    uri.clone(),
+                    &text,
+                    version,
+                    chunk_kind,
+                    crate::cross_file::CrossFileMetadata::default(),
+                )
+                .await;
+            remove_file_from_cross_file_state(state, &uri);
+            continue;
+        }
+
+        let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+        let mut meta = crate::cross_file::extract_metadata(&analysis_text);
+        let workspace_root = state.workspace_folders.first().cloned();
+        let max_chain_depth = state.cross_file_config.max_chain_depth;
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut meta,
+            &uri,
+            workspace_root.as_ref(),
+            |parent_uri| state.get_enriched_metadata(parent_uri),
+            max_chain_depth,
+        );
+
+        {
+            let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
+            crate::cross_file::resolve_system_file_sources(
+                &mut meta,
+                ws_name.as_deref(),
+                ws_root.as_deref(),
+                &lib_paths,
+            );
+        }
+
+        state
+            .document_store
+            .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
+            .await;
+
+        let parent_content =
+            collect_backward_parent_content(state, &uri, workspace_root.as_ref(), &meta);
+        state
+            .cross_file_graph
+            .update_file(&uri, &meta, workspace_root.as_ref(), |parent_uri| {
+                parent_content.get(parent_uri).cloned()
+            });
+    }
+
+    state.recompute_open_neighborhood_pins();
+}
+
 pub(crate) fn initialize_package_inputs_from_state(
     state: &mut WorldState,
     root: std::path::PathBuf,
@@ -3561,6 +3640,13 @@ struct ReconciliationDecisions {
     trigger_on_open_paren_changed: bool,
     new_trigger_on_open_paren: bool,
     workspace_exclusions_changed: bool,
+    /// `Some(root, exclusions)` when `[workspace].exclude` changed and package
+    /// inputs already have a workspace root. Used to reseed package R-file
+    /// inputs on reloads that do not run a workspace scan.
+    workspace_exclusion_package_reseed: Option<(
+        std::path::PathBuf,
+        crate::config_file::CompiledWorkspaceExclusions,
+    )>,
     /// `Some(root)` when `packageMode` flipped to a non-Disabled mode and
     /// the helper still needs to read `DESCRIPTION` / `NAMESPACE` from
     /// disk before re-applying. `None` otherwise (no mode change, or the
@@ -3837,6 +3923,7 @@ impl LanguageServer for Backend {
                                 cross_file_entries,
                                 new_index_entries,
                             );
+                            replay_open_documents_after_workspace_index_apply(&mut state).await;
                             if let Some(root) = root_for_pkg_inputs.clone() {
                                 // Populate package_inputs from the now-applied
                                 // workspace index and overlay open documents
@@ -7796,6 +7883,14 @@ impl Backend {
             let lint_config_changed = state.lint_config != prev.prev_lint;
             let workspace_exclusions_changed =
                 state.workspace_exclusions.patterns() != prev.prev_workspace_exclusions.as_slice();
+            let workspace_exclusion_package_reseed = workspace_exclusions_changed.then(|| {
+                state
+                    .package_inputs
+                    .workspace_root
+                    .clone()
+                    .map(|root| (root, state.workspace_exclusions.clone()))
+            });
+            let workspace_exclusion_package_reseed = workspace_exclusion_package_reseed.flatten();
 
             let only_watch_changed = watch_settings_changed
                 && !lint_config_changed
@@ -7884,6 +7979,7 @@ impl Backend {
                 trigger_on_open_paren_changed,
                 new_trigger_on_open_paren,
                 workspace_exclusions_changed,
+                workspace_exclusion_package_reseed,
                 pkg_mode_io_needed,
                 open_uris,
             }
@@ -7902,6 +7998,7 @@ impl Backend {
             trigger_on_open_paren_changed,
             new_trigger_on_open_paren,
             workspace_exclusions_changed,
+            workspace_exclusion_package_reseed,
             pkg_mode_io_needed,
             open_uris,
         } = decisions;
@@ -7910,6 +8007,7 @@ impl Backend {
             self.traversal_truncation.reset_notice_throttle();
         }
 
+        let mut package_inputs_initialized_by_exclusion_reload = false;
         if workspace_exclusions_changed {
             let (affected_len, scan_inputs) = {
                 let mut state = self.state.write().await;
@@ -7973,6 +8071,7 @@ impl Backend {
                                 cross_file_entries,
                                 new_index_entries,
                             );
+                            replay_open_documents_after_workspace_index_apply(&mut state).await;
                             if let Some(root) = root_for_pkg_inputs {
                                 initialize_package_inputs_from_state(
                                     &mut state,
@@ -7982,6 +8081,7 @@ impl Backend {
                                     Default::default(),
                                     rprofile_scan,
                                 );
+                                package_inputs_initialized_by_exclusion_reload = true;
                             } else {
                                 state.apply_package_event(
                                     &crate::package_state::PackageInputDelta::Initial,
@@ -8005,13 +8105,57 @@ impl Backend {
                     }
                 }
             }
+
+            if !package_inputs_initialized_by_exclusion_reload
+                && pkg_mode_io_needed.is_none()
+                && let Some((root, workspace_exclusions)) =
+                    workspace_exclusion_package_reseed.clone()
+            {
+                let root_clone = root.clone();
+                let (desc_text, ns_text, disk_r_files, rprofile_scan) =
+                    tokio::task::spawn_blocking(move || {
+                        let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
+                            .ok()
+                            .map(|s| Arc::from(s.as_str()));
+                        let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
+                            .ok()
+                            .map(|s| Arc::from(s.as_str()));
+                        let disk_r_files = collect_package_r_file_inputs_from_disk_with_exclusions(
+                            &root_clone,
+                            &workspace_exclusions,
+                        );
+                        let rprofile_scan =
+                            crate::package_state::rprofile::scan_workspace_rprofile(&root_clone);
+                        (desc, ns, disk_r_files, rprofile_scan)
+                    })
+                    .await
+                    .unwrap_or((
+                        None,
+                        None,
+                        Default::default(),
+                        Default::default(),
+                    ));
+
+                let mut state = self.state.write().await;
+                initialize_package_inputs_from_state(
+                    &mut state,
+                    root,
+                    desc_text,
+                    ns_text,
+                    disk_r_files,
+                    Some(rprofile_scan),
+                );
+                package_inputs_initialized_by_exclusion_reload = true;
+            }
         }
 
         // --- Package mode rebuild: repopulate inputs after mode switch ---
         // For non-Disabled mode switches, re-read DESCRIPTION and NAMESPACE
         // from disk (R files are already in `package_inputs` from prior
         // did_open/did_change/scan events). Then derive package state.
-        if let Some(root) = pkg_mode_io_needed {
+        if let Some(root) = pkg_mode_io_needed
+            && !package_inputs_initialized_by_exclusion_reload
+        {
             let root_clone = root.clone();
             let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
             let (desc_text, ns_text, disk_r_files, rprofile_scan) =
@@ -14673,6 +14817,180 @@ mod project_config_initialize_tests {
         assert!(
             state.workspace_index.contains_key(&generated_uri),
             "newly re-included file must be merged into the legacy document index"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_exclusion_reload_preserves_dirty_open_buffer_source_edge() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("raven.toml"), "[workspace]\nexclude = []\n").unwrap();
+        fs::write(tmp.path().join("main.R"), "main_value <- 1\n").unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_fn <- function() 1\n").unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let main_uri = Url::from_file_path(tmp.path().join("main.R")).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        open_doc(
+            backend,
+            &main_uri,
+            "r",
+            1,
+            "source(\"helper.R\")\nhelper_fn()\n",
+        )
+        .await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&main_uri)
+                    .iter()
+                    .any(|edge| edge.to == helper_uri),
+                "precondition: dirty open buffer must own the source edge"
+            );
+        }
+
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"ignored/**\"]\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&main_uri)
+                .iter()
+                .any(|edge| edge.to == helper_uri),
+            "exclusion reload must replay the live buffer after applying disk scan topology"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_exclusion_reload_reseeds_package_inputs_when_index_workspace_disabled() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(
+            tmp.path().join("DESCRIPTION"),
+            "Package: testpkg\nVersion: 1.0\n",
+        )
+        .unwrap();
+        let generated_path = tmp.path().join("R").join("generated.R");
+        fs::write(&generated_path, "generated_fn <- function() 1\n").unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            concat!(
+                "[workspace]\n",
+                "exclude = []\n",
+                "[crossFile]\n",
+                "indexWorkspace = false\n",
+                "[packages]\n",
+                "enabled = false\n",
+                "packageMode = \"enabled\"\n",
+            ),
+        )
+        .unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let disk_r_files = collect_package_r_file_inputs_from_disk(tmp.path());
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state(
+                &mut state,
+                tmp.path().to_path_buf(),
+                Some("Package: testpkg\nVersion: 1.0\n".into()),
+                None,
+                disk_r_files,
+                None,
+            );
+        }
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.package_inputs.r_files.contains_key(&generated_path),
+                "precondition: generated.R must be seeded as a package input"
+            );
+            assert!(
+                state
+                    .package_state
+                    .scope_contribution()
+                    .r_internal_symbols
+                    .contains("generated_fn"),
+                "precondition: generated_fn must contribute to package scope"
+            );
+        }
+
+        fs::write(
+            tmp.path().join("raven.toml"),
+            concat!(
+                "[workspace]\n",
+                "exclude = [\"R/generated.R\"]\n",
+                "[crossFile]\n",
+                "indexWorkspace = false\n",
+                "[packages]\n",
+                "enabled = false\n",
+                "packageMode = \"enabled\"\n",
+            ),
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.package_inputs.r_files.contains_key(&generated_path),
+            "excluded package R file must be removed from package_inputs.r_files"
+        );
+        assert!(
+            !state
+                .package_state
+                .scope_contribution()
+                .r_internal_symbols
+                .contains("generated_fn"),
+            "excluded package R file must stop contributing symbols to package scope"
         );
     }
 
