@@ -1586,6 +1586,48 @@ impl DependencyGraph {
         }
     }
 
+    /// Preserve `uri`'s outgoing forward edges while removing every reverse
+    /// entry that would let `uri` act as a parent for another file.
+    ///
+    /// Project-excluded open buffers need their own live diagnostics to follow
+    /// `source()` edges into non-excluded helpers, but they must not lend their
+    /// own symbols back through the dependency graph. Keeping `forward[uri]`
+    /// gives the queried buffer a diagnostic neighborhood; pruning
+    /// `backward[child]` entries for those same edges prevents the child from
+    /// inheriting `uri` as a parent when the child is diagnosed. Incoming edges
+    /// to `uri` are removed wholesale so non-excluded parents cannot source an
+    /// excluded child via backward directives.
+    ///
+    /// Returns `true` when any graph edge entry was removed.
+    pub(crate) fn make_forward_edges_non_lending(&mut self, uri: &Url) -> bool {
+        let mut changed = false;
+
+        if self.backward.contains_key(uri) {
+            self.remove_backward_edges(uri);
+            changed = true;
+        }
+
+        let outgoing = self.forward.get(uri).cloned().unwrap_or_default();
+        for edge in outgoing {
+            if let Some(backward_edges) = self.backward.get_mut(&edge.to) {
+                let before = backward_edges.len();
+                let key = edge.key();
+                backward_edges.retain(|candidate| candidate.key() != key);
+                changed |= backward_edges.len() != before;
+                if backward_edges.is_empty() {
+                    self.backward.remove(&edge.to);
+                }
+            }
+        }
+
+        if changed {
+            self.edge_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+
+        changed
+    }
+
     /// Collect all URIs reachable from `uri` within `max_depth` hops,
     /// following both forward and backward edges.
     ///
