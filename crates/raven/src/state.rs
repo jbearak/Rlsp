@@ -1714,12 +1714,11 @@ impl WorldState {
         meta: &'a crate::cross_file::CrossFileMetadata,
         workspace_root: Option<&Url>,
     ) -> std::borrow::Cow<'a, crate::cross_file::CrossFileMetadata> {
-        let graph_meta = self.metadata_for_dependency_graph(open_uri, meta, workspace_root);
         if root == open_uri {
-            return graph_meta;
+            return self.metadata_for_dependency_graph(open_uri, meta, workspace_root);
         }
 
-        let mut root_meta = graph_meta.as_ref().clone();
+        let mut root_meta = meta.clone();
         root_meta.inherited_working_directory = None;
         crate::cross_file::enrich_metadata_with_inherited_wd(
             &mut root_meta,
@@ -1728,7 +1727,8 @@ impl WorldState {
             |parent_uri| self.get_enriched_metadata(parent_uri),
             self.cross_file_config.max_chain_depth,
         );
-        std::borrow::Cow::Owned(root_meta)
+        let graph_meta = self.metadata_for_dependency_graph(root, &root_meta, workspace_root);
+        std::borrow::Cow::Owned(graph_meta.into_owned())
     }
 
     /// Apply pre-scanned workspace index results (for non-blocking initialization).

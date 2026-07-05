@@ -2944,7 +2944,9 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
                     crate::cross_file::CrossFileMetadata::default(),
                 )
                 .await;
-            remove_file_from_cross_file_state(state, &uri);
+            for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
+                remove_file_from_cross_file_state(state, &graph_root);
+            }
             continue;
         }
 
@@ -2975,15 +2977,9 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
             .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
             .await;
 
-        let parent_content =
-            collect_backward_parent_content(state, &uri, workspace_root.as_ref(), &meta);
-        let graph_meta = state.metadata_for_dependency_graph(&uri, &meta, workspace_root.as_ref());
-        state.cross_file_graph.update_file(
-            &uri,
-            graph_meta.as_ref(),
-            workspace_root.as_ref(),
-            |parent_uri| parent_content.get(parent_uri).cloned(),
-        );
+        let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
+        let _ =
+            update_cross_file_graph_for_roots(state, &graph_roots, &meta, workspace_root.as_ref());
     }
 
     state.recompute_open_neighborhood_pins();
@@ -3186,12 +3182,11 @@ fn metadata_for_graph_root<'a>(
     meta: &'a crate::cross_file::CrossFileMetadata,
     workspace_root: Option<&Url>,
 ) -> std::borrow::Cow<'a, crate::cross_file::CrossFileMetadata> {
-    let graph_meta = state.metadata_for_dependency_graph(input_root, meta, workspace_root);
     if root == input_root {
-        return graph_meta;
+        return state.metadata_for_dependency_graph(input_root, meta, workspace_root);
     }
 
-    let mut root_meta = graph_meta.as_ref().clone();
+    let mut root_meta = meta.clone();
     root_meta.inherited_working_directory = None;
     crate::cross_file::enrich_metadata_with_inherited_wd(
         &mut root_meta,
@@ -3200,7 +3195,8 @@ fn metadata_for_graph_root<'a>(
         |parent_uri| state.get_enriched_metadata(parent_uri),
         state.cross_file_config.max_chain_depth,
     );
-    std::borrow::Cow::Owned(root_meta)
+    let graph_meta = state.metadata_for_dependency_graph(root, &root_meta, workspace_root);
+    std::borrow::Cow::Owned(graph_meta.into_owned())
 }
 
 fn update_cross_file_graph_for_roots(
@@ -3538,7 +3534,7 @@ async fn resync_file_from_disk(
     {
         let mut state = state_arc.write().await;
         if state.is_project_excluded_uri(uri) {
-            if state.documents.contains_key(uri) {
+            if state.is_document_open_or_alias(uri) {
                 log::trace!(
                     "Disk resync excluded-file removal vetoed by open document: {}",
                     uri
@@ -5851,7 +5847,9 @@ impl LanguageServer for Backend {
                     Some(language_id.as_str()),
                 );
                 state.cross_file_activity.record_recent(uri.clone());
-                remove_file_from_cross_file_state(&mut state, &uri);
+                for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
+                    remove_file_from_cross_file_state(&mut state, &graph_root);
+                }
                 drop(state);
                 self.publish_diagnostics(&uri).await;
                 return;
@@ -6770,7 +6768,9 @@ impl LanguageServer for Backend {
                     )
                     .await;
                 state.cross_file_activity.record_recent(uri.clone());
-                remove_file_from_cross_file_state(&mut state, &uri);
+                for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
+                    remove_file_from_cross_file_state(&mut state, &graph_root);
+                }
                 drop(state);
                 self.publish_diagnostics(&uri).await;
                 return;
