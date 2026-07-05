@@ -2617,7 +2617,9 @@ pub(crate) fn sysdata_r_fallback_needed(state: &WorldState) -> bool {
 
 /// Remove a file that no longer exists on disk from every cross-file
 /// structure: the dependency graph (all edges in both directions), the
-/// disk-content cache, both workspace indexes, and the metadata cache.
+/// disk-content cache, both workspace indexes, the metadata cache, and the
+/// persisted editor-derived chunk-kind override for extension-mismatched
+/// Rmd/Quarto files.
 ///
 /// Returns the affected open dependents, computed from the **pre-removal**
 /// graph via `compute_affected_dependents_after_edit` — the removal itself
@@ -2650,6 +2652,7 @@ fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<U
     state.cross_file_file_cache.invalidate(uri);
     state.cross_file_workspace_index.invalidate(uri);
     state.cross_file_meta.remove(uri);
+    state.prune_editor_chunk_kind_override(uri);
     // Prune the per-URI coalescing entry with the rest of the closed-file
     // state. A delayed retry that captured an older generation treats the
     // missing entry as a mismatch; if the URI is later recreated, its new
@@ -2960,12 +2963,12 @@ async fn resync_missing_file(
 /// (chunk bodies only, never prose); the file cache stores the RAW content —
 /// its readers mask on read. `chunk_kind` preserves the closing document's
 /// editor-language classification: a file-backed document without an
-/// `.Rmd`/`.qmd` extension opened with `languageId: rmd` was chunk-masked
-/// while open, and path-only reclassification here would parse the same disk
-/// text as plain R and mint prose `source()` edges. The close path passes
-/// the tracked `Document`'s `chunk_kind`; the watched-files path passes
-/// `None` (no editor signal exists for an external disk event) and falls
-/// back to path classification.
+/// Rmd/Quarto extension opened with `languageId: rmd` was chunk-masked while
+/// open, and path-only reclassification here would parse the same disk text as
+/// plain R and mint prose `source()` edges. The close path passes the tracked
+/// `Document`'s `chunk_kind`; the watched-files path passes `None`, which
+/// consults `WorldState`'s persisted editor-derived chunk-kind override before
+/// falling back to path classification.
 ///
 /// `undecodable_as_missing` splits `SourceReadError::InvalidEncoding`
 /// handling by caller: the close path passes `true` (the user closed a file
@@ -2997,6 +3000,7 @@ async fn resync_file_from_disk(
     // skip the disk read and parse entirely. Purely an optimization for
     // close-then-reopen and watched-event-races-open bursts — the commit-time
     // veto below remains the correctness gate.
+    let effective_chunk_kind;
     {
         let state = state_arc.read().await;
         if state.documents.contains_key(uri) {
@@ -3010,6 +3014,7 @@ async fn resync_file_from_disk(
             );
             return ResyncOutcome::Skipped;
         }
+        effective_chunk_kind = chunk_kind.unwrap_or_else(|| state.chunk_kind_for_closed_file(uri));
     }
 
     let content = match crate::state::read_source_async(&path).await {
@@ -3047,10 +3052,7 @@ async fn resync_file_from_disk(
     // Mask Rmd/Quarto prose so directives/source()/library() come from chunk
     // bodies only (#343), then parse ONCE and derive both metadata and
     // artifacts from the same tree.
-    let analysis = match chunk_kind {
-        Some(kind) => crate::cross_file::analysis_text_for_kind(kind, &content),
-        None => crate::cross_file::analysis_text_for_path(uri.path(), &content),
-    };
+    let analysis = crate::cross_file::analysis_text_for_kind(effective_chunk_kind, &content);
     let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None));
     let mut cross_file_meta =
         crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
@@ -3146,11 +3148,10 @@ async fn resync_file_from_disk(
     // files and nothing repopulates it outside the scan / on-demand
     // indexing. Mirrors the on-demand insert (including its empty
     // `loaded_packages` precedent); raw contents + analysis-tree pair is the
-    // scan's own convention (masking is geometry-preserving). Known residual
-    // (issue #563): the entry does not persist `chunk_kind`, so for an
-    // extension-mismatched Rmd document (languageId-classified) tree
-    // consumers that reconstruct analysis text by path pair this masked
-    // tree with raw text.
+    // scan's own convention (masking is geometry-preserving). State-aware
+    // readers that reconstruct the analysis text from RAW contents consult
+    // `WorldState::chunk_kind_for_closed_file`, so a persisted editor-language
+    // classification keeps this tree/text pair aligned after close (#563).
     let fresh_entry = crate::workspace_index::IndexEntry {
         contents: ropey::Rope::from_str(&content),
         tree,
@@ -5263,7 +5264,7 @@ impl LanguageServer for Backend {
             // For Rmd/Quarto docs this masks the prose first so the graph,
             // DocumentStore, and on-demand indexing see only chunk-body
             // source()/library() calls and directives (#343). Classify by
-            // languageId-then-URI so untitled `.Rmd`/`.qmd` buffers (no file
+            // languageId-then-URI so untitled Rmd/Quarto buffers (no file
             // extension) are masked too — and reuse the same `chunk_kind` for
             // the DocumentStore open below so its tree/artifacts agree.
             let (chunk_kind, analysis_text) =
@@ -5296,7 +5297,7 @@ impl LanguageServer for Backend {
 
             // Update new DocumentStore with enriched metadata (Requirement 1.3).
             // `chunk_kind` was classified above by languageId-then-URI so
-            // untitled `.Rmd`/`.qmd` buffers mask their tree/artifacts (#343).
+            // untitled Rmd/Quarto buffers mask their tree/artifacts (#343).
             state
                 .document_store
                 .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
@@ -6753,7 +6754,7 @@ impl LanguageServer for Backend {
         // block below), not the URI extension: that is what fed the buffer's
         // edges into the graph in the first place, and it covers
         // extension-less R documents like `.Rprofile` as well as `.R` and
-        // `.Rmd`/`.qmd`. Non-`file:` URIs (untitled buffers) have no disk
+        // Rmd/Quarto extensions. Non-`file:` URIs (untitled buffers) have no disk
         // truth to converge to.
         let has_disk_path = uri.to_file_path().is_ok();
         let close_resync;
@@ -6793,6 +6794,9 @@ impl LanguageServer for Backend {
                 // the pre-commit graph — the buffer-derived edges stay in
                 // place until that resync's own commit replaces them.)
                 resync_chunk_kind = state.documents.get(uri).map(|doc| doc.chunk_kind);
+                if let Some(kind) = resync_chunk_kind {
+                    state.record_editor_chunk_kind_override(uri, kind);
+                }
             }
 
             // Close in new DocumentStore (Requirement 1.5)
@@ -7295,7 +7299,7 @@ impl LanguageServer for Backend {
                 }
 
                 // Rmd/Quarto files flow through like plain R since #558:
-                // `resync_file_from_disk` masks path-classified `.Rmd`/`.qmd`
+                // `resync_file_from_disk` masks path-classified Rmd/Quarto
                 // content (chunk bodies only, never prose — the pollution the
                 // old skip guarded against), and the close resync now
                 // installs graph/index state for closed Rmd documents that a
@@ -8522,8 +8526,11 @@ impl Backend {
         // `.Rmd` reached via a backward directive contributes chunk-defined
         // symbols and chunk library()/source() calls — not prose. The cached
         // content and `IndexEntry.contents` below stay RAW (see those sites).
-        let analysis_text_cow =
-            crate::cross_file::analysis_text_for_path(file_uri.path(), &content);
+        let chunk_kind = {
+            let state = self.state.read().await;
+            state.chunk_kind_for_closed_file(file_uri)
+        };
+        let analysis_text_cow = crate::cross_file::analysis_text_for_kind(chunk_kind, &content);
         let analysis_text: &str = &analysis_text_cow;
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis_text, None));
         let mut cross_file_meta =
@@ -8918,8 +8925,11 @@ impl Backend {
 
         // Analysis text: masked for Rmd/Quarto (chunk bodies only), raw
         // otherwise (#343). Cached content / `IndexEntry.contents` stay RAW.
-        let analysis_text_cow =
-            crate::cross_file::analysis_text_for_path(file_uri.path(), &content);
+        let chunk_kind = {
+            let state = self.state.read().await;
+            state.chunk_kind_for_closed_file(file_uri)
+        };
+        let analysis_text_cow = crate::cross_file::analysis_text_for_kind(chunk_kind, &content);
         let analysis_text: &str = &analysis_text_cow;
         let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis_text, None));
         let mut cross_file_meta =
@@ -18086,7 +18096,7 @@ mod project_config_initialize_tests {
 
     /// The close resync masks disk content with the closing document's
     /// editor-language classification, not the path: a file-backed document
-    /// WITHOUT an `.Rmd`/`.qmd` extension opened as `languageId: rmd` is
+    /// WITHOUT an Rmd/Quarto extension opened as `languageId: rmd` is
     /// chunk-masked while open, and the resync must not reclassify the same
     /// disk text as plain R (which would mint prose `source()` edges).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -18096,8 +18106,8 @@ mod project_config_initialize_tests {
         // Both decoy targets exist, so an unmasked (plain-R) parse of the
         // prose line would resolve a real edge.
         fs::write(tmp.path().join("prose_decoy.R"), "d <- 1\n").unwrap();
-        // `.Rmarkdown` is NOT matched by the path classifier (only .rmd/.qmd),
-        // so only the languageId can classify this document as R Markdown.
+        // `.md` is not matched by the path classifier, so only the languageId
+        // can classify this document as R Markdown.
         let content = concat!(
             "# Report\n",
             "\n",
@@ -18107,8 +18117,8 @@ mod project_config_initialize_tests {
             "source(\"helpers.R\")\n",
             "```\n",
         );
-        fs::write(tmp.path().join("report.Rmarkdown"), content).unwrap();
-        let (svc, report_uri) = open_in_workspace(&tmp, "report.Rmarkdown", "rmd", content).await;
+        fs::write(tmp.path().join("report.md"), content).unwrap();
+        let (svc, report_uri) = open_in_workspace(&tmp, "report.md", "rmd", content).await;
         let backend = svc.inner();
         let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
         let decoy_uri = Url::from_file_path(tmp.path().join("prose_decoy.R")).unwrap();
@@ -18149,6 +18159,271 @@ mod project_config_initialize_tests {
         assert!(
             !deps.iter().any(|e| e.to == decoy_uri),
             "the resync must keep the editor-language chunk masking — prose must never become an edge"
+        );
+    }
+
+    /// Issue #563: a watched CHANGED after closing an extension-mismatched Rmd
+    /// keeps using the persisted editor-language chunk kind. Without the
+    /// override, the watched path passes `chunk_kind: None`, reclassifies this
+    /// `.md` as plain R, and prose `source()` / `# raven: source` entries become
+    /// graph edges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue563_watched_change_after_closing_extension_mismatched_rmd_preserves_masking() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helpers.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        fs::write(tmp.path().join("prose_call.R"), "call_decoy <- 1\n").unwrap();
+        fs::write(
+            tmp.path().join("prose_directive.R"),
+            "directive_decoy <- 1\n",
+        )
+        .unwrap();
+        let report_v1 = concat!(
+            "# Report\n",
+            "\n",
+            "# raven: source prose_directive.R\n",
+            "source(\"prose_call.R\")\n",
+            "\n",
+            "```{r}\n",
+            "source(\"helpers.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("report.md"), report_v1).unwrap();
+        let (svc, report_uri) = open_in_workspace(&tmp, "report.md", "rmd", report_v1).await;
+        let backend = svc.inner();
+        let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+        let prose_call_uri = Url::from_file_path(tmp.path().join("prose_call.R")).unwrap();
+        let prose_directive_uri =
+            Url::from_file_path(tmp.path().join("prose_directive.R")).unwrap();
+
+        close_doc(backend, &report_uri).await;
+        let closed_resync_installed = wait_for_state(backend, 5_000, |state| {
+            state.editor_chunk_kind_overrides.get(&report_uri).copied()
+                == Some(crate::chunks::ChunkKind::Rmd)
+                && state
+                    .cross_file_workspace_index
+                    .get_metadata(&report_uri)
+                    .is_some()
+                && state
+                    .cross_file_graph
+                    .get_dependencies(&report_uri)
+                    .iter()
+                    .any(|e| e.to == helpers_uri)
+        })
+        .await;
+        assert!(
+            closed_resync_installed,
+            "close must persist the editor chunk kind and install disk-derived state"
+        );
+
+        let report_v2 = concat!(
+            "# Report\n",
+            "\n",
+            "# raven: source prose_directive.R\n",
+            "source(\"prose_call.R\")\n",
+            "\n",
+            "```{r}\n",
+            "source(\"extra.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("report.md"), report_v2).unwrap();
+        send_watched_change(backend, &report_uri).await;
+
+        let updated = wait_for_state(backend, 5_000, |state| {
+            let deps = state.cross_file_graph.get_dependencies(&report_uri);
+            deps.iter().any(|e| e.to == extra_uri) && !deps.iter().any(|e| e.to == helpers_uri)
+        })
+        .await;
+        assert!(
+            updated,
+            "watched CHANGED must update the chunk edge for the closed mismatched Rmd"
+        );
+
+        let state = backend.state.read().await;
+        let deps = state.cross_file_graph.get_dependencies(&report_uri);
+        assert!(
+            !deps.iter().any(|e| e.to == prose_call_uri),
+            "prose source() must remain masked after watched resync"
+        );
+        assert!(
+            !deps.iter().any(|e| e.to == prose_directive_uri),
+            "prose # raven: source must remain masked after watched resync"
+        );
+    }
+
+    /// Issue #563: after the index entries for a closed extension-mismatched
+    /// Rmd are evicted, `get_enriched_metadata` falls back to the raw file
+    /// cache. That fallback must consult the persisted editor-language chunk
+    /// kind before path classification.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue563_get_enriched_metadata_file_cache_fallback_uses_persisted_chunk_kind() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helpers.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("prose_call.R"), "call_decoy <- 1\n").unwrap();
+        fs::write(
+            tmp.path().join("prose_directive.R"),
+            "directive_decoy <- 1\n",
+        )
+        .unwrap();
+        let report = concat!(
+            "# Report\n",
+            "\n",
+            "# raven: source prose_directive.R\n",
+            "source(\"prose_call.R\")\n",
+            "\n",
+            "```{r}\n",
+            "source(\"helpers.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("report.md"), report).unwrap();
+        let (svc, report_uri) = open_in_workspace(&tmp, "report.md", "rmd", report).await;
+        let backend = svc.inner();
+
+        close_doc(backend, &report_uri).await;
+        let cached = wait_for_state(backend, 5_000, |state| {
+            state.cross_file_file_cache.get(&report_uri).as_deref() == Some(report)
+                && state.editor_chunk_kind_overrides.get(&report_uri).copied()
+                    == Some(crate::chunks::ChunkKind::Rmd)
+        })
+        .await;
+        assert!(
+            cached,
+            "close resync must leave raw file-cache content and a chunk-kind override"
+        );
+
+        {
+            let state = backend.state.write().await;
+            state.workspace_index_new.invalidate(&report_uri);
+            state.cross_file_workspace_index.invalidate(&report_uri);
+        }
+
+        let state = backend.state.read().await;
+        let meta = state
+            .get_enriched_metadata(&report_uri)
+            .expect("file-cache fallback metadata must be available");
+        let source_paths: Vec<&str> = meta.sources.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(
+            source_paths,
+            vec!["helpers.R"],
+            "file-cache fallback must extract metadata from chunks only"
+        );
+    }
+
+    /// `.Rmarkdown` is a knitr-supported R Markdown extension and should be
+    /// path-classified as Rmd even with no editor language signal. A direct disk
+    /// resync is enough to prove the closed-file path masks prose before
+    /// extracting graph edges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue563_rmarkdown_extension_path_classified_resync_masks_prose_without_editor_signal()
+    {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
+        fs::write(tmp.path().join("helpers.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("prose_call.R"), "call_decoy <- 1\n").unwrap();
+        let report = concat!(
+            "# Report\n",
+            "\n",
+            "source(\"prose_call.R\")\n",
+            "\n",
+            "```{r}\n",
+            "source(\"helpers.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("report.Rmarkdown"), report).unwrap();
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let report_uri = Url::from_file_path(tmp.path().join("report.Rmarkdown")).unwrap();
+        let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
+        let prose_call_uri = Url::from_file_path(tmp.path().join("prose_call.R")).unwrap();
+
+        let outcome =
+            resync_file_from_disk(&backend.state, &report_uri, None, None, true, None).await;
+        assert!(
+            matches!(outcome, ResyncOutcome::Updated { .. }),
+            ".Rmarkdown disk resync must commit without an editor language signal"
+        );
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.editor_chunk_kind_overrides.contains_key(&report_uri),
+            "path-classified .Rmarkdown files do not need an editor override"
+        );
+        let deps = state.cross_file_graph.get_dependencies(&report_uri);
+        assert!(
+            deps.iter().any(|e| e.to == helpers_uri),
+            "chunk source() must produce an edge for path-classified .Rmarkdown"
+        );
+        assert!(
+            !deps.iter().any(|e| e.to == prose_call_uri),
+            "prose source() must be masked for path-classified .Rmarkdown"
+        );
+    }
+
+    /// Issue #563: removing a file's closed cross-file state also drops the
+    /// persisted editor-language chunk-kind override. Recreating the same path
+    /// later should not inherit an old language classification until the editor
+    /// opens it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue563_deleting_extension_mismatched_rmd_prunes_persisted_chunk_kind() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helpers.R"), "helper_fn <- function() 1\n").unwrap();
+        let report = concat!(
+            "# Report\n",
+            "\n",
+            "```{r}\n",
+            "source(\"helpers.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("report.md"), report).unwrap();
+        let (svc, report_uri) = open_in_workspace(&tmp, "report.md", "rmd", report).await;
+        let backend = svc.inner();
+
+        close_doc(backend, &report_uri).await;
+        let persisted = wait_for_state(backend, 5_000, |state| {
+            state.editor_chunk_kind_overrides.get(&report_uri).copied()
+                == Some(crate::chunks::ChunkKind::Rmd)
+                && state
+                    .cross_file_workspace_index
+                    .get_metadata(&report_uri)
+                    .is_some()
+        })
+        .await;
+        assert!(
+            persisted,
+            "close must persist the editor-derived chunk kind before deletion"
+        );
+
+        fs::remove_file(tmp.path().join("report.md")).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: report_uri.clone(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.editor_chunk_kind_overrides.contains_key(&report_uri),
+            "deletion convergence must prune the persisted chunk kind"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&report_uri)
+                .is_empty(),
+            "deletion convergence must remove graph state too"
+        );
+        assert!(
+            state
+                .cross_file_workspace_index
+                .get_metadata(&report_uri)
+                .is_none(),
+            "deletion convergence must remove workspace-index metadata"
         );
     }
 

@@ -46,7 +46,7 @@ For dynamic or conditional paths that Raven can't detect, use [directives](direc
 
 ### R Markdown / Quarto chunks
 
-Inside `.Rmd` / `.qmd` documents, only R chunk bodies feed cross-file analysis — prose and YAML front matter are masked out before detection. A `source()` or `library()` call written in a chunk participates exactly as it would in a `.R` file; the same text in prose is ignored. Within a single document, bindings from earlier chunks are visible in later chunks (ordered-concatenation semantics) — define `x` in chunk 1 and it resolves in chunk 3. A `.R` file may also declare `# raven: sourced-by report.Rmd`, in which case Raven reads the report's chunks to supply that file's inherited scope. `.Rmd` / `.qmd` files are not added to the proactive workspace scan, so the editor sees these relationships when the Rmd is open or when a `.R` file points at it via a backward directive. See [R Code Chunks](./chunks.md#cross-file-resolution-from-chunks).
+Inside `.Rmd` / `.Rmarkdown` / `.qmd` documents, only R chunk bodies feed cross-file analysis — prose and YAML front matter are masked out before detection. A `source()` or `library()` call written in a chunk participates exactly as it would in a `.R` file; the same text in prose is ignored. Within a single document, bindings from earlier chunks are visible in later chunks (ordered-concatenation semantics) — define `x` in chunk 1 and it resolves in chunk 3. A `.R` file may also declare `# raven: sourced-by report.Rmd`, in which case Raven reads the report's chunks to supply that file's inherited scope. `.Rmd` / `.Rmarkdown` / `.qmd` files are not added to the proactive workspace scan, so the editor sees these relationships when the Rmd is open or when a `.R` file points at it via a backward directive. See [R Code Chunks](./chunks.md#cross-file-resolution-from-chunks).
 
 ## Package Awareness
 
@@ -305,6 +305,8 @@ While a file is open, its buffer is authoritative: unsaved edits that add or rem
 This authority is by exact LSP file URI. Symlink spellings and case aliases are separate identities, so an open buffer under one spelling does not automatically stand in for a watcher event or `source()` edge under another. See [Limitations: symlink and case aliases](limitations.md#language-server).
 
 When you close a file without saving, Raven re-reads just that file from disk and converges the graph back to disk truth — a `source()` edge added only in the discarded buffer disappears, and an edge the buffer had removed comes back. If the file no longer exists on disk, its graph entry is removed entirely. Open files that depend on it have their diagnostics refreshed automatically. This never triggers a workspace rescan, and reopening the file immediately always wins over the disk re-read.
+
+For file-backed R Markdown / Quarto documents whose extension does not identify them as chunk documents, Raven remembers the editor's last Rmd/Quarto language classification after close. Watched disk changes and closed-file cache fallbacks keep using chunk masking until that file's cross-file state is removed, so prose `source()` calls and directives do not start contributing graph edges just because the document is closed.
 
 ### Traversal budgets in large workspaces
 

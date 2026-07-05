@@ -68,8 +68,8 @@ pub fn extract_metadata(content: &str) -> CrossFileMetadata {
 
 /// The R-analysis view of `content` for the file identified by `path_or_uri`:
 /// the geometry-preserving [`crate::chunks::mask_to_r`] mask for R Markdown /
-/// Quarto documents (`.Rmd` / `.qmd`), and the raw `content` borrowed
-/// unchanged for everything else.
+/// Quarto documents (`.Rmd` / `.Rmarkdown` / `.qmd`), and the raw `content`
+/// borrowed unchanged for everything else.
 ///
 /// This is the single place that pairs path-based classification with masking
 /// for closed-file / on-demand-indexing call sites that only have a path and a
@@ -144,6 +144,24 @@ pub(crate) fn classify_and_mask<'a>(
     (chunk_kind, analysis_text)
 }
 
+/// Extract cross-file metadata from `content` using an already-resolved chunk
+/// kind, masking R Markdown / Quarto prose first so directives, `source()`
+/// calls, and `library()` calls are taken from R chunk bodies only (never from
+/// prose or YAML front matter).
+///
+/// For non-Rmd files this is identical to [`extract_metadata`]. Use this at any
+/// site that extracts metadata from a file's *raw* content when the caller has
+/// a live or persisted editor-language classification. That classification must
+/// outrank path classification for extension-mismatched Rmd/Quarto files
+/// (issue #563).
+pub fn extract_metadata_for_kind(
+    chunk_kind: crate::chunks::ChunkKind,
+    content: &str,
+) -> CrossFileMetadata {
+    let analysis = analysis_text_for_kind(chunk_kind, content);
+    extract_metadata(&analysis)
+}
+
 /// Extract cross-file metadata from `content`, masking R Markdown / Quarto
 /// prose first so directives, `source()` calls, and `library()` calls are
 /// taken from R chunk bodies only (never from prose or YAML front matter).
@@ -151,11 +169,14 @@ pub(crate) fn classify_and_mask<'a>(
 /// For non-Rmd files this is identical to [`extract_metadata`]. Use this at any
 /// site that extracts metadata from a path-identified file's *raw* content
 /// (file-cache fallbacks, on-demand indexing, legacy-document arms) so that
-/// `.Rmd` / `.qmd` files contribute outgoing edges from their chunks rather
-/// than spurious prose-derived ones (issue #343).
+/// `.Rmd` / `.Rmarkdown` / `.qmd` files contribute outgoing edges from their
+/// chunks rather than spurious prose-derived ones (issue #343). State-aware
+/// closed-file callers should prefer
+/// [`WorldState::extract_metadata_for_uri`](crate::state::WorldState::extract_metadata_for_uri)
+/// so persisted editor-language chunk classification can outrank the path
+/// (issue #563).
 pub fn extract_metadata_for_path(path_or_uri: &str, content: &str) -> CrossFileMetadata {
-    let analysis = analysis_text_for_path(path_or_uri, content);
-    extract_metadata(&analysis)
+    extract_metadata_for_kind(crate::chunks::classify_chunk_document(path_or_uri), content)
 }
 
 /// Extract cross-file metadata using a pre-parsed tree when available.
