@@ -118,8 +118,9 @@ Indexes the workspace, then reports the full diagnostic set for the requested
 files (or every R / R Markdown / Quarto file in the workspace when no PATHS are
 given): syntax errors, semantic checks, style lints, cross-file diagnostics
 (missing source files, circular dependencies, out-of-scope usage),
-missing-package warnings, and undefined-variable diagnostics. For .Rmd / .qmd
-the R code inside chunks is analyzed; prose and non-R chunks are ignored.
+missing-package warnings, and undefined-variable diagnostics. For .Rmd /
+.Rmarkdown / .qmd the R code inside chunks is analyzed; prose and non-R chunks
+are ignored.
 Honors raven.toml / .lintr.
 
 Options:
@@ -160,9 +161,9 @@ Exit codes:
 }
 
 /// Open a report target that the workspace scan did NOT index (a path reached
-/// through a different symlink alias, OR a chunk file — `.Rmd`/`.qmd` are
-/// deliberately outside the R-only workspace scan) into `state.documents` and
-/// wire its outgoing edges into the dependency graph.
+/// through a different symlink alias, OR a chunk file — `.Rmd`/`.Rmarkdown`/
+/// `.qmd` are deliberately outside the R-only workspace scan) into
+/// `state.documents` and wire its outgoing edges into the dependency graph.
 ///
 /// `text` is the already-decoded file contents (the caller owns the
 /// `read_source` error handling). `path` is used only to classify the chunk
@@ -189,8 +190,8 @@ fn open_disk_fallback_target(
     text: &str,
 ) {
     // Pass an honest language id so the Document classifies the chunk kind
-    // correctly: "rmd" for `.Rmd`/`.qmd` (the constructor reads the URI to
-    // classify it as Rmd and masks the prose), "r" otherwise.
+    // correctly: "rmd" for `.Rmd`/`.Rmarkdown`/`.qmd` (the constructor reads
+    // the URI to classify it as Rmd and masks the prose), "r" otherwise.
     // `file_type_from_language_id("rmd")` is `None`, so the `FileType` still
     // falls back to R via the URI — only the chunk masking differs.
     let language_id = if is_chunk_file(path) { "rmd" } else { "r" };
@@ -751,12 +752,12 @@ async fn maybe_load_sysdata_fallback(state: &mut crate::state::WorldState) {
 ///
 /// Covers the directly-attached packages (`library()` / `require()`) of each
 /// reported file. R-source targets read their already-parsed `loaded_packages`
-/// from the workspace index (free). Chunk-bearing targets (`.Rmd`/`.qmd`) are
-/// never in the R-only scan, so they're read from disk and masked here so a
-/// chunk `library()` call warms its package's exports too — without this the
-/// undefined-variable check would conservatively suppress bare calls to an
-/// installed-but-uncached package attached only inside a chunk, under-reporting
-/// relative to the editor.
+/// from the workspace index (free). Chunk-bearing targets (`.Rmd`/
+/// `.Rmarkdown`/`.qmd`) are never in the R-only scan, so they're read from disk
+/// and masked here so a chunk `library()` call warms its package's exports too
+/// — without this the undefined-variable check would conservatively suppress
+/// bare calls to an installed-but-uncached package attached only inside a chunk,
+/// under-reporting relative to the editor.
 ///
 /// In package mode, also covers NAMESPACE whole-package `import(pkg)`
 /// directives (`scope_contribution.full_imports`) and packages attached by
@@ -1316,9 +1317,9 @@ async fn collect_target_diagnostics(
 
     // Phase 3 (sequential): targets not handled in phase 1 — a bad URL, or a
     // disk-fallback target the scan didn't index (e.g. a symlink-alias path, or
-    // an `.Rmd`/`.qmd` chunk file outside the R-only scan). Rare; the existing
-    // open → compute → close path (which uses `state.documents`) is preserved
-    // verbatim, so behavior for these is unchanged.
+    // an `.Rmd`/`.Rmarkdown`/`.qmd` chunk file outside the R-only scan). Rare;
+    // the existing open → compute → close path (which uses `state.documents`)
+    // is preserved verbatim, so behavior for these is unchanged.
     for path in targets {
         let Ok(uri) = Url::from_file_path(path) else {
             eprintln!(
@@ -1369,8 +1370,8 @@ async fn collect_target_diagnostics(
 }
 
 /// Resolve which files to report diagnostics for. Empty `paths` means every R
-/// source (`.R`/`.r`) and chunk-bearing document (`.Rmd`/`.qmd`) under the
-/// workspace root. Explicit paths are taken as-is (files) or walked
+/// source (`.R`/`.r`) and chunk-bearing document (`.Rmd`/`.Rmarkdown`/`.qmd`)
+/// under the workspace root. Explicit paths are taken as-is (files) or walked
 /// (directories). The result is sorted and de-duplicated for stable output.
 /// Chunk files are collected both as explicit args and while walking a
 /// directory, so `raven check` diagnoses the R chunks inside them (issue #343).
@@ -2200,26 +2201,50 @@ mod tests {
     }
 
     #[test]
-    fn walk_includes_rmd_and_qmd() {
+    fn walk_includes_rmd_rmarkdown_and_qmd() {
         // The empty-PATHS workspace walk collects chunk-bearing documents
         // alongside R sources, including mixed-case extensions
-        // (is_chunk_file matches `.rmd`/`.qmd` case-insensitively).
+        // (is_chunk_file matches `.rmd`/`.rmarkdown`/`.qmd`
+        // case-insensitively).
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("a.R"), "x <- 1\n").unwrap();
         fs::write(tmp.path().join("report.Rmd"), "prose\n").unwrap();
+        fs::write(tmp.path().join("notebook.Rmarkdown"), "prose\n").unwrap();
+        fs::write(tmp.path().join(".Rmarkdown"), "prose\n").unwrap();
         fs::write(tmp.path().join("paper.qmd"), "prose\n").unwrap();
         fs::write(tmp.path().join("UPPER.RMD"), "prose\n").unwrap();
+        fs::write(tmp.path().join("UPPER.RMARKDOWN"), "prose\n").unwrap();
         fs::write(tmp.path().join("UPPER.QMD"), "prose\n").unwrap();
 
         let mut operator_error = false;
         let targets = collect_report_targets(&[], tmp.path(), &mut operator_error);
-        assert_eq!(targets.len(), 5, "got {targets:?}");
+        assert_eq!(targets.len(), 8, "got {targets:?}");
         let chunk_count = targets.iter().filter(|p| is_chunk_file(p)).count();
         assert_eq!(
-            chunk_count, 4,
-            "all four chunk files collected; got {targets:?}"
+            chunk_count, 7,
+            "all seven chunk files collected; got {targets:?}"
         );
         assert!(!operator_error);
+    }
+
+    #[test]
+    fn directory_walk_rmarkdown_chunk_syntax_error_exits_failed() {
+        let tmp = TempDir::new().unwrap();
+        let rmarkdown = tmp.path().join("report.Rmarkdown");
+        fs::write(&rmarkdown, "# Title\n```{r}\nf <- function( {\n```\n").unwrap();
+
+        let mut args = base_args(tmp.path());
+        args.paths = vec![tmp.path().to_path_buf()];
+        assert_eq!(run_blocking(args.clone()), EXIT_LINT_FAILED);
+
+        let diags = collect_diagnostics_blocking(&args);
+        let canonical_rmarkdown = std::fs::canonicalize(&rmarkdown).unwrap();
+        assert!(
+            diags.iter().any(|(path, d)| path == &canonical_rmarkdown
+                && d.range.start.line == 2
+                && d.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)),
+            "directory walk must analyze .Rmarkdown chunks at document coordinates; got {diags:?}"
+        );
     }
 
     #[test]
