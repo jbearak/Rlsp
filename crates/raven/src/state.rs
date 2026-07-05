@@ -573,13 +573,27 @@ pub struct WorldState {
     ///
     /// Values are copied into `watched_file_resync_generations` per URI. Keeping
     /// the source outside that map lets removal prune URI entries without
-    /// reusing a generation if a later CREATE/CHANGE re-adds the same URI; old
-    /// delayed retries still see either a missing entry or a different value.
+    /// reusing a generation if a later CREATE/CHANGE or close re-adds the same
+    /// URI; old delayed retries still see either a missing entry or a
+    /// different value.
     pub watched_file_resync_generation_counter: u64,
-    /// Per-URI latest watched-file generation for events that can mutate
-    /// closed-file state. Delayed undecodable-file retries capture a generation
-    /// and re-check it at commit time so a newer watcher event, or removal of
-    /// the URI entry, supersedes any pending retry for the same URI.
+    /// Per-URI latest generation for ownership of closed-file convergence.
+    ///
+    /// Watched CREATE/CHANGE/DELETE events bump this before queuing or applying
+    /// disk state. `did_close` also bumps it while switching a URI from
+    /// open-buffer truth back to disk/package truth: watcher events skipped
+    /// while the document was open must not let an older delayed retry apply
+    /// after close. `did_open` does not bump; open-document guards veto watched
+    /// resync commits and package-input applies while the buffer is open, and
+    /// the eventual close bump owns the next closed-state transition.
+    ///
+    /// Removal through `remove_file_from_cross_file_state` prunes the URI entry
+    /// with the rest of the closed-file state. Delayed undecodable retries
+    /// capture a generation and re-check it at commit/apply time: `Updated`
+    /// requires an exact table match, while `Removed` requires the entry to
+    /// still be absent after its own removal commit pruned it. Later watched
+    /// events or closes recreate the entry from the state-wide counter, so old
+    /// generations are never reused.
     pub watched_file_resync_generations: HashMap<Url, u64>,
     /// Handle to the running libpath watcher, if any. Dropping it stops watching.
     pub libpath_watcher_handle:

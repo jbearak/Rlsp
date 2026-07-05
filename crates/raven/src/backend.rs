@@ -1833,13 +1833,16 @@ enum WatchedManifestPayload {
 /// then extend the affected-open-doc set with the same manifest and
 /// `system.file()` fanout used by the synchronous watcher path.
 ///
-/// Content and `.Rprofile` scans run off-lock; the input mutation, package
-/// re-derive, workspace `system.file()` re-resolution, and gated affected-set
-/// extension happen under one write lock. Delayed undecodable-retry callers
-/// attach per-entry generation expectations; each expectation is checked under
-/// that same write lock immediately before its package-input mutation, so a
-/// stale retry cannot apply captured manifest state after a newer watcher event
-/// has taken ownership of the URI. `sync_publish_path` controls whether
+/// Content and `.Rprofile` scans usually run off-lock; if a non-deleted
+/// DESCRIPTION/NAMESPACE read returns no text, the existing
+/// `WatchedFileChanged` translator may still fall back to a best-effort disk
+/// read under the write lock. The input mutation, package re-derive, workspace
+/// `system.file()` re-resolution, and gated affected-set extension happen
+/// under one write lock. Delayed undecodable-retry callers attach per-entry
+/// generation expectations; each expectation is checked under that same write
+/// lock immediately before its package-input mutation, so a stale retry cannot
+/// apply captured manifest state after a newer watcher event or close has
+/// taken ownership of the URI. `sync_publish_path` controls whether
 /// newly-affected URIs are force-marked immediately, matching
 /// [`extend_affected_for_manifest_change`]'s publish-path contract.
 async fn apply_watched_manifest_changes(
@@ -1914,6 +1917,13 @@ async fn apply_watched_manifest_changes(
     let mut state = state_arc.write().await;
     let mut deltas = Vec::new();
     for (uri, payload, deleted, generation_expectation) in manifest_contents {
+        if state.documents.contains_key(&uri) {
+            log::trace!(
+                "Skipping watched manifest package-input event for open document: {}",
+                uri
+            );
+            continue;
+        }
         if !watched_package_input_generation_is_current(&state, &uri, generation_expectation) {
             if let Some(expectation) = generation_expectation {
                 log::trace!(
@@ -2874,6 +2884,23 @@ mod watched_package_input_generation_tests {
             ),
             "Removed is current after its successful removal pruned the entry"
         );
+
+        let close_generation = bump_watched_file_resync_generation(&mut state, &uri);
+        assert!(
+            state.watched_file_resync_generations.contains_key(&uri),
+            "precondition: did_close-style ownership bump recreates the entry"
+        );
+        assert!(
+            !watched_package_input_generation_is_current(
+                &state,
+                &uri,
+                Some(WatchedPackageInputGenerationExpectation {
+                    generation: close_generation.wrapping_sub(1),
+                    kind: WatchedPackageInputOutcomeKind::Removed,
+                }),
+            ),
+            "Removed is stale after did_close recreated the generation entry"
+        );
     }
 }
 
@@ -3499,8 +3526,9 @@ fn spawn_watched_undecodable_retry(
 /// retry package-input events carry the captured generation and commit outcome:
 /// `Updated` is current only while the URI's generation still equals the
 /// captured generation, while `Removed` is current only while the generation
-/// entry is absent after the removal commit pruned it. Both the manifest path
-/// and the R-file package loop re-check that currency under the same
+/// entry is absent after the removal commit pruned it. A later watched event
+/// or close recreates the entry and supersedes the retry. Both the manifest
+/// path and the R-file package loop re-check that currency under the same
 /// `WorldState` write lock that applies the package mutation, then publish via
 /// this batch tail after capping.
 async fn run_watched_resync_batch(
@@ -3639,150 +3667,14 @@ async fn run_watched_resync_batch(
         affected_for_async_set.extend(affected_for_async.iter().cloned());
     }
 
-    // Update package inputs and derive state for committed CREATED/CHANGED
-    // R/*.R files so roxygen tag changes from external edits (e.g. git
-    // checkout) propagate to the namespace model and internal symbols. A
-    // delayed invalid-final retry records `deleted: true`, mirroring the
-    // synchronous DELETED watched branch.
-    {
-        let mut state = state_arc.write().await;
-        let package_events: Vec<_> = package_input_events
-            .iter()
-            .filter(|event| event.committed || mode.include_uncommitted_package_events())
-            .filter(|event| {
-                !matches!(mode, WatchedResyncBatchMode::DelayedUndecodableRetry)
-                    || watched_manifest_change_for_uri(&state, &event.uri, event.deleted).is_none()
-            })
-            .filter(|event| {
-                let current = watched_package_input_generation_is_current(
-                    &state,
-                    &event.uri,
-                    event.generation_expectation,
-                );
-                if !current
-                    && let Some(expectation) = event.generation_expectation
-                {
-                    log::trace!(
-                        "Skipping stale watched R-file package-input event for {} ({:?}, generation {})",
-                        event.uri,
-                        expectation.kind,
-                        expectation.generation
-                    );
-                }
-                current
-            })
-            .collect();
-        // Gate on any package source file — `is_r_source_path` matches both
-        // `R/` and `tests/testthat/`. Without the `tests/` branch, external
-        // edits that touch only test files (e.g. `git checkout` on a topic
-        // branch) would leave their RFileFacts stale in `package_state`.
-        let root_for_check = state.package_inputs.workspace_root.clone();
-        let model_rprofile = state.package_inputs.model_rprofile;
-        let rprofile_sourced = &state.package_inputs.rprofile_sourced_files;
-        let has_pkg_files = root_for_check.as_ref().is_some_and(|root| {
-            package_events.iter().any(|event| {
-                event.uri.to_file_path().ok().is_some_and(|p| {
-                    crate::package_state::is_r_source_path(&p, root).is_some()
-                        || is_package_source_dir(&p, root)
-                        // data/ and data-raw/ CREATED/CHANGED events also
-                        // have dedicated translate() handlers (dataset_names /
-                        // sysdata_names rescans).
-                        || is_package_data_path(&p, root)
-                        // A helper that `.Rprofile` transitively source()s can
-                        // live outside the package's tracked R dirs (e.g.
-                        // scripts/, inst/). Editing it isn't an RFileChanged,
-                        // but it must still reach translate() so the prelude is
-                        // re-scanned and its symbols/packages reach open
-                        // `scripts/` files (Task 12).
-                        || (model_rprofile
-                            && path_in_rprofile_sourced_set(&p, rprofile_sourced))
-                })
-            })
-        });
-        if has_pkg_files {
-            let mut deltas = Vec::new();
-            let mut ns_changed = false;
-            let old_ns_model = state.package_state.namespace_model().cloned();
-            // Snapshot the package's visibility/contribution state
-            // (Arc-backed clones are cheap) so visibility-only changes — e.g.
-            // internal symbol or NAMESPACE-import edits that don't alter
-            // exports — also trigger the open-file fanout below.
-            let old_contribution = state.package_state.scope_contribution().clone();
-            for event in package_events {
-                if state.documents.contains_key(&event.uri) {
-                    continue; // open docs are authoritative; skip
-                }
-                // Use the file cache content (already inserted above). Removal
-                // outcomes deliberately carry `None` and `deleted: true` so
-                // package inputs drop the file instead of preserving stale
-                // text. Uncommitted immediate-pass events carry `deleted:
-                // false`; because the sync pass invalidated the file cache,
-                // skipped directory/file events naturally pass `None`, matching
-                // the old inline watched loop's disk-fallback behavior.
-                let on_disk_text: Option<std::sync::Arc<str>> = if event.deleted {
-                    None
-                } else {
-                    state
-                        .cross_file_file_cache
-                        .get(&event.uri)
-                        .map(|s| std::sync::Arc::from(s.as_str()))
-                };
-                let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                    uri: event.uri.clone(),
-                    on_disk_text,
-                    deleted: event.deleted,
-                };
-                if let Some(delta) =
-                    crate::package_state::event::translate(&mut state.package_inputs, event)
-                {
-                    deltas.push(delta);
-                }
-            }
-            // Detect whether this batch carries a prelude rescan (Task 12):
-            // editing a helper that `.Rprofile` sources re-scans the prelude,
-            // whose symbols/packages reach `scripts/` files — files that are
-            // NOT `is_r_source_path` and so are missed by the R/+tests fanout
-            // below. The RProfileChanged delta may appear top-level or nested
-            // in the per-file Batch built by `translate_watched`, so check both.
-            // Computed BEFORE `deltas` is moved into `Batch`.
-            let rprofile_changed = batch_contains_rprofile_changed(&deltas);
-            if !deltas.is_empty() {
-                let batch = crate::package_state::PackageInputDelta::Batch(deltas);
-                state.apply_package_event(&batch);
-                ns_changed = state.package_state.namespace_model() != old_ns_model.as_ref()
-                    || state.package_state.scope_contribution() != &old_contribution;
-            }
-            if ns_changed {
-                // Namespace model changed (e.g. roxygen tags changed in an
-                // external edit). Add all open package files (R/ and
-                // tests/testthat/) to affected set so their @import diagnostics
-                // are refreshed. When the prelude rescanned, also add every open
-                // workspace R-language file (incl. `scripts/`), since the
-                // prelude contributes to their script scope.
-                if let Some(ref root) = state.package_inputs.workspace_root.clone() {
-                    for open_uri in state.documents.keys() {
-                        if let Ok(p) = open_uri.to_file_path()
-                            && (crate::package_state::is_r_source_path(&p, root).is_some()
-                                || (rprofile_changed
-                                    && crate::package_state::is_package_workspace_r_file(&p, root)))
-                            && affected_for_async_set.insert(open_uri.clone())
-                        {
-                            affected_for_async.push(open_uri.clone());
-                        }
-                    }
-                    // The fanout above misses arbitrary load_all carriers
-                    // (root-level analysis.R / scripts/) and their source-graph
-                    // neighborhood; widen for them on the async path too.
-                    extend_affected_for_load_all_revalidation_from_state(
-                        &mut affected_for_async,
-                        &mut affected_for_async_set,
-                        &state,
-                        root,
-                    );
-                }
-            }
-        }
-    }
+    apply_watched_r_file_package_input_events(
+        &state_arc,
+        &mut affected_for_async,
+        &mut affected_for_async_set,
+        package_input_events,
+        mode,
+    )
+    .await;
 
     // Now that the graph reflects every committed CREATED/CHANGED file in
     // this batch, cap and force-mark the full union of affected open documents
@@ -3808,6 +3700,156 @@ async fn run_watched_resync_batch(
         Some(traversal_truncation),
     )
     .await;
+}
+
+/// Update package inputs and derive state for committed CREATED/CHANGED
+/// R/*.R files so roxygen tag changes from external edits (e.g. git checkout)
+/// propagate to the namespace model and internal symbols. A delayed
+/// invalid-final retry records `deleted: true`, mirroring the synchronous
+/// DELETED watched branch.
+async fn apply_watched_r_file_package_input_events(
+    state_arc: &Arc<RwLock<WorldState>>,
+    affected_for_async: &mut Vec<Url>,
+    affected_for_async_set: &mut std::collections::HashSet<Url>,
+    package_input_events: Vec<WatchedPackageInputEvent>,
+    mode: WatchedResyncBatchMode,
+) {
+    let mut state = state_arc.write().await;
+    let package_events: Vec<_> = package_input_events
+        .iter()
+        .filter(|event| event.committed || mode.include_uncommitted_package_events())
+        .filter(|event| {
+            !matches!(mode, WatchedResyncBatchMode::DelayedUndecodableRetry)
+                || watched_manifest_change_for_uri(&state, &event.uri, event.deleted).is_none()
+        })
+        .filter(|event| {
+            let current = watched_package_input_generation_is_current(
+                &state,
+                &event.uri,
+                event.generation_expectation,
+            );
+            if !current
+                && let Some(expectation) = event.generation_expectation
+            {
+                log::trace!(
+                    "Skipping stale watched R-file package-input event for {} ({:?}, generation {})",
+                    event.uri,
+                    expectation.kind,
+                    expectation.generation
+                );
+            }
+            current
+        })
+        .collect();
+    // Gate on any package source file — `is_r_source_path` matches both
+    // `R/` and `tests/testthat/`. Without the `tests/` branch, external
+    // edits that touch only test files (e.g. `git checkout` on a topic
+    // branch) would leave their RFileFacts stale in `package_state`.
+    let root_for_check = state.package_inputs.workspace_root.clone();
+    let model_rprofile = state.package_inputs.model_rprofile;
+    let rprofile_sourced = &state.package_inputs.rprofile_sourced_files;
+    let has_pkg_files = root_for_check.as_ref().is_some_and(|root| {
+        package_events.iter().any(|event| {
+            event.uri.to_file_path().ok().is_some_and(|p| {
+                crate::package_state::is_r_source_path(&p, root).is_some()
+                    || is_package_source_dir(&p, root)
+                    // data/ and data-raw/ CREATED/CHANGED events also
+                    // have dedicated translate() handlers (dataset_names /
+                    // sysdata_names rescans).
+                    || is_package_data_path(&p, root)
+                    // A helper that `.Rprofile` transitively source()s can
+                    // live outside the package's tracked R dirs (e.g.
+                    // scripts/, inst/). Editing it isn't an RFileChanged,
+                    // but it must still reach translate() so the prelude is
+                    // re-scanned and its symbols/packages reach open
+                    // `scripts/` files (Task 12).
+                    || (model_rprofile && path_in_rprofile_sourced_set(&p, rprofile_sourced))
+            })
+        })
+    });
+    if has_pkg_files {
+        let mut deltas = Vec::new();
+        let mut ns_changed = false;
+        let old_ns_model = state.package_state.namespace_model().cloned();
+        // Snapshot the package's visibility/contribution state (Arc-backed
+        // clones are cheap) so visibility-only changes — e.g. internal symbol
+        // or NAMESPACE-import edits that don't alter exports — also trigger the
+        // open-file fanout below.
+        let old_contribution = state.package_state.scope_contribution().clone();
+        for event in package_events {
+            if state.documents.contains_key(&event.uri) {
+                continue; // open docs are authoritative; skip
+            }
+            // Use the file cache content (already inserted above). Removal
+            // outcomes deliberately carry `None` and `deleted: true` so package
+            // inputs drop the file instead of preserving stale text.
+            // Uncommitted immediate-pass events carry `deleted: false`; because
+            // the sync pass invalidated the file cache, skipped directory/file
+            // events naturally pass `None`, matching the old inline watched
+            // loop's disk-fallback behavior.
+            let on_disk_text: Option<std::sync::Arc<str>> = if event.deleted {
+                None
+            } else {
+                state
+                    .cross_file_file_cache
+                    .get(&event.uri)
+                    .map(|s| std::sync::Arc::from(s.as_str()))
+            };
+            let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                uri: event.uri.clone(),
+                on_disk_text,
+                deleted: event.deleted,
+            };
+            if let Some(delta) =
+                crate::package_state::event::translate(&mut state.package_inputs, event)
+            {
+                deltas.push(delta);
+            }
+        }
+        // Detect whether this batch carries a prelude rescan (Task 12):
+        // editing a helper that `.Rprofile` sources re-scans the prelude, whose
+        // symbols/packages reach `scripts/` files — files that are NOT
+        // `is_r_source_path` and so are missed by the R/+tests fanout below.
+        // The RProfileChanged delta may appear top-level or nested in the
+        // per-file Batch built by `translate_watched`, so check both. Computed
+        // BEFORE `deltas` is moved into `Batch`.
+        let rprofile_changed = batch_contains_rprofile_changed(&deltas);
+        if !deltas.is_empty() {
+            let batch = crate::package_state::PackageInputDelta::Batch(deltas);
+            state.apply_package_event(&batch);
+            ns_changed = state.package_state.namespace_model() != old_ns_model.as_ref()
+                || state.package_state.scope_contribution() != &old_contribution;
+        }
+        if ns_changed {
+            // Namespace model changed (e.g. roxygen tags changed in an external
+            // edit). Add all open package files (R/ and tests/testthat/) to
+            // affected set so their @import diagnostics are refreshed. When the
+            // prelude rescanned, also add every open workspace R-language file
+            // (incl. `scripts/`), since the prelude contributes to their script
+            // scope.
+            if let Some(ref root) = state.package_inputs.workspace_root.clone() {
+                for open_uri in state.documents.keys() {
+                    if let Ok(p) = open_uri.to_file_path()
+                        && (crate::package_state::is_r_source_path(&p, root).is_some()
+                            || (rprofile_changed
+                                && crate::package_state::is_package_workspace_r_file(&p, root)))
+                        && affected_for_async_set.insert(open_uri.clone())
+                    {
+                        affected_for_async.push(open_uri.clone());
+                    }
+                }
+                // The fanout above misses arbitrary load_all carriers
+                // (root-level analysis.R / scripts/) and their source-graph
+                // neighborhood; widen for them on the async path too.
+                extend_affected_for_load_all_revalidation_from_state(
+                    affected_for_async,
+                    affected_for_async_set,
+                    &state,
+                    root,
+                );
+            }
+        }
+    }
 }
 
 /// Sort watched-file diagnostic fanout by activity and enforce the configured
@@ -6767,6 +6809,16 @@ impl LanguageServer for Backend {
 
             // Close the document (legacy)
             state.close_document(uri);
+
+            // Closing takes watched-resync generation ownership before any
+            // close-driven package mutation and before the spawned
+            // `run_close_resync` below. Watcher events for open documents are
+            // skipped, so a delayed retry that removed state and pruned this
+            // entry must not later apply its stale package removal after this
+            // close has reinstalled disk truth.
+            if has_disk_path {
+                bump_watched_file_resync_generation(&mut state, uri);
+            }
 
             // Snapshot package visibility before applying the close event, so we
             // can detect symbol/import changes caused by switching the closed
@@ -17340,6 +17392,223 @@ mod project_config_initialize_tests {
         assert!(
             affected.is_empty(),
             "stale manifest event must not add publish fanout"
+        );
+    }
+
+    /// A manifest change collected while the file was closed must still lose
+    /// to an open document at apply time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_manifest_apply_skips_open_document_at_apply_time() {
+        let tmp = TempDir::new().unwrap();
+        let old_desc = "Package: oldpkg\nVersion: 0.1.0\n";
+        let open_desc = "Package: openpkg\nVersion: 0.1.0\n";
+        let desc_path = tmp.path().join("DESCRIPTION");
+        fs::write(&desc_path, old_desc).unwrap();
+        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let desc_uri = Url::from_file_path(&desc_path).unwrap();
+        seed_package_description_input(backend, tmp.path(), old_desc).await;
+        open_doc(backend, &desc_uri, "plaintext", 1, open_desc).await;
+
+        let mut affected = Vec::new();
+        apply_watched_manifest_changes(
+            &backend.state,
+            &mut affected,
+            &[WatchedManifestChange {
+                uri: desc_uri,
+                deleted: true,
+                generation_expectation: None,
+            }],
+            false,
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .package_inputs
+                .description
+                .as_ref()
+                .map(|input| input.text.as_ref()),
+            Some(open_desc),
+            "apply-time manifest guard must not let a watched deletion clobber an open buffer"
+        );
+        assert_eq!(
+            state.package_state.workspace().map(|ws| ws.name.as_str()),
+            Some("openpkg"),
+            "open DESCRIPTION state must remain the derived package state"
+        );
+        assert!(
+            affected.is_empty(),
+            "skipped open manifest event must not add publish fanout"
+        );
+    }
+
+    /// Pin the R-file package apply-time generation guard directly: stale
+    /// removed retry events must not clear package inputs, while current
+    /// removed retry events still do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_r_file_apply_respects_removed_expectation_currentness() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let helper_path = tmp.path().join("R").join("helper.R");
+        let helper = "helper_fn <- function() 1\n";
+        fs::write(&helper_path, helper).unwrap();
+        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        seed_package_r_file_input(backend, tmp.path(), "R/helper.R", helper).await;
+        let stale_generation = {
+            let mut state = backend.state.write().await;
+            let stale = bump_watched_file_resync_generation(&mut state, &helper_uri);
+            bump_watched_file_resync_generation(&mut state, &helper_uri);
+            stale
+        };
+
+        let mut affected = Vec::new();
+        let mut affected_set = std::collections::HashSet::new();
+        apply_watched_r_file_package_input_events(
+            &backend.state,
+            &mut affected,
+            &mut affected_set,
+            vec![WatchedPackageInputEvent {
+                uri: helper_uri.clone(),
+                deleted: true,
+                committed: true,
+                generation_expectation: Some(WatchedPackageInputGenerationExpectation {
+                    generation: stale_generation,
+                    kind: WatchedPackageInputOutcomeKind::Removed,
+                }),
+            }],
+            WatchedResyncBatchMode::DelayedUndecodableRetry,
+        )
+        .await;
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .package_inputs
+                .r_files
+                .get(&helper_path)
+                .map(|input| input.text.as_ref()),
+            Some(helper),
+            "stale removed R-file event must not clear package input at apply time"
+        );
+        assert!(affected.is_empty());
+
+        seed_package_r_file_input(backend, tmp.path(), "R/helper.R", helper).await;
+        {
+            let mut state = backend.state.write().await;
+            state.watched_file_resync_generations.remove(&helper_uri);
+        }
+        let mut affected = Vec::new();
+        let mut affected_set = std::collections::HashSet::new();
+        apply_watched_r_file_package_input_events(
+            &backend.state,
+            &mut affected,
+            &mut affected_set,
+            vec![WatchedPackageInputEvent {
+                uri: helper_uri.clone(),
+                deleted: true,
+                committed: true,
+                generation_expectation: Some(WatchedPackageInputGenerationExpectation {
+                    generation: stale_generation,
+                    kind: WatchedPackageInputOutcomeKind::Removed,
+                }),
+            }],
+            WatchedResyncBatchMode::DelayedUndecodableRetry,
+        )
+        .await;
+
+        assert!(
+            !backend
+                .state
+                .read()
+                .await
+                .package_inputs
+                .r_files
+                .contains_key(&helper_path),
+            "current removed R-file event must clear package input"
+        );
+    }
+
+    /// Closing a file after a retry removal pruned the generation entry
+    /// recreates that entry under the close write lock, so stale removed retry
+    /// package events cannot clear the disk truth installed by close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn did_close_generation_bump_blocks_stale_removed_r_file_retry_apply() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let helper_path = tmp.path().join("R").join("helper.R");
+        let helper = "helper_fn <- function() 1\n";
+        fs::write(&helper_path, helper).unwrap();
+        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(&helper_path).unwrap();
+        seed_package_r_file_input(backend, tmp.path(), "R/helper.R", helper).await;
+        {
+            let mut state = backend.state.write().await;
+            state.watched_file_resync_generations.remove(&helper_uri);
+            assert!(
+                !state
+                    .watched_file_resync_generations
+                    .contains_key(&helper_uri),
+                "precondition: retry removal pruned the generation entry"
+            );
+        }
+
+        open_doc(backend, &helper_uri, "r", 1, helper).await;
+        close_doc(backend, &helper_uri).await;
+        let close_generation = {
+            let state = backend.state.read().await;
+            *state
+                .watched_file_resync_generations
+                .get(&helper_uri)
+                .expect("did_close must recreate the generation entry")
+        };
+
+        let mut affected = Vec::new();
+        let mut affected_set = std::collections::HashSet::new();
+        apply_watched_r_file_package_input_events(
+            &backend.state,
+            &mut affected,
+            &mut affected_set,
+            vec![WatchedPackageInputEvent {
+                uri: helper_uri.clone(),
+                deleted: true,
+                committed: true,
+                generation_expectation: Some(WatchedPackageInputGenerationExpectation {
+                    generation: close_generation.wrapping_sub(1),
+                    kind: WatchedPackageInputOutcomeKind::Removed,
+                }),
+            }],
+            WatchedResyncBatchMode::DelayedUndecodableRetry,
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .package_inputs
+                .r_files
+                .get(&helper_path)
+                .map(|input| input.text.as_ref()),
+            Some(helper),
+            "stale removed retry event must not clear package input after close owns the URI"
+        );
+        assert!(
+            state
+                .watched_file_resync_generations
+                .contains_key(&helper_uri),
+            "close-owned generation entry must remain present"
+        );
+        assert!(
+            affected.is_empty(),
+            "stale removed R-file event must not add publish fanout"
         );
     }
 
