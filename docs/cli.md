@@ -192,7 +192,7 @@ Set `RAVEN_DEB_VERSION` in your CI variables to one of the versions listed by `a
 
 ### Scope
 
-`.R` / `.r` files and R Markdown / Quarto files (`.Rmd` / `.qmd`) are all reported. When a workspace walk or a directory argument includes `.Rmd` / `.qmd` files they are analyzed the same way the editor analyzes them: every R chunk body is treated as R code at its document coordinates, while prose, YAML front matter, and non-R chunks (Python, Bash, …) are ignored. Diagnostics are reported at the coordinates of the chunk body line where they occur, so the line and column in `text` / `json` / `sarif` output map directly to the document. Cross-file resolution from chunks works: a `source()` inside a chunk creates a real dependency edge, and missing-file and cross-file scope diagnostics are reported the same as from a `.R` file.
+`.R` / `.r` files and R Markdown / Quarto files (`.Rmd` / `.Rmarkdown` / `.qmd`) are all reported. When a workspace walk or a directory argument includes `.Rmd` / `.Rmarkdown` / `.qmd` files they are analyzed the same way the editor analyzes them: every R chunk body is treated as R code at its document coordinates, while prose, YAML front matter, and non-R chunks (Python, Bash, …) are ignored. Diagnostics are reported at the coordinates of the chunk body line where they occur, so the line and column in `text` / `json` / `sarif` output map directly to the document. Cross-file resolution from chunks works: a `source()` inside a chunk creates a real dependency edge, and missing-file and cross-file scope diagnostics are reported the same as from a `.R` file.
 
 ## `raven lint`
 
@@ -236,7 +236,7 @@ raven lint [OPTIONS] [PATHS...]
 
 `raven lint` runs the native style linter only. Cross-file, undefined-variable, and package diagnostics need a workspace scan; use [`raven check`](#raven-check) for those.
 
-`.R` / `.r` files and R Markdown / Quarto files (`.Rmd` / `.qmd`) are linted. Inside `.Rmd` / `.qmd` files, lint rules apply to R chunk bodies; prose, YAML front matter, and non-R chunks are ignored. `# nolint` / `# nolint start` / `# nolint end` and `# raven: ignore` markers inside chunk bodies work as in plain R files. Other file types are ignored silently. Passing a directory walks it recursively for `.R` / `.r`, `.Rmd`, and `.qmd` files.
+`.R` / `.r` files and R Markdown / Quarto files (`.Rmd` / `.Rmarkdown` / `.qmd`) are linted. Inside `.Rmd` / `.Rmarkdown` / `.qmd` files, lint rules apply to R chunk bodies; prose, YAML front matter, and non-R chunks are ignored. `# nolint` / `# nolint start` / `# nolint end` and `# raven: ignore` markers inside chunk bodies work as in plain R files. Other file types are ignored silently. Passing a directory walks it recursively for `.R` / `.r`, `.Rmd`, `.Rmarkdown`, and `.qmd` files.
 
 ## `raven packages`
 

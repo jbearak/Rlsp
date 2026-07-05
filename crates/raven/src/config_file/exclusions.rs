@@ -68,6 +68,9 @@ impl CompiledWorkspaceExclusions {
     }
 
     pub fn is_excluded_uri(&self, uri: &Url) -> bool {
+        if self.is_empty() {
+            return false;
+        }
         uri.to_file_path()
             .ok()
             .is_some_and(|path| self.is_excluded_path(&path))
@@ -261,6 +264,15 @@ fn compile_prune_matchers(pattern: &str) -> Vec<GlobMatcher> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn empty_exclusions_do_not_exclude_file_uri() {
+        let cfg = CompiledWorkspaceExclusions::default();
+        let uri = Url::from_file_path(std::env::temp_dir().join("anything.R")).unwrap();
+
+        assert!(cfg.is_empty());
+        assert!(!cfg.is_excluded_uri(&uri));
+    }
 
     #[test]
     fn last_match_wins_with_negation() {
