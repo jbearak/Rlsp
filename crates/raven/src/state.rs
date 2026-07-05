@@ -372,6 +372,13 @@ impl Document {
 /// alias buffers map to the same canonical URI, the oldest remaining alias is
 /// used as the live-buffer source; if the canonical URI itself is open, exact
 /// document-store lookup wins before this map is consulted.
+///
+/// Alias graph mirroring follows the same authority rule: an open buffer may
+/// update its own graph URI plus only the canonical roots for which
+/// [`WorldState::open_document_uri_for_authoritative_uri`] currently returns
+/// that buffer's URI. A newer non-authoritative alias can keep its own graph
+/// node fresh, but it must not overwrite the canonical node whose live content
+/// comes from an older alias or from the exact canonical open URI.
 #[derive(Debug, Default, Clone)]
 pub struct OpenDocumentAliases {
     canonical_to_open: HashMap<Url, Vec<Url>>,
@@ -1052,6 +1059,18 @@ impl WorldState {
         roots
     }
 
+    pub fn authoritative_revalidation_roots_for_uri(&self, uri: &Url) -> Vec<Url> {
+        let roots = self.revalidation_roots_for_uri(uri);
+        if !self.documents.contains_key(uri) || self.open_document_aliases.is_empty() {
+            return roots;
+        }
+
+        roots
+            .into_iter()
+            .filter(|root| self.open_document_uri_for_authoritative_uri(root).as_ref() == Some(uri))
+            .collect()
+    }
+
     pub fn affected_open_dependents_after_edit(
         &self,
         edited_uri: &Url,
@@ -1060,7 +1079,7 @@ impl WorldState {
     ) -> Vec<Url> {
         let mut affected = Vec::new();
         let mut seen = HashSet::new();
-        for root in self.revalidation_roots_for_uri(edited_uri) {
+        for root in self.authoritative_revalidation_roots_for_uri(edited_uri) {
             let dependents =
                 crate::cross_file::revalidation::compute_affected_dependents_after_edit(
                     &root,

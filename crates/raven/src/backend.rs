@@ -1552,6 +1552,103 @@ fn collect_close_fanout_siblings(
         .collect()
 }
 
+fn add_close_fanout_uris(
+    state: &WorldState,
+    fanout: &mut Vec<(Url, Option<i32>, Option<u64>)>,
+    additional: impl IntoIterator<Item = Url>,
+) {
+    let mut candidates: Vec<Url> = fanout.iter().map(|(uri, _, _)| uri.clone()).collect();
+    let mut seen: std::collections::HashSet<Url> = candidates.iter().cloned().collect();
+    for uri in additional {
+        if state.documents.contains_key(&uri) && seen.insert(uri.clone()) {
+            candidates.push(uri);
+        }
+    }
+    cap_watched_file_revalidations(
+        &mut candidates,
+        &state.cross_file_activity,
+        state.cross_file_config.max_revalidations_per_trigger,
+    );
+    *fanout = candidates
+        .into_iter()
+        .filter_map(|uri| {
+            state
+                .documents
+                .get(&uri)
+                .map(|doc| (uri, doc.version, Some(doc.revision)))
+        })
+        .collect();
+}
+
+fn remirror_authoritative_alias_roots_after_close(
+    state: &mut WorldState,
+    roots: &[Url],
+    old_meta: Option<&crate::cross_file::CrossFileMetadata>,
+    old_interface_hash: Option<u64>,
+) -> Vec<Url> {
+    let workspace_root = state.workspace_folders.first().cloned();
+    let mut affected = Vec::new();
+    let mut affected_set = std::collections::HashSet::new();
+    let mut edges_changed = false;
+    let mut seen_roots = std::collections::HashSet::new();
+
+    for root in roots {
+        if !seen_roots.insert(root.clone()) {
+            continue;
+        }
+        let Some(open_uri) = state.open_document_uri_for_authoritative_uri(root) else {
+            continue;
+        };
+        let Some(open_doc) = state.document_store.get_without_touch(&open_uri) else {
+            continue;
+        };
+        let meta = open_doc.metadata.clone();
+        let new_interface_hash = open_doc.artifacts.interface_hash;
+        let parent_content =
+            collect_backward_parent_content(state, &open_uri, workspace_root.as_ref(), &meta);
+
+        let result = state.cross_file_graph.update_file(
+            root,
+            &meta,
+            workspace_root.as_ref(),
+            |parent_uri| parent_content.get(parent_uri).cloned(),
+        );
+        edges_changed |= result.edges_changed;
+
+        let interface_changed = old_interface_hash != Some(new_interface_hash);
+        if interface_changed || result.edges_changed {
+            for dep in state.affected_open_dependents_after_edit(
+                root,
+                interface_changed,
+                result.edges_changed,
+            ) {
+                if affected_set.insert(dep.clone()) {
+                    affected.push(dep);
+                }
+            }
+        }
+
+        for child in crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+            root,
+            old_meta,
+            &meta,
+            &state.cross_file_graph,
+            &state.cross_file_meta,
+        ) {
+            if let Some(open_child) = state.open_document_uri_for_authoritative_uri(&child)
+                && affected_set.insert(open_child.clone())
+            {
+                affected.push(open_child);
+            }
+        }
+    }
+
+    if edges_changed {
+        state.recompute_open_neighborhood_pins();
+    }
+    affected
+}
+
 fn extend_with_open_package_docs(
     affected: &mut Vec<Url>,
     affected_set: &mut std::collections::HashSet<Url>,
@@ -2477,6 +2574,48 @@ fn collect_package_r_file_inputs_from_disk(
     r_files
 }
 
+fn package_r_file_input_from_text(
+    text: std::sync::Arc<str>,
+    kind: crate::package_state::RFileKind,
+) -> crate::package_state::RFileInput {
+    let content_digest = crate::package_state::ContentDigest::of(&text);
+    crate::package_state::RFileInput {
+        kind,
+        text,
+        content_digest,
+    }
+}
+
+fn authoritative_package_r_file_uri_for_open_document(
+    state: &WorldState,
+    open_uri: &Url,
+    root: &std::path::Path,
+) -> Option<(Url, std::path::PathBuf, crate::package_state::RFileKind)> {
+    if state.open_document_aliases.is_empty() {
+        let path = open_uri.to_file_path().ok()?;
+        let kind = crate::package_state::is_r_source_path(&path, root)?;
+        return Some((open_uri.clone(), path, kind));
+    }
+
+    let mut raw_match = None;
+    let mut canonical_match = None;
+    for graph_uri in state.authoritative_revalidation_roots_for_uri(open_uri) {
+        let Ok(path) = graph_uri.to_file_path() else {
+            continue;
+        };
+        let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
+            continue;
+        };
+        if &graph_uri == open_uri {
+            raw_match = Some((graph_uri, path, kind));
+        } else if canonical_match.is_none() {
+            canonical_match = Some((graph_uri, path, kind));
+        }
+    }
+
+    canonical_match.or(raw_match)
+}
+
 fn hydrate_package_r_files_from_state(
     state: &WorldState,
     root: &std::path::Path,
@@ -2485,7 +2624,12 @@ fn hydrate_package_r_files_from_state(
     let open_uris: std::collections::HashSet<Url> = state.documents.keys().cloned().collect();
 
     for uri in state.workspace_index_new.uris() {
-        if open_uris.contains(&uri) {
+        let open_or_alias = if state.open_document_aliases.is_empty() {
+            open_uris.contains(&uri)
+        } else {
+            state.is_document_open_or_alias(&uri)
+        };
+        if open_or_alias {
             continue;
         }
         if let Ok(path) = uri.to_file_path()
@@ -2493,21 +2637,13 @@ fn hydrate_package_r_files_from_state(
             && let Some(entry) = state.workspace_index_new.get(&uri)
         {
             let text: std::sync::Arc<str> = entry.contents.to_string().into();
-            let digest = crate::package_state::ContentDigest::of(&text);
-            r_files.insert(
-                path,
-                crate::package_state::RFileInput {
-                    kind,
-                    text,
-                    content_digest: digest,
-                },
-            );
+            r_files.insert(path, package_r_file_input_from_text(text, kind));
         }
     }
 
     for uri in &open_uris {
-        if let Ok(path) = uri.to_file_path()
-            && let Some(kind) = crate::package_state::is_r_source_path(&path, root)
+        if let Some((_, path, kind)) =
+            authoritative_package_r_file_uri_for_open_document(state, uri, root)
         {
             let text: std::sync::Arc<str> = state
                 .documents
@@ -2515,15 +2651,7 @@ fn hydrate_package_r_files_from_state(
                 .map(|d| d.text())
                 .unwrap_or_default()
                 .into();
-            let digest = crate::package_state::ContentDigest::of(&text);
-            r_files.insert(
-                path,
-                crate::package_state::RFileInput {
-                    kind,
-                    text,
-                    content_digest: digest,
-                },
-            );
+            r_files.insert(path, package_r_file_input_from_text(text, kind));
         }
     }
 
@@ -5278,8 +5406,17 @@ impl LanguageServer for Backend {
                 let arc_text: std::sync::Arc<str> = text.as_str().into();
                 let old_ns_model = state.package_state.namespace_model().cloned();
                 let old_contribution = state.package_state.scope_contribution().clone();
+                let package_event_uri = state
+                    .package_inputs
+                    .workspace_root
+                    .as_ref()
+                    .and_then(|root| {
+                        authoritative_package_r_file_uri_for_open_document(&state, &uri, root)
+                            .map(|(event_uri, _, _)| event_uri)
+                    })
+                    .unwrap_or_else(|| uri.clone());
                 let event = crate::package_state::event::HandlerEvent::DidOpen {
-                    uri: uri.clone(),
+                    uri: package_event_uri,
                     text: arc_text,
                 };
                 if let Some(delta) =
@@ -5378,7 +5515,7 @@ impl LanguageServer for Backend {
             let parent_content =
                 collect_backward_parent_content(&state, &uri_clone, workspace_root.as_ref(), &meta);
 
-            let graph_roots = state.revalidation_roots_for_uri(&uri);
+            let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
             let mut result = state.cross_file_graph.update_file(
                 &uri,
                 &meta,
@@ -5746,7 +5883,7 @@ impl LanguageServer for Backend {
                     }
                 }
 
-                let graph_roots = state.revalidation_roots_for_uri(&uri);
+                let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
                 let mut second_result = state.cross_file_graph.update_file(
                     &uri,
                     &meta,
@@ -5874,7 +6011,7 @@ impl LanguageServer for Backend {
                 })
                 .collect();
 
-            let graph_roots = state.revalidation_roots_for_uri(&uri);
+            let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
             let mut second_result = state.cross_file_graph.update_file(
                 &uri,
                 &meta,
@@ -6201,7 +6338,7 @@ impl LanguageServer for Backend {
                     &meta,
                 );
 
-                let graph_roots = state.revalidation_roots_for_uri(&uri);
+                let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
                 let mut graph_result = state.cross_file_graph.update_file(
                     &uri,
                     &meta,
@@ -6266,11 +6403,20 @@ impl LanguageServer for Backend {
             // watched-file events are the only package events that may read
             // from disk and are handled on their own code paths.
             let mut package_visibility_changed = false;
+            let package_event_uri = state
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .and_then(|root| {
+                    authoritative_package_r_file_uri_for_open_document(&state, &uri, root)
+                        .map(|(event_uri, _, _)| event_uri)
+                })
+                .unwrap_or_else(|| uri.clone());
             let in_package_input_path = state
                 .package_inputs
                 .workspace_root
                 .as_ref()
-                .zip(uri.to_file_path().ok())
+                .zip(package_event_uri.to_file_path().ok())
                 .is_some_and(|(root, path)| {
                     crate::package_state::is_r_source_path(&path, root).is_some()
                         || path == root.join("DESCRIPTION")
@@ -6286,7 +6432,7 @@ impl LanguageServer for Backend {
                 let old_ns_model = state.package_state.namespace_model().cloned();
                 let old_contribution = state.package_state.scope_contribution().clone();
                 let event = crate::package_state::event::HandlerEvent::DidChange {
-                    uri: uri.clone(),
+                    uri: package_event_uri,
                     text,
                 };
                 if let Some(delta) =
@@ -6662,27 +6808,33 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
 
-        let package_close_path: bool = {
+        let package_close_uri: Option<Url> = {
             let state = self.state.read().await;
             state
                 .package_inputs
                 .workspace_root
                 .as_ref()
-                .zip(uri.to_file_path().ok())
-                .is_some_and(|(root, path)| {
-                    crate::package_state::is_r_source_path(&path, root).is_some()
-                        || is_package_manifest_path(&path, root)
+                .and_then(|root| {
+                    if let Some((event_uri, _, _)) =
+                        authoritative_package_r_file_uri_for_open_document(&state, uri, root)
+                    {
+                        return Some(event_uri);
+                    }
+                    uri.to_file_path()
+                        .ok()
+                        .and_then(|path| is_package_manifest_path(&path, root).then(|| uri.clone()))
                 })
         };
 
-        // Closing reverts package inputs to DISK truth — never the discarded
-        // buffer (the same convergence rule the cross-file resync below
-        // follows, and what `refresh_rprofile_prelude_from_disk` documents
-        // for `.Rprofile`). A missing or undecodable file yields `None`,
-        // which `HandlerEvent::DidClose` translates into removing the file
-        // from `package_inputs` — so a file deleted from disk while its
-        // buffer was open drops its package-internal symbols on close
-        // instead of retaining them until an (never-coming) watcher event.
+        // Closing reverts package inputs to the canonical slot's next
+        // authoritative source: a remaining live alias if one exists, otherwise
+        // DISK truth (the same convergence rule the cross-file resync below
+        // follows, and what `refresh_rprofile_prelude_from_disk` documents for
+        // `.Rprofile`). A missing or undecodable disk file yields `None`, which
+        // `HandlerEvent::DidClose` translates into removing the file from
+        // `package_inputs` — so a file deleted from disk while its buffer was
+        // open drops its package-internal symbols on close instead of retaining
+        // them until an (never-coming) watcher event.
         //
         // Deliberate double read: the spawned cross-file resync re-reads the
         // same file. Handing this snapshot to the resync would trade
@@ -6692,23 +6844,24 @@ impl LanguageServer for Backend {
         // reads, package and cross-file state briefly reflect different
         // snapshots; the write also fires a watcher CHANGED event whose
         // pipeline re-syncs both, so the straddle self-heals.
-        let close_text: Option<Arc<str>> = if package_close_path {
-            match uri.to_file_path() {
-                Ok(path) => {
-                    tokio::task::spawn_blocking(move || {
-                        // BOM-aware decode (read off the async runtime).
-                        crate::state::read_source(&path)
-                            .ok()
-                            .map(|text| Arc::from(text.as_str()))
-                    })
-                    .await
-                    .unwrap_or(None)
+        let close_text: Option<Arc<str>> =
+            if let Some(package_close_uri) = package_close_uri.clone() {
+                match package_close_uri.to_file_path() {
+                    Ok(path) => {
+                        tokio::task::spawn_blocking(move || {
+                            // BOM-aware decode (read off the async runtime).
+                            crate::state::read_source(&path)
+                                .ok()
+                                .map(|text| Arc::from(text.as_str()))
+                        })
+                        .await
+                        .unwrap_or(None)
+                    }
+                    Err(_) => None,
                 }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // If the closed document is the workspace-root `.Rprofile`, its prelude
         // must be re-scanned from disk after this block: closing discards any
@@ -6765,6 +6918,20 @@ impl LanguageServer for Backend {
                 resync_chunk_kind = state.documents.get(uri).map(|doc| doc.chunk_kind);
             }
 
+            let mut closed_authoritative_roots = Vec::new();
+            if state.open_document_uri_for_authoritative_uri(uri).as_ref() == Some(uri) {
+                closed_authoritative_roots.push(uri.clone());
+            }
+            for alias in state.canonical_uris_for_open_document(uri) {
+                if state
+                    .open_document_uri_for_authoritative_uri(&alias)
+                    .as_ref()
+                    == Some(uri)
+                {
+                    closed_authoritative_roots.push(alias);
+                }
+            }
+
             // Close in new DocumentStore (Requirement 1.5)
             state.document_store.close(uri);
 
@@ -6811,12 +6978,25 @@ impl LanguageServer for Backend {
             let old_ns_model = state.package_state.namespace_model().cloned();
             let old_contribution = state.package_state.scope_contribution().clone();
 
-            // In package mode, update package inputs on close from the disk
-            // snapshot captured above (buffer edits are discarded on close).
-            if package_close_path {
-                let event = crate::package_state::event::HandlerEvent::DidClose {
-                    uri: uri.clone(),
-                    on_disk_text: close_text,
+            // In package mode, update package inputs on close. If another alias
+            // remains authoritative for the same canonical package slot, switch
+            // the slot to that live buffer immediately; otherwise revert to the
+            // disk snapshot captured above.
+            if let Some(package_close_uri) = package_close_uri.clone() {
+                let live_text = state
+                    .open_document_uri_for_authoritative_uri(&package_close_uri)
+                    .and_then(|open_uri| state.documents.get(&open_uri).map(|doc| doc.text()))
+                    .map(Arc::<str>::from);
+                let event = if let Some(text) = live_text {
+                    crate::package_state::event::HandlerEvent::DidChange {
+                        uri: package_close_uri,
+                        text,
+                    }
+                } else {
+                    crate::package_state::event::HandlerEvent::DidClose {
+                        uri: package_close_uri,
+                        on_disk_text: close_text.clone(),
+                    }
                 };
                 if let Some(delta) =
                     crate::package_state::event::translate(&mut state.package_inputs, event)
@@ -6825,7 +7005,7 @@ impl LanguageServer for Backend {
                 }
             }
 
-            // Workspace-root `.Rprofile` is not a `package_close_path` (it is
+            // Workspace-root `.Rprofile` is not a package close URI (it is
             // neither an R-source path nor a manifest), so the close above does
             // not touch the prelude. Schedule a disk re-scan after the lock to
             // revert any unsaved buffer edits (off-lock; the scan follows
@@ -6861,47 +7041,55 @@ impl LanguageServer for Backend {
             let pkg_visibility_changed = state.package_state.namespace_model()
                 != old_ns_model.as_ref()
                 || state.package_state.scope_contribution() != &old_contribution;
-            if pkg_visibility_changed {
-                if let Some(root) = state.package_inputs.workspace_root.clone() {
-                    sibling_fanout = collect_close_fanout_siblings(&state, uri, &root);
-                    // Close-time visibility changes must also reach
-                    // devtools::load_all() carriers (root-level analysis.R,
-                    // scripts/) and their source-graph neighborhoods —
-                    // `is_r_source_path` misses those, and every
-                    // watcher-driven visibility fanout already widens this
-                    // way. Re-cap the union so the extension cannot bypass
-                    // `max_revalidations_per_trigger`.
-                    let mut uris: Vec<Url> =
-                        sibling_fanout.iter().map(|(u, _, _)| u.clone()).collect();
-                    let mut seen: std::collections::HashSet<Url> = uris.iter().cloned().collect();
-                    seen.insert(uri.clone());
-                    extend_affected_for_load_all_revalidation_from_state(
-                        &mut uris, &mut seen, &state, &root,
-                    );
-                    cap_watched_file_revalidations(
-                        &mut uris,
-                        &state.cross_file_activity,
-                        state.cross_file_config.max_revalidations_per_trigger,
-                    );
-                    sibling_fanout = uris
-                        .into_iter()
-                        .filter_map(|u| {
-                            let doc = state.documents.get(&u)?;
-                            Some((u, doc.version, Some(doc.revision)))
-                        })
-                        .collect();
-                }
-                // When the disk resync runs, it owns the siblings' marking and
-                // publishing (folded into run_close_resync so an open file
-                // that is both a package sibling and a graph dependent is
-                // force-marked exactly once, and publishes post-commit).
-                // Marking here as well would strand a counter: the resync's
-                // debounced schedule cancels the pending sibling task.
-                if !sibling_fanout.is_empty() && !close_resync {
-                    state
-                        .diagnostics_gate
-                        .mark_force_republish_many(sibling_fanout.iter().map(|(u, _, _)| u));
-                }
+            if pkg_visibility_changed
+                && let Some(root) = state.package_inputs.workspace_root.clone()
+            {
+                sibling_fanout = collect_close_fanout_siblings(&state, uri, &root);
+                // Close-time visibility changes must also reach
+                // devtools::load_all() carriers (root-level analysis.R,
+                // scripts/) and their source-graph neighborhoods —
+                // `is_r_source_path` misses those, and every
+                // watcher-driven visibility fanout already widens this
+                // way. Re-cap the union so the extension cannot bypass
+                // `max_revalidations_per_trigger`.
+                let mut uris: Vec<Url> = sibling_fanout.iter().map(|(u, _, _)| u.clone()).collect();
+                let mut seen: std::collections::HashSet<Url> = uris.iter().cloned().collect();
+                seen.insert(uri.clone());
+                extend_affected_for_load_all_revalidation_from_state(
+                    &mut uris, &mut seen, &state, &root,
+                );
+                cap_watched_file_revalidations(
+                    &mut uris,
+                    &state.cross_file_activity,
+                    state.cross_file_config.max_revalidations_per_trigger,
+                );
+                sibling_fanout = uris
+                    .into_iter()
+                    .filter_map(|u| {
+                        let doc = state.documents.get(&u)?;
+                        Some((u, doc.version, Some(doc.revision)))
+                    })
+                    .collect();
+            }
+            let remirror_affected = remirror_authoritative_alias_roots_after_close(
+                &mut state,
+                &closed_authoritative_roots,
+                resync_old_meta.as_deref(),
+                resync_old_interface_hash,
+            );
+            if !remirror_affected.is_empty() {
+                add_close_fanout_uris(&state, &mut sibling_fanout, remirror_affected);
+            }
+            // When the disk resync runs, it owns the siblings' marking and
+            // publishing (folded into run_close_resync so an open file
+            // that is both a package sibling and a graph dependent is
+            // force-marked exactly once, and publishes post-commit).
+            // Marking here as well would strand a counter: the resync's
+            // debounced schedule cancels the pending sibling task.
+            if !sibling_fanout.is_empty() && !close_resync {
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(sibling_fanout.iter().map(|(u, _, _)| u));
             }
 
             // Invalidate the workspace index entry so the next scan re-reads from disk.
@@ -16842,6 +17030,180 @@ mod project_config_initialize_tests {
         assert!(
             snapshot_diagnostics(&state, &parent_uri).is_empty(),
             "parent scope must see live content from the symlink alias buffer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn package_hydration_uses_authoritative_alias_for_canonical_r_file() {
+        let tmp = TempDir::new().unwrap();
+        let r_dir = tmp.path().join("R");
+        fs::create_dir(&r_dir).unwrap();
+        fs::write(tmp.path().join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(r_dir.join("foo.r"), "disk_only <- function() 1\n").unwrap();
+        let sibling = "disk_only()\n";
+        fs::write(r_dir.join("sibling.R"), sibling).unwrap();
+
+        let (svc, sibling_uri) = open_in_workspace(&tmp, "R/sibling.R", "r", sibling).await;
+        let backend = svc.inner();
+        let canonical_path = r_dir.join("foo.r");
+        let alias_path = r_dir.join("foo.R");
+        let alias_uri = Url::from_file_path(&alias_path).unwrap();
+
+        open_doc(backend, &alias_uri, "r", 1, "live_only <- function() 1\n").await;
+
+        let disk_seed = collect_package_r_file_inputs_from_disk(tmp.path());
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            initialize_package_inputs_from_state(
+                &mut state,
+                tmp.path().to_path_buf(),
+                Some("Package: pkg\n".into()),
+                None,
+                disk_seed,
+                None,
+            );
+        }
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.package_inputs.r_files.contains_key(&alias_path),
+            "raw wrong-case alias must not create a phantom package input"
+        );
+        let canonical_input = state
+            .package_inputs
+            .r_files
+            .get(&canonical_path)
+            .expect("canonical package slot must be hydrated");
+        assert_eq!(&*canonical_input.text, "live_only <- function() 1\n");
+        assert!(
+            !state
+                .package_state
+                .scope_contribution()
+                .r_internal_symbols
+                .contains("disk_only"),
+            "canonical package slot must use live alias text, not stale disk text"
+        );
+        let diagnostics = snapshot_diagnostics(&state, &sibling_uri);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.message.contains("disk_only")),
+            "package sibling must no longer resolve the disk-only symbol; got {diagnostics:?}"
+        );
+    }
+
+    /// A newer symlink alias must keep its own graph node fresh without
+    /// overwriting the canonical graph node owned by the exact canonical open
+    /// buffer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_authoritative_alias_change_does_not_overwrite_canonical_graph_root() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "child_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("child.R"), tmp.path().join("link.R")).unwrap();
+
+        let (svc, child_uri) =
+            open_in_workspace(&tmp, "child.R", "r", "child_fn <- function() 1\n").await;
+        let backend = svc.inner();
+        let link_uri = Url::from_file_path(tmp.path().join("link.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        open_doc(backend, &link_uri, "r", 1, "child_fn <- function() 1\n").await;
+        change_doc(
+            backend,
+            &link_uri,
+            2,
+            "source(\"extra.R\")\nchild_fn <- function() 1\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&child_uri),
+            Some(child_uri.clone()),
+            "exact canonical open URI must outrank symlink aliases"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&link_uri)
+                .iter()
+                .any(|edge| edge.to == extra_uri),
+            "the non-authoritative alias keeps its own graph node fresh"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependencies(&child_uri)
+                .iter()
+                .any(|edge| edge.to == extra_uri),
+            "the non-authoritative alias must not overwrite canonical graph edges"
+        );
+    }
+
+    /// When the authoritative alias closes, the canonical graph node must switch
+    /// to the remaining authoritative alias instead of waiting for a future edit.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_authoritative_alias_remirrors_remaining_alias_to_canonical_root() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "child_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        fs::write(tmp.path().join("driver.R"), "driver <- 1\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("child.R"), tmp.path().join("link-a.R"))
+            .unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("child.R"), tmp.path().join("link-b.R"))
+            .unwrap();
+
+        let (svc, _driver_uri) = open_in_workspace(&tmp, "driver.R", "r", "driver <- 1\n").await;
+        let backend = svc.inner();
+        let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        let link_a_uri = Url::from_file_path(tmp.path().join("link-a.R")).unwrap();
+        let link_b_uri = Url::from_file_path(tmp.path().join("link-b.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        open_doc(backend, &link_a_uri, "r", 1, "child_fn <- function() 1\n").await;
+        open_doc(
+            backend,
+            &link_b_uri,
+            "r",
+            1,
+            "source(\"extra.R\")\nchild_fn <- function() 1\n",
+        )
+        .await;
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.open_document_uri_for_authoritative_uri(&child_uri),
+                Some(link_a_uri.clone()),
+                "oldest alias should initially own the canonical root"
+            );
+            assert!(
+                !state
+                    .cross_file_graph
+                    .get_dependencies(&child_uri)
+                    .iter()
+                    .any(|edge| edge.to == extra_uri),
+                "newer non-authoritative alias must not overwrite the canonical root"
+            );
+        }
+
+        close_doc(backend, &link_a_uri).await;
+
+        let remirrored = wait_for_state(backend, 5_000, |state| {
+            state.open_document_uri_for_authoritative_uri(&child_uri) == Some(link_b_uri.clone())
+                && state
+                    .cross_file_graph
+                    .get_dependencies(&child_uri)
+                    .iter()
+                    .any(|edge| edge.to == extra_uri)
+        })
+        .await;
+        assert!(
+            remirrored,
+            "closing the authoritative alias must remirror the remaining alias metadata"
         );
     }
 
