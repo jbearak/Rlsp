@@ -54,7 +54,7 @@ undefinedVariableSeverity = "warning"
 
 These exclusions are broader than lint overrides: Raven ignores matching files for background workspace indexing, dependency discovery, file-watcher/on-demand indexing, editor diagnostics, package-mode disk seeding, and default `raven check` discovery. Existing index entries that become excluded after a live `raven.toml` reload are removed from Raven's indexes and dependency graph.
 
-Use directory globs such as `generated/**`, `archive/**`, or `**/cache/**` to ignore whole trees. Raven compiles the glob list once when config is recomputed and matches paths relative to the containing workspace root. Patterns are evaluated in order; a leading `!` re-includes matching paths, so `["generated/**", "!generated/keep.R"]` excludes the generated tree except `generated/keep.R`.
+Use directory globs such as `generated/**`, `archive/**`, or `**/cache/**` to ignore whole trees. Raven compiles the glob list once when config is recomputed and matches paths relative to the containing workspace root. `*` and `?` do not cross `/`; use `**` for recursive matches, such as `**/*.log` for `.log` files at any depth. Patterns are evaluated in order; a leading `!` re-includes matching paths, so `["generated/**", "!generated/keep.R"]` excludes the generated tree except `generated/keep.R`.
 
 Raven prunes directories during the serial workspace walk only when a positive directory glob proves every descendant is excluded, such as `generated/**`. If any negated pattern is present, directory pruning is disabled for the list so re-included files are never dropped before they can match. Files are still filtered by the full ordered matcher.
 

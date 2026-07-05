@@ -60,7 +60,7 @@ The whole workspace is always indexed so cross-file resolution is accurate. The 
 exclude = ["generated/**", "archive/**", "!generated/keep.R"]
 ```
 
-`[workspace].exclude` defaults to `[]`. Patterns are project-root-relative globs, matched against paths relative to the containing workspace root. They apply to the workspace index and to default `raven check` discovery. Directory globs like `generated/**` prune whole directories before the parallel parse/index phase; when any negated re-include pattern (`!pattern`) is present, Raven disables directory pruning for the list so a re-included file is never skipped early. The full ordered matcher still filters files, with the last matching pattern winning.
+`[workspace].exclude` defaults to `[]`. Patterns are project-root-relative globs, matched against paths relative to the containing workspace root. `*` and `?` do not cross `/`; use `**` for recursive matches, such as `**/*.log` for `.log` files at any depth. They apply to the workspace index and to default `raven check` discovery. Directory globs like `generated/**` prune whole directories before the parallel parse/index phase; when any negated re-include pattern (`!pattern`) is present, Raven disables directory pruning for the list so a re-included file is never skipped early. The full ordered matcher still filters files, with the last matching pattern winning.
 
 Explicit file arguments bypass these exclusions: `raven check generated/one.R` still reports `generated/one.R` even if `generated/**` is excluded. Directory arguments are discovery walks, so exclusions apply inside them.
 

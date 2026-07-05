@@ -2262,6 +2262,9 @@ fn hydrate_package_r_files_from_state(
         if open_uris.contains(&uri) {
             continue;
         }
+        if state.is_project_excluded_uri(&uri) {
+            continue;
+        }
         if let Ok(path) = uri.to_file_path()
             && let Some(kind) = crate::package_state::is_r_source_path(&path, root)
             && let Some(entry) = state.workspace_index_new.get(&uri)
@@ -2280,6 +2283,9 @@ fn hydrate_package_r_files_from_state(
     }
 
     for uri in &open_uris {
+        if state.is_project_excluded_uri(uri) {
+            continue;
+        }
         if let Ok(path) = uri.to_file_path()
             && let Some(kind) = crate::package_state::is_r_source_path(&path, root)
         {
@@ -5959,9 +5965,9 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
 
-        let package_close_path: bool = {
+        let (package_close_path, package_close_excluded): (bool, bool) = {
             let state = self.state.read().await;
-            state
+            let package_close_path = state
                 .package_inputs
                 .workspace_root
                 .as_ref()
@@ -5969,7 +5975,8 @@ impl LanguageServer for Backend {
                 .is_some_and(|(root, path)| {
                     crate::package_state::is_r_source_path(&path, root).is_some()
                         || is_package_manifest_path(&path, root)
-                })
+                });
+            (package_close_path, state.is_project_excluded_uri(uri))
         };
 
         // Closing reverts package inputs to DISK truth — never the discarded
@@ -5978,8 +5985,9 @@ impl LanguageServer for Backend {
         // for `.Rprofile`). A missing or undecodable file yields `None`,
         // which `HandlerEvent::DidClose` translates into removing the file
         // from `package_inputs` — so a file deleted from disk while its
-        // buffer was open drops its package-internal symbols on close
-        // instead of retaining them until an (never-coming) watcher event.
+        // buffer was open, or a file that is now excluded by `[workspace].exclude`,
+        // drops its package-internal symbols on close instead of retaining them
+        // until an (never-coming) watcher event.
         //
         // Deliberate double read: the spawned cross-file resync re-reads the
         // same file. Handing this snapshot to the resync would trade
@@ -5989,7 +5997,7 @@ impl LanguageServer for Backend {
         // reads, package and cross-file state briefly reflect different
         // snapshots; the write also fires a watcher CHANGED event whose
         // pipeline re-syncs both, so the straddle self-heals.
-        let close_text: Option<Arc<str>> = if package_close_path {
+        let close_text: Option<Arc<str>> = if package_close_path && !package_close_excluded {
             match uri.to_file_path() {
                 Ok(path) => {
                     tokio::task::spawn_blocking(move || {
@@ -7721,6 +7729,9 @@ impl Backend {
     ///
     /// It releases that lock before doing any blocking work. Outside the
     /// lock, in order, it:
+    ///   - removes newly excluded index entries and, when workspace indexing is
+    ///     enabled, rescans the workspace so newly re-included files are merged
+    ///     back into the indexes,
     ///   - re-reads `DESCRIPTION` / `NAMESPACE` on a `packageMode` mode
     ///     switch, then re-applies under a brief write lock,
     ///   - re-registers the completion capability if `triggerOnOpenParen`
@@ -7900,17 +7911,100 @@ impl Backend {
         }
 
         if workspace_exclusions_changed {
-            let mut state = self.state.write().await;
-            let affected = remove_project_excluded_index_entries(&mut state);
-            if !affected.is_empty() {
-                state
-                    .diagnostics_gate
-                    .mark_force_republish_many(affected.iter());
-            }
+            let (affected_len, scan_inputs) = {
+                let mut state = self.state.write().await;
+                let affected = remove_project_excluded_index_entries(&mut state);
+                if !affected.is_empty() {
+                    state
+                        .diagnostics_gate
+                        .mark_force_republish_many(affected.iter());
+                }
+                let scan_inputs = state.cross_file_config.index_workspace.then(|| {
+                    (
+                        state.workspace_folders.clone(),
+                        state.cross_file_config.max_chain_depth,
+                        state.workspace_exclusions.clone(),
+                        state
+                            .workspace_folders
+                            .first()
+                            .and_then(|u| u.to_file_path().ok()),
+                    )
+                });
+                (affected.len(), scan_inputs)
+            };
             log::info!(
                 "Workspace exclusions changed; removed {} affected indexed/open entries",
-                affected.len()
+                affected_len
             );
+
+            if let Some((folders, max_chain_depth, workspace_exclusions, root_for_pkg_inputs)) =
+                scan_inputs.filter(|(folders, _, _, _)| !folders.is_empty())
+            {
+                let scan_result = tokio::task::spawn_blocking(move || {
+                    crate::state::scan_workspace_with_exclusions(
+                        &folders,
+                        max_chain_depth,
+                        &workspace_exclusions,
+                    )
+                })
+                .await;
+
+                match scan_result {
+                    Ok((index, cross_file_entries, new_index_entries)) => {
+                        let (desc_text, ns_text, rprofile_scan) =
+                            if let Some(ref root) = root_for_pkg_inputs {
+                                let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
+                                    .ok()
+                                    .map(|s| Arc::from(s.as_str()));
+                                let ns = std::fs::read_to_string(root.join("NAMESPACE"))
+                                    .ok()
+                                    .map(|s| Arc::from(s.as_str()));
+                                let scan =
+                                    crate::package_state::rprofile::scan_workspace_rprofile(root);
+                                (desc, ns, Some(scan))
+                            } else {
+                                (None, None, None)
+                            };
+
+                        let (package_library, packages_enabled) = {
+                            let mut state = self.state.write().await;
+                            state.apply_workspace_index(
+                                index,
+                                cross_file_entries,
+                                new_index_entries,
+                            );
+                            if let Some(root) = root_for_pkg_inputs {
+                                initialize_package_inputs_from_state(
+                                    &mut state,
+                                    root,
+                                    desc_text,
+                                    ns_text,
+                                    Default::default(),
+                                    rprofile_scan,
+                                );
+                            } else {
+                                state.apply_package_event(
+                                    &crate::package_state::PackageInputDelta::Initial,
+                                );
+                            }
+                            (
+                                state.package_library.clone(),
+                                state.cross_file_config.packages_enabled
+                                    && state.package_library_ready
+                                    && !package_settings_changed,
+                            )
+                        };
+
+                        if packages_enabled {
+                            prefetch_packages_for_open_documents(&self.state, &package_library)
+                                .await;
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("Workspace exclusion reload scan task failed: {}", err);
+                    }
+                }
+            }
         }
 
         // --- Package mode rebuild: repopulate inputs after mode switch ---
@@ -14513,6 +14607,75 @@ mod project_config_initialize_tests {
         assert_eq!(backend.state.read().await.lint_config.line_length, 140);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_exclusion_reload_reindexes_newly_included_files() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        let generated_path = tmp.path().join("generated").join("helper.R");
+        fs::write(&generated_path, "generated_fn <- function() 1\n").unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        let generated_uri = Url::from_file_path(&generated_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        {
+            let state = backend.state.read().await;
+            assert!(state.workspace_exclusions.is_excluded_uri(&generated_uri));
+            assert!(
+                state.workspace_index_new.get(&generated_uri).is_none(),
+                "precondition: excluded file must not already be indexed"
+            );
+        }
+
+        fs::write(tmp.path().join("raven.toml"), "[workspace]\nexclude = []\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.workspace_exclusions.is_excluded_uri(&generated_uri),
+            "reload must pick up the removed exclusion"
+        );
+        assert!(
+            state.workspace_index_new.get(&generated_uri).is_some(),
+            "newly re-included file must be merged into the unified workspace index"
+        );
+        assert!(
+            state
+                .cross_file_workspace_index
+                .get_metadata(&generated_uri)
+                .is_some(),
+            "newly re-included file must be merged into the legacy cross-file index"
+        );
+        assert!(
+            state.workspace_index.contains_key(&generated_uri),
+            "newly re-included file must be merged into the legacy document index"
+        );
+    }
+
     #[tokio::test]
     async fn watched_files_ignores_home_lintr_event_when_home_lintr_disabled() {
         use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
@@ -17544,6 +17707,56 @@ mod project_config_initialize_tests {
         assert!(
             !state.package_inputs.r_files.contains_key(&helper_path),
             "closing a disk-deleted package source must drop its package input"
+        );
+    }
+
+    /// Closing a project-excluded package source must converge package inputs to
+    /// "not present", even if the file still exists on disk. Otherwise an
+    /// excluded `R/generated.R` re-enters package mode as soon as its buffer is
+    /// closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_of_project_excluded_package_source_removes_package_input() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"R/generated.R\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("DESCRIPTION"),
+            "Package: testpkg\nVersion: 1.0\n",
+        )
+        .unwrap();
+        let disk = "excluded_fn <- function() 1\n";
+        fs::write(tmp.path().join("R").join("generated.R"), disk).unwrap();
+        let (svc, generated_uri) = open_in_workspace(&tmp, "R/generated.R", "r", disk).await;
+        let backend = svc.inner();
+        let generated_path = tmp.path().join("R").join("generated.R");
+
+        {
+            let mut state = backend.state.write().await;
+            assert!(state.workspace_exclusions.is_excluded_uri(&generated_uri));
+            state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+            state.package_inputs.description = Some(crate::package_state::DescriptionInput {
+                text: "Package: testpkg\nVersion: 1.0\n".into(),
+            });
+        }
+
+        close_doc(backend, &generated_uri).await;
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.package_inputs.r_files.contains_key(&generated_path),
+            "excluded package source must not be restored from disk on close"
+        );
+        assert!(
+            !state
+                .package_state
+                .scope_contribution()
+                .r_internal_symbols
+                .contains("excluded_fn"),
+            "symbols from an excluded package source must not persist after close"
         );
     }
 

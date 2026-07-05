@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobMatcher};
+use globset::{Glob, GlobBuilder, GlobMatcher};
 use serde_json::Value;
 use tower_lsp::lsp_types::Url;
 
@@ -139,7 +139,7 @@ pub fn compile_workspace_exclusions(
         let Some((negated, pattern)) = normalize_pattern(raw) else {
             continue;
         };
-        let glob = match Glob::new(&pattern) {
+        let glob = match workspace_glob(&pattern) {
             Ok(glob) => glob,
             Err(err) => {
                 log::warn!("raven.toml: invalid workspace.exclude glob {raw:?}: {err}");
@@ -193,6 +193,10 @@ fn normalize_pattern(raw: &str) -> Option<(bool, String)> {
     Some((negated, pattern))
 }
 
+fn workspace_glob(pattern: &str) -> Result<Glob, globset::Error> {
+    GlobBuilder::new(pattern).literal_separator(true).build()
+}
+
 fn compile_prune_matchers(pattern: &str) -> Vec<GlobMatcher> {
     let Some(prefix) = pattern.strip_suffix("/**") else {
         return Vec::new();
@@ -202,12 +206,12 @@ fn compile_prune_matchers(pattern: &str) -> Vec<GlobMatcher> {
     }
 
     let mut matchers = Vec::new();
-    if let Ok(glob) = Glob::new(prefix) {
+    if let Ok(glob) = workspace_glob(prefix) {
         matchers.push(glob.compile_matcher());
     }
     if let Some(stripped) = prefix.strip_prefix("**/")
         && !stripped.is_empty()
-        && let Ok(glob) = Glob::new(stripped)
+        && let Ok(glob) = workspace_glob(stripped)
     {
         matchers.push(glob.compile_matcher());
     }
@@ -247,5 +251,45 @@ mod tests {
         assert!(cfg.can_prune_directory(&root.join("generated")));
         assert!(cfg.is_excluded_path(&root.join("generated/drop.R")));
         assert!(!cfg.is_excluded_path(&root.join("other/generated/drop.R")));
+    }
+
+    #[test]
+    fn single_star_does_not_cross_directory_separator() {
+        let root = PathBuf::from("/workspace");
+        let cfg = compile_workspace_exclusions(
+            &json!({ "workspace": { "exclude": ["generated/*"] } }),
+            vec![root.clone()],
+        );
+
+        assert!(cfg.is_excluded_path(&root.join("generated/file.R")));
+        assert!(
+            !cfg.is_excluded_path(&root.join("generated/nested/file.R")),
+            "single-star globs must not match through '/'"
+        );
+    }
+
+    #[test]
+    fn double_star_crosses_directory_separator() {
+        let root = PathBuf::from("/workspace");
+        let cfg = compile_workspace_exclusions(
+            &json!({ "workspace": { "exclude": ["generated/**"] } }),
+            vec![root.clone()],
+        );
+
+        assert!(cfg.is_excluded_path(&root.join("generated/file.R")));
+        assert!(cfg.is_excluded_path(&root.join("generated/nested/file.R")));
+    }
+
+    #[test]
+    fn recursive_directory_glob_prunes_any_matching_directory() {
+        let root = PathBuf::from("/workspace");
+        let cfg = compile_workspace_exclusions(
+            &json!({ "workspace": { "exclude": ["**/generated/**"] } }),
+            vec![root.clone()],
+        );
+
+        assert!(cfg.can_prune_directory(&root.join("generated")));
+        assert!(cfg.can_prune_directory(&root.join("pkg/generated")));
+        assert!(cfg.is_excluded_path(&root.join("pkg/generated/file.R")));
     }
 }
