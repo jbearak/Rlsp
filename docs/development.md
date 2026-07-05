@@ -285,6 +285,8 @@ Key properties (details in the function's doc comment):
 - `old_meta` (for working-directory-change child invalidation) is caller-supplied: the close path must capture it **before** the document stores are wiped, because the unsaved buffer's metadata lives only there.
 - The publish tail (activity-capped fanout → `mark_force_republish_many` → `publish_diagnostics_for_uris_bounded`) stays caller-owned: watched-files defers it to the end of its batch; the close path runs it per close after unioning its pre-close dependent walk with the post-commit one.
 
+Watched-file invalid UTF-8 is treated as potentially transient on the immediate pass: the resync skips state removal and schedules one delayed retry. The retry captures the watched-file generation for that URI, so any newer CREATE/CHANGE/DELETE supersedes it before disk I/O or under the commit lock. If the delayed retry still sees invalid bytes and its generation is current, it runs with invalid-encoding-as-missing semantics and removes the same graph/index/package state a missing file would remove.
+
 ### Interactive request cancellation
 
 Raven keeps `tower-lsp` at `.concurrency_level(1)` to preserve ordered text sync, which means tower-lsp's built-in `$/cancelRequest` notification can be delayed behind the in-flight request it is supposed to cancel. `start_lsp()` wraps the `LspService` in `RequestCancellationService`, which intercepts `$/cancelRequest` synchronously in `Service::call` and records cancellations in a request-id keyed registry before tower-lsp queues the notification.

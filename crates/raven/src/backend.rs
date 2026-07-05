@@ -2432,6 +2432,12 @@ fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<U
     state.cross_file_file_cache.invalidate(uri);
     state.cross_file_workspace_index.invalidate(uri);
     state.cross_file_meta.remove(uri);
+    // Prune the per-URI coalescing entry with the rest of the closed-file
+    // state. A delayed retry that captured an older generation treats the
+    // missing entry as a mismatch; if the URI is later recreated, its new
+    // generation comes from the state-wide counter and cannot reuse the old
+    // value.
+    state.watched_file_resync_generations.remove(uri);
     // The legacy startup-scan document map is a content-provider tier of its
     // own (`DefaultContentProvider` consults it before the file cache) and an
     // `exists_cached` source; leaving the entry would keep reporting a
@@ -2511,15 +2517,42 @@ struct WatchedResyncItem {
     generation: u64,
 }
 
+#[derive(Clone, Copy)]
+enum WatchedResyncBatchMode {
+    Immediate,
+    DelayedUndecodableRetry,
+}
+
+impl WatchedResyncBatchMode {
+    fn include_uncommitted_package_events(self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    fn schedule_undecodable_retries(self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    fn undecodable_as_missing(self) -> bool {
+        matches!(self, Self::DelayedUndecodableRetry)
+    }
+}
+
+struct WatchedPackageInputEvent {
+    uri: Url,
+    deleted: bool,
+    committed: bool,
+}
+
 const WATCHED_UNDECODABLE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn bump_watched_file_resync_generation(state: &mut WorldState, uri: &Url) -> u64 {
-    let generation = state
+    state.watched_file_resync_generation_counter =
+        state.watched_file_resync_generation_counter.wrapping_add(1);
+    let generation = state.watched_file_resync_generation_counter;
+    state
         .watched_file_resync_generations
-        .entry(uri.clone())
-        .or_insert(0);
-    *generation = generation.wrapping_add(1);
-    *generation
+        .insert(uri.clone(), generation);
+    generation
 }
 
 fn watched_file_resync_generation_matches(
@@ -3139,8 +3172,7 @@ fn spawn_watched_undecodable_retry(
             traversal_truncation,
             vec![item],
             affected,
-            false,
-            true,
+            WatchedResyncBatchMode::DelayedUndecodableRetry,
         )
         .await;
     });
@@ -3148,20 +3180,26 @@ fn spawn_watched_undecodable_retry(
 
 /// Run the CREATED/CHANGED disk-resync tail for watched files: commit any
 /// readable disk state (or delayed invalid-final removal), update package
-/// inputs from the committed outcomes, then cap, force-mark, and publish the
-/// affected open documents.
+/// inputs from the caller-selected event set, then cap, force-mark, and
+/// publish the affected open documents.
+///
+/// [`WatchedResyncBatchMode::Immediate`] preserves pre-#564 behavior: package
+/// translation sees every watched item, including directory events whose file
+/// resync skips after failing to read the directory as source text.
+/// [`WatchedResyncBatchMode::DelayedUndecodableRetry`] feeds only committed
+/// outcomes to package translation so superseded/skipped retries cannot touch
+/// package state; a newer watched event owns convergence.
 async fn run_watched_resync_batch(
     state_arc: Arc<RwLock<WorldState>>,
     client: Client,
     traversal_truncation: Arc<TraversalTruncationState>,
     uris_to_update: Vec<WatchedResyncItem>,
     mut affected_for_async: Vec<Url>,
-    schedule_undecodable_retries: bool,
-    undecodable_as_missing: bool,
+    mode: WatchedResyncBatchMode,
 ) {
     let mut affected_for_async_set: std::collections::HashSet<Url> =
         affected_for_async.iter().cloned().collect();
-    let mut committed_events: Vec<(Url, bool)> = Vec::new();
+    let mut package_input_events: Vec<WatchedPackageInputEvent> = Vec::new();
 
     for item in &uris_to_update {
         // Capture old metadata before the disk read (for WD change
@@ -3181,7 +3219,7 @@ async fn run_watched_resync_batch(
             &item.uri,
             None,
             old_meta,
-            undecodable_as_missing,
+            mode.undecodable_as_missing(),
             Some(item.generation),
         )
         .await
@@ -3195,7 +3233,11 @@ async fn run_watched_resync_batch(
                         affected_for_async.push(dep);
                     }
                 }
-                committed_events.push((item.uri.clone(), false));
+                package_input_events.push(WatchedPackageInputEvent {
+                    uri: item.uri.clone(),
+                    deleted: false,
+                    committed: true,
+                });
                 log::trace!("Updated workspace index for: {}", item.uri);
             }
             ResyncOutcome::Removed {
@@ -3206,20 +3248,35 @@ async fn run_watched_resync_batch(
                         affected_for_async.push(dep);
                     }
                 }
-                committed_events.push((item.uri.clone(), true));
+                package_input_events.push(WatchedPackageInputEvent {
+                    uri: item.uri.clone(),
+                    deleted: true,
+                    committed: true,
+                });
                 log::trace!("Removed watched file state during resync: {}", item.uri);
             }
-            ResyncOutcome::SkippedInvalidEncoding if schedule_undecodable_retries => {
+            ResyncOutcome::SkippedInvalidEncoding if mode.schedule_undecodable_retries() => {
                 spawn_watched_undecodable_retry(
                     state_arc.clone(),
                     client.clone(),
                     traversal_truncation.clone(),
                     item.clone(),
                 );
+                package_input_events.push(WatchedPackageInputEvent {
+                    uri: item.uri.clone(),
+                    deleted: false,
+                    committed: false,
+                });
             }
             ResyncOutcome::Vetoed
             | ResyncOutcome::SkippedInvalidEncoding
-            | ResyncOutcome::Skipped => {}
+            | ResyncOutcome::Skipped => {
+                package_input_events.push(WatchedPackageInputEvent {
+                    uri: item.uri.clone(),
+                    deleted: false,
+                    committed: false,
+                });
+            }
         }
     }
 
@@ -3230,6 +3287,10 @@ async fn run_watched_resync_batch(
     // synchronous DELETED watched branch.
     {
         let mut state = state_arc.write().await;
+        let package_events: Vec<_> = package_input_events
+            .iter()
+            .filter(|event| event.committed || mode.include_uncommitted_package_events())
+            .collect();
         // Gate on any package source file — `is_r_source_path` matches both
         // `R/` and `tests/testthat/`. Without the `tests/` branch, external
         // edits that touch only test files (e.g. `git checkout` on a topic
@@ -3238,8 +3299,8 @@ async fn run_watched_resync_batch(
         let model_rprofile = state.package_inputs.model_rprofile;
         let rprofile_sourced = &state.package_inputs.rprofile_sourced_files;
         let has_pkg_files = root_for_check.as_ref().is_some_and(|root| {
-            committed_events.iter().any(|(u, _)| {
-                u.to_file_path().ok().is_some_and(|p| {
+            package_events.iter().any(|event| {
+                event.uri.to_file_path().ok().is_some_and(|p| {
                     crate::package_state::is_r_source_path(&p, root).is_some()
                         || is_package_source_dir(&p, root)
                         // data/ and data-raw/ CREATED/CHANGED events also
@@ -3266,25 +3327,29 @@ async fn run_watched_resync_batch(
             // internal symbol or NAMESPACE-import edits that don't alter
             // exports — also trigger the open-file fanout below.
             let old_contribution = state.package_state.scope_contribution().clone();
-            for (uri, deleted) in &committed_events {
-                if state.documents.contains_key(uri) {
+            for event in package_events {
+                if state.documents.contains_key(&event.uri) {
                     continue; // open docs are authoritative; skip
                 }
                 // Use the file cache content (already inserted above). Removal
                 // outcomes deliberately carry `None` and `deleted: true` so
-                // package inputs drop the file instead of preserving stale text.
-                let on_disk_text: Option<std::sync::Arc<str>> = if *deleted {
+                // package inputs drop the file instead of preserving stale
+                // text. Uncommitted immediate-pass events carry `deleted:
+                // false`; because the sync pass invalidated the file cache,
+                // skipped directory/file events naturally pass `None`, matching
+                // the old inline watched loop's disk-fallback behavior.
+                let on_disk_text: Option<std::sync::Arc<str>> = if event.deleted {
                     None
                 } else {
                     state
                         .cross_file_file_cache
-                        .get(uri)
+                        .get(&event.uri)
                         .map(|s| std::sync::Arc::from(s.as_str()))
                 };
                 let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                    uri: uri.clone(),
+                    uri: event.uri.clone(),
                     on_disk_text,
-                    deleted: *deleted,
+                    deleted: event.deleted,
                 };
                 if let Some(delta) =
                     crate::package_state::event::translate(&mut state.package_inputs, event)
@@ -7160,8 +7225,7 @@ impl LanguageServer for Backend {
                     traversal_truncation,
                     uris_to_update,
                     affected_open_docs,
-                    true,
-                    false,
+                    WatchedResyncBatchMode::Immediate,
                 )
                 .await;
             });
@@ -16653,6 +16717,40 @@ mod project_config_initialize_tests {
         );
     }
 
+    /// A watched CHANGED on the package `R/` directory must still run the
+    /// package-input directory rescan even though the cross-file file resync
+    /// skips after failing to read the directory as source text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_changed_on_package_r_directory_rescans_r_files() {
+        let tmp = TempDir::new().unwrap();
+        let r_dir = tmp.path().join("R");
+        fs::create_dir(&r_dir).unwrap();
+        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        backend.state.write().await.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+
+        let helper_path = r_dir.join("helper.R");
+        let helper = "helper_fn <- function() 1\n";
+        fs::write(&helper_path, helper).unwrap();
+
+        let r_dir_uri = Url::from_file_path(&r_dir).unwrap();
+        send_watched_change(backend, &r_dir_uri).await;
+
+        let rescanned = wait_for_state(backend, 5_000, |state| {
+            state
+                .package_inputs
+                .r_files
+                .get(&helper_path)
+                .is_some_and(|input| input.text.as_ref() == helper)
+        })
+        .await;
+        assert!(
+            rescanned,
+            "a directory-only watched event on R/ must hydrate new package R files"
+        );
+    }
+
     /// Issue #564: when a watched CHANGED read sees invalid UTF-8 and the
     /// delayed retry still sees invalid UTF-8, the file converges like a
     /// deletion instead of retaining its previous graph/index/package state
@@ -16678,6 +16776,17 @@ mod project_config_initialize_tests {
             "precondition: helper disk state installed"
         );
         seed_package_r_file_input(backend, tmp.path(), "R/helper.R", helper).await;
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_index.insert(
+                helper_uri.clone(),
+                crate::state::Document::new("legacy_helper <- function() 0\n", None),
+            );
+            assert!(
+                state.workspace_index.contains_key(&helper_uri),
+                "precondition: legacy workspace index entry is present"
+            );
+        }
 
         std::fs::write(&helper_path, [0x78u8, 0x80, 0x79]).unwrap();
         send_watched_change(backend, &helper_uri).await;
@@ -16693,8 +16802,12 @@ mod project_config_initialize_tests {
                     .get_metadata(&helper_uri)
                     .is_none()
                 && !state.workspace_index_new.contains(&helper_uri)
+                && !state.workspace_index.contains_key(&helper_uri)
                 && state.cross_file_file_cache.get(&helper_uri).is_none()
                 && !state.package_inputs.r_files.contains_key(&helper_path)
+                && !state
+                    .watched_file_resync_generations
+                    .contains_key(&helper_uri)
                 && !snapshot_diagnostics(state, &main_uri).is_empty()
         })
         .await;
@@ -16771,14 +16884,54 @@ mod project_config_initialize_tests {
         seed_package_r_file_input(backend, tmp.path(), "R/helper.R", old_helper).await;
 
         std::fs::write(&helper_path, [0x78u8, 0x80, 0x79]).unwrap();
+        let first_event_at = tokio::time::Instant::now();
         send_watched_change(backend, &helper_uri).await;
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let first_generation_seen = wait_for_state(backend, 1_000, |state| {
+            state
+                .watched_file_resync_generations
+                .contains_key(&helper_uri)
+        })
+        .await;
+        assert!(
+            first_generation_seen,
+            "first watched event must enter the generation table"
+        );
+        let first_generation = {
+            let state = backend.state.read().await;
+            *state
+                .watched_file_resync_generations
+                .get(&helper_uri)
+                .expect("first generation remains current before second event")
+        };
+
+        let second_event_at = first_event_at + std::time::Duration::from_millis(300);
+        if tokio::time::Instant::now() < second_event_at {
+            tokio::time::sleep_until(second_event_at).await;
+        }
 
         // A second watched event supersedes the first retry, but the file is
         // still invalid long enough that the first retry would remove state if
         // it were not generation-checked.
         send_watched_change(backend, &helper_uri).await;
-        tokio::time::sleep(std::time::Duration::from_millis(850)).await;
+        let second_generation_seen = wait_for_state(backend, 1_000, |state| {
+            state
+                .watched_file_resync_generations
+                .get(&helper_uri)
+                .is_some_and(|generation| *generation != first_generation)
+        })
+        .await;
+        assert!(
+            second_generation_seen,
+            "second watched event must supersede the first generation"
+        );
+
+        let after_first_retry_deadline = first_event_at
+            + WATCHED_UNDECODABLE_RETRY_DELAY
+            + std::time::Duration::from_millis(150);
+        if tokio::time::Instant::now() < after_first_retry_deadline {
+            tokio::time::sleep_until(after_first_retry_deadline).await;
+        }
         {
             let state = backend.state.read().await;
             assert!(
