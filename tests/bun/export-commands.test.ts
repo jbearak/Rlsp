@@ -226,6 +226,37 @@ describe('export commands', () => {
         });
     });
 
+    it('exports .Rmarkdown files without keeping the source extension in the output name', async () => {
+        await withTempDir(async (dir) => {
+            const { registerExportCommands } = await loadExportCommands();
+            const rmdPath = writeRmd(dir, 'analysis.Rmarkdown');
+            const previewPaths = previewArtifactPaths(rmdPath);
+            const registry = new OperationRegistry();
+            let knitCount = 0;
+
+            registerExportCommands({ subscriptions: [] } as any, {
+                resolver: { resolve: async () => fakePandocExecutable(dir) },
+                registry,
+                getOutput: () => outputChannel(),
+                runKnit: async () => {
+                    knitCount++;
+                    await fs.promises.mkdir(previewPaths.previewDir, { recursive: true });
+                    await fs.promises.writeFile(previewPaths.mdPath, '# knitted\n');
+                    return { ok: true };
+                },
+            });
+
+            const command = registeredCommands.get('raven.knit.exportHtml');
+            expect(command).toBeDefined();
+            await command?.(fileUri(rmdPath));
+
+            expect(knitCount).toBe(1);
+            expect(fs.existsSync(path.join(dir, 'analysis.html'))).toBe(true);
+            expect(fs.existsSync(path.join(dir, 'analysis.Rmarkdown.html'))).toBe(false);
+            expect(warnings).toEqual([]);
+        });
+    });
+
     it('clears the progress popover and Export busy state before showing the Saved toast', async () => {
         // Regression: previously `openExportedFile` (which awaits the
         // "Saved …" info notification with Open / View buttons) was

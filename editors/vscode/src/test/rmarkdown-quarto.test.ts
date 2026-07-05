@@ -1,7 +1,7 @@
 /**
  * Integration tests for R Markdown / Quarto chunk detection using demo files.
  *
- * Opens the .Rmd and .qmd files from demo/rmarkdown-quarto/ and verifies
+ * Opens the .Rmd, .Rmarkdown, and .qmd files from demo/rmarkdown-quarto/ and verifies
  * that Raven detects R code chunks (via CodeLens or document symbols).
  */
 
@@ -71,6 +71,26 @@ suite('rmarkdown-quarto chunk detection', function (this: Mocha.Suite) {
         assert.ok(
             lenses.length >= 2,
             `Expected at least 2 CodeLens entries for .Rmd chunks; got ${lenses.length}`,
+        );
+    });
+
+    test('.Rmarkdown file: R chunks are detected', async function () {
+        // Skip if chunk commands are not registered (coexistence mode).
+        const all = new Set(await vscode.commands.getCommands(true));
+        if (!all.has('raven.runCurrentChunk')) {
+            this.skip();
+            return;
+        }
+
+        const { lenses, languageId } = await openAndGetCodeLenses(demoPath('analysis.Rmarkdown'));
+        assert.strictEqual(
+            languageId,
+            'rmd',
+            `Expected .Rmarkdown file to resolve to languageId 'rmd', got '${languageId}'`,
+        );
+        assert.ok(
+            lenses.length >= 2,
+            `Expected at least 2 CodeLens entries for .Rmarkdown chunks; got ${lenses.length}`,
         );
     });
 

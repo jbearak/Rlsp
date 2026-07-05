@@ -1,6 +1,6 @@
 # Syntax Highlighting
 
-Raven contributes syntax highlighting in three ways: LSP semantic tokens for R function names (including inside R chunks of `.Rmd` / `.qmd` documents), TextMate grammars for R, R Markdown, JAGS, Stan, and R package development files, and a GitHub-themed highlighter for the rendered HTML output of `Raven: Knit Preview`. The R and R Markdown grammars are vendored from [REditorSupport/vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax) (MIT) so `.R` and `.Rmd` files highlight out of the box, including in remote workspaces; siblings that ship the same grammar are preferred when installed (see below). For JAGS, Stan, and the package infrastructure files, Raven ships the grammar itself because VS Code doesn't bundle one.
+Raven contributes syntax highlighting in three ways: LSP semantic tokens for R function names (including inside R chunks of `.Rmd` / `.Rmarkdown` / `.qmd` documents), TextMate grammars for R, R Markdown, JAGS, Stan, and R package development files, and a GitHub-themed highlighter for the rendered HTML output of `Raven: Knit Preview`. The R and R Markdown grammars are vendored from [REditorSupport/vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax) (MIT) so `.R`, `.Rmd`, and `.Rmarkdown` files highlight out of the box, including in remote workspaces; siblings that ship the same grammar are preferred when installed (see below). For JAGS, Stan, and the package infrastructure files, Raven ships the grammar itself because VS Code doesn't bundle one.
 
 ## R
 
@@ -11,7 +11,7 @@ Raven emits LSP semantic tokens for R function names. The token legend contains 
 
 This is intentionally narrow. The goal is to catch call and definition sites reliably via the tree-sitter AST, then let the TextMate grammar handle everything else (comments, strings, numbers, operators, roxygen tags, constants, storage types, brackets). Semantic tokens augment the grammar; they don't replace it.
 
-Semantic tokens fire inside `R` chunks of `.Rmd` / `.qmd` documents too. Raven walks the document chunk-by-chunk (via the same chunk detector used for the document outline), parses each R chunk body in isolation with tree-sitter, and rebases the tokens onto the full document so VS Code paints them in the editor. Non-R chunks (Python, SQL, Bash, etc.) are intentionally skipped — Raven is an R language server.
+Semantic tokens fire inside `R` chunks of `.Rmd` / `.Rmarkdown` / `.qmd` documents too. Raven walks the document chunk-by-chunk (via the same chunk detector used for the document outline), parses each R chunk body in isolation with tree-sitter, and rebases the tokens onto the full document so VS Code paints them in the editor. Non-R chunks (Python, SQL, Bash, etc.) are intentionally skipped — Raven is an R language server.
 
 Raven isn't the only R language server that emits semantic tokens — the one bundled with the full `REditorSupport.r` extension (distinct from the grammar-only `REditorSupport.r-syntax` discussed below) also does, with broader coverage. See [Coexistence](./coexistence.md) if you're running both.
 
@@ -37,11 +37,11 @@ Raven runs on the **workspace extension host** because it ships an LSP binary. I
 
 Raven therefore vendors the R and R Markdown grammars from REditorSupport (MIT) directly into `editors/vscode/syntaxes/r.tmLanguage.json` and `editors/vscode/syntaxes/rmd.tmLanguage.json`. The provenance and sync procedure live in `editors/vscode/syntaxes/SOURCE.md`. With this contribution in place:
 
-- `.Rmd` files highlight out of the box, with Markdown prose styling, R code chunks, embedded highlighting for a dozen other languages in their fenced blocks, and inline `` `r ` `` expressions.
+- `.Rmd` / `.Rmarkdown` files highlight out of the box, with Markdown prose styling, R code chunks, embedded highlighting for a dozen other languages in their fenced blocks, and inline `` `r ` `` expressions.
 - The knit pipeline's R-chunk tokenizer always finds a grammar, even in fresh remote sessions where the user hasn't (and can't) install a UI-only sibling.
 - Sibling grammars still win when present. The priority lists differ by file type:
   - **`.R` files:** `REditorSupport.r-syntax` → `REditorSupport.r` → `vscode.r` → Raven's vendored copy.
-  - **`.Rmd` files:** `REditorSupport.r-syntax` → `REditorSupport.r` → Raven's vendored copy. `vscode.r` is intentionally absent — the VS Code built-in only contributes `source.r`, never the R Markdown grammar.
+  - **`.Rmd` / `.Rmarkdown` files:** `REditorSupport.r-syntax` → `REditorSupport.r` → Raven's vendored copy. `vscode.r` is intentionally absent — the VS Code built-in only contributes `source.r`, never the R Markdown grammar.
   A user with the upstream extension keeps the freshest grammar; everyone else gets the synced snapshot Raven shipped.
 
 Raven still does **not** ship a `quarto` grammar — install [`quarto.quarto`](https://marketplace.visualstudio.com/items?itemName=quarto.quarto) for `.qmd` highlighting and preview.

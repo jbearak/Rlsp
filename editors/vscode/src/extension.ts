@@ -82,11 +82,12 @@ const WORD_SEPARATORS = "`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?";
  * across dotted names — see the wordPattern tests in `lsp.test.ts`).
  *
  * The asymmetry is intentional: `editor.wordSeparators` resolves per *document*
- * language, not per embedded code chunk. An `.Rmd`/`.qmd` file is a single
- * `rmd`/`quarto` document mixing Markdown prose with R chunks, so overriding
- * `[rmd]`/`[quarto]` would change word selection in the prose too, not just the
- * R code. We scope the separator override to pure R/JAGS documents and let the
- * shared `wordPattern` cover dotted-name navigation inside `.Rmd`/`.qmd`.
+ * language, not per embedded code chunk. An `.Rmd` / `.Rmarkdown` / `.qmd`
+ * file is a single `rmd`/`quarto` document mixing Markdown prose with R
+ * chunks, so overriding `[rmd]`/`[quarto]` would change word selection in the
+ * prose too, not just the R code. We scope the separator override to pure
+ * R/JAGS documents and let the shared `wordPattern` cover dotted-name
+ * navigation inside `.Rmd` / `.Rmarkdown` / `.qmd`.
  */
 const DOT_IN_WORD_LANGUAGE_IDS = ['r', 'jags'] as const;
 
@@ -270,13 +271,14 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             { scheme: 'untitled', language: 'stan' },
         ],
         synchronize: {
-            // Matches the LSP `documentSelector` above. `.Rmd` / `.qmd` are
-            // included so workspace file events for those documents reach the
-            // server too. `raven.toml` and `.lintr` are watched so portable
-            // project-config edits reach the server for live reconfiguration.
+            // Matches the LSP `documentSelector` above. `.Rmd`,
+            // `.Rmarkdown`, and `.qmd` are included so workspace file events
+            // for those documents reach the server too. `raven.toml` and
+            // `.lintr` are watched so portable project-config edits reach the
+            // server for live reconfiguration.
             fileEvents: [
                 vscode.workspace.createFileSystemWatcher(
-                    '**/*.{r,R,rmd,Rmd,RMD,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}',
+                    '**/*.{r,R,rmd,Rmd,RMD,rmarkdown,Rmarkdown,RMARKDOWN,qmd,Qmd,QMD,jags,Jags,JAGS,bugs,Bugs,BUGS,stan,Stan,STAN}',
                 ),
                 vscode.workspace.createFileSystemWatcher('**/raven.toml'),
                 vscode.workspace.createFileSystemWatcher('**/.lintr'),

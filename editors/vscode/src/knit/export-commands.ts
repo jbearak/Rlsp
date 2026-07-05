@@ -105,11 +105,12 @@ export function registerExportCommands(context: vscode.ExtensionContext, deps: E
             vscode.commands.registerCommand(id, async (uri?: vscode.Uri, opts?: Partial<RunExportOpts>) => {
                 const target = uri ?? vscode.window.activeTextEditor?.document.uri;
                 if (!target) {
-                    void vscode.window.showWarningMessage('No .Rmd file selected to export.');
+                    void vscode.window.showWarningMessage('No R Markdown file selected to export.');
                     return;
                 }
-                if (path.extname(target.fsPath).toLowerCase() !== '.rmd') {
-                    void vscode.window.showWarningMessage(`Cannot export ${path.basename(target.fsPath)} — not an .Rmd file.`);
+                const ext = path.extname(target.fsPath).toLowerCase();
+                if (ext !== '.rmd' && ext !== '.rmarkdown') {
+                    void vscode.window.showWarningMessage(`Cannot export ${path.basename(target.fsPath)} — not an R Markdown file.`);
                     return;
                 }
                 const entry: RunExportOpts['entry'] = opts?.entry ?? 'editor-toolbar';
@@ -351,7 +352,9 @@ async function runExportInner(
     const sourceDir = path.dirname(rmd.fsPath);
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(rmd)?.uri.fsPath;
     const containmentRoot = workspaceFolder ?? sourceDir;
-    const baseName = path.basename(rmd.fsPath).replace(/\.[Rr][Mm][Dd]$/, '');
+    const baseName = path
+        .basename(rmd.fsPath)
+        .replace(/\.(?:[Rr][Mm][Dd]|[Rr][Mm][Aa][Rr][Kk][Dd][Oo][Ww][Nn])$/, '');
     const destPath = path.join(sourceDir, `${baseName}.${EXPORT_EXTENSION[format]}`);
 
     const pdfEngine = resolvePdfEngineSetting(

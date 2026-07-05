@@ -44,7 +44,7 @@ Demonstrates linting configured via `.vscode/settings.json`. Same violations fil
 ### `rmarkdown-quarto/`
 Demonstrates chunk detection in R Markdown and Quarto files.
 
-- `analysis.Rmd` — R Markdown with multiple R chunks
+- `analysis.Rmd` / `analysis.Rmarkdown` — R Markdown with multiple R chunks
 - `report.qmd` — Quarto document with R chunks using `#|` options
 
 ### `data-viewer-smoke.R`
@@ -56,5 +56,5 @@ The mocha integration tests in `editors/vscode/src/test/` exercise the same scen
 
 - `package-mode.test.ts` — package mode visibility and boundary
 - `linting-config.test.ts` — lint diagnostics with `raven.toml` in the workspace
-- `rmarkdown-quarto.test.ts` — chunk detection on .Rmd and .qmd files
+- `rmarkdown-quarto.test.ts` — chunk detection on .Rmd, .Rmarkdown, and .qmd files
 - `data-viewer.test.ts` — data viewer panel lifecycle and scrolling

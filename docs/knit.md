@@ -3,7 +3,7 @@
 Raven ships **`Raven: Knit Preview`** for previewing R Markdown and
 three companion **export** commands (`Knit: Export to HTML…`,
 `Knit: Export to PDF…`, `Knit: Export to Word…`) for saving the
-rendered document next to the source `.Rmd`. The pipeline is
+rendered document next to the source `.Rmd` / `.Rmarkdown`. The pipeline is
 intentionally narrow:
 
 - The preview is always HTML, regardless of the YAML `output:`
@@ -29,8 +29,8 @@ intentionally narrow:
   "press Knit again" placeholder.
 - The preview is saved to a per-session temp directory under
   `<os.tmpdir()>/raven-knit/<workspaceHash>/<sessionId>/preview/<sourceHash>/`,
-  so the `.Rmd`'s own directory stays clean. Export commands write the
-  final file (HTML / PDF / DOCX) next to the `.Rmd`.
+  so the source document's own directory stays clean. Export commands write the
+  final file (HTML / PDF / DOCX) next to the source document.
 - Export commands shell out to Pandoc. PDF export additionally needs a
   PDF engine — `xelatex` (a LaTeX engine) by default, or `wkhtmltopdf`
   (WebKit-based, no LaTeX required).
@@ -47,7 +47,7 @@ using whichever R / Python / SQL / Bash grammar your installed VS
 Code extensions contribute, with Raven's `function` semantic-token
 overlay layered on top of R blocks.
 
-While you edit the source `.Rmd` (or `.qmd`), VS Code's **Outline**
+While you edit the source `.Rmd`, `.Rmarkdown`, or `.qmd`, VS Code's **Outline**
 view and breadcrumbs reflect the document's Markdown heading structure —
 the same structure the preview renders — so you can navigate the document
 as you preview it. See [docs/document-outline.md](document-outline.md).
@@ -55,7 +55,7 @@ as you preview it. See [docs/document-outline.md](document-outline.md).
 See [docs/coexistence.md](coexistence.md) for the surfaces Raven
 defers to other extensions (most notably `quarto.quarto`). The R and
 R Markdown grammars are vendored from REditorSupport upstream and ship
-with Raven, so `.Rmd` files highlight in fresh installs and remote
+with Raven, so `.Rmd` / `.Rmarkdown` files highlight in fresh installs and remote
 workspaces; sibling grammars (`REditorSupport.r-syntax`,
 `REditorSupport.r`, the built-in `vscode.r`) are still preferred when
 installed.
@@ -67,12 +67,13 @@ default `"auto"` setting it is **disabled** when the
 `REditorSupport.r` extension is enabled or VS Code is running as
 Positron — both already provide their own knit affordances. In every
 other environment it is enabled and appears in the command palette on
-`.Rmd` files.
+`.Rmd` / `.Rmarkdown` files.
 
 The command appears in the command palette only when the resolved gate
-is open and the active file is `.Rmd` / `.rmd` / `.RMD`. Invoke it from
+is open and the active file is `.rmd`, `.Rmd`, `.RMD`, `.rmarkdown`,
+`.Rmarkdown`, or `.RMARKDOWN`. Invoke it from
 the active editor, the Command Palette, or the editor-title Raven menu
-when an `.Rmd` file is open.
+when an R Markdown file is open.
 
 ## What it does, step by step
 
@@ -100,8 +101,8 @@ when an `.Rmd` file is open.
    explicit `dev:` in YAML or in a chunk is still honored.
 5. **Working-directory resolution.** Controlled by
    `raven.knit.workingDirectory`:
-   - `document` (default) — directory containing the `.Rmd`.
-   - `project` — workspace folder containing the `.Rmd`. Refuses if
+   - `document` (default) — directory containing the R Markdown source.
+   - `project` — workspace folder containing the R Markdown source. Refuses if
      the document is outside every workspace folder.
    - `current` — substitutes `getwd()` for `root.dir`, so chunks
      evaluate from R's startup working directory.
@@ -173,14 +174,14 @@ when an `.Rmd` file is open.
 
 11. **Reveal.** Raven opens the rendered HTML in a **Knit Preview**
     webview panel beside the editor — no success popover, the panel
-    itself is the signal. Each `.Rmd` gets its own panel; knitting a
-    second `.Rmd` opens a separate panel that stacks as a tab in the
+    itself is the signal. Each R Markdown source gets its own panel; knitting a
+    second source opens a separate panel that stacks as a tab in the
     same "preview" column rather than replacing the first. Re-knitting
-    the same `.Rmd` updates its panel in place. The panel toolbar
+    the same source updates its panel in place. The panel toolbar
     is icon-only and stays single-row at every panel width. From left
     to right it carries:
 
-    - **Knit again** (refresh icon) — re-knits the source `.Rmd` (the
+    - **Knit again** (refresh icon) — re-knits the source document (the
       same code path as invoking `Raven: Knit Preview` from the
       palette).
     - **Export** (share icon) — opens an in-shell popover with three
@@ -270,10 +271,10 @@ when an `.Rmd` file is open.
     ```
 
     Where `<workspaceHash>` is a SHA-256 of the first workspace folder
-    URI (or the `.Rmd`'s parent directory when no workspace is open),
+    URI (or the source document's parent directory when no workspace is open),
     `<sessionId>` is a UUID generated at extension activation so two
     VS Code windows on the same workspace are isolated, and
-    `<sourceHash>` is a SHA-256 of the `.Rmd`'s absolute path. The
+    `<sourceHash>` is a SHA-256 of the source document's absolute path. The
     whole `preview/<sourceHash>` directory is removed when its panel is
     disposed (closed). What happens at window exit depends on
     `raven.knit.persistPreview`:
@@ -309,7 +310,7 @@ locations (Homebrew, RStudio's bundled Pandoc, etc.). If Pandoc is
 missing Raven shows an actionable error with an "Install Pandoc…"
 button.
 
-The exported file is written next to the source `.Rmd` as
+The exported file is written next to the source document as
 `<basename>.{html,pdf,docx}`. Writes are atomic (temp file + rename),
 so a cancelled or failed export never corrupts a prior successful
 output. A notification offers two buttons on success:
@@ -343,7 +344,7 @@ instead and needs no LaTeX). If the engine isn't found Raven surfaces an
 | `number_sections` | Pandoc `--number-sections` (export only) |
 | `highlight` | Pandoc `--highlight-style` (export only; validated against the known list) |
 | `self_contained` | HTML export always passes Pandoc `--embed-resources` for portable output. `self_contained: false` is logged to the `Raven: Knit` output channel and ignored — the linked-assets workflow it implies would require shipping the temp `figure/` dir next to the exported `.html`, and that dir gets purged after the preview panel closes. Ignored for PDF/Word too. |
-| `css` | Pandoc `--css=<absolute path>` (containment-checked against the workspace folder / .Rmd parent) |
+| `css` | Pandoc `--css=<absolute path>` (containment-checked against the workspace folder / source-document parent) |
 | `mathjax` | Pandoc `--mathjax` |
 | `pandoc_args` | Appended verbatim to the Pandoc argv during export (after Raven's own flags), except entries that set destination (`-o`, `--output`) or output format (`-t`, `--to`, `-w`, `--write`) — those are stripped because the editor menu owns them. Stripped entries are logged to the `Raven: Knit` output channel. Preview never invokes Pandoc, so `pandoc_args` does not affect preview output. |
 
@@ -448,12 +449,12 @@ those checks live in the runtime sanitizer only.
 
 | Capability | Where it lives |
 |---|---|
-| Live preview of `.Rmd` or `.qmd` | `quarto.quarto`'s `Quarto: Preview` |
+| Live preview of `.Rmd` / `.Rmarkdown` or `.qmd` | `quarto.quarto`'s `Quarto: Preview` |
 | Auto-refresh / live preview on save | `quarto.quarto`'s `Quarto: Preview`. The Knit Preview panel is a static viewer with a manual Knit again button — not a live recompile. |
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` |
 | `.qmd` grammar / LSP | `quarto.quarto` |
 | html_document-specific YAML options (`theme`, `code_folding`, `df_print`, …) | Out of scope. Honoring them requires becoming `rmarkdown::html_document` (Bootstrap + JS runtime). Use `rmarkdown::render(...)` in the R console for full template fidelity. |
-| `pandoc_args:` *full* passthrough | The editor menu picks export destination (always sibling of the source `.Rmd`) and format, so `-o`/`--output`/`-t`/`--to`/`-w`/`--write` are stripped from YAML's `pandoc_args` and logged. Everything else flows through — see the honored-options table above. |
+| `pandoc_args:` *full* passthrough | The editor menu picks export destination (always sibling of the source document) and format, so `-o`/`--output`/`-t`/`--to`/`-w`/`--write` are stripped from YAML's `pandoc_args` and logged. Everything else flows through — see the honored-options table above. |
 | Custom YAML `knit:` hook dispatch | Run the hook function manually in the R console. |
 | Knit-with-Parameters dialog | Edit YAML defaults, or call `rmarkdown::render(params = list(...))`. |
 | `runtime: shiny` documents | `rmarkdown::run('foo.Rmd')` in the R console. |

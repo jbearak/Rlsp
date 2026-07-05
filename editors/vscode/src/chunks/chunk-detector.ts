@@ -69,7 +69,7 @@ const SECTION_DIVIDER_RE = /^#+(?!')\s*.*[-#+=*]{4,}\s*$/;
  */
 export function classify_chunk_document(file_name_or_uri: string): DocumentKind {
     const lower = file_name_or_uri.toLowerCase();
-    if (lower.endsWith('.rmd') || lower.endsWith('.qmd')) return 'rmd';
+    if (lower.endsWith('.rmd') || lower.endsWith('.rmarkdown') || lower.endsWith('.qmd')) return 'rmd';
     return 'r';
 }
 
@@ -80,7 +80,7 @@ export function classify_chunk_document(file_name_or_uri: string): DocumentKind 
  * have no file extension to inspect — classify correctly under our `rmd` /
  * `quarto` language IDs, then falls back to the extension-based check as a
  * safety net for environments where another extension has claimed the
- * languageId for `.Rmd` / `.qmd` files.
+ * languageId for `.Rmd` / `.Rmarkdown` / `.qmd` files.
  */
 export function classify_chunk_document_for_document(
     document: { languageId: string; uri: { fsPath: string; path: string } },
@@ -93,7 +93,7 @@ export function classify_chunk_document_for_document(
 /**
  * Cheap substring screen for "does this document contain any chunk anchors?".
  * Lets callers skip the per-line detector loop on plain `.R` files that never
- * use cell markers and on prose-only `.Rmd` documents.
+ * use cell markers and on prose-only `.Rmd` / `.Rmarkdown` documents.
  *
  * The screen is intentionally coarse: returning `true` only guarantees that an
  * anchor character sequence is present somewhere in the text, not that any

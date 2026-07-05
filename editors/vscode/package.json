@@ -326,13 +326,13 @@
         "command": "raven.sourceFile",
         "key": "shift+ctrl+enter",
         "mac": "shift+cmd+enter",
-        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)"
+        "when": "editorTextFocus && editorLangId == r && raven.rConsoleEnabled && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)"
       },
       {
         "command": "raven.knit",
         "key": "ctrl+shift+enter",
         "mac": "cmd+shift+enter",
-        "when": "editorTextFocus && raven.rConsoleEnabled && raven.rmdKnit.enabled && (editorLangId == rmd || editorLangId == r) && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+        "when": "editorTextFocus && raven.rConsoleEnabled && raven.rmdKnit.enabled && (editorLangId == rmd || editorLangId == r) && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/"
       },
       {
         "command": "raven.runCurrentChunk",
@@ -439,19 +439,19 @@
         },
         {
           "command": "raven.knit",
-          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/"
         },
         {
           "command": "raven.knit.exportHtml",
-          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/"
         },
         {
           "command": "raven.knit.exportPdf",
-          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/"
         },
         {
           "command": "raven.knit.exportDocx",
-          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/"
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/"
         },
         {
           "command": "raven.knit.openOutputChannel"
@@ -517,62 +517,62 @@
         },
         {
           "command": "raven.runUpwardLines",
-          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "1_run@2"
         },
         {
           "command": "raven.runDownwardLines",
-          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "1_run@3"
         },
         {
           "command": "raven.runCurrentChunk",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "2_chunk_current@1"
         },
         {
           "command": "raven.runCurrentChunkAndMove",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "2_chunk_current@2"
         },
         {
           "command": "raven.runAboveChunks",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "3_chunk_directional@1"
         },
         {
           "command": "raven.runBelowChunks",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "3_chunk_directional@2"
         },
         {
           "command": "raven.runAllChunks",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "3_chunk_directional@3"
         },
         {
           "command": "raven.knit",
-          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/",
           "group": "4_file@1"
         },
         {
           "command": "raven.knit.exportHtml",
-          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/",
           "group": "4_file@2"
         },
         {
           "command": "raven.knit.exportPdf",
-          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/",
           "group": "4_file@3"
         },
         {
           "command": "raven.knit.exportDocx",
-          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD)$/",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/",
           "group": "4_file@4"
         },
         {
           "command": "raven.sourceFile",
-          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "4_file@5"
         },
         {
@@ -587,42 +587,42 @@
         },
         {
           "command": "raven.terminal.runUpwardLines",
-          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "1_run@2"
         },
         {
           "command": "raven.terminal.runDownwardLines",
-          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "1_run@3"
         },
         {
           "command": "raven.terminal.runCurrentChunk",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "2_chunk_current@1"
         },
         {
           "command": "raven.terminal.runCurrentChunkAndMove",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "2_chunk_current@2"
         },
         {
           "command": "raven.terminal.runAboveChunks",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "3_chunk_directional@1"
         },
         {
           "command": "raven.terminal.runBelowChunks",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "3_chunk_directional@2"
         },
         {
           "command": "raven.terminal.runAllChunks",
-          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == rmd || editorLangId == quarto || (editorLangId == r && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "3_chunk_directional@3"
         },
         {
           "command": "raven.terminal.sourceFile",
-          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|qmd|Qmd|QMD)$/)",
+          "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "4_file@1"
         }
       ]
@@ -660,7 +660,10 @@
         "extensions": [
           ".rmd",
           ".Rmd",
-          ".RMD"
+          ".RMD",
+          ".rmarkdown",
+          ".Rmarkdown",
+          ".RMARKDOWN"
         ],
         "configuration": "./language-configuration.json"
       },
@@ -859,13 +862,16 @@
       "files.associations": {
         "*.rmd": "rmd",
         "*.Rmd": "rmd",
-        "*.RMD": "rmd"
+        "*.RMD": "rmd",
+        "*.rmarkdown": "rmd",
+        "*.Rmarkdown": "rmd",
+        "*.RMARKDOWN": "rmd"
       }
     },
     "colors": [
       {
         "id": "raven.chunk.activeBackground",
-        "description": "Background color for runnable R code chunks in .Rmd / .qmd files and `# %%` cells in .R files.",
+        "description": "Background color for runnable R code chunks in .Rmd / .Rmarkdown / .qmd files and `# %%` cells in .R files.",
         "defaults": {
           "dark": "#ffffff0c",
           "light": "#0000000a",
@@ -1401,7 +1407,7 @@
             "Activate Raven's R console, plot viewer, and data viewer unless the REditorSupport (R) extension is enabled or VS Code is running as Positron."
           ],
           "default": "auto",
-          "description": "Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd knit command. The default `auto` resolves to `disabled` when the REditorSupport (R) extension is enabled or VS Code is running as Positron, so Raven doesn't duplicate surfaces those provide. Code intelligence and the help viewer are unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
+          "description": "Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd / .Rmarkdown knit command. The default `auto` resolves to `disabled` when the REditorSupport (R) extension is enabled or VS Code is running as Positron, so Raven doesn't duplicate surfaces those provide. Code intelligence and the help viewer are unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
         },
         "raven.knit.workingDirectory": {
           "type": "string",
@@ -1411,8 +1417,8 @@
             "current"
           ],
           "enumDescriptions": [
-            "Use the directory containing the .Rmd file (default).",
-            "Use the workspace folder containing the .Rmd file.",
+            "Use the directory containing the R Markdown source file (default).",
+            "Use the workspace folder containing the R Markdown source file.",
             "Use R's startup working directory (substitute getwd() for the knitr root.dir)."
           ],
           "default": "document",
@@ -1737,7 +1743,7 @@
         "raven.chunks.highlight.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Highlight R code chunks in .Rmd / .qmd files (and `# %%` cells in .R files) with a background color. Disable to remove the background entirely."
+          "description": "Highlight R code chunks in .Rmd / .Rmarkdown / .qmd files (and `# %%` cells in .R files) with a background color. Disable to remove the background entirely."
         },
         "raven.chunks.activeCellIndicator": {
           "type": "boolean",

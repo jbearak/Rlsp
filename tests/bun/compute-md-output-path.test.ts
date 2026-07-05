@@ -41,6 +41,12 @@ describe('computeMdOutputPath', () => {
         expect(out).toBe(path.join(expectedPreviewDir('/tmp/foo.RMD'), 'foo.md'));
     });
 
+    test('strips .Rmarkdown case variants and appends .md', () => {
+        expect(path.basename(computeMdOutputPath('/tmp/foo.rmarkdown'))).toBe('foo.md');
+        expect(path.basename(computeMdOutputPath('/tmp/foo.Rmarkdown'))).toBe('foo.md');
+        expect(path.basename(computeMdOutputPath('/tmp/foo.RMARKDOWN'))).toBe('foo.md');
+    });
+
     test('handles paths with multiple dots in the basename', () => {
         const out = computeMdOutputPath('/tmp/foo.bar.Rmd');
         expect(out).toBe(path.join(expectedPreviewDir('/tmp/foo.bar.Rmd'), 'foo.bar.md'));
@@ -67,9 +73,10 @@ describe('computeHtmlOutputPath', () => {
         expect(out).toBe(path.join(expectedPreviewDir('/tmp/foo.Rmd'), 'foo.html'));
     });
 
-    test('strips .rmd / .RMD case variants', () => {
+    test('strips .rmd / .RMD / .Rmarkdown case variants', () => {
         expect(path.basename(computeHtmlOutputPath('/tmp/foo.rmd'))).toBe('foo.html');
         expect(path.basename(computeHtmlOutputPath('/tmp/foo.RMD'))).toBe('foo.html');
+        expect(path.basename(computeHtmlOutputPath('/tmp/foo.Rmarkdown'))).toBe('foo.html');
     });
 
     test('matches computeMdOutputPath structurally — sibling md/html in same dir', () => {

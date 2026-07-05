@@ -86,6 +86,33 @@ test("VS Code package metadata registers mixed-case JAGS and Stan extensions", (
   expect(stan?.extensions).toEqual([".stan", ".Stan", ".STAN"]);
 });
 
+test("VS Code package metadata registers mixed-case R Markdown extensions", () => {
+  const packageJsonPath = path.join(
+    import.meta.dir,
+    "..",
+    "..",
+    "editors",
+    "vscode",
+    "package.json",
+  );
+  const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+  const languages = pkg.contributes.languages as Array<{
+    id: string;
+    extensions: string[];
+  }>;
+
+  const rmd = languages.find((language) => language.id === "rmd");
+
+  expect(rmd?.extensions).toEqual([
+    ".rmd",
+    ".Rmd",
+    ".RMD",
+    ".rmarkdown",
+    ".Rmarkdown",
+    ".RMARKDOWN",
+  ]);
+});
+
 test("VS Code package metadata associates .Rprofile with the r language", () => {
   // `.Rprofile` is R code with no `.R` extension, so VS Code only treats it as
   // R (live text-sync + highlighting + diagnostics) if the `r` language claims
@@ -134,13 +161,13 @@ test("VS Code package metadata activates on r/jags/stan via contributes.language
   expect(languageIds).toContain("stan");
 });
 
-test("VS Code package metadata pins .Rmd files to the rmd language via files.associations", () => {
+test("VS Code package metadata pins R Markdown files to the rmd language via files.associations", () => {
   // The Quarto extension contributes `editorLangId == quarto` for `.rmd` (it
   // accepts both `.qmd` and `.rmd`). When only Raven and Quarto are installed,
   // VS Code's `contributes.languages` resolver can pick Quarto's claim over
-  // Raven's, leaving `.Rmd` files tagged as `quarto` — at which point Raven's
+  // Raven's, leaving R Markdown files tagged as `quarto` — at which point Raven's
   // `raven.knit` keybinding (gated on `editorLangId == rmd || == r`) silently
-  // stops firing on `.Rmd`. `contributes.languages` resolution order is not a
+  // stops firing on them. `contributes.languages` resolution order is not a
   // documented invariant, so we don't rely on outvoting Quarto there.
   //
   // REditorSupport.r-syntax used to mask the bug by contributing another `rmd`
@@ -170,6 +197,9 @@ test("VS Code package metadata pins .Rmd files to the rmd language via files.ass
     "*.rmd": "rmd",
     "*.Rmd": "rmd",
     "*.RMD": "rmd",
+    "*.rmarkdown": "rmd",
+    "*.Rmarkdown": "rmd",
+    "*.RMARKDOWN": "rmd",
   });
 
   // Never claim `.qmd` — Quarto owns that extension and its preview / render

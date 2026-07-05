@@ -209,7 +209,7 @@ async function runKnitCommand(
     const docUri = explicitUri ?? vscode.window.activeTextEditor?.document.uri;
     if (!docUri) {
         await vscode.window.showInformationMessage(
-            'Raven: Knit Preview requires an active editor with a .Rmd file.',
+            'Raven: Knit Preview requires an active editor with an R Markdown file.',
         );
         return;
     }
@@ -226,11 +226,11 @@ async function runKnitCommand(
         return;
     }
 
-    // Reject inputs that aren't file-backed `.Rmd` documents. Order
+    // Reject inputs that aren't file-backed R Markdown documents. Order
     // matters: an untitled buffer with `languageId === 'rmd'` has a
     // URI scheme of `untitled` and a path without an extension; we
     // surface "save the file first" rather than the misleading
-    // "not a .Rmd file" message. The AGENTS.md "File-type tracking"
+    // "not an R Markdown file" message. The AGENTS.md "File-type tracking"
     // learning calls this out specifically.
     if (docUri.scheme !== 'file' && docUri.scheme !== 'vscode-remote') {
         await vscode.window.showInformationMessage(
@@ -253,9 +253,9 @@ async function runKnitCommand(
 
     // After the scheme check passes we know we have a file-backed URI.
     const ext = path.extname(docUri.fsPath || docUri.path).toLowerCase();
-    if (ext !== '.rmd') {
+    if (ext !== '.rmd' && ext !== '.rmarkdown') {
         await vscode.window.showInformationMessage(
-            'Raven: Knit Preview only runs on .Rmd files.',
+            'Raven: Knit Preview only runs on .Rmd or .Rmarkdown files.',
         );
         return;
     }

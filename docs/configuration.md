@@ -153,7 +153,7 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.rConsole.activation` | `"auto"` | When Raven's R console — and the surfaces gated alongside it (plot viewer, data viewer, chunk navigation / highlighting / active-cell indicator, `.R` cell mode, and the `r.json` snippets contributed to `.Rmd` / `.qmd`) — activates. `"enabled"`: always activate. `"disabled"`: never activate. `"auto"`: activate unless the REditorSupport extension is enabled or VS Code is running as Positron. See [R Console](r-console.md) and [Coexistence](coexistence.md). |
+| `raven.rConsole.activation` | `"auto"` | When Raven's R console — and the surfaces gated alongside it (plot viewer, data viewer, chunk navigation / highlighting / active-cell indicator, `.R` cell mode, and the `r.json` snippets contributed to `.Rmd` / `.Rmarkdown` / `.qmd`) — activates. `"enabled"`: always activate. `"disabled"`: never activate. `"auto"`: activate unless the REditorSupport extension is enabled or VS Code is running as Positron. See [R Console](r-console.md) and [Coexistence](coexistence.md). |
 
 ## Plot Settings
 
@@ -190,7 +190,7 @@ Values:
 - `"rstudio-minus"` — All arguments indent relative to previous line, regardless of paren position
 - `"off"` — Disables AST-aware indentation (Tier 2); only basic declarative rules remain
 
-Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto files by default (lowest-priority VS Code default). This is required for Tier 2 indentation — though Tier 2 itself applies only to plain R files, so the default has no indentation effect in `.Rmd` / `.qmd` (those use Tier 1 only). Disable per-language:
+Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto files by default (lowest-priority VS Code default). This is required for Tier 2 indentation — though Tier 2 itself applies only to plain R files, so the default has no indentation effect in `.Rmd` / `.Rmarkdown` / `.qmd` (those use Tier 1 only). Disable per-language:
 
 ```json
 "[r]": {

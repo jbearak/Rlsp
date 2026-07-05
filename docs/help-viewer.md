@@ -16,7 +16,7 @@ The help viewer is triggered from a hover:
 - **From a hover**: Hover over an identifier (e.g., `dplyr::filter` or `plot`). When the symbol resolves to a known package, the hover bubble displays a bold `pkg::name` heading at the top — click it to open the help panel.
 
 > [!NOTE]
-> In R Markdown (`.Rmd`) and Quarto (`.qmd`) files, hover-triggered help works on identifiers inside R code chunks (the same as in `.R` files). Hovering prose, YAML front matter, or a non-R chunk produces no hover, so there's no help link there.
+> In R Markdown (`.Rmd` / `.Rmarkdown`) and Quarto (`.qmd`) files, hover-triggered help works on identifiers inside R code chunks (the same as in `.R` files). Hovering prose, YAML front matter, or a non-R chunk produces no hover, so there's no help link there.
 
 There is no command-palette entry: the panel needs a resolved topic and package, which only the hover link supplies, so `raven.openHelpPanel` (and the `raven.help.back` / `raven.help.forward` navigation commands) are hidden from the palette.
 

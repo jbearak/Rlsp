@@ -3,7 +3,7 @@
  *
  * Layout:
  *   <os.tmpdir()>/raven-knit/<workspaceHash>/<sessionId>/
- *     preview/<sourceHash>/   ← stable per .Rmd, scoped to this VS Code window
+ *     preview/<sourceHash>/   ← stable per R Markdown source, scoped to this VS Code window
  *     export/<uuid>/          ← throwaway, per editor-toolbar export invocation
  *
  * Keeping this module free of `vscode` imports lets it be unit-tested
@@ -37,7 +37,7 @@ export function computeWorkspaceHash(workspaceUri: string): string {
     return crypto.createHash('sha256').update(workspaceUri).digest('hex');
 }
 
-/** SHA-256 of an absolute .Rmd path. Stable per source file. */
+/** SHA-256 of an absolute R Markdown source path. Stable per source file. */
 export function computeSourceHash(absPath: string): string {
     return crypto.createHash('sha256').update(absPath).digest('hex');
 }
@@ -97,7 +97,7 @@ export function sessionRoot(workspaceHash: string, sessionId: string): string {
     return path.join(ravenKnitRoot(), workspaceHash, sessionId);
 }
 
-/** `<sessionRoot>/preview/<sourceHash>/`. Stable per `.Rmd` for the session. */
+/** `<sessionRoot>/preview/<sourceHash>/`. Stable per R Markdown source for the session. */
 export function previewDirFor(workspaceHash: string, sessionId: string, sourceHash: string): string {
     return path.join(sessionRoot(workspaceHash, sessionId), 'preview', sourceHash);
 }
@@ -112,12 +112,12 @@ export interface PreviewArtifactPaths {
     mdPath: string;
     htmlPath: string;
     figDir: string;
-    /** SHA-256 of the absolute .Rmd path. Used as the refcount key in OperationRegistry. */
+    /** SHA-256 of the absolute R Markdown source path. Used as the refcount key in OperationRegistry. */
     previewKey: string;
 }
 
 /**
- * Resolve every per-source artifact path for the given .Rmd.
+ * Resolve every per-source artifact path for the given R Markdown source.
  *
  * Requires `initSessionState` to have been called (i.e., the extension
  * is active). The optional `sessionInfo` parameter accepts an explicit
@@ -127,7 +127,7 @@ export interface PreviewArtifactPaths {
  *
  * `workspaceHash` is resolved via `workspaceHashFor(rmdAbsPath)` when
  * no explicit pair is given, which means single-file mode (no
- * workspace) cleanly falls back to a per-`.Rmd`-parent-dir hash.
+ * workspace) cleanly falls back to a per-source-parent-dir hash.
  */
 export function previewArtifactPaths(
     rmdAbsPath: string,
@@ -136,7 +136,9 @@ export function previewArtifactPaths(
     const sourceHash = computeSourceHash(rmdAbsPath);
     const resolved = sessionInfo ?? resolveSessionForSource(rmdAbsPath);
     const previewDir = previewDirFor(resolved.workspaceHash, resolved.sessionId, sourceHash);
-    const baseName = path.basename(rmdAbsPath).replace(/\.[Rr][Mm][Dd]$/, '');
+    const baseName = path
+        .basename(rmdAbsPath)
+        .replace(/\.(?:[Rr][Mm][Dd]|[Rr][Mm][Aa][Rr][Kk][Dd][Oo][Ww][Nn])$/, '');
     return {
         previewDir,
         mdPath: path.join(previewDir, `${baseName}.md`),

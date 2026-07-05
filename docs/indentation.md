@@ -129,7 +129,7 @@ if (condition) {
 
 ### Indentation not working at all
 
-1. Check the file's language mode (status bar): R, R Markdown, and Quarto are all supported — but in `.Rmd` / `.qmd` files, Tier 2 indentation applies only inside R chunk bodies, not in prose or YAML
+1. Check the file's language mode (status bar): R, R Markdown, and Quarto are all supported — but in `.Rmd` / `.Rmarkdown` / `.qmd` files, Tier 2 indentation applies only inside R chunk bodies, not in prose or YAML
 2. Verify Raven is running (check VS Code's status bar)
 3. Reload VS Code: `Ctrl+Shift+P` → "Developer: Reload Window"
 
