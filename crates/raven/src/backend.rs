@@ -2586,34 +2586,85 @@ fn package_r_file_input_from_text(
     }
 }
 
+#[derive(Clone, Debug)]
+enum AuthoritativePackageInputUri {
+    Manifest {
+        uri: Url,
+    },
+    RFile {
+        uri: Url,
+        path: std::path::PathBuf,
+        kind: crate::package_state::RFileKind,
+    },
+}
+
+impl AuthoritativePackageInputUri {
+    fn uri(&self) -> &Url {
+        match self {
+            Self::Manifest { uri, .. } | Self::RFile { uri, .. } => uri,
+        }
+    }
+
+    fn into_r_file(self) -> Option<(Url, std::path::PathBuf, crate::package_state::RFileKind)> {
+        match self {
+            Self::RFile { uri, path, kind } => Some((uri, path, kind)),
+            Self::Manifest { .. } => None,
+        }
+    }
+}
+
+fn package_input_uri_for_path(
+    uri: Url,
+    path: std::path::PathBuf,
+    root: &std::path::Path,
+) -> Option<AuthoritativePackageInputUri> {
+    if is_package_manifest_path(&path, root) {
+        return Some(AuthoritativePackageInputUri::Manifest { uri });
+    }
+    let kind = crate::package_state::is_r_source_path(&path, root)?;
+    Some(AuthoritativePackageInputUri::RFile { uri, path, kind })
+}
+
+fn authoritative_package_input_uri_for_open_document(
+    state: &WorldState,
+    open_uri: &Url,
+    root: &std::path::Path,
+) -> Option<AuthoritativePackageInputUri> {
+    if state.open_document_aliases.is_empty() {
+        let path = open_uri.to_file_path().ok()?;
+        return package_input_uri_for_path(open_uri.clone(), path, root);
+    }
+
+    if let Some(canonical_uris) = state
+        .open_document_aliases
+        .canonical_uris_for_open(open_uri)
+    {
+        for canonical_uri in canonical_uris.iter().rev() {
+            let Ok(path) = canonical_uri.to_file_path() else {
+                continue;
+            };
+            let Some(candidate) = package_input_uri_for_path(canonical_uri.clone(), path, root)
+            else {
+                continue;
+            };
+            return (state
+                .open_document_uri_for_authoritative_uri(candidate.uri())
+                .as_ref()
+                == Some(open_uri))
+            .then_some(candidate);
+        }
+    }
+
+    let path = open_uri.to_file_path().ok()?;
+    package_input_uri_for_path(open_uri.clone(), path, root)
+}
+
 fn authoritative_package_r_file_uri_for_open_document(
     state: &WorldState,
     open_uri: &Url,
     root: &std::path::Path,
 ) -> Option<(Url, std::path::PathBuf, crate::package_state::RFileKind)> {
-    if state.open_document_aliases.is_empty() {
-        let path = open_uri.to_file_path().ok()?;
-        let kind = crate::package_state::is_r_source_path(&path, root)?;
-        return Some((open_uri.clone(), path, kind));
-    }
-
-    let mut raw_match = None;
-    let mut canonical_match = None;
-    for graph_uri in state.authoritative_revalidation_roots_for_uri(open_uri) {
-        let Ok(path) = graph_uri.to_file_path() else {
-            continue;
-        };
-        let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
-            continue;
-        };
-        if &graph_uri == open_uri {
-            raw_match = Some((graph_uri, path, kind));
-        } else if canonical_match.is_none() {
-            canonical_match = Some((graph_uri, path, kind));
-        }
-    }
-
-    canonical_match.or(raw_match)
+    authoritative_package_input_uri_for_open_document(state, open_uri, root)?.into_r_file()
 }
 
 fn hydrate_package_r_files_from_state(
@@ -5406,26 +5457,28 @@ impl LanguageServer for Backend {
                 let arc_text: std::sync::Arc<str> = text.as_str().into();
                 let old_ns_model = state.package_state.namespace_model().cloned();
                 let old_contribution = state.package_state.scope_contribution().clone();
-                let package_event_uri = state
-                    .package_inputs
-                    .workspace_root
-                    .as_ref()
-                    .and_then(|root| {
-                        authoritative_package_r_file_uri_for_open_document(&state, &uri, root)
-                            .map(|(event_uri, _, _)| event_uri)
-                    })
-                    .unwrap_or_else(|| uri.clone());
-                let event = crate::package_state::event::HandlerEvent::DidOpen {
-                    uri: package_event_uri,
-                    text: arc_text,
-                };
-                if let Some(delta) =
-                    crate::package_state::event::translate(&mut state.package_inputs, event)
-                {
-                    state.apply_package_event(&delta);
-                    package_visibility_changed = state.package_state.namespace_model()
-                        != old_ns_model.as_ref()
-                        || state.package_state.scope_contribution() != &old_contribution;
+                let package_event_uri =
+                    state
+                        .package_inputs
+                        .workspace_root
+                        .as_ref()
+                        .and_then(|root| {
+                            authoritative_package_input_uri_for_open_document(&state, &uri, root)
+                                .map(|package_input| package_input.uri().clone())
+                        });
+                if let Some(package_event_uri) = package_event_uri {
+                    let event = crate::package_state::event::HandlerEvent::DidOpen {
+                        uri: package_event_uri,
+                        text: arc_text,
+                    };
+                    if let Some(delta) =
+                        crate::package_state::event::translate(&mut state.package_inputs, event)
+                    {
+                        state.apply_package_event(&delta);
+                        package_visibility_changed = state.package_state.namespace_model()
+                            != old_ns_model.as_ref()
+                            || state.package_state.scope_contribution() != &old_contribution;
+                    }
                 }
             }
 
@@ -6408,21 +6461,10 @@ impl LanguageServer for Backend {
                 .workspace_root
                 .as_ref()
                 .and_then(|root| {
-                    authoritative_package_r_file_uri_for_open_document(&state, &uri, root)
-                        .map(|(event_uri, _, _)| event_uri)
-                })
-                .unwrap_or_else(|| uri.clone());
-            let in_package_input_path = state
-                .package_inputs
-                .workspace_root
-                .as_ref()
-                .zip(package_event_uri.to_file_path().ok())
-                .is_some_and(|(root, path)| {
-                    crate::package_state::is_r_source_path(&path, root).is_some()
-                        || path == root.join("DESCRIPTION")
-                        || path == root.join("NAMESPACE")
+                    authoritative_package_input_uri_for_open_document(&state, &uri, root)
+                        .map(|package_input| package_input.uri().clone())
                 });
-            if in_package_input_path {
+            if let Some(package_event_uri) = package_event_uri {
                 let text: std::sync::Arc<str> = state
                     .documents
                     .get(&uri)
@@ -6815,14 +6857,8 @@ impl LanguageServer for Backend {
                 .workspace_root
                 .as_ref()
                 .and_then(|root| {
-                    if let Some((event_uri, _, _)) =
-                        authoritative_package_r_file_uri_for_open_document(&state, uri, root)
-                    {
-                        return Some(event_uri);
-                    }
-                    uri.to_file_path()
-                        .ok()
-                        .and_then(|path| is_package_manifest_path(&path, root).then(|| uri.clone()))
+                    authoritative_package_input_uri_for_open_document(&state, uri, root)
+                        .map(|package_input| package_input.uri().clone())
                 })
         };
 
@@ -11047,6 +11083,51 @@ mod tests {
             assert!(hydrated.contains_key(&disk_only));
             let open_entry = hydrated.get(&open_path).expect("open file hydrated");
             assert_eq!(&*open_entry.text, "open_value <- 'buffer'\n");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn package_hydration_prefers_symlink_target_over_case_corrected_alias() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = temp.path();
+            let r_dir = root.join("R");
+            std::fs::create_dir_all(&r_dir).unwrap();
+            let target_path = r_dir.join("foo.R");
+            let link_path = r_dir.join("link.R");
+            let raw_alias_path = r_dir.join("LINK.R");
+            std::fs::write(&target_path, "disk_only <- function() 1\n").unwrap();
+            std::os::unix::fs::symlink("foo.R", &link_path).unwrap();
+
+            let raw_alias_uri = Url::from_file_path(&raw_alias_path).unwrap();
+            let link_uri = Url::from_file_path(&link_path).unwrap();
+            let target_uri = Url::from_file_path(&target_path).unwrap();
+            let mut state = WorldState::new();
+            state
+                .workspace_folders
+                .push(Url::from_file_path(root).unwrap());
+            state.documents.insert(
+                raw_alias_uri.clone(),
+                Document::new("live_target <- function() 2\n", Some(1)),
+            );
+            state
+                .open_document_aliases
+                .open(raw_alias_uri, vec![link_uri.clone(), target_uri.clone()]);
+
+            let disk_seed = collect_package_r_file_inputs_from_disk(root);
+            let hydrated = hydrate_package_r_files_from_state(&state, root, disk_seed);
+
+            assert!(
+                !hydrated.contains_key(&raw_alias_path),
+                "raw wrong-case symlink spelling must not become a package input"
+            );
+            assert!(
+                !hydrated.contains_key(&link_path),
+                "case-corrected symlink spelling must not become a phantom package input"
+            );
+            let target_entry = hydrated
+                .get(&target_path)
+                .expect("final symlink target must be the package slot");
+            assert_eq!(&*target_entry.text, "live_target <- function() 2\n");
         }
 
         #[test]
@@ -17090,6 +17171,85 @@ mod project_config_initialize_tests {
                 .iter()
                 .any(|diag| diag.message.contains("disk_only")),
             "package sibling must no longer resolve the disk-only symbol; got {diagnostics:?}"
+        );
+    }
+
+    /// Issue #567 follow-up: live DESCRIPTION/NAMESPACE events must be routed
+    /// to the canonical manifest slot even when the editor opened a case alias.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn package_manifest_alias_updates_canonical_description_slot_and_closes_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let r_dir = tmp.path().join("R");
+        fs::create_dir(&r_dir).unwrap();
+        let disk_description = "Package: pkg\nVersion: 1.0\nImports: stats\n";
+        fs::write(tmp.path().join("DESCRIPTION"), disk_description).unwrap();
+        fs::write(r_dir.join("sibling.R"), "sibling <- function() 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let sibling_uri = Url::from_file_path(r_dir.join("sibling.R")).unwrap();
+        open_doc(backend, &sibling_uri, "r", 1, "sibling <- function() 1\n").await;
+        {
+            let disk_seed = collect_package_r_file_inputs_from_disk(tmp.path());
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state(
+                &mut state,
+                tmp.path().to_path_buf(),
+                Some(disk_description.into()),
+                None,
+                disk_seed,
+                None,
+            );
+        }
+
+        let canonical_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
+        let alias_uri = Url::from_file_path(tmp.path().join("description")).unwrap();
+        let open_description = "Package: pkg\nVersion: 1.0\nImports: utils\n";
+        open_doc(backend, &alias_uri, "r", 1, open_description).await;
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.open_document_uri_for_authoritative_uri(&canonical_uri),
+                Some(alias_uri.clone()),
+                "canonical DESCRIPTION must resolve to the wrong-case open buffer"
+            );
+            assert_eq!(
+                state.package_inputs.description.as_ref().map(|d| &*d.text),
+                Some(open_description),
+                "didOpen must install the live alias text in the DESCRIPTION slot"
+            );
+        }
+
+        let changed_description = "Package: pkg\nVersion: 1.0\nImports: methods\n";
+        change_doc(backend, &alias_uri, 2, changed_description).await;
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.package_inputs.description.as_ref().map(|d| &*d.text),
+                Some(changed_description),
+                "didChange must keep routing the alias buffer to canonical DESCRIPTION"
+            );
+        }
+
+        close_doc(backend, &alias_uri).await;
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.package_inputs.description.as_ref().map(|d| &*d.text),
+            Some(disk_description),
+            "didClose must read the canonical DESCRIPTION path and revert to disk"
         );
     }
 
