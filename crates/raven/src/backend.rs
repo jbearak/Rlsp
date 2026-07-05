@@ -2370,6 +2370,634 @@ pub(crate) fn sysdata_r_fallback_needed(state: &WorldState) -> bool {
     state.package_inputs.sysdata_names.is_empty() && has_sysdata_rda
 }
 
+/// Remove a file that no longer exists on disk from every cross-file
+/// structure: the dependency graph (all edges in both directions), the
+/// disk-content cache, both workspace indexes, and the metadata cache.
+///
+/// Returns the affected open dependents, computed from the **pre-removal**
+/// graph via `compute_affected_dependents_after_edit` — the removal itself
+/// destroys the edges needed to find them. Walks both backward (parents that
+/// source the removed file lose its symbols) and forward (children that were
+/// sourced by it lose their inherited parent scope).
+///
+/// Deliberately caller-owned, because batching differs per caller:
+/// - `package_inputs` translation (`HandlerEvent::WatchedFileChanged { deleted: true }`);
+/// - `recompute_open_neighborhood_pins` — the watched-files DELETED loop
+///   recomputes pins once per batch, not once per file;
+/// - force-republish marking and diagnostics publishing.
+///
+/// Shared by the watched-files `FileChangeType::DELETED` branch and the
+/// `did_close` disk-resync path (issue #558), so removal semantics cannot
+/// drift between them.
+fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<Url> {
+    let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+        uri,
+        true,
+        false,
+        &state.cross_file_graph,
+        |u| state.documents.contains_key(u),
+        state.cross_file_config.max_chain_depth,
+        state.cross_file_config.max_transitive_dependents_visited,
+    );
+
+    state.workspace_index_new.invalidate(uri);
+    state.cross_file_graph.remove_file(uri);
+    state.cross_file_file_cache.invalidate(uri);
+    state.cross_file_workspace_index.invalidate(uri);
+    state.cross_file_meta.remove(uri);
+    // The legacy startup-scan document map is a content-provider tier of its
+    // own (`DefaultContentProvider` consults it before the file cache) and an
+    // `exists_cached` source; leaving the entry would keep reporting a
+    // deleted file as present.
+    state.workspace_index.remove(uri);
+    neighbors
+}
+
+/// Resolve a file's `# raven: sourced-by` targets and pre-collect their
+/// content (open buffer first, then the disk-content cache) into a map, so
+/// `DependencyGraph::update_file`'s `get_content` closure can run while the
+/// graph is mutably borrowed. Backward directives always resolve relative to
+/// the file's own directory — `PathContext::new`, never `# raven: cd` (the
+/// CLAUDE.md path-resolution invariant). Shared by `did_open`, `did_change`,
+/// and `resync_file_from_disk` so backward parent lookup cannot drift.
+fn collect_backward_parent_content(
+    state: &WorldState,
+    uri: &Url,
+    workspace_root: Option<&Url>,
+    meta: &crate::cross_file::CrossFileMetadata,
+) -> std::collections::HashMap<Url, String> {
+    let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
+    meta.sourced_by
+        .iter()
+        .filter_map(|d| {
+            let ctx = backward_path_ctx.as_ref()?;
+            let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
+            let parent_uri = Url::from_file_path(resolved).ok()?;
+            let content = state
+                .documents
+                .get(&parent_uri)
+                .map(|doc| doc.text())
+                .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+            Some((parent_uri, content))
+        })
+        .collect()
+}
+
+/// What a single-file disk resync did, so the caller can fold the affected
+/// open dependents into its own fanout batch (capping, force-republish
+/// marking, and publishing stay caller-owned — callers batch differently).
+enum ResyncOutcome {
+    /// Disk content was committed. `affected_after_commit` is the deduped
+    /// union of open working-directory-invalidated children and — when the
+    /// commit changed edges — the post-update
+    /// `compute_affected_dependents_after_edit` walk. `new_interface_hash`
+    /// is the committed disk artifacts' `interface_hash`, so callers that
+    /// know the pre-resync hash (the close path captures the buffer's) can
+    /// widen their fanout on interface-only changes.
+    Updated {
+        affected_after_commit: Vec<Url>,
+        new_interface_hash: u64,
+    },
+    /// The file no longer exists on disk; its cross-file state was removed
+    /// via `remove_file_from_cross_file_state`. `affected_dependents` comes
+    /// from the pre-removal graph.
+    Removed { affected_dependents: Vec<Url> },
+    /// The URI was an open document at commit time, so the disk state was
+    /// discarded untouched: the open buffer is authoritative, and its own
+    /// `did_open`/`did_change` pipeline has already installed fresher state.
+    Vetoed,
+    /// Nothing to resync: non-`file:` URI, the file exists but could not be
+    /// read/decoded, or a concurrent resync already committed a NEWER disk
+    /// snapshot for this file (staleness veto). No state was mutated.
+    Skipped,
+}
+
+/// The "file is gone" tail of [`resync_file_from_disk`]: veto if the URI was
+/// (re)opened, otherwise remove the file's cross-file state and refresh the
+/// pin set.
+async fn resync_missing_file(state_arc: &Arc<RwLock<WorldState>>, uri: &Url) -> ResyncOutcome {
+    let mut state = state_arc.write().await;
+    if state.documents.contains_key(uri) {
+        return ResyncOutcome::Vetoed;
+    }
+    let affected_dependents = remove_file_from_cross_file_state(&mut state, uri);
+    state.recompute_open_neighborhood_pins();
+    ResyncOutcome::Removed {
+        affected_dependents,
+    }
+}
+
+/// Re-sync one file's cross-file state (disk-content cache, workspace index,
+/// dependency graph) from its on-disk content. The shared single-file
+/// primitive behind the watched-files CREATED/CHANGED async pass and the
+/// `did_close` disk resync (issue #558) — the two paths must not drift.
+///
+/// `old_meta` is caller-supplied because the correct capture point differs:
+/// the watched-files path reads it just before the disk read (the file was
+/// never open, so every metadata tier already reflects disk), while the
+/// close path must capture it **before** `did_close` wipes the document
+/// stores — the unsaved buffer's metadata (its `# raven: cd` state in
+/// particular) lives only there, and working-directory change detection
+/// compares against what dependents last saw, i.e. the buffer.
+///
+/// Locking: all disk I/O and content-derived computation (masking, parsing,
+/// metadata/artifact extraction) run off-lock; `resolve_system_file_sources`
+/// inputs are snapshotted under a brief read lock; every mutation happens
+/// inside **one** write-lock critical section whose first statement is the
+/// reopen veto — if the URI is an open document at commit time the resync
+/// returns [`ResyncOutcome::Vetoed`] having mutated nothing. Because the
+/// buffer-derived edges are only ever replaced atomically by
+/// `DependencyGraph::update_file` inside that section, there is no transient
+/// window where the file has an empty edge set. (The veto is deliberately
+/// unconditional: the pre-#558 watched-files pass split this across separate
+/// read/write acquisitions with no open-at-commit check on the graph update,
+/// so a reopen during the async gap could clobber fresh buffer state.)
+///
+/// Rmd/Quarto disk content is masked before metadata/artifact extraction
+/// (chunk bodies only, never prose); the file cache stores the RAW content —
+/// its readers mask on read. `chunk_kind` preserves the closing document's
+/// editor-language classification: a file-backed document without an
+/// `.Rmd`/`.qmd` extension opened with `languageId: rmd` was chunk-masked
+/// while open, and path-only reclassification here would parse the same disk
+/// text as plain R and mint prose `source()` edges. The close path passes
+/// the tracked `Document`'s `chunk_kind`; the watched-files path passes
+/// `None` (no editor signal exists for an external disk event) and falls
+/// back to path classification.
+/// `undecodable_as_missing` splits `SourceReadError::InvalidEncoding`
+/// handling by caller: the close path passes `true` (the user closed a file
+/// whose disk content is not R-readable — converge like a deletion, matching
+/// the package `DidClose` which read the same bytes), while the watched path
+/// passes `false` (a non-atomic external write can transiently present
+/// invalid UTF-8, and removal would strip closed parents' incoming edges,
+/// which only OPEN parents can recover — skip instead and let the completing
+/// write's next CHANGED event converge).
+async fn resync_file_from_disk(
+    state_arc: &Arc<RwLock<WorldState>>,
+    uri: &Url,
+    chunk_kind: Option<crate::chunks::ChunkKind>,
+    old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
+    undecodable_as_missing: bool,
+) -> ResyncOutcome {
+    let Ok(path) = uri.to_file_path() else {
+        return ResyncOutcome::Skipped;
+    };
+
+    // Cheap preflight veto: if the URI is (already again) an open document,
+    // skip the disk read and parse entirely. Purely an optimization for
+    // close-then-reopen and watched-event-races-open bursts — the commit-time
+    // veto below remains the correctness gate.
+    if state_arc.read().await.documents.contains_key(uri) {
+        log::trace!("Disk resync preflight-vetoed by open document: {}", uri);
+        return ResyncOutcome::Vetoed;
+    }
+
+    let content = match crate::state::read_source_async(&path).await {
+        Ok(c) => c,
+        Err(crate::state::SourceReadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return resync_missing_file(state_arc, uri).await;
+        }
+        Err(e @ crate::state::SourceReadError::InvalidEncoding { .. }) => {
+            // See the doc comment: removal for the close path (converge with
+            // the package DidClose that read the same bytes), skip for the
+            // watched path (transient non-atomic writes).
+            if undecodable_as_missing {
+                log::trace!("Disk resync removing undecodable file state {}: {}", uri, e);
+                return resync_missing_file(state_arc, uri).await;
+            }
+            log::trace!("Disk resync skipping undecodable file {}: {}", uri, e);
+            return ResyncOutcome::Skipped;
+        }
+        Err(e) => {
+            // Transient IO errors (permissions, interrupted reads): mutate
+            // nothing; a later watcher event or reopen converges.
+            log::trace!("Failed to read file {}: {}", uri, e);
+            return ResyncOutcome::Skipped;
+        }
+    };
+
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return resync_missing_file(state_arc, uri).await;
+        }
+        Err(_) => return ResyncOutcome::Skipped,
+    };
+
+    // Mask Rmd/Quarto prose so directives/source()/library() come from chunk
+    // bodies only (#343), then parse ONCE and derive both metadata and
+    // artifacts from the same tree.
+    let analysis = match chunk_kind {
+        Some(kind) => crate::cross_file::analysis_text_for_kind(kind, &content),
+        None => crate::cross_file::analysis_text_for_path(uri.path(), &content),
+    };
+    let tree = crate::parser_pool::with_parser(|parser| parser.parse(analysis.as_ref(), None));
+    let mut cross_file_meta =
+        crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
+
+    // Resolve system.file() source entries into concrete paths BEFORE
+    // computing artifacts (artifact computation consumes the resolved meta).
+    {
+        let state = state_arc.read().await;
+        let ws = state.package_state.workspace();
+        let ws_name = ws.map(|w| w.name.as_str());
+        let ws_root = ws.map(|w| w.root.as_path());
+        let lib_paths = state.package_library.lib_paths();
+        crate::cross_file::resolve_system_file_sources(
+            &mut cross_file_meta,
+            ws_name,
+            ws_root,
+            lib_paths,
+        );
+    }
+
+    // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression
+    // for declared symbols)
+    let artifacts = std::sync::Arc::new(match tree.as_ref() {
+        Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+            uri,
+            tree,
+            &analysis,
+            Some(&cross_file_meta),
+        ),
+        None => crate::cross_file::scope::ScopeArtifacts::default(),
+    });
+    let new_interface_hash = artifacts.interface_hash;
+
+    let snapshot =
+        crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
+
+    // Single write-lock commit. The reopen veto MUST stay the first statement
+    // under the lock: nothing above mutated shared state, so a veto is total.
+    let mut state = state_arc.write().await;
+    if state.documents.contains_key(uri) {
+        log::trace!("Disk resync vetoed by reopen: {}", uri);
+        return ResyncOutcome::Vetoed;
+    }
+
+    // Staleness veto: a concurrent resync of the SAME file (a close resync
+    // racing a watched CHANGED event, or two watched batches) may have
+    // committed a NEWER disk snapshot between our off-lock read and this
+    // commit. The open-document vetoes are blind to that — they check
+    // openness, not freshness — so compare against the snapshot the earlier
+    // commit stored and abort rather than overwrite fresher state with an
+    // older read. (Same-mtime writes within the filesystem's timestamp
+    // granularity are not distinguished; the next watcher event converges
+    // them.)
+    if let Some(existing) = state.cross_file_file_cache.get_snapshot(uri)
+        && existing.mtime > snapshot.mtime
+    {
+        log::trace!(
+            "Disk resync staleness-vetoed (newer snapshot already committed): {}",
+            uri
+        );
+        return ResyncOutcome::Skipped;
+    }
+
+    // Inherit the parent's working directory for `# raven: sourced-by` files
+    // with no own `# raven: cd`, matching `did_open`/`did_change` and the
+    // startup scan's WD fixpoint — without it, the commit below would resolve
+    // this file's forward `source()` paths file-relative and drop edges the
+    // open buffer (or the scan) had correctly formed through the parent's WD.
+    {
+        let workspace_root = state.workspace_folders.first().cloned();
+        let max_chain_depth = state.cross_file_config.max_chain_depth;
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut cross_file_meta,
+            uri,
+            workspace_root.as_ref(),
+            |parent_uri| state.get_enriched_metadata(parent_uri),
+            max_chain_depth,
+        );
+    }
+
+    // Replace the unified-index entry IN PLACE with fresh disk state.
+    // `workspace_index_new` outranks `cross_file_workspace_index` in
+    // `get_enriched_metadata` and the content provider, so a stale scan-time
+    // entry would shadow the commit below — but merely invalidating it would
+    // drop the file from reference search, which walks this index for closed
+    // files and nothing repopulates it outside the scan / on-demand
+    // indexing. Mirrors the on-demand insert (including its empty
+    // `loaded_packages` precedent); raw contents + analysis-tree pair is the
+    // scan's own convention (masking is geometry-preserving). Known residual
+    // (issue #563): the entry does not persist `chunk_kind`, so for an
+    // extension-mismatched Rmd document (languageId-classified) tree
+    // consumers that reconstruct analysis text by path pair this masked
+    // tree with raw text.
+    let fresh_entry = crate::workspace_index::IndexEntry {
+        contents: ropey::Rope::from_str(&content),
+        tree,
+        loaded_packages: Vec::new(),
+        snapshot: snapshot.clone(),
+        metadata: std::sync::Arc::new(cross_file_meta.clone()),
+        artifacts: artifacts.clone(),
+        indexed_at_version: 0,
+    };
+    state.workspace_index_new.insert(uri.clone(), fresh_entry);
+
+    // Cache RAW content for future match/inference resolution (readers mask).
+    state
+        .cross_file_file_cache
+        .insert(uri.clone(), snapshot.clone(), content);
+
+    // Drop the legacy startup-scan document map entry:
+    // `DefaultContentProvider` consults it above the file cache, so a stale
+    // scan-time entry would shadow the fresh content committed above. The
+    // fresh unified-index entry keeps reference search fed.
+    state.workspace_index.remove(uri);
+
+    // `update_from_disk`'s open-document guard only ever tests THIS uri,
+    // which the veto above just proved closed — pass an empty set rather
+    // than cloning every open-document URI under the write lock.
+    let open_docs = std::collections::HashSet::new();
+    state.cross_file_workspace_index.update_from_disk(
+        uri,
+        &open_docs,
+        snapshot,
+        cross_file_meta.clone(),
+        artifacts,
+    );
+
+    let workspace_root = state.workspace_folders.first().cloned();
+
+    let parent_content =
+        collect_backward_parent_content(&state, uri, workspace_root.as_ref(), &cross_file_meta);
+
+    let graph_result = state.cross_file_graph.update_file(
+        uri,
+        &cross_file_meta,
+        workspace_root.as_ref(),
+        |parent_uri| parent_content.get(parent_uri).cloned(),
+    );
+
+    // Restore incoming edges from OPEN parents after an exists -> missing ->
+    // exists cycle: `remove_file` strips parent -> child edges (they are
+    // owned by PARENT metadata), and updating the recreated child cannot
+    // re-derive them. Open parents still carry the resolved reference in
+    // their metadata, so when this file has no incoming forward edges,
+    // re-run `update_file` for each open parent that references it. (Closed
+    // parents converge on their own watched events or reopen — their stale
+    // edges were removed with the file, matching pre-existing behavior.)
+    let mut parent_edges_restored = false;
+    let has_incoming_forward = state
+        .cross_file_graph
+        .get_dependents(uri)
+        .iter()
+        .any(|e| !e.is_backward_directive);
+    if !has_incoming_forward {
+        // Candidate filter: ordinary `source()` entries carry only their raw
+        // path string (`resolved_uri` is populated for `system.file()`
+        // resolution only), so pre-match on the target's file name and let
+        // `update_file` do the real path resolution — a false positive is a
+        // no-op re-derivation of edges the parent already has.
+        let target_name = path.file_name();
+        let candidate_parents: Vec<Url> = state
+            .documents
+            .keys()
+            .filter(|p| *p != uri)
+            .filter(|p| {
+                state.document_store.get_without_touch(p).is_some_and(|d| {
+                    d.metadata.sources.iter().any(|s| {
+                        s.resolved_uri.as_ref() == Some(uri)
+                            || std::path::Path::new(&s.path).file_name() == target_name
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        for parent in candidate_parents {
+            let Some(parent_meta) = state
+                .document_store
+                .get_without_touch(&parent)
+                .map(|d| d.metadata.clone())
+            else {
+                continue;
+            };
+            let pc = collect_backward_parent_content(
+                &state,
+                &parent,
+                workspace_root.as_ref(),
+                &parent_meta,
+            );
+            let res = state.cross_file_graph.update_file(
+                &parent,
+                &parent_meta,
+                workspace_root.as_ref(),
+                |u| pc.get(u).cloned(),
+            );
+            parent_edges_restored |= res.edges_changed;
+        }
+    }
+
+    // Invalidate children affected by working directory change (Requirement 8).
+    let wd_children = crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+        uri,
+        old_meta.as_deref(),
+        &cross_file_meta,
+        &state.cross_file_graph,
+        &state.cross_file_meta,
+    );
+
+    let mut affected: Vec<Url> = Vec::new();
+    let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
+    for child in wd_children {
+        if state.documents.contains_key(&child) && affected_set.insert(child.clone()) {
+            affected.push(child);
+        }
+    }
+
+    // Recompute neighbors against the POST-update graph: any forward/backward
+    // edge the new disk content introduces (e.g. a freshly-added `source()`
+    // call) — or a restored open-parent edge — is invisible to pre-update
+    // walks the caller may have done.
+    if graph_result.edges_changed || parent_edges_restored {
+        let post_neighbors =
+            crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                uri,
+                true,
+                true,
+                &state.cross_file_graph,
+                |u| state.documents.contains_key(u),
+                state.cross_file_config.max_chain_depth,
+                state.cross_file_config.max_transitive_dependents_visited,
+            );
+        for dep in post_neighbors {
+            if affected_set.insert(dep.clone()) {
+                affected.push(dep);
+            }
+        }
+        // Edges moved: URIs reachable (or no longer reachable) from open
+        // documents changed, so refresh the LRU pin set.
+        state.recompute_open_neighborhood_pins();
+    }
+
+    ResyncOutcome::Updated {
+        affected_after_commit: affected,
+        new_interface_hash,
+    }
+}
+
+/// `did_close`'s disk-resync driver (issue #558): converge `uri`'s cross-file
+/// state back to disk truth via [`resync_file_from_disk`], union a
+/// pre-commit dependent walk (over the buffer-derived edges, which stay in
+/// the graph until this resync's commit replaces them) with the post-commit
+/// walks, then cap, force-mark, and publish through the bounded fanout — the
+/// same tail the watched-files async pass uses.
+///
+/// Global bound on concurrent close-resync tasks. Each `did_close` of an R
+/// document spawns one `run_close_resync` (disk read, parse, write-lock
+/// commit, bounded diagnostics fanout); without a server-wide cap, a "close
+/// all" of N files runs N of those concurrently — N write-lock commits
+/// contending with keystrokes and up to N x `DIAGNOSTIC_FANOUT_CONCURRENCY`
+/// diagnostic workers. Queued resyncs stay correct: a file reopened while
+/// its resync waits is caught by the preflight/commit vetoes.
+static CLOSE_RESYNC_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// `package_sibling_fanout` carries `did_close`'s package-visibility fanout
+/// (open siblings whose diagnostics depend on the closed buffer's package
+/// symbols). Folding it in here — instead of `did_close` marking and
+/// scheduling it separately — guarantees each URI is force-marked at most
+/// once per close (two independent marks would race: the second
+/// `run_debounced_diagnostics` schedule cancels the first pending task and
+/// strands its marker) and publishes the siblings AFTER the disk commit.
+/// The sibling set publishes even on [`ResyncOutcome::Vetoed`] /
+/// [`ResyncOutcome::Skipped`]: the package `DidClose` event already committed
+/// synchronously inside `did_close`, independent of the cross-file commit.
+/// Graph-derived sets (`pre_affected` and the post-commit walks) publish only
+/// after a successful commit — on a veto the reopened buffer's own `did_open`
+/// pipeline owns them, and on a skip nothing changed. The closed file itself
+/// is never in the affected set — `compute_affected_dependents_after_edit`
+/// excludes its root — so a close never publishes for the closed document.
+///
+/// Known counter slack (shared with every mark-then-bounded-publish path,
+/// e.g. the watched-files async tail): the gate's force-republish counter is
+/// per-URI, not per-trigger, so overlapping closes that share a dependent can
+/// strand one marker when a later `run_debounced_diagnostics` schedule
+/// cancels an earlier pending task, and a pre-existing pending publish can
+/// consume a marker meant for this trigger. The worst case either way is one
+/// extra — or one gate-skipped — same-version republish of already-current
+/// diagnostics, bounded by `MAX_FORCE_REPUBLISH`; monotonicity is never
+/// violated. Trigger-scoped accounting would be a gate redesign, out of
+/// scope here.
+#[allow(clippy::too_many_arguments)]
+async fn run_close_resync(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    traversal_truncation: Arc<TraversalTruncationState>,
+    uri: Url,
+    chunk_kind: Option<crate::chunks::ChunkKind>,
+    old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
+    old_interface_hash: Option<u64>,
+    package_sibling_fanout: Vec<Url>,
+) {
+    // Bound close-burst concurrency server-wide (see CLOSE_RESYNC_PERMITS).
+    // The permit covers the dependent walk, the disk read, the commit, AND
+    // the publish fanout.
+    let _permit = CLOSE_RESYNC_PERMITS
+        .acquire()
+        .await
+        .expect("static close-resync semaphore is never closed");
+
+    // Pre-commit dependent walk (bounded, up to
+    // `max_transitive_dependents_visited` nodes), off the handler path so a
+    // close never delays the next queued LSP message with it. The graph
+    // still holds the closed buffer's edges: this resync is the only thing
+    // that replaces them, and it runs strictly after this walk.
+    let pre_affected: Vec<Url> = {
+        let state = state_arc.read().await;
+        crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+            &uri,
+            true,
+            false,
+            &state.cross_file_graph,
+            |u| state.documents.contains_key(u),
+            state.cross_file_config.max_chain_depth,
+            state.cross_file_config.max_transitive_dependents_visited,
+        )
+    };
+
+    let (post, interface_changed, committed) =
+        match resync_file_from_disk(&state_arc, &uri, chunk_kind, old_meta, true).await {
+            ResyncOutcome::Updated {
+                affected_after_commit,
+                new_interface_hash,
+            } => {
+                // `None` (no buffer artifacts survived to the capture) is
+                // treated as changed — the safe direction.
+                let changed = old_interface_hash != Some(new_interface_hash);
+                (affected_after_commit, changed, true)
+            }
+            ResyncOutcome::Removed {
+                affected_dependents,
+            } => (affected_dependents, false, true),
+            ResyncOutcome::Vetoed | ResyncOutcome::Skipped => (Vec::new(), false, false),
+        };
+
+    let mut affected: Vec<Url> = Vec::new();
+    let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
+    for dep in package_sibling_fanout {
+        if seen.insert(dep.clone()) {
+            affected.push(dep);
+        }
+    }
+    if committed {
+        for dep in pre_affected.into_iter().chain(post) {
+            if seen.insert(dep.clone()) {
+                affected.push(dep);
+            }
+        }
+    }
+
+    {
+        let state = state_arc.read().await;
+        // The pre-close walk saw the graph as it stood at close time; when
+        // the committed disk interface differs from the buffer's, re-walk
+        // over the POST-commit graph too (mirroring did_change's
+        // interface_changed fanout). This catches dependents reachable only
+        // through edges another concurrent resync restored between the
+        // capture and this commit — e.g. closing a parent and child together
+        // where the parent's disk content re-adds the parent -> child edge.
+        if committed && interface_changed {
+            let post_commit_deps =
+                crate::cross_file::revalidation::compute_affected_dependents_after_edit(
+                    &uri,
+                    true,
+                    false,
+                    &state.cross_file_graph,
+                    |u| state.documents.contains_key(u),
+                    state.cross_file_config.max_chain_depth,
+                    state.cross_file_config.max_transitive_dependents_visited,
+                );
+            for dep in post_commit_deps {
+                if seen.insert(dep.clone()) {
+                    affected.push(dep);
+                }
+            }
+        }
+        // Drop dependents that closed during the async gap: marking a closed
+        // URI would leave an orphan force-republish counter for a later
+        // reopen to inherit (`did_close` clears the gate only at ITS close).
+        affected.retain(|u| state.documents.contains_key(u));
+        if affected.is_empty() {
+            return;
+        }
+        cap_watched_file_revalidations(
+            &mut affected,
+            &state.cross_file_activity,
+            state.cross_file_config.max_revalidations_per_trigger,
+        );
+        state
+            .diagnostics_gate
+            .mark_force_republish_many(affected.iter());
+    }
+    Backend::publish_diagnostics_for_uris_bounded(
+        state_arc,
+        client,
+        affected,
+        Some(traversal_truncation),
+    )
+    .await;
+}
+
 /// Sort watched-file diagnostic fanout by activity and enforce the configured
 /// per-trigger cap before any force-republish markers are created.
 fn cap_watched_file_revalidations(
@@ -3936,29 +4564,8 @@ impl LanguageServer for Backend {
                 }
             }
 
-            // Pre-collect content for potential parent files to avoid borrow conflicts
-            // The content provider needs to access documents/cache while graph is mutably borrowed
-            // IMPORTANT: Use PathContext WITHOUT `# raven: cd` for backward directives
-            // Backward directives should always be resolved relative to the file's directory
-            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                &uri_clone,
-                workspace_root.as_ref(),
-            );
-            let parent_content: std::collections::HashMap<Url, String> = meta
-                .sourced_by
-                .iter()
-                .filter_map(|d| {
-                    let ctx = backward_path_ctx.as_ref()?;
-                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                    let parent_uri = Url::from_file_path(resolved).ok()?;
-                    let content = state
-                        .documents
-                        .get(&parent_uri)
-                        .map(|doc| doc.text())
-                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                    Some((parent_uri, content))
-                })
-                .collect();
+            let parent_content =
+                collect_backward_parent_content(&state, &uri_clone, workspace_root.as_ref(), &meta);
 
             let result = state.cross_file_graph.update_file(
                 &uri,
@@ -4773,28 +5380,12 @@ impl LanguageServer for Backend {
                     Vec::new()
                 };
 
-                // Pre-collect content for potential parent files to avoid borrow conflicts
-                // IMPORTANT: Use PathContext WITHOUT `# raven: cd` for backward directives
-                // Backward directives should always be resolved relative to the file's directory
-                let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+                let parent_content = collect_backward_parent_content(
+                    &state,
                     &uri_clone,
                     workspace_root.as_ref(),
+                    &meta,
                 );
-                let parent_content: std::collections::HashMap<Url, String> = meta
-                    .sourced_by
-                    .iter()
-                    .filter_map(|d| {
-                        let ctx = backward_path_ctx.as_ref()?;
-                        let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                        let parent_uri = Url::from_file_path(resolved).ok()?;
-                        let content = state
-                            .documents
-                            .get(&parent_uri)
-                            .map(|doc| doc.text())
-                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                        Some((parent_uri, content))
-                    })
-                    .collect();
 
                 let graph_result = state.cross_file_graph.update_file(
                     &uri,
@@ -5248,9 +5839,9 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
 
-        let (package_close_path, close_text): (bool, Option<Arc<str>>) = {
+        let package_close_path: bool = {
             let state = self.state.read().await;
-            let package_close_path = state
+            state
                 .package_inputs
                 .workspace_root
                 .as_ref()
@@ -5258,32 +5849,42 @@ impl LanguageServer for Backend {
                 .is_some_and(|(root, path)| {
                     crate::package_state::is_r_source_path(&path, root).is_some()
                         || is_package_manifest_path(&path, root)
-                });
-            let in_memory_text = if package_close_path {
-                state.documents.get(uri).map(|doc| Arc::from(doc.text()))
-            } else {
-                None
-            };
-            (package_close_path, in_memory_text)
+                })
         };
 
-        let close_text = if package_close_path && close_text.is_none() {
-            let path = uri.to_file_path().ok();
-            if let Some(path) = path {
-                tokio::task::spawn_blocking(move || {
-                    // BOM-aware decode (read off the async runtime); an
-                    // undecodable closed file simply yields no text.
-                    crate::state::read_source(&path)
-                        .ok()
-                        .map(|text| Arc::from(text.as_str()))
-                })
-                .await
-                .unwrap_or(None)
-            } else {
-                None
+        // Closing reverts package inputs to DISK truth — never the discarded
+        // buffer (the same convergence rule the cross-file resync below
+        // follows, and what `refresh_rprofile_prelude_from_disk` documents
+        // for `.Rprofile`). A missing or undecodable file yields `None`,
+        // which `HandlerEvent::DidClose` translates into removing the file
+        // from `package_inputs` — so a file deleted from disk while its
+        // buffer was open drops its package-internal symbols on close
+        // instead of retaining them until an (never-coming) watcher event.
+        //
+        // Deliberate double read: the spawned cross-file resync re-reads the
+        // same file. Handing this snapshot to the resync would trade
+        // commit-time freshness (the resync's read happens right before its
+        // veto+commit) for one saved small-file read on a warm page cache —
+        // not worth the coupling. If a disk write lands between the two
+        // reads, package and cross-file state briefly reflect different
+        // snapshots; the write also fires a watcher CHANGED event whose
+        // pipeline re-syncs both, so the straddle self-heals.
+        let close_text: Option<Arc<str>> = if package_close_path {
+            match uri.to_file_path() {
+                Ok(path) => {
+                    tokio::task::spawn_blocking(move || {
+                        // BOM-aware decode (read off the async runtime).
+                        crate::state::read_source(&path)
+                            .ok()
+                            .map(|text| Arc::from(text.as_str()))
+                    })
+                    .await
+                    .unwrap_or(None)
+                }
+                Err(_) => None,
             }
         } else {
-            close_text
+            None
         };
 
         // If the closed document is the workspace-root `.Rprofile`, its prelude
@@ -5291,8 +5892,54 @@ impl LanguageServer for Backend {
         // unsaved buffer edits the live did_change refresh folded in.
         let mut rprofile_close_root: Option<std::path::PathBuf> = None;
 
+        // Issue #558: closing a graph-relevant file schedules a disk resync
+        // (spawned after this block) so cross-file state derived from a
+        // discarded unsaved buffer converges back to disk truth. Gated on
+        // the tracked document's own `file_type` (set inside the write-lock
+        // block below), not the URI extension: that is what fed the buffer's
+        // edges into the graph in the first place, and it covers
+        // extension-less R documents like `.Rprofile` as well as `.R` and
+        // `.Rmd`/`.qmd`. Non-`file:` URIs (untitled buffers) have no disk
+        // truth to converge to.
+        let has_disk_path = uri.to_file_path().is_ok();
+        let close_resync;
+        let mut resync_old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> =
+            None;
+        let mut resync_old_interface_hash: Option<u64> = None;
+        let mut resync_chunk_kind: Option<crate::chunks::ChunkKind> = None;
+
         let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
             let mut state = self.state.write().await;
+
+            // Capture the pre-close view the disk resync needs, BEFORE the
+            // document stores are wiped below. `old_meta` must come from the
+            // buffer tier: working-directory change detection compares the
+            // buffer's `# raven: cd` (what dependents last resolved against)
+            // against the disk state the resync installs. The dependent walk
+            // runs over the buffer-derived graph edges, which deliberately
+            // stay in place until the resync commits — there is no transient
+            // empty-edge window for dependents to observe.
+            close_resync = has_disk_path
+                && state
+                    .documents
+                    .get(uri)
+                    .is_some_and(|doc| doc.file_type == crate::file_type::FileType::R);
+            if close_resync {
+                resync_old_meta = state.get_enriched_metadata(uri);
+                resync_old_interface_hash = state
+                    .document_store
+                    .get_without_touch(uri)
+                    .map(|doc| doc.artifacts.interface_hash);
+                // The buffer's chunk classification came from the editor's
+                // languageId (#343); the resync must mask disk content the
+                // same way — path reclassification would parse an
+                // extensionless Rmd/Quarto document as plain R.
+                // (The pre-commit dependent WALK deliberately lives inside
+                // `run_close_resync`, off the handler path: it needs only
+                // the pre-commit graph — the buffer-derived edges stay in
+                // place until that resync's own commit replaces them.)
+                resync_chunk_kind = state.documents.get(uri).map(|doc| doc.chunk_kind);
+            }
 
             // Close in new DocumentStore (Requirement 1.5)
             state.document_store.close(uri);
@@ -5318,9 +5965,8 @@ impl LanguageServer for Backend {
             let old_ns_model = state.package_state.namespace_model().cloned();
             let old_contribution = state.package_state.scope_contribution().clone();
 
-            // In package mode, update package inputs on close from the
-            // authoritative snapshot captured above: the last in-memory
-            // document text when available, otherwise a fresh filesystem read.
+            // In package mode, update package inputs on close from the disk
+            // snapshot captured above (buffer edits are discarded on close).
             if package_close_path {
                 let event = crate::package_state::event::HandlerEvent::DidClose {
                     uri: uri.clone(),
@@ -5344,6 +5990,21 @@ impl LanguageServer for Backend {
                 rprofile_close_root = Some(root);
             }
 
+            // Closing a helper the `.Rprofile` transitively source()s also
+            // reverts the prelude to disk: its symbols reached the prelude
+            // through the live buffer, and the watcher path — which folds
+            // the same rescan into its R-file deltas (Task 12) — skipped
+            // every event while this document was open.
+            if rprofile_close_root.is_none()
+                && state.package_inputs.model_rprofile
+                && let Some(root) = state.package_inputs.workspace_root.clone()
+                && uri.to_file_path().ok().is_some_and(|p| {
+                    path_in_rprofile_sourced_set(&p, &state.package_inputs.rprofile_sourced_files)
+                })
+            {
+                rprofile_close_root = Some(root);
+            }
+
             // Detect package-mode visibility changes triggered by the close.
             // When an unsaved buffer with buffer-only symbols (e.g. a freshly
             // added function) closes, those symbols leave `r_internal_symbols`
@@ -5357,8 +6018,40 @@ impl LanguageServer for Backend {
             if pkg_visibility_changed {
                 if let Some(root) = state.package_inputs.workspace_root.clone() {
                     sibling_fanout = collect_close_fanout_siblings(&state, uri, &root);
+                    // Close-time visibility changes must also reach
+                    // devtools::load_all() carriers (root-level analysis.R,
+                    // scripts/) and their source-graph neighborhoods —
+                    // `is_r_source_path` misses those, and every
+                    // watcher-driven visibility fanout already widens this
+                    // way. Re-cap the union so the extension cannot bypass
+                    // `max_revalidations_per_trigger`.
+                    let mut uris: Vec<Url> =
+                        sibling_fanout.iter().map(|(u, _, _)| u.clone()).collect();
+                    let mut seen: std::collections::HashSet<Url> = uris.iter().cloned().collect();
+                    seen.insert(uri.clone());
+                    extend_affected_for_load_all_revalidation_from_state(
+                        &mut uris, &mut seen, &state, &root,
+                    );
+                    cap_watched_file_revalidations(
+                        &mut uris,
+                        &state.cross_file_activity,
+                        state.cross_file_config.max_revalidations_per_trigger,
+                    );
+                    sibling_fanout = uris
+                        .into_iter()
+                        .filter_map(|u| {
+                            let doc = state.documents.get(&u)?;
+                            Some((u, doc.version, Some(doc.revision)))
+                        })
+                        .collect();
                 }
-                if !sibling_fanout.is_empty() {
+                // When the disk resync runs, it owns the siblings' marking and
+                // publishing (folded into run_close_resync so an open file
+                // that is both a package sibling and a graph dependent is
+                // force-marked exactly once, and publishes post-commit).
+                // Marking here as well would strand a counter: the resync's
+                // debounced schedule cancels the pending sibling task.
+                if !sibling_fanout.is_empty() && !close_resync {
                     state
                         .diagnostics_gate
                         .mark_force_republish_many(sibling_fanout.iter().map(|(u, _, _)| u));
@@ -5388,22 +6081,48 @@ impl LanguageServer for Backend {
             self.refresh_rprofile_prelude_from_disk(root).await;
         }
 
-        // Schedule revalidation for affected open siblings outside the write
-        // lock. The debounce window collapses bursts (e.g. "close all" closing
-        // many files in quick succession) into a single republish per sibling.
-        for (sibling_uri, trigger_version, trigger_revision) in sibling_fanout {
-            let state_arc = self.state.clone();
-            let client = self.client.clone();
-            let traversal_truncation = self.traversal_truncation.clone();
-            tokio::spawn(run_debounced_diagnostics(
-                state_arc,
-                client,
-                sibling_uri,
-                debounce_ms,
-                trigger_version,
-                trigger_revision,
-                Some(traversal_truncation),
+        if close_resync {
+            // Issue #558: converge cross-file state back to disk truth
+            // off-lock. The buffer-derived graph edges were deliberately left
+            // untouched in the write-lock block above; the spawned resync
+            // replaces them atomically from disk (or removes the file's entry
+            // if it is gone), then republishes affected open dependents —
+            // including the package-visibility siblings, which ride the
+            // resync so each URI is marked exactly once and published after
+            // the commit — through the normal gate. A close-then-reopen race
+            // is handled by the resync's commit-time veto. Never calls
+            // `scan_workspace` — this re-reads exactly one file.
+            let sibling_uris: Vec<Url> = sibling_fanout.into_iter().map(|(u, _, _)| u).collect();
+            tokio::spawn(run_close_resync(
+                self.state.clone(),
+                self.client.clone(),
+                self.traversal_truncation.clone(),
+                uri.clone(),
+                resync_chunk_kind,
+                resync_old_meta,
+                resync_old_interface_hash,
+                sibling_uris,
             ));
+        } else {
+            // No disk resync for this close (non-file URI or non-R document):
+            // schedule the package-sibling revalidation directly, outside the
+            // write lock. The debounce window collapses bursts (e.g. "close
+            // all" closing many files in quick succession) into a single
+            // republish per sibling.
+            for (sibling_uri, trigger_version, trigger_revision) in sibling_fanout {
+                let state_arc = self.state.clone();
+                let client = self.client.clone();
+                let traversal_truncation = self.traversal_truncation.clone();
+                tokio::spawn(run_debounced_diagnostics(
+                    state_arc,
+                    client,
+                    sibling_uri,
+                    debounce_ms,
+                    trigger_version,
+                    trigger_revision,
+                    Some(traversal_truncation),
+                ));
+            }
         }
     }
 
@@ -5711,16 +6430,13 @@ impl LanguageServer for Backend {
                     continue;
                 }
 
-                // Skip Rmd/Quarto files: they're routed to the LSP for the
-                // document outline (issue #227), but their prose/YAML would
-                // pollute the cross-file index if parsed as R. The workspace
-                // startup scan already excludes them via
-                // `is_stat_model_extension`; this keeps the watcher consistent.
-                let lower_path = uri.path().to_ascii_lowercase();
-                if lower_path.ends_with(".rmd") || lower_path.ends_with(".qmd") {
-                    log::trace!("Skipping watched Rmd/Quarto file change: {}", uri);
-                    continue;
-                }
+                // Rmd/Quarto files flow through like plain R since #558:
+                // `resync_file_from_disk` masks path-classified `.Rmd`/`.qmd`
+                // content (chunk bodies only, never prose — the pollution the
+                // old skip guarded against), and the close resync now
+                // installs graph/index state for closed Rmd documents that a
+                // later external edit or deletion must be able to update or
+                // remove.
 
                 match change.typ {
                     FileChangeType::CREATED | FileChangeType::CHANGED => {
@@ -5756,34 +6472,12 @@ impl LanguageServer for Backend {
                         log::trace!("Invalidated caches for changed file: {}", uri);
                     }
                     FileChangeType::DELETED => {
-                        // Find affected open neighbors before removing from graph.
-                        // Walks both backward (parents that source the deleted
-                        // file lose its symbols) and forward (children that
-                        // were sourced by it lose their inherited parent scope).
-                        let neighbors =
-                            crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                                uri,
-                                true,
-                                false,
-                                &state.cross_file_graph,
-                                |u| state.documents.contains_key(u),
-                                state.cross_file_config.max_chain_depth,
-                                state.cross_file_config.max_transitive_dependents_visited,
-                            );
+                        let neighbors = remove_file_from_cross_file_state(&mut state, uri);
                         for dep in neighbors {
                             if affected_set.insert(dep.clone()) {
                                 affected.push(dep);
                             }
                         }
-
-                        // Remove from new WorkspaceIndex
-                        state.workspace_index_new.invalidate(uri);
-
-                        // Remove from dependency graph and caches (legacy)
-                        state.cross_file_graph.remove_file(uri);
-                        state.cross_file_file_cache.invalidate(uri);
-                        state.cross_file_workspace_index.invalidate(uri);
-                        state.cross_file_meta.remove(uri);
 
                         // Update package inputs for deleted R/*.R or DESCRIPTION/NAMESPACE files.
                         // The event-driven path in the post-loop block handles the derive.
@@ -6107,193 +6801,36 @@ impl LanguageServer for Backend {
                 affected_for_async.iter().cloned().collect();
             tokio::spawn(async move {
                 for uri in &uris_to_update {
-                    // Read file content asynchronously
-                    let path = match uri.to_file_path() {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-
-                    let content = match crate::state::read_source_async(&path).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            log::trace!("Failed to read/decode file {}: {}", uri, e);
-                            continue;
-                        }
-                    };
-
-                    let metadata = match tokio::fs::metadata(&path).await {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-
-                    // Capture old metadata before recomputing (for WD change detection)
+                    // Capture old metadata before the disk read (for WD change
+                    // detection). The file was never open — the sync pass
+                    // skips open documents — so every metadata tier already
+                    // reflects the last-known disk state.
                     let old_meta = {
                         let state = state_arc.read().await;
                         state.get_enriched_metadata(uri)
                     };
 
-                    // Compute metadata and artifacts
-                    let mut cross_file_meta = crate::cross_file::extract_metadata(&content);
-
-                    // Resolve system.file() source entries into concrete paths
-                    {
-                        let state = state_arc.read().await;
-                        let ws = state.package_state.workspace();
-                        let ws_name = ws.map(|w| w.name.as_str());
-                        let ws_root = ws.map(|w| w.root.as_path());
-                        let lib_paths = state.package_library.lib_paths();
-                        crate::cross_file::resolve_system_file_sources(
-                            &mut cross_file_meta,
-                            ws_name,
-                            ws_root,
-                            lib_paths,
-                        );
-                    }
-
-                    let artifacts = std::sync::Arc::new({
-                        let mut parser = tree_sitter::Parser::new();
-                        if parser.set_language(&tree_sitter_r::LANGUAGE.into()).is_ok() {
-                            if let Some(tree) = parser.parse(&content, None) {
-                                // Use compute_artifacts_with_metadata to include declared symbols from directives
-                                // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-                                crate::cross_file::scope::compute_artifacts_with_metadata(
-                                    uri,
-                                    &tree,
-                                    &content,
-                                    Some(&cross_file_meta),
-                                )
-                            } else {
-                                crate::cross_file::scope::ScopeArtifacts::default()
-                            }
-                        } else {
-                            crate::cross_file::scope::ScopeArtifacts::default()
+                    // Affected dependents are collected but NOT force-marked
+                    // yet: marking is deferred until after the full async
+                    // union is capped, avoiding both duplicate markers and
+                    // cap bypasses from post-update fanout.
+                    match resync_file_from_disk(&state_arc, uri, None, old_meta, false).await {
+                        ResyncOutcome::Updated {
+                            affected_after_commit: deps,
+                            ..
                         }
-                    });
-
-                    let snapshot = crate::cross_file::file_cache::FileSnapshot::with_content_hash(
-                        &metadata, &content,
-                    );
-
-                    // Cache content for future match/inference resolution
-                    state_arc.read().await.cross_file_file_cache.insert(
-                        uri.clone(),
-                        snapshot.clone(),
-                        content.clone(),
-                    );
-
-                    // Update workspace index under brief lock
-                    {
-                        let state = state_arc.read().await;
-                        let open_docs: std::collections::HashSet<_> =
-                            state.documents.keys().cloned().collect();
-                        state.cross_file_workspace_index.update_from_disk(
-                            uri,
-                            &open_docs,
-                            snapshot,
-                            cross_file_meta.clone(),
-                            artifacts,
-                        );
-                    }
-
-                    // Update dependency graph
-                    let edges_mutated = {
-                        let mut state = state_arc.write().await;
-                        let uri_clone = uri.clone();
-                        let workspace_root = state.workspace_folders.first().cloned();
-
-                        // Pre-collect content for potential parent files to avoid borrow conflicts
-                        // IMPORTANT: Use PathContext WITHOUT `# raven: cd` for backward directives
-                        // Backward directives should always be resolved relative to the file's directory
-                        let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
-                            &uri_clone,
-                            workspace_root.as_ref(),
-                        );
-                        let parent_content: std::collections::HashMap<Url, String> =
-                            cross_file_meta
-                                .sourced_by
-                                .iter()
-                                .filter_map(|d| {
-                                    let ctx = backward_path_ctx.as_ref()?;
-                                    let resolved = crate::cross_file::path_resolve::resolve_path(
-                                        &d.path, ctx,
-                                    )?;
-                                    let parent_uri = Url::from_file_path(resolved).ok()?;
-                                    let content = state
-                                        .documents
-                                        .get(&parent_uri)
-                                        .map(|doc| doc.text())
-                                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                                    Some((parent_uri, content))
-                                })
-                                .collect();
-
-                        let graph_result = state.cross_file_graph.update_file(
-                            uri,
-                            &cross_file_meta,
-                            workspace_root.as_ref(),
-                            |parent_uri| parent_content.get(parent_uri).cloned(),
-                        );
-
-                        // Invalidate children affected by working directory change (Requirement 8)
-                        let wd_children = crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-                            uri,
-                            old_meta.as_deref(),
-                            &cross_file_meta,
-                            &state.cross_file_graph,
-                            &state.cross_file_meta,
-                        );
-                        // Collect open children for diagnostics. Force-marking
-                        // is intentionally deferred until after the full async
-                        // union is capped, avoiding both duplicate markers and
-                        // cap bypasses from post-update fanout.
-                        for child in wd_children {
-                            if state.documents.contains_key(&child)
-                                && affected_for_async_set.insert(child.clone())
-                            {
-                                affected_for_async.push(child);
-                            }
-                        }
-
-                        // Recompute neighbors against the POST-update graph.
-                        // The sync pass at watched-files entry computed
-                        // affected URIs from the *pre-update* graph, so any
-                        // forward/backward edge that this file introduces in
-                        // its new content (e.g. a freshly-added `source()`
-                        // call) is invisible to that pass. Re-running the
-                        // walk here picks up newly-reachable open neighbors.
-                        // Force-marking is deferred until after the full union
-                        // is capped so newly discovered neighbors cannot push
-                        // this trigger past `max_revalidations_per_trigger`.
-                        if graph_result.edges_changed {
-                            let post_neighbors =
-                                crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                                    uri,
-                                    true,
-                                    true,
-                                    &state.cross_file_graph,
-                                    |u| state.documents.contains_key(u),
-                                    state.cross_file_config.max_chain_depth,
-                                    state.cross_file_config.max_transitive_dependents_visited,
-                                );
-                            for dep in post_neighbors {
+                        | ResyncOutcome::Removed {
+                            affected_dependents: deps,
+                        } => {
+                            for dep in deps {
                                 if affected_for_async_set.insert(dep.clone()) {
                                     affected_for_async.push(dep);
                                 }
                             }
+                            log::trace!("Updated workspace index for: {}", uri);
                         }
-                        graph_result.edges_changed
-                    };
-
-                    // The sync watched-files pass refreshed pins for DELETED
-                    // files only. CREATED/CHANGED files have their edges
-                    // mutated here in the async pass, so refresh again now
-                    // that the graph reflects the disk update.
-                    if edges_mutated {
-                        let mut state = state_arc.write().await;
-                        state.recompute_open_neighborhood_pins();
+                        ResyncOutcome::Vetoed | ResyncOutcome::Skipped => {}
                     }
-
-                    log::trace!("Updated workspace index for: {}", uri);
                 }
 
                 // Update package inputs and derive state for CREATED/CHANGED R/*.R
@@ -15341,6 +15878,1795 @@ mod project_config_initialize_tests {
         }
     }
 
+    /// Characterization test for the watched-files CREATED/CHANGED async
+    /// disk-read pass: a disk edit to a CLOSED file must update the
+    /// dependency graph and the cross-file workspace index from disk
+    /// content. Written before extracting the shared single-file resync
+    /// primitive (issue #558) to pin the current behavior through the
+    /// refactor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_file_change_updates_graph_and_index_from_disk() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        fs::write(
+            tmp.path().join("main.R"),
+            "source(\"helper.R\")\nhelper_fn()\n",
+        )
+        .unwrap();
+        let (svc, main_uri) =
+            open_in_workspace(&tmp, "main.R", "r", "source(\"helper.R\")\nhelper_fn()\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        // Sanity: opening main.R created the main -> helper edge.
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&main_uri)
+                    .iter()
+                    .any(|e| e.to == helper_uri),
+                "did_open must add the main -> helper edge"
+            );
+        }
+
+        // External (closed-file) disk edit: helper.R gains a source() edge.
+        fs::write(
+            tmp.path().join("helper.R"),
+            "source(\"extra.R\")\nhelper_fn <- function() 1\n",
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: helper_uri.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // The graph mutation happens in the spawned async disk-read pass.
+        let updated = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri)
+        })
+        .await;
+        assert!(
+            updated,
+            "watched CHANGED event must add the helper -> extra edge from disk content"
+        );
+        let state = backend.state.read().await;
+        let meta = state
+            .cross_file_workspace_index
+            .get_metadata(&helper_uri)
+            .expect("workspace index must hold disk-derived metadata for the changed file");
+        assert_eq!(
+            meta.sources.len(),
+            1,
+            "index metadata must reflect the new on-disk source() call"
+        );
+    }
+
+    /// Characterization test for the watched-files DELETED branch: deleting
+    /// a closed file must drop its graph edges (including the mirror in an
+    /// open parent's forward list) and its workspace-index entry, and the
+    /// open dependent's force-republish marker must be consumed by the
+    /// synchronous publish before the handler returns. Pins current
+    /// behavior ahead of the issue #558 extraction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_file_deleted_removes_graph_edges_and_index_entry() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(
+            tmp.path().join("main.R"),
+            "source(\"helper.R\")\nhelper_fn()\n",
+        )
+        .unwrap();
+        let (svc, main_uri) =
+            open_in_workspace(&tmp, "main.R", "r", "source(\"helper.R\")\nhelper_fn()\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+
+        // The undefined-variable collector defers all diagnostics until the
+        // workspace scan completes (Auto backward-dependency mode); the test
+        // harness never runs `initialized`, so mark the scan complete.
+        backend.state.write().await.workspace_scan_complete = true;
+
+        // Sanity: the edge exists and helper_fn resolves (no diagnostics).
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&main_uri)
+                    .iter()
+                    .any(|e| e.to == helper_uri),
+                "did_open must add the main -> helper edge"
+            );
+            assert!(
+                snapshot_diagnostics(&state, &main_uri).is_empty(),
+                "helper_fn must resolve through the source() edge before deletion"
+            );
+        }
+
+        fs::remove_file(tmp.path().join("helper.R")).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: helper_uri.clone(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+
+        // DELETED-only batches mutate the graph synchronously, so the
+        // post-handler state is final: edges gone in both directions, index
+        // entry gone, and the dependent's force-republish marker consumed by
+        // the synchronous publish loop.
+        let state = backend.state.read().await;
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependencies(&main_uri)
+                .iter()
+                .any(|e| e.to == helper_uri),
+            "deletion must remove the main -> helper edge"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependents(&helper_uri)
+                .is_empty(),
+            "deletion must clear the deleted file's backward edges"
+        );
+        assert!(
+            state
+                .cross_file_workspace_index
+                .get_metadata(&helper_uri)
+                .is_none(),
+            "deletion must invalidate the workspace-index entry"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&main_uri),
+            0,
+            "the dependent's force-republish marker must be consumed before the handler returns"
+        );
+        assert!(
+            !snapshot_diagnostics(&state, &main_uri).is_empty(),
+            "helper_fn must be flagged once the sourced file is gone"
+        );
+    }
+
+    // ====================================================================
+    // did_close disk resync (issue #558): closing a buffer must converge
+    // the cross-file graph/index back to disk truth, discarding topology
+    // derived from unsaved buffer edits.
+    // ====================================================================
+
+    /// Issue #558 test 1: an unsaved `source()` edge added in the buffer
+    /// must disappear from the graph when the document closes — the resync
+    /// reverts to disk topology (which has no such edge).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_after_unsaved_added_source_edge_reverts_to_disk_topology() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "x <- 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        // Unsaved buffer edit adds a source() edge; the open buffer is
+        // authoritative, so the graph gains it.
+        change_doc(backend, &helper_uri, 2, "source(\"extra.R\")\nx <- 1\n").await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&helper_uri)
+                    .iter()
+                    .any(|e| e.to == extra_uri),
+                "unsaved buffer edit must add the helper -> extra edge"
+            );
+        }
+
+        close_doc(backend, &helper_uri).await;
+
+        let reverted = wait_for_state(backend, 5_000, |state| {
+            !state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri)
+        })
+        .await;
+        assert!(
+            reverted,
+            "close must revert the buffer-only source() edge to disk topology"
+        );
+        let state = backend.state.read().await;
+        let meta = state
+            .cross_file_workspace_index
+            .get_metadata(&helper_uri)
+            .expect("close resync must install disk-derived index metadata");
+        assert!(
+            meta.sources.is_empty(),
+            "index metadata must reflect the on-disk content (no source() call)"
+        );
+    }
+
+    /// The resync gate keys off the tracked document's `file_type`, not the
+    /// URI extension, so extension-less R documents like `.Rprofile` get the
+    /// close-time resync too: a buffer-only source() edge in an unsaved
+    /// `.Rprofile` must revert on close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_rprofile_reverts_buffer_only_source_edge() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".Rprofile"), "options(digits = 3)\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, rprofile_uri) =
+            open_in_workspace(&tmp, ".Rprofile", "r", "options(digits = 3)\n").await;
+        let backend = svc.inner();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        change_doc(
+            backend,
+            &rprofile_uri,
+            2,
+            "source(\"extra.R\")\noptions(digits = 3)\n",
+        )
+        .await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&rprofile_uri)
+                    .iter()
+                    .any(|e| e.to == extra_uri),
+                "unsaved .Rprofile edit must add the edge"
+            );
+        }
+
+        close_doc(backend, &rprofile_uri).await;
+
+        let reverted = wait_for_state(backend, 5_000, |state| {
+            !state
+                .cross_file_graph
+                .get_dependencies(&rprofile_uri)
+                .iter()
+                .any(|e| e.to == extra_uri)
+        })
+        .await;
+        assert!(
+            reverted,
+            ".Rprofile close must revert the buffer-only source() edge to disk topology"
+        );
+    }
+
+    /// The resync enriches disk metadata with the parent's inherited working
+    /// directory before committing, matching `did_open`/`did_change`: closing
+    /// a `# raven: sourced-by` child whose source() paths resolve through the
+    /// parent's `# raven: cd` must keep those edges rather than dropping to
+    /// file-relative resolution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_resync_preserves_inherited_working_directory_edges() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("data")).unwrap();
+        fs::create_dir(tmp.path().join("scripts")).unwrap();
+        fs::write(
+            tmp.path().join("parent.R"),
+            "# raven: cd data\nsource(\"../scripts/child.R\")\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("data").join("helper.R"),
+            "helper_fn <- function() 1\n",
+        )
+        .unwrap();
+        let child_disk = "# raven: sourced-by ../parent.R\nsource(\"helper.R\")\n";
+        fs::write(tmp.path().join("scripts").join("child.R"), child_disk).unwrap();
+
+        let (svc, child_uri) = open_in_workspace(&tmp, "scripts/child.R", "r", child_disk).await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("data").join("helper.R")).unwrap();
+
+        // did_open enriched the buffer's metadata with the parent's `cd`, so
+        // the child's source("helper.R") resolves to data/helper.R (never
+        // scripts/helper.R, which does not exist).
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&child_uri)
+                    .iter()
+                    .any(|e| e.to == helper_uri),
+                "open must resolve the child's source() through the inherited working directory"
+            );
+        }
+
+        close_doc(backend, &child_uri).await;
+
+        // Wait for the resync to install disk-derived index metadata (the
+        // edge itself is unchanged here, so it cannot signal completion).
+        let resynced = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_workspace_index
+                .get_metadata(&child_uri)
+                .is_some()
+        })
+        .await;
+        assert!(
+            resynced,
+            "close resync must install index metadata for the child"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&child_uri)
+                .iter()
+                .any(|e| e.to == helper_uri),
+            "close resync must keep resolving through the inherited working directory"
+        );
+    }
+
+    /// Issue #558 test 2: a `source()` edge removed by an unsaved buffer
+    /// edit must be restored from disk when the document closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_after_unsaved_removed_edge_restores_disk_edge() {
+        let tmp = TempDir::new().unwrap();
+        let disk = "source(\"extra.R\")\nx <- 1\n";
+        fs::write(tmp.path().join("helper.R"), disk).unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", disk).await;
+        let backend = svc.inner();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        // Unsaved buffer edit removes the source() line; the edge drops.
+        change_doc(backend, &helper_uri, 2, "x <- 1\n").await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !state
+                    .cross_file_graph
+                    .get_dependencies(&helper_uri)
+                    .iter()
+                    .any(|e| e.to == extra_uri),
+                "unsaved buffer edit must drop the helper -> extra edge"
+            );
+        }
+
+        close_doc(backend, &helper_uri).await;
+
+        let restored = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri)
+        })
+        .await;
+        assert!(
+            restored,
+            "close must restore the on-disk source() edge the unsaved edit removed"
+        );
+    }
+
+    /// Issue #558 test 3 (deterministic half): when the URI is an open
+    /// document, `resync_file_from_disk` must return `Vetoed` and mutate
+    /// nothing — the open buffer's state stays authoritative. (With the doc
+    /// open for the whole call this exercises the preflight veto; the
+    /// commit-time veto is the same check replayed under the write lock, and
+    /// the close-then-reopen e2e test covers the racing case.)
+    #[tokio::test]
+    async fn resync_vetoes_commit_when_document_is_open() {
+        let tmp = TempDir::new().unwrap();
+        // Disk has a source() edge; the open buffer does NOT.
+        fs::write(tmp.path().join("helper.R"), "source(\"extra.R\")\nx <- 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        let outcome = resync_file_from_disk(&backend.state, &helper_uri, None, None, true).await;
+        assert!(
+            matches!(outcome, ResyncOutcome::Vetoed),
+            "resync must veto while the document is open"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri),
+            "vetoed resync must not install disk-derived edges over buffer state"
+        );
+    }
+
+    /// The staleness veto: a resync must never overwrite a NEWER snapshot a
+    /// concurrent same-file resync already committed (close resync racing a
+    /// watched CHANGED event — both open-document vetoes are blind to
+    /// freshness). Seeding the file cache with a future-mtime snapshot
+    /// simulates the fresher commit having won the race.
+    #[tokio::test]
+    async fn resync_skips_when_newer_snapshot_already_committed() {
+        let tmp = TempDir::new().unwrap();
+        // Disk content would add an edge if committed.
+        fs::write(tmp.path().join("helper.R"), "source(\"extra.R\")\nx <- 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        fs::write(tmp.path().join("other.R"), "y <- 1\n").unwrap();
+        let (svc, _other_uri) = open_in_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        // Simulate a concurrent resync having committed FRESHER disk state:
+        // a cache snapshot whose mtime is ahead of the on-disk file's.
+        let newer_content = "newer <- 1\n".to_string();
+        {
+            let state = backend.state.read().await;
+            state.cross_file_file_cache.insert(
+                helper_uri.clone(),
+                crate::cross_file::file_cache::FileSnapshot {
+                    mtime: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                    size: newer_content.len() as u64,
+                    content_hash: None,
+                },
+                newer_content.clone(),
+            );
+        }
+
+        let outcome = resync_file_from_disk(&backend.state, &helper_uri, None, None, true).await;
+        assert!(
+            matches!(outcome, ResyncOutcome::Skipped),
+            "an older disk read must not overwrite a newer committed snapshot"
+        );
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.cross_file_file_cache.get(&helper_uri).as_deref(),
+            Some(newer_content.as_str()),
+            "the fresher cached content must survive the stale resync"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri),
+            "the stale read's edges must not be committed"
+        );
+    }
+
+    /// Opening a document invalidates its closed-file cache entry, so a
+    /// poisoned (newer-mtime) snapshot from before the open cannot wrongly
+    /// win the staleness veto at the next close — e.g. a `git checkout`
+    /// restoring older mtimes while the buffer was open, when watcher
+    /// events (and their invalidation) are skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_clears_cached_snapshot_so_close_resync_commits() {
+        use tower_lsp::lsp_types::{DidCloseTextDocumentParams, TextDocumentIdentifier};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "x <- 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        fs::write(tmp.path().join("other.R"), "y <- 1\n").unwrap();
+        let (svc, _other) = open_in_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        // Poison the cache with a future-mtime snapshot (as a fresher commit
+        // would leave), then open the file — the open must clear it.
+        {
+            let state = backend.state.read().await;
+            state.cross_file_file_cache.insert(
+                helper_uri.clone(),
+                crate::cross_file::file_cache::FileSnapshot {
+                    mtime: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                    size: 1,
+                    content_hash: None,
+                },
+                "poisoned <- 1\n".to_string(),
+            );
+        }
+        open_doc(backend, &helper_uri, "r", 1, "x <- 1\n").await;
+
+        // Simulate the checkout: disk now has an edge; its mtime is "older"
+        // than the poisoned snapshot would have been.
+        fs::write(tmp.path().join("helper.R"), "source(\"extra.R\")\nx <- 1\n").unwrap();
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: helper_uri.clone(),
+                },
+            })
+            .await;
+
+        let committed = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri)
+        })
+        .await;
+        assert!(
+            committed,
+            "the close resync must commit disk state — the pre-open snapshot must not veto it"
+        );
+    }
+
+    /// A watched CHANGED that reads transiently-invalid UTF-8 (a non-atomic
+    /// external write in progress) must NOT remove the file's cross-file
+    /// state: removal would strip a closed parent's incoming edge, which
+    /// nothing could restore. It skips; the completing write's next CHANGED
+    /// converges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_transient_invalid_encoding_does_not_remove_state() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "child_fn <- function() 1\n").unwrap();
+        let parent = "source(\"child.R\")\nchild_fn()\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&parent_uri)
+                    .iter()
+                    .any(|e| e.to == child_uri),
+                "precondition: parent -> child edge exists"
+            );
+        }
+
+        // Mid-write garbage on disk, then the watcher fires.
+        std::fs::write(tmp.path().join("child.R"), [0x78u8, 0x80, 0x79]).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: child_uri.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // Give the async resync time to (incorrectly) act, then assert the
+        // edge survived the transient garbage.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .any(|e| e.to == child_uri),
+            "transiently-undecodable watched content must not strip the parent's edge"
+        );
+    }
+
+    /// The missing-file branch has its own veto: a file deleted from disk
+    /// whose URI is (re)opened must not have its cross-file state removed —
+    /// the open buffer is authoritative even when no disk file backs it.
+    #[tokio::test]
+    async fn resync_missing_file_vetoes_when_reopened() {
+        let tmp = TempDir::new().unwrap();
+        let content = "source(\"extra.R\")\nx <- 1\n";
+        fs::write(tmp.path().join("helper.R"), content).unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", content).await;
+        let backend = svc.inner();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        fs::remove_file(tmp.path().join("helper.R")).unwrap();
+
+        // Call the missing-file branch directly (the resync entry point
+        // would preflight-veto before ever reaching it) with the document
+        // open, as a racing reopen would leave it.
+        let outcome = resync_missing_file(&backend.state, &helper_uri).await;
+        assert!(
+            matches!(outcome, ResyncOutcome::Vetoed),
+            "the missing-file branch must veto while the document is open"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri),
+            "a vetoed removal must leave the open buffer's edges intact"
+        );
+    }
+
+    /// Issue #558 test 3 (end-to-end half): close-then-immediate-reopen.
+    /// Whatever order the spawned resync and the reopen's `did_open` land
+    /// in, the reopened buffer's topology must win — either the resync
+    /// commits first and `did_open` overwrites it, or `did_open` lands
+    /// first and the resync's commit-time veto fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_then_reopen_keeps_reopened_buffer_topology() {
+        let tmp = TempDir::new().unwrap();
+        // Disk has NO source() edge; the reopened buffer adds one (unsaved).
+        fs::write(tmp.path().join("helper.R"), "x <- 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        close_doc(backend, &helper_uri).await;
+        // Immediate reopen with different (unsaved) buffer content.
+        open_doc(
+            backend,
+            &helper_uri,
+            "r",
+            1,
+            "source(\"extra.R\")\nx <- 1\n",
+        )
+        .await;
+
+        // Let the spawned resync settle (commit or veto), then assert the
+        // reopened buffer's edge survived.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri),
+            "a stale disk commit must never clobber the reopened buffer's topology"
+        );
+    }
+
+    /// Issue #558 test 4: transitive dependents (grandparent -> parent ->
+    /// helper) are revalidated and republished after the close resync
+    /// restores disk content the unsaved buffer had removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_resync_revalidates_transitive_dependents() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("parent.R"), "source(\"helper.R\")\n").unwrap();
+        fs::write(
+            tmp.path().join("grandparent.R"),
+            "source(\"parent.R\")\nhelper_fn()\n",
+        )
+        .unwrap();
+        let (svc, grandparent_uri) = open_in_workspace(
+            &tmp,
+            "grandparent.R",
+            "r",
+            "source(\"parent.R\")\nhelper_fn()\n",
+        )
+        .await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
+        // The undefined-variable collector defers until the workspace scan
+        // completes; the harness never runs `initialized`.
+        backend.state.write().await.workspace_scan_complete = true;
+
+        // Sanity: helper_fn resolves through the transitive chain.
+        {
+            let state = backend.state.read().await;
+            assert!(
+                snapshot_diagnostics(&state, &grandparent_uri).is_empty(),
+                "helper_fn must resolve through parent -> helper before the edit"
+            );
+        }
+
+        // Unsaved buffer edit deletes helper_fn; the grandparent now flags it.
+        change_doc(backend, &helper_uri, 2, "x <- 1\n").await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !snapshot_diagnostics(&state, &grandparent_uri).is_empty(),
+                "deleting helper_fn in the buffer must flag the grandparent's call"
+            );
+        }
+        // Let did_change's own dependent fanout drain before closing, so the
+        // marker-consumed assertion below observes only the close resync's
+        // mark/publish pair (a pending debounced publish cancelled by the
+        // resync's schedule() would otherwise strand its marker).
+        let drained = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&grandparent_uri)
+                == 0
+        })
+        .await;
+        assert!(drained, "did_change's dependent fanout must drain");
+
+        close_doc(backend, &helper_uri).await;
+
+        // Stage 1: the resync must MARK the transitive dependent (visible
+        // during the 200ms publish debounce) — asserting only the drained
+        // `== 0` end state would pass even if the publish tail never ran.
+        let marked = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&grandparent_uri)
+                >= 1
+        })
+        .await;
+        assert!(
+            marked,
+            "the close resync must force-mark the transitive dependent"
+        );
+        // The resync restores disk content (helper_fn exists again) and
+        // force-republishes the transitive dependent.
+        let recovered = wait_for_state(backend, 5_000, |state| {
+            snapshot_diagnostics(state, &grandparent_uri).is_empty()
+        })
+        .await;
+        assert!(
+            recovered,
+            "close resync must restore disk content and revalidate the transitive dependent"
+        );
+        // Stage 2: the marker must be consumed by the bounded publish.
+        let consumed = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&grandparent_uri)
+                == 0
+        })
+        .await;
+        assert!(
+            consumed,
+            "the dependent's force-republish marker must be consumed by the publish tail"
+        );
+    }
+
+    /// Issue #558 test 5: no transient empty-edge window. Between close and
+    /// the disk commit, a dependent's diagnostics must never observe the
+    /// closed file with its edges stripped — the buffer-derived edges stay
+    /// in place until the resync atomically replaces them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_resync_has_no_transient_empty_edge_window() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(
+            tmp.path().join("parent.R"),
+            "source(\"helper.R\")\nhelper_fn()\n",
+        )
+        .unwrap();
+        let (svc, parent_uri) =
+            open_in_workspace(&tmp, "parent.R", "r", "source(\"helper.R\")\nhelper_fn()\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
+        backend.state.write().await.workspace_scan_complete = true;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                snapshot_diagnostics(&state, &parent_uri).is_empty(),
+                "helper_fn must resolve before the close"
+            );
+        }
+
+        close_doc(backend, &helper_uri).await;
+
+        // Sample the dependent's diagnostics continuously through the resync
+        // window: the parent -> helper edge and helper's resolvable content
+        // must be visible at every instant (buffer == disk here, so the
+        // final state is identical; only a transient strip could flag).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            {
+                let state = backend.state.read().await;
+                assert!(
+                    state
+                        .cross_file_graph
+                        .get_dependencies(&parent_uri)
+                        .iter()
+                        .any(|e| e.to == helper_uri),
+                    "the parent -> helper edge must never transiently disappear"
+                );
+                assert!(
+                    snapshot_diagnostics(&state, &parent_uri).is_empty(),
+                    "the dependent must never transiently flag helper_fn during the resync"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Closing a deleted-from-disk file removes its cross-file state
+    /// entirely (graph edges in both directions, index entries) instead of
+    /// leaving stale buffer-derived topology behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_of_deleted_file_removes_cross_file_state() {
+        let tmp = TempDir::new().unwrap();
+        let content = "source(\"extra.R\")\nx <- 1\n";
+        fs::write(tmp.path().join("helper.R"), content).unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", content).await;
+        let backend = svc.inner();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&helper_uri)
+                    .iter()
+                    .any(|e| e.to == extra_uri),
+                "open buffer must contribute the helper -> extra edge"
+            );
+        }
+
+        // Delete the underlying file while the buffer is still open, then close.
+        fs::remove_file(tmp.path().join("helper.R")).unwrap();
+        close_doc(backend, &helper_uri).await;
+
+        let removed = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .is_empty()
+                && state
+                    .cross_file_workspace_index
+                    .get_metadata(&helper_uri)
+                    .is_none()
+        })
+        .await;
+        assert!(
+            removed,
+            "closing a deleted file must remove its graph edges and index entry"
+        );
+    }
+
+    /// The close resync masks disk content with the closing document's
+    /// editor-language classification, not the path: a file-backed document
+    /// WITHOUT an `.Rmd`/`.qmd` extension opened as `languageId: rmd` is
+    /// chunk-masked while open, and the resync must not reclassify the same
+    /// disk text as plain R (which would mint prose `source()` edges).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_resync_respects_language_mode_chunk_classification() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helpers.R"), "helper_fn <- function() 1\n").unwrap();
+        // Both decoy targets exist, so an unmasked (plain-R) parse of the
+        // prose line would resolve a real edge.
+        fs::write(tmp.path().join("prose_decoy.R"), "d <- 1\n").unwrap();
+        // `.Rmarkdown` is NOT matched by the path classifier (only .rmd/.qmd),
+        // so only the languageId can classify this document as R Markdown.
+        let content = concat!(
+            "# Report\n",
+            "\n",
+            "source(\"prose_decoy.R\")\n",
+            "\n",
+            "```{r}\n",
+            "source(\"helpers.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("report.Rmarkdown"), content).unwrap();
+        let (svc, report_uri) = open_in_workspace(&tmp, "report.Rmarkdown", "rmd", content).await;
+        let backend = svc.inner();
+        let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
+        let decoy_uri = Url::from_file_path(tmp.path().join("prose_decoy.R")).unwrap();
+
+        // Sanity: while open (languageId-classified, masked), only the chunk
+        // edge exists.
+        {
+            let state = backend.state.read().await;
+            let deps = state.cross_file_graph.get_dependencies(&report_uri);
+            assert!(
+                deps.iter().any(|e| e.to == helpers_uri),
+                "chunk source() must produce an edge while open"
+            );
+            assert!(
+                !deps.iter().any(|e| e.to == decoy_uri),
+                "prose source() must not produce an edge while open"
+            );
+        }
+
+        close_doc(backend, &report_uri).await;
+
+        // The resync installs disk-derived index metadata; wait for it, then
+        // assert the classification survived the close.
+        let resynced = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_workspace_index
+                .get_metadata(&report_uri)
+                .is_some()
+        })
+        .await;
+        assert!(resynced, "close resync must install index metadata");
+        let state = backend.state.read().await;
+        let deps = state.cross_file_graph.get_dependencies(&report_uri);
+        assert!(
+            deps.iter().any(|e| e.to == helpers_uri),
+            "the chunk edge must survive the close resync"
+        );
+        assert!(
+            !deps.iter().any(|e| e.to == decoy_uri),
+            "the resync must keep the editor-language chunk masking — prose must never become an edge"
+        );
+    }
+
+    /// An open file that is BOTH a package-visibility sibling and a graph
+    /// dependent of the closing document must be force-marked exactly once:
+    /// the sibling fanout rides the close resync instead of being marked and
+    /// scheduled separately (a second schedule cancels the first pending
+    /// debounced task and strands its marker). A second, package-ONLY
+    /// sibling (`c.R`, no graph edge to the closed file) pins the fold
+    /// itself: it can only be marked through `package_sibling_fanout`, so an
+    /// implementation that drops the sibling set from `run_close_resync`
+    /// fails its stage-1 assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_marks_overlapping_package_sibling_and_dependent_once() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(tmp.path().join("R").join("a.R"), "a_fn <- function() 1\n").unwrap();
+        let b_disk = "source(\"a.R\")\nb_fn <- function() 2\n";
+        fs::write(tmp.path().join("R").join("b.R"), b_disk).unwrap();
+        // Package-only sibling: open R/ file with NO edge to a.R.
+        let c_disk = "c_fn <- function() 3\n";
+        fs::write(tmp.path().join("R").join("c.R"), c_disk).unwrap();
+        let (svc, b_uri) = open_in_workspace(&tmp, "R/b.R", "r", b_disk).await;
+        let backend = svc.inner();
+        let a_uri = Url::from_file_path(tmp.path().join("R").join("a.R")).unwrap();
+        let c_uri = Url::from_file_path(tmp.path().join("R").join("c.R")).unwrap();
+        open_doc(backend, &a_uri, "r", 1, "a_fn <- function() 1\n").await;
+        open_doc(backend, &c_uri, "r", 1, c_disk).await;
+
+        // Activate REAL package mode (a bare workspace_root without a
+        // DESCRIPTION never derives a scope contribution, so
+        // pkg_visibility_changed would stay false and the sibling fanout
+        // would be empty), then make a's close change package visibility
+        // (buffer-only symbol discarded on close).
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+            state.package_inputs.description = Some(crate::package_state::DescriptionInput {
+                text: "Package: testpkg\nVersion: 1.0\n".into(),
+            });
+            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+        }
+        change_doc(
+            backend,
+            &a_uri,
+            2,
+            "a_fn <- function() 1\nbuffer_only_fn <- function() 2\n",
+        )
+        .await;
+        // Drain the open/change fanout so the assertions below observe only
+        // the close's marking.
+        let drained = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&b_uri)
+                == 0
+                && state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&c_uri)
+                    == 0
+        })
+        .await;
+        assert!(
+            drained,
+            "the open/change fanout must drain before the close"
+        );
+
+        close_doc(backend, &a_uri).await;
+
+        // b.R is in the sibling fanout (open R/ file, package visibility
+        // changed) AND in the resync's dependent walk (it sources a.R);
+        // c.R is in the sibling fanout ONLY. Stage 1: observe the resync
+        // actually MARK both (the publish rides a 200ms debounce after
+        // marking, so the counters are visibly >= 1 in between) — without
+        // this the final `== 0` would pass vacuously, since the counters
+        // were drained before the close. The c.R half fails if the sibling
+        // set is dropped from `run_close_resync` (nothing else marks a
+        // package-only sibling).
+        let marked = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&b_uri)
+                >= 1
+        })
+        .await;
+        assert!(
+            marked,
+            "the close resync must force-mark the overlapping sibling/dependent"
+        );
+        let sibling_marked = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&c_uri)
+                >= 1
+        })
+        .await;
+        assert!(
+            sibling_marked,
+            "the close resync must force-mark the package-only sibling (the fold itself)"
+        );
+        // Stage 2: each single publish must consume each single marker. A
+        // double mark (sibling path + resync path) would leave a counter
+        // stuck at 1 after its publish.
+        let settled = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&b_uri)
+                == 0
+                && state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&c_uri)
+                    == 0
+        })
+        .await;
+        assert!(
+            settled,
+            "both siblings must be force-marked exactly once and consumed"
+        );
+    }
+
+    /// Exists -> missing -> exists: deleting a sourced file strips the open
+    /// parent's edge (removal is total), and recreating the file must
+    /// restore it — the recreated child's own metadata cannot re-derive an
+    /// edge owned by PARENT metadata, so the resync re-runs the open
+    /// parents' graph updates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recreated_file_restores_open_parent_edges() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "child_fn <- function() 1\n").unwrap();
+        let parent = "source(\"child.R\")\nchild_fn()\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&parent_uri)
+                    .iter()
+                    .any(|e| e.to == child_uri),
+                "precondition: the parent -> child edge exists"
+            );
+        }
+
+        // Delete: the DELETED branch removes ALL of child's edges, including
+        // the parent-owned one.
+        fs::remove_file(tmp.path().join("child.R")).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: child_uri.clone(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !state
+                    .cross_file_graph
+                    .get_dependencies(&parent_uri)
+                    .iter()
+                    .any(|e| e.to == child_uri),
+                "deletion must strip the parent -> child edge"
+            );
+        }
+
+        // Recreate: the resync must restore the open parent's edge.
+        fs::write(tmp.path().join("child.R"), "child_fn <- function() 1\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: child_uri.clone(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+        let restored = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .any(|e| e.to == child_uri)
+        })
+        .await;
+        assert!(
+            restored,
+            "recreating the file must restore the open parent's source() edge"
+        );
+    }
+
+    /// The legacy startup-scan document map (`state.workspace_index`) is a
+    /// content-provider tier above the file cache; the resync must drop its
+    /// entry or stale scan-time content shadows the fresh disk commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_resync_drops_stale_legacy_workspace_index_entry() {
+        use tower_lsp::lsp_types::{DidCloseTextDocumentParams, TextDocumentIdentifier};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_fn <- function() 1\n").unwrap();
+        let (svc, helper_uri) =
+            open_in_workspace(&tmp, "helper.R", "r", "helper_fn <- function() 1\n").await;
+        let backend = svc.inner();
+
+        // Plant a stale legacy-index entry, as the startup scan would have.
+        backend.state.write().await.workspace_index.insert(
+            helper_uri.clone(),
+            crate::state::Document::new("old_fn <- function() 1\n", None),
+        );
+
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: helper_uri.clone(),
+                },
+            })
+            .await;
+
+        let dropped = wait_for_state(backend, 5_000, |state| {
+            !state.workspace_index.contains_key(&helper_uri)
+        })
+        .await;
+        assert!(
+            dropped,
+            "the resync commit must drop the stale legacy workspace-index entry"
+        );
+    }
+
+    /// A file whose disk content became undecodable converges like a missing
+    /// file on close: the package input side already removes it
+    /// (`on_disk_text: None`), and the cross-file side must not strand the
+    /// discarded buffer's graph entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_of_undecodable_file_removes_cross_file_state() {
+        use tower_lsp::lsp_types::{DidCloseTextDocumentParams, TextDocumentIdentifier};
+
+        let tmp = TempDir::new().unwrap();
+        let content = "source(\"extra.R\")\nx <- 1\n";
+        fs::write(tmp.path().join("helper.R"), content).unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", content).await;
+        let backend = svc.inner();
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !state
+                    .cross_file_graph
+                    .get_dependencies(&helper_uri)
+                    .is_empty(),
+                "precondition: the buffer's edge exists"
+            );
+        }
+
+        // Replace the disk content with invalid UTF-8 (no BOM: a lone
+        // continuation byte), then close.
+        std::fs::write(tmp.path().join("helper.R"), [0x78u8, 0x80, 0x79]).unwrap();
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: helper_uri.clone(),
+                },
+            })
+            .await;
+
+        let removed = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .is_empty()
+                && state
+                    .cross_file_workspace_index
+                    .get_metadata(&helper_uri)
+                    .is_none()
+        })
+        .await;
+        assert!(
+            removed,
+            "undecodable disk content must converge like a missing file"
+        );
+    }
+
+    /// Watched CHANGED/DELETED events for CLOSED `.Rmd` documents flow
+    /// through the resync (the old skip guard pre-dated masked resyncs):
+    /// external edits update the chunk-derived edges, and deletion removes
+    /// the state the close resync installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_events_update_and_remove_closed_rmd_state() {
+        use tower_lsp::lsp_types::{
+            DidChangeWatchedFilesParams, DidCloseTextDocumentParams, FileChangeType, FileEvent,
+            TextDocumentIdentifier,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helpers.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        fs::write(tmp.path().join("prose_decoy.R"), "d <- 1\n").unwrap();
+        let rmd_v1 = concat!(
+            "# Report\n",
+            "\n",
+            "source(\"prose_decoy.R\")\n",
+            "\n",
+            "```{r}\n",
+            "source(\"helpers.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("analysis.Rmd"), rmd_v1).unwrap();
+        let (svc, rmd_uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd_v1).await;
+        let backend = svc.inner();
+        let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+        let decoy_uri = Url::from_file_path(tmp.path().join("prose_decoy.R")).unwrap();
+
+        // Close (installs disk-derived state), then edit the CLOSED file on
+        // disk, re-pointing the chunk edge.
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: rmd_uri.clone(),
+                },
+            })
+            .await;
+        let installed = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_graph
+                .get_dependencies(&rmd_uri)
+                .iter()
+                .any(|e| e.to == helpers_uri)
+        })
+        .await;
+        assert!(installed, "close resync must install the chunk edge");
+
+        let rmd_v2 = concat!(
+            "# Report\n",
+            "\n",
+            "source(\"prose_decoy.R\")\n",
+            "\n",
+            "```{r}\n",
+            "source(\"extra.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("analysis.Rmd"), rmd_v2).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: rmd_uri.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+        let updated = wait_for_state(backend, 5_000, |state| {
+            let deps = state.cross_file_graph.get_dependencies(&rmd_uri);
+            deps.iter().any(|e| e.to == extra_uri) && !deps.iter().any(|e| e.to == helpers_uri)
+        })
+        .await;
+        assert!(
+            updated,
+            "a watched CHANGED for a closed Rmd must update its chunk edge"
+        );
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !state
+                    .cross_file_graph
+                    .get_dependencies(&rmd_uri)
+                    .iter()
+                    .any(|e| e.to == decoy_uri),
+                "prose source() must stay masked through the watched resync"
+            );
+        }
+
+        // Delete the closed Rmd: its installed state must be removed.
+        fs::remove_file(tmp.path().join("analysis.Rmd")).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: rmd_uri.clone(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        let state = backend.state.read().await;
+        assert!(
+            state.cross_file_graph.get_dependencies(&rmd_uri).is_empty(),
+            "deleting a closed Rmd must remove its graph state"
+        );
+        assert!(
+            state
+                .cross_file_workspace_index
+                .get_metadata(&rmd_uri)
+                .is_none(),
+            "deleting a closed Rmd must remove its index entry"
+        );
+    }
+
+    /// A close-time package-visibility change must reach `load_all()`
+    /// carriers (root-level scripts that are not `is_r_source_path`), the
+    /// same widening every watcher-driven visibility fanout applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_visibility_fanout_reaches_load_all_carriers() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        fs::write(tmp.path().join("R").join("a.R"), "a_fn <- function() 1\n").unwrap();
+        let analysis = "devtools::load_all()\na_fn()\n";
+        fs::write(tmp.path().join("analysis.R"), analysis).unwrap();
+        let (svc, analysis_uri) = open_in_workspace(&tmp, "analysis.R", "r", analysis).await;
+        let backend = svc.inner();
+        let a_uri = Url::from_file_path(tmp.path().join("R").join("a.R")).unwrap();
+        open_doc(backend, &a_uri, "r", 1, "a_fn <- function() 1\n").await;
+
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+            state.package_inputs.description = Some(crate::package_state::DescriptionInput {
+                text: "Package: testpkg\nVersion: 1.0\n".into(),
+            });
+            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+        }
+        change_doc(
+            backend,
+            &a_uri,
+            2,
+            "a_fn <- function() 1\nbuffer_only_fn <- function() 2\n",
+        )
+        .await;
+        let drained = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&analysis_uri)
+                == 0
+        })
+        .await;
+        assert!(drained, "pre-close fanout must drain");
+
+        close_doc(backend, &a_uri).await;
+
+        // The carrier is NOT is_r_source_path and has no graph edge to a.R —
+        // only the load_all widening can mark it.
+        let marked = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&analysis_uri)
+                >= 1
+        })
+        .await;
+        assert!(
+            marked,
+            "the close visibility fanout must reach the load_all carrier"
+        );
+        let settled = wait_for_state(backend, 5_000, |state| {
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&analysis_uri)
+                == 0
+        })
+        .await;
+        assert!(settled, "the carrier's marker must be consumed");
+    }
+
+    /// Closing a dirty package source reverts its package input to DISK
+    /// truth: symbols that existed only in the discarded buffer must leave
+    /// `package_inputs.r_files` (previously the close event installed the
+    /// buffer text, stranding buffer-only symbols until a watcher event that
+    /// never comes — disk was never touched).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_reverts_package_input_to_disk_text() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let disk = "pkg_fn <- function() 1\n";
+        fs::write(tmp.path().join("R").join("helper.R"), disk).unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "R/helper.R", "r", disk).await;
+        let backend = svc.inner();
+        let helper_path = tmp.path().join("R").join("helper.R");
+
+        // Activate package mode after open; the did_change below then routes
+        // through the package event pipeline.
+        backend.state.write().await.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+
+        change_doc(
+            backend,
+            &helper_uri,
+            2,
+            "pkg_fn <- function() 1\nbuffer_only_fn <- function() 2\n",
+        )
+        .await;
+        {
+            let state = backend.state.read().await;
+            let input = state
+                .package_inputs
+                .r_files
+                .get(&helper_path)
+                .expect("did_change must install the buffer text as a package input");
+            assert!(
+                input.text.contains("buffer_only_fn"),
+                "precondition: the live buffer text carries the buffer-only symbol"
+            );
+        }
+
+        close_doc(backend, &helper_uri).await;
+
+        // The DidClose translate runs synchronously inside did_close's write
+        // lock, so the post-close state is final.
+        let state = backend.state.read().await;
+        let input = state
+            .package_inputs
+            .r_files
+            .get(&helper_path)
+            .expect("the file still exists on disk, so its input must remain");
+        assert_eq!(
+            input.text.as_ref(),
+            disk,
+            "close must revert the package input to exactly the disk text"
+        );
+    }
+
+    /// Closing a package source whose disk file was deleted while the buffer
+    /// was open removes it from `package_inputs.r_files` — the watcher's
+    /// DELETED event was skipped ("open docs are authoritative"), so the
+    /// close is the last chance to converge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_of_deleted_package_source_removes_package_input() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("R")).unwrap();
+        let disk = "pkg_fn <- function() 1\n";
+        fs::write(tmp.path().join("R").join("helper.R"), disk).unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "R/helper.R", "r", disk).await;
+        let backend = svc.inner();
+        let helper_path = tmp.path().join("R").join("helper.R");
+
+        backend.state.write().await.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+        // Seed the input through the live pipeline (buffer text).
+        change_doc(backend, &helper_uri, 2, "pkg_fn <- function() 1\nx <- 1\n").await;
+        assert!(
+            backend
+                .state
+                .read()
+                .await
+                .package_inputs
+                .r_files
+                .contains_key(&helper_path),
+            "precondition: the open buffer's input is tracked"
+        );
+
+        fs::remove_file(&helper_path).unwrap();
+        close_doc(backend, &helper_uri).await;
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.package_inputs.r_files.contains_key(&helper_path),
+            "closing a disk-deleted package source must drop its package input"
+        );
+    }
+
+    /// A stale `workspace_index_new` entry (planted by the startup scan or
+    /// on-demand indexing) outranks `cross_file_workspace_index` in
+    /// `get_enriched_metadata` and the content provider, so the resync's
+    /// commit must invalidate it — otherwise the freshly committed disk
+    /// state is shadowed and dependents keep resolving the pre-resync
+    /// interface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_resync_overrides_stale_unified_index_entry() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(
+            tmp.path().join("parent.R"),
+            "source(\"helper.R\")\nhelper_fn()\n",
+        )
+        .unwrap();
+        let (svc, parent_uri) =
+            open_in_workspace(&tmp, "parent.R", "r", "source(\"helper.R\")\nhelper_fn()\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        backend.state.write().await.workspace_scan_complete = true;
+
+        // Plant a STALE unified-index entry for helper.R, simulating a scan
+        // snapshot taken before the file's current disk content (it defines
+        // old_fn, not helper_fn).
+        {
+            let stale = "old_fn <- function() 1\n";
+            let tree = crate::parser_pool::with_parser(|p| p.parse(stale, None));
+            let metadata = std::sync::Arc::new(crate::cross_file::extract_metadata(stale));
+            let artifacts = std::sync::Arc::new(match tree.as_ref() {
+                Some(t) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                    &helper_uri,
+                    t,
+                    stale,
+                    Some(&metadata),
+                ),
+                None => crate::cross_file::scope::ScopeArtifacts::default(),
+            });
+            let fs_meta = std::fs::metadata(tmp.path().join("helper.R")).unwrap();
+            let entry = crate::workspace_index::IndexEntry {
+                contents: ropey::Rope::from_str(stale),
+                tree,
+                loaded_packages: Vec::new(),
+                snapshot: crate::cross_file::file_cache::FileSnapshot::with_content_hash(
+                    &fs_meta, stale,
+                ),
+                metadata,
+                artifacts,
+                indexed_at_version: 0,
+            };
+            let state = backend.state.read().await;
+            state.workspace_index_new.insert(helper_uri.clone(), entry);
+        }
+        // Precondition: the stale entry shadows every lower tier, so the
+        // parent cannot resolve helper_fn.
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !snapshot_diagnostics(&state, &parent_uri).is_empty(),
+                "the stale unified-index entry must shadow lower tiers (test precondition)"
+            );
+        }
+
+        // Open + close helper.R (buffer identical to disk): the close resync
+        // must drop the stale unified-index entry so the fresh disk commit
+        // becomes visible to the dependent.
+        open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
+        close_doc(backend, &helper_uri).await;
+
+        let recovered = wait_for_state(backend, 5_000, |state| {
+            snapshot_diagnostics(state, &parent_uri).is_empty()
+        })
+        .await;
+        assert!(
+            recovered,
+            "close resync must invalidate the stale unified-index entry that shadows disk state"
+        );
+    }
+
+    /// Rmd/Quarto close resync goes through the masking pipeline: disk
+    /// metadata comes from chunk bodies only, so an unsaved chunk edit
+    /// reverts and prose `source()` mentions never become edges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_resync_rmd_uses_masked_disk_content() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helpers.R"), "helper_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        // The prose decoy target exists on disk, so an unmasked parse WOULD
+        // resolve it into an edge — masking is what keeps it out.
+        fs::write(tmp.path().join("prose_decoy.R"), "d <- 1\n").unwrap();
+        let rmd_disk = concat!(
+            "# Report\n",
+            "\n",
+            "Prose calls source(\"prose_decoy.R\") but that is not R.\n",
+            "\n",
+            "```{r}\n",
+            "source(\"helpers.R\")\n",
+            "```\n",
+        );
+        fs::write(tmp.path().join("analysis.Rmd"), rmd_disk).unwrap();
+        let (svc, rmd_uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd_disk).await;
+        let backend = svc.inner();
+        let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+        let decoy_uri = Url::from_file_path(tmp.path().join("prose_decoy.R")).unwrap();
+
+        // Unsaved chunk edit swaps the source() target to extra.R.
+        let rmd_buffer = concat!(
+            "# Report\n",
+            "\n",
+            "Prose calls source(\"prose_decoy.R\") but that is not R.\n",
+            "\n",
+            "```{r}\n",
+            "source(\"extra.R\")\n",
+            "```\n",
+        );
+        change_doc(backend, &rmd_uri, 2, rmd_buffer).await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&rmd_uri)
+                    .iter()
+                    .any(|e| e.to == extra_uri),
+                "unsaved chunk edit must point the edge at extra.R"
+            );
+        }
+
+        close_doc(backend, &rmd_uri).await;
+
+        let reverted = wait_for_state(backend, 5_000, |state| {
+            let deps = state.cross_file_graph.get_dependencies(&rmd_uri);
+            deps.iter().any(|e| e.to == helpers_uri) && !deps.iter().any(|e| e.to == extra_uri)
+        })
+        .await;
+        assert!(
+            reverted,
+            "close must revert the Rmd's edge to the on-disk chunk target"
+        );
+        let state = backend.state.read().await;
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependencies(&rmd_uri)
+                .iter()
+                .any(|e| e.to == decoy_uri),
+            "prose source() mentions must never become edges (masked extraction)"
+        );
+    }
+
+    /// A chunkless Rmd on disk resyncs to empty analysis metadata: prose
+    /// `source()` mentions never become edges, and a chunk edge that existed
+    /// only in the discarded buffer disappears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_resync_chunkless_rmd_yields_no_edges() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        fs::write(tmp.path().join("prose_decoy.R"), "d <- 1\n").unwrap();
+        // Disk version has NO chunks — only prose that mentions source().
+        let rmd_disk = concat!(
+            "# Report\n",
+            "\n",
+            "Prose calls source(\"prose_decoy.R\") but that is not R.\n",
+        );
+        fs::write(tmp.path().join("analysis.Rmd"), rmd_disk).unwrap();
+        let (svc, rmd_uri) = open_in_workspace(&tmp, "analysis.Rmd", "rmd", rmd_disk).await;
+        let backend = svc.inner();
+
+        // Unsaved buffer edit adds a chunk with a real source() edge.
+        let rmd_buffer = concat!(
+            "# Report\n",
+            "\n",
+            "Prose calls source(\"prose_decoy.R\") but that is not R.\n",
+            "\n",
+            "```{r}\n",
+            "source(\"extra.R\")\n",
+            "```\n",
+        );
+        change_doc(backend, &rmd_uri, 2, rmd_buffer).await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !state.cross_file_graph.get_dependencies(&rmd_uri).is_empty(),
+                "unsaved chunk edit must add an edge"
+            );
+        }
+
+        close_doc(backend, &rmd_uri).await;
+
+        let emptied = wait_for_state(backend, 5_000, |state| {
+            state.cross_file_graph.get_dependencies(&rmd_uri).is_empty()
+        })
+        .await;
+        assert!(
+            emptied,
+            "chunkless disk content must resync to zero edges (prose never counts)"
+        );
+    }
+
+    /// A DELETED-only watcher batch with multiple files removes every file's
+    /// cross-file state in one pass and settles the open dependent's
+    /// force-republish marker before the handler returns (pins/package state
+    /// recompute once per batch, after the loop).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_files_deleted_batch_removes_all_files() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.R"), "a_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("b.R"), "b_fn <- function() 2\n").unwrap();
+        let main = "source(\"a.R\")\nsource(\"b.R\")\na_fn()\nb_fn()\n";
+        fs::write(tmp.path().join("main.R"), main).unwrap();
+        let (svc, main_uri) = open_in_workspace(&tmp, "main.R", "r", main).await;
+        let backend = svc.inner();
+        let a_uri = Url::from_file_path(tmp.path().join("a.R")).unwrap();
+        let b_uri = Url::from_file_path(tmp.path().join("b.R")).unwrap();
+        {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.cross_file_graph.get_dependencies(&main_uri).len(),
+                2,
+                "both edges must exist before the deletions"
+            );
+        }
+
+        fs::remove_file(tmp.path().join("a.R")).unwrap();
+        fs::remove_file(tmp.path().join("b.R")).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![
+                    FileEvent {
+                        uri: a_uri.clone(),
+                        typ: FileChangeType::DELETED,
+                    },
+                    FileEvent {
+                        uri: b_uri.clone(),
+                        typ: FileChangeType::DELETED,
+                    },
+                ],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&main_uri)
+                .is_empty(),
+            "both deleted files' edges must be removed in the one batch"
+        );
+        for uri in [&a_uri, &b_uri] {
+            assert!(
+                state.cross_file_workspace_index.get_metadata(uri).is_none(),
+                "index entry for {uri} must be invalidated"
+            );
+        }
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&main_uri),
+            0,
+            "the dependent's force-republish marker must be consumed synchronously"
+        );
+    }
+
+    /// Regression guard for the reopen race the shared-resync extraction
+    /// closed: a watched CHANGED event racing a `did_open` of the same file
+    /// must never clobber the fresh buffer's topology with stale disk state.
+    /// (Pre-extraction, the async pass's graph update had no open-at-commit
+    /// check; the workspace index self-guarded but the graph did not.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_file_reopen_during_async_read_does_not_clobber_graph() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        // Disk gains a source() edge; the buffer opened mid-flight has none.
+        fs::write(tmp.path().join("helper.R"), "source(\"extra.R\")\nx <- 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        fs::write(tmp.path().join("other.R"), "y <- 1\n").unwrap();
+        // Open an unrelated file so the backend is initialized the usual way.
+        let (svc, _other_uri) = open_in_workspace(&tmp, "other.R", "r", "y <- 1\n").await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        // Fire the watched event (async disk read spawns), then immediately
+        // open the file with buffer content that has NO edge.
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: helper_uri.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+        open_doc(backend, &helper_uri, "r", 1, "x <- 1\n").await;
+
+        // Whichever side wins the race, the open buffer's (edge-free)
+        // topology must be the settled state.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let state = backend.state.read().await;
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependencies(&helper_uri)
+                .iter()
+                .any(|e| e.to == extra_uri),
+            "a stale watched-file disk commit must never clobber an open buffer's topology"
+        );
+    }
+
     /// The `raven/projectConfigLoaded` payload schema is a contract with
     /// the VS Code extension. Lock it down: `path: string` ⇒
     /// `source: "raven.toml" | ".lintr"`; `path: None` ⇒ both fields
@@ -15659,6 +17985,77 @@ lineLength = 200
             })
             .await;
         (svc, uri)
+    }
+
+    /// Open `uri` on an already-initialized backend (the `did_open` half of
+    /// `open_in_workspace`, for second and reopened documents).
+    async fn open_doc(backend: &Backend, uri: &Url, language_id: &str, version: i32, text: &str) {
+        use tower_lsp::lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: language_id.into(),
+                    version,
+                    text: text.into(),
+                },
+            })
+            .await;
+    }
+
+    /// Replace `uri`'s full buffer text through the real `did_change` path.
+    async fn change_doc(backend: &Backend, uri: &Url, version: i32, text: &str) {
+        use tower_lsp::lsp_types::{
+            DidChangeTextDocumentParams, TextDocumentContentChangeEvent,
+            VersionedTextDocumentIdentifier,
+        };
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.into(),
+                }],
+            })
+            .await;
+    }
+
+    /// Close `uri` through the real `did_close` path.
+    async fn close_doc(backend: &Backend, uri: &Url) {
+        use tower_lsp::lsp_types::{DidCloseTextDocumentParams, TextDocumentIdentifier};
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            })
+            .await;
+    }
+
+    /// Poll `check` against fresh `WorldState` read snapshots until it
+    /// returns `true` or `timeout_ms` elapses. Returns whether the condition
+    /// was met. For tests that assert on the outcome of fire-and-forget
+    /// background work (the watched-files async disk-read pass, the
+    /// `did_close` disk resync), which has no join handle to await.
+    async fn wait_for_state<F>(backend: &Backend, timeout_ms: u64, mut check: F) -> bool
+    where
+        F: FnMut(&WorldState) -> bool,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            {
+                let state = backend.state.read().await;
+                if check(&state) {
+                    return true;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     fn snapshot_diagnostics(

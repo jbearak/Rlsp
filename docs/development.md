@@ -271,6 +271,20 @@ See `crates/raven/src/cross_file/revalidation.rs`.
 
 Raven intentionally keeps `tower-lsp` at `.concurrency_level(1)` so text-sync notifications remain ordered. Do not use global LSP concurrency to speed up diagnostics. Dependency-triggered fan-out is localized in `crates/raven/src/backend.rs`: `publish_diagnostics_for_uris_bounded` runs the normal debounced diagnostic pipeline for an already-computed URI set with a small fixed concurrency limit (`DIAGNOSTIC_FANOUT_CONCURRENCY`). Each worker rebuilds its own snapshot and commits through the monotonic gate.
 
+### Single-file disk resync (watched files & document close, #558)
+
+`resync_file_from_disk` in `crates/raven/src/backend.rs` is the shared primitive that converges one file's cross-file state (disk-content cache, workspace index, dependency graph) to its on-disk content. Two callers use it, so their semantics cannot drift:
+
+- the `did_change_watched_files` CREATED/CHANGED async pass (external disk edits to closed files), and
+- the `did_close` resync (`run_close_resync`), which discards graph topology derived from a discarded unsaved buffer.
+
+Key properties (details in the function's doc comment):
+
+- All disk I/O and parsing run off-lock; every mutation happens in **one** write-lock critical section whose first statement is an unconditional reopen veto — if the URI is an open document at commit time, nothing is mutated (the open buffer's own `did_open`/`did_change` pipeline is authoritative). This veto also closed a pre-#558 race where a watched-file disk commit could clobber a buffer opened during the async gap.
+- A missing file routes to `remove_file_from_cross_file_state`, the same removal primitive the watched-files DELETED branch uses.
+- `old_meta` (for working-directory-change child invalidation) is caller-supplied: the close path must capture it **before** the document stores are wiped, because the unsaved buffer's metadata lives only there.
+- The publish tail (activity-capped fanout → `mark_force_republish_many` → `publish_diagnostics_for_uris_bounded`) stays caller-owned: watched-files defers it to the end of its batch; the close path runs it per close after unioning its pre-close dependent walk with the post-commit one.
+
 ### Interactive request cancellation
 
 Raven keeps `tower-lsp` at `.concurrency_level(1)` to preserve ordered text sync, which means tower-lsp's built-in `$/cancelRequest` notification can be delayed behind the in-flight request it is supposed to cancel. `start_lsp()` wraps the `LspService` in `RequestCancellationService`, which intercepts `$/cancelRequest` synchronously in `Service::call` and records cancellations in a request-id keyed registry before tower-lsp queues the notification.

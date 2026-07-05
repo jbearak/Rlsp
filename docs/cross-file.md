@@ -298,6 +298,12 @@ The `raven.crossFile.backwardDependencies` setting controls how Raven discovers 
 
 See [Configuration](configuration.md) for the setting.
 
+### Open buffers, disk state, and closing files
+
+While a file is open, its buffer is authoritative: unsaved edits that add or remove `source()` calls or directives update the dependency graph live, and disk changes to that file are ignored until it closes.
+
+When you close a file without saving, Raven re-reads just that file from disk and converges the graph back to disk truth — a `source()` edge added only in the discarded buffer disappears, and an edge the buffer had removed comes back. If the file no longer exists on disk, its graph entry is removed entirely. Open files that depend on it have their diagnostics refreshed automatically. This never triggers a workspace rescan, and reopening the file immediately always wins over the disk re-read.
+
 ### Traversal budgets in large workspaces
 
 Cross-file resolution walks the `source()` dependency graph under two safety budgets that bound analysis cost on pathologically dense graphs:
