@@ -486,7 +486,26 @@ fn extract_data_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
     packages
 }
 
-/// Global LSP state
+/// Global LSP state.
+///
+/// # Raw URI identity
+///
+/// Raven's LSP document identity is the raw file `Url` supplied by the client
+/// or path-resolution caller. `WorldState` keeps that convention consistently:
+/// open documents, legacy document maps, workspace indexes, the cross-file file
+/// cache, the dependency graph, and diagnostic publication gates are all keyed
+/// by the uncanonicalized `Url`.
+///
+/// Symlink aliases and alternate case spellings are therefore distinct document
+/// identities by design. An open buffer is authoritative for the exact raw URI
+/// that was opened; it is not an alias layer for another URI that happens to
+/// name the same underlying file. Raven deliberately avoids
+/// `std::fs::canonicalize` for this identity model because canonicalization
+/// follows symlinks and can produce path prefixes that diverge from the
+/// uncanonicalized workspace-index keys. The path resolver's case correction
+/// (`canonicalize_case_below`) is intentionally narrower: it rewrites only the
+/// resolved suffix below a trusted prefix so source edges match index keys, and
+/// does not make symlink or case aliases equivalent LSP identities.
 pub struct WorldState {
     // Document management (new architecture)
     pub document_store: DocumentStore,
