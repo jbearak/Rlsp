@@ -382,9 +382,10 @@ impl Document {
 ///
 /// Package-mode and `.Rprofile` authority reuse this map too. A symlink/case
 /// alias may keep diagnostics published to the client URI while package
-/// membership checks, package-internal scope injection, package sibling
-/// fanout, and workspace-root `.Rprofile` prelude ownership resolve through
-/// the authoritative canonical URI.
+/// membership checks, package-internal scope injection, self-package NSE policy,
+/// parameter/signature package scope, package sibling fanout, and workspace-root
+/// `.Rprofile` prelude ownership resolve through the authoritative canonical
+/// URI.
 #[derive(Debug, Default, Clone)]
 pub struct OpenDocumentAliases {
     canonical_to_open: HashMap<Url, Vec<Url>>,
@@ -1052,12 +1053,18 @@ impl WorldState {
             .unwrap_or_default()
     }
 
-    /// Return the canonical package R-file URI that should be used for
-    /// package-membership checks for `open_uri`, when `open_uri` is an
-    /// authoritative alias of a package source/test file.
+    /// Return the canonical workspace URI that should be used for depth-0
+    /// scope-contribution path checks for `open_uri`, when `open_uri` is an
+    /// authoritative alias of a workspace file.
+    ///
+    /// This is broader than package-source membership: the same query URI gates
+    /// package symbols, testthat packages, self-package NSE policy, parameter
+    /// scope, and `.Rprofile` prelude applicability. Diagnostics and document
+    /// storage still use the raw client URI; callers use this only for
+    /// membership/scope resolution and fall back to `open_uri` on `None`.
     ///
     /// `None` is the no-alias fast path: callers should keep using `open_uri`.
-    pub(crate) fn authoritative_package_query_uri_for_open_document(
+    pub(crate) fn authoritative_workspace_query_uri_for_open_document(
         &self,
         open_uri: &Url,
         workspace_root: &std::path::Path,
@@ -1072,7 +1079,7 @@ impl WorldState {
             let Ok(path) = canonical_uri.to_file_path() else {
                 continue;
             };
-            if crate::package_state::is_r_source_path(&path, workspace_root).is_none() {
+            if path.strip_prefix(workspace_root).is_err() {
                 continue;
             }
             if self
@@ -1260,7 +1267,7 @@ impl WorldState {
                 .map(|root| {
                     docs.iter()
                         .filter_map(|(uri, _)| {
-                            self.authoritative_package_query_uri_for_open_document(uri, root)
+                            self.authoritative_workspace_query_uri_for_open_document(uri, root)
                                 .map(|query_uri| (uri.clone(), query_uri))
                         })
                         .collect()

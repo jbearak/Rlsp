@@ -5198,10 +5198,11 @@ where
     )
 }
 
-/// As [`scope_at_position_with_graph`], but package contribution path gates use
+/// As [`scope_at_position_with_graph`], but scope-contribution path gates use
 /// `package_query_uri` when provided. This lets an open symlink/case alias keep
-/// diagnostics published to the client URI while package membership is resolved
-/// against the canonical package URI.
+/// diagnostics published to the client URI while package membership and
+/// workspace-relative `.Rprofile` applicability resolve against the canonical
+/// workspace URI.
 #[allow(clippy::too_many_arguments)]
 pub fn scope_at_position_with_graph_with_package_query_uri<F, G>(
     uri: &Url,
@@ -5353,7 +5354,7 @@ where
     )
 }
 
-/// As [`scope_at_position_with_graph_cached`], but package contribution path
+/// As [`scope_at_position_with_graph_cached`], but scope-contribution path
 /// gates use `package_query_uri` when provided.
 #[allow(clippy::too_many_arguments)]
 pub fn scope_at_position_with_graph_cached_with_package_query_uri<F, G>(
@@ -5449,7 +5450,7 @@ where
 }
 
 /// As [`scope_at_position_with_graph_cached_with_standalone_cache`], but
-/// package contribution path gates use `package_query_uri` when provided.
+/// scope-contribution path gates use `package_query_uri` when provided.
 #[allow(clippy::too_many_arguments)]
 pub fn scope_at_position_with_graph_cached_with_standalone_cache_and_package_query_uri<F, G>(
     uri: &Url,
@@ -6099,9 +6100,10 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // Internal recursive calls (forward source children, parent walks) always
     // receive `None` — the contribution applies only to the root query file.
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
-    // Canonical URI used only for package-contribution path gates at depth 0.
+    // Canonical URI used only for scope-contribution path gates at depth 0.
     // Open-document aliases keep `uri` as the client/publish spelling while
-    // using this URI to decide whether the query belongs to the package.
+    // using this URI to decide whether the query belongs to the package or the
+    // workspace-root `.Rprofile` prelude.
     package_query_uri: Option<&Url>,
     // Provider expanding `data()` file-stem aliases to dataset object names
     // (issue #429). Threaded to forward-source children (a sourced file's
@@ -7700,7 +7702,7 @@ where
     /// test-attached packages (e.g. `testthat` under `tests/testthat/`) are
     /// visible at the cursor.
     package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
-    /// Canonical URI used only for package-contribution path gates. The stream
+    /// Canonical URI used only for scope-contribution path gates. The stream
     /// still resolves and publishes against `queried_uri`.
     package_query_uri: Option<&'a Url>,
 
@@ -7869,7 +7871,7 @@ where
         )
     }
 
-    /// As [`ScopeStream::new_with_standalone_cache`], but package contribution
+    /// As [`ScopeStream::new_with_standalone_cache`], but scope-contribution
     /// path gates use `package_query_uri` when provided.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_standalone_cache_and_package_query_uri(

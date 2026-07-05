@@ -821,7 +821,13 @@ fn get_scope(
             base_packages: state.package_library.base_packages(),
         });
 
-    scope::scope_at_position_with_graph(
+    let package_contribution = state.package_state.scope_contribution();
+    let package_query_uri = package_contribution
+        .workspace_root
+        .as_ref()
+        .and_then(|root| state.authoritative_workspace_query_uri_for_open_document(uri, root));
+
+    scope::scope_at_position_with_graph_with_package_query_uri(
         uri,
         position.line,
         position.character,
@@ -834,8 +840,9 @@ fn get_scope(
         state.cross_file_config.hoist_globals_in_functions,
         state.cross_file_config.backward_dependencies,
         &|| false, // non-diagnostic path, no cancellation,
-        Some(state.package_state.scope_contribution()),
+        Some(package_contribution),
         data_provider.as_ref(),
+        package_query_uri.as_ref(),
     )
 }
 
@@ -1191,6 +1198,115 @@ f(beta = 2)
         )
         .expect("later call resolves to a user signature");
         assert_eq!(names(late), vec!["beta"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_open_test_file_uses_canonical_testthat_scope_for_package_signature() {
+        use crate::package_library::{PackageInfo, PackageLibrary};
+        use crate::package_state::{PackageScopeContribution, PackageState};
+        use crate::state::{Document, WorldState};
+        use std::collections::{BTreeSet, HashSet};
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = tmp.path().join("pkg");
+            let link = tmp.path().join("pkg-link");
+            std::fs::create_dir_all(root.join("tests").join("testthat")).unwrap();
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+
+            let canonical_uri =
+                Url::from_file_path(root.join("tests").join("testthat").join("test-x.R")).unwrap();
+            let alias_uri =
+                Url::from_file_path(link.join("tests").join("testthat").join("test-x.R")).unwrap();
+            let workspace_uri = Url::from_file_path(&root).unwrap();
+
+            let mut state = WorldState::new();
+            state.workspace_folders = vec![workspace_uri];
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = true;
+            state.package_library = Arc::new(PackageLibrary::new_empty());
+            state.package_library_ready = true;
+
+            let mut exports = HashSet::new();
+            exports.insert("expect_equal".to_string());
+            state
+                .package_library
+                .insert_package(PackageInfo::new("testthat".to_string(), exports))
+                .await;
+
+            let mut test_attached = BTreeSet::new();
+            test_attached.insert("testthat".to_string());
+            state.package_state.set_from(PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(root.clone()),
+                    test_attached_packages: Arc::new(test_attached),
+                    ..PackageScopeContribution::default()
+                },
+                ..PackageState::default()
+            });
+
+            let code = "expect_equal(1, 1)\n";
+            state.documents.insert(
+                alias_uri.clone(),
+                Document::new_with_uri(code, None, &alias_uri),
+            );
+            state
+                .open_document_aliases
+                .open(alias_uri.clone(), vec![canonical_uri.clone()]);
+            assert_eq!(
+                state.authoritative_workspace_query_uri_for_open_document(&alias_uri, &root),
+                Some(canonical_uri),
+                "precondition: alias-open test file must resolve to the canonical package URI"
+            );
+
+            let cache = SignatureCache::new(10);
+            cache.insert_package(
+                "testthat::expect_equal".to_string(),
+                FunctionSignature {
+                    name: "expect_equal".to_string(),
+                    parameters: vec![
+                        ParameterInfo {
+                            name: "object".to_string(),
+                            default_value: None,
+                            is_dots: false,
+                        },
+                        ParameterInfo {
+                            name: "expected".to_string(),
+                            default_value: None,
+                            is_dots: false,
+                        },
+                    ],
+                    source: SignatureSource::RSubprocess {
+                        package: Some("testthat".to_string()),
+                    },
+                },
+            );
+
+            let sig = resolve(
+                &state,
+                &cache,
+                "expect_equal",
+                None,
+                false,
+                &alias_uri,
+                tower_lsp::lsp_types::Position::new(0, 12),
+            )
+            .expect("alias-open test file must resolve testthat::expect_equal formals");
+            let names: Vec<String> = sig.parameters.into_iter().map(|p| p.name).collect();
+            assert_eq!(names, vec!["object", "expected"]);
+            assert!(
+                matches!(
+                    sig.source,
+                    SignatureSource::RSubprocess {
+                        package: Some(ref package)
+                    } if package == "testthat"
+                ),
+                "signature must come from the Suggests/test-attached package"
+            );
+        });
     }
 
     /// Issue #459: a redundantly backtick-quoted *syntactic* callee resolves to

@@ -183,8 +183,9 @@ pub(crate) struct DiagnosticsSnapshot {
     /// symbols into resolution results for files under `R/` and `tests/testthat/`.
     /// Also used in the diagnostic loop for full-import package checks.
     pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
-    /// Canonical package URI used only for package-contribution path gates when
-    /// this snapshot was built for an open symlink/case alias.
+    /// Canonical workspace URI used only for scope-contribution path gates when
+    /// this snapshot was built for an open symlink/case alias. Diagnostics still
+    /// publish to the raw client URI.
     pub(crate) package_query_uri: Option<Url>,
     /// Issue #483 (WI2b): persistent standalone-scope cache context, captured
     /// under the `WorldState` read lock during `build` (the `Arc` handle plus
@@ -423,7 +424,7 @@ impl DiagnosticsSnapshot {
                 .workspace_root
                 .as_ref()
                 .and_then(|root| {
-                    state.authoritative_package_query_uri_for_open_document(uri, root)
+                    state.authoritative_workspace_query_uri_for_open_document(uri, root)
                 }),
             // Issue #483 (WI2b): capture the persistent-cache handle and key
             // components under the read lock; the cache is consulted later with
@@ -3613,7 +3614,7 @@ pub(crate) fn get_cross_file_scope(
 
     let package_query_uri = package_contribution
         .and_then(|contrib| contrib.workspace_root.as_ref())
-        .and_then(|root| state.authoritative_package_query_uri_for_open_document(uri, root));
+        .and_then(|root| state.authoritative_workspace_query_uri_for_open_document(uri, root));
 
     scope::scope_at_position_with_graph_with_package_query_uri(
         uri,
@@ -3683,7 +3684,7 @@ pub(crate) fn get_cross_file_scope_with_cache(
 
     let package_query_uri = package_contribution
         .and_then(|contrib| contrib.workspace_root.as_ref())
-        .and_then(|root| state.authoritative_package_query_uri_for_open_document(uri, root));
+        .and_then(|root| state.authoritative_workspace_query_uri_for_open_document(uri, root));
 
     scope::scope_at_position_with_graph_cached_with_package_query_uri(
         uri,
@@ -6795,7 +6796,8 @@ fn unanimous_declared_formals(
 fn self_nse_package_for_file(snapshot: &DiagnosticsSnapshot, uri: &Url) -> Option<String> {
     let name = snapshot.scope_contribution.package_name.as_ref()?;
     let root = snapshot.scope_contribution.workspace_root.as_ref()?;
-    let path = uri.to_file_path().ok()?;
+    let query_uri = snapshot.package_query_uri.as_ref().unwrap_or(uri);
+    let path = query_uri.to_file_path().ok()?;
     crate::package_state::is_package_workspace_r_file(&path, root).then(|| name.clone())
 }
 
@@ -17299,7 +17301,8 @@ fn test_attached_packages_for_uri(snapshot: &DiagnosticsSnapshot, uri: &Url) -> 
     let Some(root) = snapshot.scope_contribution.workspace_root.as_ref() else {
         return Vec::new();
     };
-    let Ok(path) = uri.to_file_path() else {
+    let query_uri = snapshot.package_query_uri.as_ref().unwrap_or(uri);
+    let Ok(path) = query_uri.to_file_path() else {
         return Vec::new();
     };
     match crate::package_state::is_r_source_path(&path, root) {
@@ -30318,6 +30321,72 @@ y <- totally_undefined_baseline()
         );
     }
 
+    /// Issue #567 round 7: a non-package workspace script opened through a
+    /// symlink alias still gets the workspace-root `.Rprofile` prelude. The
+    /// publish/document URI remains the raw alias; only the contribution query
+    /// URI is canonicalized so `append_rprofile_prelude` can match the real
+    /// workspace root.
+    #[cfg(unix)]
+    #[test]
+    fn alias_open_non_package_script_gets_rprofile_prelude() {
+        use crate::package_state::{PackageScopeContribution, PackageState};
+        use crate::state::{Document, WorldState};
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("pkg");
+        let link = tmp.path().join("pkg-link");
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        let canonical_uri = Url::from_file_path(root.join("scripts").join("analysis.R")).unwrap();
+        let alias_uri = Url::from_file_path(link.join("scripts").join("analysis.R")).unwrap();
+        let workspace_uri = Url::from_file_path(&root).unwrap();
+        let code = "helper()\nreally_missing()\n";
+
+        let mut rprofile_symbols = BTreeSet::new();
+        rprofile_symbols.insert("helper".to_string());
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_uri];
+        state.workspace_scan_complete = true;
+        state.package_inputs.workspace_root = Some(root.clone());
+        state.package_state.set_from(PackageState {
+            scope_contribution: PackageScopeContribution {
+                workspace_root: Some(root.clone()),
+                rprofile_root: Some(root.clone()),
+                rprofile_symbols: Arc::new(rprofile_symbols),
+                ..PackageScopeContribution::default()
+            },
+            ..PackageState::default()
+        });
+        state.documents.insert(
+            alias_uri.clone(),
+            Document::new_with_uri(code, None, &alias_uri),
+        );
+        state
+            .open_document_aliases
+            .open(alias_uri.clone(), vec![canonical_uri.clone()]);
+
+        assert_eq!(
+            state.authoritative_workspace_query_uri_for_open_document(&alias_uri, &root),
+            Some(canonical_uri),
+            "precondition: alias-open script must resolve to the canonical workspace URI"
+        );
+
+        let diagnostics = diagnostics(&state, &alias_uri, &DiagCancelToken::never());
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            !messages.contains(&"helper is not defined"),
+            ".Rprofile helper must be visible in alias-open scripts/ file; got {messages:?}"
+        );
+        assert!(
+            messages.contains(&"really_missing is not defined"),
+            "positive control must still report a genuine undefined symbol; got {messages:?}"
+        );
+    }
+
     /// Issue #275: `test_helper_symbols` (top-level defs from
     /// `tests/testthat/helper-*.R`) must suppress undefined-variable
     /// diagnostics in peer files under `tests/testthat/`.
@@ -30481,6 +30550,65 @@ y <- totally_undefined_baseline()
                 .iter()
                 .map(|d| d.message.clone())
                 .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Issue #567 round 7: the self-package NSE policy must use the canonical
+    /// package identity for alias-open package files. Without the canonical
+    /// query URI, this symlink-open `R/` file is outside the raw workspace root
+    /// and dplyr's own `filter()` policy would not suppress the masked column.
+    #[cfg(unix)]
+    #[test]
+    fn alias_open_package_file_gets_self_package_nse_policy() {
+        use crate::package_state::{PackageScopeContribution, PackageState};
+        use crate::state::{Document, WorldState};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("dplyr");
+        let link = tmp.path().join("dplyr-link");
+        std::fs::create_dir_all(root.join("R")).unwrap();
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        let canonical_uri = Url::from_file_path(root.join("R").join("verbs.R")).unwrap();
+        let alias_uri = Url::from_file_path(link.join("R").join("verbs.R")).unwrap();
+        let workspace_uri = Url::from_file_path(&root).unwrap();
+        let code = "df <- data.frame(cyl = 1)\nfilter(df, cyl == 1)\nreally_missing\n";
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_uri];
+        state.workspace_scan_complete = true;
+        state.package_inputs.workspace_root = Some(root.clone());
+        state.package_state.set_from(PackageState {
+            scope_contribution: PackageScopeContribution {
+                workspace_root: Some(root.clone()),
+                package_name: Some("dplyr".to_string()),
+                ..PackageScopeContribution::default()
+            },
+            ..PackageState::default()
+        });
+        state.documents.insert(
+            alias_uri.clone(),
+            Document::new_with_uri(code, None, &alias_uri),
+        );
+        state
+            .open_document_aliases
+            .open(alias_uri.clone(), vec![canonical_uri.clone()]);
+
+        assert_eq!(
+            state.authoritative_workspace_query_uri_for_open_document(&alias_uri, &root),
+            Some(canonical_uri),
+            "precondition: alias-open package file must resolve to the canonical package URI"
+        );
+
+        let diagnostics = diagnostics(&state, &alias_uri, &DiagCancelToken::never());
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            !messages.contains(&"cyl is not defined"),
+            "self-package NSE policy must suppress data-masked column args; got {messages:?}"
+        );
+        assert!(
+            messages.contains(&"really_missing is not defined"),
+            "positive control must still report a genuine undefined symbol; got {messages:?}"
         );
     }
 
@@ -31138,6 +31266,7 @@ y <- totally_undefined_baseline()
         state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
         state.cross_file_config.packages_enabled = true;
         state.package_library_ready = true;
+        state.package_inputs.workspace_root = Some(workspace_path.to_path_buf());
 
         // Register testthat's exports so `is_package_export` recognizes `test_that`.
         let mut testthat_exports = HashSet::new();
@@ -31215,6 +31344,123 @@ y <- totally_undefined_baseline()
                 .any(|d| d.message.contains("test_that") && d.message.contains("used before")),
             "testthat exports under tests/testthat/ must not be reported as used-before-sourced. \
              messages: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_out_of_scope_test_attached_export_uses_canonical_query_for_symlink_alias() {
+        use crate::package_library::PackageInfo;
+        use crate::package_state::PackageScopeContribution;
+        use crate::state::WorldState;
+        use std::collections::{BTreeSet, HashSet};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path().join("pkg");
+        let link_path = temp_dir.path().join("pkg-link");
+        let testthat_dir = workspace_path.join("tests").join("testthat");
+        std::fs::create_dir_all(&testthat_dir).unwrap();
+        std::os::unix::fs::symlink(&workspace_path, &link_path).unwrap();
+
+        let main_code = "test_that(\"x\", { 1 })\nsource('test-other.R')\n";
+        let other_code = "test_that <- function(...) NULL\n";
+        std::fs::write(testthat_dir.join("test-foo.R"), main_code).unwrap();
+        std::fs::write(testthat_dir.join("test-other.R"), other_code).unwrap();
+
+        let workspace_url = Url::from_file_path(&workspace_path).unwrap();
+        let main_url =
+            Url::from_file_path(link_path.join("tests").join("testthat").join("test-foo.R"))
+                .unwrap();
+        let other_url = Url::from_file_path(
+            link_path
+                .join("tests")
+                .join("testthat")
+                .join("test-other.R"),
+        )
+        .unwrap();
+        let canonical_main_url = Url::from_file_path(testthat_dir.join("test-foo.R")).unwrap();
+
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![workspace_url];
+        state.workspace_scan_complete = true;
+        state.cross_file_config.out_of_scope_severity = Some(DiagnosticSeverity::WARNING);
+        state.cross_file_config.packages_enabled = true;
+        state.package_library_ready = true;
+        state.package_inputs.workspace_root = Some(workspace_path.clone());
+
+        let mut testthat_exports = HashSet::new();
+        testthat_exports.insert("test_that".to_string());
+        state
+            .package_library
+            .insert_package(PackageInfo::new("testthat".to_string(), testthat_exports))
+            .await;
+
+        let mut attached = BTreeSet::new();
+        attached.insert("testthat".to_string());
+        state
+            .package_state
+            .set_from(crate::package_state::PackageState {
+                scope_contribution: PackageScopeContribution {
+                    workspace_root: Some(workspace_path.clone()),
+                    test_attached_packages: std::sync::Arc::new(attached),
+                    ..PackageScopeContribution::default()
+                },
+                ..Default::default()
+            });
+
+        state.open_document_with_language_id(main_url.clone(), main_code, Some(1), Some("r"));
+        state.open_document_with_language_id(other_url.clone(), other_code, Some(1), Some("r"));
+
+        let raw_path = main_url.to_file_path().unwrap();
+        assert!(
+            crate::package_state::is_r_source_path(&raw_path, &workspace_path).is_none(),
+            "precondition: the old raw test-file gate must miss the symlink alias"
+        );
+
+        state.cross_file_graph.update_file(
+            &main_url,
+            &crate::cross_file::extract_metadata(main_code),
+            None,
+            |_| None,
+        );
+        state.cross_file_graph.update_file(
+            &other_url,
+            &crate::cross_file::extract_metadata(other_code),
+            None,
+            |_| None,
+        );
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_url)
+            .expect("snapshot built for symlink-open test-foo.R");
+        assert_eq!(
+            snapshot.package_query_uri.as_ref(),
+            Some(&canonical_main_url),
+            "precondition: diagnostics must carry the canonical package query URI"
+        );
+
+        let mut diagnostics = Vec::new();
+        collect_out_of_scope_diagnostics_from_snapshot(
+            &snapshot,
+            &main_url,
+            snapshot.tree.root_node(),
+            &snapshot.text,
+            &mut diagnostics,
+            &mut std::collections::HashMap::new(),
+            &DiagCancelToken::never(),
+            None,
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("test_that") && d.message.contains("used before")),
+            "testthat exports under a symlink-open tests/testthat file must not be reported as \
+             used-before-sourced. messages: {:?}",
             diagnostics
                 .iter()
                 .map(|d| d.message.clone())
