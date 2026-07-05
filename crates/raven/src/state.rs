@@ -188,9 +188,10 @@ pub struct Document {
     /// `loaded_packages`. Distinct field because the attachment semantics differ.
     pub data_packages: Vec<String>,
     pub file_type: FileType,
-    /// Chunk-detection kind for the outline: `Rmd` for `.Rmd`/`.qmd` documents
-    /// and for untitled buffers whose `languageId` is `rmd`/`quarto`; `R`
-    /// (i.e. `# %%` cells) otherwise. Mirrors the client-side classifier in
+    /// Chunk-detection kind for the outline: `Rmd` for `.Rmd`,
+    /// `.Rmarkdown`, and `.qmd` documents and for untitled buffers whose
+    /// `languageId` is `rmd`/`quarto`; `R` (i.e. `# %%` cells) otherwise.
+    /// Mirrors the client-side classifier in
     /// `editors/vscode/src/chunks/chunk-detector.ts`.
     pub chunk_kind: ChunkKind,
     /// Masked analysis text for Rmd/Quarto documents (`chunks::mask_to_r` of the
@@ -487,7 +488,26 @@ fn extract_data_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
     packages
 }
 
-/// Global LSP state
+/// Global LSP state.
+///
+/// # Raw URI identity
+///
+/// Raven's LSP document identity is the raw file `Url` supplied by the client
+/// or path-resolution caller. `WorldState` keeps that convention consistently:
+/// open documents, legacy document maps, workspace indexes, the cross-file file
+/// cache, the dependency graph, and diagnostic publication gates are all keyed
+/// by the uncanonicalized `Url`.
+///
+/// Symlink aliases and alternate case spellings are therefore distinct document
+/// identities by design. An open buffer is authoritative for the exact raw URI
+/// that was opened; it is not an alias layer for another URI that happens to
+/// name the same underlying file. Raven deliberately avoids
+/// `std::fs::canonicalize` for this identity model because canonicalization
+/// follows symlinks and can produce path prefixes that diverge from the
+/// uncanonicalized workspace-index keys. The path resolver's case correction
+/// (`canonicalize_case_below`) is intentionally narrower: it rewrites only the
+/// resolved suffix below a trusted prefix so source edges match index keys, and
+/// does not make symlink or case aliases equivalent LSP identities.
 pub struct WorldState {
     // Document management (new architecture)
     pub document_store: DocumentStore,
@@ -575,6 +595,44 @@ pub struct WorldState {
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
+    /// Last-known editor-derived chunk classification for file-backed
+    /// documents whose editor language made the file behave differently from
+    /// path classification.
+    ///
+    /// Live documents use their stored [`Document::chunk_kind`]. This tiny
+    /// closed-file override map preserves the editor `languageId: rmd/quarto`
+    /// signal after close so watched disk resyncs, on-demand indexing, and raw
+    /// file-cache metadata fallbacks keep masking extension-mismatched Rmd /
+    /// Quarto files. Entries exist only when the editor-derived kind differs
+    /// from [`classify_chunk_document`] for the URI path, and cross-file state
+    /// removal prunes them with the rest of the URI's closed-file state.
+    pub editor_chunk_kind_overrides: HashMap<Url, ChunkKind>,
+    /// State-wide source for watched-file resync generations.
+    ///
+    /// Values are copied into `watched_file_resync_generations` per URI. Keeping
+    /// the source outside that map lets removal prune URI entries without
+    /// reusing a generation if a later CREATE/CHANGE or close re-adds the same
+    /// URI; old delayed retries still see either a missing entry or a
+    /// different value.
+    pub watched_file_resync_generation_counter: u64,
+    /// Per-URI latest generation for ownership of closed-file convergence.
+    ///
+    /// Watched CREATE/CHANGE/DELETE events bump this before queuing or applying
+    /// disk state. `did_close` also bumps it while switching a URI from
+    /// open-buffer truth back to disk/package truth: watcher events skipped
+    /// while the document was open must not let an older delayed retry apply
+    /// after close. `did_open` does not bump; open-document guards veto watched
+    /// resync commits and package-input applies while the buffer is open, and
+    /// the eventual close bump owns the next closed-state transition.
+    ///
+    /// Removal through `remove_file_from_cross_file_state` prunes the URI entry
+    /// with the rest of the closed-file state. Delayed undecodable retries
+    /// capture a generation and re-check it at commit/apply time: `Updated`
+    /// requires an exact table match, while `Removed` requires the entry to
+    /// still be absent after its own removal commit pruned it. Later watched
+    /// events or closes recreate the entry from the state-wide counter, so old
+    /// generations are never reused.
+    pub watched_file_resync_generations: HashMap<Url, u64>,
     /// Handle to the running libpath watcher, if any. Dropping it stops watching.
     pub libpath_watcher_handle:
         Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
@@ -875,6 +933,9 @@ impl WorldState {
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
+            editor_chunk_kind_overrides: HashMap::new(),
+            watched_file_resync_generation_counter: 0,
+            watched_file_resync_generations: HashMap::new(),
             libpath_watcher_handle: None,
             package_library_ready: false,
             workspace_scan_complete: false,
@@ -1085,14 +1146,82 @@ impl WorldState {
         // cache invalidation) are skipped because open docs are
         // authoritative. No reader consults this cache for open documents.
         self.cross_file_file_cache.invalidate(&uri);
-        self.documents.insert(
-            uri.clone(),
-            Document::new_with_language_id(text, version, &uri, language_id),
-        );
+        let document = Document::new_with_language_id(text, version, &uri, language_id);
+        self.record_editor_chunk_kind_override(&uri, document.chunk_kind);
+        self.documents.insert(uri.clone(), document);
     }
 
     pub fn close_document(&mut self, uri: &Url) {
         self.documents.remove(uri);
+    }
+
+    /// Persist or clear the editor-derived chunk-kind override for a
+    /// file-backed document.
+    ///
+    /// Only extension mismatches are stored: when `chunk_kind` equals
+    /// [`classify_chunk_document`] for `uri.path()`, any previous override is
+    /// removed. This keeps the map small and means ordinary `.Rmd`,
+    /// `.Rmarkdown`, and `.qmd` files continue to be path-classified after
+    /// close. Untitled and other non-file URIs never have closed disk state, so
+    /// they also clear any stale entry.
+    pub fn record_editor_chunk_kind_override(&mut self, uri: &Url, chunk_kind: ChunkKind) {
+        if uri.to_file_path().is_err() || chunk_kind == classify_chunk_document(uri.path()) {
+            self.editor_chunk_kind_overrides.remove(uri);
+        } else {
+            self.editor_chunk_kind_overrides
+                .insert(uri.clone(), chunk_kind);
+        }
+    }
+
+    /// Drop the persisted editor-derived chunk-kind override for `uri`.
+    ///
+    /// Call this from every path that removes a URI's closed cross-file state
+    /// (deletion, final undecodable convergence, or workspace-index cleanup) so
+    /// a later recreated file starts from path classification until the editor
+    /// supplies a fresh language signal.
+    pub fn prune_editor_chunk_kind_override(&mut self, uri: &Url) {
+        self.editor_chunk_kind_overrides.remove(uri);
+    }
+
+    /// Return the chunk kind to use for closed-file disk content.
+    ///
+    /// The last-known editor-derived override wins over path classification.
+    /// This mirrors open-document precedence without requiring raw disk caches
+    /// or workspace-index entries to persist a full `Document`.
+    pub fn chunk_kind_for_closed_file(&self, uri: &Url) -> ChunkKind {
+        self.editor_chunk_kind_overrides
+            .get(uri)
+            .copied()
+            .unwrap_or_else(|| classify_chunk_document(uri.path()))
+    }
+
+    /// Return the R-analysis view of raw closed-file `content` for `uri`.
+    ///
+    /// This is the state-aware sibling of
+    /// [`crate::cross_file::analysis_text_for_path`]: persisted editor-derived
+    /// chunk classification wins before falling back to path classification, so
+    /// extension-mismatched Rmd/Quarto files continue to mask prose after close.
+    pub fn analysis_text_for_uri<'a>(
+        &self,
+        uri: &Url,
+        content: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        crate::cross_file::analysis_text_for_kind(self.chunk_kind_for_closed_file(uri), content)
+    }
+
+    /// Extract metadata from raw closed-file `content` for `uri`.
+    ///
+    /// File-cache and content-provider fallbacks should use this instead of
+    /// [`crate::cross_file::extract_metadata_for_path`] whenever a
+    /// [`WorldState`] is available, because the persisted editor-derived chunk
+    /// kind must outrank path classification for extension-mismatched Rmd /
+    /// Quarto files.
+    pub fn extract_metadata_for_uri(
+        &self,
+        uri: &Url,
+        content: &str,
+    ) -> crate::cross_file::CrossFileMetadata {
+        crate::cross_file::extract_metadata_for_kind(self.chunk_kind_for_closed_file(uri), content)
     }
 
     pub fn apply_change(&mut self, uri: &Url, change: TextDocumentContentChangeEvent) {
@@ -1128,11 +1257,11 @@ impl WorldState {
         let content_provider = self.content_provider();
         if let Some(content) = content_provider.get_content(uri) {
             // Cached content is RAW; mask Rmd/Quarto before extracting so
-            // directives come from chunk bodies, not prose (#343).
-            return Some(Arc::new(crate::cross_file::extract_metadata_for_path(
-                uri.path(),
-                &content,
-            )));
+            // directives come from chunk bodies, not prose (#343). Use the
+            // persisted editor-derived chunk kind when present so an
+            // extension-mismatched Rmd/Quarto file keeps masking after close
+            // (#563).
+            return Some(Arc::new(self.extract_metadata_for_uri(uri, &content)));
         }
         None
     }
@@ -1153,7 +1282,10 @@ impl WorldState {
     /// `extract_metadata_for_path`, and `DocumentStore::compute_derived`
     /// re-derives artifacts from the masked text); the legacy-documents arm
     /// (tier 4) and the file-cache arm (tier 5) likewise mask via
-    /// `analysis_text()` / `extract_metadata_for_path`. So directives,
+    /// `analysis_text()` / `extract_metadata_for_uri`. The state-aware file
+    /// cache fallback consults persisted editor-language chunk classification
+    /// before path classification, so extension-mismatched Rmd/Quarto files do
+    /// not start treating prose as R after close (issue #563). So directives,
     /// `source()`, and `library()` always reflect chunk bodies, never prose.
     pub fn get_enriched_metadata(
         &self,
@@ -1175,13 +1307,11 @@ impl WorldState {
             .or_else(|| {
                 // Cached content is RAW; mask Rmd/Quarto before extracting so
                 // directives/source()/library() come from chunk bodies, not
-                // prose (#343).
-                self.cross_file_file_cache.get(uri).map(|content| {
-                    Arc::new(crate::cross_file::extract_metadata_for_path(
-                        uri.path(),
-                        &content,
-                    ))
-                })
+                // prose (#343), preserving any editor-language override from
+                // the closed document (#563).
+                self.cross_file_file_cache
+                    .get(uri)
+                    .map(|content| Arc::new(self.extract_metadata_for_uri(uri, &content)))
             })
     }
 
@@ -1596,6 +1726,7 @@ impl WorldState {
             }
             self.workspace_index_new.invalidate(&uri);
             self.cross_file_graph.remove_file(&uri);
+            self.prune_editor_chunk_kind_override(&uri);
         }
     }
 
@@ -1997,10 +2128,11 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
     // Pair `doc.tree` with the analysis text it was parsed from (masked for
     // Rmd/Quarto, raw otherwise) for both metadata extraction and artifact
     // computation, so byte offsets align (#343). The scan currently never sees
-    // chunk files (`is_stat_model_extension` excludes `.rmd`/`.qmd`), so this is
-    // behavior-neutral today; the pairing must stay analysis-consistent in case
-    // that ever changes — feeding raw `&text` against a masked tree would
-    // mis-slice (and panic on a non-UTF-8 boundary in multibyte prose).
+    // chunk files (`is_stat_model_extension` excludes Rmd/Quarto extensions),
+    // so this is behavior-neutral today; the pairing must stay
+    // analysis-consistent in case that ever changes — feeding raw `&text`
+    // against a masked tree would mis-slice (and panic on a non-UTF-8 boundary
+    // in multibyte prose).
     let analysis_text = doc.analysis_text();
 
     let cross_file_meta = crate::cross_file::extract_metadata(&analysis_text);

@@ -401,7 +401,7 @@ pub(crate) fn get_text_and_tree(
     // 1. Enriched open documents (authoritative for open files). Return the
     //    analysis text (masked for Rmd/Quarto, raw otherwise) so the caller's
     //    byte-offset slices into `tree` align — `contents` is RAW and would
-    //    mis-slice (or panic on a non-UTF-8 boundary) for `.Rmd`/`.qmd` (#343).
+    //    mis-slice (or panic on a non-UTF-8 boundary) for Rmd/Quarto docs (#343).
     if let Some(doc) = state.document_store.get_without_touch(uri) {
         if let Some(tree) = &doc.tree {
             return Some((doc.analysis_text(), tree.clone()));
@@ -428,7 +428,7 @@ pub(crate) fn get_text_and_tree(
     if let Some(entry) = state.workspace_index_new.get(uri) {
         if let Some(tree) = &entry.tree {
             let raw = entry.contents.to_string();
-            let text = crate::cross_file::analysis_text_for_path(uri.path(), &raw).into_owned();
+            let text = state.analysis_text_for_uri(uri, &raw).into_owned();
             return Some((text, tree.clone()));
         } else {
             log::debug!(
@@ -453,7 +453,7 @@ pub(crate) fn get_text_and_tree(
     //    rather than failing closed, and the (text, tree) pair stays aligned
     //    (raw == analysis for plain R, so this is behavior-neutral there) (#343).
     if let Some(content) = state.cross_file_file_cache.get(uri) {
-        let analysis = crate::cross_file::analysis_text_for_path(uri.path(), &content).into_owned();
+        let analysis = state.analysis_text_for_uri(uri, &content).into_owned();
         if let Some(tree) = crate::parser_pool::with_parser(|p| p.parse(&analysis, None)) {
             return Some((analysis, tree));
         } else {

@@ -554,7 +554,23 @@ type SubgraphCache = std::sync::RwLock<
     lru::LruCache<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>,
 >;
 
-/// Dependency graph tracking source relationships between files
+/// Dependency graph tracking source relationships between files.
+///
+/// # Raw URI identity
+///
+/// Graph nodes are raw file `Url` values, matching the rest of the LSP state.
+/// `update_file` stores the caller's `uri` verbatim as the parent node and
+/// stores child nodes with `path_to_uri` from the resolved path; neither side is
+/// normalized through `std::fs::canonicalize`.
+///
+/// This is intentional. Symlink aliases and alternate case spellings can refer
+/// to the same file on disk, but they remain distinct graph identities unless
+/// the path-resolution layer itself rewrites a source-path suffix to the real
+/// directory-entry case. Full filesystem canonicalization was rejected because
+/// it follows symlinks, which can produce prefixes that no longer match the
+/// uncanonicalized workspace-index keys. The graph therefore preserves Raven's
+/// supported LSP identity model: open-document authority and graph reachability
+/// are exact-URI properties, not underlying-inode properties.
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
     forward: HashMap<Url, Vec<DependencyEdge>>,
@@ -3278,6 +3294,110 @@ mod tests {
         );
         assert_ne!(dependents[0].from, temp_url(&temp_dir, "Parent.R"));
         assert_ne!(dependents[0].from, temp_url(&temp_dir, "parent.R"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_edge_through_symlink_spelling_is_distinct_from_real_open_uri() {
+        // Issue #562: raw URI identity is deliberate. A source edge whose parent
+        // URI is under a symlink spelling keeps that spelling in the graph, even
+        // when the same helper file is open under the symlink target spelling.
+        let (temp_dir, workspace_url) = create_temp_workspace(&["real/main.R", "real/helper.R"]);
+        let real_dir = temp_dir.path().join("real");
+        let link_dir = temp_dir.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let link_main = Url::from_file_path(link_dir.join("main.R")).unwrap();
+        let link_helper = Url::from_file_path(link_dir.join("helper.R")).unwrap();
+        let real_helper = temp_url(&temp_dir, "real/helper.R");
+
+        assert_eq!(
+            std::fs::canonicalize(link_helper.to_file_path().unwrap()).unwrap(),
+            std::fs::canonicalize(real_helper.to_file_path().unwrap()).unwrap(),
+            "fixture must name the same helper file through both spellings"
+        );
+        assert_ne!(
+            link_helper, real_helper,
+            "raw LSP URIs must preserve the symlink spelling difference"
+        );
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &link_main,
+            &make_meta_with_source("helper.R", 1),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let deps = graph.get_dependencies(&link_main);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            deps[0].to, link_helper,
+            "source() under the symlink parent must create the symlink-spelled graph node"
+        );
+        assert_ne!(
+            deps[0].to, real_helper,
+            "the graph must not canonicalize the edge target to the symlink target"
+        );
+
+        assert_eq!(graph.get_dependents(&link_helper).len(), 1);
+        assert!(
+            graph.get_dependents(&real_helper).is_empty(),
+            "an open document under the real URI is not authoritative for the symlink URI"
+        );
+    }
+
+    #[test]
+    fn source_edge_case_spelling_is_distinct_from_open_alias_uri() {
+        // Issue #562: case spelling is not an LSP identity alias. This fixture
+        // uses ASCII-only case (`Helper.R` vs `helper.r`) because Raven's
+        // single-case-insensitive-match leniency is intentionally ASCII-only.
+        let (temp_dir, workspace_url) = create_temp_workspace(&["main.R", "Helper.R"]);
+        let main = temp_url(&temp_dir, "main.R");
+        let real_helper = temp_url(&temp_dir, "Helper.R");
+        let lower_helper_path = temp_dir.path().join("helper.r");
+        let lower_helper = Url::from_file_path(&lower_helper_path).unwrap();
+
+        if host_is_case_sensitive() {
+            assert!(
+                !lower_helper_path.exists(),
+                "case-sensitive hosts should exercise the ASCII single-ci-match leniency"
+            );
+        } else {
+            assert!(
+                lower_helper_path.exists(),
+                "case-insensitive hosts should make helper.r a true alias of Helper.R"
+            );
+        }
+        assert_ne!(
+            real_helper, lower_helper,
+            "raw LSP URIs must preserve the case spelling difference"
+        );
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &main,
+            &make_meta_with_source("helper.r", 1),
+            Some(&workspace_url),
+            |_| None,
+        );
+
+        let deps = graph.get_dependencies(&main);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            deps[0].to, real_helper,
+            "source() should still resolve to the on-disk/index spelling"
+        );
+        assert_ne!(
+            deps[0].to, lower_helper,
+            "the graph target remains distinct from an open document under the typed case alias"
+        );
+
+        assert_eq!(graph.get_dependents(&real_helper).len(), 1);
+        assert!(
+            graph.get_dependents(&lower_helper).is_empty(),
+            "an open document under the case alias URI is not authoritative for the resolved URI"
+        );
     }
 
     #[test]
