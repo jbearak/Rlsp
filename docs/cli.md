@@ -13,6 +13,8 @@ If your codebase imports R packages, Raven needs to know the symbols those packa
 - `raven packages fetch` — produce the same `.raven/packages.json` from CRAN/Bioconductor r-universe instead of a local R install. Needs no R, no installed packages, and no dependency on the `names-db` Release. See [`raven packages fetch`](#raven-packages-fetch) and [Package database](package-database.md).
 - `raven packages update` — download the CRAN/Bioconductor metadata Raven uses to recognize symbols from packages that are not installed. No install bundles this database, so run it whenever you want broad coverage without a local R install. See [`raven packages update`](#raven-packages-update).
 
+If you are new to CI, start with [Automated checks in CI](ci.md). It explains what CI is, how Raven checks R code without running the analysis, and gives copyable GitHub Actions and Bitbucket Pipelines files.
+
 ## Why Raven analyzes R without running it
 
 Most language ecosystems have a CI checker that reads code without executing it — `cargo check`, `tsc`, `pyright`, `ruff`. R's tooling grew up around a different need: `R CMD check` and the CI ecosystem around it verify *packages*, which means installing every dependency and running code. There's little equivalent for *analysis repositories* — the scripts that make up most scientific and statistical work — and that gap is what these commands fill.
@@ -100,7 +102,7 @@ Source files must be UTF-8. A UTF-8 byte-order mark is stripped and BOM-marked U
 
 ## CI examples
 
-Use `raven check` in CI as a static gate for pull requests and pushes. The important setup choice is package metadata: Raven does not need to execute your R code, and CI usually does not need to install every package just to resolve exports. Installing R itself is not the expensive part; restoring and compiling the package dependency tree is.
+Use `raven check` in CI as a static gate for pull requests and pushes. If you want a beginner-friendly overview before the command reference, see [Automated checks in CI](ci.md). The important setup choice is package metadata: Raven does not need to execute your R code, and CI usually does not need to install every package just to resolve exports. Installing R itself is not the expensive part; restoring and compiling the package dependency tree is.
 
 ### Package metadata strategies
 
@@ -124,12 +126,15 @@ See [`raven packages fetch`](#raven-packages-fetch), [`raven packages freeze`](#
 
 ### GitHub Actions example
 
+You can copy [`docs/examples/ci/github-actions-raven.yml`](examples/ci/github-actions-raven.yml) to `.github/workflows/raven.yml`:
+
 ```yaml
 name: Raven
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  push:
 
 jobs:
   raven:
@@ -179,10 +184,11 @@ pipelines:
 The apt repository is static HTTPS hosting for Debian repository metadata and `.deb` files; it is not a Docker image and does not run a remote installer script. The SHA-256 check pins the bootstrap keyring before apt trusts it, and the `signed-by=` keyring then makes apt verify Raven's repository metadata before it installs the package. Pin a specific Raven package version for reproducible CI:
 
 ```yaml
-          - apt-get install -y raven=0.12.0-1
+          - apt-cache madison raven
+          - apt-get install -y "raven=${RAVEN_DEB_VERSION}"
 ```
 
-Use `latest`-style behavior by omitting the version pin. As with GitHub Actions, `raven packages update` restores broad CRAN/Bioconductor coverage but follows Raven's moving `names-db` Release; commit `.raven/packages.json` from `raven packages freeze` when package metadata should be project-pinned.
+Set `RAVEN_DEB_VERSION` in your CI variables to one of the versions listed by `apt-cache madison raven`, or use `latest`-style behavior by omitting the version pin. As with GitHub Actions, `raven packages update` restores broad CRAN/Bioconductor coverage but follows Raven's moving `names-db` Release; commit `.raven/packages.json` from `raven packages freeze` when package metadata should be project-pinned.
 
 ### Scope
 

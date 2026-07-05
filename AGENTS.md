@@ -35,6 +35,7 @@ User-facing:
 - `docs/data-viewer.md`
 - `docs/help-viewer.md`
 - `docs/document-outline.md`
+- `docs/ci.md`
 - `docs/cli.md`
 - `docs/editor-integrations.md`
 - `docs/coexistence.md`
