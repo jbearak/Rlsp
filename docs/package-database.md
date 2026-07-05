@@ -82,7 +82,7 @@ Both write the same schema (v1) and are consumed through the same reader — `ra
 
 **Scope limits.** `fetch` covers only the project's used set — it does not replace Tier 3's zero-adoption, whole-ecosystem floor. And base/recommended packages are not on r-universe; they still come from local R or the embedded fallback at analysis time.
 
-See [`raven packages fetch`](cli.md#raven-packages-fetch) and [Four ways to run `raven check` in CI](cli.md#four-ways-to-run-raven-check-in-ci) for usage and the full strategy comparison.
+See [`raven packages fetch`](cli.md#raven-packages-fetch) and [CI package metadata strategies](cli.md#package-metadata-strategies) for usage and the full strategy comparison.
 
 ### Version skew is explained, not silently dropped
 
