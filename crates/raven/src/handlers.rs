@@ -183,6 +183,9 @@ pub(crate) struct DiagnosticsSnapshot {
     /// symbols into resolution results for files under `R/` and `tests/testthat/`.
     /// Also used in the diagnostic loop for full-import package checks.
     pub(crate) scope_contribution: crate::package_state::PackageScopeContribution,
+    /// Canonical package URI used only for package-contribution path gates when
+    /// this snapshot was built for an open symlink/case alias.
+    pub(crate) package_query_uri: Option<Url>,
     /// Issue #483 (WI2b): persistent standalone-scope cache context, captured
     /// under the `WorldState` read lock during `build` (the `Arc` handle plus
     /// the *real* graph's `edge_revision` and the `package_config_generation`)
@@ -415,6 +418,13 @@ impl DiagnosticsSnapshot {
             rmd_declared_params,
             parent_prefix_cache: std::cell::RefCell::new(scope::ParentPrefixCache::new()),
             scope_contribution: state.package_state.scope_contribution().clone(),
+            package_query_uri: state
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .and_then(|root| {
+                    state.authoritative_package_query_uri_for_open_document(uri, root)
+                }),
             // Issue #483 (WI2b): capture the persistent-cache handle and key
             // components under the read lock; the cache is consulted later with
             // no `WorldState` guard held. `edge_revision` MUST come from the real
@@ -479,7 +489,7 @@ impl DiagnosticsSnapshot {
             });
 
         let mut cache = self.parent_prefix_cache.borrow_mut();
-        scope::scope_at_position_with_graph_cached_with_standalone_cache(
+        scope::scope_at_position_with_graph_cached_with_standalone_cache_and_package_query_uri(
             uri,
             line,
             column,
@@ -496,6 +506,7 @@ impl DiagnosticsSnapshot {
             Some(&self.scope_contribution),
             data_provider.as_ref(),
             self.standalone_ctx.clone(),
+            self.package_query_uri.as_ref(),
         )
     }
 }
@@ -3600,7 +3611,11 @@ pub(crate) fn get_cross_file_scope(
             base_packages: state.package_library.base_packages(),
         });
 
-    scope::scope_at_position_with_graph(
+    let package_query_uri = package_contribution
+        .and_then(|contrib| contrib.workspace_root.as_ref())
+        .and_then(|root| state.authoritative_package_query_uri_for_open_document(uri, root));
+
+    scope::scope_at_position_with_graph_with_package_query_uri(
         uri,
         line,
         column,
@@ -3615,6 +3630,7 @@ pub(crate) fn get_cross_file_scope(
         &is_cancelled,
         package_contribution,
         data_provider.as_ref(),
+        package_query_uri.as_ref(),
     )
 }
 
@@ -3665,7 +3681,11 @@ pub(crate) fn get_cross_file_scope_with_cache(
             base_packages: state.package_library.base_packages(),
         });
 
-    scope::scope_at_position_with_graph_cached(
+    let package_query_uri = package_contribution
+        .and_then(|contrib| contrib.workspace_root.as_ref())
+        .and_then(|root| state.authoritative_package_query_uri_for_open_document(uri, root));
+
+    scope::scope_at_position_with_graph_cached_with_package_query_uri(
         uri,
         line,
         column,
@@ -3681,6 +3701,7 @@ pub(crate) fn get_cross_file_scope_with_cache(
         prefix_cache,
         package_contribution,
         data_provider.as_ref(),
+        package_query_uri.as_ref(),
     )
 }
 
@@ -5648,7 +5669,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         };
 
     let empty_base_exports = HashSet::new();
-    let scope_result = scope::scope_at_position_with_graph(
+    let scope_result = scope::scope_at_position_with_graph_with_package_query_uri(
         uri,
         u32::MAX,
         u32::MAX,
@@ -5665,6 +5686,7 @@ fn collect_max_depth_diagnostics_from_snapshot(
         // No `data()` alias expansion (issue #429): this pass only reads
         // `scope_result.depth_exceeded`, never `scope.symbols`.
         None,
+        snapshot.package_query_uri.as_ref(),
     );
 
     {
@@ -6156,7 +6178,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             base_packages: snapshot.package_library.base_packages(),
         });
 
-    let mut stream_opt = scope::ScopeStream::new_with_standalone_cache(
+    let mut stream_opt = scope::ScopeStream::new_with_standalone_cache_and_package_query_uri(
         uri,
         &get_artifacts,
         &get_metadata,
@@ -6171,6 +6193,7 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         Some(&snapshot.scope_contribution),
         data_provider.as_ref(),
         snapshot.standalone_ctx.clone(),
+        snapshot.package_query_uri.as_ref(),
     );
 
     // Pre-compute the names of test-attached packages (testthat under
@@ -7038,7 +7061,7 @@ fn collect_undefined_variables_from_snapshot(
             base_packages: snapshot.package_library.base_packages(),
         });
 
-    let mut stream_opt = scope::ScopeStream::new_with_standalone_cache(
+    let mut stream_opt = scope::ScopeStream::new_with_standalone_cache_and_package_query_uri(
         uri,
         &get_artifacts,
         &get_metadata,
@@ -7053,6 +7076,7 @@ fn collect_undefined_variables_from_snapshot(
         Some(&snapshot.scope_contribution),
         data_provider.as_ref(),
         snapshot.standalone_ctx.clone(),
+        snapshot.package_query_uri.as_ref(),
     );
 
     // Reusable buffer for position-aware packages; avoids per-iteration allocation.

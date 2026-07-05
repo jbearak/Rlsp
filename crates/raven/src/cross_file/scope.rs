@@ -5179,6 +5179,51 @@ where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
+    scope_at_position_with_graph_with_package_query_uri(
+        uri,
+        line,
+        column,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        max_depth,
+        base_exports,
+        hoist_globals,
+        backward_dep_mode,
+        is_cancelled,
+        package_contribution,
+        data_alias_provider,
+        None,
+    )
+}
+
+/// As [`scope_at_position_with_graph`], but package contribution path gates use
+/// `package_query_uri` when provided. This lets an open symlink/case alias keep
+/// diagnostics published to the client URI while package membership is resolved
+/// against the canonical package URI.
+#[allow(clippy::too_many_arguments)]
+pub fn scope_at_position_with_graph_with_package_query_uri<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
+    package_query_uri: Option<&Url>,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
     let mut visited = HashMap::new();
 
     // Build initial PathContext for the root file
@@ -5210,6 +5255,7 @@ where
         true,
         None,
         package_contribution,
+        package_query_uri,
         data_alias_provider,
         &forward_child_memo,
     )
@@ -5287,7 +5333,7 @@ where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
     G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
 {
-    scope_at_position_with_graph_cached_with_standalone_cache(
+    scope_at_position_with_graph_cached_with_package_query_uri(
         uri,
         line,
         column,
@@ -5304,6 +5350,52 @@ where
         package_contribution,
         data_alias_provider,
         None,
+    )
+}
+
+/// As [`scope_at_position_with_graph_cached`], but package contribution path
+/// gates use `package_query_uri` when provided.
+#[allow(clippy::too_many_arguments)]
+pub fn scope_at_position_with_graph_cached_with_package_query_uri<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    prefix_cache: &mut ParentPrefixCache,
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
+    package_query_uri: Option<&Url>,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    scope_at_position_with_graph_cached_with_standalone_cache_and_package_query_uri(
+        uri,
+        line,
+        column,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        max_depth,
+        base_exports,
+        hoist_globals,
+        backward_dep_mode,
+        is_cancelled,
+        prefix_cache,
+        package_contribution,
+        data_alias_provider,
+        None,
+        package_query_uri,
     )
 }
 
@@ -5327,6 +5419,52 @@ pub fn scope_at_position_with_graph_cached_with_standalone_cache<F, G>(
     backward_dep_mode: super::config::BackwardDependencyMode,
     is_cancelled: &dyn Fn() -> bool,
     prefix_cache: &mut ParentPrefixCache,
+    package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    data_alias_provider: Option<&DataAliasProvider<'_>>,
+    standalone_ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
+) -> ScopeAtPosition
+where
+    F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
+    G: Fn(&Url) -> Option<std::sync::Arc<super::types::CrossFileMetadata>>,
+{
+    scope_at_position_with_graph_cached_with_standalone_cache_and_package_query_uri(
+        uri,
+        line,
+        column,
+        get_artifacts,
+        get_metadata,
+        graph,
+        workspace_root,
+        max_depth,
+        base_exports,
+        hoist_globals,
+        backward_dep_mode,
+        is_cancelled,
+        prefix_cache,
+        package_contribution,
+        data_alias_provider,
+        standalone_ctx,
+        None,
+    )
+}
+
+/// As [`scope_at_position_with_graph_cached_with_standalone_cache`], but
+/// package contribution path gates use `package_query_uri` when provided.
+#[allow(clippy::too_many_arguments)]
+pub fn scope_at_position_with_graph_cached_with_standalone_cache_and_package_query_uri<F, G>(
+    uri: &Url,
+    line: u32,
+    column: u32,
+    get_artifacts: &F,
+    get_metadata: &G,
+    graph: &super::dependency::DependencyGraph,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+    base_exports: &HashSet<String>,
+    hoist_globals: bool,
+    backward_dep_mode: super::config::BackwardDependencyMode,
+    is_cancelled: &dyn Fn() -> bool,
+    prefix_cache: &mut ParentPrefixCache,
     // Package-mode contribution. When `Some`, synthetic package-internal and
     // imported symbols are injected into the root-file scope (Phase 5a).
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
@@ -5336,6 +5474,7 @@ pub fn scope_at_position_with_graph_cached_with_standalone_cache<F, G>(
     // disable caching. Seeds the per-query forward-child memo so the EOF hook in
     // `scope_at_position_with_graph_recursive` can consult/populate the cache.
     standalone_ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
+    package_query_uri: Option<&Url>,
 ) -> ScopeAtPosition
 where
     F: Fn(&Url) -> Option<Arc<ScopeArtifacts>>,
@@ -5430,6 +5569,7 @@ where
         true,
         Some(&prefix_arc),
         package_contribution,
+        package_query_uri,
         data_alias_provider,
         &forward_child_memo,
     )
@@ -5742,6 +5882,7 @@ where
             true,
             None,
             None,
+            None,
             // Parent-prefix walk does not expand `data()` aliases (issue #429):
             // the prefix is cached in a provider-independent `ParentPrefixCache`
             // keyed only by `(uri, inside)`, so threading a provider here would
@@ -5958,6 +6099,10 @@ fn scope_at_position_with_graph_recursive<F, G>(
     // Internal recursive calls (forward source children, parent walks) always
     // receive `None` — the contribution applies only to the root query file.
     package_contribution: Option<&crate::package_state::PackageScopeContribution>,
+    // Canonical URI used only for package-contribution path gates at depth 0.
+    // Open-document aliases keep `uri` as the client/publish spelling while
+    // using this URI to decide whether the query belongs to the package.
+    package_query_uri: Option<&Url>,
     // Provider expanding `data()` file-stem aliases to dataset object names
     // (issue #429). Threaded to forward-source children (a sourced file's
     // `data()` call expands too). The backward parent-prefix walk does NOT
@@ -6538,6 +6683,7 @@ where
                                         true,
                                         None,
                                         None,
+                                        None,
                                         child_provider,
                                         forward_child_memo,
                                     )
@@ -6562,6 +6708,7 @@ where
                                 backward_dep_mode,
                                 is_cancelled,
                                 false,
+                                None,
                                 None,
                                 None,
                                 child_provider,
@@ -6806,8 +6953,9 @@ where
     if current_depth == 0
         && let Some(contrib) = package_contribution
     {
-        append_package_contribution(&mut scope, uri, contrib);
-        append_rprofile_prelude(&mut scope, uri, contrib);
+        let contribution_uri = package_query_uri.unwrap_or(uri);
+        append_package_contribution(&mut scope, contribution_uri, contrib);
+        append_rprofile_prelude(&mut scope, contribution_uri, contrib);
     }
 
     // Issue #483 (WI2b): populate the persistent standalone cache. Only the
@@ -7027,6 +7175,11 @@ pub fn is_package_internal_uri(uri: &Url) -> bool {
 /// definitions always take precedence. `full_imports` entries are intentionally
 /// skipped: enumerating their symbols requires the package library, which is
 /// handled by the existing `pkg_resolver` / combined-exports path.
+///
+/// `uri` is the URI used for package path classification. For an open
+/// symlink/case alias, callers keep the queried/client URI elsewhere for
+/// diagnostics publishing and pass the authoritative canonical package URI here
+/// so `strip_prefix(root)` and package layout checks see the real package path.
 pub(crate) fn append_package_contribution(
     scope: &mut ScopeAtPosition,
     uri: &Url,
@@ -7547,6 +7700,9 @@ where
     /// test-attached packages (e.g. `testthat` under `tests/testthat/`) are
     /// visible at the cursor.
     package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
+    /// Canonical URI used only for package-contribution path gates. The stream
+    /// still resolves and publishes against `queried_uri`.
+    package_query_uri: Option<&'a Url>,
 
     /// Pre-computed set of symbol names that the package contribution would
     /// inject for `queried_uri` (R/ internals + NAMESPACE-imported names +
@@ -7653,7 +7809,7 @@ where
         package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
         data_alias_provider: Option<&'a DataAliasProvider<'a>>,
     ) -> Option<Self> {
-        Self::new_with_standalone_cache(
+        Self::new_with_standalone_cache_and_package_query_uri(
             queried_uri,
             get_artifacts,
             get_metadata,
@@ -7668,6 +7824,7 @@ where
             package_contribution,
             data_alias_provider,
             None,
+            None,
         )
     }
 
@@ -7676,7 +7833,46 @@ where
     /// prefix forward-child memos so the EOF hook can consult/populate the
     /// cross-snapshot cache. `None` is equivalent to `ScopeStream::new`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, reason = "kept as the non-alias compatibility wrapper")]
     pub fn new_with_standalone_cache(
+        queried_uri: &'a Url,
+        get_artifacts: &'a F,
+        get_metadata: &'a G,
+        graph: &'a super::dependency::DependencyGraph,
+        workspace_root: Option<&'a Url>,
+        max_depth: usize,
+        base_exports: &'a HashSet<String>,
+        hoist_globals: bool,
+        backward_dep_mode: super::config::BackwardDependencyMode,
+        is_cancelled: &'a dyn Fn() -> bool,
+        prefix_cache: &'a std::cell::RefCell<ParentPrefixCache>,
+        package_contribution: Option<&'a crate::package_state::PackageScopeContribution>,
+        data_alias_provider: Option<&'a DataAliasProvider<'a>>,
+        standalone_ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
+    ) -> Option<Self> {
+        Self::new_with_standalone_cache_and_package_query_uri(
+            queried_uri,
+            get_artifacts,
+            get_metadata,
+            graph,
+            workspace_root,
+            max_depth,
+            base_exports,
+            hoist_globals,
+            backward_dep_mode,
+            is_cancelled,
+            prefix_cache,
+            package_contribution,
+            data_alias_provider,
+            standalone_ctx,
+            None,
+        )
+    }
+
+    /// As [`ScopeStream::new_with_standalone_cache`], but package contribution
+    /// path gates use `package_query_uri` when provided.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_standalone_cache_and_package_query_uri(
         queried_uri: &'a Url,
         get_artifacts: &'a F,
         get_metadata: &'a G,
@@ -7700,6 +7896,7 @@ where
         // cache context, so the backward-parent path simply recomputes — a missed
         // optimization, never a stale hit.
         standalone_ctx: Option<super::standalone_cache::StandaloneCacheCtx>,
+        package_query_uri: Option<&'a Url>,
     ) -> Option<Self> {
         let artifacts = get_artifacts(queried_uri)?;
 
@@ -7801,8 +7998,9 @@ where
         // `queried_uri`. Doing it once at construction keeps
         // `is_visible`/`symbol_for` O(1) hash lookups instead of repeatedly
         // walking the BTreeMap of helper files.
+        let contribution_query_uri = package_query_uri.unwrap_or(queried_uri);
         let contribution_symbol_names =
-            compute_contribution_symbol_names(queried_uri, package_contribution);
+            compute_contribution_symbol_names(contribution_query_uri, package_contribution);
 
         Some(Self {
             queried_uri,
@@ -7827,6 +8025,7 @@ where
             path_ctx,
             prefix_cache,
             package_contribution,
+            package_query_uri,
             contribution_symbol_names,
             data_alias_provider,
             forward_child_memo,
@@ -8318,8 +8517,9 @@ where
         // visibility check route through `parent_symbol_names` (computed via
         // the recursive path at position (0, 0)).
         if let Some(contrib) = self.package_contribution {
-            append_package_contribution(&mut scope, self.queried_uri, contrib);
-            append_rprofile_prelude(&mut scope, self.queried_uri, contrib);
+            let contribution_uri = self.package_query_uri.unwrap_or(self.queried_uri);
+            append_package_contribution(&mut scope, contribution_uri, contrib);
+            append_rprofile_prelude(&mut scope, contribution_uri, contrib);
         }
 
         scope
@@ -8728,6 +8928,7 @@ where
                     self.is_cancelled,
                     true,
                     Some(&child_prefix),
+                    None,
                     None,
                     child_provider,
                     &self.forward_child_memo,
@@ -26845,6 +27046,70 @@ mod package_contribution_tests {
             sym.source_uri.as_str().starts_with("package:"),
             "synthetic symbol source_uri must use package: scheme, got {}",
             sym.source_uri
+        );
+    }
+
+    #[test]
+    fn package_contribution_uses_canonical_query_uri_for_alias_path() {
+        let workspace_root = Url::parse("file:///work/pkg").unwrap();
+        let alias_uri = Url::parse("file:///tmp/pkg-link/R/main.R").unwrap();
+        let canonical_uri = Url::parse("file:///work/pkg/R/main.R").unwrap();
+        let main_code = "result <- helper()";
+        let main_arts = artifacts_for(&alias_uri, main_code);
+
+        let get_artifacts = |u: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if u == &alias_uri {
+                Some(main_arts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |_u: &Url| -> Option<std::sync::Arc<super::super::types::CrossFileMetadata>> { None };
+        let graph = super::super::dependency::DependencyGraph::new();
+        let contrib = make_contribution("/work/pkg", &["helper"], &[]);
+
+        let raw_scope = scope_at_position_with_graph(
+            &alias_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+            None,
+        );
+        assert!(
+            !raw_scope.symbols.contains_key("helper"),
+            "raw symlink spelling is outside /work/pkg and must not receive package symbols"
+        );
+
+        let canonical_scope = scope_at_position_with_graph_with_package_query_uri(
+            &alias_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            super::super::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            Some(&contrib),
+            None,
+            Some(&canonical_uri),
+        );
+        assert!(
+            canonical_scope.symbols.contains_key("helper"),
+            "canonical package query URI must make the alias-open file see package peers"
         );
     }
 

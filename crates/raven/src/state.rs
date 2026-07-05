@@ -379,6 +379,12 @@ impl Document {
 /// that buffer's URI. A newer non-authoritative alias can keep its own graph
 /// node fresh, but it must not overwrite the canonical node whose live content
 /// comes from an older alias or from the exact canonical open URI.
+///
+/// Package-mode and `.Rprofile` authority reuse this map too. A symlink/case
+/// alias may keep diagnostics published to the client URI while package
+/// membership checks, package-internal scope injection, package sibling
+/// fanout, and workspace-root `.Rprofile` prelude ownership resolve through
+/// the authoritative canonical URI.
 #[derive(Debug, Default, Clone)]
 pub struct OpenDocumentAliases {
     canonical_to_open: HashMap<Url, Vec<Url>>,
@@ -1046,6 +1052,58 @@ impl WorldState {
             .unwrap_or_default()
     }
 
+    /// Return the canonical package R-file URI that should be used for
+    /// package-membership checks for `open_uri`, when `open_uri` is an
+    /// authoritative alias of a package source/test file.
+    ///
+    /// `None` is the no-alias fast path: callers should keep using `open_uri`.
+    pub(crate) fn authoritative_package_query_uri_for_open_document(
+        &self,
+        open_uri: &Url,
+        workspace_root: &std::path::Path,
+    ) -> Option<Url> {
+        if self.open_document_aliases.is_empty() {
+            return None;
+        }
+        let canonical_uris = self
+            .open_document_aliases
+            .canonical_uris_for_open(open_uri)?;
+        for canonical_uri in canonical_uris.iter().rev() {
+            let Ok(path) = canonical_uri.to_file_path() else {
+                continue;
+            };
+            if crate::package_state::is_r_source_path(&path, workspace_root).is_none() {
+                continue;
+            }
+            if self
+                .open_document_uri_for_authoritative_uri(canonical_uri)
+                .as_ref()
+                == Some(open_uri)
+            {
+                return Some(canonical_uri.clone());
+            }
+        }
+        None
+    }
+
+    /// Return the authoritative URI root for `target_path` when `open_uri`
+    /// owns that path either directly or through an open-document alias.
+    pub(crate) fn authoritative_open_uri_for_path(
+        &self,
+        open_uri: &Url,
+        target_path: &std::path::Path,
+    ) -> Option<Url> {
+        if open_uri.to_file_path().ok().as_deref() == Some(target_path) {
+            return Some(open_uri.clone());
+        }
+        if self.open_document_aliases.is_empty() {
+            return None;
+        }
+        self.authoritative_revalidation_roots_for_uri(open_uri)
+            .into_iter()
+            .find(|root| root.to_file_path().ok().as_deref() == Some(target_path))
+    }
+
     pub fn revalidation_roots_for_uri(&self, uri: &Url) -> Vec<Url> {
         let mut roots = Vec::with_capacity(
             self.open_document_aliases
@@ -1195,6 +1253,19 @@ impl WorldState {
 
         crate::backend::ScopeProbeSnapshot {
             docs: docs.to_vec(),
+            package_query_uris: self
+                .package_inputs
+                .workspace_root
+                .as_ref()
+                .map(|root| {
+                    docs.iter()
+                        .filter_map(|(uri, _)| {
+                            self.authoritative_package_query_uri_for_open_document(uri, root)
+                                .map(|query_uri| (uri.clone(), query_uri))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             artifacts_map,
             metadata_map,
             doc_loaded_packages: self

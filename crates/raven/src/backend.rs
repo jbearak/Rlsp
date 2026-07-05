@@ -1530,9 +1530,7 @@ fn collect_close_fanout_siblings(
         .keys()
         .filter(|open_uri| *open_uri != closing_uri)
         .filter(|open_uri| {
-            open_uri.to_file_path().ok().is_some_and(|p| {
-                crate::package_state::is_r_source_path(&p, workspace_root).is_some()
-            })
+            is_authoritative_package_source_open_uri(state, open_uri, workspace_root)
         })
         .cloned()
         .collect();
@@ -1664,10 +1662,7 @@ fn extend_with_open_package_docs(
     workspace_root: &std::path::Path,
 ) {
     for open_uri in state.documents.keys() {
-        if open_uri
-            .to_file_path()
-            .ok()
-            .is_some_and(|p| crate::package_state::is_r_source_path(&p, workspace_root).is_some())
+        if is_authoritative_package_source_open_uri(state, open_uri, workspace_root)
             && affected_set.insert(open_uri.clone())
         {
             affected.push(open_uri.clone());
@@ -2675,6 +2670,41 @@ fn authoritative_package_r_file_uri_for_open_document(
     authoritative_package_input_uri_for_open_document(state, open_uri, root)?.into_r_file()
 }
 
+fn authoritative_package_r_file_kind_for_open_document(
+    state: &WorldState,
+    open_uri: &Url,
+    root: &std::path::Path,
+) -> Option<crate::package_state::RFileKind> {
+    if let Some((_, _, kind)) =
+        authoritative_package_r_file_uri_for_open_document(state, open_uri, root)
+    {
+        return Some(kind);
+    }
+    open_uri
+        .to_file_path()
+        .ok()
+        .and_then(|path| crate::package_state::is_r_source_path(&path, root))
+}
+
+fn is_authoritative_package_source_open_uri(
+    state: &WorldState,
+    open_uri: &Url,
+    root: &std::path::Path,
+) -> bool {
+    authoritative_package_r_file_kind_for_open_document(state, open_uri, root).is_some()
+}
+
+fn authoritative_rprofile_root_for_open_document(
+    state: &WorldState,
+    open_uri: &Url,
+) -> Option<std::path::PathBuf> {
+    let root = state.package_inputs.workspace_root.as_ref()?;
+    let rprofile_path = root.join(".Rprofile");
+    state
+        .authoritative_open_uri_for_path(open_uri, &rprofile_path)
+        .map(|_| root.clone())
+}
+
 fn hydrate_package_r_files_from_state(
     state: &WorldState,
     root: &std::path::Path,
@@ -2748,10 +2778,11 @@ pub(crate) fn initialize_package_inputs_from_state(
     // inputs untouched in that case (modeling stays enabled). When modeling is
     // disabled the prelude is cleared regardless (an open buffer can't keep a
     // prelude that the feature is turned off for).
-    let rprofile_open = state
-        .documents
-        .keys()
-        .any(|u| u.to_file_path().ok().as_deref() == Some(root.join(".Rprofile").as_path()));
+    let rprofile_open = state.documents.keys().any(|u| {
+        state
+            .authoritative_open_uri_for_path(u, &root.join(".Rprofile"))
+            .is_some()
+    });
     if state.package_inputs.model_rprofile && rprofile_open {
         // Buffer-authoritative: keep the live prelude inputs as-is.
     } else {
@@ -4031,10 +4062,13 @@ async fn apply_watched_r_file_package_input_events(
             // scope.
             if let Some(ref root) = state.package_inputs.workspace_root.clone() {
                 for open_uri in state.documents.keys() {
-                    if let Ok(p) = open_uri.to_file_path()
-                        && (crate::package_state::is_r_source_path(&p, root).is_some()
-                            || (rprofile_changed
-                                && crate::package_state::is_package_workspace_r_file(&p, root)))
+                    let is_package_source =
+                        is_authoritative_package_source_open_uri(&state, open_uri, root);
+                    let is_rprofile_workspace_r = rprofile_changed
+                        && open_uri.to_file_path().ok().is_some_and(|p| {
+                            crate::package_state::is_package_workspace_r_file(&p, root)
+                        });
+                    if (is_package_source || is_rprofile_workspace_r)
                         && affected_for_async_set.insert(open_uri.clone())
                     {
                         affected_for_async.push(open_uri.clone());
@@ -5554,9 +5588,7 @@ impl LanguageServer for Backend {
             // a dirty buffer), so the prelude must reflect the buffer, not just
             // the disk seed — without this, open scripts would see a stale
             // prelude until the first keystroke.
-            if let Some(root) = state.package_inputs.workspace_root.clone()
-                && uri.to_file_path().ok().as_deref() == Some(root.join(".Rprofile").as_path())
-            {
+            if let Some(root) = authoritative_rprofile_root_for_open_document(&state, &uri) {
                 rprofile_live_edit = Some((root, text.as_str().into()));
             }
 
@@ -5754,14 +5786,14 @@ impl LanguageServer for Backend {
             // of open files have potentially stale diagnostics.
             if (interface_changed || package_visibility_changed)
                 && let Some(pkg) = state.package_workspace()
-                && let Ok(fp) = uri.to_file_path()
             {
-                let r_dir = pkg.root.join("R");
-                if package_visibility_changed || fp.starts_with(&r_dir) {
+                let edited_kind =
+                    authoritative_package_r_file_kind_for_open_document(&state, &uri, &pkg.root);
+                if package_visibility_changed
+                    || edited_kind == Some(crate::package_state::RFileKind::Source)
+                {
                     for open_uri in state.documents.keys() {
-                        if let Ok(p) = open_uri.to_file_path()
-                            && crate::package_state::is_r_source_path(&p, &pkg.root).is_some()
-                        {
+                        if is_authoritative_package_source_open_uri(&state, open_uri, &pkg.root) {
                             affected.insert(open_uri.clone());
                         }
                     }
@@ -6178,25 +6210,27 @@ impl LanguageServer for Backend {
                 let get_artifacts = |u: &Url| probe.artifacts_map.get(u).cloned();
                 let get_metadata = |u: &Url| probe.metadata_map.get(u).cloned();
                 let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
-                let scope = crate::cross_file::scope::scope_at_position_with_graph(
-                    &uri,
-                    probe_line,
-                    u32::MAX,
-                    &get_artifacts,
-                    &get_metadata,
-                    &probe.graph,
-                    probe.workspace_folder.as_ref(),
-                    probe.max_chain_depth,
-                    &empty_base_exports,
-                    false,
-                    probe.backward_dependencies,
-                    &|| false,
-                    Some(&probe.scope_contribution),
-                    // Package-scope probe reads only `inherited_packages` /
-                    // `loaded_packages`, never `scope.symbols`, so `data()`
-                    // alias expansion (issue #429) is unnecessary here.
-                    None,
-                );
+                let scope =
+                    crate::cross_file::scope::scope_at_position_with_graph_with_package_query_uri(
+                        &uri,
+                        probe_line,
+                        u32::MAX,
+                        &get_artifacts,
+                        &get_metadata,
+                        &probe.graph,
+                        probe.workspace_folder.as_ref(),
+                        probe.max_chain_depth,
+                        &empty_base_exports,
+                        false,
+                        probe.backward_dependencies,
+                        &|| false,
+                        Some(&probe.scope_contribution),
+                        // Package-scope probe reads only `inherited_packages` /
+                        // `loaded_packages`, never `scope.symbols`, so `data()`
+                        // alias expansion (issue #429) is unnecessary here.
+                        None,
+                        probe.package_query_uris.get(&uri),
+                    );
 
                 let mut pkgs = scope.inherited_packages;
                 pkgs.extend(scope.loaded_packages);
@@ -6363,8 +6397,7 @@ impl LanguageServer for Backend {
 
             // Snapshot the post-change buffer text if this is the workspace-root
             // `.Rprofile`, for the off-lock prelude refresh after this block.
-            if let Some(root) = state.package_inputs.workspace_root.clone()
-                && uri.to_file_path().ok().as_deref() == Some(root.join(".Rprofile").as_path())
+            if let Some(root) = authoritative_rprofile_root_for_open_document(&state, &uri)
                 && let Some(text) = state
                     .documents
                     .get(&uri)
@@ -6610,9 +6643,7 @@ impl LanguageServer for Backend {
             // the affected-set.
             if package_visibility_changed && let Some(pkg) = state.package_workspace() {
                 for open_uri in state.documents.keys() {
-                    if let Ok(p) = open_uri.to_file_path()
-                        && crate::package_state::is_r_source_path(&p, &pkg.root).is_some()
-                    {
+                    if is_authoritative_package_source_open_uri(&state, open_uri, &pkg.root) {
                         affected.insert(open_uri.clone());
                     }
                 }
@@ -6626,14 +6657,12 @@ impl LanguageServer for Backend {
             if interface_changed
                 && !package_visibility_changed
                 && let Some(pkg) = state.package_workspace()
-                && let Ok(fp) = uri.to_file_path()
             {
-                let r_dir = pkg.root.join("R");
-                if fp.starts_with(&r_dir) {
+                let edited_kind =
+                    authoritative_package_r_file_kind_for_open_document(&state, &uri, &pkg.root);
+                if edited_kind == Some(crate::package_state::RFileKind::Source) {
                     for open_uri in state.documents.keys() {
-                        if let Ok(p) = open_uri.to_file_path()
-                            && crate::package_state::is_r_source_path(&p, &pkg.root).is_some()
-                        {
+                        if is_authoritative_package_source_open_uri(&state, open_uri, &pkg.root) {
                             affected.insert(open_uri.clone());
                         }
                     }
@@ -6759,7 +6788,8 @@ impl LanguageServer for Backend {
                     let get_artifacts = |u: &Url| probe.artifacts_map.get(u).cloned();
                     let get_metadata = |u: &Url| probe.metadata_map.get(u).cloned();
                     let probe_line = probe.docs.first().map(|(_, l)| *l).unwrap_or(0);
-                    let scope = crate::cross_file::scope::scope_at_position_with_graph(
+                    let scope =
+                        crate::cross_file::scope::scope_at_position_with_graph_with_package_query_uri(
                         &revalidation_uri,
                         probe_line,
                         u32::MAX,
@@ -6776,6 +6806,7 @@ impl LanguageServer for Backend {
                         // Probe reads only packages, not `scope.symbols`;
                         // no `data()` alias expansion needed (issue #429).
                         None,
+                        probe.package_query_uris.get(&revalidation_uri),
                     );
                     all_packages.extend(scope.inherited_packages);
                     all_packages.extend(scope.loaded_packages);
@@ -7099,9 +7130,7 @@ impl LanguageServer for Backend {
             // not touch the prelude. Schedule a disk re-scan after the lock to
             // revert any unsaved buffer edits (off-lock; the scan follows
             // transitive source()).
-            if let Some(root) = state.package_inputs.workspace_root.clone()
-                && uri.to_file_path().ok().as_deref() == Some(root.join(".Rprofile").as_path())
-            {
+            if let Some(root) = authoritative_rprofile_root_for_open_document(&state, uri) {
                 rprofile_close_root = Some(root);
             }
 
@@ -9918,7 +9947,7 @@ pub(crate) async fn prefetch_packages_for_open_documents(
     let get_artifacts = |target_uri: &Url| probe.artifacts_map.get(target_uri).cloned();
     let get_metadata = |target_uri: &Url| probe.metadata_map.get(target_uri).cloned();
     for (uri, line) in &probe.docs {
-        let scope = crate::cross_file::scope::scope_at_position_with_graph(
+        let scope = crate::cross_file::scope::scope_at_position_with_graph_with_package_query_uri(
             uri,
             *line,
             u32::MAX,
@@ -9935,6 +9964,7 @@ pub(crate) async fn prefetch_packages_for_open_documents(
             // Probe reads only packages, not `scope.symbols`; no `data()`
             // alias expansion needed (issue #429).
             None,
+            probe.package_query_uris.get(uri),
         );
         for p in scope.inherited_packages {
             all_pkgs.insert(p);
@@ -10107,6 +10137,7 @@ pub(crate) fn restart_libpath_watcher<'a>(
 /// dependency neighborhood (including closed parent files) is included.
 pub(crate) struct ScopeProbeSnapshot {
     pub(crate) docs: Vec<(Url, u32)>,
+    pub(crate) package_query_uris: std::collections::HashMap<Url, Url>,
     pub(crate) artifacts_map:
         std::collections::HashMap<Url, Arc<crate::cross_file::scope::ScopeArtifacts>>,
     pub(crate) metadata_map:
@@ -10306,7 +10337,8 @@ async fn run_libpath_consumer(
                     .docs
                     .iter()
                     .filter_map(|(uri, line)| {
-                        let scope = crate::cross_file::scope::scope_at_position_with_graph(
+                        let scope =
+                            crate::cross_file::scope::scope_at_position_with_graph_with_package_query_uri(
                             uri,
                             *line,
                             u32::MAX,
@@ -10323,6 +10355,7 @@ async fn run_libpath_consumer(
                             // Probe reads only packages, not `scope.symbols`;
                             // no `data()` alias expansion needed (issue #429).
                             None,
+                            probe.package_query_uris.get(uri),
                         );
                         // Scope probe captures inherited + global-scope packages.
                         // Also check the document's full loaded_packages which
@@ -15505,6 +15538,110 @@ mod project_config_initialize_tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_rprofile_symlink_alias_uses_buffer_and_survives_package_reinit() {
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().join("pkg");
+        let link_path = tmp.path().join("pkg-link");
+        fs::create_dir_all(&root_path).unwrap();
+        fs::write(root_path.join(".Rprofile"), "helper_a <- function() 1\n").unwrap();
+        fs::write(root_path.join("script.R"), "helper_b()\n").unwrap();
+        std::os::unix::fs::symlink(&root_path, &link_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&root_path).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            initialize_package_inputs_from_state(
+                &mut state,
+                root_path.clone(),
+                None,
+                None,
+                Default::default(),
+                None,
+            );
+        }
+
+        let script_uri = Url::from_file_path(root_path.join("script.R")).unwrap();
+        open_doc(backend, &script_uri, "r", 1, "helper_b()\n").await;
+        {
+            let state = backend.state.read().await;
+            let script_diags = snapshot_diagnostics(&state, &script_uri);
+            assert!(
+                script_diags
+                    .iter()
+                    .any(|diag| diag.message.contains("helper_b")),
+                "precondition: helper_b is undefined before the alias .Rprofile opens"
+            );
+        }
+
+        let alias_rprofile_uri = Url::from_file_path(link_path.join(".Rprofile")).unwrap();
+        open_doc(
+            backend,
+            &alias_rprofile_uri,
+            "r",
+            1,
+            "helper_b <- function() 1\n",
+        )
+        .await;
+
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.package_inputs.rprofile_symbols.contains("helper_b"),
+                "alias-open .Rprofile buffer must own the live prelude: {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+            let script_diags = snapshot_diagnostics(&state, &script_uri);
+            assert!(
+                !script_diags
+                    .iter()
+                    .any(|diag| diag.message.contains("helper_b")),
+                "script diagnostics must fold in the alias-open .Rprofile prelude: {script_diags:?}"
+            );
+        }
+
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state(
+                &mut state,
+                root_path.clone(),
+                None,
+                None,
+                Default::default(),
+                Some(crate::package_state::rprofile::scan_workspace_rprofile(
+                    &root_path,
+                )),
+            );
+            assert!(
+                state.package_inputs.rprofile_symbols.contains("helper_b"),
+                "package reinitialization must preserve alias-open .Rprofile prelude: {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+            assert!(
+                !state.package_inputs.rprofile_symbols.contains("helper_a"),
+                "disk .Rprofile must not clobber the alias-open dirty prelude: {:?}",
+                state.package_inputs.rprofile_symbols
+            );
+        }
+    }
+
     /// While `.Rprofile` is OPEN with unsaved edits, a file-watcher event for it
     /// (external disk touch, or the editor's own save) must NOT overwrite the
     /// live-buffer prelude with the on-disk scan — open documents are
@@ -17473,6 +17610,106 @@ mod project_config_initialize_tests {
                 .iter()
                 .any(|diag| diag.message.contains("disk_only")),
             "package sibling must no longer resolve the disk-only symbol; got {diagnostics:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn package_symlink_alias_gets_own_package_scope_and_revalidates_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("pkg");
+        let link = tmp.path().join("pkg-link");
+        let r_dir = real.join("R");
+        fs::create_dir_all(&r_dir).unwrap();
+        fs::write(real.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(r_dir.join("foo.R"), "disk_foo <- function() 1\n").unwrap();
+        fs::write(r_dir.join("peer.R"), "peer <- function() 1\n").unwrap();
+        fs::write(r_dir.join("sibling.R"), "live_alias2()\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&real).unwrap(),
+                    name: "pkg".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        {
+            let disk_seed = collect_package_r_file_inputs_from_disk(&real);
+            let mut state = backend.state.write().await;
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+            state.workspace_scan_complete = true;
+            initialize_package_inputs_from_state(
+                &mut state,
+                real.clone(),
+                Some("Package: pkg\n".into()),
+                None,
+                disk_seed,
+                None,
+            );
+        }
+
+        let sibling_uri = Url::from_file_path(r_dir.join("sibling.R")).unwrap();
+        open_doc(backend, &sibling_uri, "r", 1, "live_alias2()\n").await;
+        let foo_uri = Url::from_file_path(r_dir.join("foo.R")).unwrap();
+        let alias_uri = Url::from_file_path(link.join("R").join("foo.R")).unwrap();
+        open_doc(
+            backend,
+            &alias_uri,
+            "r",
+            1,
+            "foo_result <- peer()\nlive_alias <- function() 1\n",
+        )
+        .await;
+
+        let sibling_force_before_change = {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.open_document_uri_for_authoritative_uri(&foo_uri),
+                Some(alias_uri.clone()),
+                "canonical package R file must resolve to the symlink-open buffer"
+            );
+            let alias_diags = snapshot_diagnostics(&state, &alias_uri);
+            assert!(
+                !alias_diags.iter().any(|diag| diag.message.contains("peer")),
+                "alias buffer's own diagnostics must see package peer symbols: {alias_diags:?}"
+            );
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&sibling_uri)
+        };
+
+        change_doc(
+            backend,
+            &alias_uri,
+            2,
+            "foo_result <- peer()\nlive_alias2 <- function() 2\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&sibling_uri)
+                > sibling_force_before_change,
+            "editing the symlink alias package file must fan out to package siblings"
+        );
+        let sibling_diags = snapshot_diagnostics(&state, &sibling_uri);
+        assert!(
+            !sibling_diags
+                .iter()
+                .any(|diag| diag.message.contains("live_alias2")),
+            "package sibling must resolve the live symbol from the alias buffer: {sibling_diags:?}"
         );
     }
 
