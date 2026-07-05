@@ -7872,7 +7872,8 @@ impl Backend {
     /// lock, in order, it:
     ///   - removes newly excluded index entries and, when workspace indexing is
     ///     enabled, rescans the workspace so newly re-included files are merged
-    ///     back into the indexes,
+    ///     back into the indexes; when no scan runs, it still replays open
+    ///     buffers under the new exclusions,
     ///   - re-reads `DESCRIPTION` / `NAMESPACE` on a `packageMode` mode
     ///     switch, then re-applies under a brief write lock,
     ///   - re-registers the completion capability if `triggerOnOpenParen`
@@ -8089,8 +8090,9 @@ impl Backend {
                 affected_len
             );
 
+            let scan_inputs = scan_inputs.filter(|(folders, _, _, _)| !folders.is_empty());
             if let Some((folders, max_chain_depth, workspace_exclusions, root_for_pkg_inputs)) =
-                scan_inputs.filter(|(folders, _, _, _)| !folders.is_empty())
+                scan_inputs
             {
                 let scan_workspace_exclusions = workspace_exclusions.clone();
                 let scan_result = tokio::task::spawn_blocking(move || {
@@ -8163,6 +8165,9 @@ impl Backend {
                         log::error!("Workspace exclusion reload scan task failed: {}", err);
                     }
                 }
+            } else {
+                let mut state = self.state.write().await;
+                replay_open_documents_after_workspace_index_apply(&mut state).await;
             }
 
             if !package_inputs_initialized_by_exclusion_reload
@@ -15225,6 +15230,112 @@ mod project_config_initialize_tests {
         assert!(
             !has_helper_fn_undefined(&state, &main_uri),
             "re-including the open helper must make helper_fn resolve"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_exclusion_reload_reincluded_open_helper_without_workspace_index() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            concat!(
+                "[workspace]\n",
+                "exclude = [\"generated/**\"]\n",
+                "[crossFile]\n",
+                "indexWorkspace = false\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("generated").join("helper.R"),
+            "helper_fn <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("main.R"),
+            "source(\"generated/helper.R\")\nhelper_fn()\n",
+        )
+        .unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let helper_uri =
+            Url::from_file_path(tmp.path().join("generated").join("helper.R")).unwrap();
+        let main_uri = Url::from_file_path(tmp.path().join("main.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
+        open_doc(
+            backend,
+            &main_uri,
+            "r",
+            1,
+            "source(\"generated/helper.R\")\nhelper_fn()\n",
+        )
+        .await;
+        backend.state.write().await.workspace_scan_complete = true;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !state.cross_file_config.index_workspace,
+                "precondition: workspace indexing must be disabled"
+            );
+            assert!(
+                !has_dependency_edge(&state, &main_uri, &helper_uri),
+                "precondition: excluded helper must not contribute a graph edge"
+            );
+            assert!(
+                has_helper_fn_undefined(&state, &main_uri),
+                "precondition: excluded helper must not resolve helper_fn"
+            );
+        }
+
+        fs::write(
+            tmp.path().join("raven.toml"),
+            concat!(
+                "[workspace]\n",
+                "exclude = []\n",
+                "[crossFile]\n",
+                "indexWorkspace = false\n",
+            ),
+        )
+        .unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+        backend.state.write().await.workspace_scan_complete = true;
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.workspace_exclusions.is_excluded_uri(&helper_uri),
+            "reload must pick up the removed exclusion"
+        );
+        assert!(
+            has_dependency_edge(&state, &main_uri, &helper_uri),
+            "re-including the open helper must restore the source edge without a workspace scan"
+        );
+        assert!(
+            !has_helper_fn_undefined(&state, &main_uri),
+            "re-including the open helper must make helper_fn resolve without a workspace scan"
         );
     }
 
