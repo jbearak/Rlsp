@@ -75,6 +75,8 @@ For a detailed comparison with RStudio, Positron (Ark), and REditorSupport — c
 
 **GitHub Actions:** Use `jbearak/setup-raven@v1` to install the pre-built CLI, then run `raven check` with the flags you want. See [CLI](docs/cli.md#github-actions-example).
 
+**Bitbucket Pipelines and Ubuntu CI:** Install Raven from the signed apt repository in an Ubuntu image, then run `raven check`. See [CLI](docs/cli.md#bitbucket-pipelines-example).
+
 **Build from source:** Install with `cargo install --git https://github.com/jbearak/raven raven`, or build from a local checkout. See [Development Notes](docs/development.md).
 
 ## Documentation
