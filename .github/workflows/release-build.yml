@@ -368,7 +368,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Debian packaging tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dpkg-dev gnupg unzip
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends binutils dpkg-dev gnupg unzip
 
       - name: Extract version
         id: version
@@ -389,14 +389,16 @@ jobs:
           merge-multiple: true
 
       - name: Build Debian packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p deb-input/amd64 deb-input/arm64 deb-dist
           unzip -q lsp-amd64/raven-linux-x64.zip -d deb-input/amd64
           unzip -q lsp-arm64/raven-linux-arm64.zip -d deb-input/arm64
-          scripts/debian/build-deb.sh "${{ steps.version.outputs.version }}" amd64 deb-input/amd64/raven deb-dist
-          scripts/debian/build-deb.sh "${{ steps.version.outputs.version }}" arm64 deb-input/arm64/raven deb-dist
-          dpkg-deb --info "deb-dist/raven_${{ steps.version.outputs.version }}-1_amd64.deb"
-          dpkg-deb --info "deb-dist/raven_${{ steps.version.outputs.version }}-1_arm64.deb"
+          scripts/debian/build-deb.sh "$VERSION" amd64 deb-input/amd64/raven deb-dist
+          scripts/debian/build-deb.sh "$VERSION" arm64 deb-input/arm64/raven deb-dist
+          dpkg-deb --info "deb-dist/raven_${VERSION}-1_amd64.deb"
+          dpkg-deb --info "deb-dist/raven_${VERSION}-1_arm64.deb"
 
       - name: Checkout apt repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -409,10 +411,16 @@ jobs:
         env:
           APT_REPO_GPG_PRIVATE_KEY: ${{ secrets.APT_REPO_GPG_PRIVATE_KEY }}
           APT_REPO_GPG_PASSPHRASE: ${{ secrets.APT_REPO_GPG_PASSPHRASE }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           if [ -z "${APT_REPO_GPG_PRIVATE_KEY:-}" ]; then
             echo "::error::APT_REPO_GPG_PRIVATE_KEY is required when ENABLE_APT_BUMP is true" >&2
             exit 1
+          fi
+          if [ -f "apt-repo/pool/main/r/raven/raven_${VERSION}-1_amd64.deb" ] &&
+             [ -f "apt-repo/pool/main/r/raven/raven_${VERSION}-1_arm64.deb" ]; then
+            echo "apt repository already contains Raven $VERSION packages."
+            exit 0
           fi
           export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
           mkdir -p "$GNUPGHOME"
@@ -428,9 +436,9 @@ jobs:
           APT_GPG_PASSPHRASE="$APT_REPO_GPG_PASSPHRASE" \
             scripts/debian/update-apt-repo.sh \
               apt-repo \
-              "${{ steps.version.outputs.version }}" \
-              "deb-dist/raven_${{ steps.version.outputs.version }}-1_amd64.deb" \
-              "deb-dist/raven_${{ steps.version.outputs.version }}-1_arm64.deb"
+              "$VERSION" \
+              "deb-dist/raven_${VERSION}-1_amd64.deb" \
+              "deb-dist/raven_${VERSION}-1_arm64.deb"
 
       - name: Open apt repository bump PR
         working-directory: apt-repo
@@ -442,7 +450,7 @@ jobs:
             echo "::error::APT_REPO_TOKEN is required when ENABLE_APT_BUMP is true" >&2
             exit 1
           fi
-          if git diff --quiet; then
+          if [ -z "$(git status --porcelain)" ]; then
             echo "apt repository already contains Raven $VERSION — nothing to do."
             exit 0
           fi

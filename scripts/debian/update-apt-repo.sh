@@ -16,8 +16,29 @@ fail() {
   exit 1
 }
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${script_dir}/lib.sh"
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required"
+}
+
+tmp_files=()
+cleanup() {
+  if [ "${#tmp_files[@]}" -gt 0 ]; then
+    rm -f "${tmp_files[@]}"
+  fi
+}
+trap cleanup EXIT
+
+make_temp_file() {
+  local target_var="$1"
+  local template="$2"
+  local tmp_file
+
+  tmp_file="$(mktemp "$template")"
+  tmp_files+=("$tmp_file")
+  printf -v "$target_var" '%s' "$tmp_file"
 }
 
 if [ "$#" -ne 4 ]; then
@@ -29,12 +50,7 @@ version="$2"
 amd64_deb="$3"
 arm64_deb="$4"
 
-case "$version" in
-  v*) fail "version must not include a leading v: ${version}" ;;
-esac
-if ! [[ "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+([+~A-Za-z0-9._-]+)?$ ]]; then
-  fail "version must be a Debian-compatible Raven version such as 0.12.0"
-fi
+validate_raven_debian_version "$version"
 
 require_command dpkg-deb
 require_command dpkg-scanpackages
@@ -62,27 +78,34 @@ if [ "$(dpkg-deb --field "$arm64_deb" Architecture)" != "arm64" ]; then
 fi
 
 mkdir -p \
+  "${repo_root}" \
   "${repo_root}/pool/main/r/raven" \
   "${repo_root}/dists/stable/main/binary-amd64" \
   "${repo_root}/dists/stable/main/binary-arm64"
+repo_root="$(cd "$repo_root" && pwd)"
 
 cp "$amd64_deb" "${repo_root}/pool/main/r/raven/"
 cp "$arm64_deb" "${repo_root}/pool/main/r/raven/"
 
 for arch in amd64 arm64; do
   packages_file="${repo_root}/dists/stable/main/binary-${arch}/Packages"
+  make_temp_file packages_tmp "${packages_file}.tmp.XXXXXX"
+  make_temp_file packages_gz_tmp "${packages_file}.gz.tmp.XXXXXX"
   (
     cd "$repo_root"
-    dpkg-scanpackages --multiversion --arch "$arch" pool /dev/null > "dists/stable/main/binary-${arch}/Packages"
+    dpkg-scanpackages --multiversion --arch "$arch" pool /dev/null > "$packages_tmp"
   )
-  gzip -9n -c "$packages_file" > "${packages_file}.gz"
+  gzip -9n -c "$packages_tmp" > "$packages_gz_tmp"
+  mv "$packages_tmp" "$packages_file"
+  mv "$packages_gz_tmp" "${packages_file}.gz"
 done
 
 release_file="${repo_root}/dists/stable/Release"
-release_tmp="${release_file}.tmp"
+make_temp_file release_tmp "${release_file}.tmp.XXXXXX"
 date_rfc2822="$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')"
 
-cat > "$release_tmp" <<RELEASE
+{
+  cat <<RELEASE
 Origin: Raven
 Label: Raven
 Suite: stable
@@ -94,27 +117,28 @@ Description: Raven apt repository
 MD5Sum:
 RELEASE
 
-(
-  cd "${repo_root}/dists/stable"
-  find main -type f \( -name 'Packages' -o -name 'Packages.gz' \) | LC_ALL=C sort | while read -r path; do
-    checksum="$(md5sum "$path" | awk '{print $1}')"
-    size="$(wc -c < "$path" | tr -d ' ')"
-    printf ' %s %16s %s\n' "$checksum" "$size" "$path"
-  done
-) >> "$release_tmp"
+  (
+    cd "${repo_root}/dists/stable"
+    find main -type f \( -name 'Packages' -o -name 'Packages.gz' \) | LC_ALL=C sort | while read -r path; do
+      checksum="$(md5sum "$path" | awk '{print $1}')"
+      size="$(wc -c < "$path" | tr -d ' ')"
+      printf ' %s %16s %s\n' "$checksum" "$size" "$path"
+    done
+  )
 
-cat >> "$release_tmp" <<'RELEASE'
+  cat <<'RELEASE'
 SHA256:
 RELEASE
 
-(
-  cd "${repo_root}/dists/stable"
-  find main -type f \( -name 'Packages' -o -name 'Packages.gz' \) | LC_ALL=C sort | while read -r path; do
-    checksum="$(sha256sum "$path" | awk '{print $1}')"
-    size="$(wc -c < "$path" | tr -d ' ')"
-    printf ' %s %16s %s\n' "$checksum" "$size" "$path"
-  done
-) >> "$release_tmp"
+  (
+    cd "${repo_root}/dists/stable"
+    find main -type f \( -name 'Packages' -o -name 'Packages.gz' \) | LC_ALL=C sort | while read -r path; do
+      checksum="$(sha256sum "$path" | awk '{print $1}')"
+      size="$(wc -c < "$path" | tr -d ' ')"
+      printf ' %s %16s %s\n' "$checksum" "$size" "$path"
+    done
+  )
+} > "$release_tmp"
 
 mv "$release_tmp" "$release_file"
 
@@ -122,7 +146,10 @@ if [ -n "${APT_GPG_KEY_FINGERPRINT:-}" ]; then
   require_command gpg
   passphrase_args=()
   if [ -n "${APT_GPG_PASSPHRASE:-}" ]; then
-    passphrase_args=(--pinentry-mode loopback --passphrase "$APT_GPG_PASSPHRASE")
+    make_temp_file passphrase_file "${TMPDIR:-/tmp}/raven-apt-gpg-passphrase.XXXXXX"
+    chmod 600 "$passphrase_file"
+    printf '%s' "$APT_GPG_PASSPHRASE" > "$passphrase_file"
+    passphrase_args=(--pinentry-mode loopback --passphrase-file "$passphrase_file")
   fi
   gpg --batch --yes "${passphrase_args[@]}" \
     --default-key "$APT_GPG_KEY_FINGERPRINT" \

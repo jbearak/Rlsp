@@ -16,26 +16,53 @@ describe("apt packaging release integration", () => {
       expect(existsSync(scriptPath)).toBe(true);
       expect(statSync(scriptPath).mode & 0o111).not.toBe(0);
     }
+    expect(existsSync(path.join(repoRoot, "scripts", "debian", "lib.sh"))).toBe(true);
   });
 
   test("build-deb declares the Raven runtime package metadata", () => {
     const script = readRepoFile("scripts", "debian", "build-deb.sh");
     expect(script).toContain("Package: raven");
-    expect(script).toContain("Depends: ca-certificates, curl");
+    expect(script).toContain("dpkg-shlibdeps");
+    expect(script).toContain("sub(/^shlibs:Depends=/");
+    expect(script).toContain('depends="ca-certificates, curl"');
+    expect(script).toContain("Depends: ${depends}");
     expect(script).toContain("/usr/bin/raven");
     expect(script).toContain("/usr/share/doc/raven/copyright");
   });
 
+  test("Debian scripts share version validation and avoid GPG passphrases in argv", () => {
+    const helper = readRepoFile("scripts", "debian", "lib.sh");
+    const buildScript = readRepoFile("scripts", "debian", "build-deb.sh");
+    const updateScript = readRepoFile("scripts", "debian", "update-apt-repo.sh");
+
+    expect(helper).toContain("validate_raven_debian_version");
+    expect(buildScript).toContain(". \"${script_dir}/lib.sh\"");
+    expect(updateScript).toContain(". \"${script_dir}/lib.sh\"");
+    expect(updateScript).toContain("--passphrase-file");
+    expect(updateScript).not.toContain('--passphrase "$APT_GPG_PASSPHRASE"');
+  });
+
   test("release workflow can publish apt repository PRs behind an explicit gate", () => {
     const workflow = readRepoFile(".github", "workflows", "release-build.yml");
+    const aptJob = workflow.slice(
+      workflow.indexOf("  bump-apt:"),
+      workflow.indexOf("  # ── Homebrew tap bump"),
+    );
+
     expect(workflow).toContain("bump-apt:");
     expect(workflow).toContain("vars.ENABLE_APT_BUMP == 'true'");
-    expect(workflow).toContain("APT_REPO_TOKEN");
-    expect(workflow).toContain("APT_REPO_GPG_PRIVATE_KEY");
-    expect(workflow).toContain("APT_REPO_GPG_PASSPHRASE");
-    expect(workflow).toContain("repository: jbearak/apt-raven");
-    expect(workflow).toContain("scripts/debian/build-deb.sh");
-    expect(workflow).toContain("scripts/debian/update-apt-repo.sh");
+    expect(aptJob).toContain("APT_REPO_TOKEN");
+    expect(aptJob).toContain("APT_REPO_GPG_PRIVATE_KEY");
+    expect(aptJob).toContain("APT_REPO_GPG_PASSPHRASE");
+    expect(aptJob).toContain("repository: jbearak/apt-raven");
+    expect(aptJob).toContain("scripts/debian/build-deb.sh");
+    expect(aptJob).toContain("scripts/debian/update-apt-repo.sh");
+    expect(aptJob).toContain("VERSION: ${{ steps.version.outputs.version }}");
+    expect(aptJob).toContain('scripts/debian/build-deb.sh "$VERSION"');
+    expect(aptJob).toContain('scripts/debian/update-apt-repo.sh');
+    expect(aptJob).toContain('git status --porcelain');
+    expect(aptJob).not.toContain('scripts/debian/build-deb.sh "${{ steps.version.outputs.version }}"');
+    expect(aptJob).not.toContain('git diff --quiet');
     expect(workflow).toContain("lsp-linux-x64");
     expect(workflow).toContain("lsp-linux-arm64");
   });

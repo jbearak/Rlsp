@@ -53,6 +53,11 @@ require_file "$arm64_deb"
 test "$(dpkg-deb --field "$amd64_deb" Package)" = "raven" || fail "amd64 package name mismatch"
 test "$(dpkg-deb --field "$amd64_deb" Version)" = "1.2.3-1" || fail "amd64 version mismatch"
 test "$(dpkg-deb --field "$amd64_deb" Architecture)" = "amd64" || fail "amd64 architecture mismatch"
+depends="$(dpkg-deb --field "$amd64_deb" Depends)"
+case "$depends" in
+  *ca-certificates*curl* | *curl*ca-certificates*) ;;
+  *) fail "amd64 package dependency list lacks ca-certificates and curl: ${depends}" ;;
+esac
 dpkg-deb --contents "$amd64_deb" | grep -F "./usr/bin/raven" >/dev/null || fail "amd64 deb lacks /usr/bin/raven"
 dpkg-deb --contents "$amd64_deb" | grep -F "./usr/share/doc/raven/copyright" >/dev/null || fail "amd64 deb lacks copyright"
 
