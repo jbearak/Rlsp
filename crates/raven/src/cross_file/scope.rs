@@ -1204,6 +1204,9 @@ where
         let is_standalone = get_metadata(&f).is_some_and(|m| m.standalone);
         if !is_standalone {
             for edge in graph.get_dependents(&f) {
+                if edge.non_lending {
+                    continue;
+                }
                 if contrib.insert(edge.from.clone()) {
                     work.push_back(edge.from.clone());
                 }
@@ -5712,6 +5715,9 @@ where
     let mut parent_edge_indices: HashMap<Url, usize> = HashMap::new();
     let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
     for edge in graph.get_dependents(uri) {
+        if edge.non_lending {
+            continue;
+        }
         let entry = parent_edge_indices.get(&edge.from).copied();
         match entry {
             Some(existing_index) => {
@@ -12203,6 +12209,158 @@ outside_var <- 2"#;
         assert!(
             scope.symbols.contains_key("b"),
             "b should be available from sourced file"
+        );
+    }
+
+    #[test]
+    fn non_lending_parent_does_not_lend_symbols_to_helper_scope() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let excluded_uri = Url::parse("file:///project/excluded.R").unwrap();
+        let helper_uri = Url::parse("file:///project/helper.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let excluded_code = "from_excluded <- 1\nsource(\"helper.R\")\n";
+        let helper_code = "from_helper <- 2\n";
+        let excluded_artifacts = Arc::new(compute_artifacts(
+            &excluded_uri,
+            &parse_r(excluded_code),
+            excluded_code,
+        ));
+        let helper_artifacts = Arc::new(compute_artifacts(
+            &helper_uri,
+            &parse_r(helper_code),
+            helper_code,
+        ));
+
+        let mut graph = DependencyGraph::new();
+        let excluded_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "helper.R".to_string(),
+                line: 1,
+                column: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&excluded_uri, &excluded_meta, Some(&workspace_root), |_| {
+            None
+        });
+        graph.make_forward_edges_non_lending(&excluded_uri);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &excluded_uri {
+                Some(excluded_artifacts.clone())
+            } else if uri == &helper_uri {
+                Some(helper_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| -> Option<Arc<CrossFileMetadata>> {
+            (uri == &excluded_uri).then(|| Arc::new(excluded_meta.clone()))
+        };
+
+        let helper_scope = scope_at_position_with_graph(
+            &helper_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+
+        assert!(
+            !helper_scope.symbols.contains_key("from_excluded"),
+            "a non-lending excluded parent must not contribute symbols to the helper"
+        );
+        assert!(
+            helper_scope.symbols.contains_key("from_helper"),
+            "the helper's own symbols remain visible"
+        );
+    }
+
+    #[test]
+    fn non_lending_excluded_buffer_still_consumes_helper_exports() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        let excluded_uri = Url::parse("file:///project/excluded.R").unwrap();
+        let helper_uri = Url::parse("file:///project/helper.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let excluded_code = "from_excluded <- 1\nsource(\"helper.R\")\n";
+        let helper_code = "from_helper <- 2\n";
+        let excluded_artifacts = Arc::new(compute_artifacts(
+            &excluded_uri,
+            &parse_r(excluded_code),
+            excluded_code,
+        ));
+        let helper_artifacts = Arc::new(compute_artifacts(
+            &helper_uri,
+            &parse_r(helper_code),
+            helper_code,
+        ));
+
+        let mut graph = DependencyGraph::new();
+        let excluded_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "helper.R".to_string(),
+                line: 1,
+                column: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&excluded_uri, &excluded_meta, Some(&workspace_root), |_| {
+            None
+        });
+        graph.make_forward_edges_non_lending(&excluded_uri);
+        let trimmed =
+            graph.extract_subgraph(&HashSet::from([excluded_uri.clone(), helper_uri.clone()]));
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &excluded_uri {
+                Some(excluded_artifacts.clone())
+            } else if uri == &helper_uri {
+                Some(helper_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| -> Option<Arc<CrossFileMetadata>> {
+            (uri == &excluded_uri).then(|| Arc::new(excluded_meta.clone()))
+        };
+
+        let excluded_scope = scope_at_position_with_graph(
+            &excluded_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &trimmed,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+
+        assert!(
+            excluded_scope.symbols.contains_key("from_helper"),
+            "the excluded buffer must still consume helper exports through its forward edge"
         );
     }
 
