@@ -1604,10 +1604,17 @@ fn remirror_authoritative_alias_roots_after_close(
         };
         let meta = open_doc.metadata.clone();
         let new_interface_hash = open_doc.artifacts.interface_hash;
+        let root_meta = metadata_for_graph_root(
+            state,
+            root,
+            &open_uri,
+            meta.as_ref(),
+            workspace_root.as_ref(),
+        );
         let result = update_cross_file_graph_for_roots(
             state,
             std::slice::from_ref(root),
-            &meta,
+            root_meta.as_ref(),
             workspace_root.as_ref(),
         );
         edges_changed |= result.edges_changed;
@@ -1625,10 +1632,14 @@ fn remirror_authoritative_alias_roots_after_close(
             }
         }
 
+        let old_root_meta = old_meta.map(|old_meta| {
+            metadata_for_graph_root(state, root, &open_uri, old_meta, workspace_root.as_ref())
+                .into_owned()
+        });
         for child in crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
             root,
-            old_meta,
-            &meta,
+            old_root_meta.as_ref(),
+            root_meta.as_ref(),
             &state.cross_file_graph,
             &state.cross_file_meta,
         ) {
@@ -2851,6 +2862,29 @@ fn collect_backward_parent_content(
         .collect()
 }
 
+fn metadata_for_graph_root<'a>(
+    state: &WorldState,
+    root: &Url,
+    input_root: &Url,
+    meta: &'a crate::cross_file::CrossFileMetadata,
+    workspace_root: Option<&Url>,
+) -> std::borrow::Cow<'a, crate::cross_file::CrossFileMetadata> {
+    if root == input_root {
+        return std::borrow::Cow::Borrowed(meta);
+    }
+
+    let mut root_meta = meta.clone();
+    root_meta.inherited_working_directory = None;
+    crate::cross_file::enrich_metadata_with_inherited_wd(
+        &mut root_meta,
+        root,
+        workspace_root,
+        |parent_uri| state.get_enriched_metadata(parent_uri),
+        state.cross_file_config.max_chain_depth,
+    );
+    std::borrow::Cow::Owned(root_meta)
+}
+
 fn update_cross_file_graph_for_roots(
     state: &mut WorldState,
     graph_roots: &[Url],
@@ -2871,13 +2905,15 @@ fn update_cross_file_graph_for_roots(
             });
 
     for root in roots {
-        let parent_content = collect_backward_parent_content(state, root, workspace_root, meta);
-        let root_result =
-            state
-                .cross_file_graph
-                .update_file(root, meta, workspace_root, |parent_uri| {
-                    parent_content.get(parent_uri).cloned()
-                });
+        let root_meta = metadata_for_graph_root(state, root, first_root, meta, workspace_root);
+        let parent_content =
+            collect_backward_parent_content(state, root, workspace_root, root_meta.as_ref());
+        let root_result = state.cross_file_graph.update_file(
+            root,
+            root_meta.as_ref(),
+            workspace_root,
+            |parent_uri| parent_content.get(parent_uri).cloned(),
+        );
         result.edges_changed |= root_result.edges_changed;
     }
 
@@ -5637,12 +5673,30 @@ impl LanguageServer for Backend {
 
             // Invalidate children affected by working directory change (Requirement 8)
             let mut wd_affected = Vec::new();
+            let input_root = graph_roots.first().unwrap_or(&uri);
             for graph_uri in &graph_roots {
+                let old_root_meta = old_meta.as_deref().map(|old_meta| {
+                    metadata_for_graph_root(
+                        &state,
+                        graph_uri,
+                        input_root,
+                        old_meta,
+                        workspace_root.as_ref(),
+                    )
+                    .into_owned()
+                });
+                let new_root_meta = metadata_for_graph_root(
+                    &state,
+                    graph_uri,
+                    input_root,
+                    &meta,
+                    workspace_root.as_ref(),
+                );
                 wd_affected.extend(
                     crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
                         graph_uri,
-                        old_meta.as_deref(),
-                        &meta,
+                        old_root_meta.as_ref(),
+                        new_root_meta.as_ref(),
                         &state.cross_file_graph,
                         &state.cross_file_meta,
                     ),
@@ -6391,12 +6445,30 @@ impl LanguageServer for Backend {
 
                 // Invalidate children affected by working directory change (Requirement 8)
                 let mut wd_children = Vec::new();
+                let input_root = graph_roots.first().unwrap_or(&uri);
                 for graph_uri in &graph_roots {
+                    let old_root_meta = old_meta.as_deref().map(|old_meta| {
+                        metadata_for_graph_root(
+                            &state,
+                            graph_uri,
+                            input_root,
+                            old_meta,
+                            workspace_root.as_ref(),
+                        )
+                        .into_owned()
+                    });
+                    let new_root_meta = metadata_for_graph_root(
+                        &state,
+                        graph_uri,
+                        input_root,
+                        &meta,
+                        workspace_root.as_ref(),
+                    );
                     wd_children.extend(
                         crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
                             graph_uri,
-                            old_meta.as_deref(),
-                            &meta,
+                            old_root_meta.as_ref(),
+                            new_root_meta.as_ref(),
                             &state.cross_file_graph,
                             &state.cross_file_meta,
                         ),
@@ -17266,6 +17338,81 @@ mod project_config_initialize_tests {
         assert!(
             canonical_backward.call_site_column.is_some(),
             "canonical edge must retain a concrete inferred call-site column"
+        );
+    }
+
+    /// Round 5 issue #567: the canonical mirror of a symlink-opened backward
+    /// child must derive inherited working directory from the canonical parent
+    /// spelling, not reuse the raw symlink parent's directory from the open URI.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn symlink_backward_child_canonical_mirror_resolves_forward_source_canonically() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+
+        let parent = "source(\"sub/child.R\")\n";
+        let child = "# raven: sourced-by ../parent.R\nsource(\"helper.R\")\n";
+        fs::write(real.join("parent.R"), parent).unwrap();
+        fs::write(real.join("sub").join("child.R"), child).unwrap();
+        fs::write(real.join("helper.R"), "helper_fn <- function() 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let child_uri = Url::from_file_path(real.join("sub").join("child.R")).unwrap();
+        let link_child_uri =
+            Url::from_file_path(tmp.path().join("link").join("sub").join("child.R")).unwrap();
+        let helper_uri = Url::from_file_path(real.join("helper.R")).unwrap();
+        let link_helper_uri =
+            Url::from_file_path(tmp.path().join("link").join("helper.R")).unwrap();
+
+        open_doc(backend, &link_child_uri, "r", 1, child).await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&child_uri),
+            Some(link_child_uri.clone()),
+            "canonical child URI must resolve to the symlink-open buffer"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&link_child_uri)
+                .iter()
+                .any(|edge| edge.to == link_helper_uri),
+            "raw symlink root should still resolve source() through the symlink parent directory"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&child_uri)
+                .iter()
+                .any(|edge| edge.to == helper_uri),
+            "canonical mirror must resolve source() through the canonical parent directory"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependencies(&child_uri)
+                .iter()
+                .any(|edge| edge.to == link_helper_uri),
+            "canonical mirror must not retain the raw symlink helper spelling"
         );
     }
 

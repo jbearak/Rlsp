@@ -1428,6 +1428,29 @@ impl WorldState {
             })
     }
 
+    fn metadata_for_open_graph_root<'a>(
+        &self,
+        root: &Url,
+        open_uri: &Url,
+        meta: &'a crate::cross_file::CrossFileMetadata,
+        workspace_root: Option<&Url>,
+    ) -> std::borrow::Cow<'a, crate::cross_file::CrossFileMetadata> {
+        if root == open_uri {
+            return std::borrow::Cow::Borrowed(meta);
+        }
+
+        let mut root_meta = meta.clone();
+        root_meta.inherited_working_directory = None;
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut root_meta,
+            root,
+            workspace_root,
+            |parent_uri| self.get_enriched_metadata(parent_uri),
+            self.cross_file_config.max_chain_depth,
+        );
+        std::borrow::Cow::Owned(root_meta)
+    }
+
     /// Apply pre-scanned workspace index results (for non-blocking initialization).
     ///
     /// Package-mode state is *not* set from parameters: this function
@@ -1709,25 +1732,29 @@ impl WorldState {
         // index-derived edges until the user edits the buffer.
         let index_rebuilt: std::collections::HashSet<Url> = changed_uris.iter().cloned().collect();
         for uri in open_affected {
-            let Some(doc) = self.document_store.get_without_touch(&uri) else {
+            let Some(doc_meta) = self
+                .document_store
+                .get_without_touch(&uri)
+                .map(|doc| doc.metadata.clone())
+            else {
                 continue;
             };
-            let mut new_sources = doc.metadata.sources.clone();
+            let mut new_sources = doc_meta.sources.clone();
             crate::cross_file::resolve_system_file_source_entries(
                 &mut new_sources,
                 ws_name.as_deref(),
                 ws_root.as_deref(),
                 &lib_paths,
             );
-            let resolution_changed = new_sources != doc.metadata.sources;
+            let resolution_changed = new_sources != doc_meta.sources;
             let meta = if resolution_changed {
                 old_targets.extend(
-                    doc.metadata
+                    doc_meta
                         .sources
                         .iter()
                         .filter_map(|s| s.resolved_uri.clone()),
                 );
-                let mut new_meta = (*doc.metadata).clone();
+                let mut new_meta = (*doc_meta).clone();
                 new_meta.sources = new_sources;
                 let new_meta = Arc::new(new_meta);
                 self.document_store.replace_metadata(&uri, new_meta.clone());
@@ -1735,21 +1762,30 @@ impl WorldState {
             } else if index_rebuilt.contains(&uri) {
                 // Unchanged buffer, but the index pass overwrote this file's
                 // edges from index metadata — re-assert the buffer's.
-                doc.metadata.clone()
+                doc_meta.clone()
             } else {
                 continue;
             };
-            let get_content = |parent_uri: &Url| -> Option<String> {
-                self.workspace_index_new
-                    .get(parent_uri)
-                    .map(|e| e.contents.to_string())
-            };
-            self.cross_file_graph.update_file(
-                &uri,
-                meta.as_ref(),
-                workspace_root.as_ref(),
-                get_content,
-            );
+            let graph_roots = self.authoritative_revalidation_roots_for_uri(&uri);
+            for root in &graph_roots {
+                let root_meta = self.metadata_for_open_graph_root(
+                    root,
+                    &uri,
+                    meta.as_ref(),
+                    workspace_root.as_ref(),
+                );
+                let get_content = |parent_uri: &Url| -> Option<String> {
+                    self.workspace_index_new
+                        .get(parent_uri)
+                        .map(|e| e.contents.to_string())
+                };
+                self.cross_file_graph.update_file(
+                    root,
+                    root_meta.as_ref(),
+                    workspace_root.as_ref(),
+                    get_content,
+                );
+            }
             if resolution_changed && !changed_uris.contains(&uri) {
                 changed_uris.push(uri);
             }
@@ -3212,6 +3248,88 @@ mod tests {
         assert!(
             resolved_path.ends_with("otherpkg/helper.R"),
             "must resolve into the new lib path, got {resolved_path:?}"
+        );
+    }
+
+    /// Open buffers are authoritative for their canonical alias roots too. When
+    /// a package event resolves a deferred `system.file()` source on a symlink
+    /// spelling, the canonical graph node must be rebuilt from the same live
+    /// metadata so canonical parents see the new external edge.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_system_file_in_workspace_rebuilds_canonical_alias_open_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+
+        let content = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+        std::fs::write(real.join("child.R"), content).unwrap();
+
+        let libdir = tempfile::TempDir::new().unwrap();
+        let pkg_dir = libdir.path().join("otherpkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("helper.R"), "helper_fn <- function() 42\n").unwrap();
+
+        let link_uri = Url::from_file_path(tmp.path().join("link").join("child.R")).unwrap();
+        let canonical_uri = Url::from_file_path(real.join("child.R")).unwrap();
+        let helper_uri = Url::from_file_path(pkg_dir.join("helper.R")).unwrap();
+
+        let mut state = WorldState::new();
+        state
+            .workspace_folders
+            .push(Url::from_file_path(tmp.path()).unwrap());
+        state.open_document_with_language_id(link_uri.clone(), content, Some(1), Some("r"));
+        state
+            .document_store
+            .open_with_metadata(
+                link_uri.clone(),
+                content,
+                1,
+                crate::chunks::ChunkKind::R,
+                crate::cross_file::extract_metadata(content),
+            )
+            .await;
+
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&canonical_uri),
+            Some(link_uri.clone()),
+            "canonical child URI must resolve to the symlink-open buffer"
+        );
+
+        state.resolve_system_file_in_workspace();
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&canonical_uri)
+                .is_empty(),
+            "precondition: canonical root has no resolved edge while lib_paths are empty"
+        );
+
+        let mut swapped = crate::package_library::PackageLibrary::new_empty();
+        swapped.set_lib_paths(vec![libdir.path().to_path_buf()]);
+        state.package_library = Arc::new(swapped);
+        let changed = state.resolve_system_file_in_workspace();
+
+        assert!(
+            changed.iter().any(|uri| uri == &link_uri),
+            "the raw open URI should report changed system.file resolution"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&link_uri)
+                .iter()
+                .any(|edge| edge.to == helper_uri),
+            "raw open graph root must gain the resolved system.file edge"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&canonical_uri)
+                .iter()
+                .any(|edge| edge.to == helper_uri),
+            "canonical alias graph root must gain the resolved system.file edge"
         );
     }
 
