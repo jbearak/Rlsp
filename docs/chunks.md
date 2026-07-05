@@ -2,7 +2,7 @@
 
 Raven recognizes R code chunks in R Markdown / Quarto documents and `# %%`-delimited cells in plain `.R` files. You can run a single chunk, every chunk above the cursor, or every chunk in the document; navigate forward and backward between chunks; and see a subtle background tint that makes chunks easy to scan.
 
-This is the daily-driver workflow for `.Rmd` / `.qmd` users coming from RStudio or vscode-R.
+This is the daily-driver workflow for `.Rmd` / `.Rmarkdown` / `.qmd` users coming from RStudio or vscode-R.
 
 > [!NOTE]
 > All chunk-related features — navigation commands (Go to Next/Previous Chunk, Select Current Chunk), chunk background highlighting and the active-cell indicator, `.R` cell mode (`# %%` markers and RStudio-style `# Section ----` dividers), the **run** commands (for example, Run Current Chunk, Run Above Chunks, Run All Chunks — see [Commands](#commands) for the full set), and every chunk CodeLens button (defaults `▷ Run Chunk` / `↘ Run Next Chunk` / `↥ Run Above`, plus any others added via `raven.chunks.codeLens.commands`) — are gated behind `raven.rConsole.activation`. The run commands and CodeLens additionally require Raven's R console because they create or reuse the R terminal Raven manages. If the R console is disabled (or `auto` defers to another R extension), none of these surfaces register, so REditorSupport / Positron handle chunks instead. See [Coexistence](./coexistence.md).
@@ -11,7 +11,7 @@ This is the daily-driver workflow for `.Rmd` / `.qmd` users coming from RStudio 
 
 | Form | File types | Example header |
 |------|------------|----------------|
-| Fenced block | `.Rmd`, `.qmd` | ```` ```{r setup, eval=FALSE} ```` |
+| Fenced block | `.Rmd`, `.Rmarkdown`, `.qmd` | ```` ```{r setup, eval=FALSE} ```` |
 | Cell marker | `.R` | `# %% Section 1` |
 
 Fenced blocks may use either backticks or tildes, and four-or-more-character fences nest naturally (so a chunk can contain a literal `` ``` ``).
@@ -22,7 +22,7 @@ Chunks also appear in the document outline (`Cmd/Ctrl+Shift+O`) as a distinct sy
 
 ## Language features inside chunks
 
-The R code inside chunk bodies is first-class. Raven analyzes all R chunk bodies as a single R program, so the editor's R language features work inside chunks of `.Rmd` / `.qmd` documents and resolve symbols across chunks (a function defined in one chunk can be used, navigated to, and completed in a later chunk):
+The R code inside chunk bodies is first-class. Raven analyzes all R chunk bodies as a single R program, so the editor's R language features work inside chunks of `.Rmd` / `.Rmarkdown` / `.qmd` documents and resolve symbols across chunks (a function defined in one chunk can be used, navigated to, and completed in a later chunk):
 
 - [Diagnostics](./diagnostics.md), [completion](./completion.md), [hover](./hover.md), signature help, [go-to-definition](./go-to-definition.md), [find-references](./find-references.md), folding, expand-selection, and on-type [indentation](./indentation.md).
 
@@ -32,7 +32,7 @@ These features apply only inside R chunk bodies. On prose, YAML front matter, or
 
 Cross-file awareness ([Cross-File Analysis](./cross-file.md)) reads only chunk bodies, never prose. A `source("helpers.R")` written inside an R chunk creates a real dependency edge — symbols defined in the sourced file resolve in later chunks, and a missing target is flagged — while the same text in prose or a comment outside a chunk is ignored. `library()` calls and `# raven: cd` / `# raven: sourced-by`-style directives are likewise honored only inside chunks.
 
-The relationship also works in the other direction: a plain `.R` file can declare `# raven: sourced-by analysis.Rmd`, and Raven will read the Rmd's chunks (not its prose) to supply the helper's inherited scope. `.Rmd` / `.qmd` files are not added to the proactive workspace scan, so this incoming direction is established by the directive on the `.R` file, or by opening the Rmd itself.
+The relationship also works in the other direction: a plain `.R` file can declare `# raven: sourced-by analysis.Rmd`, and Raven will read the Rmd's chunks (not its prose) to supply the helper's inherited scope. `.Rmd` / `.Rmarkdown` / `.qmd` files are not added to the proactive workspace scan, so this incoming direction is established by the directive on the `.R` file, or by opening the Rmd itself.
 
 ### Suppressing diagnostics in a chunk
 
@@ -75,7 +75,7 @@ plain `.R` file.
 | Mac | Windows/Linux | Action |
 |-----|---------------|--------|
 | `Cmd+Enter` | `Ctrl+Enter` | Run Line or Selection |
-| `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` | Source File (`.R`) / Knit (`.Rmd`) |
+| `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` | Source File (`.R`) / Knit (`.Rmd`, `.Rmarkdown`) |
 | `Cmd+Alt+Enter` | `Ctrl+Alt+Enter` | Run Current Chunk |
 | `Cmd+Alt+Shift+Enter` | `Ctrl+Alt+Shift+Enter` | Run Current Chunk and Move |
 | `Cmd+Alt+P` | `Ctrl+Alt+P` | Run Previous Chunk |
@@ -233,6 +233,6 @@ The cell containing the cursor gets a top and bottom border so you can see at a 
 
 ## Limitations
 
-- `Raven: Knit Preview` (in this extension) runs `knitr::knit` plus Raven's HTML render pipeline for `.Rmd` files. Pandoc export (HTML/PDF/Word) is invoked separately by the `Raven: Knit: Export to …` commands. See [docs/knit.md](knit.md). For `.qmd` files Raven defers to `quarto.quarto`'s `Quarto: Render` / `Quarto: Preview`.
+- `Raven: Knit Preview` (in this extension) runs `knitr::knit` plus Raven's HTML render pipeline for `.Rmd` / `.Rmarkdown` files. Pandoc export (HTML/PDF/Word) is invoked separately by the `Raven: Knit: Export to …` commands. See [docs/knit.md](knit.md). For `.qmd` files Raven defers to `quarto.quarto`'s `Quarto: Render` / `Quarto: Preview`.
 - Nested chunks (the inner chunk inside an outer chunk's body) are not supported — the inner chunk header is treated as ordinary content of the outer chunk.
 - `eval = !my_condition` and other dynamic option expressions are read literally; Raven does not evaluate R to determine `eval`.

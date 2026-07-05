@@ -37,8 +37,8 @@ function loadPackageJson(): PackageJson {
 // Regex literals for the extension families — these mirror the regex
 // fragments embedded in the package.json `when` expressions so the tests
 // stay locked to a single source of truth.
-const RMD_QMD_EXT = /\\\.\(rmd\|Rmd\|RMD\|qmd\|Qmd\|QMD\)\$/;
-const RMD_ONLY_EXT = /\\\.\(rmd\|Rmd\|RMD\)\$/;
+const RMD_QMD_EXT = /\\\.\(rmd\|Rmd\|RMD\|rmarkdown\|Rmarkdown\|RMARKDOWN\|qmd\|Qmd\|QMD\)\$/;
+const RMD_ONLY_EXT = /\\\.\(rmd\|Rmd\|RMD\|rmarkdown\|Rmarkdown\|RMARKDOWN\)\$/;
 
 function findCommand(entries: MenuEntry[], command: string): MenuEntry | undefined {
     return entries.find((entry) => entry.command === command);
@@ -50,7 +50,7 @@ function findSubmenu(entries: MenuEntry[], submenu: string): MenuEntry | undefin
 
 function assertHidesForRmdQmd(entry: MenuEntry, label: string): void {
     const when = entry.when ?? '';
-    // The auto-include entries must hide on .Rmd / .qmd. We require both
+    // The auto-include entries must hide on .Rmd / .Rmarkdown / .qmd. We require both
     // the explicit `editorLangId == r` constraint and the negated extension
     // test — otherwise an .R file named `notes.Rmd` (matched only by
     // extension) would slip through with `editorLangId == r` alone.
@@ -64,7 +64,7 @@ function assertHidesForRmdQmd(entry: MenuEntry, label: string): void {
     );
     assert.ok(
         RMD_QMD_EXT.test(when),
-        `${label} must reference the .Rmd/.qmd extension family, got: ${when}`,
+        `${label} must reference the .Rmd/.Rmarkdown/.qmd extension family, got: ${when}`,
     );
 }
 
@@ -78,7 +78,7 @@ function assertShowsOnlyForRmdQmd(entry: MenuEntry, label: string): void {
         when.includes('editorLangId == quarto'),
         `${label} must fire for editorLangId == quarto, got: ${when}`,
     );
-    // Also covers .R files saved with a .Rmd / .qmd extension (handy when
+    // Also covers .R files saved with a .Rmd / .Rmarkdown / .qmd extension (handy when
     // another extension claims the language).
     assert.ok(
         when.includes('editorLangId == r'),
@@ -86,12 +86,12 @@ function assertShowsOnlyForRmdQmd(entry: MenuEntry, label: string): void {
     );
     assert.ok(
         RMD_QMD_EXT.test(when),
-        `${label} must reference the .Rmd/.qmd extension family, got: ${when}`,
+        `${label} must reference the .Rmd/.Rmarkdown/.qmd extension family, got: ${when}`,
     );
 }
 
 suite('Send to R submenu: editor-title gating', () => {
-    test('auto-include line entries and Source File hide on .Rmd / .qmd', () => {
+    test('auto-include line entries and Source File hide on .Rmd / .Rmarkdown / .qmd', () => {
         const pkg = loadPackageJson();
         const entries = pkg.contributes.menus['raven.sendToR'] ?? [];
         for (const command of ['raven.runUpwardLines', 'raven.runDownwardLines', 'raven.sourceFile']) {
@@ -112,11 +112,11 @@ suite('Send to R submenu: editor-title gating', () => {
         assert.strictEqual(
             entry.when,
             undefined,
-            'raven.runLineOrSelection must have no `when` clause so it surfaces on .R, .Rmd, and .qmd alike',
+            'raven.runLineOrSelection must have no `when` clause so it surfaces on .R, .Rmd, .Rmarkdown, and .qmd alike',
         );
     });
 
-    test('chunk commands are gated to .Rmd / .qmd', () => {
+    test('chunk commands are gated to .Rmd / .Rmarkdown / .qmd', () => {
         // Plain `.R` cell mode (`# %%`) is real, but the toolbar menu is
         // meant for chunk-based authoring; users with cell-mode `.R` reach
         // chunk operations through the CodeLens or command palette. Gating
@@ -136,7 +136,7 @@ suite('Send to R submenu: editor-title gating', () => {
         }
     });
 
-    test('Knit is gated to .Rmd files and the rmdKnit feature flag', () => {
+    test('Knit is gated to R Markdown files and the rmdKnit feature flag', () => {
         const pkg = loadPackageJson();
         const entries = pkg.contributes.menus['raven.sendToR'] ?? [];
         const entry = findCommand(entries, 'raven.knit');
@@ -146,12 +146,12 @@ suite('Send to R submenu: editor-title gating', () => {
             when.includes('raven.rmdKnit.enabled'),
             `Knit must require raven.rmdKnit.enabled, got: ${when}`,
         );
-        // Knit only applies to .Rmd — Quarto preview is a separate concern —
-        // so the extension test must reference the .Rmd-only family and must
-        // not pull in .qmd extensions.
+        // Knit only applies to R Markdown — Quarto preview is a separate
+        // concern — so the extension test must reference the R Markdown-only
+        // family and must not pull in .qmd extensions.
         assert.ok(
             RMD_ONLY_EXT.test(when),
-            `Knit must reference the .Rmd-only extension family, got: ${when}`,
+            `Knit must reference the R Markdown-only extension family, got: ${when}`,
         );
         assert.ok(
             !when.includes('qmd'),
@@ -162,8 +162,8 @@ suite('Send to R submenu: editor-title gating', () => {
     test('Terminal submenu surfaces for every supported language', () => {
         // The Terminal submenu sends to whatever terminal is currently
         // active (tmux, Docker, …); it must stay reachable on .R, .Rmd,
-        // and .qmd. The auto-include and Source-File entries inside the
-        // submenu have their own gating — see the dedicated suite below.
+        // .Rmarkdown, and .qmd. The auto-include and Source-File entries
+        // inside the submenu have their own gating — see the dedicated suite below.
         const pkg = loadPackageJson();
         const entries = pkg.contributes.menus['raven.sendToR'] ?? [];
         const submenu = findSubmenu(entries, 'raven.sendToR.terminal');
@@ -177,7 +177,7 @@ suite('Send to R submenu: editor-title gating', () => {
 });
 
 suite('Send to R → Terminal submenu: editor-title gating', () => {
-    test('terminal auto-include and sourceFile entries hide on .Rmd / .qmd', () => {
+    test('terminal auto-include and sourceFile entries hide on .Rmd / .Rmarkdown / .qmd', () => {
         const pkg = loadPackageJson();
         const entries = pkg.contributes.menus['raven.sendToR.terminal'] ?? [];
         for (const command of [
@@ -199,11 +199,11 @@ suite('Send to R → Terminal submenu: editor-title gating', () => {
         assert.strictEqual(
             entry.when,
             undefined,
-            'raven.terminal.runLineOrSelection must have no `when` clause so it surfaces on .R, .Rmd, and .qmd alike',
+            'raven.terminal.runLineOrSelection must have no `when` clause so it surfaces on .R, .Rmd, .Rmarkdown, and .qmd alike',
         );
     });
 
-    test('terminal chunk commands mirror the main chunk set on .Rmd / .qmd', () => {
+    test('terminal chunk commands mirror the main chunk set on .Rmd / .Rmarkdown / .qmd', () => {
         // The Terminal submenu should expose the same chunk operations the
         // main menu does, so a user driving a tmux-hosted R session can run
         // chunks without bouncing through the managed R terminal. Knit is
@@ -248,9 +248,9 @@ suite('Send to R → Terminal submenu: editor-title gating', () => {
 });
 
 suite('Send to R: shift+enter chord on chunk-based documents', () => {
-    test('Knit takes Shift+Enter on .Rmd when the rmdKnit feature flag is on', () => {
+    test('Knit takes Shift+Enter on R Markdown files when the rmdKnit feature flag is on', () => {
         // The .R Shift+Enter shortcut runs `source()`. Knit is the closest
-        // equivalent for an .Rmd document, so the chord is repurposed there
+        // equivalent for an R Markdown document, so the chord is repurposed there
         // whenever the feature flag is on.
         const pkg = loadPackageJson();
         const bindings = pkg.contributes.keybindings ?? [];
@@ -275,7 +275,7 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
         );
         assert.ok(
             RMD_ONLY_EXT.test(when),
-            `raven.knit keybinding must reference the .Rmd-only extension family, got: ${when}`,
+            `raven.knit keybinding must reference the R Markdown-only extension family, got: ${when}`,
         );
         // Knit must not steal the chord on .qmd — Quarto preview belongs to
         // a separate command path.
@@ -289,11 +289,11 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
         );
     });
 
-    test('Knit keybinding requires the .Rmd extension on every branch', () => {
+    test('Knit keybinding requires an R Markdown extension on every branch', () => {
         // A `.R` file whose language was overridden to `rmd` would satisfy
         // `editorLangId == rmd` alone — but Knit invokes knitr against the
         // physical file path and breaks if the on-disk extension is not
-        // .Rmd. The `when` clause must require the extension match outside
+        // R Markdown. The `when` clause must require the extension match outside
         // any language-id alternation so no `editorLangId == rmd || …`
         // branch can short-circuit the extension test.
         const pkg = loadPackageJson();
@@ -313,7 +313,7 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
         const top_level_and_with_ext = /&&\s*resourceExtname =~/;
         assert.ok(
             top_level_and_with_ext.test(when),
-            `raven.knit keybinding must AND the .Rmd extension test at the top level — not inside a language-id alternation. Got: ${when}`,
+            `raven.knit keybinding must AND the R Markdown extension test at the top level — not inside a language-id alternation. Got: ${when}`,
         );
     });
 
@@ -341,7 +341,7 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
     test('Source File keybinding stays restricted to plain .R', () => {
         // Pin the existing Source File gating so it can coexist with the
         // new Knit binding on the same chord without double-firing.
-        // On .qmd and .Rmd-with-Knit-disabled the chord is intentionally
+        // On .qmd and R Markdown files with Knit disabled the chord is intentionally
         // unbound — Run All Chunks is reachable via the toolbar or palette.
         const pkg = loadPackageJson();
         const bindings = pkg.contributes.keybindings ?? [];
@@ -354,17 +354,17 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
         );
         assert.ok(
             when.includes('!(resourceExtname'),
-            `raven.sourceFile must exclude .Rmd/.qmd extensions, got: ${when}`,
+            `raven.sourceFile must exclude .Rmd/.Rmarkdown/.qmd extensions, got: ${when}`,
         );
         assert.ok(
             RMD_QMD_EXT.test(when),
-            `raven.sourceFile must reference the .Rmd/.qmd extension family, got: ${when}`,
+            `raven.sourceFile must reference the .Rmd/.Rmarkdown/.qmd extension family, got: ${when}`,
         );
     });
 
     test('runCurrentChunk no longer holds the Shift+Enter chord', () => {
         // Previously raven.runCurrentChunk was bound to cmd+shift+enter for
-        // .Rmd / .qmd. With Knit owning the chord on .Rmd, the previous
+        // .Rmd / .Rmarkdown / .qmd. With Knit owning the chord on R Markdown, the previous
         // binding must be removed (not duplicated) so it cannot double-fire.
         const pkg = loadPackageJson();
         const bindings = pkg.contributes.keybindings ?? [];
@@ -376,7 +376,7 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
         assert.strictEqual(
             conflict,
             undefined,
-            'raven.runCurrentChunk must not hold the Shift+Enter chord — that chord now belongs to Knit or Run All Chunks for .Rmd / .qmd',
+            'raven.runCurrentChunk must not hold the Shift+Enter chord — that chord now belongs to Knit or Run All Chunks for .Rmd / .Rmarkdown / .qmd',
         );
     });
 });

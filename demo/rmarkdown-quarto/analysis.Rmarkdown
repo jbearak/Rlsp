@@ -1,0 +1,27 @@
+---
+title: "Demo R Markdown"
+output: html_document
+---
+
+## Introduction
+
+This document demonstrates Raven's R Markdown chunk detection.
+
+```{r setup, include=FALSE}
+library(ggplot2)
+```
+
+## Analysis
+
+```{r analysis}
+data <- mtcars
+summary(data$mpg)
+```
+
+Some prose between chunks.
+
+```{r plot, fig.width=8}
+ggplot(data, aes(x = wt, y = mpg)) +
+  geom_point() +
+  labs(title = "MPG vs Weight")
+```

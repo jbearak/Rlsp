@@ -19,9 +19,12 @@ function lines(text: string): string[] {
 }
 
 describe('classify_chunk_document', () => {
-    test('treats .Rmd as rmd', () => {
+    test('treats .Rmd and .Rmarkdown as rmd', () => {
         expect(classify_chunk_document('/tmp/foo.Rmd')).toBe('rmd');
         expect(classify_chunk_document('/tmp/foo.rmd')).toBe('rmd');
+        expect(classify_chunk_document('/tmp/foo.Rmarkdown')).toBe('rmd');
+        expect(classify_chunk_document('/tmp/foo.rmarkdown')).toBe('rmd');
+        expect(classify_chunk_document('/tmp/foo.RMARKDOWN')).toBe('rmd');
     });
 
     test('treats .qmd as rmd', () => {
@@ -595,6 +598,8 @@ describe('classify_chunk_document_for_document', () => {
     test('falls back to URI extension for `r` languageId', () => {
         const rmd = { languageId: 'r', uri: { fsPath: '/tmp/report.Rmd', path: '/tmp/report.Rmd' } };
         expect(classify_chunk_document_for_document(rmd)).toBe('rmd');
+        const rmarkdown = { languageId: 'r', uri: { fsPath: '/tmp/report.Rmarkdown', path: '/tmp/report.Rmarkdown' } };
+        expect(classify_chunk_document_for_document(rmarkdown)).toBe('rmd');
         const qmd = { languageId: 'r', uri: { fsPath: '/tmp/notes.qmd', path: '/tmp/notes.qmd' } };
         expect(classify_chunk_document_for_document(qmd)).toBe('rmd');
         const r = { languageId: 'r', uri: { fsPath: '/tmp/main.R', path: '/tmp/main.R' } };
