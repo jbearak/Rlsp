@@ -2379,11 +2379,13 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
 
         let parent_content =
             collect_backward_parent_content(state, &uri, workspace_root.as_ref(), &meta);
-        state
-            .cross_file_graph
-            .update_file(&uri, &meta, workspace_root.as_ref(), |parent_uri| {
-                parent_content.get(parent_uri).cloned()
-            });
+        let graph_meta = state.metadata_for_dependency_graph(&uri, &meta, workspace_root.as_ref());
+        state.cross_file_graph.update_file(
+            &uri,
+            graph_meta.as_ref(),
+            workspace_root.as_ref(),
+            |parent_uri| parent_content.get(parent_uri).cloned(),
+        );
     }
 
     state.recompute_open_neighborhood_pins();
@@ -2872,9 +2874,11 @@ async fn resync_file_from_disk(
     let parent_content =
         collect_backward_parent_content(&state, uri, workspace_root.as_ref(), &cross_file_meta);
 
+    let graph_meta =
+        state.metadata_for_dependency_graph(uri, &cross_file_meta, workspace_root.as_ref());
     let graph_result = state.cross_file_graph.update_file(
         uri,
-        &cross_file_meta,
+        graph_meta.as_ref(),
         workspace_root.as_ref(),
         |parent_uri| parent_content.get(parent_uri).cloned(),
     );
@@ -2928,9 +2932,11 @@ async fn resync_file_from_disk(
                 workspace_root.as_ref(),
                 &parent_meta,
             );
+            let graph_meta =
+                state.metadata_for_dependency_graph(&parent, &parent_meta, workspace_root.as_ref());
             let res = state.cross_file_graph.update_file(
                 &parent,
-                &parent_meta,
+                graph_meta.as_ref(),
                 workspace_root.as_ref(),
                 |u| pc.get(u).cloned(),
             );
@@ -4779,9 +4785,11 @@ impl LanguageServer for Backend {
             let parent_content =
                 collect_backward_parent_content(&state, &uri_clone, workspace_root.as_ref(), &meta);
 
+            let graph_meta =
+                state.metadata_for_dependency_graph(&uri, &meta, workspace_root.as_ref());
             let result = state.cross_file_graph.update_file(
                 &uri,
-                &meta,
+                graph_meta.as_ref(),
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
@@ -5142,9 +5150,11 @@ impl LanguageServer for Backend {
                     }
                 }
 
+                let graph_meta =
+                    state.metadata_for_dependency_graph(&uri, &meta, workspace_root.as_ref());
                 let second_result = state.cross_file_graph.update_file(
                     &uri,
-                    &meta,
+                    graph_meta.as_ref(),
                     workspace_root.as_ref(),
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
@@ -5273,9 +5283,11 @@ impl LanguageServer for Backend {
                 })
                 .collect();
 
+            let graph_meta =
+                state.metadata_for_dependency_graph(&uri, &meta, workspace_root.as_ref());
             let second_result = state.cross_file_graph.update_file(
                 &uri,
-                &meta,
+                graph_meta.as_ref(),
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
@@ -5623,9 +5635,11 @@ impl LanguageServer for Backend {
                     &meta,
                 );
 
+                let graph_meta =
+                    state.metadata_for_dependency_graph(&uri, &meta, workspace_root.as_ref());
                 let graph_result = state.cross_file_graph.update_file(
                     &uri,
-                    &meta,
+                    graph_meta.as_ref(),
                     workspace_root.as_ref(),
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
@@ -8598,9 +8612,14 @@ impl Backend {
                 (*cross_file_meta).clone(),
                 artifacts.clone(),
             );
-            state.cross_file_graph.update_file(
+            let graph_meta = state.metadata_for_dependency_graph(
                 file_uri,
                 &cross_file_meta,
+                workspace_root.as_ref(),
+            );
+            state.cross_file_graph.update_file(
+                file_uri,
+                graph_meta.as_ref(),
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
@@ -8998,9 +9017,14 @@ impl Backend {
                 (*cross_file_meta).clone(),
                 artifacts.clone(),
             );
-            state.cross_file_graph.update_file(
+            let graph_meta = state.metadata_for_dependency_graph(
                 file_uri,
                 &cross_file_meta,
+                workspace_root.as_ref(),
+            );
+            state.cross_file_graph.update_file(
+                file_uri,
+                graph_meta.as_ref(),
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
@@ -14958,6 +14982,253 @@ mod project_config_initialize_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_project_excluded_sourced_helper_does_not_resolve_in_parent() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("generated").join("helper.R"),
+            "helper_fn <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("main.R"),
+            "source(\"generated/helper.R\")\nhelper_fn()\n",
+        )
+        .unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let helper_uri =
+            Url::from_file_path(tmp.path().join("generated").join("helper.R")).unwrap();
+        let main_uri = Url::from_file_path(tmp.path().join("main.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
+        open_doc(
+            backend,
+            &main_uri,
+            "r",
+            1,
+            "source(\"generated/helper.R\")\nhelper_fn()\n",
+        )
+        .await;
+        backend.state.write().await.workspace_scan_complete = true;
+
+        let state = backend.state.read().await;
+        assert!(
+            !has_dependency_edge(&state, &main_uri, &helper_uri),
+            "main.R must not gain a graph edge to an open project-excluded helper"
+        );
+        assert!(
+            has_helper_fn_undefined(&state, &main_uri),
+            "helper_fn must remain undefined when the sourced helper is project-excluded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_excluded_sourced_helper_open_close_does_not_flap_parent_resolution() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("generated").join("helper.R"),
+            "helper_fn <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("main.R"),
+            "source(\"generated/helper.R\")\nhelper_fn()\n",
+        )
+        .unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let helper_uri =
+            Url::from_file_path(tmp.path().join("generated").join("helper.R")).unwrap();
+        let main_uri = Url::from_file_path(tmp.path().join("main.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        open_doc(
+            backend,
+            &main_uri,
+            "r",
+            1,
+            "source(\"generated/helper.R\")\nhelper_fn()\n",
+        )
+        .await;
+        backend.state.write().await.workspace_scan_complete = true;
+
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !has_dependency_edge(&state, &main_uri, &helper_uri),
+                "closed project-excluded helper must not have a graph edge"
+            );
+            assert!(
+                has_helper_fn_undefined(&state, &main_uri),
+                "closed project-excluded helper must not resolve helper_fn"
+            );
+        }
+        let closed_signature = {
+            let state = backend.state.read().await;
+            diagnostic_signature(&state, &main_uri)
+        };
+
+        open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !has_dependency_edge(&state, &main_uri, &helper_uri),
+                "opening the excluded helper must not add a graph edge"
+            );
+            assert!(
+                has_helper_fn_undefined(&state, &main_uri),
+                "opening the excluded helper must not make helper_fn resolve"
+            );
+            assert_eq!(
+                diagnostic_signature(&state, &main_uri),
+                closed_signature,
+                "opening the excluded helper must exactly match closed-file diagnostics"
+            );
+        }
+
+        close_doc(backend, &helper_uri).await;
+        let state = backend.state.read().await;
+        assert!(
+            !has_dependency_edge(&state, &main_uri, &helper_uri),
+            "closing the excluded helper must leave the parent graph unchanged"
+        );
+        assert!(
+            has_helper_fn_undefined(&state, &main_uri),
+            "closing the excluded helper must leave helper_fn undefined"
+        );
+        assert_eq!(
+            diagnostic_signature(&state, &main_uri),
+            closed_signature,
+            "closing the excluded helper must restore the same closed-file diagnostics"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_exclusion_reload_reincluded_open_helper_restores_parent_resolution() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("generated").join("helper.R"),
+            "helper_fn <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("main.R"),
+            "source(\"generated/helper.R\")\nhelper_fn()\n",
+        )
+        .unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let helper_uri =
+            Url::from_file_path(tmp.path().join("generated").join("helper.R")).unwrap();
+        let main_uri = Url::from_file_path(tmp.path().join("main.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        open_doc(backend, &helper_uri, "r", 1, "helper_fn <- function() 1\n").await;
+        open_doc(
+            backend,
+            &main_uri,
+            "r",
+            1,
+            "source(\"generated/helper.R\")\nhelper_fn()\n",
+        )
+        .await;
+        backend.state.write().await.workspace_scan_complete = true;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                !has_dependency_edge(&state, &main_uri, &helper_uri),
+                "precondition: excluded helper must not contribute a graph edge"
+            );
+            assert!(
+                has_helper_fn_undefined(&state, &main_uri),
+                "precondition: excluded helper must not resolve helper_fn"
+            );
+        }
+
+        fs::write(tmp.path().join("raven.toml"), "[workspace]\nexclude = []\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(tmp.path().join("raven.toml")).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+        backend.state.write().await.workspace_scan_complete = true;
+
+        let state = backend.state.read().await;
+        assert!(
+            !state.workspace_exclusions.is_excluded_uri(&helper_uri),
+            "reload must pick up the removed exclusion"
+        );
+        assert!(
+            has_dependency_edge(&state, &main_uri, &helper_uri),
+            "re-including the open helper must restore the source edge"
+        );
+        assert!(
+            !has_helper_fn_undefined(&state, &main_uri),
+            "re-including the open helper must make helper_fn resolve"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn workspace_exclusion_reload_reseeds_package_inputs_when_index_workspace_disabled() {
         use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
 
@@ -18964,6 +19235,27 @@ lineLength = 200
         } else {
             Vec::new()
         }
+    }
+
+    fn has_dependency_edge(state: &WorldState, from: &Url, to: &Url) -> bool {
+        state
+            .cross_file_graph
+            .get_dependencies(from)
+            .iter()
+            .any(|edge| &edge.to == to)
+    }
+
+    fn has_helper_fn_undefined(state: &WorldState, uri: &Url) -> bool {
+        snapshot_diagnostics(state, uri)
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("helper_fn is not defined"))
+    }
+
+    fn diagnostic_signature(state: &WorldState, uri: &Url) -> Vec<(u32, String)> {
+        snapshot_diagnostics(state, uri)
+            .into_iter()
+            .map(|diagnostic| (diagnostic.range.start.line, diagnostic.message))
+            .collect()
     }
 
     /// Flag #1: an open Rmd whose chunk `source()`s an existing helper must

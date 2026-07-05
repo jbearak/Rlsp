@@ -238,11 +238,13 @@ fn open_disk_fallback_target(
             Some((parent_uri, content))
         })
         .collect();
-    state
-        .cross_file_graph
-        .update_file(uri, &meta, workspace_root.as_ref(), |parent_uri| {
-            parent_content.get(parent_uri).cloned()
-        });
+    let graph_meta = state.metadata_for_dependency_graph(uri, &meta, workspace_root.as_ref());
+    state.cross_file_graph.update_file(
+        uri,
+        graph_meta.as_ref(),
+        workspace_root.as_ref(),
+        |parent_uri| parent_content.get(parent_uri).cloned(),
+    );
 }
 
 pub async fn run(args: CheckArgs) -> i32 {
