@@ -5,6 +5,7 @@
 //
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use tower_lsp::lsp_types::{Diagnostic, Url};
 
 use super::parent_resolve::{infer_call_site_from_parent, resolve_match_pattern};
@@ -411,7 +412,7 @@ where
 }
 
 /// A dependency edge from parent (caller) to child (callee)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct DependencyEdge {
     /// Parent file (caller)
     pub from: Url,
@@ -464,6 +465,52 @@ pub struct DependencyEdge {
     /// False for forward-family directives (e.g. `# raven: source`, `# raven: run`,
     /// `# raven: include`) and AST-detected edges.
     pub is_backward_directive: bool,
+    /// True when the parent may consume the child's exports, and the edge
+    /// remains visible to full-graph revalidation, but the child must not
+    /// inherit symbols or packages from the parent. Used for project-excluded
+    /// open buffers: an excluded `E` that sources helper `H` still needs edits
+    /// to `H` to reschedule `E`, but `H` must not borrow `E`'s scope.
+    ///
+    /// Deliberately excluded from `PartialEq`, `Eq`, `Hash`, and `Self::key`:
+    /// it is a lending policy marker on an otherwise identical edge, not edge
+    /// identity. This keeps `update_file`'s before/after edge snapshots from
+    /// reporting a spurious edge change when excluded-root edges are rebuilt
+    /// unmarked and then re-marked non-lending.
+    pub non_lending: bool,
+}
+
+impl PartialEq for DependencyEdge {
+    fn eq(&self, other: &Self) -> bool {
+        self.from == other.from
+            && self.to == other.to
+            && self.call_site_line == other.call_site_line
+            && self.call_site_column == other.call_site_column
+            && self.local == other.local
+            && self.chdir == other.chdir
+            && self.is_sys_source == other.is_sys_source
+            && self.sys_source_global_env == other.sys_source_global_env
+            && self.is_function_scoped == other.is_function_scoped
+            && self.is_directive == other.is_directive
+            && self.is_backward_directive == other.is_backward_directive
+    }
+}
+
+impl Eq for DependencyEdge {}
+
+impl Hash for DependencyEdge {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.from.hash(state);
+        self.to.hash(state);
+        self.call_site_line.hash(state);
+        self.call_site_column.hash(state);
+        self.local.hash(state);
+        self.chdir.hash(state);
+        self.is_sys_source.hash(state);
+        self.sys_source_global_env.hash(state);
+        self.is_function_scoped.hash(state);
+        self.is_directive.hash(state);
+        self.is_backward_directive.hash(state);
+    }
 }
 
 /// Canonical key for edge deduplication (from, to pair only)
@@ -488,6 +535,13 @@ struct EdgeKey {
     is_backward_directive: bool,
 }
 
+/// Full edge key plus lending policy, used only for revision invalidation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EdgePolicyKey {
+    key: EdgeKey,
+    non_lending: bool,
+}
+
 impl DependencyEdge {
     fn key(&self) -> EdgeKey {
         EdgeKey {
@@ -501,6 +555,13 @@ impl DependencyEdge {
             sys_source_global_env: self.sys_source_global_env,
             is_function_scoped: self.is_function_scoped,
             is_backward_directive: self.is_backward_directive,
+        }
+    }
+
+    fn policy_key(&self) -> EdgePolicyKey {
+        EdgePolicyKey {
+            key: self.key(),
+            non_lending: self.non_lending,
         }
     }
 
@@ -767,6 +828,11 @@ impl DependencyGraph {
             .get(uri)
             .map(|edges| edges.iter().cloned().collect())
             .unwrap_or_default();
+        let old_forward_policy: HashSet<EdgePolicyKey> = self
+            .forward
+            .get(uri)
+            .map(|edges| edges.iter().map(DependencyEdge::policy_key).collect())
+            .unwrap_or_default();
         // Snapshot backward edges (incoming `is_backward_directive` edges)
         // before removal: a `# raven: sourced-by` directive change rewires the
         // backward map for `uri` and the forward map for each parent, but
@@ -780,6 +846,17 @@ impl DependencyGraph {
                     .iter()
                     .filter(|e| e.is_backward_directive)
                     .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let old_backward_policy: HashSet<EdgePolicyKey> = self
+            .backward
+            .get(uri)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter(|e| e.is_backward_directive)
+                    .map(DependencyEdge::policy_key)
                     .collect()
             })
             .unwrap_or_default();
@@ -819,6 +896,7 @@ impl DependencyGraph {
                             is_function_scoped: source.is_function_scoped,
                             is_directive: true,
                             is_backward_directive: false,
+                            non_lending: false,
                         };
                         directive_from_to.insert(edge.as_from_to_pair());
                         directive_edges.push(edge);
@@ -892,6 +970,7 @@ impl DependencyGraph {
                     is_function_scoped: false,
                     is_directive: true,
                     is_backward_directive: true,
+                    non_lending: false,
                 };
                 let pair = edge.as_from_to_pair();
                 if !directive_from_to.contains(&pair) {
@@ -923,6 +1002,7 @@ impl DependencyGraph {
                     is_function_scoped: source.is_function_scoped,
                     is_directive: false,
                     is_backward_directive: false,
+                    non_lending: false,
                 };
                 let pair = edge.as_from_to_pair();
 
@@ -1020,6 +1100,11 @@ impl DependencyGraph {
             .get(uri)
             .map(|edges| edges.iter().cloned().collect())
             .unwrap_or_default();
+        let new_forward_policy: HashSet<EdgePolicyKey> = self
+            .forward
+            .get(uri)
+            .map(|edges| edges.iter().map(DependencyEdge::policy_key).collect())
+            .unwrap_or_default();
         let new_backward: HashSet<DependencyEdge> = self
             .backward
             .get(uri)
@@ -1031,12 +1116,27 @@ impl DependencyGraph {
                     .collect()
             })
             .unwrap_or_default();
+        let new_backward_policy: HashSet<EdgePolicyKey> = self
+            .backward
+            .get(uri)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter(|e| e.is_backward_directive)
+                    .map(DependencyEdge::policy_key)
+                    .collect()
+            })
+            .unwrap_or_default();
         result.edges_changed = old_forward != new_forward || old_backward != new_backward;
+        let lending_policy_changed =
+            old_forward_policy != new_forward_policy || old_backward_policy != new_backward_policy;
 
         // Bump edge_revision so cycle/subgraph caches become stale for every
         // URI. detect_cycle and cached_neighborhood_subgraph then either
-        // re-fill their slot or evict via the revision-mismatch check.
-        if result.edges_changed {
+        // re-fill their slot or evict via the revision-mismatch check. A
+        // non_lending flip invalidates those caches too, but deliberately does
+        // not set `edges_changed`: lending policy is not a revalidation edge.
+        if result.edges_changed || lending_policy_changed {
             self.edge_revision
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
@@ -1056,6 +1156,15 @@ impl DependencyGraph {
     ///
     /// This is much cheaper than cloning the entire graph when only a
     /// neighborhood of files is needed (e.g., for diagnostic snapshots).
+    ///
+    /// `non_lending` edges are retained in the forward index but omitted from
+    /// the backward index. That gives an excluded open buffer's own diagnostic
+    /// snapshot the helper exports it consumes, while preventing that excluded
+    /// buffer from becoming an ancestor whose symbols, packages, or NSE/func
+    /// declarations propagate into the helper's trimmed snapshot. The full
+    /// live graph keeps the backward copy for revalidation, so this is another
+    /// deliberate source of the safe `S_trimmed ⊆ S_full` asymmetry documented
+    /// on [`Self::revalidation_consistent_set`].
     pub fn extract_subgraph(&self, uris: &HashSet<Url>) -> Self {
         let mut forward = HashMap::new();
         let mut backward = HashMap::new();
@@ -1074,7 +1183,7 @@ impl DependencyGraph {
             if let Some(edges) = self.backward.get(uri) {
                 let filtered: Vec<_> = edges
                     .iter()
-                    .filter(|e| uris.contains(&e.from))
+                    .filter(|e| uris.contains(&e.from) && !e.non_lending)
                     .cloned()
                     .collect();
                 if !filtered.is_empty() {
@@ -1372,7 +1481,11 @@ impl DependencyGraph {
     /// suppression (leaving a real diagnostic in place — a false positive at
     /// worst), never fabricate one or drop a needed revalidation. Under budget
     /// truncation the two graphs can reach different sets — the same safe
-    /// direction.
+    /// direction. `extract_subgraph` also drops `non_lending` edges from its
+    /// backward index (while the full graph keeps them for revalidation), which
+    /// is the same safe-direction asymmetry: excluded open buffers can be
+    /// rescheduled when their helpers change, but cannot lend declarations or
+    /// parent-prefix scope into those helpers' trimmed snapshots.
     ///
     /// Returns the union with the backward ancestors FIRST, then the forward
     /// descendants, matching both callers' historical ordering. **`root` itself
@@ -1586,19 +1699,24 @@ impl DependencyGraph {
         }
     }
 
-    /// Preserve `uri`'s outgoing forward edges while removing every reverse
-    /// entry that would let `uri` act as a parent for another file.
+    /// Preserve `uri`'s outgoing forward edges while marking them non-lending.
     ///
     /// Project-excluded open buffers need their own live diagnostics to follow
     /// `source()` edges into non-excluded helpers, but they must not lend their
     /// own symbols back through the dependency graph. Keeping `forward[uri]`
-    /// gives the queried buffer a diagnostic neighborhood; pruning
-    /// `backward[child]` entries for those same edges prevents the child from
-    /// inheriting `uri` as a parent when the child is diagnosed. Incoming edges
-    /// to `uri` are removed wholesale so non-excluded parents cannot source an
-    /// excluded child via backward directives.
+    /// gives the queried buffer a diagnostic neighborhood and lets it consume
+    /// helper exports. Keeping the corresponding `backward[child]` entries
+    /// lets full-graph revalidation walk from a helper edit back to the
+    /// excluded open consumer. The `non_lending` marker makes those reverse
+    /// entries asymmetric: lending consumers (`parent_prefix_at`, the
+    /// standalone fingerprint helper, and the trimmed subgraph's backward
+    /// index) skip them, so the helper never inherits the excluded buffer's
+    /// symbols, packages, or cross-file NSE/func declarations. Incoming edges
+    /// to `uri` are still removed wholesale so non-excluded parents cannot
+    /// source an excluded child via backward directives.
     ///
-    /// Returns `true` when any graph edge entry was removed.
+    /// Returns `true` when incoming edges were removed or any outgoing edge
+    /// copy flips from lending to non-lending.
     pub(crate) fn make_forward_edges_non_lending(&mut self, uri: &Url) -> bool {
         let mut changed = false;
 
@@ -1607,15 +1725,30 @@ impl DependencyGraph {
             changed = true;
         }
 
-        let outgoing = self.forward.get(uri).cloned().unwrap_or_default();
-        for edge in outgoing {
-            if let Some(backward_edges) = self.backward.get_mut(&edge.to) {
-                let before = backward_edges.len();
-                let key = edge.key();
-                backward_edges.retain(|candidate| candidate.key() != key);
-                changed |= backward_edges.len() != before;
-                if backward_edges.is_empty() {
-                    self.backward.remove(&edge.to);
+        let outgoing: Vec<(Url, EdgeKey)> = self
+            .forward
+            .get_mut(uri)
+            .map(|edges| {
+                edges
+                    .iter_mut()
+                    .map(|edge| {
+                        if !edge.non_lending {
+                            edge.non_lending = true;
+                            changed = true;
+                        }
+                        (edge.to.clone(), edge.key())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (to, key) in outgoing {
+            if let Some(backward_edges) = self.backward.get_mut(&to) {
+                for candidate in backward_edges {
+                    if candidate.key() == key && !candidate.non_lending {
+                        candidate.non_lending = true;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -1964,11 +2097,12 @@ impl DependencyGraph {
 
     /// Current global edge revision — a monotonic counter bumped on any
     /// structural edge change (`update_file` reporting `edges_changed`,
-    /// `remove_file`). Used as the membership-pinning component of the
-    /// cross-snapshot `StandaloneScopeCache` key (issue #483): capture it from
-    /// the *real* `WorldState` graph (a cloned per-snapshot graph resets its own
-    /// counter to 0), so it changes whenever a `source()` edge is added,
-    /// retargeted, or moved anywhere in the workspace.
+    /// `remove_file`) or lending-policy transition. Used as the
+    /// membership-pinning component of the cross-snapshot `StandaloneScopeCache`
+    /// key (issue #483): capture it from the *real* `WorldState` graph (a cloned
+    /// per-snapshot graph resets its own counter to 0), so it changes whenever a
+    /// `source()` edge is added, retargeted, moved, or switched between lending
+    /// and non-lending anywhere in the workspace.
     pub fn edge_revision(&self) -> u64 {
         self.edge_revision
             .load(std::sync::atomic::Ordering::Acquire)
@@ -4778,6 +4912,159 @@ z <- 3
         assert!(
             !deps[0].is_backward_directive,
             "Forward directive edge should have is_backward_directive=false"
+        );
+    }
+
+    #[test]
+    fn non_lending_marker_does_not_participate_in_edge_identity() {
+        let mut graph = DependencyGraph::new();
+        let excluded = url("excluded.R");
+        let helper = url("helper.R");
+        graph.update_file(
+            &excluded,
+            &make_meta_with_source("helper.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+
+        let before: HashSet<DependencyEdge> = graph
+            .get_dependencies(&excluded)
+            .into_iter()
+            .cloned()
+            .collect();
+        assert!(
+            before.iter().all(|edge| !edge.non_lending),
+            "precondition: freshly built edges are lending"
+        );
+
+        assert!(
+            graph.make_forward_edges_non_lending(&excluded),
+            "first mark must report a graph change"
+        );
+        let after: HashSet<DependencyEdge> = graph
+            .get_dependencies(&excluded)
+            .into_iter()
+            .cloned()
+            .collect();
+        assert!(
+            after.iter().all(|edge| edge.non_lending),
+            "edge copies should now be marked non-lending"
+        );
+        assert_eq!(
+            before, after,
+            "non_lending is a policy marker, not edge identity"
+        );
+        let revision_after_first_mark = graph.edge_revision();
+        assert!(
+            !graph.make_forward_edges_non_lending(&excluded),
+            "marking an already non-lending edge should not bump the revision"
+        );
+        assert_eq!(
+            graph.edge_revision(),
+            revision_after_first_mark,
+            "a redundant non-lending mark must not bump edge_revision"
+        );
+        assert_eq!(
+            graph.get_dependencies(&excluded)[0].to,
+            helper,
+            "the forward edge must remain present"
+        );
+    }
+
+    #[test]
+    fn non_lending_edges_revalidate_in_full_graph_but_not_trimmed_ancestors() {
+        let mut graph = DependencyGraph::new();
+        let excluded = url("excluded.R");
+        let helper = url("helper.R");
+        graph.update_file(
+            &excluded,
+            &make_meta_with_source("helper.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        assert!(graph.make_forward_edges_non_lending(&excluded));
+
+        let full_dependents = graph.get_transitive_dependents(&helper, 10, 200);
+        assert!(
+            full_dependents.contains(&excluded),
+            "the full graph must retain the reverse edge so helper edits revalidate the excluded consumer"
+        );
+        assert!(
+            graph
+                .get_dependencies(&excluded)
+                .iter()
+                .any(|edge| edge.to == helper && edge.non_lending),
+            "forward copy should be retained and marked"
+        );
+        assert!(
+            graph
+                .get_dependents(&helper)
+                .iter()
+                .any(|edge| edge.from == excluded && edge.non_lending),
+            "backward copy should be retained and marked"
+        );
+
+        let uris = HashSet::from([excluded.clone(), helper.clone()]);
+        let trimmed = graph.extract_subgraph(&uris);
+        assert!(
+            trimmed
+                .get_dependencies(&excluded)
+                .iter()
+                .any(|edge| edge.to == helper && edge.non_lending),
+            "trimmed forward index keeps the excluded buffer's consumed helper"
+        );
+        assert!(
+            trimmed.get_dependents(&helper).is_empty(),
+            "trimmed backward index drops non-lending parents"
+        );
+        assert!(
+            !trimmed
+                .get_transitive_dependents(&helper, 10, 200)
+                .contains(&excluded),
+            "the helper's trimmed ancestors must not include the excluded parent"
+        );
+    }
+
+    #[test]
+    fn non_lending_to_lending_transition_invalidates_cached_trimmed_subgraph() {
+        let mut graph = DependencyGraph::new();
+        let excluded = url("excluded.R");
+        let helper = url("helper.R");
+        let meta = make_meta_with_source("helper.R", 1);
+        graph.update_file(&excluded, &meta, Some(&workspace_root()), |_| None);
+        assert!(graph.make_forward_edges_non_lending(&excluded));
+        let revision_while_excluded = graph.edge_revision();
+
+        let cached = graph.cached_neighborhood_subgraph(&helper, 10, 100);
+        assert!(
+            cached.subgraph.get_dependents(&helper).is_empty(),
+            "precondition: a trimmed snapshot built while excluded must drop the non-lending parent"
+        );
+        let cache_hits_before = graph.subgraph_cache_hits();
+
+        let result = graph.update_file(&excluded, &meta, Some(&workspace_root()), |_| None);
+        assert!(
+            !result.edges_changed,
+            "non_lending is not part of dependent-revalidation edge identity"
+        );
+        assert!(
+            graph.edge_revision() > revision_while_excluded,
+            "flipping an existing edge back to lending must invalidate revision-gated caches"
+        );
+
+        let refreshed = graph.cached_neighborhood_subgraph(&helper, 10, 100);
+        assert_eq!(
+            graph.subgraph_cache_hits(),
+            cache_hits_before,
+            "edge_revision bump must prevent reuse of the stale trimmed snapshot"
+        );
+        assert!(
+            refreshed
+                .subgraph
+                .get_dependents(&helper)
+                .iter()
+                .any(|edge| edge.from == excluded && !edge.non_lending),
+            "after un-exclusion, the helper's trimmed snapshot must see the parent as lending"
         );
     }
 

@@ -2688,6 +2688,12 @@ impl AuthoritativePackageInputUri {
     }
 }
 
+/// Pure package-input classifier for an already-selected path spelling.
+///
+/// This is called from `did_change` while holding `WorldState::write()`, so it
+/// must not perform filesystem I/O. Case and symlink aliases are discovered once
+/// at `did_open` by `WorldState::register_open_document_aliases`; this helper
+/// only decides whether the supplied URI/path pair is a package input.
 fn package_input_uri_for_path(
     uri: Url,
     path: std::path::PathBuf,
@@ -2700,14 +2706,56 @@ fn package_input_uri_for_path(
     Some(AuthoritativePackageInputUri::RFile { uri, path, kind })
 }
 
+fn authoritative_package_input_for_open_candidate(
+    state: &WorldState,
+    open_uri: &Url,
+    candidate: AuthoritativePackageInputUri,
+) -> Option<AuthoritativePackageInputUri> {
+    match state.open_document_uri_for_authoritative_uri(candidate.uri()) {
+        Some(owner) if owner != *open_uri => None,
+        _ => Some(candidate),
+    }
+}
+
+/// Whether an open-time alias candidate may replace the raw opened path as the
+/// package-input slot. If the raw path is already a package R file, a symlink
+/// target can win only when it is still the same package input kind; otherwise
+/// `R/link.R -> ../outside.R` would make the lexical package source disappear.
+fn package_alias_candidate_matches_open_input_kind(
+    open_candidate: Option<&AuthoritativePackageInputUri>,
+    alias_candidate: &AuthoritativePackageInputUri,
+) -> bool {
+    match (open_candidate, alias_candidate) {
+        (
+            Some(AuthoritativePackageInputUri::RFile {
+                kind: open_kind, ..
+            }),
+            AuthoritativePackageInputUri::RFile {
+                kind: alias_kind, ..
+            },
+        ) => open_kind == alias_kind,
+        (Some(AuthoritativePackageInputUri::RFile { .. }), _) => false,
+        (Some(AuthoritativePackageInputUri::Manifest { .. }), _) => {
+            matches!(
+                alias_candidate,
+                AuthoritativePackageInputUri::Manifest { .. }
+            )
+        }
+        (None, _) => true,
+    }
+}
+
 fn authoritative_package_input_uri_for_open_document(
     state: &WorldState,
     open_uri: &Url,
     root: &std::path::Path,
 ) -> Option<AuthoritativePackageInputUri> {
+    let open_path = open_uri.to_file_path().ok()?;
+    let open_candidate = package_input_uri_for_path(open_uri.clone(), open_path, root);
+
     if state.open_document_aliases.is_empty() {
-        let path = open_uri.to_file_path().ok()?;
-        return package_input_uri_for_path(open_uri.clone(), path, root);
+        let candidate = open_candidate?;
+        return authoritative_package_input_for_open_candidate(state, open_uri, candidate);
     }
 
     if let Some(canonical_uris) = state
@@ -2722,16 +2770,16 @@ fn authoritative_package_input_uri_for_open_document(
             else {
                 continue;
             };
-            return (state
-                .open_document_uri_for_authoritative_uri(candidate.uri())
-                .as_ref()
-                == Some(open_uri))
-            .then_some(candidate);
+            if !package_alias_candidate_matches_open_input_kind(open_candidate.as_ref(), &candidate)
+            {
+                continue;
+            }
+            return authoritative_package_input_for_open_candidate(state, open_uri, candidate);
         }
     }
 
-    let path = open_uri.to_file_path().ok()?;
-    package_input_uri_for_path(open_uri.clone(), path, root)
+    let candidate = open_candidate?;
+    authoritative_package_input_for_open_candidate(state, open_uri, candidate)
 }
 
 fn authoritative_package_r_file_uri_for_open_document(
@@ -2869,11 +2917,13 @@ fn hydrate_package_r_files_from_state(
     root: &std::path::Path,
     mut r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
 ) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
-    let open_uris: std::collections::HashSet<Url> = state.documents.keys().cloned().collect();
+    let mut open_uris: Vec<Url> = state.documents.keys().cloned().collect();
+    open_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    let open_uri_set: std::collections::HashSet<Url> = open_uris.iter().cloned().collect();
 
     for uri in state.workspace_index_new.uris() {
         let open_or_alias = if state.open_document_aliases.is_empty() {
-            open_uris.contains(&uri)
+            open_uri_set.contains(&uri)
         } else {
             state.is_document_open_or_alias(&uri)
         };
@@ -3874,7 +3924,7 @@ async fn resync_file_from_disk(
         .cross_file_graph
         .get_dependents(uri)
         .iter()
-        .any(|e| !e.is_backward_directive);
+        .any(|e| !e.is_backward_directive && !e.non_lending);
     if !has_incoming_forward {
         // Candidate filter: ordinary `source()` entries carry only their raw
         // path string (`resolved_uri` is populated for `system.file()`
@@ -16346,15 +16396,28 @@ mod project_config_initialize_tests {
 
         let state = backend.state.read().await;
         assert!(
-            has_dependency_edge(&state, &excluded_uri, &helper_uri),
-            "excluded buffer should keep a forward edge for its own diagnostics"
+            state
+                .cross_file_graph
+                .get_dependencies(&excluded_uri)
+                .iter()
+                .any(|edge| edge.to == helper_uri && edge.non_lending),
+            "excluded buffer should keep a non-lending forward edge for its own diagnostics"
         );
         assert!(
             state
                 .cross_file_graph
                 .get_dependents(&helper_uri)
-                .is_empty(),
-            "excluded buffer must not be a parent/lender of the non-excluded helper"
+                .iter()
+                .any(|edge| edge.from == excluded_uri && edge.non_lending),
+            "excluded buffer reverse edge should be retained for revalidation but non-lending"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependents(&helper_uri)
+                .iter()
+                .any(|edge| edge.from == excluded_uri && !edge.non_lending),
+            "excluded buffer must not be a lending parent of the non-excluded helper"
         );
         assert!(
             !state.workspace_index_new.contains(&excluded_uri)
@@ -16551,8 +16614,20 @@ mod project_config_initialize_tests {
                 "precondition: canonical root keeps the outgoing edge for live diagnostics"
             );
             assert!(
-                state.cross_file_graph.get_dependents(&child_uri).is_empty(),
-                "precondition: excluded alias must not lend through the canonical child"
+                state
+                    .cross_file_graph
+                    .get_dependents(&child_uri)
+                    .iter()
+                    .any(|edge| edge.from == canonical_parent && edge.non_lending),
+                "precondition: excluded alias reverse edge must be retained but non-lending"
+            );
+            assert!(
+                !state
+                    .cross_file_graph
+                    .get_dependents(&child_uri)
+                    .iter()
+                    .any(|edge| edge.from == canonical_parent && !edge.non_lending),
+                "precondition: excluded alias must not have a lending reverse edge"
             );
         }
 
@@ -16606,8 +16681,20 @@ mod project_config_initialize_tests {
             "remirror should preserve the canonical root's outgoing edge"
         );
         assert!(
-            state.cross_file_graph.get_dependents(&child_uri).is_empty(),
-            "remirror must not recreate a reverse lending edge from the non-excluded child"
+            state
+                .cross_file_graph
+                .get_dependents(&child_uri)
+                .iter()
+                .any(|edge| edge.from == canonical_parent && edge.non_lending),
+            "remirror must retain the reverse edge for revalidation but mark it non-lending"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependents(&child_uri)
+                .iter()
+                .any(|edge| edge.from == canonical_parent && !edge.non_lending),
+            "remirror must not recreate a lending reverse edge from the non-excluded child"
         );
     }
 
@@ -16670,12 +16757,20 @@ mod project_config_initialize_tests {
             "excluded canonical root should keep its forward edge for live diagnostics"
         );
         assert!(
+            state
+                .cross_file_graph
+                .get_dependents(&helper_uri)
+                .iter()
+                .any(|edge| edge.from == canonical_parent && edge.non_lending),
+            "excluded canonical root reverse edge must be retained but non-lending"
+        );
+        assert!(
             !state
                 .cross_file_graph
                 .get_dependents(&helper_uri)
                 .iter()
-                .any(|edge| edge.from == canonical_parent),
-            "excluded canonical root must not lend symbols through the helper's reverse edge"
+                .any(|edge| edge.from == canonical_parent && !edge.non_lending),
+            "excluded canonical root must not have a lending helper reverse edge"
         );
     }
 
@@ -16719,15 +16814,28 @@ mod project_config_initialize_tests {
 
         let state = backend.state.read().await;
         assert!(
-            has_dependency_edge(&state, &excluded_uri, &helper_uri),
-            "did_change must refresh forward graph edges for excluded live diagnostics"
+            state
+                .cross_file_graph
+                .get_dependencies(&excluded_uri)
+                .iter()
+                .any(|edge| edge.to == helper_uri && edge.non_lending),
+            "did_change must refresh non-lending forward graph edges for excluded live diagnostics"
         );
         assert!(
             state
                 .cross_file_graph
                 .get_dependents(&helper_uri)
-                .is_empty(),
-            "did_change must not make the excluded buffer a symbol-lending parent"
+                .iter()
+                .any(|edge| edge.from == excluded_uri && edge.non_lending),
+            "did_change must retain the reverse edge for revalidation but mark it non-lending"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependents(&helper_uri)
+                .iter()
+                .any(|edge| edge.from == excluded_uri && !edge.non_lending),
+            "did_change must not make the excluded buffer a lending parent"
         );
         assert!(
             !snapshot_diagnostics(&state, &excluded_uri)
@@ -16791,12 +16899,28 @@ mod project_config_initialize_tests {
 
         let state = backend.state.read().await;
         assert!(
-            has_dependency_edge(&state, &parent_uri, &child_uri),
-            "excluded parent keeps forward edge for its own graph neighborhood"
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .any(|edge| edge.to == child_uri && edge.non_lending),
+            "excluded parent keeps a non-lending forward edge for its own graph neighborhood"
         );
         assert!(
-            state.cross_file_graph.get_dependents(&child_uri).is_empty(),
-            "non-excluded child must not inherit the excluded parent"
+            state
+                .cross_file_graph
+                .get_dependents(&child_uri)
+                .iter()
+                .any(|edge| edge.from == parent_uri && edge.non_lending),
+            "non-excluded child keeps a reverse edge for revalidation but not lending"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependents(&child_uri)
+                .iter()
+                .any(|edge| edge.from == parent_uri && !edge.non_lending),
+            "non-excluded child must not have a lending edge from the excluded parent"
         );
         assert!(
             snapshot_diagnostics(&state, &child_uri)
@@ -19885,6 +20009,248 @@ mod project_config_initialize_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn package_double_open_case_alias_handlers_keep_single_authoritative_r_file_slot() {
+        if crate::test_utils::host_is_case_sensitive() {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let r_dir = tmp.path().join("R");
+        fs::create_dir(&r_dir).unwrap();
+        fs::write(tmp.path().join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(r_dir.join("child.R"), "disk_child <- function() 1\n").unwrap();
+
+        let canonical_path = r_dir.join("child.R");
+        let canonical_uri = Url::from_file_path(&canonical_path).unwrap();
+        let alias_path = r_dir.join("child.r");
+        let alias_uri = Url::from_file_path(&alias_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "pkg".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let disk_seed = collect_package_r_file_inputs_from_disk(tmp.path());
+            let mut state = backend.state.write().await;
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                tmp.path().to_path_buf(),
+                Some("Package: pkg\n".into()),
+                None,
+                disk_seed,
+                None,
+                &exclusions,
+            );
+        }
+
+        open_doc(
+            backend,
+            &canonical_uri,
+            "r",
+            1,
+            "canonical_child <- function() 1\n",
+        )
+        .await;
+        open_doc(backend, &alias_uri, "r", 1, "alias_child <- function() 2\n").await;
+        change_doc(backend, &alias_uri, 2, "alias_changed <- function() 3\n").await;
+        close_doc(backend, &alias_uri).await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&canonical_uri),
+            Some(canonical_uri.clone()),
+            "the exact canonical open buffer must own the package slot"
+        );
+        assert_eq!(
+            state.package_inputs.r_files.len(),
+            1,
+            "case aliases must share one package R-file slot: {:?}",
+            state.package_inputs.r_files.keys().collect::<Vec<_>>()
+        );
+        let input = state
+            .package_inputs
+            .r_files
+            .get(&canonical_path)
+            .expect("the single package input uses the on-disk casing");
+        assert_eq!(
+            &*input.text, "canonical_child <- function() 1\n",
+            "changing and closing the non-owner alias must not overwrite canonical text"
+        );
+        assert!(
+            !state.package_inputs.r_files.contains_key(&alias_path),
+            "the wrong-case spelling must not become a second package input"
+        );
+    }
+
+    /// Issue #577: real handlers register open aliases before package-input
+    /// routing. The old low-level repro inserted documents directly, leaving
+    /// `open_document_aliases` empty and bypassing the #567 ownership gate.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn package_double_open_symlink_alias_handlers_keep_single_authoritative_r_file_slot() {
+        let tmp = TempDir::new().unwrap();
+        let r_dir = tmp.path().join("R");
+        fs::create_dir(&r_dir).unwrap();
+        fs::write(tmp.path().join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(r_dir.join("child.R"), "disk_child <- function() 1\n").unwrap();
+        std::os::unix::fs::symlink("child.R", r_dir.join("child-link.R")).unwrap();
+
+        let canonical_path = r_dir.join("child.R");
+        let canonical_uri = Url::from_file_path(&canonical_path).unwrap();
+        let alias_path = r_dir.join("child-link.R");
+        let alias_uri = Url::from_file_path(&alias_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "pkg".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let disk_seed = collect_package_r_file_inputs_from_disk(tmp.path());
+            let mut state = backend.state.write().await;
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                tmp.path().to_path_buf(),
+                Some("Package: pkg\n".into()),
+                None,
+                disk_seed,
+                None,
+                &exclusions,
+            );
+        }
+
+        open_doc(
+            backend,
+            &canonical_uri,
+            "r",
+            1,
+            "canonical_child <- function() 1\n",
+        )
+        .await;
+        open_doc(backend, &alias_uri, "r", 1, "alias_child <- function() 2\n").await;
+        change_doc(backend, &alias_uri, 2, "alias_changed <- function() 3\n").await;
+        close_doc(backend, &alias_uri).await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&canonical_uri),
+            Some(canonical_uri.clone()),
+            "the exact canonical open buffer must own the package slot"
+        );
+        assert_eq!(
+            state.package_inputs.r_files.len(),
+            1,
+            "symlink aliases must share one package R-file slot: {:?}",
+            state.package_inputs.r_files.keys().collect::<Vec<_>>()
+        );
+        let input = state
+            .package_inputs
+            .r_files
+            .get(&canonical_path)
+            .expect("the single package input uses the symlink target path");
+        assert_eq!(
+            &*input.text, "canonical_child <- function() 1\n",
+            "changing and closing the non-owner alias must not overwrite canonical text"
+        );
+        assert!(
+            !state.package_inputs.r_files.contains_key(&alias_path),
+            "the symlink spelling must not become a second package input"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn package_symlink_r_source_escaping_root_keeps_lexical_package_slot() {
+        let tmp = TempDir::new().unwrap();
+        let pkg = tmp.path().join("pkg");
+        let outside = tmp.path().join("outside");
+        let r_dir = pkg.join("R");
+        fs::create_dir_all(&r_dir).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(pkg.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        let outside_target = outside.join("target.R");
+        fs::write(&outside_target, "outside_target <- function() 1\n").unwrap();
+        std::os::unix::fs::symlink(&outside_target, r_dir.join("link.R")).unwrap();
+
+        let link_path = r_dir.join("link.R");
+        let link_uri = Url::from_file_path(&link_path).unwrap();
+        let outside_uri = Url::from_file_path(outside_target.canonicalize().unwrap()).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&pkg).unwrap(),
+                    name: "pkg".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let disk_seed = collect_package_r_file_inputs_from_disk(&pkg);
+            let mut state = backend.state.write().await;
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                pkg.clone(),
+                Some("Package: pkg\n".into()),
+                None,
+                disk_seed,
+                None,
+                &exclusions,
+            );
+        }
+
+        open_doc(backend, &link_uri, "r", 1, "link_live <- function() 1\n").await;
+        change_doc(backend, &link_uri, 2, "link_changed <- function() 2\n").await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&outside_uri),
+            Some(link_uri.clone()),
+            "precondition: alias registration discovered the symlink target"
+        );
+        let input = state
+            .package_inputs
+            .r_files
+            .get(&link_path)
+            .expect("escaping symlink must keep the lexical package R-file slot");
+        assert_eq!(&*input.text, "link_changed <- function() 2\n");
+        assert!(
+            !state.package_inputs.r_files.contains_key(&outside_target),
+            "the outside symlink target must not replace the package slot"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn package_symlink_alias_gets_own_package_scope_and_revalidates_sibling() {
@@ -20429,6 +20795,82 @@ mod project_config_initialize_tests {
                 .iter()
                 .any(|e| e.to == extra_uri),
             "vetoed resync must not install disk-derived edges over buffer state"
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_restores_open_parent_when_only_incoming_edge_is_non_lending() {
+        let tmp = TempDir::new().unwrap();
+        let parent = "source(\"helper.R\")\nparent_value <- 1\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_value <- 1\n").unwrap();
+
+        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        let excluded_uri = Url::from_file_path(tmp.path().join("excluded.R")).unwrap();
+
+        {
+            let mut state = backend.state.write().await;
+            // Simulate the exists -> missing half: removing the helper strips
+            // parent-owned incoming edges, but the open parent's metadata still
+            // has the source() entry that resync must replay.
+            state.cross_file_graph.remove_file(&helper_uri);
+
+            let workspace_root = state.workspace_folders.first().cloned();
+            let excluded_meta = crate::cross_file::CrossFileMetadata {
+                sources: vec![crate::cross_file::types::ForwardSource {
+                    path: "helper.R".to_string(),
+                    line: 0,
+                    column: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            state.cross_file_graph.update_file(
+                &excluded_uri,
+                &excluded_meta,
+                workspace_root.as_ref(),
+                |_| None,
+            );
+            state
+                .cross_file_graph
+                .make_forward_edges_non_lending(&excluded_uri);
+
+            let incoming = state.cross_file_graph.get_dependents(&helper_uri);
+            assert_eq!(
+                incoming.len(),
+                1,
+                "precondition: only the excluded incoming edge remains"
+            );
+            assert!(
+                incoming
+                    .iter()
+                    .any(|edge| edge.from == excluded_uri && edge.non_lending),
+                "precondition: retained incoming edge is non-lending"
+            );
+        }
+
+        let outcome =
+            resync_file_from_disk(&backend.state, &helper_uri, None, None, true, None).await;
+        assert!(
+            matches!(outcome, ResyncOutcome::Updated { .. }),
+            "helper resync should commit disk state"
+        );
+
+        let state = backend.state.read().await;
+        let incoming = state.cross_file_graph.get_dependents(&helper_uri);
+        assert!(
+            incoming
+                .iter()
+                .any(|edge| edge.from == parent_uri && !edge.non_lending),
+            "a non-lending excluded edge must not suppress restoration of the real open parent"
+        );
+        assert!(
+            incoming
+                .iter()
+                .any(|edge| edge.from == excluded_uri && edge.non_lending),
+            "the excluded consumer's retained edge remains non-lending"
         );
     }
 
@@ -23516,12 +23958,28 @@ lineLength = 200
         helper_symbol: &str,
     ) {
         assert!(
-            has_dependency_edge(state, excluded_uri, helper_uri),
-            "excluded buffer should keep a forward edge for its own diagnostics"
+            state
+                .cross_file_graph
+                .get_dependencies(excluded_uri)
+                .iter()
+                .any(|edge| edge.to == *helper_uri && edge.non_lending),
+            "excluded buffer should keep a non-lending forward edge for its own diagnostics"
         );
         assert!(
-            state.cross_file_graph.get_dependents(helper_uri).is_empty(),
-            "excluded buffer must not be a parent/lender of the non-excluded helper"
+            state
+                .cross_file_graph
+                .get_dependents(helper_uri)
+                .iter()
+                .any(|edge| edge.from == *excluded_uri && edge.non_lending),
+            "excluded buffer reverse edge should be retained for revalidation but non-lending"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependents(helper_uri)
+                .iter()
+                .any(|edge| edge.from == *excluded_uri && !edge.non_lending),
+            "excluded buffer must not be a lending parent of the non-excluded helper"
         );
         assert!(
             !state.workspace_index_new.contains(excluded_uri)

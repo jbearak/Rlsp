@@ -6631,6 +6631,13 @@ struct CrossFileNse {
 /// from it (an unresolved / missing-file node) simply contributes nothing — it
 /// has no declarations.
 ///
+/// `extract_subgraph` also removes `non_lending` edges from the backward index
+/// while retaining them forward. That means an excluded open buffer can still
+/// collect diagnostics over helpers it sources, and the full graph can still
+/// revalidate that buffer when a helper changes, but this collector will not
+/// treat the excluded buffer as the helper's ancestor or propagate its NSE/func
+/// declarations into the helper.
+///
 /// Because the trimmed subgraph is the bounded (`max_chain_depth` /
 /// `max_transitive_dependents_visited`) neighborhood, propagation is likewise
 /// bounded: a declaration on an `S(uri)` member beyond the neighborhood bound

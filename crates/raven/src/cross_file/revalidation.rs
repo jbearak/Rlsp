@@ -1592,6 +1592,44 @@ mod tests {
     }
 
     #[test]
+    fn excluded_non_lending_parent_is_revalidated_when_helper_changes() {
+        // Issue #578: an excluded open buffer still consumes the helper it
+        // sources, so helper edits must reschedule that open buffer. The
+        // non-lending marker only prevents the helper from inheriting symbols
+        // from the excluded parent.
+        let mut graph = DependencyGraph::new();
+        let excluded = affected_url("excluded.R");
+        let helper = affected_url("helper.R");
+        let meta_excluded = make_meta_with_source("helper.R", 1);
+        graph.update_file(
+            &excluded,
+            &meta_excluded,
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+        graph.make_forward_edges_non_lending(&excluded);
+
+        let mut open: std::collections::HashSet<Url> = std::collections::HashSet::new();
+        open.insert(excluded.clone());
+        open.insert(helper.clone());
+
+        let affected = compute_affected_dependents_after_edit(
+            &helper,
+            true,
+            false,
+            &graph,
+            |u| open.contains(u),
+            10,
+            200,
+        );
+        assert_eq!(
+            affected,
+            vec![excluded],
+            "editing the helper must reschedule the excluded open consumer"
+        );
+    }
+
+    #[test]
     fn test_compute_affected_includes_forward_dependencies() {
         // parent is edited; child (sourced by parent) must be revalidated.
         // This is the bug: the previous implementation only walked backward
