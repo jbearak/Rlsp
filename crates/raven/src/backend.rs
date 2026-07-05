@@ -28,7 +28,7 @@ use tower_lsp::lsp_types::*;
 
 use crate::handlers;
 use crate::indentation;
-use crate::state::{IndentationSettings, SymbolConfig, WorldState, scan_workspace};
+use crate::state::{IndentationSettings, SymbolConfig, WorldState};
 use crate::utf16::utf16_column_to_byte_offset;
 tokio::task_local! {
     static CURRENT_LSP_REQUEST_ID: JsonRpcId;
@@ -2200,8 +2200,17 @@ fn batch_contains_rprofile_changed(deltas: &[crate::package_state::PackageInputD
     })
 }
 
+#[cfg(test)]
 fn collect_package_r_file_inputs_from_disk(
     root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
+    let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+    collect_package_r_file_inputs_from_disk_with_exclusions(root, &exclusions)
+}
+
+fn collect_package_r_file_inputs_from_disk_with_exclusions(
+    root: &std::path::Path,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
     let mut r_files = std::collections::BTreeMap::new();
     for base in [root.join("R"), root.join("tests").join("testthat")] {
@@ -2215,6 +2224,9 @@ fn collect_package_r_file_inputs_from_disk(
             .filter(|entry| entry.file_type().is_file())
         {
             let path = entry.into_path();
+            if exclusions.is_excluded_path(&path) {
+                continue;
+            }
             let Some(kind) = crate::package_state::is_r_source_path(&path, root) else {
                 continue;
             };
@@ -2413,6 +2425,40 @@ fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<U
     neighbors
 }
 
+fn remove_project_excluded_file_from_cross_file_state(
+    state: &mut WorldState,
+    uri: &Url,
+) -> Option<Vec<Url>> {
+    if !state.is_project_excluded_uri(uri) {
+        return None;
+    }
+    Some(remove_file_from_cross_file_state(state, uri))
+}
+
+fn remove_project_excluded_index_entries(state: &mut WorldState) -> Vec<Url> {
+    let mut candidates: std::collections::HashSet<Url> =
+        state.workspace_index_new.uris().into_iter().collect();
+    candidates.extend(state.cross_file_workspace_index.uris());
+    candidates.extend(state.workspace_index.keys().cloned());
+    candidates.extend(state.documents.keys().cloned());
+
+    let mut affected = Vec::new();
+    let mut affected_set = std::collections::HashSet::new();
+    for uri in candidates {
+        if let Some(neighbors) = remove_project_excluded_file_from_cross_file_state(state, &uri) {
+            for dep in neighbors {
+                if affected_set.insert(dep.clone()) {
+                    affected.push(dep);
+                }
+            }
+        }
+    }
+    if !affected.is_empty() {
+        state.recompute_open_neighborhood_pins();
+    }
+    affected
+}
+
 /// Resolve a file's `# raven: sourced-by` targets and pre-collect their
 /// content (open buffer first, then the disk-content cache) into a map, so
 /// `DependencyGraph::update_file`'s `get_content` closure can run while the
@@ -2538,6 +2584,18 @@ async fn resync_file_from_disk(
     old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
     undecodable_as_missing: bool,
 ) -> ResyncOutcome {
+    {
+        let mut state = state_arc.write().await;
+        if let Some(affected_dependents) =
+            remove_project_excluded_file_from_cross_file_state(&mut state, uri)
+        {
+            state.recompute_open_neighborhood_pins();
+            return ResyncOutcome::Removed {
+                affected_dependents,
+            };
+        }
+    }
+
     let Ok(path) = uri.to_file_path() else {
         return ResyncOutcome::Skipped;
     };
@@ -3470,6 +3528,7 @@ struct ConfigChangeSnapshot {
     prev_cross_file: crate::cross_file::CrossFileConfig,
     prev_lint: crate::linting::LintConfig,
     prev_completion: crate::state::CompletionConfig,
+    prev_workspace_exclusions: Vec<String>,
     /// `recompute_parsed_configs` resets `symbol_config` to defaults. The
     /// helper restores `hierarchical_document_symbol_support` from this
     /// value (set from client capabilities at initialize time).
@@ -3495,6 +3554,7 @@ struct ReconciliationDecisions {
     max_transitive_dependents_visited_changed: bool,
     trigger_on_open_paren_changed: bool,
     new_trigger_on_open_paren: bool,
+    workspace_exclusions_changed: bool,
     /// `Some(root)` when `packageMode` flipped to a non-Disabled mode and
     /// the helper still needs to read `DESCRIPTION` / `NAMESPACE` from
     /// disk before re-applying. `None` otherwise (no mode change, or the
@@ -3684,6 +3744,7 @@ impl LanguageServer for Backend {
             packages_r_path,
             additional_paths,
             index_workspace,
+            workspace_exclusions,
         ) = {
             let state = self.state.read().await;
             (
@@ -3696,6 +3757,7 @@ impl LanguageServer for Backend {
                     .packages_additional_library_paths
                     .clone(),
                 state.cross_file_config.index_workspace,
+                state.workspace_exclusions.clone(),
             )
         };
 
@@ -3716,7 +3778,11 @@ impl LanguageServer for Backend {
                 // Run the blocking scan in a blocking task
                 let scan_result = tokio::task::spawn_blocking(move || {
                     let scan_start = std::time::Instant::now();
-                    let result = scan_workspace(&folders_clone, max_chain_depth);
+                    let result = crate::state::scan_workspace_with_exclusions(
+                        &folders_clone,
+                        max_chain_depth,
+                        &workspace_exclusions,
+                    );
                     let scan_duration = scan_start.elapsed();
                     let file_count = result.0.len();
                     crate::perf::record_workspace_scan(scan_duration, file_count);
@@ -3867,6 +3933,7 @@ impl LanguageServer for Backend {
         } else {
             let package_seed = if let Some(root) = root_for_pkg_inputs.clone() {
                 let root_clone = root.clone();
+                let workspace_exclusions = workspace_exclusions.clone();
                 Some((
                     root,
                     tokio::task::spawn_blocking(move || {
@@ -3876,7 +3943,10 @@ impl LanguageServer for Backend {
                         let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
                             .ok()
                             .map(|s| Arc::from(s.as_str()));
-                        let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
+                        let disk_r_files = collect_package_r_file_inputs_from_disk_with_exclusions(
+                            &root_clone,
+                            &workspace_exclusions,
+                        );
                         // Precompute the `.Rprofile` prelude scan OFF the write
                         // lock (it follows transitive source(); see
                         // `initialize_package_inputs_from_state`).
@@ -4387,6 +4457,32 @@ impl LanguageServer for Backend {
             packages_enabled,
         ) = {
             let mut state = self.state.write().await;
+
+            if state.is_project_excluded_uri(&uri) {
+                let (chunk_kind, _) =
+                    crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
+                state
+                    .document_store
+                    .open_with_metadata(
+                        uri.clone(),
+                        &text,
+                        version,
+                        chunk_kind,
+                        crate::cross_file::CrossFileMetadata::default(),
+                    )
+                    .await;
+                state.open_document_with_language_id(
+                    uri.clone(),
+                    &text,
+                    Some(version),
+                    Some(language_id.as_str()),
+                );
+                state.cross_file_activity.record_recent(uri.clone());
+                remove_file_from_cross_file_state(&mut state, &uri);
+                drop(state);
+                self.publish_diagnostics(&uri).await;
+                return;
+            }
 
             // Capture old metadata before recomputing (for WD change detection)
             let old_meta = state.get_enriched_metadata(&uri);
@@ -5283,6 +5379,30 @@ impl LanguageServer for Backend {
             package_library,
         ) = {
             let mut state = self.state.write().await;
+
+            if state.is_project_excluded_uri(&uri) {
+                if let Some(doc) = state.documents.get_mut(&uri) {
+                    doc.version = Some(version);
+                }
+                for change in changes.clone() {
+                    state.apply_change(&uri, change);
+                }
+                state
+                    .document_store
+                    .update_with_metadata(
+                        &uri,
+                        changes,
+                        version,
+                        crate::cross_file::CrossFileMetadata::default(),
+                        None,
+                    )
+                    .await;
+                state.cross_file_activity.record_recent(uri.clone());
+                remove_file_from_cross_file_state(&mut state, &uri);
+                drop(state);
+                self.publish_diagnostics(&uri).await;
+                return;
+            }
 
             // Capture old metadata before recomputing (for WD change detection)
             let old_meta = state.get_enriched_metadata(&uri);
@@ -6202,6 +6322,7 @@ impl LanguageServer for Backend {
                 prev_cross_file: state.cross_file_config.clone(),
                 prev_lint: state.lint_config.clone(),
                 prev_completion: state.completion_config.clone(),
+                prev_workspace_exclusions: state.workspace_exclusions.patterns().to_vec(),
                 prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
             };
 
@@ -6317,6 +6438,7 @@ impl LanguageServer for Backend {
                     prev_cross_file: state.cross_file_config.clone(),
                     prev_lint: state.lint_config.clone(),
                     prev_completion: state.completion_config.clone(),
+                    prev_workspace_exclusions: state.workspace_exclusions.patterns().to_vec(),
                     prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
                 };
 
@@ -6440,6 +6562,32 @@ impl LanguageServer for Backend {
 
                 match change.typ {
                     FileChangeType::CREATED | FileChangeType::CHANGED => {
+                        if let Some(neighbors) =
+                            remove_project_excluded_file_from_cross_file_state(&mut state, uri)
+                        {
+                            for dep in neighbors {
+                                if affected_set.insert(dep.clone()) {
+                                    affected.push(dep);
+                                }
+                            }
+                            let event =
+                                crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                                    uri: uri.clone(),
+                                    on_disk_text: None,
+                                    deleted: true,
+                                };
+                            if crate::package_state::event::translate(
+                                &mut state.package_inputs,
+                                event,
+                            )
+                            .is_some()
+                            {
+                                had_pkg_deletion = true;
+                            }
+                            log::trace!("Removed excluded file from cross-file state: {}", uri);
+                            continue;
+                        }
+
                         // Invalidate disk-backed caches
                         state.cross_file_file_cache.invalidate(uri);
                         state.cross_file_workspace_index.invalidate(uri);
@@ -7635,14 +7783,20 @@ impl Backend {
             // `LintConfig`) still need an explicit `*_changed` guard below —
             // extend the chain when adding another such struct.
             let lint_config_changed = state.lint_config != prev.prev_lint;
+            let workspace_exclusions_changed =
+                state.workspace_exclusions.patterns() != prev.prev_workspace_exclusions.as_slice();
 
-            let only_watch_changed = watch_settings_changed && !lint_config_changed && {
-                let mut probe = state.cross_file_config.clone();
-                probe.packages_watch_library_paths =
-                    prev.prev_cross_file.packages_watch_library_paths;
-                probe.packages_watch_debounce_ms = prev.prev_cross_file.packages_watch_debounce_ms;
-                probe == prev.prev_cross_file
-            };
+            let only_watch_changed = watch_settings_changed
+                && !lint_config_changed
+                && !workspace_exclusions_changed
+                && {
+                    let mut probe = state.cross_file_config.clone();
+                    probe.packages_watch_library_paths =
+                        prev.prev_cross_file.packages_watch_library_paths;
+                    probe.packages_watch_debounce_ms =
+                        prev.prev_cross_file.packages_watch_debounce_ms;
+                    probe == prev.prev_cross_file
+                };
 
             let packages_enabled = state.cross_file_config.packages_enabled;
             let max_transitive_dependents_visited_changed =
@@ -7718,6 +7872,7 @@ impl Backend {
                 max_transitive_dependents_visited_changed,
                 trigger_on_open_paren_changed,
                 new_trigger_on_open_paren,
+                workspace_exclusions_changed,
                 pkg_mode_io_needed,
                 open_uris,
             }
@@ -7735,6 +7890,7 @@ impl Backend {
             max_transitive_dependents_visited_changed,
             trigger_on_open_paren_changed,
             new_trigger_on_open_paren,
+            workspace_exclusions_changed,
             pkg_mode_io_needed,
             open_uris,
         } = decisions;
@@ -7743,12 +7899,27 @@ impl Backend {
             self.traversal_truncation.reset_notice_throttle();
         }
 
+        if workspace_exclusions_changed {
+            let mut state = self.state.write().await;
+            let affected = remove_project_excluded_index_entries(&mut state);
+            if !affected.is_empty() {
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(affected.iter());
+            }
+            log::info!(
+                "Workspace exclusions changed; removed {} affected indexed/open entries",
+                affected.len()
+            );
+        }
+
         // --- Package mode rebuild: repopulate inputs after mode switch ---
         // For non-Disabled mode switches, re-read DESCRIPTION and NAMESPACE
         // from disk (R files are already in `package_inputs` from prior
         // did_open/did_change/scan events). Then derive package state.
         if let Some(root) = pkg_mode_io_needed {
             let root_clone = root.clone();
+            let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
             let (desc_text, ns_text, disk_r_files, rprofile_scan) =
                 tokio::task::spawn_blocking(move || {
                     let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
@@ -7757,7 +7928,10 @@ impl Backend {
                     let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
                         .ok()
                         .map(|s| std::sync::Arc::from(s.as_str()));
-                    let disk_r_files = collect_package_r_file_inputs_from_disk(&root_clone);
+                    let disk_r_files = collect_package_r_file_inputs_from_disk_with_exclusions(
+                        &root_clone,
+                        &workspace_exclusions,
+                    );
                     // Precompute the `.Rprofile` prelude scan OFF the write lock
                     // (it follows transitive source(); see
                     // `initialize_package_inputs_from_state`).
@@ -7965,6 +8139,13 @@ impl Backend {
         file_uri: &Url,
     ) -> Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> {
         log::trace!("On-demand indexing: {}", file_uri);
+        {
+            let mut state = self.state.write().await;
+            if remove_project_excluded_file_from_cross_file_state(&mut state, file_uri).is_some() {
+                state.recompute_open_neighborhood_pins();
+                return None;
+            }
+        }
 
         // Read file content
         let path = match file_uri.to_file_path() {
@@ -8365,6 +8546,13 @@ impl Backend {
             inherited_wd.display(),
             file_uri
         );
+        {
+            let mut state = self.state.write().await;
+            if remove_project_excluded_file_from_cross_file_state(&mut state, file_uri).is_some() {
+                state.recompute_open_neighborhood_pins();
+                return None;
+            }
+        }
 
         let path = match file_uri.to_file_path() {
             Ok(p) => p,
@@ -8869,6 +9057,7 @@ pub(crate) async fn publish_diagnostics_inner(
         workspace_folder,
         missing_file_severity,
         case_mismatch_severity,
+        project_excluded,
     ) = {
         let state = state_arc.read().await;
         let version = state.documents.get(uri).and_then(|d| d.version);
@@ -8897,11 +9086,12 @@ pub(crate) async fn publish_diagnostics_inner(
         // that flips `diagnostics.enabled` to `false` could still
         // publish missing-file diagnostics from the async phase.
         let diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
+        let project_excluded = state.is_project_excluded_uri(uri);
 
         // Skip the snapshot build entirely when the master switch is
         // off — saves the snapshot's metadata clone + neighborhood walk.
         // Mirrors the early-exit in `handlers::diagnostics`.
-        let snapshot = if diagnostics_enabled {
+        let snapshot = if diagnostics_enabled && !project_excluded {
             handlers::DiagnosticsSnapshot::build(&state, uri)
         } else {
             None
@@ -8934,6 +9124,7 @@ pub(crate) async fn publish_diagnostics_inner(
             workspace_folder,
             missing_file_severity,
             case_mismatch_severity,
+            project_excluded,
         )
     };
     // Read lock released — scope resolution and async I/O run unlocked.
@@ -8960,7 +9151,7 @@ pub(crate) async fn publish_diagnostics_inner(
     // publishing missing-file diagnostics while the sync phase was
     // empty. When disabled, publish an explicit empty `Vec` so the
     // client clears any prior diagnostics for the URI.
-    let diagnostics = if diagnostics_enabled {
+    let diagnostics = if diagnostics_enabled && !project_excluded {
         handlers::diagnostics_async_standalone(
             uri,
             sync_diagnostics,
@@ -17618,6 +17809,105 @@ mod project_config_initialize_tests {
                 .force_republish_count_for_test(&main_uri),
             0,
             "the dependent's force-republish marker must be consumed synchronously"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_file_change_removes_stale_entry_when_now_project_excluded() {
+        use tower_lsp::lsp_types::{DidChangeWatchedFilesParams, FileChangeType, FileEvent};
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"ignored/**\"]\n[crossFile]\nindexWorkspace = false\n",
+        )
+        .unwrap();
+        fs::create_dir(tmp.path().join("ignored")).unwrap();
+        let ignored_path = tmp.path().join("ignored/stale.R");
+        fs::write(&ignored_path, "fresh <- 1\n").unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let ignored_uri = Url::from_file_path(&ignored_path).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root.clone(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.workspace_exclusions.is_excluded_uri(&ignored_uri),
+                "test precondition: raven.toml exclusion must be compiled"
+            );
+        }
+
+        {
+            let stale = "stale <- 1\n";
+            let tree = crate::parser_pool::with_parser(|p| p.parse(stale, None));
+            let metadata = std::sync::Arc::new(crate::cross_file::CrossFileMetadata::default());
+            let artifacts =
+                std::sync::Arc::new(crate::cross_file::scope::ScopeArtifacts::default());
+            let fs_meta = std::fs::metadata(&ignored_path).unwrap();
+            let snapshot =
+                crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_meta, stale);
+            let entry = crate::workspace_index::IndexEntry {
+                contents: ropey::Rope::from_str(stale),
+                tree,
+                loaded_packages: Vec::new(),
+                snapshot: snapshot.clone(),
+                metadata: metadata.clone(),
+                artifacts: artifacts.clone(),
+                indexed_at_version: 0,
+            };
+            let cross_entry = crate::cross_file::workspace_index::IndexEntry {
+                snapshot,
+                metadata,
+                artifacts,
+                indexed_at_version: 0,
+            };
+            let mut state = backend.state.write().await;
+            state.workspace_index_new.insert(ignored_uri.clone(), entry);
+            state
+                .cross_file_workspace_index
+                .insert(ignored_uri.clone(), cross_entry);
+            state.workspace_index.insert(
+                ignored_uri.clone(),
+                crate::state::Document::new(stale, None),
+            );
+        }
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: ignored_uri.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state.workspace_index_new.get(&ignored_uri).is_none(),
+            "excluded watched-file change must remove stale unified index entry"
+        );
+        assert!(
+            state
+                .cross_file_workspace_index
+                .get_metadata(&ignored_uri)
+                .is_none(),
+            "excluded watched-file change must remove stale legacy cross-file entry"
+        );
+        assert!(
+            !state.workspace_index.contains_key(&ignored_uri),
+            "excluded watched-file change must remove stale legacy document entry"
         );
     }
 

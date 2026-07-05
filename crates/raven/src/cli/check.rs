@@ -21,8 +21,9 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 
 use crate::cli::shared::{
     ColorChoice, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR, OutputFormat, SeverityLevel,
-    absolute_path, collect_check_target_paths, encoding_diagnostic, is_chunk_file, is_r_file,
-    parse_color_choice, parse_output_format, parse_severity_level, render, resolve_color_from_env,
+    absolute_path, collect_check_target_paths_with_exclusions, encoding_diagnostic, is_chunk_file,
+    is_r_file, parse_color_choice, parse_output_format, parse_severity_level, render,
+    resolve_color_from_env,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -311,7 +312,12 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     // Resolve which files to report diagnostics for. A named path that does not
     // exist is an operator error (exit 2), matching `raven lint`.
     let mut operator_error = false;
-    let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
+    let targets = collect_report_targets_with_exclusions(
+        &args.paths,
+        &root,
+        &state.workspace_exclusions,
+        &mut operator_error,
+    );
 
     // Warm the package-export cache before computing diagnostics, matching the
     // editor's post-scan prefetch (see [`prefetch_reported_packages`]).
@@ -457,7 +463,11 @@ fn build_indexed_state(
     // owns `state` exclusively.
     let max_chain_depth = state.cross_file_config.max_chain_depth;
     let (index, cross_file_entries, new_index_entries) =
-        crate::state::scan_workspace(std::slice::from_ref(workspace_url), max_chain_depth);
+        crate::state::scan_workspace_with_exclusions(
+            std::slice::from_ref(workspace_url),
+            max_chain_depth,
+            &state.workspace_exclusions,
+        );
     state.apply_workspace_index(index, cross_file_entries, new_index_entries);
 
     // Derive package-mode scope (so `R/*.R` files in an R package see each
@@ -1370,20 +1380,31 @@ async fn collect_target_diagnostics(
 ///
 /// A named path that does not exist sets `*operator_error`, so the caller can
 /// return exit code 2 — matching `raven lint`.
+#[cfg(test)]
 fn collect_report_targets(
     paths: &[PathBuf],
     root: &Path,
     operator_error: &mut bool,
 ) -> Vec<PathBuf> {
+    let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+    collect_report_targets_with_exclusions(paths, root, &exclusions, operator_error)
+}
+
+fn collect_report_targets_with_exclusions(
+    paths: &[PathBuf],
+    root: &Path,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    operator_error: &mut bool,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if paths.is_empty() {
-        collect_check_target_paths(root, &mut out);
+        collect_check_target_paths_with_exclusions(root, &mut out, exclusions);
     } else {
         for p in paths {
             let abs = absolute_path(root, p);
             let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
             if abs.is_dir() {
-                collect_check_target_paths(&abs, &mut out);
+                collect_check_target_paths_with_exclusions(&abs, &mut out, exclusions);
             } else if abs.is_file() {
                 if is_r_file(&abs) || is_chunk_file(&abs) {
                     out.push(abs);
@@ -2089,6 +2110,30 @@ mod tests {
     }
 
     #[test]
+    fn collect_targets_empty_skips_project_excluded_files() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("included.R"), "x <- 1\n").unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(tmp.path().join("generated/ignored.R"), "y <- 1\n").unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["generated/**"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+
+        let mut operator_error = false;
+        let targets = collect_report_targets_with_exclusions(
+            &[],
+            tmp.path(),
+            &exclusions,
+            &mut operator_error,
+        );
+
+        assert_eq!(targets.len(), 1, "got {targets:?}");
+        assert!(targets[0].ends_with("included.R"), "got {targets:?}");
+        assert!(!operator_error);
+    }
+
+    #[test]
     fn walk_includes_rmd_and_qmd() {
         // The empty-PATHS workspace walk collects chunk-bearing documents
         // alongside R sources, including mixed-case extensions
@@ -2122,6 +2167,33 @@ mod tests {
         // Targets are canonicalized so they match the canonical workspace root.
         assert_eq!(targets, vec![std::fs::canonicalize(&rmd).unwrap()]);
         assert!(!operator_error);
+    }
+
+    #[test]
+    fn explicit_file_target_bypasses_project_exclusion() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        let target = tmp.path().join("generated/explicit.R");
+        fs::write(&target, "definitely_missing_symbol_559\n").unwrap();
+        let canonical_target = std::fs::canonicalize(&target).unwrap();
+
+        let mut args = base_args(tmp.path());
+        args.no_config = false;
+        args.paths = vec![target.clone()];
+
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            diags.iter().any(|(path, diag)| path == &canonical_target
+                && diag
+                    .message
+                    .contains("definitely_missing_symbol_559 is not defined")),
+            "explicit excluded file must still be diagnosed; got {diags:?}"
+        );
     }
 
     #[test]
@@ -2565,7 +2637,12 @@ mod tests {
         state.resolve_system_file_in_workspace();
         maybe_load_sysdata_fallback(&mut state).await;
         let mut operator_error = false;
-        let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
+        let targets = collect_report_targets_with_exclusions(
+            &args.paths,
+            &root,
+            &state.workspace_exclusions,
+            &mut operator_error,
+        );
         prefetch_reported_packages(&state, &targets).await;
         (state, targets)
     }

@@ -2,6 +2,7 @@
 
 pub mod discovery;
 pub mod discovery_load;
+pub mod exclusions;
 pub mod lintr_loader;
 pub mod merge;
 pub mod overrides;
@@ -14,6 +15,7 @@ pub use discovery_load::{
     DiscoveredLoad, LoadedConfig, discover_and_load, discover_and_load_with_options,
     load_explicit_config, load_explicit_config_from_base, resolve_explicit_config_path,
 };
+pub use exclusions::{CompiledWorkspaceExclusions, compile_workspace_exclusions};
 pub use lintr_loader::load as load_lintr;
 pub use merge::merge as merge_settings;
 pub use overrides::{
@@ -154,18 +156,21 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     // them together here is the per-CLAUDE.md invariant: this function
     // is the only place that writes any parsed config field after a
     // settings change.
-    if let Some(root) = state
+    let workspace_roots: Vec<std::path::PathBuf> = state
         .workspace_folders
-        .first()
-        .and_then(|u| u.to_file_path().ok())
-    {
-        state.lint_overrides = compile_lint_overrides(&merged, &root);
+        .iter()
+        .filter_map(|u| u.to_file_path().ok())
+        .collect();
+
+    if let Some(root) = workspace_roots.first() {
+        state.lint_overrides = compile_lint_overrides(&merged, root);
     } else {
         // No workspace root yet — clear any stale overrides so we don't
         // resolve against patches whose globs were computed against a
         // since-removed root.
         state.lint_overrides = Vec::new();
     }
+    state.workspace_exclusions = compile_workspace_exclusions(&merged, workspace_roots);
 }
 
 #[cfg(test)]
@@ -302,6 +307,38 @@ mod tests {
         );
         recompute_parsed_configs(&mut state);
         assert!(state.lint_config.enabled);
+    }
+
+    #[test]
+    fn recompute_updates_workspace_exclusions_from_project_layer() {
+        let root = tempfile::TempDir::new().unwrap();
+        let root_url = tower_lsp::lsp_types::Url::from_file_path(root.path()).unwrap();
+        let mut state = state_with(
+            json!({}),
+            root.path().join("raven.toml").to_str().unwrap(),
+            Some(json!({ "workspace": { "exclude": ["generated/**"] } })),
+        );
+        state.workspace_folders = vec![root_url];
+
+        recompute_parsed_configs(&mut state);
+        assert!(
+            state
+                .workspace_exclusions
+                .is_excluded_path(&root.path().join("generated/a.R"))
+        );
+
+        state.raw_project_settings = Some(json!({ "workspace": { "exclude": ["archive/**"] } }));
+        recompute_parsed_configs(&mut state);
+        assert!(
+            !state
+                .workspace_exclusions
+                .is_excluded_path(&root.path().join("generated/a.R"))
+        );
+        assert!(
+            state
+                .workspace_exclusions
+                .is_excluded_path(&root.path().join("archive/a.R"))
+        );
     }
 
     #[test]
