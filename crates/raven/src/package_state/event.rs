@@ -221,6 +221,10 @@ fn translate_watched(
             });
     let canonical_desc = canonical_root.join("DESCRIPTION");
     let canonical_ns = canonical_root.join("NAMESPACE");
+    // Treat a newly-excluded path the same as a deletion: every branch below
+    // (DESCRIPTION/NAMESPACE/.Rprofile/r-source/data(-raw)/generic-dir) already
+    // has correct "file gone" cleanup logic, so folding exclusion into
+    // `deleted` reuses it instead of duplicating removal logic per branch.
     let deleted = deleted || (!exclusions.is_empty() && exclusions.is_excluded_path(&path));
 
     if canonical_path == canonical_desc || path == root.join("DESCRIPTION") {

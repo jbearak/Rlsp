@@ -4,6 +4,7 @@
 //! files from workspace discovery/indexing and default CLI discovery, not just
 //! lint diagnostics.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobBuilder, GlobMatcher};
@@ -53,13 +54,13 @@ impl CompiledWorkspaceExclusions {
         let Some(rel) = self.relative_path(path) else {
             return false;
         };
-        if rel.as_os_str().is_empty() {
+        if rel.as_ref().as_os_str().is_empty() {
             return false;
         }
 
         let mut excluded = false;
         for rule in &self.rules {
-            if rule.matcher.is_match(rel) {
+            if rule.matcher.is_match(rel.as_ref()) {
                 excluded = !rule.negated;
             }
         }
@@ -86,7 +87,7 @@ impl CompiledWorkspaceExclusions {
         let Some(rel) = self.relative_path(dir) else {
             return false;
         };
-        if rel.as_os_str().is_empty() {
+        if rel.as_ref().as_os_str().is_empty() {
             return false;
         }
         self.rules.iter().any(|rule| {
@@ -94,16 +95,54 @@ impl CompiledWorkspaceExclusions {
                 && rule
                     .prune_matchers
                     .iter()
-                    .any(|matcher| matcher.is_match(rel))
+                    .any(|matcher| matcher.is_match(rel.as_ref()))
         })
     }
 
-    fn relative_path<'a>(&'a self, path: &'a Path) -> Option<&'a Path> {
-        self.roots
+    /// Return `path` relative to the nearest configured workspace root.
+    ///
+    /// The serial workspace walk hands this matcher paths produced by joining
+    /// entries onto the stored workspace root, so root and input already share
+    /// spelling and the raw `strip_prefix` result is authoritative. The
+    /// canonicalized fallback exists only for watched/incremental paths
+    /// (`event.rs` `translate_watched`, backend on-demand indexing) whose URIs
+    /// may arrive under a symlinked or differently-spelled root. It affects
+    /// matcher input normalization only; index and graph keys remain
+    /// uncanonicalized.
+    fn relative_path<'a>(&'a self, path: &'a Path) -> Option<Cow<'a, Path>> {
+        if let Some(rel) = self
+            .roots
             .iter()
             .filter_map(|root| path.strip_prefix(root).ok())
             .min_by_key(|rel| rel.components().count())
+        {
+            return Some(Cow::Borrowed(rel));
+        }
+
+        let canonical_path = canonicalize_existing_or_parent(path)?;
+        self.roots
+            .iter()
+            .filter_map(|root| {
+                let canonical_root = root.canonicalize().ok()?;
+                canonical_path
+                    .strip_prefix(&canonical_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .min_by_key(|rel| rel.components().count())
+            .map(Cow::Owned)
     }
+}
+
+fn canonicalize_existing_or_parent(path: &Path) -> Option<PathBuf> {
+    path.canonicalize()
+        .ok()
+        .or_else(|| match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => {
+                parent.canonicalize().ok().map(|parent| parent.join(name))
+            }
+            _ => None,
+        })
 }
 
 /// Build compiled workspace exclusions from `[workspace].exclude`.
@@ -291,5 +330,28 @@ mod tests {
         assert!(cfg.can_prune_directory(&root.join("generated")));
         assert!(cfg.can_prune_directory(&root.join("pkg/generated")));
         assert!(cfg.is_excluded_path(&root.join("pkg/generated/file.R")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_spelled_watched_path_uses_canonical_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real_root = tmp.path().join("real");
+        let link_root = tmp.path().join("link");
+        std::fs::create_dir_all(real_root.join("generated")).unwrap();
+        symlink(&real_root, &link_root).unwrap();
+
+        let excluded = real_root.join("generated/drop.R");
+        std::fs::write(&excluded, "drop <- 1\n").unwrap();
+        let missing = real_root.join("generated/missing.R");
+        let cfg = compile_workspace_exclusions(
+            &json!({ "workspace": { "exclude": ["generated/**"] } }),
+            vec![link_root],
+        );
+
+        assert!(cfg.is_excluded_path(&excluded));
+        assert!(cfg.is_excluded_path(&missing));
     }
 }
