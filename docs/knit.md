@@ -449,7 +449,7 @@ those checks live in the runtime sanitizer only.
 
 | Capability | Where it lives |
 |---|---|
-| Live preview of `.Rmd` or `.qmd` | `quarto.quarto`'s `Quarto: Preview` |
+| Live preview of `.Rmd` / `.Rmarkdown` or `.qmd` | `quarto.quarto`'s `Quarto: Preview` |
 | Auto-refresh / live preview on save | `quarto.quarto`'s `Quarto: Preview`. The Knit Preview panel is a static viewer with a manual Knit again button — not a live recompile. |
 | `.qmd` rendering | `quarto.quarto`'s `Quarto: Render` |
 | `.qmd` grammar / LSP | `quarto.quarto` |

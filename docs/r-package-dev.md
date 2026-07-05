@@ -12,7 +12,7 @@ Raven activates **package mode** when the workspace root contains a `DESCRIPTION
 
 3. **Roxygen + NAMESPACE merge** — Raven unions imports and exports parsed from the generated `NAMESPACE` file with roxygen tags (`@import`, `@importFrom`, `@export`) parsed from `R/*.R` files. Imports visible to your code are the combined set from both sources, so you get correct import resolution whether you edit `NAMESPACE` directly, rely on `devtools::document()` to regenerate it from roxygen, or are mid-edit between the two.
 
-4. **Own NSE verbs** — The package's own exported non-standard-evaluation verbs keep their argument policy inside the package's own files (any of its `.R`/`.Rmd`/`.qmd` source files — `R/`, `tests/`, vignettes, `man/` examples, `inst/`, `data-raw/`, and so on). When you develop a package named `dplyr`, a `filter(df, x > 1)` in its test suite does not flag the masked column `x`, even though no `library(dplyr)` attaches the package under development. See [Non-Standard Evaluation](non-standard-evaluation.md) for how the per-call argument policy works.
+4. **Own NSE verbs** — The package's own exported non-standard-evaluation verbs keep their argument policy inside the package's own files (any of its `.R`/`.Rmd`/`.Rmarkdown`/`.qmd` source files — `R/`, `tests/`, vignettes, `man/` examples, `inst/`, `data-raw/`, and so on). When you develop a package named `dplyr`, a `filter(df, x > 1)` in its test suite does not flag the masked column `x`, even though no `library(dplyr)` attaches the package under development. See [Non-Standard Evaluation](non-standard-evaluation.md) for how the per-call argument policy works.
 
 ## What's Supported
 

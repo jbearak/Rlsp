@@ -871,7 +871,7 @@
     "colors": [
       {
         "id": "raven.chunk.activeBackground",
-        "description": "Background color for runnable R code chunks in .Rmd / .qmd files and `# %%` cells in .R files.",
+        "description": "Background color for runnable R code chunks in .Rmd / .Rmarkdown / .qmd files and `# %%` cells in .R files.",
         "defaults": {
           "dark": "#ffffff0c",
           "light": "#0000000a",
@@ -1407,7 +1407,7 @@
             "Activate Raven's R console, plot viewer, and data viewer unless the REditorSupport (R) extension is enabled or VS Code is running as Positron."
           ],
           "default": "auto",
-          "description": "Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd knit command. The default `auto` resolves to `disabled` when the REditorSupport (R) extension is enabled or VS Code is running as Positron, so Raven doesn't duplicate surfaces those provide. Code intelligence and the help viewer are unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
+          "description": "Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd / .Rmarkdown knit command. The default `auto` resolves to `disabled` when the REditorSupport (R) extension is enabled or VS Code is running as Positron, so Raven doesn't duplicate surfaces those provide. Code intelligence and the help viewer are unaffected by this setting. See https://github.com/jbearak/raven/blob/main/docs/coexistence.md."
         },
         "raven.knit.workingDirectory": {
           "type": "string",
@@ -1417,8 +1417,8 @@
             "current"
           ],
           "enumDescriptions": [
-            "Use the directory containing the .Rmd file (default).",
-            "Use the workspace folder containing the .Rmd file.",
+            "Use the directory containing the R Markdown source file (default).",
+            "Use the workspace folder containing the R Markdown source file.",
             "Use R's startup working directory (substitute getwd() for the knitr root.dir)."
           ],
           "default": "document",
@@ -1743,7 +1743,7 @@
         "raven.chunks.highlight.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Highlight R code chunks in .Rmd / .qmd files (and `# %%` cells in .R files) with a background color. Disable to remove the background entirely."
+          "description": "Highlight R code chunks in .Rmd / .Rmarkdown / .qmd files (and `# %%` cells in .R files) with a background color. Disable to remove the background entirely."
         },
         "raven.chunks.activeCellIndicator": {
           "type": "boolean",
