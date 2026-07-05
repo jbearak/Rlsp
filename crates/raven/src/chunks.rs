@@ -86,7 +86,7 @@ fn section_divider_re() -> &'static Regex {
 /// [`ChunkKind::R`] for unknown extensions so behavior is predictable.
 pub fn classify_chunk_document(path_or_uri: &str) -> ChunkKind {
     let lower = path_or_uri.to_ascii_lowercase();
-    if lower.ends_with(".rmd") || lower.ends_with(".qmd") {
+    if lower.ends_with(".rmd") || lower.ends_with(".rmarkdown") || lower.ends_with(".qmd") {
         ChunkKind::Rmd
     } else {
         ChunkKind::R
@@ -907,6 +907,14 @@ mod tests {
     #[test]
     fn classifies_rmd_qmd_extensions() {
         assert_eq!(classify_chunk_document("/tmp/foo.Rmd"), ChunkKind::Rmd);
+        assert_eq!(
+            classify_chunk_document("/tmp/foo.Rmarkdown"),
+            ChunkKind::Rmd
+        );
+        assert_eq!(
+            classify_chunk_document("/tmp/foo.RMARKDOWN"),
+            ChunkKind::Rmd
+        );
         assert_eq!(classify_chunk_document("/tmp/foo.qmd"), ChunkKind::Rmd);
         assert_eq!(classify_chunk_document("/tmp/foo.QMD"), ChunkKind::Rmd);
         assert_eq!(classify_chunk_document("/tmp/foo.R"), ChunkKind::R);

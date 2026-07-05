@@ -311,12 +311,12 @@ See `index_file_on_demand` / `index_forward_chain` / `index_backward_chain` in
 
 ### Rmd/Quarto raw-content vs masked-analysis split (#343)
 
-For `.Rmd` / `.qmd` documents, everywhere we store or extract cross-file data we keep two views distinct (mirroring the `Document` type docs in `state.rs`):
+For `.Rmd` / `.Rmarkdown` / `.qmd` documents, everywhere we store or extract cross-file data we keep two views distinct (mirroring the `Document` type docs in `state.rs`):
 
 - **Raw content** — `DocumentStore::DocumentState.contents`, `IndexEntry.contents`, and the `cross_file_file_cache` entry stay verbatim. `ContentProvider::get_content` returns raw, serving snippets and non-R-language text scans.
 - **Masked analysis** — the `tree`, `metadata`, `artifacts`, and `loaded_packages` on those same entries are derived from `chunks::mask_to_r` (chunk bodies only). Byte offsets in the stored `tree` index into the masked text, exposed by `DocumentState::analysis_text()`; pairing the tree with raw content mis-slices.
 
-The single chokepoint helpers live in `cross_file/mod.rs`: `analysis_text_for_path(path, content)` (masks for Rmd, borrows raw otherwise) and `extract_metadata_for_path(path, content)`. Every metadata-extraction site that starts from a path-identified file's raw content (did_open, on-demand indexing, file-cache fallbacks in `state.rs`, the legacy-document arms in `content_provider.rs`) routes through these so `.Rmd` files contribute outgoing edges from chunks, never spurious prose-derived ones. `.Rmd`/`.qmd` are intentionally excluded from the proactive workspace scan (outgoing-only); incoming relationships come from an open Rmd or a `.R` file's `# raven: sourced-by` backward directive.
+The state-aware closed-file chokepoints live in `state.rs`: `WorldState::analysis_text_for_uri(uri, content)` and `WorldState::extract_metadata_for_uri(uri, content)`. They consult `WorldState::editor_chunk_kind_overrides` first, then fall back to path classification, so extension-mismatched Rmd/Quarto files keep masking after close. The pure path-based helpers in `cross_file/mod.rs` — `analysis_text_for_path(path, content)` and `extract_metadata_for_path(path, content)` — remain for call sites that have raw content but no `WorldState`; their classifier masks `.Rmd` / `.Rmarkdown` / `.qmd` documents and borrows raw otherwise. Raw-content fallbacks therefore still contribute outgoing edges from chunks, never spurious prose-derived ones. `.Rmd` / `.Rmarkdown` / `.qmd` are intentionally excluded from the proactive workspace scan (outgoing-only); incoming relationships come from an open Rmd/Quarto document or a `.R` file's `# raven: sourced-by` backward directive.
 
 ## Package library internals
 
