@@ -302,6 +302,8 @@ See [Configuration](configuration.md) for the setting.
 
 While a file is open, its buffer is authoritative: unsaved edits that add or remove `source()` calls or directives update the dependency graph live, and disk changes to that file are ignored until it closes.
 
+This authority is by exact LSP file URI. Symlink spellings and case aliases are separate identities, so an open buffer under one spelling does not automatically stand in for a watcher event or `source()` edge under another. See [Limitations: symlink and case aliases](limitations.md#language-server).
+
 When you close a file without saving, Raven re-reads just that file from disk and converges the graph back to disk truth — a `source()` edge added only in the discarded buffer disappears, and an edge the buffer had removed comes back. If the file no longer exists on disk, its graph entry is removed entirely. Open files that depend on it have their diagnostics refreshed automatically. This never triggers a workspace rescan, and reopening the file immediately always wins over the disk re-read.
 
 ### Traversal budgets in large workspaces
