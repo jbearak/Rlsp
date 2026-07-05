@@ -263,11 +263,7 @@ pub fn is_dev_context_path(path: &Path, workspace_root: &Path) -> bool {
     let Some(rel) = path.strip_prefix(workspace_root).ok() else {
         return false;
     };
-    let is_r_extension = matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("R" | "r" | "Rmd" | "rmd" | "qmd")
-    );
-    if !is_r_extension {
+    if !is_r_or_chunk_extension(path) {
         return false;
     }
     let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
@@ -286,11 +282,7 @@ pub fn is_built_doc_dir_path(path: &Path, workspace_root: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(workspace_root) else {
         return false;
     };
-    let is_r_extension = matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("R" | "r" | "Rmd" | "rmd" | "qmd")
-    );
-    if !is_r_extension {
+    if !is_r_or_chunk_extension(path) {
         return false;
     }
     let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
@@ -317,10 +309,24 @@ pub fn is_package_workspace_r_file(path: &Path, workspace_root: &Path) -> bool {
     if path.strip_prefix(workspace_root).is_err() {
         return false;
     }
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("R" | "r" | "Rmd" | "rmd" | "qmd")
-    )
+    is_r_or_chunk_extension(path)
+}
+
+/// Shared extension test backing [`is_dev_context_path`], [`is_built_doc_dir_path`],
+/// and [`is_package_workspace_r_file`] (issue #582) so the three predicates
+/// cannot drift from each other or from the canonical chunk classifier.
+///
+/// True for a plain R source extension (`.R`/`.r`, matched case-sensitively —
+/// there is no other real-world casing of a single-letter extension) or for
+/// any chunk-bearing document extension recognized by
+/// [`crate::chunks::classify_chunk_document`] (`.Rmd`/`.Rmarkdown`/`.qmd`,
+/// matched case-insensitively since that classifier lowercases the whole
+/// path before comparing suffixes).
+fn is_r_or_chunk_extension(path: &Path) -> bool {
+    if matches!(path.extension().and_then(|e| e.to_str()), Some("R" | "r")) {
+        return true;
+    }
+    crate::chunks::classify_chunk_document(&path.to_string_lossy()) == crate::chunks::ChunkKind::Rmd
 }
 
 /// Synchronously scan `<workspace_root>/data/` for dataset names.
@@ -693,6 +699,11 @@ mod path_tests {
             root
         ));
         assert!(is_dev_context_path(
+            Path::new("/work/pkg/vignettes/intro.Rmarkdown"),
+            root
+        ));
+        assert!(is_dev_context_path(Path::new("/work/pkg/demo/x.QMD"), root));
+        assert!(is_dev_context_path(
             Path::new("/work/pkg/man/rmd/topic.Rmd"),
             root
         ));
@@ -770,6 +781,10 @@ mod path_tests {
             Path::new("/work/pkg/inst/data.csv"),
             root
         ));
+        assert!(!is_dev_context_path(
+            Path::new("/work/pkg/demo/readme.txt"),
+            root
+        ));
         // Random dir
         assert!(!is_dev_context_path(
             Path::new("/work/pkg/src/code.R"),
@@ -784,8 +799,16 @@ mod path_tests {
             Path::new("/work/pkg/vignettes/v.R"),
             root
         ));
+        assert!(is_built_doc_dir_path(
+            Path::new("/work/pkg/vignettes/intro.Rmarkdown"),
+            root
+        ));
         assert!(is_built_doc_dir_path(Path::new("/work/pkg/man/ex.R"), root));
         assert!(is_built_doc_dir_path(Path::new("/work/pkg/demo/d.R"), root));
+        assert!(is_built_doc_dir_path(
+            Path::new("/work/pkg/demo/x.QMD"),
+            root
+        ));
         // data-raw is APPLIED to (not a built doc dir) — narrower than is_dev_context_path.
         assert!(!is_built_doc_dir_path(
             Path::new("/work/pkg/data-raw/prep.R"),
@@ -793,6 +816,10 @@ mod path_tests {
         ));
         assert!(!is_built_doc_dir_path(
             Path::new("/work/pkg/scripts/a.R"),
+            root
+        ));
+        assert!(!is_built_doc_dir_path(
+            Path::new("/work/pkg/demo/readme.txt"),
             root
         ));
     }
@@ -1139,11 +1166,19 @@ mod scan_data_tests {
             root
         ));
         assert!(is_package_workspace_r_file(
+            Path::new("/work/pkg/vignettes/intro.Rmarkdown"),
+            root
+        ));
+        assert!(is_package_workspace_r_file(
             Path::new("/work/pkg/inst/script.R"),
             root
         ));
         assert!(is_package_workspace_r_file(
             Path::new("/work/pkg/demo/demo.R"),
+            root
+        ));
+        assert!(is_package_workspace_r_file(
+            Path::new("/work/pkg/demo/x.QMD"),
             root
         ));
         assert!(is_package_workspace_r_file(
@@ -1161,6 +1196,10 @@ mod scan_data_tests {
         ));
         assert!(!is_package_workspace_r_file(
             Path::new("/work/pkg/data/foo.csv"),
+            root
+        ));
+        assert!(!is_package_workspace_r_file(
+            Path::new("/work/pkg/demo/readme.txt"),
             root
         ));
     }
