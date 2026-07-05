@@ -5539,6 +5539,7 @@ impl LanguageServer for Backend {
             // On-demand indexing: Collect sourced files that need indexing
             // Synchronous indexing: Files directly sourced by this open document and backward directive targets
             let mut files_to_index = Vec::new();
+            let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
 
             if on_demand_enabled {
                 let path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
@@ -5573,29 +5574,60 @@ impl LanguageServer for Backend {
                 }
 
                 // Files referenced by backward directives
-                let backward_ctx = crate::cross_file::path_resolve::PathContext::new(
-                    &uri_clone,
-                    workspace_root.as_ref(),
-                );
+                if graph_roots.len() == 1 && graph_roots[0] == uri_clone {
+                    let backward_ctx = crate::cross_file::path_resolve::PathContext::new(
+                        &uri_clone,
+                        workspace_root.as_ref(),
+                    );
 
-                for directive in &meta.sourced_by {
-                    if let Some(ctx) = backward_ctx.as_ref()
-                        && let Some(resolved) =
-                            crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
-                        && let Ok(parent_uri) = Url::from_file_path(resolved)
-                        && !state.is_document_open_or_alias(&parent_uri)
-                        && !state.cross_file_workspace_index.contains(&parent_uri)
-                    {
-                        log::trace!(
-                            "Scheduling on-demand indexing for parent file: {}",
-                            parent_uri
+                    for directive in &meta.sourced_by {
+                        if let Some(ctx) = backward_ctx.as_ref()
+                            && let Some(resolved) =
+                                crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
+                            && let Ok(parent_uri) = Url::from_file_path(resolved)
+                            && !state.is_document_open_or_alias(&parent_uri)
+                            && !state.cross_file_workspace_index.contains(&parent_uri)
+                        {
+                            log::trace!(
+                                "Scheduling on-demand indexing for parent file: {}",
+                                parent_uri
+                            );
+                            files_to_index.push((parent_uri, IndexCategory::BackwardDirective));
+                        }
+                    }
+                } else {
+                    for root in &graph_roots {
+                        let backward_ctx = crate::cross_file::path_resolve::PathContext::new(
+                            root,
+                            workspace_root.as_ref(),
                         );
-                        files_to_index.push((parent_uri, IndexCategory::BackwardDirective));
+
+                        for directive in &meta.sourced_by {
+                            if let Some(ctx) = backward_ctx.as_ref()
+                                && let Some(resolved) =
+                                    crate::cross_file::path_resolve::resolve_path(
+                                        &directive.path,
+                                        ctx,
+                                    )
+                                && let Ok(parent_uri) = Url::from_file_path(resolved)
+                                && !state.is_document_open_or_alias(&parent_uri)
+                                && !state.cross_file_workspace_index.contains(&parent_uri)
+                                && !files_to_index.iter().any(|(uri, category)| {
+                                    *category == IndexCategory::BackwardDirective
+                                        && uri == &parent_uri
+                                })
+                            {
+                                log::trace!(
+                                    "Scheduling on-demand indexing for parent file: {}",
+                                    parent_uri
+                                );
+                                files_to_index.push((parent_uri, IndexCategory::BackwardDirective));
+                            }
+                        }
                     }
                 }
             }
 
-            let graph_roots = state.authoritative_revalidation_roots_for_uri(&uri);
             let result = update_cross_file_graph_for_roots(
                 &mut state,
                 &graph_roots,
@@ -17134,6 +17166,106 @@ mod project_config_initialize_tests {
         assert!(
             canonical_backward.call_site_column.is_some(),
             "canonical mirror must retain a concrete inferred call-site column"
+        );
+    }
+
+    /// Issue #567 round 4: opening a child through a directory symlink must
+    /// on-demand index backward-directive parents for every authoritative graph
+    /// root. The canonical parent starts absent from open docs, the file cache,
+    /// and both indexes, so this exercises the production `did_open` path rather
+    /// than the manual preloading path above.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn symlink_backward_directive_did_open_indexes_canonical_parent_for_call_site() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+
+        let parent = "source(\"sub/child.R\")\npost_source_parent <- function() 2\n";
+        let child = "# raven: sourced-by ../parent.R\nchild_fn <- function() 1\n";
+        fs::write(real.join("parent.R"), parent).unwrap();
+        fs::write(real.join("sub").join("child.R"), child).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let parent_uri = Url::from_file_path(real.join("parent.R")).unwrap();
+        let link_parent_uri =
+            Url::from_file_path(tmp.path().join("link").join("parent.R")).unwrap();
+        let child_uri = Url::from_file_path(real.join("sub").join("child.R")).unwrap();
+        let link_child_uri =
+            Url::from_file_path(tmp.path().join("link").join("sub").join("child.R")).unwrap();
+
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+            assert!(
+                state.cross_file_config.on_demand_indexing_enabled,
+                "precondition: did_open must use on-demand indexing"
+            );
+            for parent_root in [&link_parent_uri, &parent_uri] {
+                assert!(
+                    !state.documents.contains_key(parent_root),
+                    "precondition: parent must not be open before did_open: {parent_root}"
+                );
+                assert!(
+                    !state.workspace_index_new.contains(parent_root),
+                    "precondition: parent must not be in workspace_index_new before did_open: {parent_root}"
+                );
+                assert!(
+                    !state.cross_file_workspace_index.contains(parent_root),
+                    "precondition: parent must not be in cross_file_workspace_index before did_open: {parent_root}"
+                );
+                assert!(
+                    state.cross_file_file_cache.get(parent_root).is_none(),
+                    "precondition: parent must not be in file cache before did_open: {parent_root}"
+                );
+                assert!(
+                    state.content_provider().get_content(parent_root).is_none(),
+                    "precondition: content provider must not have parent content before did_open: {parent_root}"
+                );
+            }
+        }
+
+        open_doc(backend, &link_child_uri, "r", 1, child).await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&child_uri),
+            Some(link_child_uri.clone()),
+            "canonical child URI must resolve to the symlink-open buffer"
+        );
+
+        let canonical_backward = state
+            .cross_file_graph
+            .get_dependents(&child_uri)
+            .into_iter()
+            .find(|edge| edge.from == parent_uri && edge.is_backward_directive)
+            .expect("canonical root must have a backward-directive edge");
+        assert_eq!(
+            canonical_backward.call_site_line,
+            Some(0),
+            "did_open must infer the canonical edge's source() call site from the canonical parent"
+        );
+        assert!(
+            canonical_backward.call_site_column.is_some(),
+            "canonical edge must retain a concrete inferred call-site column"
         );
     }
 
