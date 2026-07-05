@@ -569,6 +569,11 @@ pub struct WorldState {
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
+    /// Per-URI generation bumped by each watched-file event that can mutate
+    /// closed-file state. Delayed undecodable-file retries capture a
+    /// generation and re-check it at commit time so a newer watcher event
+    /// supersedes any pending retry for the same URI.
+    pub watched_file_resync_generations: HashMap<Url, u64>,
     /// Handle to the running libpath watcher, if any. Dropping it stops watching.
     pub libpath_watcher_handle:
         Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
@@ -776,6 +781,7 @@ impl WorldState {
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
+            watched_file_resync_generations: HashMap::new(),
             libpath_watcher_handle: None,
             package_library_ready: false,
             workspace_scan_complete: false,
