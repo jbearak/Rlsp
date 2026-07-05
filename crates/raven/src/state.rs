@@ -846,7 +846,7 @@ impl WorldState {
     /// the current project exclusions.
     ///
     /// Open project-excluded documents remain in the document stores so their
-    /// buffers can stay authoritative and publish empty diagnostics, but they
+    /// buffers can stay authoritative and publish live diagnostics, but they
     /// must not lend symbols to non-excluded files. The graph is intentionally
     /// exclusion-agnostic, so callers pass this filtered view when updating
     /// graph edges. The original metadata is preserved for diagnostics such as
@@ -2075,6 +2075,9 @@ impl WorldState {
                     workspace_root.as_ref(),
                     get_content,
                 );
+                if self.is_project_excluded_uri(&uri) || self.is_project_excluded_uri(root) {
+                    self.cross_file_graph.make_forward_edges_non_lending(root);
+                }
             }
             if resolution_changed && !changed_uris.contains(&uri) {
                 changed_uris.push(uri);

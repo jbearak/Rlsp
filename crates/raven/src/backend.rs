@@ -1615,14 +1615,18 @@ fn remirror_authoritative_alias_roots_after_close(
             root_meta.as_ref(),
             workspace_root.as_ref(),
         );
-        edges_changed |= result.edges_changed;
+        let mut root_edges_changed = result.edges_changed;
+        if state.is_project_excluded_uri(&open_uri) || state.is_project_excluded_uri(root) {
+            root_edges_changed |= state.cross_file_graph.make_forward_edges_non_lending(root);
+        }
+        edges_changed |= root_edges_changed;
 
         let interface_changed = old_interface_hash != Some(new_interface_hash);
-        if interface_changed || result.edges_changed {
+        if interface_changed || root_edges_changed {
             for dep in state.affected_open_dependents_after_edit(
                 root,
                 interface_changed,
-                result.edges_changed,
+                root_edges_changed,
             ) {
                 if affected_set.insert(dep.clone()) {
                     affected.push(dep);
@@ -2934,19 +2938,17 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
 
     for (uri, text, version, chunk_kind) in open_docs {
         if state.is_project_excluded_uri(&uri) {
+            let workspace_root = state.workspace_folders.first().cloned();
+            let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
+            let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
             state
                 .document_store
-                .open_with_metadata(
-                    uri.clone(),
-                    &text,
-                    version,
-                    chunk_kind,
-                    crate::cross_file::CrossFileMetadata::default(),
-                )
+                .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
                 .await;
             for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
                 remove_file_from_cross_file_state(state, &graph_root);
             }
+            update_project_excluded_live_graph(state, &uri, &meta, workspace_root.as_ref());
             continue;
         }
 
@@ -3175,6 +3177,93 @@ fn collect_backward_parent_content(
         .collect()
 }
 
+fn extract_enriched_live_metadata(
+    state: &WorldState,
+    uri: &Url,
+    analysis_text: &str,
+) -> crate::cross_file::CrossFileMetadata {
+    let mut meta = crate::cross_file::extract_metadata(analysis_text);
+    let workspace_root = state.workspace_folders.first().cloned();
+    let max_chain_depth = state.cross_file_config.max_chain_depth;
+
+    crate::cross_file::enrich_metadata_with_inherited_wd(
+        &mut meta,
+        uri,
+        workspace_root.as_ref(),
+        |parent_uri| state.get_enriched_metadata(parent_uri),
+        max_chain_depth,
+    );
+
+    let ws = state.package_state.workspace();
+    let ws_name = ws.map(|w| w.name.as_str());
+    let ws_root = ws.map(|w| w.root.as_path());
+    let lib_paths = state.package_library.lib_paths();
+    crate::cross_file::resolve_system_file_sources(&mut meta, ws_name, ws_root, lib_paths);
+
+    meta
+}
+
+fn source_targets_to_index_for_live_diagnostics(
+    state: &WorldState,
+    uri: &Url,
+    meta: &crate::cross_file::CrossFileMetadata,
+    workspace_root: Option<&Url>,
+) -> Vec<Url> {
+    let mut files_to_index = Vec::new();
+    let path_ctx =
+        crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_root);
+
+    for source in &meta.sources {
+        let source_uri = source.resolved_uri.clone().or_else(|| {
+            path_ctx.as_ref().and_then(|ctx| {
+                let resolved =
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        ctx,
+                    )?;
+                Url::from_file_path(resolved).ok()
+            })
+        });
+        if let Some(source_uri) = source_uri
+            && !state.is_project_excluded_uri(&source_uri)
+            && !state.is_document_open_or_alias(&source_uri)
+            && !state.workspace_index_new.contains(&source_uri)
+            && !state.cross_file_workspace_index.contains(&source_uri)
+            && !files_to_index.contains(&source_uri)
+        {
+            files_to_index.push(source_uri);
+        }
+    }
+
+    files_to_index
+}
+
+fn update_project_excluded_live_graph(
+    state: &mut WorldState,
+    uri: &Url,
+    meta: &crate::cross_file::CrossFileMetadata,
+    workspace_root: Option<&Url>,
+) {
+    let graph_roots = state.authoritative_revalidation_roots_for_uri(uri);
+    let input_root = graph_roots.first().unwrap_or(uri);
+    for graph_root in &graph_roots {
+        let graph_meta =
+            metadata_for_graph_root(state, graph_root, input_root, meta, workspace_root);
+        let parent_content =
+            collect_backward_parent_content(state, graph_root, workspace_root, graph_meta.as_ref());
+        state.cross_file_graph.update_file(
+            graph_root,
+            graph_meta.as_ref(),
+            workspace_root,
+            |parent_uri| parent_content.get(parent_uri).cloned(),
+        );
+        state
+            .cross_file_graph
+            .make_forward_edges_non_lending(graph_root);
+    }
+    state.recompute_open_neighborhood_pins();
+}
+
 fn metadata_for_graph_root<'a>(
     state: &WorldState,
     root: &Url,
@@ -3219,6 +3308,11 @@ fn update_cross_file_graph_for_roots(
         workspace_root,
         |parent_uri| parent_content.get(parent_uri).cloned(),
     );
+    if state.is_project_excluded_uri(first_root) {
+        result.edges_changed |= state
+            .cross_file_graph
+            .make_forward_edges_non_lending(first_root);
+    }
 
     for root in roots {
         let root_meta = metadata_for_graph_root(state, root, first_root, meta, workspace_root);
@@ -3231,6 +3325,9 @@ fn update_cross_file_graph_for_roots(
             |parent_uri| parent_content.get(parent_uri).cloned(),
         );
         result.edges_changed |= root_result.edges_changed;
+        if state.is_project_excluded_uri(root) {
+            result.edges_changed |= state.cross_file_graph.make_forward_edges_non_lending(root);
+        }
     }
 
     result
@@ -3821,7 +3918,13 @@ async fn resync_file_from_disk(
                 workspace_root.as_ref(),
                 |u| pc.get(u).cloned(),
             );
-            parent_edges_restored |= res.edges_changed;
+            let mut parent_edges_changed = res.edges_changed;
+            if state.is_project_excluded_uri(&parent) {
+                parent_edges_changed |= state
+                    .cross_file_graph
+                    .make_forward_edges_non_lending(&parent);
+            }
+            parent_edges_restored |= parent_edges_changed;
         }
     }
 
@@ -5828,17 +5931,34 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
 
             if state.is_project_excluded_uri(&uri) {
-                let (chunk_kind, _) =
+                let workspace_root = state.workspace_folders.first().cloned();
+                let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
+                let max_forward_depth = state.cross_file_config.max_forward_depth;
+                let packages_enabled = state.cross_file_config.packages_enabled;
+                let (chunk_kind, analysis_text) =
                     crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
+                let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
+                let files_to_index = if on_demand_enabled {
+                    source_targets_to_index_for_live_diagnostics(
+                        &state,
+                        &uri,
+                        &meta,
+                        workspace_root.as_ref(),
+                    )
+                } else {
+                    Vec::new()
+                };
+                let packages_to_prefetch = if packages_enabled {
+                    let mut packages =
+                        extract_loaded_packages_from_library_calls(&meta.library_calls);
+                    packages.extend(namespace_warm_packages(&meta));
+                    packages
+                } else {
+                    Vec::new()
+                };
                 state
                     .document_store
-                    .open_with_metadata(
-                        uri.clone(),
-                        &text,
-                        version,
-                        chunk_kind,
-                        crate::cross_file::CrossFileMetadata::default(),
-                    )
+                    .open_with_metadata(uri.clone(), &text, version, chunk_kind, meta.clone())
                     .await;
                 state.open_document_with_language_id(
                     uri.clone(),
@@ -5850,7 +5970,29 @@ impl LanguageServer for Backend {
                 for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
                     remove_file_from_cross_file_state(&mut state, &graph_root);
                 }
+                update_project_excluded_live_graph(
+                    &mut state,
+                    &uri,
+                    &meta,
+                    workspace_root.as_ref(),
+                );
                 drop(state);
+                if packages_enabled && !packages_to_prefetch.is_empty() {
+                    let _ = self.ensure_package_library_initialized().await;
+                    let package_library = self.state.read().await.package_library.clone();
+                    package_library
+                        .prefetch_packages(&packages_to_prefetch)
+                        .await;
+                }
+                if on_demand_enabled {
+                    for file_uri in files_to_index {
+                        self.index_file_on_demand(&file_uri).await;
+                    }
+                    if max_forward_depth > 0 {
+                        self.index_forward_chain(&uri, max_forward_depth, workspace_root.as_ref())
+                            .await;
+                    }
+                }
                 self.publish_diagnostics(&uri).await;
                 return;
             }
@@ -6751,27 +6893,75 @@ impl LanguageServer for Backend {
             let mut state = self.state.write().await;
 
             if state.is_project_excluded_uri(&uri) {
+                let workspace_root = state.workspace_folders.first().cloned();
+                let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
+                let max_forward_depth = state.cross_file_config.max_forward_depth;
+                let packages_enabled = state.cross_file_config.packages_enabled;
                 if let Some(doc) = state.documents.get_mut(&uri) {
                     doc.version = Some(version);
                 }
                 for change in changes.clone() {
                     state.apply_change(&uri, change);
                 }
+                let (meta, precomputed_masked) = state
+                    .documents
+                    .get(&uri)
+                    .map(|doc| {
+                        let analysis_text = doc.analysis_text();
+                        let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
+                        let precomputed_masked = doc.is_rmd_document().then_some(analysis_text);
+                        (meta, precomputed_masked)
+                    })
+                    .unwrap_or_default();
+                let files_to_index = if on_demand_enabled {
+                    source_targets_to_index_for_live_diagnostics(
+                        &state,
+                        &uri,
+                        &meta,
+                        workspace_root.as_ref(),
+                    )
+                } else {
+                    Vec::new()
+                };
+                let packages_to_prefetch = if packages_enabled {
+                    let mut packages =
+                        extract_loaded_packages_from_library_calls(&meta.library_calls);
+                    packages.extend(namespace_warm_packages(&meta));
+                    packages
+                } else {
+                    Vec::new()
+                };
                 state
                     .document_store
-                    .update_with_metadata(
-                        &uri,
-                        changes,
-                        version,
-                        crate::cross_file::CrossFileMetadata::default(),
-                        None,
-                    )
+                    .update_with_metadata(&uri, changes, version, meta.clone(), precomputed_masked)
                     .await;
                 state.cross_file_activity.record_recent(uri.clone());
                 for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
                     remove_file_from_cross_file_state(&mut state, &graph_root);
                 }
+                update_project_excluded_live_graph(
+                    &mut state,
+                    &uri,
+                    &meta,
+                    workspace_root.as_ref(),
+                );
                 drop(state);
+                if packages_enabled && !packages_to_prefetch.is_empty() {
+                    let _ = self.ensure_package_library_initialized().await;
+                    let package_library = self.state.read().await.package_library.clone();
+                    package_library
+                        .prefetch_packages(&packages_to_prefetch)
+                        .await;
+                }
+                if on_demand_enabled {
+                    for file_uri in files_to_index {
+                        self.index_file_on_demand(&file_uri).await;
+                    }
+                    if max_forward_depth > 0 {
+                        self.index_forward_chain(&uri, max_forward_depth, workspace_root.as_ref())
+                            .await;
+                    }
+                }
                 self.publish_diagnostics(&uri).await;
                 return;
             }
@@ -10363,7 +10553,6 @@ pub(crate) async fn publish_diagnostics_inner(
         workspace_folder,
         missing_file_severity,
         case_mismatch_severity,
-        project_excluded,
     ) = {
         let state = state_arc.read().await;
         let version = state.documents.get(uri).and_then(|d| d.version);
@@ -10392,12 +10581,11 @@ pub(crate) async fn publish_diagnostics_inner(
         // that flips `diagnostics.enabled` to `false` could still
         // publish missing-file diagnostics from the async phase.
         let diagnostics_enabled = state.cross_file_config.diagnostics_enabled;
-        let project_excluded = state.is_project_excluded_uri(uri);
 
         // Skip the snapshot build entirely when the master switch is
         // off — saves the snapshot's metadata clone + neighborhood walk.
         // Mirrors the early-exit in `handlers::diagnostics`.
-        let snapshot = if diagnostics_enabled && !project_excluded {
+        let snapshot = if diagnostics_enabled {
             handlers::DiagnosticsSnapshot::build(&state, uri)
         } else {
             None
@@ -10430,7 +10618,6 @@ pub(crate) async fn publish_diagnostics_inner(
             workspace_folder,
             missing_file_severity,
             case_mismatch_severity,
-            project_excluded,
         )
     };
     // Read lock released — scope resolution and async I/O run unlocked.
@@ -10457,7 +10644,7 @@ pub(crate) async fn publish_diagnostics_inner(
     // publishing missing-file diagnostics while the sync phase was
     // empty. When disabled, publish an explicit empty `Vec` so the
     // client clears any prior diagnostics for the URI.
-    let diagnostics = if diagnostics_enabled && !project_excluded {
+    let diagnostics = if diagnostics_enabled {
         handlers::diagnostics_async_standalone(
             uri,
             sync_diagnostics,
@@ -16040,6 +16227,583 @@ mod project_config_initialize_tests {
                 .iter()
                 .any(|edge| edge.to == helper_uri),
             "exclusion reload must replay the live buffer after applying disk scan topology"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_project_excluded_file_publishes_live_diagnostics() {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::Request;
+        use tower_lsp::lsp_types::{
+            DidOpenTextDocumentParams, PublishDiagnosticsParams, TextDocumentItem,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let excluded_uri =
+            Url::from_file_path(tmp.path().join("generated").join("live.R")).unwrap();
+
+        let (mut svc, mut socket) = tower_lsp::LspService::new(Backend::new);
+        let initialize = Request::build("initialize")
+            .id(1)
+            .params(
+                serde_json::to_value(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri: root,
+                        name: "t".into(),
+                    }]),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+        assert!(response.is_some_and(|response| response.is_ok()));
+        svc.inner().state.write().await.workspace_scan_complete = true;
+
+        let did_open = Request::build("textDocument/didOpen")
+            .params(
+                serde_json::to_value(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: excluded_uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: "definitely_missing_symbol_572\n".into(),
+                    },
+                })
+                .unwrap(),
+            )
+            .finish();
+        let response = svc.ready().await.unwrap().call(did_open).await.unwrap();
+        assert!(response.is_none());
+
+        let request = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("excluded open must publish diagnostics")
+            .expect("diagnostics notification must be present");
+        assert_eq!(request.method(), "textDocument/publishDiagnostics");
+        let params: PublishDiagnosticsParams =
+            serde_json::from_value(request.params().expect("publish params").clone()).unwrap();
+        assert_eq!(params.uri, excluded_uri);
+        assert!(
+            params.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("definitely_missing_symbol_572 is not defined")),
+            "excluded open buffer must publish live diagnostics, got {:?}",
+            params
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_project_excluded_file_resolves_own_non_excluded_source() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_value <- 1\n").unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        let excluded_uri = Url::from_file_path(tmp.path().join("generated").join("use.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        backend.state.write().await.workspace_scan_complete = true;
+
+        open_doc(
+            backend,
+            &excluded_uri,
+            "r",
+            1,
+            "source(\"../helper.R\")\nhelper_value\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            has_dependency_edge(&state, &excluded_uri, &helper_uri),
+            "excluded buffer should keep a forward edge for its own diagnostics"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependents(&helper_uri)
+                .is_empty(),
+            "excluded buffer must not be a parent/lender of the non-excluded helper"
+        );
+        assert!(
+            !state.workspace_index_new.contains(&excluded_uri)
+                && !state.cross_file_workspace_index.contains(&excluded_uri)
+                && !state.workspace_index.contains_key(&excluded_uri),
+            "excluded open buffer must stay out of workspace indexes"
+        );
+        assert!(
+            !snapshot_diagnostics(&state, &excluded_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("helper_value is not defined")),
+            "excluded buffer's own source() target should resolve; diagnostics: {:?}",
+            diagnostic_signature(&state, &excluded_uri)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_index_replay_preserves_project_excluded_live_source_graph() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_value <- 1\n").unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        let excluded_uri = Url::from_file_path(tmp.path().join("generated").join("use.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        open_doc(
+            backend,
+            &excluded_uri,
+            "r",
+            1,
+            "source(\"../helper.R\")\nhelper_value\n",
+        )
+        .await;
+
+        let (folders, max_chain_depth, exclusions) = {
+            let state = backend.state.read().await;
+            (
+                state.workspace_folders.clone(),
+                state.cross_file_config.max_chain_depth,
+                state.workspace_exclusions.clone(),
+            )
+        };
+        let scan_result =
+            crate::state::scan_workspace_with_exclusions(&folders, max_chain_depth, &exclusions);
+        {
+            let mut state = backend.state.write().await;
+            state.apply_workspace_index(scan_result.0, scan_result.1, scan_result.2);
+            replay_open_documents_after_workspace_index_apply(&mut state).await;
+        }
+
+        let state = backend.state.read().await;
+        assert_project_excluded_live_source_non_lending(
+            &state,
+            &excluded_uri,
+            &helper_uri,
+            "helper_value",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn system_file_reresolution_keeps_project_excluded_open_buffer_non_lending() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+
+        let libdir = TempDir::new().unwrap();
+        let pkg_dir = libdir.path().join("otherpkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("helper.R"), "helper_value <- 1\n").unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let helper_uri = Url::from_file_path(pkg_dir.join("helper.R")).unwrap();
+        let excluded_uri = Url::from_file_path(tmp.path().join("generated").join("use.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        open_doc(
+            backend,
+            &excluded_uri,
+            "r",
+            1,
+            "source(system.file(\"helper.R\", package = \"otherpkg\"))\nhelper_value\n",
+        )
+        .await;
+
+        {
+            let mut state = backend.state.write().await;
+            let mut swapped = crate::package_library::PackageLibrary::new_empty();
+            swapped.set_lib_paths(vec![libdir.path().to_path_buf()]);
+            state.package_library = std::sync::Arc::new(swapped);
+
+            let changed = state.resolve_system_file_in_workspace();
+            assert!(
+                changed.iter().any(|uri| uri == &excluded_uri),
+                "system.file re-resolution must report the open excluded URI as changed, got {changed:?}"
+            );
+        }
+
+        let state = backend.state.read().await;
+        assert_project_excluded_live_source_non_lending(
+            &state,
+            &excluded_uri,
+            &helper_uri,
+            "helper_value",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alias_close_remirror_keeps_project_excluded_remaining_alias_non_lending() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        let generated = tmp.path().join("generated");
+        fs::create_dir(&real).unwrap();
+        fs::create_dir(&generated).unwrap();
+        std::os::unix::fs::symlink(&real, generated.join("a")).unwrap();
+        std::os::unix::fs::symlink(&real, generated.join("b")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(real.join("parent.R"), "source(\"child.R\")\n").unwrap();
+        fs::write(real.join("child.R"), "child_value <- 1\n").unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let alias_a = Url::from_file_path(generated.join("a").join("parent.R")).unwrap();
+        let alias_b = Url::from_file_path(generated.join("b").join("parent.R")).unwrap();
+        let canonical_parent = Url::from_file_path(real.join("parent.R")).unwrap();
+        let child_uri = Url::from_file_path(real.join("child.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        open_doc(backend, &alias_a, "r", 1, "source(\"child.R\")\n").await;
+        open_doc(backend, &alias_b, "r", 1, "source(\"child.R\")\n").await;
+
+        {
+            let state = backend.state.read().await;
+            assert!(state.is_project_excluded_uri(&alias_a));
+            assert!(state.is_project_excluded_uri(&alias_b));
+            assert!(!state.is_project_excluded_uri(&canonical_parent));
+            assert_eq!(
+                state.open_document_uri_for_authoritative_uri(&canonical_parent),
+                Some(alias_a.clone()),
+                "precondition: the first opened alias owns the canonical graph root"
+            );
+            assert!(
+                has_dependency_edge(&state, &canonical_parent, &child_uri),
+                "precondition: canonical root keeps the outgoing edge for live diagnostics"
+            );
+            assert!(
+                state.cross_file_graph.get_dependents(&child_uri).is_empty(),
+                "precondition: excluded alias must not lend through the canonical child"
+            );
+        }
+
+        let (closed_authoritative_roots, old_meta, old_interface_hash) = {
+            let state = backend.state.read().await;
+            let mut roots = Vec::new();
+            if state
+                .open_document_uri_for_authoritative_uri(&alias_a)
+                .as_ref()
+                == Some(&alias_a)
+            {
+                roots.push(alias_a.clone());
+            }
+            for alias in state.canonical_uris_for_open_document(&alias_a) {
+                if state
+                    .open_document_uri_for_authoritative_uri(&alias)
+                    .as_ref()
+                    == Some(&alias_a)
+                {
+                    roots.push(alias);
+                }
+            }
+            let old_meta = state.get_enriched_metadata(&alias_a);
+            let old_interface_hash = state
+                .document_store
+                .get_without_touch(&alias_a)
+                .map(|doc| doc.artifacts.interface_hash);
+            (roots, old_meta, old_interface_hash)
+        };
+
+        {
+            let mut state = backend.state.write().await;
+            state.document_store.close(&alias_a);
+            state.close_document(&alias_a);
+            remirror_authoritative_alias_roots_after_close(
+                &mut state,
+                &closed_authoritative_roots,
+                old_meta.as_deref(),
+                old_interface_hash,
+            );
+        }
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&canonical_parent),
+            Some(alias_b.clone()),
+            "closing the first alias must promote the remaining alias"
+        );
+        assert!(
+            has_dependency_edge(&state, &canonical_parent, &child_uri),
+            "remirror should preserve the canonical root's outgoing edge"
+        );
+        assert!(
+            state.cross_file_graph.get_dependents(&child_uri).is_empty(),
+            "remirror must not recreate a reverse lending edge from the non-excluded child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_excluded_alias_with_project_excluded_canonical_root_is_non_lending() {
+        let tmp = TempDir::new().unwrap();
+        let generated = tmp.path().join("generated");
+        let link_dir = tmp.path().join("links");
+        let target = generated.join("target");
+        fs::create_dir(&generated).unwrap();
+        fs::create_dir(&link_dir).unwrap();
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, link_dir.join("target")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_value <- 1\n").unwrap();
+        fs::write(target.join("parent.R"), "source(\"../../helper.R\")\n").unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let alias_parent = Url::from_file_path(link_dir.join("target").join("parent.R")).unwrap();
+        let canonical_parent = Url::from_file_path(target.join("parent.R")).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        open_doc(
+            backend,
+            &alias_parent,
+            "r",
+            1,
+            "source(\"../../helper.R\")\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert!(!state.is_project_excluded_uri(&alias_parent));
+        assert!(state.is_project_excluded_uri(&canonical_parent));
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&canonical_parent),
+            Some(alias_parent.clone()),
+            "the non-excluded symlink spelling should own the excluded canonical graph root"
+        );
+        assert!(
+            has_dependency_edge(&state, &canonical_parent, &helper_uri),
+            "excluded canonical root should keep its forward edge for live diagnostics"
+        );
+        assert!(
+            !state
+                .cross_file_graph
+                .get_dependents(&helper_uri)
+                .iter()
+                .any(|edge| edge.from == canonical_parent),
+            "excluded canonical root must not lend symbols through the helper's reverse edge"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn change_project_excluded_file_resolves_own_non_excluded_source() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("helper.R"), "helper_value <- 1\n").unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let helper_uri = Url::from_file_path(tmp.path().join("helper.R")).unwrap();
+        let excluded_uri = Url::from_file_path(tmp.path().join("generated").join("use.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        backend.state.write().await.workspace_scan_complete = true;
+
+        open_doc(backend, &excluded_uri, "r", 1, "helper_value\n").await;
+        change_doc(
+            backend,
+            &excluded_uri,
+            2,
+            "source(\"../helper.R\")\nhelper_value\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            has_dependency_edge(&state, &excluded_uri, &helper_uri),
+            "did_change must refresh forward graph edges for excluded live diagnostics"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependents(&helper_uri)
+                .is_empty(),
+            "did_change must not make the excluded buffer a symbol-lending parent"
+        );
+        assert!(
+            !snapshot_diagnostics(&state, &excluded_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("helper_value is not defined")),
+            "changed excluded buffer should resolve its own source() target; diagnostics: {:?}",
+            diagnostic_signature(&state, &excluded_uri)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_project_excluded_source_parent_does_not_lend_to_child() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("child.R"),
+            "child_value <- excluded_value\n",
+        )
+        .unwrap();
+
+        let root = Url::from_file_path(tmp.path()).unwrap();
+        let parent_uri =
+            Url::from_file_path(tmp.path().join("generated").join("parent.R")).unwrap();
+        let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root,
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        backend.state.write().await.workspace_scan_complete = true;
+
+        open_doc(
+            backend,
+            &parent_uri,
+            "r",
+            1,
+            "excluded_value <- 1\nsource(\"../child.R\")\n",
+        )
+        .await;
+        open_doc(
+            backend,
+            &child_uri,
+            "r",
+            1,
+            "child_value <- excluded_value\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            has_dependency_edge(&state, &parent_uri, &child_uri),
+            "excluded parent keeps forward edge for its own graph neighborhood"
+        );
+        assert!(
+            state.cross_file_graph.get_dependents(&child_uri).is_empty(),
+            "non-excluded child must not inherit the excluded parent"
+        );
+        assert!(
+            snapshot_diagnostics(&state, &child_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("excluded_value is not defined")),
+            "excluded parent symbols must remain undefined in non-excluded child; diagnostics: {:?}",
+            diagnostic_signature(&state, &child_uri)
         );
     }
 
@@ -22743,6 +23507,36 @@ lineLength = 200
         snapshot_diagnostics(state, uri)
             .iter()
             .any(|diagnostic| diagnostic.message.contains("helper_fn is not defined"))
+    }
+
+    fn assert_project_excluded_live_source_non_lending(
+        state: &WorldState,
+        excluded_uri: &Url,
+        helper_uri: &Url,
+        helper_symbol: &str,
+    ) {
+        assert!(
+            has_dependency_edge(state, excluded_uri, helper_uri),
+            "excluded buffer should keep a forward edge for its own diagnostics"
+        );
+        assert!(
+            state.cross_file_graph.get_dependents(helper_uri).is_empty(),
+            "excluded buffer must not be a parent/lender of the non-excluded helper"
+        );
+        assert!(
+            !state.workspace_index_new.contains(excluded_uri)
+                && !state.cross_file_workspace_index.contains(excluded_uri)
+                && !state.workspace_index.contains_key(excluded_uri),
+            "excluded open buffer must stay out of workspace indexes"
+        );
+        let undefined_message = format!("{helper_symbol} is not defined");
+        assert!(
+            !snapshot_diagnostics(state, excluded_uri)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(&undefined_message)),
+            "excluded buffer's own source() target should resolve; diagnostics: {:?}",
+            diagnostic_signature(state, excluded_uri)
+        );
     }
 
     fn diagnostic_signature(state: &WorldState, uri: &Url) -> Vec<(u32, String)> {
