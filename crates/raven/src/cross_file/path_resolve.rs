@@ -550,7 +550,7 @@ fn resolve_single_ci_match(base: &Path, full: &Path) -> Option<PathBuf> {
 /// `base` must resolve to an exact entry or to exactly one case-insensitive
 /// match (via [`real_entry_name_unique`]). Returns `None` if any component has
 /// no match or 2+ case-insensitive matches. Issue #530.
-fn canonicalize_case_below_unique(base: &Path, full: &Path) -> Option<PathBuf> {
+pub(crate) fn canonicalize_case_below_unique(base: &Path, full: &Path) -> Option<PathBuf> {
     let suffix = full.strip_prefix(base).ok()?;
     let mut result = base.to_path_buf();
     for component in suffix.components() {

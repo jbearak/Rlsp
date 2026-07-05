@@ -26,6 +26,7 @@ use tower_lsp::jsonrpc::{
 };
 use tower_lsp::lsp_types::*;
 
+use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::indentation;
 use crate::state::{IndentationSettings, SymbolConfig, WorldState, scan_workspace};
@@ -1580,15 +1581,7 @@ fn extend_with_watched_pre_update_dependents(
     // because their inherited scope is taken from this file's symbols at the
     // source() call. Even when edges do not change, the file's interface may,
     // so this pre-update fanout is kept for delayed undecodable retries too.
-    let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-        uri,
-        true,
-        false,
-        &state.cross_file_graph,
-        |u| state.documents.contains_key(u),
-        state.cross_file_config.max_chain_depth,
-        state.cross_file_config.max_transitive_dependents_visited,
-    );
+    let neighbors = state.affected_open_dependents_after_edit(uri, true, false);
     for dep in neighbors {
         if affected_set.insert(dep.clone()) {
             affected.push(dep);
@@ -1806,7 +1799,7 @@ fn watched_manifest_change_for_uri(
     uri: &Url,
     deleted: bool,
 ) -> Option<(Url, bool)> {
-    if state.documents.contains_key(uri) {
+    if state.is_document_open_or_alias(uri) {
         return None;
     }
     let workspace_root = state
@@ -1917,7 +1910,7 @@ async fn apply_watched_manifest_changes(
     let mut state = state_arc.write().await;
     let mut deltas = Vec::new();
     for (uri, payload, deleted, generation_expectation) in manifest_contents {
-        if state.documents.contains_key(&uri) {
+        if state.is_document_open_or_alias(&uri) {
             log::trace!(
                 "Skipping watched manifest package-input event for open document: {}",
                 uri
@@ -2635,15 +2628,7 @@ pub(crate) fn sysdata_r_fallback_needed(state: &WorldState) -> bool {
 /// `did_close` disk-resync path (issue #558), so removal semantics cannot
 /// drift between them.
 fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<Url> {
-    let neighbors = crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-        uri,
-        true,
-        false,
-        &state.cross_file_graph,
-        |u| state.documents.contains_key(u),
-        state.cross_file_config.max_chain_depth,
-        state.cross_file_config.max_transitive_dependents_visited,
-    );
+    let neighbors = state.affected_open_dependents_after_edit(uri, true, false);
 
     state.workspace_index_new.invalidate(uri);
     state.cross_file_graph.remove_file(uri);
@@ -2684,11 +2669,7 @@ fn collect_backward_parent_content(
             let ctx = backward_path_ctx.as_ref()?;
             let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
             let parent_uri = Url::from_file_path(resolved).ok()?;
-            let content = state
-                .documents
-                .get(&parent_uri)
-                .map(|doc| doc.text())
-                .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+            let content = state.content_provider().get_content(&parent_uri)?;
             Some((parent_uri, content))
         })
         .collect()
@@ -2913,7 +2894,7 @@ async fn resync_missing_file(
     expected_watched_generation: Option<u64>,
 ) -> ResyncOutcome {
     let mut state = state_arc.write().await;
-    if state.documents.contains_key(uri) {
+    if state.is_document_open_or_alias(uri) {
         return ResyncOutcome::Vetoed;
     }
     if !expected_watched_generation_is_current(&state, uri, expected_watched_generation) {
@@ -2999,7 +2980,7 @@ async fn resync_file_from_disk(
     // veto below remains the correctness gate.
     {
         let state = state_arc.read().await;
-        if state.documents.contains_key(uri) {
+        if state.is_document_open_or_alias(uri) {
             log::trace!("Disk resync preflight-vetoed by open document: {}", uri);
             return ResyncOutcome::Vetoed;
         }
@@ -3090,7 +3071,7 @@ async fn resync_file_from_disk(
     // Single write-lock commit. The reopen veto MUST stay the first statement
     // under the lock: nothing above mutated shared state, so a veto is total.
     let mut state = state_arc.write().await;
-    if state.documents.contains_key(uri) {
+    if state.is_document_open_or_alias(uri) {
         log::trace!("Disk resync vetoed by reopen: {}", uri);
         return ResyncOutcome::Vetoed;
     }
@@ -3268,8 +3249,10 @@ async fn resync_file_from_disk(
     let mut affected: Vec<Url> = Vec::new();
     let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
     for child in wd_children {
-        if state.documents.contains_key(&child) && affected_set.insert(child.clone()) {
-            affected.push(child);
+        if let Some(open_child) = state.open_document_uri_for_authoritative_uri(&child)
+            && affected_set.insert(open_child.clone())
+        {
+            affected.push(open_child);
         }
     }
 
@@ -3278,16 +3261,7 @@ async fn resync_file_from_disk(
     // call) — or a restored open-parent edge — is invisible to pre-update
     // walks the caller may have done.
     if graph_result.edges_changed || parent_edges_restored {
-        let post_neighbors =
-            crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                uri,
-                true,
-                true,
-                &state.cross_file_graph,
-                |u| state.documents.contains_key(u),
-                state.cross_file_config.max_chain_depth,
-                state.cross_file_config.max_transitive_dependents_visited,
-            );
+        let post_neighbors = state.affected_open_dependents_after_edit(uri, true, true);
         for dep in post_neighbors {
             if affected_set.insert(dep.clone()) {
                 affected.push(dep);
@@ -3372,15 +3346,7 @@ async fn run_close_resync(
     // that replaces them, and it runs strictly after this walk.
     let pre_affected: Vec<Url> = {
         let state = state_arc.read().await;
-        crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-            &uri,
-            true,
-            false,
-            &state.cross_file_graph,
-            |u| state.documents.contains_key(u),
-            state.cross_file_config.max_chain_depth,
-            state.cross_file_config.max_transitive_dependents_visited,
-        )
+        state.affected_open_dependents_after_edit(&uri, true, false)
     };
 
     let (post, interface_changed, committed) =
@@ -3427,16 +3393,7 @@ async fn run_close_resync(
         // capture and this commit — e.g. closing a parent and child together
         // where the parent's disk content re-adds the parent -> child edge.
         if committed && interface_changed {
-            let post_commit_deps =
-                crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                    &uri,
-                    true,
-                    false,
-                    &state.cross_file_graph,
-                    |u| state.documents.contains_key(u),
-                    state.cross_file_config.max_chain_depth,
-                    state.cross_file_config.max_transitive_dependents_visited,
-                );
+            let post_commit_deps = state.affected_open_dependents_after_edit(&uri, true, false);
             for dep in post_commit_deps {
                 if seen.insert(dep.clone()) {
                     affected.push(dep);
@@ -3777,7 +3734,7 @@ async fn apply_watched_r_file_package_input_events(
         // open-file fanout below.
         let old_contribution = state.package_state.scope_contribution().clone();
         for event in package_events {
-            if state.documents.contains_key(&event.uri) {
+            if state.is_document_open_or_alias(&event.uri) {
                 continue; // open docs are authoritative; skip
             }
             // Use the file cache content (already inserted above). Removal
@@ -5383,7 +5340,7 @@ impl LanguageServer for Backend {
                     });
                     if let Some(source_uri) = source_uri_opt {
                         // Check if file needs indexing (not open, not in workspace index)
-                        if !state.documents.contains_key(&source_uri)
+                        if !state.is_document_open_or_alias(&source_uri)
                             && !state.cross_file_workspace_index.contains(&source_uri)
                         {
                             log::trace!(
@@ -5406,7 +5363,7 @@ impl LanguageServer for Backend {
                         && let Some(resolved) =
                             crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
                         && let Ok(parent_uri) = Url::from_file_path(resolved)
-                        && !state.documents.contains_key(&parent_uri)
+                        && !state.is_document_open_or_alias(&parent_uri)
                         && !state.cross_file_workspace_index.contains(&parent_uri)
                     {
                         log::trace!(
@@ -5421,22 +5378,36 @@ impl LanguageServer for Backend {
             let parent_content =
                 collect_backward_parent_content(&state, &uri_clone, workspace_root.as_ref(), &meta);
 
-            let result = state.cross_file_graph.update_file(
+            let graph_roots = state.revalidation_roots_for_uri(&uri);
+            let mut result = state.cross_file_graph.update_file(
                 &uri,
                 &meta,
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
+            for alias_uri in graph_roots.iter().filter(|alias_uri| *alias_uri != &uri) {
+                let alias_result = state.cross_file_graph.update_file(
+                    alias_uri,
+                    &meta,
+                    workspace_root.as_ref(),
+                    |parent_uri| parent_content.get(parent_uri).cloned(),
+                );
+                result.edges_changed |= alias_result.edges_changed;
+            }
 
             // Invalidate children affected by working directory change (Requirement 8)
-            let wd_affected =
-                crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-                    &uri,
-                    old_meta.as_deref(),
-                    &meta,
-                    &state.cross_file_graph,
-                    &state.cross_file_meta,
+            let mut wd_affected = Vec::new();
+            for graph_uri in &graph_roots {
+                wd_affected.extend(
+                    crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                        graph_uri,
+                        old_meta.as_deref(),
+                        &meta,
+                        &state.cross_file_graph,
+                        &state.cross_file_meta,
+                    ),
                 );
+            }
 
             // Emit any directive-vs-AST conflict diagnostics
             if !result.diagnostics.is_empty() {
@@ -5509,24 +5480,19 @@ impl LanguageServer for Backend {
             // need revalidation because their inherited scope is taken from
             // `uri`'s symbols at the source() call site.
             if interface_changed || result.edges_changed {
-                let neighbors =
-                    crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                        &uri,
-                        interface_changed,
-                        result.edges_changed,
-                        &state.cross_file_graph,
-                        |u| state.documents.contains_key(u),
-                        state.cross_file_config.max_chain_depth,
-                        state.cross_file_config.max_transitive_dependents_visited,
-                    );
+                let neighbors = state.affected_open_dependents_after_edit(
+                    &uri,
+                    interface_changed,
+                    result.edges_changed,
+                );
                 for dep in neighbors {
                     affected.insert(dep);
                 }
             }
             // Include children affected by WD change (Requirement 8)
             for child in wd_affected {
-                if state.documents.contains_key(&child) {
-                    affected.insert(child);
+                if let Some(open_child) = state.open_document_uri_for_authoritative_uri(&child) {
+                    affected.insert(open_child);
                 }
             }
             // Convert to Vec for sorting
@@ -5747,11 +5713,7 @@ impl LanguageServer for Backend {
                             resolved.display()
                         );
                         let parent_uri = Url::from_file_path(resolved).ok()?;
-                        let content = state
-                            .documents
-                            .get(&parent_uri)
-                            .map(|doc| doc.text())
-                            .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                        let content = state.content_provider().get_content(&parent_uri)?;
                         Some((parent_uri, content))
                     })
                     .collect();
@@ -5784,12 +5746,22 @@ impl LanguageServer for Backend {
                     }
                 }
 
-                let second_result = state.cross_file_graph.update_file(
+                let graph_roots = state.revalidation_roots_for_uri(&uri);
+                let mut second_result = state.cross_file_graph.update_file(
                     &uri,
                     &meta,
                     workspace_root.as_ref(),
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
+                for alias_uri in graph_roots.iter().filter(|alias_uri| *alias_uri != &uri) {
+                    let alias_result = state.cross_file_graph.update_file(
+                        alias_uri,
+                        &meta,
+                        workspace_root.as_ref(),
+                        |parent_uri| parent_content.get(parent_uri).cloned(),
+                    );
+                    second_result.edges_changed |= alias_result.edges_changed;
+                }
 
                 // If re-enrichment changed dependency edges (e.g., inherited WD
                 // altered path resolution), schedule newly affected open
@@ -5797,16 +5769,7 @@ impl LanguageServer for Backend {
                 // (their inherited scope is taken from this file's symbols at
                 // the source() call site).
                 if second_result.edges_changed {
-                    let neighbors =
-                        crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                            &uri,
-                            false,
-                            true,
-                            &state.cross_file_graph,
-                            |u| state.documents.contains_key(u),
-                            state.cross_file_config.max_chain_depth,
-                            state.cross_file_config.max_transitive_dependents_visited,
-                        );
+                    let neighbors = state.affected_open_dependents_after_edit(&uri, false, true);
                     // Re-enrichment changed work_items; force-republish marking
                     // is deferred until after both re-enrichment paths complete
                     // so evicted URIs don't carry orphaned force counters.
@@ -5836,7 +5799,7 @@ impl LanguageServer for Backend {
                     });
                     if let Some(child_uri) = child_uri_opt {
                         let needs_indexing = {
-                            !state.documents.contains_key(&child_uri)
+                            !state.is_document_open_or_alias(&child_uri)
                                 && !state.cross_file_workspace_index.contains(&child_uri)
                         };
                         if needs_indexing {
@@ -5906,33 +5869,30 @@ impl LanguageServer for Backend {
                     let ctx = backward_path_ctx.as_ref()?;
                     let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
                     let parent_uri = Url::from_file_path(resolved).ok()?;
-                    let content = state
-                        .documents
-                        .get(&parent_uri)
-                        .map(|doc| doc.text())
-                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
+                    let content = state.content_provider().get_content(&parent_uri)?;
                     Some((parent_uri, content))
                 })
                 .collect();
 
-            let second_result = state.cross_file_graph.update_file(
+            let graph_roots = state.revalidation_roots_for_uri(&uri);
+            let mut second_result = state.cross_file_graph.update_file(
                 &uri,
                 &meta,
                 workspace_root.as_ref(),
                 |parent_uri| parent_content.get(parent_uri).cloned(),
             );
+            for alias_uri in graph_roots.iter().filter(|alias_uri| *alias_uri != &uri) {
+                let alias_result = state.cross_file_graph.update_file(
+                    alias_uri,
+                    &meta,
+                    workspace_root.as_ref(),
+                    |parent_uri| parent_content.get(parent_uri).cloned(),
+                );
+                second_result.edges_changed |= alias_result.edges_changed;
+            }
 
             if second_result.edges_changed {
-                let neighbors =
-                    crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                        &uri,
-                        false,
-                        true,
-                        &state.cross_file_graph,
-                        |u| state.documents.contains_key(u),
-                        state.cross_file_config.max_chain_depth,
-                        state.cross_file_config.max_transitive_dependents_visited,
-                    );
+                let neighbors = state.affected_open_dependents_after_edit(&uri, false, true);
                 // Re-enrichment changed work_items; force-republish marking
                 // is deferred until after both re-enrichment paths complete
                 // so evicted URIs don't carry orphaned force counters.
@@ -6241,22 +6201,36 @@ impl LanguageServer for Backend {
                     &meta,
                 );
 
-                let graph_result = state.cross_file_graph.update_file(
+                let graph_roots = state.revalidation_roots_for_uri(&uri);
+                let mut graph_result = state.cross_file_graph.update_file(
                     &uri,
                     &meta,
                     workspace_root.as_ref(),
                     |parent_uri| parent_content.get(parent_uri).cloned(),
                 );
+                for alias_uri in graph_roots.iter().filter(|alias_uri| *alias_uri != &uri) {
+                    let alias_result = state.cross_file_graph.update_file(
+                        alias_uri,
+                        &meta,
+                        workspace_root.as_ref(),
+                        |parent_uri| parent_content.get(parent_uri).cloned(),
+                    );
+                    graph_result.edges_changed |= alias_result.edges_changed;
+                }
 
                 // Invalidate children affected by working directory change (Requirement 8)
-                let wd_children =
-                    crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-                        &uri,
-                        old_meta.as_deref(),
-                        &meta,
-                        &state.cross_file_graph,
-                        &state.cross_file_meta,
+                let mut wd_children = Vec::new();
+                for graph_uri in &graph_roots {
+                    wd_children.extend(
+                        crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
+                            graph_uri,
+                            old_meta.as_deref(),
+                            &meta,
+                            &state.cross_file_graph,
+                            &state.cross_file_meta,
+                        ),
                     );
+                }
 
                 (
                     pkgs,
@@ -6373,24 +6347,19 @@ impl LanguageServer for Backend {
             // Bulk-mark all dependents/children under a single write-lock to
             // skip per-URI lock churn on large fan-outs (Requirement 0.8).
             if interface_changed || edges_changed {
-                let neighbors =
-                    crate::cross_file::revalidation::compute_affected_dependents_after_edit(
-                        &uri,
-                        interface_changed,
-                        edges_changed,
-                        &state.cross_file_graph,
-                        |u| state.documents.contains_key(u),
-                        state.cross_file_config.max_chain_depth,
-                        state.cross_file_config.max_transitive_dependents_visited,
-                    );
+                let neighbors = state.affected_open_dependents_after_edit(
+                    &uri,
+                    interface_changed,
+                    edges_changed,
+                );
                 for dep in neighbors {
                     affected.insert(dep);
                 }
             }
             // Include children affected by WD change (Requirement 8)
             for child in wd_affected {
-                if state.documents.contains_key(&child) {
-                    affected.insert(child);
+                if let Some(open_child) = state.open_document_uri_for_authoritative_uri(&child) {
+                    affected.insert(open_child);
                 }
             }
             // When package-mode visibility changed, all open package files
@@ -6761,6 +6730,7 @@ impl LanguageServer for Backend {
             None;
         let mut resync_old_interface_hash: Option<u64> = None;
         let mut resync_chunk_kind: Option<crate::chunks::ChunkKind> = None;
+        let mut close_resync_uris: Vec<Url> = Vec::new();
 
         let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
             let mut state = self.state.write().await;
@@ -6807,8 +6777,17 @@ impl LanguageServer for Backend {
             // Remove from activity tracking
             state.cross_file_activity.remove(uri);
 
-            // Close the document (legacy)
-            state.close_document(uri);
+            // Close the document (legacy) and tear down any canonical alias
+            // entries before watched-generation ownership is returned to disk.
+            let closed_aliases = state.close_document(uri);
+            if close_resync {
+                close_resync_uris.push(uri.clone());
+                for alias in &closed_aliases {
+                    if !close_resync_uris.contains(alias) {
+                        close_resync_uris.push(alias.clone());
+                    }
+                }
+            }
 
             // Closing takes watched-resync generation ownership before any
             // close-driven package mutation and before the spawned
@@ -6818,6 +6797,9 @@ impl LanguageServer for Backend {
             // close has reinstalled disk truth.
             if has_disk_path {
                 bump_watched_file_resync_generation(&mut state, uri);
+                for alias in &closed_aliases {
+                    bump_watched_file_resync_generation(&mut state, alias);
+                }
             }
 
             // Snapshot package visibility before applying the close event, so we
@@ -6956,17 +6938,21 @@ impl LanguageServer for Backend {
             // the commit — through the normal gate. A close-then-reopen race
             // is handled by the resync's commit-time veto. Never calls
             // `scan_workspace` — this re-reads exactly one file.
-            let sibling_uris: Vec<Url> = sibling_fanout.into_iter().map(|(u, _, _)| u).collect();
-            tokio::spawn(run_close_resync(
-                self.state.clone(),
-                self.client.clone(),
-                self.traversal_truncation.clone(),
-                uri.clone(),
-                resync_chunk_kind,
-                resync_old_meta,
-                resync_old_interface_hash,
-                sibling_uris,
-            ));
+            let mut sibling_uris: Vec<Url> =
+                sibling_fanout.into_iter().map(|(u, _, _)| u).collect();
+            for resync_uri in close_resync_uris {
+                let package_siblings = std::mem::take(&mut sibling_uris);
+                tokio::spawn(run_close_resync(
+                    self.state.clone(),
+                    self.client.clone(),
+                    self.traversal_truncation.clone(),
+                    resync_uri,
+                    resync_chunk_kind,
+                    resync_old_meta.clone(),
+                    resync_old_interface_hash,
+                    package_siblings,
+                ));
+            }
         } else {
             // No disk resync for this close (non-file URI or non-R document):
             // schedule the package-sibling revalidation directly, outside the
@@ -7289,7 +7275,7 @@ impl LanguageServer for Backend {
                 let uri = &change.uri;
 
                 // Skip if document is open (open docs are authoritative)
-                if state.documents.contains_key(uri) {
+                if state.is_document_open_or_alias(uri) {
                     log::trace!("Skipping watched file change for open document: {}", uri);
                     continue;
                 }
@@ -8715,7 +8701,7 @@ impl Backend {
 
             let needs_indexing = {
                 let state = self.state.read().await;
-                !state.documents.contains_key(&uri)
+                !state.is_document_open_or_alias(&uri)
                     && !state.cross_file_workspace_index.contains(&uri)
             };
 
@@ -8779,7 +8765,7 @@ impl Backend {
 
             let needs_indexing = {
                 let state = self.state.read().await;
-                !state.documents.contains_key(&uri)
+                !state.is_document_open_or_alias(&uri)
                     && !state.cross_file_workspace_index.contains(&uri)
             };
 
@@ -8828,7 +8814,7 @@ impl Backend {
                             forward_ctx.forward_child_inherited_wd(&resolved, source.chdir);
                         let should_index = {
                             let state = self.state.read().await;
-                            if state.documents.contains_key(&child_uri) {
+                            if state.is_document_open_or_alias(&child_uri) {
                                 false
                             } else if !state.cross_file_workspace_index.contains(&child_uri) {
                                 // Not indexed yet → index it. (Same "indexed?"
@@ -16572,6 +16558,290 @@ mod project_config_initialize_tests {
         assert!(
             !snapshot_diagnostics(&state, &main_uri).is_empty(),
             "helper_fn must be flagged once the sourced file is gone"
+        );
+    }
+
+    /// Issue #567: a live buffer opened with casing that differs from the
+    /// on-disk spelling must still behave as the canonical graph URI. The test
+    /// constructs that LSP state directly, so it is non-vacuous on
+    /// case-sensitive hosts where a real editor normally could not open the
+    /// wrong-case path from disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrong_case_alias_edit_revalidates_parent_and_supplies_live_content() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.r"), "child_fn <- function() 1\n").unwrap();
+        let parent = "source(\"child.r\")\nchild_fn()\nlive_fn()\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let child_real_uri = Url::from_file_path(tmp.path().join("child.r")).unwrap();
+        let child_alias_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+        }
+
+        open_doc(
+            backend,
+            &child_alias_uri,
+            "r",
+            1,
+            "child_fn <- function() 1\n",
+        )
+        .await;
+        let parent_force_before_change = {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.open_document_uri_for_authoritative_uri(&child_real_uri),
+                Some(child_alias_uri.clone()),
+                "real on-disk spelling must resolve to the wrong-case open buffer"
+            );
+            assert!(
+                !snapshot_diagnostics(&state, &parent_uri).is_empty(),
+                "precondition: live_fn is undefined before the alias buffer defines it"
+            );
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri)
+        };
+
+        change_doc(
+            backend,
+            &child_alias_uri,
+            2,
+            "child_fn <- function() 1\nlive_fn <- function() 2\n",
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&parent_uri)
+                .iter()
+                .any(|edge| edge.to == child_real_uri),
+            "parent edge must remain keyed by the real on-disk spelling"
+        );
+        assert!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri)
+                > parent_force_before_change,
+            "editing the alias buffer must schedule the canonical dependent parent"
+        );
+        assert!(
+            snapshot_diagnostics(&state, &parent_uri).is_empty(),
+            "parent scope must see live content from the wrong-case alias buffer"
+        );
+    }
+
+    /// Issue #567: watched-file resync for the canonical spelling must be
+    /// vetoed while a wrong-case alias buffer is open, because the buffer is
+    /// authoritative for that on-disk file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_changed_for_canonical_spelling_is_vetoed_while_alias_open() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.r"), "child_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, _parent_uri) =
+            open_in_workspace(&tmp, "parent.R", "r", "source(\"child.r\")\n").await;
+        let backend = svc.inner();
+        let child_real_uri = Url::from_file_path(tmp.path().join("child.r")).unwrap();
+        let child_alias_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        open_doc(
+            backend,
+            &child_alias_uri,
+            "r",
+            1,
+            "source(\"extra.R\")\nchild_fn <- function() 1\n",
+        )
+        .await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state
+                    .cross_file_graph
+                    .get_dependencies(&child_real_uri)
+                    .iter()
+                    .any(|edge| edge.to == extra_uri),
+                "alias open must mirror live source() edges onto the canonical graph URI"
+            );
+        }
+
+        fs::write(tmp.path().join("child.r"), "child_fn <- function() 1\n").unwrap();
+        let outcome =
+            resync_file_from_disk(&backend.state, &child_real_uri, None, None, true, None).await;
+        assert!(
+            matches!(outcome, ResyncOutcome::Vetoed),
+            "direct resync of the canonical URI must veto while alias-open"
+        );
+        send_watched_change(backend, &child_real_uri).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&child_real_uri)
+                .iter()
+                .any(|edge| edge.to == extra_uri),
+            "watched CHANGED must not replace alias-buffer graph state with disk content"
+        );
+    }
+
+    /// Issue #567: closing the alias removes the alias map; later watched
+    /// events for the canonical spelling converge from disk normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alias_map_drops_on_close_and_later_watched_events_resync() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.r"), "child_fn <- function() 1\n").unwrap();
+        fs::write(tmp.path().join("extra.R"), "extra_fn <- function() 2\n").unwrap();
+        let (svc, _parent_uri) =
+            open_in_workspace(&tmp, "parent.R", "r", "source(\"child.r\")\n").await;
+        let backend = svc.inner();
+        let child_real_uri = Url::from_file_path(tmp.path().join("child.r")).unwrap();
+        let child_alias_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
+
+        open_doc(
+            backend,
+            &child_alias_uri,
+            "r",
+            1,
+            "child_fn <- function() 1\n",
+        )
+        .await;
+        close_doc(backend, &child_alias_uri).await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.open_document_aliases.is_empty(),
+                "closing the alias buffer must tear down the alias map"
+            );
+            assert!(
+                state
+                    .open_document_uri_for_authoritative_uri(&child_real_uri)
+                    .is_none(),
+                "canonical spelling must no longer be treated as open"
+            );
+        }
+
+        let closed_resync_finished = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_workspace_index
+                .get_metadata(&child_real_uri)
+                .is_some()
+        })
+        .await;
+        assert!(
+            closed_resync_finished,
+            "close resync must restore canonical closed-file state"
+        );
+
+        fs::write(
+            tmp.path().join("child.r"),
+            "source(\"extra.R\")\nchild_fn <- function() 1\n",
+        )
+        .unwrap();
+        send_watched_change(backend, &child_real_uri).await;
+
+        let resynced = wait_for_state(backend, 5_000, |state| {
+            state
+                .cross_file_graph
+                .get_dependencies(&child_real_uri)
+                .iter()
+                .any(|edge| edge.to == extra_uri)
+        })
+        .await;
+        assert!(
+            resynced,
+            "after alias close, watched CHANGED must resync canonical disk content normally"
+        );
+    }
+
+    /// Same-URI lifecycles should not pay any alias behavior: the maps stay
+    /// empty through open/change/close when the client URI already matches the
+    /// on-disk spelling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_uri_open_change_close_keeps_alias_map_empty() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("helper.R"), "x <- 1\n").unwrap();
+        let (svc, helper_uri) = open_in_workspace(&tmp, "helper.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.open_document_aliases.is_empty(),
+                "same-URI open must not create aliases"
+            );
+        }
+        change_doc(backend, &helper_uri, 2, "x <- 2\n").await;
+        {
+            let state = backend.state.read().await;
+            assert!(
+                state.open_document_aliases.is_empty(),
+                "same-URI change must keep alias maps empty"
+            );
+        }
+        close_doc(backend, &helper_uri).await;
+        let state = backend.state.read().await;
+        assert!(
+            state.open_document_aliases.is_empty(),
+            "same-URI close must leave alias maps empty"
+        );
+    }
+
+    /// Issue #567 symlink half: when an open buffer is reached through a
+    /// symlink, canonical requests for the target use the live symlink buffer
+    /// and edits revalidate dependents of the target graph URI.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn symlink_alias_open_buffer_supplies_target_live_content() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "child_fn <- function() 1\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("child.R"), tmp.path().join("link.R")).unwrap();
+        let parent = "source(\"child.R\")\nchild_fn()\nlive_fn()\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+
+        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        let link_uri = Url::from_file_path(tmp.path().join("link.R")).unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.revalidation_debounce_ms = 60_000;
+        }
+
+        open_doc(
+            backend,
+            &link_uri,
+            "r",
+            1,
+            "child_fn <- function() 1\nlive_fn <- function() 2\n",
+        )
+        .await;
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&child_uri),
+            Some(link_uri.clone()),
+            "target URI must resolve to the symlink-open buffer"
+        );
+        assert!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent_uri)
+                > 0,
+            "opening the symlink alias must schedule the target's dependent parent"
+        );
+        assert!(
+            snapshot_diagnostics(&state, &parent_uri).is_empty(),
+            "parent scope must see live content from the symlink alias buffer"
         );
     }
 

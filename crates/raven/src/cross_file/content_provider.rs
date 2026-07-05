@@ -13,6 +13,7 @@ use super::file_cache::CrossFileFileCache;
 use super::scope::ScopeArtifacts;
 use super::types::CrossFileMetadata;
 use super::workspace_index::CrossFileWorkspaceIndex;
+use crate::state::OpenDocumentAliases;
 
 /// Trait for content providers that respect open-docs-authoritative rule
 pub trait ContentProvider {
@@ -45,6 +46,8 @@ pub struct CrossFileContentProvider<'a, D: DocumentContent> {
     pub workspace_index: &'a CrossFileWorkspaceIndex,
     /// Disk file cache for on-demand reads
     pub file_cache: &'a CrossFileFileCache,
+    /// Open-document aliases keyed by canonical graph URI
+    pub open_aliases: Option<&'a OpenDocumentAliases>,
 }
 
 impl<'a, D: DocumentContent> CrossFileContentProvider<'a, D> {
@@ -57,12 +60,38 @@ impl<'a, D: DocumentContent> CrossFileContentProvider<'a, D> {
             open_documents,
             workspace_index,
             file_cache,
+            open_aliases: None,
         }
+    }
+
+    pub fn new_with_aliases(
+        open_documents: &'a HashMap<Url, D>,
+        workspace_index: &'a CrossFileWorkspaceIndex,
+        file_cache: &'a CrossFileFileCache,
+        open_aliases: &'a OpenDocumentAliases,
+    ) -> Self {
+        Self {
+            open_documents,
+            workspace_index,
+            file_cache,
+            open_aliases: Some(open_aliases),
+        }
+    }
+
+    fn open_alias_uris(&self, uri: &Url) -> Option<&[Url]> {
+        self.open_aliases
+            .filter(|aliases| !aliases.is_empty())
+            .and_then(|aliases| aliases.open_uris_for_canonical(uri))
     }
 
     /// Check if a URI is currently open
     pub fn is_open(&self, uri: &Url) -> bool {
         self.open_documents.contains_key(uri)
+            || self.open_alias_uris(uri).is_some_and(|open_uris| {
+                open_uris
+                    .iter()
+                    .any(|open_uri| self.open_documents.contains_key(open_uri))
+            })
     }
 }
 
@@ -71,6 +100,14 @@ impl<'a, D: DocumentContent> ContentProvider for CrossFileContentProvider<'a, D>
         // 1. Open document is authoritative
         if let Some(doc) = self.open_documents.get(uri) {
             return Some(doc.content());
+        }
+
+        if let Some(open_uris) = self.open_alias_uris(uri) {
+            for open_uri in open_uris {
+                if let Some(doc) = self.open_documents.get(open_uri) {
+                    return Some(doc.content());
+                }
+            }
         }
 
         // 2. Try workspace index
@@ -86,7 +123,7 @@ impl<'a, D: DocumentContent> ContentProvider for CrossFileContentProvider<'a, D>
         // For now, we don't store extracted metadata for open docs in this provider
         // The caller should handle open docs separately
 
-        if self.open_documents.contains_key(uri) {
+        if self.is_open(uri) {
             // Open doc - caller should use their own metadata extraction
             return None;
         }
@@ -102,7 +139,7 @@ impl<'a, D: DocumentContent> ContentProvider for CrossFileContentProvider<'a, D>
 
     fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
         // 1. Open document - would need to compute artifacts
-        if self.open_documents.contains_key(uri) {
+        if self.is_open(uri) {
             // Open doc - caller should use their own artifacts computation
             return None;
         }

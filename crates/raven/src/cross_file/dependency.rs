@@ -554,7 +554,21 @@ type SubgraphCache = std::sync::RwLock<
     lru::LruCache<(Url, usize, usize), (u64, std::sync::Arc<NeighborhoodSubgraph>)>,
 >;
 
-/// Dependency graph tracking source relationships between files
+/// Dependency graph tracking source relationships between files.
+///
+/// # Raw URI Identity
+///
+/// Graph keys are the uncanonicalized `Url`s produced by path resolution and
+/// workspace indexing. Case-correction may rewrite a resolved path to the real
+/// directory-entry spelling, but the graph does not globally
+/// `std::fs::canonicalize` keys or collapse symlink spellings. This preserves
+/// the same identity model as the editor and the workspace scan.
+///
+/// Open-document aliasing lives outside the graph in
+/// [`crate::state::WorldState`]: when a client opens a case or symlink alias of
+/// a graph URI, the alias layer makes that open buffer authoritative for
+/// revalidation, content, and watched-file vetoes without rewriting graph keys
+/// or changing diagnostics publish URIs.
 pub struct DependencyGraph {
     /// Forward lookup: parent URI -> edges to children
     forward: HashMap<Url, Vec<DependencyEdge>>,

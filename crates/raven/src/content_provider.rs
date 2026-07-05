@@ -18,7 +18,7 @@ use crate::cross_file::scope::{self, ScopeArtifacts};
 use crate::cross_file::types::CrossFileMetadata;
 use crate::cross_file::workspace_index::CrossFileWorkspaceIndex;
 use crate::document_store::DocumentStore;
-use crate::state::Document;
+use crate::state::{Document, OpenDocumentAliases};
 use crate::workspace_index::WorkspaceIndex;
 
 /// Trait for content providers (sync operations)
@@ -121,6 +121,7 @@ pub struct DefaultContentProvider<'a> {
     legacy_documents: Option<&'a HashMap<Url, Document>>,
     legacy_workspace_index: Option<&'a HashMap<Url, Document>>,
     legacy_cross_file_workspace_index: Option<&'a CrossFileWorkspaceIndex>,
+    open_aliases: Option<&'a OpenDocumentAliases>,
 }
 
 impl<'a> DefaultContentProvider<'a> {
@@ -142,6 +143,7 @@ impl<'a> DefaultContentProvider<'a> {
             legacy_documents: None,
             legacy_workspace_index: None,
             legacy_cross_file_workspace_index: None,
+            open_aliases: None,
         }
     }
 
@@ -164,6 +166,7 @@ impl<'a> DefaultContentProvider<'a> {
         legacy_documents: &'a HashMap<Url, Document>,
         legacy_workspace_index: &'a HashMap<Url, Document>,
         legacy_cross_file_workspace_index: &'a CrossFileWorkspaceIndex,
+        open_aliases: &'a OpenDocumentAliases,
     ) -> Self {
         Self {
             document_store,
@@ -172,7 +175,14 @@ impl<'a> DefaultContentProvider<'a> {
             legacy_documents: Some(legacy_documents),
             legacy_workspace_index: Some(legacy_workspace_index),
             legacy_cross_file_workspace_index: Some(legacy_cross_file_workspace_index),
+            open_aliases: Some(open_aliases),
         }
+    }
+
+    fn open_alias_uris(&self, uri: &Url) -> Option<&[Url]> {
+        self.open_aliases
+            .filter(|aliases| !aliases.is_empty())
+            .and_then(|aliases| aliases.open_uris_for_canonical(uri))
     }
 }
 
@@ -198,6 +208,19 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             && let Some(doc) = legacy_docs.get(uri)
         {
             return Some(doc.text());
+        }
+
+        if let Some(open_uris) = self.open_alias_uris(uri) {
+            for open_uri in open_uris {
+                if let Some(doc) = self.document_store.get_without_touch(open_uri) {
+                    return Some(doc.contents.to_string());
+                }
+                if let Some(legacy_docs) = self.legacy_documents
+                    && let Some(doc) = legacy_docs.get(open_uri)
+                {
+                    return Some(doc.text());
+                }
+            }
         }
 
         // 3. Check WorkspaceIndex
@@ -241,6 +264,20 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         {
             let text = doc.analysis_text();
             return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
+        }
+
+        if let Some(open_uris) = self.open_alias_uris(uri) {
+            for open_uri in open_uris {
+                if let Some(doc) = self.document_store.get_without_touch(open_uri) {
+                    return Some(doc.metadata.clone());
+                }
+                if let Some(legacy_docs) = self.legacy_documents
+                    && let Some(doc) = legacy_docs.get(open_uri)
+                {
+                    let text = doc.analysis_text();
+                    return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
+                }
+            }
         }
 
         // 3. Check WorkspaceIndex
@@ -303,6 +340,27 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             )));
         }
 
+        if let Some(open_uris) = self.open_alias_uris(uri) {
+            for open_uri in open_uris {
+                if let Some(doc) = self.document_store.get_without_touch(open_uri) {
+                    return Some(doc.artifacts.clone());
+                }
+                if let Some(legacy_docs) = self.legacy_documents
+                    && let Some(doc) = legacy_docs.get(open_uri)
+                    && let Some(tree) = &doc.tree
+                {
+                    let text = doc.analysis_text();
+                    let metadata = crate::cross_file::extract_metadata(&text);
+                    return Some(Arc::new(scope::compute_artifacts_with_metadata(
+                        open_uri,
+                        tree,
+                        &text,
+                        Some(&metadata),
+                    )));
+                }
+            }
+        }
+
         // 3. Check WorkspaceIndex
         if let Some(artifacts) = self.workspace_index.get_artifacts(uri) {
             return Some(artifacts);
@@ -347,6 +405,14 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             || self
                 .legacy_documents
                 .is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
+            || self.open_alias_uris(uri).is_some_and(|open_uris| {
+                open_uris.iter().any(|open_uri| {
+                    self.document_store.contains(open_uri)
+                        || self
+                            .legacy_documents
+                            .is_some_and(|docs| docs.contains_key(open_uri))
+                })
+            })
             || self.workspace_index.contains(uri)
             || self
                 .legacy_workspace_index
@@ -367,6 +433,14 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             || self
                 .legacy_documents
                 .is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
+            || self.open_alias_uris(uri).is_some_and(|open_uris| {
+                open_uris.iter().any(|open_uri| {
+                    self.document_store.contains(open_uri)
+                        || self
+                            .legacy_documents
+                            .is_some_and(|docs| docs.contains_key(open_uri))
+                })
+            })
     }
 }
 
