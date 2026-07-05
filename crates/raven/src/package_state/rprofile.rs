@@ -44,7 +44,30 @@ pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
     let Ok(text) = crate::state::read_source(&rprofile_path) else {
         return RprofileScan::default();
     };
-    scan_rprofile_worklist(workspace_root, text)
+    scan_rprofile_worklist::<false>(workspace_root, text, None)
+}
+
+/// Like [`scan_workspace_rprofile`], but skips the root `.Rprofile` and any
+/// transitively sourced helper files matched by `[workspace].exclude`.
+pub fn scan_workspace_rprofile_with_exclusions(
+    workspace_root: &Path,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> RprofileScan {
+    if exclusions.is_empty() {
+        return scan_workspace_rprofile(workspace_root);
+    }
+
+    let rprofile_path = workspace_root.join(".Rprofile");
+    if exclusions.is_excluded_path(&rprofile_path) {
+        return RprofileScan::default();
+    }
+    // Decode through the shared BOM-aware seam so a UTF-8 BOM at the start of
+    // `.Rprofile` does not make the first harvested declaration/source call
+    // differ from normal source ingestion (`crate::state::read_source`).
+    let Ok(text) = crate::state::read_source(&rprofile_path) else {
+        return RprofileScan::default();
+    };
+    scan_rprofile_worklist::<true>(workspace_root, text, Some(exclusions))
 }
 
 /// Like [`scan_workspace_rprofile`], but seeds the scan with the GIVEN root
@@ -57,14 +80,36 @@ pub fn scan_workspace_rprofile_with_root_text(
     workspace_root: &Path,
     root_text: &str,
 ) -> RprofileScan {
-    scan_rprofile_worklist(workspace_root, root_text.to_string())
+    scan_rprofile_worklist::<false>(workspace_root, root_text.to_string(), None)
+}
+
+/// Like [`scan_workspace_rprofile_with_root_text`], but applies
+/// `[workspace].exclude` to the root `.Rprofile` and transitive helper files.
+pub fn scan_workspace_rprofile_with_root_text_and_exclusions(
+    workspace_root: &Path,
+    root_text: &str,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> RprofileScan {
+    if exclusions.is_empty() {
+        return scan_workspace_rprofile_with_root_text(workspace_root, root_text);
+    }
+
+    let rprofile_path = workspace_root.join(".Rprofile");
+    if exclusions.is_excluded_path(&rprofile_path) {
+        return RprofileScan::default();
+    }
+    scan_rprofile_worklist::<true>(workspace_root, root_text.to_string(), Some(exclusions))
 }
 
 /// Shared worklist runner: harvest top-level defs + attached packages from the
 /// root `.Rprofile` text (`root_text`), then follow its transitive literal
 /// `source()` targets from disk. Both public entry points differ only in where
 /// the root text comes from (disk vs. in-memory buffer).
-fn scan_rprofile_worklist(workspace_root: &Path, root_text: String) -> RprofileScan {
+fn scan_rprofile_worklist<const USE_EXCLUSIONS: bool>(
+    workspace_root: &Path,
+    root_text: String,
+    exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
+) -> RprofileScan {
     let mut scan = RprofileScan::default();
     let rprofile_path = workspace_root.join(".Rprofile");
     let text = root_text;
@@ -113,6 +158,9 @@ fn scan_rprofile_worklist(workspace_root: &Path, root_text: String) -> RprofileS
             else {
                 continue;
             };
+            if USE_EXCLUSIONS && exclusions.is_some_and(|e| e.is_excluded_path(&resolved)) {
+                continue;
+            }
             // Skip renv's activate.R (defines internal machinery, no user globals).
             let canonical_resolved = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
             if canonical_resolved == canonical_renv_activate || resolved == renv_activate {
@@ -266,6 +314,42 @@ mod tests {
         fs::write(tmp.path().join(".Rprofile"), "source(\"R/functions.r\")\n").unwrap();
         let scan = scan_workspace_rprofile(tmp.path());
         assert!(scan.symbols.contains("r_bind"), "got {:?}", scan.symbols);
+    }
+
+    #[test]
+    fn source_following_skips_excluded_helper() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("helpers")).unwrap();
+        let helper = tmp.path().join("helpers").join("setup.R");
+        fs::write(&helper, "excluded_helper <- function() 1\n").unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "profile_local <- 1\nsource(\"helpers/setup.R\")\n",
+        )
+        .unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["helpers/**"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+
+        let scan = scan_workspace_rprofile_with_exclusions(tmp.path(), &exclusions);
+
+        assert!(
+            scan.symbols.contains("profile_local"),
+            "non-excluded .Rprofile symbols must remain: {:?}",
+            scan.symbols
+        );
+        assert!(
+            !scan.symbols.contains("excluded_helper"),
+            "excluded sourced helper must not contribute symbols: {:?}",
+            scan.symbols
+        );
+        let canonical_helper = helper.canonicalize().unwrap();
+        assert!(
+            !scan.sourced_files.contains(&canonical_helper),
+            "excluded helper must not be recorded as a followed source: {:?}",
+            scan.sourced_files
+        );
     }
 
     #[test]

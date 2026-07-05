@@ -5,6 +5,7 @@
 // Modifications copyright (C) 2026 Jonathan Marc Bearak
 //
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -187,9 +188,10 @@ pub struct Document {
     /// `loaded_packages`. Distinct field because the attachment semantics differ.
     pub data_packages: Vec<String>,
     pub file_type: FileType,
-    /// Chunk-detection kind for the outline: `Rmd` for `.Rmd`/`.qmd` documents
-    /// and for untitled buffers whose `languageId` is `rmd`/`quarto`; `R`
-    /// (i.e. `# %%` cells) otherwise. Mirrors the client-side classifier in
+    /// Chunk-detection kind for the outline: `Rmd` for `.Rmd`,
+    /// `.Rmarkdown`, and `.qmd` documents and for untitled buffers whose
+    /// `languageId` is `rmd`/`quarto`; `R` (i.e. `# %%` cells) otherwise.
+    /// Mirrors the client-side classifier in
     /// `editors/vscode/src/chunks/chunk-detector.ts`.
     pub chunk_kind: ChunkKind,
     /// Masked analysis text for Rmd/Quarto documents (`chunks::mask_to_r` of the
@@ -593,7 +595,26 @@ fn extract_data_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
     packages
 }
 
-/// Global LSP state
+/// Global LSP state.
+///
+/// # Raw URI identity
+///
+/// Raven's LSP document identity is the raw file `Url` supplied by the client
+/// or path-resolution caller. `WorldState` keeps that convention consistently:
+/// open documents, legacy document maps, workspace indexes, the cross-file file
+/// cache, the dependency graph, and diagnostic publication gates are all keyed
+/// by the uncanonicalized `Url`.
+///
+/// Symlink aliases and alternate case spellings are therefore distinct document
+/// identities by design. An open buffer is authoritative for the exact raw URI
+/// that was opened; it is not an alias layer for another URI that happens to
+/// name the same underlying file. Raven deliberately avoids
+/// `std::fs::canonicalize` for this identity model because canonicalization
+/// follows symlinks and can produce path prefixes that diverge from the
+/// uncanonicalized workspace-index keys. The path resolver's case correction
+/// (`canonicalize_case_below`) is intentionally narrower: it rewrites only the
+/// resolved suffix below a trusted prefix so source edges match index keys, and
+/// does not make symlink or case aliases equivalent LSP identities.
 pub struct WorldState {
     // Document management (new architecture)
     pub document_store: DocumentStore,
@@ -664,6 +685,11 @@ pub struct WorldState {
     /// are configured. Per-document resolution scans this list.
     pub lint_overrides: Vec<crate::config_file::CompiledLintOverride>,
 
+    /// Compiled `[workspace].exclude` entries. Empty when no project-level
+    /// exclusions are configured. These apply to workspace/default discovery,
+    /// indexing, watcher resync, on-demand indexing, and LSP diagnostics.
+    pub workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions,
+
     /// Per-document `indentation_unit` overrides sent by the client via
     /// `raven/documentIndentUnitsChanged` when the user sets
     /// `raven.linting.indentationUnit` to `"auto"`. Keyed by URI string.
@@ -689,6 +715,18 @@ pub struct WorldState {
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
+    /// Last-known editor-derived chunk classification for file-backed
+    /// documents whose editor language made the file behave differently from
+    /// path classification.
+    ///
+    /// Live documents use their stored [`Document::chunk_kind`]. This tiny
+    /// closed-file override map preserves the editor `languageId: rmd/quarto`
+    /// signal after close so watched disk resyncs, on-demand indexing, and raw
+    /// file-cache metadata fallbacks keep masking extension-mismatched Rmd /
+    /// Quarto files. Entries exist only when the editor-derived kind differs
+    /// from [`classify_chunk_document`] for the URI path, and cross-file state
+    /// removal prunes them with the rest of the URI's closed-file state.
+    pub editor_chunk_kind_overrides: HashMap<Url, ChunkKind>,
     /// State-wide source for watched-file resync generations.
     ///
     /// Values are copied into `watched_file_resync_generations` per URI. Keeping
@@ -796,6 +834,98 @@ impl WorldState {
             None
         };
         self.package_library.set_local_dev_overlay(overlay);
+    }
+
+    /// Whether `uri` is covered by the project-level `[workspace].exclude`
+    /// matcher. Empty exclusions are a fast false path.
+    pub(crate) fn is_project_excluded_uri(&self, uri: &tower_lsp::lsp_types::Url) -> bool {
+        self.workspace_exclusions.is_excluded_uri(uri)
+    }
+
+    /// Return metadata suitable for dependency-graph edge construction under
+    /// the current project exclusions.
+    ///
+    /// Open project-excluded documents remain in the document stores so their
+    /// buffers can stay authoritative and publish empty diagnostics, but they
+    /// must not lend symbols to non-excluded files. The graph is intentionally
+    /// exclusion-agnostic, so callers pass this filtered view when updating
+    /// graph edges. The original metadata is preserved for diagnostics such as
+    /// missing-file checks on the active document's literal `source()` path.
+    pub(crate) fn metadata_for_dependency_graph<'a>(
+        &self,
+        uri: &Url,
+        meta: &'a crate::cross_file::CrossFileMetadata,
+        workspace_root: Option<&Url>,
+    ) -> Cow<'a, crate::cross_file::CrossFileMetadata> {
+        Self::metadata_for_dependency_graph_with_exclusions(
+            &self.workspace_exclusions,
+            uri,
+            meta,
+            workspace_root,
+        )
+    }
+
+    pub(crate) fn metadata_for_dependency_graph_with_exclusions<'a>(
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+        uri: &Url,
+        meta: &'a crate::cross_file::CrossFileMetadata,
+        workspace_root: Option<&Url>,
+    ) -> Cow<'a, crate::cross_file::CrossFileMetadata> {
+        if exclusions.is_empty() {
+            return Cow::Borrowed(meta);
+        }
+
+        let forward_ctx =
+            crate::cross_file::path_resolve::PathContext::from_metadata(uri, meta, workspace_root);
+        let backward_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
+
+        let forward_target_excluded = |source: &crate::cross_file::ForwardSource| {
+            let target_uri = source.resolved_uri.clone().or_else(|| {
+                let ctx = forward_ctx.as_ref()?;
+                let resolved =
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        ctx,
+                    )?;
+                Url::from_file_path(resolved).ok()
+            });
+            target_uri
+                .as_ref()
+                .is_some_and(|target| exclusions.is_excluded_uri(target))
+        };
+
+        let backward_parent_excluded = |directive: &crate::cross_file::types::BackwardDirective| {
+            let Some(ctx) = backward_ctx.as_ref() else {
+                return false;
+            };
+            let Some(resolved) =
+                crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
+            else {
+                return false;
+            };
+            Url::from_file_path(resolved)
+                .ok()
+                .is_some_and(|parent| exclusions.is_excluded_uri(&parent))
+        };
+
+        let sources_changed = meta.sources.iter().any(forward_target_excluded);
+        let sourced_by_changed = meta.sourced_by.iter().any(backward_parent_excluded);
+        if !sources_changed && !sourced_by_changed {
+            return Cow::Borrowed(meta);
+        }
+
+        let mut filtered = meta.clone();
+        if sources_changed {
+            filtered
+                .sources
+                .retain(|source| !forward_target_excluded(source));
+        }
+        if sourced_by_changed {
+            filtered
+                .sourced_by
+                .retain(|directive| !backward_parent_excluded(directive));
+        }
+        Cow::Owned(filtered)
     }
 
     /// Snapshot the owned inputs `resolve_system_file_sources` needs (workspace
@@ -913,6 +1043,7 @@ impl WorldState {
             raw_project_settings: None,
             project_config_path: None,
             lint_overrides: Vec::new(),
+            workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions::default(),
             per_document_indent_unit: std::collections::HashMap::new(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
@@ -923,6 +1054,7 @@ impl WorldState {
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
+            editor_chunk_kind_overrides: HashMap::new(),
             watched_file_resync_generation_counter: 0,
             watched_file_resync_generations: HashMap::new(),
             libpath_watcher_handle: None,
@@ -1386,19 +1518,87 @@ impl WorldState {
         // authoritative. No reader consults this cache for open documents.
         let aliases = self.register_open_document_aliases(&uri);
         self.cross_file_file_cache.invalidate(&uri);
+        let document = Document::new_with_language_id(text, version, &uri, language_id);
+        self.record_editor_chunk_kind_override(&uri, document.chunk_kind);
         for alias in aliases {
             self.cross_file_file_cache.invalidate(&alias);
         }
-        self.documents.insert(
-            uri.clone(),
-            Document::new_with_language_id(text, version, &uri, language_id),
-        );
+        self.documents.insert(uri.clone(), document);
     }
 
     pub fn close_document(&mut self, uri: &Url) -> Vec<Url> {
         let aliases = self.open_document_aliases.close(uri);
         self.documents.remove(uri);
         aliases
+    }
+
+    /// Persist or clear the editor-derived chunk-kind override for a
+    /// file-backed document.
+    ///
+    /// Only extension mismatches are stored: when `chunk_kind` equals
+    /// [`classify_chunk_document`] for `uri.path()`, any previous override is
+    /// removed. This keeps the map small and means ordinary `.Rmd`,
+    /// `.Rmarkdown`, and `.qmd` files continue to be path-classified after
+    /// close. Untitled and other non-file URIs never have closed disk state, so
+    /// they also clear any stale entry.
+    pub fn record_editor_chunk_kind_override(&mut self, uri: &Url, chunk_kind: ChunkKind) {
+        if uri.to_file_path().is_err() || chunk_kind == classify_chunk_document(uri.path()) {
+            self.editor_chunk_kind_overrides.remove(uri);
+        } else {
+            self.editor_chunk_kind_overrides
+                .insert(uri.clone(), chunk_kind);
+        }
+    }
+
+    /// Drop the persisted editor-derived chunk-kind override for `uri`.
+    ///
+    /// Call this from every path that removes a URI's closed cross-file state
+    /// (deletion, final undecodable convergence, or workspace-index cleanup) so
+    /// a later recreated file starts from path classification until the editor
+    /// supplies a fresh language signal.
+    pub fn prune_editor_chunk_kind_override(&mut self, uri: &Url) {
+        self.editor_chunk_kind_overrides.remove(uri);
+    }
+
+    /// Return the chunk kind to use for closed-file disk content.
+    ///
+    /// The last-known editor-derived override wins over path classification.
+    /// This mirrors open-document precedence without requiring raw disk caches
+    /// or workspace-index entries to persist a full `Document`.
+    pub fn chunk_kind_for_closed_file(&self, uri: &Url) -> ChunkKind {
+        self.editor_chunk_kind_overrides
+            .get(uri)
+            .copied()
+            .unwrap_or_else(|| classify_chunk_document(uri.path()))
+    }
+
+    /// Return the R-analysis view of raw closed-file `content` for `uri`.
+    ///
+    /// This is the state-aware sibling of
+    /// [`crate::cross_file::analysis_text_for_path`]: persisted editor-derived
+    /// chunk classification wins before falling back to path classification, so
+    /// extension-mismatched Rmd/Quarto files continue to mask prose after close.
+    pub fn analysis_text_for_uri<'a>(
+        &self,
+        uri: &Url,
+        content: &'a str,
+    ) -> std::borrow::Cow<'a, str> {
+        crate::cross_file::analysis_text_for_kind(self.chunk_kind_for_closed_file(uri), content)
+    }
+
+    /// Extract metadata from raw closed-file `content` for `uri`.
+    ///
+    /// File-cache and content-provider fallbacks should use this instead of
+    /// [`crate::cross_file::extract_metadata_for_path`] whenever a
+    /// [`WorldState`] is available, because the persisted editor-derived chunk
+    /// kind must outrank path classification for extension-mismatched Rmd /
+    /// Quarto files.
+    pub fn extract_metadata_for_uri(
+        &self,
+        uri: &Url,
+        content: &str,
+    ) -> crate::cross_file::CrossFileMetadata {
+        crate::cross_file::extract_metadata_for_kind(self.chunk_kind_for_closed_file(uri), content)
     }
 
     pub fn apply_change(&mut self, uri: &Url, change: TextDocumentContentChangeEvent) {
@@ -1441,11 +1641,11 @@ impl WorldState {
         let content_provider = self.content_provider();
         if let Some(content) = content_provider.get_content(uri) {
             // Cached content is RAW; mask Rmd/Quarto before extracting so
-            // directives come from chunk bodies, not prose (#343).
-            return Some(Arc::new(crate::cross_file::extract_metadata_for_path(
-                uri.path(),
-                &content,
-            )));
+            // directives come from chunk bodies, not prose (#343). Use the
+            // persisted editor-derived chunk kind when present so an
+            // extension-mismatched Rmd/Quarto file keeps masking after close
+            // (#563).
+            return Some(Arc::new(self.extract_metadata_for_uri(uri, &content)));
         }
         None
     }
@@ -1466,7 +1666,10 @@ impl WorldState {
     /// `extract_metadata_for_path`, and `DocumentStore::compute_derived`
     /// re-derives artifacts from the masked text); the legacy-documents arm
     /// (tier 4) and the file-cache arm (tier 5) likewise mask via
-    /// `analysis_text()` / `extract_metadata_for_path`. So directives,
+    /// `analysis_text()` / `extract_metadata_for_uri`. The state-aware file
+    /// cache fallback consults persisted editor-language chunk classification
+    /// before path classification, so extension-mismatched Rmd/Quarto files do
+    /// not start treating prose as R after close (issue #563). So directives,
     /// `source()`, and `library()` always reflect chunk bodies, never prose.
     pub fn get_enriched_metadata(
         &self,
@@ -1496,13 +1699,11 @@ impl WorldState {
             .or_else(|| {
                 // Cached content is RAW; mask Rmd/Quarto before extracting so
                 // directives/source()/library() come from chunk bodies, not
-                // prose (#343).
-                self.cross_file_file_cache.get(uri).map(|content| {
-                    Arc::new(crate::cross_file::extract_metadata_for_path(
-                        uri.path(),
-                        &content,
-                    ))
-                })
+                // prose (#343), preserving any editor-language override from
+                // the closed document (#563).
+                self.cross_file_file_cache
+                    .get(uri)
+                    .map(|content| Arc::new(self.extract_metadata_for_uri(uri, &content)))
             })
     }
 
@@ -1513,11 +1714,12 @@ impl WorldState {
         meta: &'a crate::cross_file::CrossFileMetadata,
         workspace_root: Option<&Url>,
     ) -> std::borrow::Cow<'a, crate::cross_file::CrossFileMetadata> {
+        let graph_meta = self.metadata_for_dependency_graph(open_uri, meta, workspace_root);
         if root == open_uri {
-            return std::borrow::Cow::Borrowed(meta);
+            return graph_meta;
         }
 
-        let mut root_meta = meta.clone();
+        let mut root_meta = graph_meta.as_ref().clone();
         root_meta.inherited_working_directory = None;
         crate::cross_file::enrich_metadata_with_inherited_wd(
             &mut root_meta,
@@ -1636,6 +1838,8 @@ impl WorldState {
         // URIs are unique, so a stable sort buys nothing; use the faster unstable.
         entries.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
 
+        let workspace_exclusions = self.workspace_exclusions.clone();
+
         // Destructure self to split borrows: cross_file_graph (mutable) and
         // workspace_index_new (shared) can coexist without pre-cloning all contents.
         let Self {
@@ -1660,9 +1864,15 @@ impl WorldState {
                     .get(parent_uri)
                     .map(|e| e.contents.to_string())
             };
-            let _result = cross_file_graph.update_file(
+            let graph_meta = Self::metadata_for_dependency_graph_with_exclusions(
+                &workspace_exclusions,
                 uri,
                 meta.as_ref(),
+                workspace_root.as_ref(),
+            );
+            let _result = cross_file_graph.update_file(
+                uri,
+                graph_meta.as_ref(),
                 workspace_root.as_ref(),
                 get_content,
             );
@@ -1790,9 +2000,11 @@ impl WorldState {
                         .get(parent_uri)
                         .map(|e| e.contents.to_string())
                 };
+                let graph_meta =
+                    self.metadata_for_dependency_graph(uri, meta.as_ref(), workspace_root.as_ref());
                 self.cross_file_graph.update_file(
                     uri,
-                    meta.as_ref(),
+                    graph_meta.as_ref(),
                     workspace_root.as_ref(),
                     get_content,
                 );
@@ -1941,6 +2153,7 @@ impl WorldState {
             }
             self.workspace_index_new.invalidate(&uri);
             self.cross_file_graph.remove_file(&uri);
+            self.prune_editor_chunk_kind_override(&uri);
         }
     }
 
@@ -2102,13 +2315,36 @@ pub(crate) fn collect_files_matching(
     out: &mut Vec<PathBuf>,
     accept: fn(&Path) -> bool,
 ) {
+    collect_files_matching_impl(dir, out, accept, None);
+}
+
+pub(crate) fn collect_files_matching_with_exclusions(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    accept: fn(&Path) -> bool,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) {
+    collect_files_matching_impl(
+        dir,
+        out,
+        accept,
+        (!exclusions.is_empty()).then_some(exclusions),
+    );
+}
+
+fn collect_files_matching_impl(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    accept: fn(&Path) -> bool,
+    exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
+) {
     let mut visited = HashSet::new();
     // Seed with the canonical root so a symlink pointing back at the root (or
     // any already-visited directory) is detected as a cycle and skipped.
     if let Ok(canonical) = fs::canonicalize(dir) {
         visited.insert(canonical);
     }
-    collect_files_matching_inner(dir, out, &mut visited, accept);
+    collect_files_matching_inner(dir, out, &mut visited, accept, exclusions);
 }
 
 fn collect_files_matching_inner(
@@ -2116,6 +2352,7 @@ fn collect_files_matching_inner(
     out: &mut Vec<PathBuf>,
     visited: &mut HashSet<PathBuf>,
     accept: fn(&Path) -> bool,
+    exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
 ) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -2136,6 +2373,10 @@ fn collect_files_matching_inner(
                 .is_some_and(should_skip_directory)
             {
                 log::trace!("Skipping directory: {}", path.display());
+                continue;
+            }
+            if exclusions.is_some_and(|exclusions| exclusions.can_prune_directory(&path)) {
+                log::trace!("Skipping excluded directory: {}", path.display());
                 continue;
             }
             let canonical = match fs::canonicalize(&path) {
@@ -2164,8 +2405,10 @@ fn collect_files_matching_inner(
                 log::trace!("Skipping symlink cycle: {}", path.display());
                 continue;
             }
-            collect_files_matching_inner(&path, out, visited, accept);
-        } else if accept(&path) {
+            collect_files_matching_inner(&path, out, visited, accept, exclusions);
+        } else if accept(&path)
+            && !exclusions.is_some_and(|exclusions| exclusions.is_excluded_path(&path))
+        {
             out.push(path);
         }
     }
@@ -2308,10 +2551,11 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
     // Pair `doc.tree` with the analysis text it was parsed from (masked for
     // Rmd/Quarto, raw otherwise) for both metadata extraction and artifact
     // computation, so byte offsets align (#343). The scan currently never sees
-    // chunk files (`is_stat_model_extension` excludes `.rmd`/`.qmd`), so this is
-    // behavior-neutral today; the pairing must stay analysis-consistent in case
-    // that ever changes — feeding raw `&text` against a masked tree would
-    // mis-slice (and panic on a non-UTF-8 boundary in multibyte prose).
+    // chunk files (`is_stat_model_extension` excludes Rmd/Quarto extensions),
+    // so this is behavior-neutral today; the pairing must stay
+    // analysis-consistent in case that ever changes — feeding raw `&text`
+    // against a masked tree would mis-slice (and panic on a non-UTF-8 boundary
+    // in multibyte prose).
     let analysis_text = doc.analysis_text();
 
     let cross_file_meta = crate::cross_file::extract_metadata(&analysis_text);
@@ -2357,6 +2601,15 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
 }
 
 pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanResult {
+    let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+    scan_workspace_with_exclusions(folders, max_chain_depth, &exclusions)
+}
+
+pub fn scan_workspace_with_exclusions(
+    folders: &[Url],
+    max_chain_depth: usize,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> WorkspaceScanResult {
     use rayon::prelude::*;
 
     // Get workspace root for path resolution
@@ -2367,7 +2620,12 @@ pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanR
     for folder in folders {
         log::info!("Scanning folder: {}", folder);
         if let Ok(path) = folder.to_file_path() {
-            collect_files_matching(&path, &mut file_paths, is_stat_model_extension);
+            collect_files_matching_with_exclusions(
+                &path,
+                &mut file_paths,
+                is_stat_model_extension,
+                exclusions,
+            );
         }
     }
 
@@ -2662,6 +2920,65 @@ mod tests {
         // name) and via the symlink (deps' canonical target name).
         assert_eq!(out.len(), 1, "got {out:?}");
         assert!(out[0].ends_with("real.R"), "got {out:?}");
+    }
+
+    #[test]
+    fn workspace_scan_skips_project_excluded_directory() {
+        use serde_json::json;
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(tmp.path().join("main.R"), "main <- 1\n").unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(tmp.path().join("generated/ignored.R"), "ignored <- 1\n").unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &json!({ "workspace": { "exclude": ["generated/**"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+        let root = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
+
+        let (index, _, _) = scan_workspace_with_exclusions(&[root], 20, &exclusions);
+        let indexed_paths: Vec<_> = index
+            .keys()
+            .filter_map(|uri| uri.to_file_path().ok())
+            .collect();
+
+        assert!(
+            indexed_paths.iter().any(|path| path.ends_with("main.R")),
+            "included file should be indexed; got {indexed_paths:?}"
+        );
+        assert!(
+            !indexed_paths
+                .iter()
+                .any(|path| path.ends_with("generated/ignored.R")),
+            "excluded generated directory must be skipped; got {indexed_paths:?}"
+        );
+    }
+
+    #[test]
+    fn collect_files_matching_negated_exclusion_does_not_prune_reincluded_file() {
+        use serde_json::json;
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(tmp.path().join("generated/drop.R"), "drop <- 1\n").unwrap();
+        fs::write(tmp.path().join("generated/keep.R"), "keep <- 1\n").unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &json!({ "workspace": { "exclude": ["generated/**", "!generated/keep.R"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+
+        let mut out = Vec::new();
+        collect_files_matching_with_exclusions(
+            tmp.path(),
+            &mut out,
+            is_stat_model_extension,
+            &exclusions,
+        );
+
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert!(out[0].ends_with("generated/keep.R"), "got {out:?}");
     }
 
     // Include workspace scanning tests

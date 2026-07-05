@@ -48,10 +48,21 @@ Diagnostics reported (subject to configured severities — see [diagnostics.md](
 
 ### Workspace and paths
 
-The whole workspace is always indexed so cross-file resolution is accurate. The workspace root is `--workspace DIR`, defaulting to the current directory. `PATHS` only filter **which files have their diagnostics reported**:
+The workspace is indexed, except for paths matched by `[workspace].exclude`, so cross-file resolution is accurate for included files. The workspace root is `--workspace DIR`, defaulting to the current directory. `PATHS` only filter **which files have their diagnostics reported**:
 
-- With no `PATHS`, every R file in the workspace is reported.
-- With `PATHS`, only those files are reported (directories are walked recursively for R files). Indexing still covers the whole workspace, so a reported file's `source()` targets resolve even when they aren't named.
+- With no `PATHS`, every included R file in the workspace is reported.
+- With `PATHS`, explicit files are reported as named, while directories are walked recursively for included R files. Indexing still covers the included workspace, so a reported file's `source()` targets resolve even when they aren't named.
+
+`raven.toml` can exclude generated or vendored trees from discovery:
+
+```toml
+[workspace]
+exclude = ["generated/**", "archive/**", "!generated/keep.R"]
+```
+
+`[workspace].exclude` defaults to `[]`. Patterns are project-root-relative globs, matched against paths relative to the containing workspace root. `*` and `?` do not cross `/`; use `**` for recursive matches, such as `**/*.log` for `.log` files at any depth. They apply to the workspace index and to default `raven check` discovery. Directory globs like `generated/**` prune whole directories before the parallel parse/index phase; when any negated re-include pattern (`!pattern`) is present, Raven disables directory pruning for the list so a re-included file is never skipped early. The full ordered matcher still filters files, with the last matching pattern winning.
+
+Explicit file arguments bypass these exclusions: `raven check generated/one.R` still reports `generated/one.R` even if `generated/**` is excluded. Directory arguments are discovery walks, so exclusions apply inside them.
 
 ### Options
 

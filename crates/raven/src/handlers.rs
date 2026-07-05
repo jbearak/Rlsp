@@ -21993,7 +21993,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // Pair the DocumentStore tree with its analysis text (masked for Rmd/Quarto,
     // raw otherwise) — never `get_content` (which is RAW): the tree's byte
     // offsets index into the masked text, so slicing raw content mis-slices
-    // (and can panic on a non-UTF-8 boundary) for `.Rmd`/`.qmd` files (#343).
+    // (and can panic on a non-UTF-8 boundary) for Rmd/Quarto files (#343).
     for file_uri in state.document_store.uris() {
         if &file_uri == uri {
             continue; // Already searched
@@ -22022,7 +22022,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
         }
         if let Some(tree) = &entry.tree {
             let raw = entry.contents.to_string();
-            let file_text = crate::cross_file::analysis_text_for_path(file_uri.path(), &raw);
+            let file_text = state.analysis_text_for_uri(&file_uri, &raw);
             find_references_in_tree(
                 tree.root_node(),
                 name,

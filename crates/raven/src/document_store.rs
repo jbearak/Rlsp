@@ -84,7 +84,8 @@ pub struct DocumentStoreMetrics {
 /// # Raw content vs. analysis text (Rmd/Quarto invariant)
 ///
 /// Like [`crate::state::Document`], an open `DocumentState` keeps two views of
-/// its content distinct for R Markdown / Quarto (`.Rmd` / `.qmd`) documents:
+/// its content distinct for R Markdown / Quarto (`.Rmd` / `.Rmarkdown` /
+/// `.qmd`) documents:
 ///
 /// * [`contents`](DocumentState::contents) is **always** the verbatim raw
 ///   document — `ContentProvider::get_content` returns it unchanged, so raw
@@ -108,7 +109,7 @@ pub struct DocumentStoreMetrics {
 /// Whether a document is masked is fixed by its
 /// [`chunk_kind`](DocumentState::chunk_kind), determined at open time from the
 /// editor's `languageId`-then-URI classification — **not** re-derived by path.
-/// Untitled `.Rmd`/`.qmd` buffers (`untitled:Untitled-1`, languageId
+/// Untitled Rmd/Quarto buffers (`untitled:Untitled-1`, languageId
 /// `"rmd"`/`"quarto"`) have no file extension, so re-classifying by path alone
 /// would parse them RAW and leak prose into find-references / workspace-symbol
 /// (#343). Saved `.Rmd` files classify identically either way.
@@ -337,9 +338,12 @@ impl DocumentStore {
         self.mark_update_started(&uri);
         // Parse content. `contents` keeps the RAW source; tree/metadata/
         // artifacts derive from the masked analysis text for Rmd/Quarto (#343).
-        // No `languageId` here, so classify by path — this entry point is for
-        // callers (tests, internal) that always have a real file extension;
-        // the LSP path uses `open_with_metadata` with the editor's languageId.
+        // No `languageId` or `WorldState` override map here, so classify by
+        // path — this entry point is for callers (tests, internal) that always
+        // have a real file extension; the LSP path uses `open_with_metadata`
+        // with the editor's languageId. State-aware closed-file fallbacks use
+        // `WorldState::extract_metadata_for_uri` instead, so extension-mismatch
+        // overrides do not belong in this store-local API.
         let chunk_kind = crate::chunks::classify_chunk_document(uri.path());
         let contents = Rope::from_str(content);
         let metadata = Arc::new(crate::cross_file::extract_metadata_for_path(
@@ -416,7 +420,7 @@ impl DocumentStore {
     /// [`chunks::classify_chunk_document_for`](crate::chunks::classify_chunk_document_for)
     /// on the `did_open` `languageId`-then-URI) rather than re-classifying by
     /// path. This is the LSP open path; it is the only place that can mask
-    /// untitled `.Rmd`/`.qmd` buffers correctly (#343). Use this when metadata
+    /// untitled Rmd/Quarto buffers correctly (#343). Use this when metadata
     /// has been enriched with inherited_working_directory.
     pub async fn open_with_metadata(
         &mut self,
@@ -514,8 +518,9 @@ impl DocumentStore {
             // Rmd/Quarto (#343). The chunk kind is fixed at open and preserved
             // here — a document's language never changes mid-session — so an
             // untitled Rmd buffer keeps masking across edits. Path-based
-            // metadata extraction is acceptable for plain R; for Rmd the
-            // `update_with_metadata` variant supplies masked-derived metadata.
+            // metadata extraction is acceptable for this store-local fallback;
+            // the LSP path uses `update_with_metadata`, whose caller supplies
+            // masked-derived metadata from the live document's analysis text.
             let chunk_kind = state.chunk_kind;
             let content = state.contents.to_string();
             let metadata = Arc::new(crate::cross_file::extract_metadata_for_path(

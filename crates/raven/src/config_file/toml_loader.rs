@@ -85,6 +85,7 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "indentation",
     "symbols",
     "completion",
+    "workspace",
 ];
 
 /// Known project-scoped leaves under `[linting]`. **Hand-maintained**: when

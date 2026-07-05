@@ -98,7 +98,8 @@ pub struct PackageInputs {
     /// Whether `.Rprofile` prelude modeling is enabled (mirrors
     /// `CrossFileConfig.model_rprofile`). Carried here so the watched-file
     /// `translate` path can gate the scan without reaching for config.
-    /// Set by `initialize_package_inputs_from_state`; `Default` is `false`
+    /// Set by `initialize_package_inputs_from_state_with_exclusions`; `Default`
+    /// is `false`
     /// (seeders set the real value from config, which defaults `true`).
     pub model_rprofile: bool,
     /// Top-level symbol names introduced by the workspace-root `.Rprofile`
@@ -330,6 +331,25 @@ pub fn is_package_workspace_r_file(path: &Path, workspace_root: &Path) -> bool {
 /// and additionally extracts top-level defs from `.R` scripts (which create
 /// dataset objects at load time via side-effects).
 pub fn scan_own_package_data_dir(workspace_root: &Path) -> BTreeSet<String> {
+    scan_own_package_data_dir_impl::<false>(workspace_root, None)
+}
+
+/// Like [`scan_own_package_data_dir`], but skips files matched by
+/// `[workspace].exclude`.
+pub fn scan_own_package_data_dir_with_exclusions(
+    workspace_root: &Path,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> BTreeSet<String> {
+    if exclusions.is_empty() {
+        return scan_own_package_data_dir(workspace_root);
+    }
+    scan_own_package_data_dir_impl::<true>(workspace_root, Some(exclusions))
+}
+
+fn scan_own_package_data_dir_impl<const USE_EXCLUSIONS: bool>(
+    workspace_root: &Path,
+    exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
+) -> BTreeSet<String> {
     use std::fs;
 
     let data_dir = workspace_root.join("data");
@@ -345,7 +365,9 @@ pub fn scan_own_package_data_dir(workspace_root: &Path) -> BTreeSet<String> {
 
     // datalist file (same format as installed packages)
     let datalist_path = data_dir.join("datalist");
-    if let Ok(content) = fs::read_to_string(&datalist_path) {
+    if (!USE_EXCLUSIONS || !exclusions.is_some_and(|e| e.is_excluded_path(&datalist_path)))
+        && let Ok(content) = fs::read_to_string(&datalist_path)
+    {
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -383,6 +405,9 @@ pub fn scan_own_package_data_dir(workspace_root: &Path) -> BTreeSet<String> {
             continue;
         }
         let path = entry.path();
+        if USE_EXCLUSIONS && exclusions.is_some_and(|e| e.is_excluded_path(&path)) {
+            continue;
+        }
         let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
@@ -1040,6 +1065,28 @@ mod scan_data_tests {
         let syms = scan_own_package_data_dir(tmp.path());
         assert!(syms.contains("starwars"), "got: {:?}", syms);
         assert!(syms.contains("starwars_films"), "got: {:?}", syms);
+    }
+
+    #[test]
+    fn scan_with_exclusions_skips_excluded_r_script_defs() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(data_dir.join("included.R"), "included_dataset <- 1\n").unwrap();
+        fs::write(data_dir.join("excluded.R"), "excluded_dataset <- 1\n").unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["data/excluded.R"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+
+        let syms = scan_own_package_data_dir_with_exclusions(tmp.path(), &exclusions);
+
+        assert!(syms.contains("included_dataset"), "got: {:?}", syms);
+        assert!(
+            !syms.contains("excluded_dataset"),
+            "excluded data/*.R must not seed dataset names: {:?}",
+            syms
+        );
     }
 
     #[test]

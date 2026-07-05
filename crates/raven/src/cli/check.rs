@@ -21,8 +21,9 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 
 use crate::cli::shared::{
     ColorChoice, EXIT_LINT_FAILED, EXIT_OK, EXIT_OPERATOR_ERROR, OutputFormat, SeverityLevel,
-    absolute_path, collect_check_target_paths, encoding_diagnostic, is_chunk_file, is_r_file,
-    parse_color_choice, parse_output_format, parse_severity_level, render, resolve_color_from_env,
+    absolute_path, collect_check_target_paths_with_exclusions, encoding_diagnostic, is_chunk_file,
+    is_r_file, parse_color_choice, parse_output_format, parse_severity_level, render,
+    resolve_color_from_env,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -237,11 +238,13 @@ fn open_disk_fallback_target(
             Some((parent_uri, content))
         })
         .collect();
-    state
-        .cross_file_graph
-        .update_file(uri, &meta, workspace_root.as_ref(), |parent_uri| {
-            parent_content.get(parent_uri).cloned()
-        });
+    let graph_meta = state.metadata_for_dependency_graph(uri, &meta, workspace_root.as_ref());
+    state.cross_file_graph.update_file(
+        uri,
+        graph_meta.as_ref(),
+        workspace_root.as_ref(),
+        |parent_uri| parent_content.get(parent_uri).cloned(),
+    );
 }
 
 pub async fn run(args: CheckArgs) -> i32 {
@@ -311,7 +314,12 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
     // Resolve which files to report diagnostics for. A named path that does not
     // exist is an operator error (exit 2), matching `raven lint`.
     let mut operator_error = false;
-    let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
+    let targets = collect_report_targets_with_exclusions(
+        &args.paths,
+        &root,
+        &state.workspace_exclusions,
+        &mut operator_error,
+    );
 
     // Warm the package-export cache before computing diagnostics, matching the
     // editor's post-scan prefetch (see [`prefetch_reported_packages`]).
@@ -430,7 +438,7 @@ async fn run_with_cwd(args: CheckArgs, cwd: &Path) -> i32 {
 /// drift is single-sourced through shared seams: config discovery+load
 /// ([`crate::config_file::discover_and_load`]), the workspace scan
 /// ([`crate::state::scan_workspace`] + [`crate::state::WorldState::apply_workspace_index`]),
-/// package-input seeding ([`crate::backend::initialize_package_inputs_from_state`]),
+/// package-input seeding ([`crate::backend::initialize_package_inputs_from_state_with_exclusions`]),
 /// and the R package library ([`crate::package_library::build_package_library`]).
 /// Keep new startup logic in those seams, not duplicated here.
 fn build_indexed_state(
@@ -457,7 +465,11 @@ fn build_indexed_state(
     // owns `state` exclusively.
     let max_chain_depth = state.cross_file_config.max_chain_depth;
     let (index, cross_file_entries, new_index_entries) =
-        crate::state::scan_workspace(std::slice::from_ref(workspace_url), max_chain_depth);
+        crate::state::scan_workspace_with_exclusions(
+            std::slice::from_ref(workspace_url),
+            max_chain_depth,
+            &state.workspace_exclusions,
+        );
     state.apply_workspace_index(index, cross_file_entries, new_index_entries);
 
     // Derive package-mode scope (so `R/*.R` files in an R package see each
@@ -466,7 +478,7 @@ fn build_indexed_state(
     // DESCRIPTION, and NAMESPACE — but MUST run after `apply_workspace_index`,
     // which resets package state.
     //
-    // The disk seed is empty: `initialize_package_inputs_from_state` hydrates
+    // The disk seed is empty: `initialize_package_inputs_from_state_with_exclusions` hydrates
     // every package R file from the workspace index we just applied, so reading
     // them from disk here would only be overwritten. This mirrors the LSP's
     // with-scan startup path, which seeds package inputs from disk only on the
@@ -477,7 +489,8 @@ fn build_indexed_state(
     let ns_text: Option<std::sync::Arc<str>> = std::fs::read_to_string(root.join("NAMESPACE"))
         .ok()
         .map(|t| t.into());
-    crate::backend::initialize_package_inputs_from_state(
+    let workspace_exclusions = state.workspace_exclusions.clone();
+    crate::backend::initialize_package_inputs_from_state_with_exclusions(
         &mut state,
         root.to_path_buf(),
         desc_text,
@@ -485,8 +498,9 @@ fn build_indexed_state(
         Default::default(),
         // `raven check` is a single-pass batch with no concurrent writers, so
         // it lets the helper scan `.Rprofile` inline (no off-lock precompute
-        // needed). See `initialize_package_inputs_from_state`.
+        // needed). See `initialize_package_inputs_from_state_with_exclusions`.
         None,
+        &workspace_exclusions,
     );
 
     Ok(state)
@@ -1370,20 +1384,31 @@ async fn collect_target_diagnostics(
 ///
 /// A named path that does not exist sets `*operator_error`, so the caller can
 /// return exit code 2 — matching `raven lint`.
+#[cfg(test)]
 fn collect_report_targets(
     paths: &[PathBuf],
     root: &Path,
     operator_error: &mut bool,
 ) -> Vec<PathBuf> {
+    let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+    collect_report_targets_with_exclusions(paths, root, &exclusions, operator_error)
+}
+
+fn collect_report_targets_with_exclusions(
+    paths: &[PathBuf],
+    root: &Path,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    operator_error: &mut bool,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if paths.is_empty() {
-        collect_check_target_paths(root, &mut out);
+        collect_check_target_paths_with_exclusions(root, &mut out, exclusions);
     } else {
         for p in paths {
             let abs = absolute_path(root, p);
             let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
             if abs.is_dir() {
-                collect_check_target_paths(&abs, &mut out);
+                collect_check_target_paths_with_exclusions(&abs, &mut out, exclusions);
             } else if abs.is_file() {
                 if is_r_file(&abs) || is_chunk_file(&abs) {
                     out.push(abs);
@@ -2089,6 +2114,92 @@ mod tests {
     }
 
     #[test]
+    fn collect_targets_empty_skips_project_excluded_files() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("included.R"), "x <- 1\n").unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(tmp.path().join("generated/ignored.R"), "y <- 1\n").unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["generated/**"] } }),
+            vec![tmp.path().to_path_buf()],
+        );
+
+        let mut operator_error = false;
+        let targets = collect_report_targets_with_exclusions(
+            &[],
+            tmp.path(),
+            &exclusions,
+            &mut operator_error,
+        );
+
+        assert_eq!(targets.len(), 1, "got {targets:?}");
+        assert!(targets[0].ends_with("included.R"), "got {targets:?}");
+        assert!(!operator_error);
+    }
+
+    #[test]
+    fn package_data_excluded_r_script_does_not_seed_dataset_scope() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(
+            root.join("raven.toml"),
+            "[workspace]\nexclude = [\"data/**\"]\n[packages]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("R")).unwrap();
+        fs::create_dir(root.join("data")).unwrap();
+        fs::write(
+            root.join("data").join("excluded.R"),
+            "excluded_dataset <- 1\n",
+        )
+        .unwrap();
+        let target = root.join("R").join("use.R");
+        fs::write(&target, "f <- function() excluded_dataset\n").unwrap();
+
+        let mut args = base_args(root);
+        args.no_config = false;
+        args.paths = vec![target];
+        let diags = collect_diagnostics_blocking(&args);
+
+        assert!(
+            has_undefined(&diags, "excluded_dataset"),
+            "excluded data/*.R symbol must remain undefined; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn package_data_raw_excluded_script_does_not_seed_sysdata_scope() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(
+            root.join("raven.toml"),
+            "[workspace]\nexclude = [\"data-raw/**\"]\n[packages]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("R")).unwrap();
+        fs::create_dir(root.join("data-raw")).unwrap();
+        fs::write(
+            root.join("data-raw").join("generate.R"),
+            "usethis::use_data(excluded_sysdata, internal = TRUE)\n",
+        )
+        .unwrap();
+        let target = root.join("R").join("use.R");
+        fs::write(&target, "f <- function() excluded_sysdata\n").unwrap();
+
+        let mut args = base_args(root);
+        args.no_config = false;
+        args.paths = vec![target];
+        let diags = collect_diagnostics_blocking(&args);
+
+        assert!(
+            has_undefined(&diags, "excluded_sysdata"),
+            "excluded data-raw/*.R sysdata symbol must remain undefined; got {diags:?}"
+        );
+    }
+
+    #[test]
     fn walk_includes_rmd_and_qmd() {
         // The empty-PATHS workspace walk collects chunk-bearing documents
         // alongside R sources, including mixed-case extensions
@@ -2122,6 +2233,33 @@ mod tests {
         // Targets are canonicalized so they match the canonical workspace root.
         assert_eq!(targets, vec![std::fs::canonicalize(&rmd).unwrap()]);
         assert!(!operator_error);
+    }
+
+    #[test]
+    fn explicit_file_target_bypasses_project_exclusion() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            "[workspace]\nexclude = [\"generated/**\"]\n",
+        )
+        .unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        let target = tmp.path().join("generated/explicit.R");
+        fs::write(&target, "definitely_missing_symbol_559\n").unwrap();
+        let canonical_target = std::fs::canonicalize(&target).unwrap();
+
+        let mut args = base_args(tmp.path());
+        args.no_config = false;
+        args.paths = vec![target.clone()];
+
+        let diags = collect_diagnostics_blocking(&args);
+        assert!(
+            diags.iter().any(|(path, diag)| path == &canonical_target
+                && diag
+                    .message
+                    .contains("definitely_missing_symbol_559 is not defined")),
+            "explicit excluded file must still be diagnosed; got {diags:?}"
+        );
     }
 
     #[test]
@@ -2565,7 +2703,12 @@ mod tests {
         state.resolve_system_file_in_workspace();
         maybe_load_sysdata_fallback(&mut state).await;
         let mut operator_error = false;
-        let targets = collect_report_targets(&args.paths, &root, &mut operator_error);
+        let targets = collect_report_targets_with_exclusions(
+            &args.paths,
+            &root,
+            &state.workspace_exclusions,
+            &mut operator_error,
+        );
         prefetch_reported_packages(&state, &targets).await;
         (state, targets)
     }
@@ -3355,6 +3498,38 @@ mod tests {
         assert!(
             !has_undefined(&diags, "r_bind"),
             "prelude must resolve r_bind: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn rprofile_excluded_sourced_helper_does_not_seed_prelude_scope() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("DESCRIPTION"), "Package: pkg\n").unwrap();
+        fs::write(
+            root.join("raven.toml"),
+            "[workspace]\nexclude = [\"helpers/**\"]\n[packages]\nenabled = false\n",
+        )
+        .unwrap();
+        fs::create_dir(root.join("helpers")).unwrap();
+        fs::write(
+            root.join("helpers").join("setup.R"),
+            "excluded_helper <- function() 1\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"helpers/setup.R\")\n").unwrap();
+        fs::create_dir(root.join("scripts")).unwrap();
+        let foo = root.join("scripts").join("foo.R");
+        fs::write(&foo, "excluded_helper()\n").unwrap();
+
+        let mut args = args_for(root, &foo);
+        args.no_config = false;
+        let diags = collect_diagnostics_blocking(&args);
+
+        assert!(
+            has_undefined(&diags, "excluded_helper"),
+            "excluded .Rprofile helper must not suppress undefined-variable: {:?}",
             diags
         );
     }

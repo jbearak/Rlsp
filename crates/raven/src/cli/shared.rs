@@ -191,6 +191,14 @@ pub fn collect_r_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     crate::state::collect_files_matching(dir, out, is_r_file);
 }
 
+pub fn collect_r_file_paths_with_exclusions(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) {
+    crate::state::collect_files_matching_with_exclusions(dir, out, is_r_file, exclusions);
+}
+
 /// Recursively collect both R sources (`.R` / `.r`) and chunk-bearing documents
 /// (`.Rmd` / `.qmd`, case-insensitive) under `dir`. Same directory walk as
 /// [`collect_r_file_paths`] — symlinked directories are followed with
@@ -203,6 +211,19 @@ pub fn collect_r_file_paths(dir: &Path, out: &mut Vec<PathBuf>) {
 /// sort afterwards.
 pub fn collect_check_target_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     crate::state::collect_files_matching(dir, out, |p| is_r_file(p) || is_chunk_file(p));
+}
+
+pub fn collect_check_target_paths_with_exclusions(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) {
+    crate::state::collect_files_matching_with_exclusions(
+        dir,
+        out,
+        |p| is_r_file(p) || is_chunk_file(p),
+        exclusions,
+    );
 }
 
 /// Build the reported finding for a target that isn't valid UTF-8. A
