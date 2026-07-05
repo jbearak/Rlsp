@@ -8,7 +8,7 @@ Raven's CI command is [`raven check`](cli.md#raven-check). It runs the same stat
 
 For most analysis repositories, start with this pattern:
 
-1. Install the Raven CLI in the CI job.
+1. Install the Raven CLI in the CI job: use `jbearak/setup-raven` on GitHub Actions, or the signed apt repository on Bitbucket Pipelines.
 2. Run `raven packages update` so Raven can recognize CRAN and Bioconductor package exports without installing the packages.
 3. Run `raven check`.
 
