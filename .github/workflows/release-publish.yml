@@ -118,6 +118,7 @@ jobs:
   github-release:
     needs: [validate, download-artifacts]
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
     steps:
@@ -166,6 +167,7 @@ jobs:
     needs: [validate, download-artifacts]
     if: inputs.publish_vscode
     runs-on: ubuntu-latest
+    environment: marketplace
     permissions: {}
     steps:
       - name: Download VSIX artifacts

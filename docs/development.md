@@ -150,12 +150,12 @@ After the build succeeds, manually run `release-publish.yml` from GitHub Actions
 
 This creates a GitHub Release with all binaries and `.vsix` files. If marketplace publishing is enabled, it uploads each platform `.vsix` to both VS Code Marketplace and Open VSX.
 
-**Required secrets** (for marketplace publishing): `VSCE_PAT`, `OVSX_PAT`.
+**Required `marketplace` environment secrets** (for marketplace publishing): `VSCE_PAT`, `OVSX_PAT`.
 
 Optional post-release packaging jobs are gated by repository variables:
 
-- `ENABLE_HOMEBREW_BUMP=true` opens a PR against `jbearak/homebrew-raven`.
-- `ENABLE_APT_BUMP=true` builds Debian packages from the Linux release artifacts and opens a PR against `jbearak/apt-raven`, a GitHub Pages-backed apt repository. This requires `APT_REPO_TOKEN`, `APT_REPO_GPG_PRIVATE_KEY`, and optionally `APT_REPO_GPG_PASSPHRASE`. The apt repository stores signed `dists/stable` metadata plus `pool/main/r/raven/*.deb`; `names.db` is still not bundled and remains user-provisioned with `raven packages update`, `fetch`, or a committed `.raven/packages.json`.
+- `ENABLE_HOMEBREW_BUMP=true` opens a PR against `jbearak/homebrew-raven`. This requires `release` environment secret `HOMEBREW_TAP_TOKEN`.
+- `ENABLE_APT_BUMP=true` builds Debian packages from the Linux release artifacts and opens a PR against `jbearak/apt-raven`, a GitHub Pages-backed apt repository. This requires `release` environment secrets `APT_REPO_TOKEN` and `APT_REPO_GPG_PRIVATE_KEY`, plus optional `APT_REPO_GPG_PASSPHRASE`. The apt repository stores signed `dists/stable` metadata plus `pool/main/r/raven/*.deb`; `names.db` is still not bundled and remains user-provisioned with `raven packages update`, `fetch`, or a committed `.raven/packages.json`.
 
 ## Cross-file internals (high-level)
 

@@ -350,9 +350,9 @@ jobs:
   # and signatures before users can see the update.
   #
   # Setup (one-time), then this job activates itself:
-  #   gh secret   set APT_REPO_TOKEN            -R jbearak/raven   # paste token
-  #   gh secret   set APT_REPO_GPG_PRIVATE_KEY  -R jbearak/raven   # armored private key
-  #   gh secret   set APT_REPO_GPG_PASSPHRASE   -R jbearak/raven   # optional, may be empty
+  #   gh secret   set APT_REPO_TOKEN            -R jbearak/raven --env release # paste token
+  #   gh secret   set APT_REPO_GPG_PRIVATE_KEY  -R jbearak/raven --env release # armored private key
+  #   gh secret   set APT_REPO_GPG_PASSPHRASE   -R jbearak/raven --env release # optional, may be empty
   #   gh variable set ENABLE_APT_BUMP -R jbearak/raven --body true
   # APT_REPO_TOKEN: a GitHub App installation token or fine-grained PAT scoped
   # to jbearak/apt-raven with Contents:write + Pull requests:write.
@@ -360,6 +360,7 @@ jobs:
     needs: github-release
     if: vars.ENABLE_APT_BUMP == 'true' && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
     steps:
@@ -486,7 +487,7 @@ jobs:
   # bootstrap script.
   #
   # Setup (one-time), then this job activates itself:
-  #   gh secret   set HOMEBREW_TAP_TOKEN   -R jbearak/raven   # paste token
+  #   gh secret   set HOMEBREW_TAP_TOKEN   -R jbearak/raven --env release # paste token
   #   gh variable set ENABLE_HOMEBREW_BUMP -R jbearak/raven --body true
   # HOMEBREW_TAP_TOKEN: a GitHub App installation token or fine-grained PAT
   # scoped to jbearak/homebrew-raven with Contents:write + Pull requests:write.
@@ -495,6 +496,7 @@ jobs:
     needs: github-release
     if: vars.ENABLE_HOMEBREW_BUMP == 'true'
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
     steps:
