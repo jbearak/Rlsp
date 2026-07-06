@@ -55,6 +55,7 @@ describe("apt packaging release integration", () => {
     expect(aptJob).toContain("APT_REPO_GPG_PRIVATE_KEY");
     expect(aptJob).toContain("APT_REPO_GPG_PASSPHRASE");
     expect(aptJob).toContain("repository: jbearak/apt-raven");
+    expect(aptJob).toContain("environment: release");
     expect(aptJob).toContain("scripts/debian/build-deb.sh");
     expect(aptJob).toContain("scripts/debian/update-apt-repo.sh");
     expect(aptJob).toContain("VERSION: ${{ steps.version.outputs.version }}");
@@ -65,6 +66,41 @@ describe("apt packaging release integration", () => {
     expect(aptJob).not.toContain('git diff --quiet');
     expect(workflow).toContain("lsp-linux-x64");
     expect(workflow).toContain("lsp-linux-arm64");
+  });
+
+  test("release publishing secrets are scoped to their environments", () => {
+    const releaseBuild = readRepoFile(".github", "workflows", "release-build.yml");
+    const releasePublish = readRepoFile(".github", "workflows", "release-publish.yml");
+
+    const aptJob = releaseBuild.slice(
+      releaseBuild.indexOf("  bump-apt:"),
+      releaseBuild.indexOf("  # ── Homebrew tap bump"),
+    );
+    const homebrewJob = releaseBuild.slice(releaseBuild.indexOf("  bump-homebrew:"));
+    const buildMarketplaceJob = releaseBuild.slice(
+      releaseBuild.indexOf("  publish-marketplace:"),
+      releaseBuild.indexOf("  # Smoke-test"),
+    );
+    const fallbackReleaseJob = releasePublish.slice(
+      releasePublish.indexOf("  github-release:"),
+      releasePublish.indexOf("  publish-marketplace:"),
+    );
+    const fallbackMarketplaceJob = releasePublish.slice(
+      releasePublish.indexOf("  publish-marketplace:"),
+    );
+
+    expect(aptJob).toContain("APT_REPO_GPG_PRIVATE_KEY");
+    expect(aptJob).toContain("APT_REPO_TOKEN");
+    expect(aptJob).toContain("environment: release");
+    expect(homebrewJob).toContain("HOMEBREW_TAP_TOKEN");
+    expect(homebrewJob).toContain("environment: release");
+    expect(buildMarketplaceJob).toContain("VSCE_PAT");
+    expect(buildMarketplaceJob).toContain("OVSX_PAT");
+    expect(buildMarketplaceJob).toContain("environment: marketplace");
+    expect(fallbackReleaseJob).toContain("environment: release");
+    expect(fallbackMarketplaceJob).toContain("VSCE_PAT");
+    expect(fallbackMarketplaceJob).toContain("OVSX_PAT");
+    expect(fallbackMarketplaceJob).toContain("environment: marketplace");
   });
 
   test("Bitbucket Pipelines example installs Raven through the signed apt repo", () => {
