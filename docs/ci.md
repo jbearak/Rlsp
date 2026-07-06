@@ -114,13 +114,21 @@ Raven emits standard SARIF 2.1.0 with `raven check --format sarif`, which GitHub
 
 ## What fails the build
 
-By default, `raven check` exits with code `1` when it finds a `warning` or `error` diagnostic, and `0` otherwise. Change that threshold with `--max-severity`:
+"Fails the build" does not mean Raven itself failed. It means `raven check` ran successfully and found at least one diagnostic at or above your severity threshold, and it reports that through its exit code — the standard way a checker signals GitHub Actions or Bitbucket Pipelines that there is something to look at. The three exit codes are distinct:
+
+- **`0`** — nothing exceeded the threshold; the step passes.
+- **`1`** — a diagnostic exceeded the threshold; the step fails. This is the signal you want — Raven found an issue in your code, not that Raven broke.
+- **`2`** — Raven itself could not run (an unreadable path, a malformed `raven.toml`). This is a genuine operator error, separate from finding issues in your code.
+
+`--max-severity LEVEL` sets the highest severity still allowed to pass; anything more severe fails the build. From most to least severe the scale is `error`, `warning`, `info`, `hint`. The default is `info`, so `warning` and `error` findings fail while `info` and `hint` pass.
+
+Raven's style and idiomatic lints — line length, naming, infix spacing, and similar — are `information`-level, so they never fail CI by default. To gate on them, enable linting (a committed `raven.toml` with `enabled = true` under `[linting]`, or a `.lintr`) and lower the threshold to `hint`, so info-level findings fail:
 
 ```bash
-raven check --max-severity warning
+raven check --max-severity hint
 ```
 
-That command allows warnings and fails only on errors. See [Exit codes](cli.md#exit-codes) and [Diagnostics](diagnostics.md) for the full diagnostic set.
+That fails the build on style findings as well as warnings and errors; `--max-severity off` is stricter still and fails on every diagnostic. See [Linting](linting.md), [Exit codes](cli.md#exit-codes), and [Diagnostics](diagnostics.md) for the full rule and diagnostic set.
 
 A failing `raven check` fails the pipeline, but a red build does not block a merge on its own. To prevent merging when the check fails, mark it as a required status check (GitHub branch protection) or a merge check (Bitbucket).
 
