@@ -122,8 +122,6 @@ Raven emits standard SARIF 2.1.0 with `raven check --format sarif`, which GitHub
 
 `--max-severity LEVEL` sets the highest severity still allowed to pass; anything more severe fails the build. From most to least severe the scale is `error`, `warning`, `info`, `hint`. The default is `info`, so `warning` and `error` findings fail while `info` and `hint` pass.
 
-Despite the name, a `warning` is not a mere FYI. Raven reserves `error` for syntax/parse errors and reports genuine problems like undefined variables at `warning` — both are things you want CI to catch, which is why the default threshold fails on them. `info` and `hint` are where the more subjective, stylistic findings live by default.
-
 Raven's style and idiomatic lints — line length, naming, infix spacing, and similar — are `information`-level, so they never fail CI by default. To gate on them, first enable linting (via `raven.toml` or a `.lintr` — see [Linting](linting.md)), then lower the threshold to `hint` so info-level findings fail:
 
 ```bash
