@@ -164,28 +164,35 @@ Use Raven's signed apt repository from a normal Ubuntu build image. You can copy
 image: ubuntu:24.04
 
 pipelines:
-  default:
-    - step:
-        name: Raven
-        script:
-          - apt-get update
-          - apt-get install -y ca-certificates curl
-          - install -d -m 0755 /etc/apt/keyrings
-          - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
-          - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
-          - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
-          - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
-          - apt-get update
-          - apt-get install -y raven
-          - raven packages update
-          - raven check
+  custom:
+    Raven:
+      - step:
+          name: Raven
+          script:
+            - apt-get update
+            - apt-get install -y ca-certificates curl
+            - install -d -m 0755 /etc/apt/keyrings
+            - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
+            - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
+            - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
+            - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
+            - apt-get update
+            - apt-get install -y raven
+            - raven packages update
+            - raven check
+
+triggers:
+  pullrequest-push:
+    - condition: glob(BITBUCKET_BRANCH, "**")
+      pipelines:
+        - Raven
 ```
 
 The apt repository is static HTTPS hosting for Debian repository metadata and `.deb` files; it is not a Docker image and does not run a remote installer script. The SHA-256 check pins the bootstrap keyring before apt trusts it, and the `signed-by=` keyring then makes apt verify Raven's repository metadata before it installs the package. Pin a specific Raven package version for reproducible CI:
 
 ```yaml
-          - apt-cache madison raven
-          - apt-get install -y "raven=${RAVEN_DEB_VERSION}"
+            - apt-cache madison raven
+            - apt-get install -y "raven=${RAVEN_DEB_VERSION}"
 ```
 
 Set `RAVEN_DEB_VERSION` in your CI variables to one of the versions listed by `apt-cache madison raven`, or use `latest`-style behavior by omitting the version pin. As with GitHub Actions, `raven packages update` restores broad CRAN/Bioconductor coverage but follows Raven's moving `names-db` Release; commit `.raven/packages.json` from `raven packages freeze` when package metadata should be project-pinned.

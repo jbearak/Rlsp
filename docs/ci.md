@@ -65,28 +65,35 @@ Bitbucket Pipelines runs the commands in `bitbucket-pipelines.yml`. Raven publis
 image: ubuntu:24.04
 
 pipelines:
-  default:
-    - step:
-        name: Raven
-        script:
-          - apt-get update
-          - apt-get install -y ca-certificates curl
-          - install -d -m 0755 /etc/apt/keyrings
-          - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
-          - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
-          - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
-          - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
-          - apt-get update
-          - apt-get install -y raven
-          - raven packages update
-          - raven check
+  custom:
+    Raven:
+      - step:
+          name: Raven
+          script:
+            - apt-get update
+            - apt-get install -y ca-certificates curl
+            - install -d -m 0755 /etc/apt/keyrings
+            - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
+            - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
+            - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
+            - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
+            - apt-get update
+            - apt-get install -y raven
+            - raven packages update
+            - raven check
+
+triggers:
+  pullrequest-push:
+    - condition: glob(BITBUCKET_BRANCH, "**")
+      pipelines:
+        - Raven
 ```
 
 Pin a specific Raven package version for reproducible Bitbucket runs:
 
 ```yaml
-          - apt-cache madison raven
-          - apt-get install -y "raven=${RAVEN_DEB_VERSION}"
+            - apt-cache madison raven
+            - apt-get install -y "raven=${RAVEN_DEB_VERSION}"
 ```
 
 Set `RAVEN_DEB_VERSION` in your pipeline variables to one of the versions listed by `apt-cache madison raven`, or omit the version pin to track the latest package in the apt repository.
