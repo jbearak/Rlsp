@@ -110,7 +110,7 @@ Set `RAVEN_DEB_VERSION` in your pipeline variables to one of the versions listed
 
 If VS Code's YAML extension reports an unresolved Bitbucket schema reference such as `pipelines_configuration`, the pipeline file can still be valid. That is an editor schema issue, not a Raven or Bitbucket runtime error.
 
-Raven emits standard SARIF 2.1.0 with `raven check --format sarif` if you want to feed findings into GitHub code scanning or Bitbucket Code Insights, but for most projects the exit-code gate below is all CI needs.
+Raven emits standard SARIF 2.1.0 with `raven check --format sarif`, which GitHub code scanning ingests directly; Bitbucket Code Insights has no native SARIF support and needs a conversion step. For most projects, though, the exit-code gate below is all CI needs.
 
 ## What fails the build
 
