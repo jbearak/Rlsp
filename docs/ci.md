@@ -38,10 +38,14 @@ Use [`jbearak/setup-raven`](https://github.com/jbearak/setup-raven) to install t
 ```yaml
 name: Raven
 
+# Runs on pull requests and on pushes to the default branch (main).
+# Scoping push to main avoids a duplicate run when you push to a branch
+# that already has an open pull request (pull_request already covers that).
 on:
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  push:
 
 jobs:
   raven:
@@ -62,6 +66,9 @@ Pin `version` to a release tag when you want a fully reproducible CLI version.
 Bitbucket Pipelines runs the commands in `bitbucket-pipelines.yml`. Raven publishes a signed apt repository, so a normal Ubuntu build image can install the CLI directly. You can copy [`docs/examples/ci/bitbucket-pipelines.yml`](examples/ci/bitbucket-pipelines.yml) to `bitbucket-pipelines.yml`:
 
 ```yaml
+# Runs on pull requests and on pushes to the default branch (main).
+# repository-push is scoped to main so pushing to a branch with an open
+# pull request runs only once (via pullrequest-push), not twice.
 image: ubuntu:24.04
 
 pipelines:
@@ -83,6 +90,10 @@ pipelines:
             - raven check
 
 triggers:
+  repository-push:
+    - condition: BITBUCKET_BRANCH == "main"
+      pipelines:
+        - Raven
   pullrequest-push:
     - condition: glob(BITBUCKET_BRANCH, "**")
       pipelines:
@@ -100,6 +111,8 @@ Set `RAVEN_DEB_VERSION` in your pipeline variables to one of the versions listed
 
 If VS Code's YAML extension reports an unresolved Bitbucket schema reference such as `pipelines_configuration`, the pipeline file can still be valid. That is an editor schema issue, not a Raven or Bitbucket runtime error.
 
+Raven emits standard SARIF 2.1.0 with `raven check --format sarif` if you want to feed findings into GitHub code scanning or Bitbucket Code Insights, but for most projects the exit-code gate below is all CI needs.
+
 ## What fails the build
 
 By default, `raven check` exits with code `1` when it finds a `warning` or `error` diagnostic, and `0` otherwise. Change that threshold with `--max-severity`:
@@ -109,5 +122,7 @@ raven check --max-severity warning
 ```
 
 That command allows warnings and fails only on errors. See [Exit codes](cli.md#exit-codes) and [Diagnostics](diagnostics.md) for the full diagnostic set.
+
+A failing `raven check` fails the pipeline, but a red build does not block a merge on its own. To prevent merging when the check fails, mark it as a required status check (GitHub branch protection) or a merge check (Bitbucket).
 
 Use a committed [`raven.toml`](configuration.md) to keep local editor diagnostics and CI behavior aligned. Common CI-specific configuration includes `[workspace].exclude` for generated outputs and `diagnostics.reportUnusedSuppressions = true` when you want Raven to flag stale `# raven: ignore` comments.

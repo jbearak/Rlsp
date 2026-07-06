@@ -131,10 +131,14 @@ You can copy [`docs/examples/ci/github-actions-raven.yml`](examples/ci/github-ac
 ```yaml
 name: Raven
 
+# Runs on pull requests and on pushes to the default branch (main).
+# Scoping push to main avoids a duplicate run when you push to a branch
+# that already has an open pull request (pull_request already covers that).
 on:
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  push:
 
 jobs:
   raven:
@@ -161,6 +165,9 @@ To get installed/local package awareness and exact local package metadata in CI,
 Use Raven's signed apt repository from a normal Ubuntu build image. You can copy [`docs/examples/ci/bitbucket-pipelines.yml`](examples/ci/bitbucket-pipelines.yml) to `bitbucket-pipelines.yml`:
 
 ```yaml
+# Runs on pull requests and on pushes to the default branch (main).
+# repository-push is scoped to main so pushing to a branch with an open
+# pull request runs only once (via pullrequest-push), not twice.
 image: ubuntu:24.04
 
 pipelines:
@@ -182,6 +189,10 @@ pipelines:
             - raven check
 
 triggers:
+  repository-push:
+    - condition: BITBUCKET_BRANCH == "main"
+      pipelines:
+        - Raven
   pullrequest-push:
     - condition: glob(BITBUCKET_BRANCH, "**")
       pipelines:
