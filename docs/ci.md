@@ -122,7 +122,7 @@ Raven emits standard SARIF 2.1.0 with `raven check --format sarif`, which GitHub
 
 `--max-severity LEVEL` sets the highest severity still allowed to pass; anything more severe fails the build. From most to least severe the scale is `error`, `warning`, `info`, `hint`. The default is `info`, so `warning` and `error` findings fail while `info` and `hint` pass.
 
-Raven's style and idiomatic lints — line length, naming, infix spacing, and similar — are `information`-level, so they never fail CI by default. To gate on them, enable linting (a committed `raven.toml` with `enabled = true` under `[linting]`, or a `.lintr`) and lower the threshold to `hint`, so info-level findings fail:
+Raven's style and idiomatic lints — line length, naming, infix spacing, and similar — are `information`-level, so they never fail CI by default. To gate on them, first enable linting (via `raven.toml` or a `.lintr` — see [Linting](linting.md)), then lower the threshold to `hint` so info-level findings fail:
 
 ```bash
 raven check --max-severity hint
