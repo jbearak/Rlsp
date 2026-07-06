@@ -134,11 +134,10 @@ name: Raven
 # Runs on pull requests and on pushes to the default branch (main).
 # Scoping push to main avoids a duplicate run when you push to a branch
 # that already has an open pull request (pull_request already covers that).
-on:
+"on":
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   raven:
