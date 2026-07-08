@@ -1,6 +1,14 @@
 # Automated checks in CI
 
-CI means **Continuous Integration**: a service such as GitHub Actions or Bitbucket Pipelines runs commands automatically when you push code or open a pull request. In practice, it gives every change a clean, repeatable check before it is merged. For a research or analysis repository, that means a typo, a missing `source()` target, or an undefined object can be caught during review instead of later, when someone reruns the analysis.
+CI means **Continuous Integration**: a service such as GitHub Actions or Bitbucket Pipelines runs commands automatically every time you push code or open a pull request. You describe the commands once, in a small configuration file committed to the repository, and the service runs them on a fresh machine for every change — no one has to remember to run the checks, and the result is visible to everyone reviewing the change.
+
+If you have not worked with CI before, it may help to know that this is standard practice in most software ecosystems: Python projects run `pytest` and `ruff` on every pull request, TypeScript projects run `eslint` and the compiler, Rust projects run `cargo clippy` and their test suite. The tools differ, but the pattern is the same — an automated gate that catches problems before a change is merged, instead of after it has broken something. Raven brings that same pattern to R analysis code. For a research repository, it means a typo, a missing `source()` target, or an undefined object is caught during review instead of later, when someone reruns the analysis.
+
+The mechanics, concretely:
+
+1. You commit a configuration file to the repository — `.github/workflows/raven.yml` for GitHub Actions, or `bitbucket-pipelines.yml` at the repository root for Bitbucket. The copy-paste examples below are complete files; you do not need to write YAML from scratch.
+2. When you push a commit or open a pull request, the service starts a fresh Linux machine, checks out your code, and runs the listed commands.
+3. The result appears on the pull request as a green check mark or a red ✗. Clicking through shows the log — the same output you would see running `raven check` in a terminal, including file names and line numbers for each finding.
 
 Raven's CI command is [`raven check`](cli.md#raven-check). It runs the same static diagnostics the editor publishes, but in a headless batch suitable for CI logs and pass/fail gating. It reads `.R`, `.Rmd`, and `.qmd` files, follows `source()` chains, and reports syntax errors, missing source paths, undefined variables, package-scope issues, and enabled style lints. It does **not** execute your scripts.
 
@@ -68,6 +76,12 @@ Bitbucket Pipelines runs the commands in `bitbucket-pipelines.yml`. Raven publis
 # Runs on pull requests and on pushes to the default branch (main).
 # repository-push is scoped to main so pushing to a branch with an open
 # pull request runs only once (via pullrequest-push), not twice.
+# lfs: false skips downloading Git LFS content (e.g. large datasets);
+# raven check reads only code. In a repository that does not use LFS,
+# the setting simply has no effect.
+clone:
+  lfs: false
+
 image: ubuntu:24.04
 
 pipelines:
@@ -109,6 +123,110 @@ Pin a specific Raven package version for reproducible Bitbucket runs:
 Set `RAVEN_DEB_VERSION` in your pipeline variables to one of the versions listed by `apt-cache madison raven`, or omit the version pin to track the latest package in the apt repository.
 
 If VS Code's YAML extension reports an unresolved Bitbucket schema reference such as `pipelines_configuration`, the pipeline file can still be valid. That is an editor schema issue, not a Raven or Bitbucket runtime error.
+
+Both Bitbucket examples set `clone: lfs: false`: if the repository stores large data files in [Git LFS](https://git-lfs.com), there is no reason to download them — `raven check` reads only code, and analysis datasets can dwarf it. In a repository that does not use LFS, the setting simply has no effect, so it is safe to keep in either case. (On GitHub Actions no equivalent is needed: `actions/checkout` skips LFS content by default.)
+
+## Running Raven and Sight together
+
+Some social-science repositories mix R and Stata. [Sight](https://github.com/jbearak/sight) is Raven's sibling project — the same kind of static checker, for Stata `.do` files — and its CI command, `sight check`, works just like `raven check`. If your repository contains both languages, run both checkers.
+
+The examples below run them **sequentially in a single job**, and that ordering is deliberate: each additional job spins up its own fresh machine and checks out the repository again, so two separate jobs cost roughly twice the startup time and compute minutes to run two commands that each take seconds. One machine, one checkout, two checks is the efficient shape — both checkers take seconds, so splitting them across runners buys nothing. (If you prefer a separate green/red mark per checker on the pull request, both providers also support splitting them into parallel jobs; that alternative is described after each example.)
+
+### GitHub Actions
+
+You can copy [`docs/examples/ci/github-actions-raven-and-sight.yml`](examples/ci/github-actions-raven-and-sight.yml) to `.github/workflows/checks.yml`:
+
+```yaml
+name: Checks
+
+# Runs on pull requests and on pushes to the default branch (main).
+# Scoping push to main avoids a duplicate run when you push to a branch
+# that already has an open pull request (pull_request already covers that).
+"on":
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jbearak/setup-raven@v1
+        with:
+          version: latest
+      - uses: jbearak/setup-sight@v1
+        with:
+          version: latest
+      - run: raven packages update
+      - run: raven check
+      # if: always() means Sight still runs (and reports its findings)
+      # even when raven check has already failed the job.
+      - run: sight check
+        if: always()
+```
+
+Both checkers install onto the same runner and share one checkout. The `if: always()` on the Sight step matters: without it, a Raven finding would skip the Sight step entirely, so you would fix the R issues, push, and only then discover the Stata issues. With it, one run reports both.
+
+To run them as **parallel jobs** instead, put two entries under `jobs:` — one with the Raven steps, one with the Sight steps — each starting with its own `actions/checkout@v4`. Each job gets its own runner and its own status on the pull request.
+
+### Bitbucket Pipelines
+
+Sight is distributed on npm, so the combined pipeline uses the `node:24` image (Debian-based — Raven's signed apt repository installs on it exactly as on Ubuntu) and adds Sight with one `npm install`. You can copy [`docs/examples/ci/bitbucket-pipelines-raven-and-sight.yml`](examples/ci/bitbucket-pipelines-raven-and-sight.yml) to `bitbucket-pipelines.yml`:
+
+```yaml
+# Runs on pull requests and on pushes to the default branch (main).
+# repository-push is scoped to main so pushing to a branch with an open
+# pull request runs only once (via pullrequest-push), not twice.
+# lfs: false skips downloading Git LFS content (e.g. large datasets);
+# raven check reads only code. In a repository that does not use LFS,
+# the setting simply has no effect.
+clone:
+  lfs: false
+
+image: node:24
+
+pipelines:
+  custom:
+    Checks:
+      - step:
+          name: Raven and Sight
+          script:
+            - apt-get update
+            - apt-get install -y ca-certificates curl
+            - install -d -m 0755 /etc/apt/keyrings
+            - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
+            - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
+            - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
+            - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
+            - apt-get update
+            - apt-get install -y raven
+            - npm install -g @jbearak/sight
+            - raven packages update
+            # Bitbucket fails the step at the first nonzero exit, which would
+            # let a Raven finding skip Sight entirely. The "|| touch" swallows
+            # raven check's exit code but records it in a marker file, sight
+            # check then runs either way, and the final test fails the step
+            # when the marker exists — so both checkers always report, and
+            # either one failing turns the step red.
+            - raven check || touch /tmp/raven-failed
+            - sight check
+            - test ! -f /tmp/raven-failed
+
+triggers:
+  repository-push:
+    - condition: BITBUCKET_BRANCH == "main"
+      pipelines:
+        - Checks
+  pullrequest-push:
+    - condition: glob(BITBUCKET_BRANCH, "**")
+      pipelines:
+        - Checks
+```
+
+Bitbucket stops a step at the first failing command, so the last three lines use a small marker-file pattern: `|| touch /tmp/raven-failed` deliberately swallows `raven check`'s exit code (recording it as a marker file instead) so the script continues, `sight check` runs and can fail the step directly, and the final `test ! -f /tmp/raven-failed` exits nonzero — failing the step — whenever the marker exists. A Raven finding therefore still turns the step red; it just does so on the last line, after Sight has also reported. Pin versions for reproducible runs the same way as in the Raven-only example: `apt-get install -y "raven=${RAVEN_DEB_VERSION}"` for Raven, and `npm install -g @jbearak/sight@X.Y.Z` for Sight.
+
+To run them as **parallel steps** instead, wrap two `- step:` entries in a `- parallel:` block — one installing and running Raven, one installing and running Sight. Each step gets its own container and its own checkout, and each reports separately in the pipeline view.
 
 ## What fails the build
 

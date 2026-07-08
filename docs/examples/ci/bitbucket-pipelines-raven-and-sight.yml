@@ -7,13 +7,13 @@
 clone:
   lfs: false
 
-image: ubuntu:24.04
+image: node:24
 
 pipelines:
   custom:
-    Raven:
+    Checks:
       - step:
-          name: Raven
+          name: Raven and Sight
           script:
             - apt-get update
             - apt-get install -y ca-certificates curl
@@ -24,15 +24,24 @@ pipelines:
             - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
             - apt-get update
             - apt-get install -y raven
+            - npm install -g @jbearak/sight
             - raven packages update
-            - raven check
+            # Bitbucket fails the step at the first nonzero exit, which would
+            # let a Raven finding skip Sight entirely. The "|| touch" swallows
+            # raven check's exit code but records it in a marker file, sight
+            # check then runs either way, and the final test fails the step
+            # when the marker exists — so both checkers always report, and
+            # either one failing turns the step red.
+            - raven check || touch /tmp/raven-failed
+            - sight check
+            - test ! -f /tmp/raven-failed
 
 triggers:
   repository-push:
     - condition: BITBUCKET_BRANCH == "main"
       pipelines:
-        - Raven
+        - Checks
   pullrequest-push:
     - condition: glob(BITBUCKET_BRANCH, "**")
       pipelines:
-        - Raven
+        - Checks
