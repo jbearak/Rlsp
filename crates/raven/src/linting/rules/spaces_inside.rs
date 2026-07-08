@@ -5,6 +5,10 @@
 //! tight: `f(x)`, `df[1]`, `mat[[i]]`. Empty groupings — `f()`, `f( )`,
 //! `mat[]`, `mat[ ]` — are left alone: there's no token next to the bracket
 //! to crowd, and forcing `f()` vs `f( )` is too pedantic for a hint.
+//! For `subset` and `subset2` only, a trailing comma that marks an omitted
+//! dimension keeps its before-close space (`x[i, ]`, `x[[i, ]]`) so this rule
+//! does not conflict with `commas_linter`; `call` nodes such as `f(a, )` are
+//! intentionally not carved out, keeping the exception scoped to R subsetting.
 //!
 //! Applies to `call`, `subset`, `subset2`, and `parenthesized_expression`
 //! nodes. The `open` and `close` field positions are used to anchor the
@@ -38,12 +42,19 @@ fn visit(
     out: &mut Vec<Diagnostic>,
 ) {
     match node.kind() {
-        "call" | "subset" | "subset2" => {
+        "call" => {
             if let Some(args) = node.child_by_field_name("arguments") {
-                check_bracketed(args, text, severity, suppressions, out);
+                check_bracketed(args, false, text, severity, suppressions, out);
             }
         }
-        "parenthesized_expression" => check_bracketed(node, text, severity, suppressions, out),
+        "subset" | "subset2" => {
+            if let Some(args) = node.child_by_field_name("arguments") {
+                check_bracketed(args, true, text, severity, suppressions, out);
+            }
+        }
+        "parenthesized_expression" => {
+            check_bracketed(node, false, text, severity, suppressions, out);
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -54,6 +65,7 @@ fn visit(
 
 fn check_bracketed(
     node: Node<'_>,
+    is_subset: bool,
     text: &str,
     severity: DiagnosticSeverity,
     suppressions: &Suppressions,
@@ -112,6 +124,20 @@ fn check_bracketed(
     if let Some(last_rel) = last_non_ws_rel {
         let before_close = &interior[last_rel..];
         if !before_close.is_empty() && !before_close.contains('\n') {
+            if is_subset
+                && close
+                    .prev_sibling()
+                    .is_some_and(|prev| prev.kind() == "comma")
+            {
+                // Accept canonical omitted-dimension subsets like `x[i, ]` so
+                // `spaces_inside` does not conflict with `commas_linter`,
+                // which flags the alternative `x[i,]`. This applies only to
+                // subset/subset2 nodes when the last token before `]` is a
+                // comma. Comment-before-`]` cases such as `x[i, # c\n]` stay
+                // safe because the pre-existing newline guard above suppresses
+                // them, so that guard must not be removed.
+                return;
+            }
             let close_text = text.get(close.start_byte()..close.end_byte()).unwrap_or("");
             emit_before_close(
                 close,

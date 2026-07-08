@@ -379,7 +379,7 @@ pub fn suppressed_lint_pairs(
 mod tests {
     use super::*;
     use crate::parser_pool::with_parser;
-    use tower_lsp::lsp_types::DiagnosticSeverity;
+    use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
 
     fn enabled_config() -> LintConfig {
         LintConfig {
@@ -1669,6 +1669,30 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn commas_and_spaces_inside_accept_omitted_subset_dimension() {
+        let config = LintConfig {
+            commas_severity: Some(DiagnosticSeverity::HINT),
+            spaces_inside_severity: Some(DiagnosticSeverity::HINT),
+            ..solo_config()
+        };
+
+        let canonical = lint("x[i, ]\n", &config);
+        assert!(
+            canonical.is_empty(),
+            "`x[i, ]` must be clean with both rules enabled: {:?}",
+            canonical
+        );
+
+        let compact = lint("x[i,]\n", &config);
+        assert_eq!(compact.len(), 1, "got {:?}", compact);
+        assert_eq!(
+            compact[0].code,
+            Some(NumberOrString::String(rule_ids::COMMAS.to_string()))
+        );
+        assert_eq!(compact[0].message, "Missing space after `,`.");
+    }
+
+    #[test]
     fn commas_in_parameters_are_also_checked() {
         let config = commas_only_config();
         // Tree-sitter treats `parameter` commas the same way; the rule walks
@@ -2273,10 +2297,66 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn spaces_inside_still_flags_subset_padding() {
+        let config = spaces_inside_only_config();
+        let diags = lint("df[ 1 ]\n", &config);
+        assert_eq!(diags.len(), 2, "got {:?}", diags);
+    }
+
+    #[test]
     fn spaces_inside_flags_subset2() {
         let config = spaces_inside_only_config();
         let diags = lint("a[[ 1 ]]\n", &config);
         assert_eq!(diags.len(), 2, "got {:?}", diags);
+    }
+
+    #[test]
+    fn spaces_inside_accepts_trailing_comma_subset_omission() {
+        let config = spaces_inside_only_config();
+        let diags = lint("x[i, ]\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn spaces_inside_accepts_trailing_comma_subset2_omission() {
+        let config = spaces_inside_only_config();
+        let diags = lint("x[[i, ]]\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn spaces_inside_accepts_first_dimension_omission() {
+        let config = spaces_inside_only_config();
+        let diags = lint("x[, ]\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn spaces_inside_flags_before_close_when_subset_prev_token_is_argument() {
+        let config = spaces_inside_only_config();
+        let diags = lint("x[i, j ]\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].message, "Remove whitespace before `]`.");
+    }
+
+    #[test]
+    fn spaces_inside_still_flags_call_trailing_comma_padding() {
+        let config = spaces_inside_only_config();
+        let diags = lint("f(a, )\n", &config);
+        assert!(
+            diags
+                .iter()
+                .any(|diag| diag.message == "Remove whitespace before `)`."),
+            "call trailing comma padding must still be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn spaces_inside_allows_comment_before_subset_close() {
+        let config = spaces_inside_only_config();
+        let diags = lint("x[i, # c\n]\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
     }
 
     #[test]

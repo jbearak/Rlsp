@@ -203,7 +203,7 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 - **Raven:** `raven.linting.spacesInsideSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::spaces_inside_linter()`.
-- Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`). Empty groupings (`f()`, `f( )`, `mat[]`) and multi-line wrapping are exempt — only single-line interior whitespace is flagged.
+- Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`). Empty groupings (`f()`, `f( )`, `mat[]`) and multi-line wrapping are exempt — only single-line interior whitespace is flagged. A trailing comma that marks an omitted subset dimension keeps its space (`x[i, ]`) and is not flagged, keeping the rule consistent with `commas`.
 
 ### Indentation
 
