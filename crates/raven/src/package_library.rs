@@ -424,6 +424,17 @@ pub struct PackageLibrary {
     /// share the set across snapshots without deep-cloning every published
     /// diagnostic batch.
     base_exports: Arc<HashSet<String>>,
+    /// Durable export-name → owner-package map for the default-attached base
+    /// packages (base, stats, utils, ...). Recovers the true owner of a symbol
+    /// that the cross-file scope pools under the synthetic `package:base` URI
+    /// (see `cross_file::scope::seed_base_exports`), e.g. `ave` → `stats`.
+    ///
+    /// Deliberately excluded from [`Self::clear_cache`] and rebuilt ONLY by
+    /// [`Self::initialize`] (via `recompute_default_attached_owners`), giving it
+    /// the same durability contract as `base_exports`: `raven.refreshPackages`
+    /// clears the per-package `packages` cache but must NOT drop this map, or
+    /// hover would revert to misattributing `ave` to {base}. See issue #592.
+    default_attached_owners: Arc<HashMap<String, String>>,
     /// R subprocess interface (None if R is unavailable)
     r_subprocess: Option<RSubprocess>,
     /// Ordered fallback metadata providers (Tier 2 repo DB, then Tier 3 shipped
@@ -453,6 +464,7 @@ impl PackageLibrary {
             combined_entries_write: Mutex::new(()),
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
+            default_attached_owners: Arc::new(HashMap::new()),
             r_subprocess: None,
             providers: Vec::new(),
             local_dev_overlay: ArcSwap::from_pointee(None),
@@ -476,6 +488,7 @@ impl PackageLibrary {
             combined_entries_write: Mutex::new(()),
             base_packages: HashSet::new(),
             base_exports: Arc::new(HashSet::new()),
+            default_attached_owners: Arc::new(HashMap::new()),
             r_subprocess,
             providers: Vec::new(),
             local_dev_overlay: ArcSwap::from_pointee(None),
@@ -1666,6 +1679,54 @@ impl PackageLibrary {
         self.find_in_per_package_cache(symbol, loaded_packages)
     }
 
+    /// Resolve the true owner package of `symbol` from the durable
+    /// default-attached owner map.
+    ///
+    /// Default-attached base packages are seeded into the cross-file scope under
+    /// the synthetic `package:base` URI by `seed_base_exports`, so symbols like
+    /// `ave` need this map to recover their real owner (`stats`) for hover help
+    /// and `from {pkg}` attribution. The map is built by
+    /// `recompute_default_attached_owners` during [`Self::initialize`] and is not
+    /// cleared by [`Self::clear_cache`], matching `base_exports` durability. This
+    /// keeps `raven.refreshPackages` from reverting symbols like `ave` to {base}
+    /// after the clearable per-package cache is wiped. See issue #592.
+    pub fn resolve_default_attached_owner(&self, symbol: &str) -> String {
+        self.default_attached_owners
+            .get(symbol)
+            .cloned()
+            .unwrap_or_else(|| "base".to_string())
+    }
+
+    /// Rebuild [`Self::default_attached_owners`] from the current per-package
+    /// `packages` cache, over the default-attached `base_packages`.
+    ///
+    /// Processes `base` first so it wins name collisions (a symbol base genuinely
+    /// exports stays attributed to base), then the other packages in byte/ASCII
+    /// `String` order (uppercase sorts before lowercase, so e.g. `grDevices`
+    /// precedes `graphics`) for deterministic — not human-alphabetical —
+    /// resolution of any cross-package collision. Called at the end of
+    /// [`Self::initialize`] once `packages` is fully populated. First-writer-wins
+    /// via `entry().or_insert`.
+    fn recompute_default_attached_owners(&mut self) {
+        let cache = self.packages.load();
+        let mut ordered: Vec<String> = self.base_packages.iter().cloned().collect();
+        ordered.sort_by(|a, b| match (a.as_str() == "base", b.as_str() == "base") {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.cmp(b),
+        });
+
+        let mut owners: HashMap<String, String> = HashMap::new();
+        for pkg in &ordered {
+            if let Some(info) = cache.get(pkg) {
+                for export in &info.exports {
+                    owners.entry(export.clone()).or_insert_with(|| pkg.clone());
+                }
+            }
+        }
+        self.default_attached_owners = Arc::new(owners);
+    }
+
     /// Set the library paths
     ///
     /// This is used during initialization to set the library paths
@@ -2064,6 +2125,7 @@ impl PackageLibrary {
         );
 
         self.base_exports = Arc::new(all_base_exports);
+        self.recompute_default_attached_owners();
         Ok(())
     }
 
@@ -4809,6 +4871,84 @@ mod tests {
         assert_eq!(
             lib.find_package_owner_for_symbol("mutate", &loaded),
             Some("dplyr".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_attached_owner_recovers_true_owner() {
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_base_packages(HashSet::from(["base".to_string(), "stats".to_string()]));
+        lib.set_base_exports(HashSet::from(["ave".to_string(), "sum".to_string()]));
+
+        lib.insert_package(PackageInfo::new(
+            "base".to_string(),
+            HashSet::from(["sum".to_string()]),
+        ))
+        .await;
+        lib.insert_package(PackageInfo::new(
+            "stats".to_string(),
+            HashSet::from(["ave".to_string()]),
+        ))
+        .await;
+        lib.recompute_default_attached_owners();
+
+        assert_eq!(lib.resolve_default_attached_owner("ave"), "stats");
+        assert_eq!(lib.resolve_default_attached_owner("sum"), "base");
+        assert_eq!(lib.resolve_default_attached_owner("not_exported"), "base");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_attached_owner_survives_clear_cache() {
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_base_packages(HashSet::from(["base".to_string(), "stats".to_string()]));
+        lib.set_base_exports(HashSet::from(["ave".to_string(), "sum".to_string()]));
+
+        lib.insert_package(PackageInfo::new(
+            "base".to_string(),
+            HashSet::from(["sum".to_string()]),
+        ))
+        .await;
+        lib.insert_package(PackageInfo::new(
+            "stats".to_string(),
+            HashSet::from(["ave".to_string()]),
+        ))
+        .await;
+        lib.recompute_default_attached_owners();
+
+        // Simulate `raven.refreshPackages`'s post-swap clear_cache: the per-package
+        // cache is wiped but the durable owner map must survive so hover still
+        // attributes `ave` to {stats}. Regression guard for issue #592.
+        lib.clear_cache().await;
+
+        assert_eq!(lib.resolve_default_attached_owner("ave"), "stats");
+        assert_eq!(lib.resolve_default_attached_owner("sum"), "base");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_attached_owner_uses_deterministic_overlap_winner() {
+        let mut lib = PackageLibrary::new_empty();
+        lib.set_base_packages(HashSet::from([
+            "base".to_string(),
+            "graphics".to_string(),
+            "grDevices".to_string(),
+        ]));
+        lib.set_base_exports(HashSet::from(["shared_sym".to_string()]));
+
+        lib.insert_package(PackageInfo::new(
+            "graphics".to_string(),
+            HashSet::from(["shared_sym".to_string()]),
+        ))
+        .await;
+        lib.insert_package(PackageInfo::new(
+            "grDevices".to_string(),
+            HashSet::from(["shared_sym".to_string()]),
+        ))
+        .await;
+        lib.recompute_default_attached_owners();
+
+        assert_eq!(
+            lib.resolve_default_attached_owner("shared_sym"),
+            "grDevices"
         );
     }
 

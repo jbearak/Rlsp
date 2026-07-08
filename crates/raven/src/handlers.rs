@@ -20438,21 +20438,33 @@ pub async fn hover(state: &WorldState, uri: &Url, position: Position) -> Option<
                     package_name
                 );
                 if let Some(pkg) = package_name {
+                    // Default-attached exports are all seeded under the synthetic
+                    // `package:base` URI; recover the real owner (e.g. stats::ave)
+                    // before fetching help / building the help-panel link. Genuine
+                    // base topics (sum, ...) resolve back to "base" unchanged.
+                    // See issue #592.
+                    let owner: String = if pkg == "base" {
+                        state.package_library.resolve_default_attached_owner(name)
+                    } else {
+                        pkg.to_string()
+                    };
+                    let owner_ref = owner.as_str();
                     let help_text =
-                        get_help_cached(&state.help_cache, name, Some(pkg), r_path.clone()).await;
+                        get_help_cached(&state.help_cache, name, Some(owner_ref), r_path.clone())
+                            .await;
                     log::trace!(
                         "hover: get_help returned {:?}",
                         help_text.as_ref().map(|s| s.len())
                     );
                     if let Some(help_text) = help_text {
                         value.push_str(&format!("```\n{}\n```", help_text));
-                        value.insert_str(0, &build_help_panel_link(name, pkg));
+                        value.insert_str(0, &build_help_panel_link(name, owner_ref));
                     } else if let Some(sig) = &symbol.signature {
                         value.push_str(&format!("```r\n{}\n```\n", sig));
-                        value.push_str(&format!("\nfrom {{{}}}", pkg));
+                        value.push_str(&format!("\nfrom {{{}}}", owner_ref));
                     } else {
                         value.push_str(&format!("```r\n{}\n```\n", name));
-                        value.push_str(&format!("\nfrom {{{}}}", pkg));
+                        value.push_str(&format!("\nfrom {{{}}}", owner_ref));
                     }
                 } else if let Some(sig) = &symbol.signature {
                     value.push_str(&format!("```r\n{}\n```\n", sig));
