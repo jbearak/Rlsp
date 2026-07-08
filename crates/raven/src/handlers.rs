@@ -560,6 +560,7 @@ pub(crate) fn diagnostics_from_snapshot(
     // Fast collectors (no scope resolution needed)
     collect_syntax_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
     collect_else_newline_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
+    collect_chained_comparison_errors(snapshot.tree.root_node(), &snapshot.text, &mut diagnostics);
     collect_invalid_assignment_targets(
         snapshot.tree.root_node(),
         &snapshot.text,
@@ -12766,6 +12767,30 @@ mod semantic_warning_pipeline_tests {
         );
     }
 
+    /// Wiring regression (issue #560): the chained-comparison collector must
+    /// fire through the full diagnostics pipeline, not only when its collector
+    /// is called directly — mirrors the invalid-assignment pipeline test.
+    #[test]
+    fn chained_comparison_fires_through_diagnostics_pipeline() {
+        let code = "x <- 2\nif (0 < x < 1) print(x)\n";
+        let (snapshot, uri) = build_snapshot_with_lint_disabled(code);
+        let diags = diagnostics_from_snapshot(&snapshot, &uri, &DiagCancelToken::never())
+            .expect("diagnostics returned");
+        assert!(
+            diags
+                .iter()
+                .any(|d| crate::diagnostic_code::diagnostic_has_code(
+                    &d.code,
+                    crate::diagnostic_code::CHAINED_COMPARISON
+                )),
+            "pipeline must emit chained-comparison; got: {:?}",
+            diags
+                .iter()
+                .map(|d| (&d.code, &d.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Issue #459 (Task 3): a redundantly backtick-quoted syntactic call
     /// `` `my_func`() `` whose name is declared via `# raven: func` must not be
     /// flagged "Undefined variable". The func-directive existence comparison
@@ -13179,6 +13204,94 @@ fn find_closing_brace_line(node: &Node, text: &str) -> Option<usize> {
     }
 
     last_brace_line
+}
+
+/// Detect and report chained comparisons (`0 < x < 1`, `a == b == c`) that R
+/// rejects but tree-sitter-r accepts silently (issue #560).
+///
+/// R's grammar makes the comparison operators (`<`, `<=`, `>`, `>=`, `==`,
+/// `!=`) non-associative: `0 < x < 1` is a parse error (`unexpected '<'`),
+/// not sugar for `(0 < x) < 1`. tree-sitter-r instead parses these operators
+/// as left-associative, producing a clean left-nested `binary_operator` spine
+/// with no ERROR node — so [`collect_syntax_errors`] never fires and Raven
+/// would otherwise stay silent on code R cannot parse.
+///
+/// **Detection rule:** a comparison `binary_operator` whose `lhs` field is
+/// *directly* another comparison `binary_operator` is a chain link. Exactly
+/// one diagnostic is emitted per maximal chain — at the link whose own `lhs`
+/// is not itself a chain link — anchored on that link's operator token, the
+/// leftmost operator R's own parse error points at. Explicitly parenthesized
+/// forms (`(0 < x) < 1`) are valid R and are excluded naturally: their `lhs`
+/// is a `parenthesized_expression`, not a `binary_operator`. Because
+/// tree-sitter-r parses these operators left-associatively, a bare comparison
+/// can never appear in the `rhs` field, so checking `lhs` alone is complete.
+///
+/// ERROR/MISSING handling is per node: the walk never descends into ERROR
+/// nodes, and a candidate chain whose own subtree contains an ERROR/MISSING
+/// (e.g. the incomplete `0 < x <`) is not reported — that region already gets
+/// a parse error from [`collect_syntax_errors`]. A complete chain in a clean
+/// subtree is still reported even when broken code follows: typing
+/// `0 < x < y <` reports the already-invalid `0 < x < y` prefix alongside the
+/// parse error for the dangling operator — they anchor on different tokens
+/// and both are real.
+fn collect_chained_comparison_errors(node: Node, text: &str, diagnostics: &mut Vec<Diagnostic>) {
+    if node.is_error() || node.is_missing() {
+        return;
+    }
+    if let Some(outer_op) = comparison_operator(node)
+        && let Some(lhs) = node.child_by_field_name("lhs")
+        && let Some(inner_op) = comparison_operator(lhs)
+        // Innermost link of the maximal chain: `lhs`'s own lhs is not another
+        // comparison, so `outer_op` is the chain's second operator in source
+        // order — the token R's parse error points at.
+        && lhs
+            .child_by_field_name("lhs")
+            .is_none_or(|l| comparison_operator(l).is_none())
+        // Checked last so only candidate chains pay the call: a chain whose
+        // own subtree contains an ERROR/MISSING node (e.g. the incomplete
+        // `0 < x <`) gets a parse error from `collect_syntax_errors`;
+        // reporting that same chain would pile a second diagnostic onto the
+        // broken region. This guard is per candidate node — a clean chain
+        // elsewhere in the tree (even the lhs prefix of a broken outer
+        // comparison) is still reported.
+        && !node.has_error()
+    {
+        // Anonymous operator tokens' `kind()` is their literal text.
+        let outer_text = outer_op.kind();
+        let inner_text = inner_op.kind();
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: ts_start_to_lsp(outer_op, text),
+                end: ts_end_to_lsp(outer_op, text),
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String(
+                crate::diagnostic_code::CHAINED_COMPARISON.to_string(),
+            )),
+            message: format!(
+                "R does not support chained comparisons: `a {inner_text} b {outer_text} c` is a \
+                 parse error. Combine separate comparisons with `&&` for scalar conditions \
+                 (`x > 0 && x < 1`) or `&` for vectorized expressions (`x > 0 & x < 1`)."
+            ),
+            ..Default::default()
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_chained_comparison_errors(child, text, diagnostics);
+    }
+}
+
+/// The operator token of `node` when `node` is a `binary_operator` using one
+/// of the non-associative comparison operators. Anonymous tokens' `kind()` is
+/// their literal source text, so no document text is needed to classify them.
+fn comparison_operator(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "binary_operator" {
+        return None;
+    }
+    let op = node.child_by_field_name("operator")?;
+    matches!(op.kind(), "<" | "<=" | ">" | ">=" | "==" | "!=").then_some(op)
 }
 
 /// Emit diagnostics for assignments whose target is suspect or invalid.
@@ -32496,6 +32609,136 @@ y <- totally_undefined_baseline()
             resolved_new, resolved_from_meta,
             "PathContext::new and PathContext::from_metadata should produce different results when @lsp-cd is present"
         );
+    }
+
+    // ========================================================================
+    // Chained Comparison Syntax Error Tests (issue #560)
+    // R rejects `0 < x < 1` / `a == b == c` as parse errors, but tree-sitter-r
+    // parses them cleanly (left-associative), so collect_syntax_errors never
+    // fires — these validate the dedicated collector.
+    // ========================================================================
+
+    fn chained_comparison_diagnostics(code: &str) -> Vec<Diagnostic> {
+        let tree = parse_r_code(code);
+        let mut diagnostics = Vec::new();
+        super::collect_chained_comparison_errors(tree.root_node(), code, &mut diagnostics);
+        diagnostics
+    }
+
+    #[test]
+    fn test_chained_comparison_basic_relational() {
+        let diagnostics = chained_comparison_diagnostics("0 < x < 1");
+        assert_eq!(diagnostics.len(), 1, "chained `<` must produce one error");
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(crate::diagnostic_code::diagnostic_has_code(
+            &diagnostics[0].code,
+            crate::diagnostic_code::CHAINED_COMPARISON
+        ));
+        assert!(
+            diagnostics[0].message.contains("x > 0 && x < 1")
+                && diagnostics[0].message.contains("x > 0 & x < 1"),
+            "message must suggest both the scalar `&&` and vectorized `&` rewrites: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn test_chained_comparison_equality() {
+        let diagnostics = chained_comparison_diagnostics("a == b == c");
+        assert_eq!(diagnostics.len(), 1, "chained `==` must produce one error");
+    }
+
+    #[test]
+    fn test_chained_comparison_mixed_operators() {
+        let diagnostics = chained_comparison_diagnostics("x >= 0 <= 1");
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "mixed `>=`/`<=` chain must produce one error"
+        );
+    }
+
+    /// A quadruple chain is one maximal chain: exactly one diagnostic, on the
+    /// second operator — where R's own parse error points.
+    #[test]
+    fn test_chained_comparison_long_chain_one_diagnostic_at_second_operator() {
+        let code = "a != b != c != d";
+        let diagnostics = chained_comparison_diagnostics(code);
+        assert_eq!(diagnostics.len(), 1, "one diagnostic per maximal chain");
+        assert_eq!(diagnostics[0].range.start, Position::new(0, 7));
+        assert_eq!(diagnostics[0].range.end, Position::new(0, 9));
+        assert_eq!(&code[7..9], "!=", "range must cover the second operator");
+    }
+
+    /// `(0 < x) < 1` is valid R (the writer was explicit); never flagged.
+    #[test]
+    fn test_chained_comparison_parenthesized_is_valid() {
+        assert!(chained_comparison_diagnostics("(0 < x) < 1").is_empty());
+        assert!(chained_comparison_diagnostics("(a == b) == c").is_empty());
+    }
+
+    #[test]
+    fn test_chained_comparison_simple_and_joined_comparisons_are_valid() {
+        assert!(chained_comparison_diagnostics("x < y").is_empty());
+        assert!(chained_comparison_diagnostics("x > 0 && x < 1").is_empty());
+        assert!(chained_comparison_diagnostics("x > 0 & x < 1").is_empty());
+        assert!(chained_comparison_diagnostics("a < b | c >= d").is_empty());
+    }
+
+    #[test]
+    fn test_chained_comparison_inside_if_condition() {
+        let diagnostics = chained_comparison_diagnostics("if (0 < x < 1) y");
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "chain inside `if (...)` still flagged"
+        );
+    }
+
+    /// The chain's second operator ends line 0; the diagnostic lands on it
+    /// even though the chain spans lines.
+    #[test]
+    fn test_chained_comparison_multiline_chain() {
+        let diagnostics = chained_comparison_diagnostics("0 < x <\n  1");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start, Position::new(0, 6));
+    }
+
+    /// An incomplete chain already gets a parse error from
+    /// collect_syntax_errors; this collector must stay silent so the two
+    /// never stack on broken code.
+    #[test]
+    fn test_chained_comparison_silent_on_parse_errors() {
+        assert!(chained_comparison_diagnostics("0 < x <").is_empty());
+        assert!(chained_comparison_diagnostics("0 < x < (1").is_empty());
+    }
+
+    /// A clean chain prefix inside an incomplete outer comparison is still
+    /// reported: `0 < x < y` is already invalid R regardless of the dangling
+    /// trailing operator (which gets its own parse error on a different
+    /// token). The `has_error` guard is per candidate node, not per tree.
+    #[test]
+    fn test_chained_comparison_clean_prefix_of_incomplete_chain() {
+        for code in ["0 < x < y <", "0 < x < y < (1"] {
+            let diagnostics = chained_comparison_diagnostics(code);
+            assert_eq!(diagnostics.len(), 1, "one diagnostic for {code:?}");
+            assert_eq!(
+                diagnostics[0].range.start,
+                Position::new(0, 6),
+                "anchored on the second operator for {code:?}"
+            );
+        }
+    }
+
+    /// Lower-precedence operators on the lhs don't break maximal-chain
+    /// detection: `a + b < c < d` errors at the `<` before `d` in R.
+    #[test]
+    fn test_chained_comparison_arithmetic_lhs() {
+        let code = "a + b < c < d";
+        let diagnostics = chained_comparison_diagnostics(code);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start, Position::new(0, 10));
+        assert_eq!(&code[10..11], "<");
     }
 
     // ========================================================================

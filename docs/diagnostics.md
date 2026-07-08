@@ -29,7 +29,7 @@ are governed only by their severity settings). The suppressible analyzer codes a
 | Code | Diagnostic | Suppressible? |
 |---|---|---|
 | `undefined-variable` | Undefined / used-before-defined variable (incl. "used before it's available") | Yes |
-| `syntax-error` | Parse errors (the umbrella code for every parse-error message above) | No |
+| `syntax-error` | Parse errors (the umbrella code; most parse errors carry it directly, but `chained-comparison` is a sub-kind that carries its own code) | No |
 | `unresolved-source-path` | A `source()` / forward-directive path (`# raven: source` / `# raven: run` / `# raven: include`) **or** a backward-directive path (`# raven: sourced-by` / `# raven: run-by` / `# raven: included-by`) that does not resolve to a file — missing, outside the workspace, or case-ambiguous (2+ case-insensitive matches) | No |
 | `source-path-case-mismatch` | A `source()` / forward-directive **or** backward-directive (`# raven: sourced-by` etc.) path that resolves only by a case difference from the real filename (`templates.r` vs `templates.R`) | No |
 | `assign-to-string-literal` | Assignment to a string literal or other almost-certainly-unintended target | Yes |
@@ -78,6 +78,7 @@ Raven surfaces parse errors from the tree-sitter R grammar whenever the document
 | `` Missing opening `{` `` / `` Missing opening `(` `` / `` Missing opening `[` `` / `` Missing opening `[[` `` | A closing delimiter appears with no matching opener (`}` at top level, `)` after a complete expression). A run of stray closers (`}}}`) reports a single diagnostic for the whole run. |
 | `In R, 'else' must appear on the same line as the closing '}' of the if block` | `else` placed on its own line after `if (cond) { body }` — R treats the `if` as complete and the `else` becomes an unexpected token |
 | ``'else' without a preceding 'if' body: in R, 'else' must follow `if (...) {...}` on the same line`` | `else` appears anywhere R would reject a bare `else` — e.g. `else { 1 }` at the top of a file, `else { … }` inside a `{ … }` block, `(else)`, `else |> f()`, or `else` used as a function argument / assignment RHS |
+| ``R does not support chained comparisons: `a < b < c` is a parse error. Combine separate comparisons with `&&` for scalar conditions (`x > 0 && x < 1`) or `&` for vectorized expressions (`x > 0 & x < 1`).`` | A chained comparison such as `0 < x < 1` or `a == b == c` (operators `<`, `<=`, `>`, `>=`, `==`, `!=`) — a parse error in R that tree-sitter accepts silently. One diagnostic per chain, anchored on the second comparison operator (where R's own parse error points). Carries the code `chained-comparison` (a `syntax-error` sub-kind). Explicitly parenthesized forms like `(0 < x) < 1` are valid R and are never flagged. |
 | `R code could not be parsed here` | Tree-sitter detected a parse error that doesn't match any of the specific patterns above |
 
 The `Mismatched brackets` message also covers wrong-closer typos where the user typed an unexpected closer immediately after an unclosed opener (e.g. `f(}` produces a single `` Mismatched brackets: `(` opened here; close with `)` not `}`. `` diagnostic rather than two separate ones).

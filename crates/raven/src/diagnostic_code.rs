@@ -58,6 +58,12 @@ pub const NAMESPACE_MEMBER_NOT_FOUND: &str = "namespace-member-not-found";
 /// that suppressed nothing. Hint severity. F2.
 pub const UNUSED_SUPPRESSION: &str = "unused-suppression";
 
+/// A chained comparison (`0 < x < 1`, `a == b == c`) — a parse error in R
+/// that tree-sitter-r accepts silently, reported by
+/// `collect_chained_comparison_errors` in `handlers.rs`. A `syntax-error`
+/// sub-kind, so (like every parse error) it is not suppressible.
+pub const CHAINED_COMPARISON: &str = "chained-comparison";
+
 /// Concrete `syntax-error` sub-kinds. Each maps to [`SYNTAX_ERROR`] as its
 /// parent so suppressing the umbrella suppresses all of them.
 pub const SYNTAX_ERROR_CHILDREN: &[&str] = &[
@@ -66,6 +72,7 @@ pub const SYNTAX_ERROR_CHILDREN: &[&str] = &[
     "unclosed-bracket",
     "unexpected-token",
     "missing-brace",
+    CHAINED_COMPARISON,
 ];
 
 /// All canonical analyzer codes (umbrella codes included, children excluded).
