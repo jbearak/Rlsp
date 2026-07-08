@@ -1,6 +1,11 @@
 # Runs on pull requests and on pushes to the default branch (main).
 # repository-push is scoped to main so pushing to a branch with an open
 # pull request runs only once (via pullrequest-push), not twice.
+# lfs: false skips downloading Git LFS content (e.g. large datasets);
+# raven check reads only code. Harmless if the repository has no LFS.
+clone:
+  lfs: false
+
 image: node:24
 
 pipelines:

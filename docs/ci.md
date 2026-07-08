@@ -76,6 +76,11 @@ Bitbucket Pipelines runs the commands in `bitbucket-pipelines.yml`. Raven publis
 # Runs on pull requests and on pushes to the default branch (main).
 # repository-push is scoped to main so pushing to a branch with an open
 # pull request runs only once (via pullrequest-push), not twice.
+# lfs: false skips downloading Git LFS content (e.g. large datasets);
+# raven check reads only code. Harmless if the repository has no LFS.
+clone:
+  lfs: false
+
 image: ubuntu:24.04
 
 pipelines:
@@ -118,14 +123,7 @@ Set `RAVEN_DEB_VERSION` in your pipeline variables to one of the versions listed
 
 If VS Code's YAML extension reports an unresolved Bitbucket schema reference such as `pipelines_configuration`, the pipeline file can still be valid. That is an editor schema issue, not a Raven or Bitbucket runtime error.
 
-If the repository stores large data files in [Git LFS](https://git-lfs.com), skip downloading them — `raven check` reads only code, and analysis datasets can dwarf it:
-
-```yaml
-clone:
-  lfs: false
-```
-
-Add that at the top level of `bitbucket-pipelines.yml`. (On GitHub Actions no change is needed: `actions/checkout` skips LFS content by default.)
+Both Bitbucket examples set `clone: lfs: false`: if the repository stores large data files in [Git LFS](https://git-lfs.com), there is no reason to download them — `raven check` reads only code, and analysis datasets can dwarf it. The setting is harmless when the repository does not use LFS. (On GitHub Actions no equivalent is needed: `actions/checkout` skips LFS content by default.)
 
 ## Running Raven and Sight together
 
@@ -179,6 +177,11 @@ Sight is distributed on npm, so the combined pipeline uses the `node:24` image (
 # Runs on pull requests and on pushes to the default branch (main).
 # repository-push is scoped to main so pushing to a branch with an open
 # pull request runs only once (via pullrequest-push), not twice.
+# lfs: false skips downloading Git LFS content (e.g. large datasets);
+# raven check reads only code. Harmless if the repository has no LFS.
+clone:
+  lfs: false
+
 image: node:24
 
 pipelines:
