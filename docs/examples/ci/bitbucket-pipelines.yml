@@ -2,7 +2,8 @@
 # repository-push is scoped to main so pushing to a branch with an open
 # pull request runs only once (via pullrequest-push), not twice.
 # lfs: false skips downloading Git LFS content (e.g. large datasets);
-# raven check reads only code. Harmless if the repository has no LFS.
+# raven check reads only code. In a repository that does not use LFS,
+# the setting simply has no effect.
 clone:
   lfs: false
 
