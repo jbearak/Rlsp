@@ -118,6 +118,15 @@ Set `RAVEN_DEB_VERSION` in your pipeline variables to one of the versions listed
 
 If VS Code's YAML extension reports an unresolved Bitbucket schema reference such as `pipelines_configuration`, the pipeline file can still be valid. That is an editor schema issue, not a Raven or Bitbucket runtime error.
 
+If the repository stores large data files in [Git LFS](https://git-lfs.com), skip downloading them — `raven check` reads only code, and analysis datasets can dwarf it:
+
+```yaml
+clone:
+  lfs: false
+```
+
+Add that at the top level of `bitbucket-pipelines.yml`. (On GitHub Actions no change is needed: `actions/checkout` skips LFS content by default.)
+
 ## Running Raven and Sight together
 
 Some social-science repositories mix R and Stata. [Sight](https://github.com/jbearak/sight) is Raven's sibling project — the same kind of static checker, for Stata `.do` files — and its CI command, `sight check`, works just like `raven check`. If your repository contains both languages, run both checkers.
