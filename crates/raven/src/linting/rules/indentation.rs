@@ -10,7 +10,9 @@
 //! * `braced_expression` — inner lines indent one `indent_unit` beyond the
 //!   line of the opening `{`. A `}` that starts its own line aligns with the
 //!   opening `{`'s line; a `}` trailing other code is left to the inner-line
-//!   rule.
+//!   rule. This standalone closer alignment takes precedence over any binary
+//!   operator continuation expectation that also reaches the closer's line
+//!   (see the "closer wins" note on `set_expectations` for why).
 //! * Bracketed groups (`call` / `subset` / `subset2` arguments,
 //!   `parenthesized_expression`, and `function_definition` parameter lists)
 //!   — when the opener is followed by code on the same line (e.g. `foo(a,`),
@@ -19,7 +21,8 @@
 //!   both are accepted to match the community-common aligned style. A
 //!   trailing `#` comment after the opener doesn't count as content (so
 //!   `foo( # note` is treated like `foo(`, hanging-only). When the opener
-//!   stands alone at end of line, only the hanging form is accepted.
+//!   stands alone at end of line, only the hanging form is accepted. A closing
+//!   delimiter that starts its own line aligns with its opener's line.
 //! * `binary_operator` — when the operator's RHS lives on a later line than
 //!   the LHS, those continuation lines indent one `indent_unit` beyond the
 //!   line where the LHS starts. The on-type formatter additionally aligns
@@ -170,10 +173,34 @@ impl Expected {
     }
 }
 
-/// Walk the tree once, recording an expected indent for each line covered by
-/// a multi-line scope. We visit the parent before its children so that nested
+/// Walk the tree once, recording an expected indent for each line covered by a
+/// multi-line scope. We visit the parent before its children so that nested
 /// (innermost) scopes overwrite their ancestor's expectation — the inner scope
 /// is what the line actually sits in.
+///
+/// **Closer wins, by construction.** A standalone closing delimiter's line
+/// (`)`, `]`, `]]`, or `}` that begins its own line) must always keep the
+/// opener-aligned expectation set by `set_braced`/`set_bracketed`, never a
+/// binary-operator continuation expectation from `set_binary_operator`. This
+/// holds without any extra bookkeeping because of two structural facts about
+/// the grammar and this traversal:
+/// * If a `binary_operator` node's continuation write (`(start_line +
+///   1)..=end_line` in `set_binary_operator`) reaches the closer's row, that
+///   operator must be an *ancestor* of the bracket/brace (a descendant's rows
+///   can never extend past its own bracket's closer token; a same-row
+///   *sibling* operator elsewhere on the closer's line, e.g. after a `;`,
+///   only starts there and so never writes to it). Ancestors are visited —
+///   and so write their expectation — strictly before descendants in this
+///   pre-order walk, so the bracket/brace's own write to the closer row
+///   always happens last and wins.
+/// * A binary operator that is a *descendant* of the bracket/brace can never
+///   reach the closer's row at all, because that row's leading token is the
+///   closer itself (that's what "begins its own line" means), leaving no room
+///   for a nested operator's span to extend onto it.
+///
+/// So the ordinary parent-before-child overwrite rule already guarantees
+/// closer alignment takes precedence, independent of how deeply the
+/// binary-operator continuation nests inside the bracket.
 fn set_expectations(
     node: Node<'_>,
     lines: &[&str],
@@ -384,6 +411,10 @@ mod tests {
             &mut out,
         );
         out
+    }
+
+    fn diagnostic_on_line(diags: &[Diagnostic], line: u32) -> Option<&Diagnostic> {
+        diags.iter().find(|diag| diag.range.start.line == line)
     }
 
     #[test]
@@ -639,6 +670,44 @@ mod tests {
             diags.iter().any(|d| d.range.start.line == 2),
             "expected misalignment diagnostic on line 2; got {:?}",
             diags
+        );
+    }
+
+    #[test]
+    fn parenthesized_binary_closer_aligns_at_top_level() {
+        let text = "changed <- !(\n    (is.na(v_prev) & is.na(v_upd)) |\n    (!is.na(v_prev) & !is.na(v_upd) & v_prev == v_upd)\n)\n";
+        let diags = lint(text, 4);
+
+        assert!(
+            diagnostic_on_line(&diags, 3).is_none(),
+            "expected no diagnostic on closing paren line; got {:?}",
+            diags
+        );
+        let operand_diag = diagnostic_on_line(&diags, 2)
+            .expect("expected continuation diagnostic on second operand line");
+        assert!(
+            operand_diag.message.contains("8"),
+            "expected message to mention 8 spaces; got {:?}",
+            operand_diag
+        );
+    }
+
+    #[test]
+    fn parenthesized_binary_closer_aligns_inside_nested_functions() {
+        let text = "outer <- function() {\n    inner <- function() {\n        changed <- !(\n            (is.na(v_prev) & is.na(v_upd)) |\n            (!is.na(v_prev) & !is.na(v_upd) & v_prev == v_upd)\n        )\n    }\n}\n";
+        let diags = lint(text, 4);
+
+        assert!(
+            diagnostic_on_line(&diags, 5).is_none(),
+            "expected no diagnostic on closing paren line; got {:?}",
+            diags
+        );
+        let operand_diag = diagnostic_on_line(&diags, 4)
+            .expect("expected continuation diagnostic on second operand line");
+        assert!(
+            operand_diag.message.contains("16"),
+            "expected message to mention 16 spaces; got {:?}",
+            operand_diag
         );
     }
 
