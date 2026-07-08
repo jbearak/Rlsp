@@ -201,8 +201,12 @@ pipelines:
             - apt-get install -y raven
             - npm install -g @jbearak/sight
             - raven packages update
-            # Run both checkers even if the first one finds issues, then fail
-            # the step if either did.
+            # Bitbucket fails the step at the first nonzero exit, which would
+            # let a Raven finding skip Sight entirely. The "|| touch" swallows
+            # raven check's exit code but records it in a marker file, sight
+            # check then runs either way, and the final test fails the step
+            # when the marker exists — so both checkers always report, and
+            # either one failing turns the step red.
             - raven check || touch /tmp/raven-failed
             - sight check
             - test ! -f /tmp/raven-failed
@@ -218,7 +222,7 @@ triggers:
         - Checks
 ```
 
-Bitbucket stops a step at the first failing command, so the last three lines use a small marker-file pattern to let Sight run even when Raven has findings, and still fail the step if either checker did. Pin versions for reproducible runs the same way as in the Raven-only example: `apt-get install -y "raven=${RAVEN_DEB_VERSION}"` for Raven, and `npm install -g @jbearak/sight@X.Y.Z` for Sight.
+Bitbucket stops a step at the first failing command, so the last three lines use a small marker-file pattern: `|| touch /tmp/raven-failed` deliberately swallows `raven check`'s exit code (recording it as a marker file instead) so the script continues, `sight check` runs and can fail the step directly, and the final `test ! -f /tmp/raven-failed` exits nonzero — failing the step — whenever the marker exists. A Raven finding therefore still turns the step red; it just does so on the last line, after Sight has also reported. Pin versions for reproducible runs the same way as in the Raven-only example: `apt-get install -y "raven=${RAVEN_DEB_VERSION}"` for Raven, and `npm install -g @jbearak/sight@X.Y.Z` for Sight.
 
 To run them as **parallel steps** instead, wrap two `- step:` entries in a `- parallel:` block — one installing and running Raven, one installing and running Sight. Each step gets its own container and its own checkout, and each reports separately in the pipeline view.
 

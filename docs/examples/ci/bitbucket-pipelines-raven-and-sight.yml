@@ -25,8 +25,12 @@ pipelines:
             - apt-get install -y raven
             - npm install -g @jbearak/sight
             - raven packages update
-            # Run both checkers even if the first one finds issues, then fail
-            # the step if either did.
+            # Bitbucket fails the step at the first nonzero exit, which would
+            # let a Raven finding skip Sight entirely. The "|| touch" swallows
+            # raven check's exit code but records it in a marker file, sight
+            # check then runs either way, and the final test fails the step
+            # when the marker exists — so both checkers always report, and
+            # either one failing turns the step red.
             - raven check || touch /tmp/raven-failed
             - sight check
             - test ! -f /tmp/raven-failed
