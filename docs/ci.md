@@ -38,10 +38,13 @@ Use [`jbearak/setup-raven`](https://github.com/jbearak/setup-raven) to install t
 ```yaml
 name: Raven
 
-on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+# Runs on pull requests and on pushes to the default branch (main).
+# Scoping push to main avoids a duplicate run when you push to a branch
+# that already has an open pull request (pull_request already covers that).
+"on":
   push:
+    branches: [main]
+  pull_request:
 
 jobs:
   raven:
@@ -62,31 +65,45 @@ Pin `version` to a release tag when you want a fully reproducible CLI version.
 Bitbucket Pipelines runs the commands in `bitbucket-pipelines.yml`. Raven publishes a signed apt repository, so a normal Ubuntu build image can install the CLI directly. You can copy [`docs/examples/ci/bitbucket-pipelines.yml`](examples/ci/bitbucket-pipelines.yml) to `bitbucket-pipelines.yml`:
 
 ```yaml
+# Runs on pull requests and on pushes to the default branch (main).
+# repository-push is scoped to main so pushing to a branch with an open
+# pull request runs only once (via pullrequest-push), not twice.
 image: ubuntu:24.04
 
 pipelines:
-  default:
-    - step:
-        name: Raven
-        script:
-          - apt-get update
-          - apt-get install -y ca-certificates curl
-          - install -d -m 0755 /etc/apt/keyrings
-          - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
-          - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
-          - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
-          - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
-          - apt-get update
-          - apt-get install -y raven
-          - raven packages update
-          - raven check
+  custom:
+    Raven:
+      - step:
+          name: Raven
+          script:
+            - apt-get update
+            - apt-get install -y ca-certificates curl
+            - install -d -m 0755 /etc/apt/keyrings
+            - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
+            - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
+            - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
+            - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
+            - apt-get update
+            - apt-get install -y raven
+            - raven packages update
+            - raven check
+
+triggers:
+  repository-push:
+    - condition: BITBUCKET_BRANCH == "main"
+      pipelines:
+        - Raven
+  pullrequest-push:
+    - condition: glob(BITBUCKET_BRANCH, "**")
+      pipelines:
+        - Raven
 ```
 
 Pin a specific Raven package version for reproducible Bitbucket runs:
 
 ```yaml
-          - apt-cache madison raven
-          - apt-get install -y "raven=${RAVEN_DEB_VERSION}"
+            - apt-cache madison raven
+            - apt-get install -y "raven=${RAVEN_DEB_VERSION}"
 ```
 
 Set `RAVEN_DEB_VERSION` in your pipeline variables to one of the versions listed by `apt-cache madison raven`, or omit the version pin to track the latest package in the apt repository.
@@ -95,12 +112,22 @@ If VS Code's YAML extension reports an unresolved Bitbucket schema reference suc
 
 ## What fails the build
 
-By default, `raven check` exits with code `1` when it finds a `warning` or `error` diagnostic, and `0` otherwise. Change that threshold with `--max-severity`:
+"Fails the build" does not mean Raven itself failed. It means `raven check` ran successfully and found at least one diagnostic at or above your severity threshold, and it reports that through its exit code — the standard way a checker signals GitHub Actions or Bitbucket Pipelines that there is something to look at. The three exit codes are distinct:
+
+- **`0`** — nothing exceeded the threshold; the step passes.
+- **`1`** — a diagnostic exceeded the threshold; the step fails. This is the signal you want — Raven found an issue in your code, not that Raven broke.
+- **`2`** — Raven itself could not run (an unreadable path, a malformed `raven.toml`). This is a genuine operator error, separate from finding issues in your code.
+
+`--max-severity LEVEL` sets the highest severity still allowed to pass; anything more severe fails the build. From most to least severe the scale is `error`, `warning`, `info`, `hint`. The default is `info`, so `warning` and `error` findings fail while `info` and `hint` pass.
+
+Raven's style and idiomatic lints — line length, naming, infix spacing, and similar — are `information`-level, so they never fail CI by default. To gate on them, first enable linting (via `raven.toml` or a `.lintr` — see [Linting](linting.md)), then lower the threshold to `hint` so info-level findings fail:
 
 ```bash
-raven check --max-severity warning
+raven check --max-severity hint
 ```
 
-That command allows warnings and fails only on errors. See [Exit codes](cli.md#exit-codes) and [Diagnostics](diagnostics.md) for the full diagnostic set.
+That fails the build on style findings as well as warnings and errors; `--max-severity off` is stricter still and fails on every diagnostic. See [Linting](linting.md), [Exit codes](cli.md#exit-codes), and [Diagnostics](diagnostics.md) for the full rule and diagnostic set.
+
+A failing `raven check` fails the pipeline, but a red build does not block a merge on its own. To prevent merging when the check fails, mark it as a required status check (GitHub branch protection) or a merge check (Bitbucket).
 
 Use a committed [`raven.toml`](configuration.md) to keep local editor diagnostics and CI behavior aligned. Common CI-specific configuration includes `[workspace].exclude` for generated outputs and `diagnostics.reportUnusedSuppressions = true` when you want Raven to flag stale `# raven: ignore` comments.

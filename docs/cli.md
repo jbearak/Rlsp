@@ -131,10 +131,13 @@ You can copy [`docs/examples/ci/github-actions-raven.yml`](examples/ci/github-ac
 ```yaml
 name: Raven
 
-on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+# Runs on pull requests and on pushes to the default branch (main).
+# Scoping push to main avoids a duplicate run when you push to a branch
+# that already has an open pull request (pull_request already covers that).
+"on":
   push:
+    branches: [main]
+  pull_request:
 
 jobs:
   raven:
@@ -161,31 +164,45 @@ To get installed/local package awareness and exact local package metadata in CI,
 Use Raven's signed apt repository from a normal Ubuntu build image. You can copy [`docs/examples/ci/bitbucket-pipelines.yml`](examples/ci/bitbucket-pipelines.yml) to `bitbucket-pipelines.yml`:
 
 ```yaml
+# Runs on pull requests and on pushes to the default branch (main).
+# repository-push is scoped to main so pushing to a branch with an open
+# pull request runs only once (via pullrequest-push), not twice.
 image: ubuntu:24.04
 
 pipelines:
-  default:
-    - step:
-        name: Raven
-        script:
-          - apt-get update
-          - apt-get install -y ca-certificates curl
-          - install -d -m 0755 /etc/apt/keyrings
-          - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
-          - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
-          - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
-          - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
-          - apt-get update
-          - apt-get install -y raven
-          - raven packages update
-          - raven check
+  custom:
+    Raven:
+      - step:
+          name: Raven
+          script:
+            - apt-get update
+            - apt-get install -y ca-certificates curl
+            - install -d -m 0755 /etc/apt/keyrings
+            - curl -fsSL https://jbearak.github.io/apt-raven/raven-archive-keyring.gpg -o /tmp/raven-archive-keyring.gpg
+            - echo "aaaee9d0c6d944091d1a78d8aeb4f93f59dc713ee1f218052add12b0d7c743cd  /tmp/raven-archive-keyring.gpg" | sha256sum -c -
+            - install -m 0644 /tmp/raven-archive-keyring.gpg /etc/apt/keyrings/raven-archive-keyring.gpg
+            - echo "deb [signed-by=/etc/apt/keyrings/raven-archive-keyring.gpg] https://jbearak.github.io/apt-raven stable main" > /etc/apt/sources.list.d/raven.list
+            - apt-get update
+            - apt-get install -y raven
+            - raven packages update
+            - raven check
+
+triggers:
+  repository-push:
+    - condition: BITBUCKET_BRANCH == "main"
+      pipelines:
+        - Raven
+  pullrequest-push:
+    - condition: glob(BITBUCKET_BRANCH, "**")
+      pipelines:
+        - Raven
 ```
 
 The apt repository is static HTTPS hosting for Debian repository metadata and `.deb` files; it is not a Docker image and does not run a remote installer script. The SHA-256 check pins the bootstrap keyring before apt trusts it, and the `signed-by=` keyring then makes apt verify Raven's repository metadata before it installs the package. Pin a specific Raven package version for reproducible CI:
 
 ```yaml
-          - apt-cache madison raven
-          - apt-get install -y "raven=${RAVEN_DEB_VERSION}"
+            - apt-cache madison raven
+            - apt-get install -y "raven=${RAVEN_DEB_VERSION}"
 ```
 
 Set `RAVEN_DEB_VERSION` in your CI variables to one of the versions listed by `apt-cache madison raven`, or use `latest`-style behavior by omitting the version pin. As with GitHub Actions, `raven packages update` restores broad CRAN/Bioconductor coverage but follows Raven's moving `names-db` Release; commit `.raven/packages.json` from `raven packages freeze` when package metadata should be project-pinned.
