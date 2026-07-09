@@ -1075,7 +1075,7 @@ fn parse_object_name_style_setting(
 
     if styles.is_empty() && had_elements {
         log::warn!(
-            "linting.{setting_name} did not contain any recognised object-name styles; the kind is disabled unless valid regexes are configured for it."
+            "linting.{setting_name} did not contain any recognised object-name styles; treating it as an empty style list."
         );
     }
 

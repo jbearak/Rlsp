@@ -974,10 +974,16 @@ fn find_named_arg<'a>(tokens: &[&'a str], name: &str) -> Option<&'a str> {
 }
 
 /// Resolve one of `object_name_linter`'s `styles` and `regexes` formals using
-/// R's exact-name-then-positional binding rules.
+/// R's exact-name-then-positional binding rules. An empty positional token is
+/// R's missing-argument placeholder (`object_name_linter(, "^x$")` leaves
+/// `styles` at its default and binds the string to `regexes`), so it consumes
+/// a formal slot without supplying a value.
 fn resolve_object_name_arg<'a>(args: &'a str, target: &str) -> Option<&'a str> {
     const FORMALS: [&str; 2] = ["styles", "regexes"];
     let target_index = FORMALS.iter().position(|formal| *formal == target)?;
+    if args.trim().is_empty() {
+        return None;
+    }
     let tokens = split_top_level_commas(args);
     if let Some(value) = find_named_arg(&tokens, target) {
         return Some(value);
@@ -988,7 +994,7 @@ fn resolve_object_name_arg<'a>(args: &'a str, target: &str) -> Option<&'a str> {
     for token in tokens
         .into_iter()
         .map(str::trim)
-        .filter(|token| !token.is_empty() && !has_unquoted_eq(token))
+        .filter(|token| !has_unquoted_eq(token))
     {
         while next_formal < FORMALS.len() && named[next_formal] {
             next_formal += 1;
@@ -996,7 +1002,7 @@ fn resolve_object_name_arg<'a>(args: &'a str, target: &str) -> Option<&'a str> {
         if next_formal == FORMALS.len() {
             break;
         }
-        if next_formal == target_index {
+        if !token.is_empty() && next_formal == target_index {
             return Some(token);
         }
         next_formal += 1;
@@ -2466,6 +2472,24 @@ mod tests {
             json!([])
         );
         assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn object_name_missing_first_positional_binds_second_to_regexes() {
+        // R's missing-argument placeholder: `object_name_linter(, "^x$")`
+        // leaves `styles` missing and binds the string to `regexes` — which,
+        // like the named `regexes =` form, replaces the default styles
+        // (regex-only mode).
+        let out = load_str("linters: linters_with_defaults(object_name_linter(, \"^x$\"))\n");
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!([])
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!(["^x$"])
+        );
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
 
     #[test]

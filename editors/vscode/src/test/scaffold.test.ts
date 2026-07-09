@@ -3,6 +3,8 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as vscode from 'vscode';
+import { activate } from './helper';
 import {
     GITIGNORE_TEMPLATE,
     LINTING_SENTINEL_BEGIN,
@@ -758,15 +760,6 @@ suite('scaffold package.json contributions', () => {
 suite('scaffold integration', () => {
     test('createScaffoldFile writes the requested content to the workspace folder', async function () {
         this.timeout(15000);
-        let vscode: typeof import('vscode');
-        let activate: typeof import('./helper').activate;
-        try {
-            vscode = require('vscode') as typeof import('vscode');
-            ({ activate } = require('./helper') as typeof import('./helper'));
-        } catch {
-            this.skip();
-            return;
-        }
         await activate();
         const folder = vscode.workspace.workspaceFolders?.[0];
         assert.ok(folder, 'a workspace folder must be open in the test harness');
@@ -788,15 +781,6 @@ suite('scaffold integration', () => {
 
     test('extension registers both scaffold commands', async function () {
         this.timeout(15000);
-        let vscode: typeof import('vscode');
-        let activate: typeof import('./helper').activate;
-        try {
-            vscode = require('vscode') as typeof import('vscode');
-            ({ activate } = require('./helper') as typeof import('./helper'));
-        } catch {
-            this.skip();
-            return;
-        }
         await activate();
         const all = await vscode.commands.getCommands(true);
         assert.ok(
