@@ -400,7 +400,12 @@ fn classify_raven(trimmed: &str) -> Option<NolintMarker> {
 /// prevents `nolinter` or `@lsp-ignored` from matching `nolint` /
 /// `@lsp-ignore` — mirroring the strictness of the directive parser at
 /// `cross_file/directive.rs` for `# @lsp-ignore`.
-fn matches_keyword<'a>(haystack: &'a str, keyword: &str) -> Option<&'a str> {
+///
+/// `pub(crate)` so other rules that need a conservative "is this comment a
+/// suppression/directive marker" test (e.g. the indentation rule's aligned-
+/// comment exemption) can reuse the same boundary discipline instead of
+/// re-approximating it and drifting out of sync with [`classify`].
+pub(crate) fn matches_keyword<'a>(haystack: &'a str, keyword: &str) -> Option<&'a str> {
     let rest = haystack.strip_prefix(keyword)?;
     match rest.as_bytes().first() {
         // EOL, whitespace, colon, `-` (used by `@lsp-ignore-next` and
