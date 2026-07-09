@@ -28,11 +28,11 @@
 //! * **Leading-dot "hidden" names** (`.foo`, `.my_helper`, `.onLoad`) are
 //!   accepted under every scheme — an optional leading dot is stripped before
 //!   scheme classification, mirroring lintr.
-//! * **Non-ASCII identifiers** are skipped by style-based configurations —
-//!   case is locale-dependent and the named styles' simple ASCII schemes
-//!   can't classify them. Regex-only configurations (an empty style list
-//!   with regexes) do check non-ASCII names against the regexes, since the
-//!   user's patterns are the entire policy there.
+//! * **Non-ASCII identifiers** are skipped when no regexes are configured
+//!   for the kind — case is locale-dependent and the named styles' simple
+//!   ASCII schemes can't classify them. When regexes are configured
+//!   (regex-only or combined with styles), non-ASCII names are checked
+//!   against the regexes; the named styles never match them.
 //! * **Named-argument `=`** (`f(name = value)`) is never an assignment target,
 //!   so it isn't checked. `=` elsewhere (top level, function bodies, braced
 //!   blocks) *is* treated as assignment and the LHS is checked.
@@ -317,12 +317,13 @@ fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) ->
         return true;
     }
     // Non-ASCII identifiers can't be classified by the named styles' simple
-    // ASCII schemes, so style-based configurations skip them. Regex-only
-    // configurations (empty style list) must NOT skip: the user's regexes are
-    // the whole policy and can express Unicode constraints, so exempting
-    // non-ASCII names would make such policies unenforceable.
+    // ASCII schemes, so configurations with no regexes skip them. When
+    // regexes ARE configured — regex-only or combined with styles — the name
+    // is checked: regexes can express Unicode constraints, so exempting
+    // non-ASCII names would make such policies unenforceable (the named
+    // styles never match a non-ASCII name; see `matches_scheme`).
     if !name.is_ascii() {
-        return !patterns.styles.is_empty();
+        return patterns.regexes.is_empty();
     }
     // S3 method dispatch: only relevant for function definitions. A name like
     // `print.MyClass` is `<generic>.<ClassName>` — exempt when some prefix
@@ -452,8 +453,12 @@ fn is_known_s3_generic(name: &str) -> bool {
 
 fn matches_scheme(name: &str, style: ObjectNameStyle) -> bool {
     if !name.is_ascii() {
-        // Should already be handled by `should_skip_name`, but be defensive.
-        return true;
+        // The ASCII schemes can never classify a non-ASCII name. Returning
+        // false matters in combined style+regex configurations, where
+        // `should_skip_name` lets non-ASCII names through so the regexes can
+        // judge them — a style must not auto-accept what it cannot classify.
+        // Configurations without regexes never reach here (skipped earlier).
+        return false;
     }
     // R treats a leading dot as the "hidden identifier" marker (e.g. `.foo`).
     // lintr accepts an optional leading dot for every scheme — match that so
@@ -888,5 +893,19 @@ mod tests {
             regex_only
         ));
         assert!(!matches_patterns("\u{e9}Bad", regex_only));
+        // Combined style+regex configurations also check non-ASCII names —
+        // the regexes may exist precisely to govern Unicode identifiers, and
+        // the ASCII styles never match them.
+        let styles = [ObjectNameStyle::SnakeCase];
+        let combined = KindPatterns {
+            styles: &styles,
+            regexes: &regexes,
+        };
+        assert!(!should_skip_name(
+            "\u{e9}Bad",
+            SymbolKind::Variable,
+            combined
+        ));
+        assert!(!matches_patterns("\u{e9}Bad", combined));
     }
 }

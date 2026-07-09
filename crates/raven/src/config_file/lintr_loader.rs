@@ -473,17 +473,19 @@ fn apply_linter_call(
             // a regex-only configuration whose patterns were all rejected:
             // leave styles unset so Raven retains its defaults rather than
             // silently disabling the check.
-            if emit_styles
+            let styles_emitted = emit_styles
                 || regex_only
-                || (explicit_empty_styles && (!accepted_regexes.is_empty() || !rejected_regex))
-            {
+                || (explicit_empty_styles && (!accepted_regexes.is_empty() || !rejected_regex));
+            if styles_emitted {
                 emit_object_name_list(linting, "objectNameStyle", &accepted_styles);
             }
-            // An explicit empty `styles = c()` with no `regexes` argument at
-            // all means "disable this check": clear regexes too, otherwise
-            // per-key config merging would leave client-layer regexes in
-            // effect as an accidental regex-only mode.
-            let clears_regexes = explicit_empty_styles
+            // When the call determines the style policy but supplies no
+            // `regexes` argument, lintr's regexes default to none — so clear
+            // regexes too, otherwise per-key config merging would leave
+            // client-layer regexes ORed in. This covers both `styles = c()`
+            // ("disable this check") and a styles-only call like
+            // `object_name_linter("camelCase")`.
+            let clears_regexes = styles_emitted
                 && !regexes_supplied
                 && accepted_regexes.is_empty()
                 && !rejected_regex;
@@ -683,6 +685,19 @@ struct ScanState {
     prev_ident: bool,
 }
 
+/// The closing delimiter matching an R raw-string opening delimiter, or
+/// `None` if `open` cannot open a raw-string body. The single source of the
+/// bracket pairs, shared by the streaming scanner ([`ScanState`]) and the
+/// whole-token parser ([`parse_r_raw_string_literal`]) so they cannot drift.
+fn raw_string_close(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        _ => None,
+    }
+}
+
 /// Raw-string scanning sub-state for [`ScanState`], mirroring how R lexes
 /// `r"---(body)---"` (any of `(`/`[`/`{` as the opening delimiter, matched by
 /// `)`/`]`/`}` plus the same dash run plus the quote).
@@ -742,42 +757,31 @@ impl ScanState {
                 self.raw = RawScan::None;
             }
             RawScan::Dashes { quote, dashes } => {
-                match c {
-                    '-' => {
-                        self.raw = RawScan::Dashes {
-                            quote,
-                            dashes: dashes + 1,
-                        };
-                        return false;
-                    }
-                    '(' | '[' | '{' => {
-                        let close = match c {
-                            '(' => ')',
-                            '[' => ']',
-                            _ => '}',
-                        };
-                        self.raw = RawScan::Body {
-                            quote,
-                            dashes,
-                            close,
-                            progress: 0,
-                        };
-                        return false;
-                    }
-                    _ => {
-                        // `r"abc"` — malformed as a raw string; treat the
-                        // quote as having opened an ordinary string and
-                        // reprocess `c` as its content.
-                        self.raw = RawScan::None;
-                        self.in_str = Some(quote);
-                        if c == quote {
-                            self.in_str = None;
-                        } else if c == '\\' {
-                            self.escaped = true;
-                        }
-                        return false;
+                if c == '-' {
+                    self.raw = RawScan::Dashes {
+                        quote,
+                        dashes: dashes + 1,
+                    };
+                } else if let Some(close) = raw_string_close(c) {
+                    self.raw = RawScan::Body {
+                        quote,
+                        dashes,
+                        close,
+                        progress: 0,
+                    };
+                } else {
+                    // `r"abc"` — malformed as a raw string; treat the quote
+                    // as having opened an ordinary string and reprocess `c`
+                    // as its content.
+                    self.raw = RawScan::None;
+                    self.in_str = Some(quote);
+                    if c == quote {
+                        self.in_str = None;
+                    } else if c == '\\' {
+                        self.escaped = true;
                     }
                 }
+                return false;
             }
             RawScan::Body {
                 quote,
@@ -1201,12 +1205,7 @@ fn parse_r_raw_string_literal(raw: &str) -> Option<String> {
     let dash_count = rest.chars().take_while(|c| *c == '-').count();
     let rest = &rest[dash_count..];
     let open = rest.chars().next()?;
-    let close = match open {
-        '(' => ')',
-        '[' => ']',
-        '{' => '}',
-        _ => return None,
-    };
+    let close = raw_string_close(open)?;
     let body = &rest[open.len_utf8()..];
     let mut terminator = String::with_capacity(dash_count + 2);
     terminator.push(close);
@@ -1253,7 +1252,15 @@ fn note_unsupported_object_name_style(value: &str, warnings: &mut Vec<String>) -
         ));
         return true;
     }
-    if let Some(known) = object_name_style_hint(value) {
+    // The did-you-mean check only applies to values *shaped like* a style
+    // name. Without this guard, the punctuation-stripping hint key would
+    // swallow legitimate regexes that merely contain a style name (e.g.
+    // `"^camelCase$"` normalizes to `camelcase`), discarding them instead of
+    // letting the treat-as-regex leniency compile them.
+    let style_shaped = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '));
+    if style_shaped && let Some(known) = object_name_style_hint(value) {
         warnings.push(format!(
             ".lintr: object_name_linter style '{value}' is not a recognized Raven style name; did you mean '{known}'? Skipping it"
         ));
@@ -2143,10 +2150,11 @@ mod tests {
             out.settings["linting"]["objectNameStyleFunction"],
             json!(["snake_case"])
         );
-        assert!(
-            out.settings["linting"]
-                .get("objectNameRegexesFunction")
-                .is_none()
+        // Styles-only call: regexes are cleared (lintr's regexes default to
+        // none when only styles is supplied).
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!([])
         );
         assert!(has_unrecognized_warning(&out));
     }
@@ -2430,6 +2438,41 @@ mod tests {
     }
 
     #[test]
+    fn object_name_style_shaped_regex_is_not_mistaken_for_typo() {
+        // A regex that merely CONTAINS a style name (metacharacters present)
+        // must reach the treat-as-regex leniency, not the did-you-mean skip.
+        let out = load_str("linters: linters_with_defaults(object_name_linter(\"^camelCase$\"))\n");
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!(["^camelCase$"])
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!([])
+        );
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn object_name_styles_only_call_clears_client_regexes() {
+        // lintr: a styles-only call leaves regexes at their default (none),
+        // so the loader emits empty regex arrays to clear client-layer
+        // regexes during per-key merging.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(styles = \"camelCase\"))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!(["camelCase"])
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!([])
+        );
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
     fn object_name_unparseable_regexes_expression_keeps_defaults() {
         // `regexes = paste0(...)` can't be evaluated statically. With an
         // explicit empty `styles`, the kind must NOT be silently disabled:
@@ -2531,10 +2574,10 @@ mod tests {
             out.settings["linting"]["objectNameStyleFunction"],
             json!(["snake_case"])
         );
-        assert!(
-            out.settings["linting"]
-                .get("objectNameRegexesFunction")
-                .is_none()
+        // Styles-only call: regexes are cleared alongside the emitted styles.
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!([])
         );
         assert!(has_unrecognized_warning(&out));
     }

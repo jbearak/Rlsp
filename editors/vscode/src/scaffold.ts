@@ -702,7 +702,6 @@ export function renderRavenToml(linting: Record<string, unknown> | undefined): s
 }
 
 function toTomlScalar(v: unknown): string {
-    if (typeof v === 'string') return JSON.stringify(v);
     if (typeof v === 'boolean' || typeof v === 'number') return String(v);
     return JSON.stringify(v);
 }
@@ -779,7 +778,7 @@ async function runScaffoldCommand(fileName: string, content: string): Promise<vo
     try {
         await createScaffoldFile(folder, fileName, content);
     } catch (err) {
-            void vscode.window.showErrorMessage(
+        void vscode.window.showErrorMessage(
             `Raven: failed to create ${fileName}: ${err instanceof Error ? err.message : String(err)}`,
         );
     }

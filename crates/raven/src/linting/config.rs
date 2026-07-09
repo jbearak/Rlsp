@@ -95,17 +95,17 @@ impl ObjectNameStyle {
 /// equality intentionally use only the original source string (via
 /// `Regex::as_str`) because `regex::Regex` does not implement equality and
 /// the source is the stable configuration value users supplied.
+#[derive(Clone)]
 pub struct CompiledRegex {
     regex: regex::Regex,
 }
 
 /// Cap on [`compile_cached`]'s process-wide pattern cache. Real configurations
 /// hold a handful of patterns; the cap only guards against pathological churn
-/// (e.g. a config file rewritten with generated patterns), where the whole map
-/// is dropped and rebuilt rather than tracking recency.
+/// (e.g. a config file rewritten with generated patterns).
 const REGEX_CACHE_CAP: usize = 512;
 
-/// Compile `source`, memoizing successes in a process-wide cache.
+/// Compile `source`, memoizing successes in a process-wide LRU cache.
 ///
 /// Some callers re-parse lint configuration repeatedly — per-document
 /// `[[linting.overrides]]` resolution re-runs on every debounced edit, and the
@@ -113,23 +113,26 @@ const REGEX_CACHE_CAP: usize = 512;
 /// — so compilation must be cheap on repeat. `regex::Regex` is internally
 /// reference-counted, making the cached clone trivial. Errors are not cached:
 /// they are already rare, warned about once per parse, and re-erroring is
-/// cheap relative to a successful compile.
+/// cheap relative to a successful compile. The lock is exclusive but the
+/// critical sections are tiny and only config parsing takes it — the
+/// per-name `is_match` hot loop never touches the cache.
 fn compile_cached(source: &str) -> Result<regex::Regex, regex::Error> {
-    use std::collections::HashMap;
+    use std::num::NonZeroUsize;
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<String, regex::Regex>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(map) = cache.lock()
+    static CACHE: OnceLock<Mutex<lru::LruCache<String, regex::Regex>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        Mutex::new(lru::LruCache::new(
+            NonZeroUsize::new(REGEX_CACHE_CAP).expect("cap is nonzero"),
+        ))
+    });
+    if let Ok(mut map) = cache.lock()
         && let Some(regex) = map.get(source)
     {
         return Ok(regex.clone());
     }
     let regex = regex::Regex::new(source)?;
     if let Ok(mut map) = cache.lock() {
-        if map.len() >= REGEX_CACHE_CAP {
-            map.clear();
-        }
-        map.insert(source.to_string(), regex.clone());
+        map.push(source.to_string(), regex.clone());
     }
     Ok(regex)
 }
@@ -159,14 +162,6 @@ impl fmt::Debug for CompiledRegex {
         f.debug_tuple("CompiledRegex")
             .field(&self.source())
             .finish()
-    }
-}
-
-impl Clone for CompiledRegex {
-    fn clone(&self) -> Self {
-        Self {
-            regex: self.regex.clone(),
-        }
     }
 }
 

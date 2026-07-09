@@ -51,7 +51,6 @@ import { registerKnit, disposeKnitGrammarRegistryForDeactivation } from './knit'
 import { validateServerBinary } from './server-binary-check';
 import { dotLintrAutoEnableAllowed } from './lintr-auto-enable';
 
-export { renderRavenToml } from './scaffold';
 
 /**
  * Read all raven.* settings from VS Code configuration and construct
