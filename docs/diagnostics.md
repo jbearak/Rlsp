@@ -299,9 +299,9 @@ The object-name lint has independent settings for **functions** (`objectNameStyl
 
 > [!NOTE]
 > Some names are always accepted regardless of the configured style:
-> - An optional leading `.` is always valid; the rest of the name must still match (e.g. `.helper` under `snake_case` is fine, `.myHelper` is not).
+> - Named styles treat an optional leading `.` as decorative; the rest of the name must still match (e.g. `.helper` under `snake_case` is fine, `.myHelper` is not). Custom regexes match the full identifier including the leading dot.
 > - Function definitions with the shape `<generic>.<class>` are exempt when `<generic>` is a known base R S3 generic (`print.MyClass`, `as.Date.character`, `print.data.frame`, etc.). For less-common generics, use `# nolint` or `# raven: ignore`.
-> - Backtick-quoted names (e.g. `` `with spaces` ``, `` `+.MyClass` ``) and non-ASCII identifiers are skipped entirely.
+> - Backtick-quoted names (e.g. `` `with spaces` ``, `` `+.MyClass` ``) are skipped entirely. Non-ASCII identifiers are skipped only when no regexes are configured for the kind; with regexes configured they are checked against the regexes.
 
 **Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
 

@@ -1040,6 +1040,12 @@ fn parse_object_name_styles(
     unrecognized_constructs: &mut usize,
 ) -> Option<ObjectNameStringList> {
     let raw = resolve_object_name_arg(args, "styles")?.trim();
+    if raw.is_empty() {
+        // `styles = ,` — a named missing argument. The name still reserves
+        // the formal for positional binding (handled by the resolver), but
+        // the formal itself is missing, exactly like the bare placeholder.
+        return None;
+    }
     Some(parse_object_name_string_list(raw, unrecognized_constructs))
 }
 
@@ -1050,6 +1056,10 @@ fn parse_object_name_regexes(
     unrecognized_constructs: &mut usize,
 ) -> Option<ObjectNameStringList> {
     let raw = resolve_object_name_arg(args, "regexes")?.trim();
+    if raw.is_empty() {
+        // `regexes = ,` — named missing argument; see the styles twin above.
+        return None;
+    }
     Some(parse_object_name_string_list(raw, unrecognized_constructs))
 }
 
@@ -2488,6 +2498,25 @@ mod tests {
         assert_eq!(
             out.settings["linting"]["objectNameRegexesFunction"],
             json!(["^x$"])
+        );
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn object_name_named_missing_argument_reserves_slot_but_stays_missing() {
+        // `styles = ,` is a named missing argument in R: the name reserves
+        // the formal (the positional binds to `regexes`), but styles itself
+        // stays missing — so this is regex-only mode, with no warning.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(styles = , \"camelCase\"))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!([])
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!(["camelCase"])
         );
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
