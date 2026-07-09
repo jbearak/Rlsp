@@ -37,16 +37,26 @@ lineLength = 120
 # tighter than the default of 64
 maxChainDepth = 10
 
+[crossFile.diagnostics]
+missingFile = "warning"
+caseMismatch = "auto"
+
 [packages]
 enabled = true
 
 [diagnostics]
-undefinedVariableSeverity = "warning"
+enabled = true
+
+[diagnostics.severity]
+undefinedVariable = "warning"
 ```
 
 ### Per-file overrides
 
 `[[linting.overrides]]` is an array of glob → patch entries. Globs are anchored at the project root. Order matters: later entries win on conflicts. Setting `enabled = false` in an override skips matching files entirely.
+
+Canonical paths shared with Sight and their permanent compatibility aliases
+are specified in [Shared project configuration schema](shared-config-schema.md).
 
 ### Project exclusions
 
