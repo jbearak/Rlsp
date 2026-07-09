@@ -686,7 +686,7 @@ export function renderRavenToml(linting: Record<string, unknown> | undefined): s
     for (const [key, dflt, comment] of entries) {
         const fromUser = linting?.[key];
         // `enabled` is special: the init-options factory always emits it
-        // (see initializationOptions.ts:367), so the "is this explicit?"
+        // (see getInitializationOptions in initializationOptions.ts), so the "is this explicit?"
         // heuristic above doesn't apply. Treat enabled as explicit only when
         // it differs from the package.json default.
         const isExplicit =
