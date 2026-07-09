@@ -86,6 +86,9 @@ const DOC_LINK_OVERRIDES = {
 
 const TOML_PATH_OVERRIDES = {
   "raven.linting.readHomeLintr": null,
+  "raven.crossFile.caseMismatchSeverity": "crossFile.diagnostics.caseMismatch",
+  "raven.crossFile.missingFileSeverity": "crossFile.diagnostics.missingFile",
+  "raven.diagnostics.undefinedVariableSeverity": "diagnostics.severity.undefinedVariable",
 };
 
 const DESCRIPTION_OVERRIDES = {

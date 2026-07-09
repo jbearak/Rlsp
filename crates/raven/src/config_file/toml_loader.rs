@@ -38,8 +38,9 @@ pub fn load_str(text: &str, source_label: &str) -> Option<LoadedToml> {
             return None;
         }
     };
-    let json = toml_to_json(toml_value);
+    let mut json = toml_to_json(toml_value);
     let mut warnings = Vec::new();
+    normalize_shared_paths(&mut json, source_label, &mut warnings);
     if let Value::Object(map) = &json {
         validate_top_level_keys(map, source_label, &mut warnings);
     } else {
@@ -53,6 +54,153 @@ pub fn load_str(text: &str, source_label: &str) -> Option<LoadedToml> {
         settings: json,
         warnings,
     })
+}
+
+/// Normalize the shared Raven/Sight TOML paths into Raven's existing LSP
+/// settings shape. The old Raven paths remain permanent aliases, while the
+/// canonical shared path wins when both are present.
+fn normalize_shared_paths(json: &mut Value, source_label: &str, warnings: &mut Vec<String>) {
+    normalize_alias(
+        json,
+        &["workspace", "exclude"],
+        &["exclude"],
+        &["workspace", "exclude"],
+        source_label,
+        warnings,
+    );
+    normalize_alias(
+        json,
+        &["diagnostics", "severity", "undefinedVariable"],
+        &["diagnostics", "undefinedVariableSeverity"],
+        &["diagnostics", "undefinedVariableSeverity"],
+        source_label,
+        warnings,
+    );
+    normalize_alias(
+        json,
+        &["crossFile", "diagnostics", "missingFile"],
+        &["crossFile", "missingFileSeverity"],
+        &["crossFile", "missingFileSeverity"],
+        source_label,
+        warnings,
+    );
+    normalize_alias(
+        json,
+        &["crossFile", "diagnostics", "caseMismatch"],
+        &["crossFile", "caseMismatchSeverity"],
+        &["crossFile", "caseMismatchSeverity"],
+        source_label,
+        warnings,
+    );
+}
+
+fn normalize_alias(
+    json: &mut Value,
+    canonical_path: &[&str],
+    alias_path: &[&str],
+    internal_path: &[&str],
+    source_label: &str,
+    warnings: &mut Vec<String>,
+) {
+    let canonical = get_path(json, canonical_path).cloned();
+    let alias = get_path(json, alias_path).cloned();
+    let canonical_is_set = canonical.is_some();
+    let alias_is_set = alias.is_some();
+
+    let Some(value) = canonical.or(alias) else {
+        return;
+    };
+
+    if canonical_is_set && alias_is_set {
+        warnings.push(format!(
+            "{source_label}: both '{}' and compatibility alias '{}' are set; using '{}'",
+            canonical_path.join("."),
+            alias_path.join("."),
+            canonical_path.join(".")
+        ));
+    }
+
+    if !set_path(json, internal_path, value.clone()) {
+        if canonical_is_set {
+            warnings.push(format!(
+                "{source_label}: cannot apply '{}' because its parent is not a table",
+                canonical_path.join(".")
+            ));
+            return;
+        }
+
+        warnings.push(format!(
+            "{source_label}: parent of '{}' is not a table; replacing it to apply compatibility alias '{}'",
+            canonical_path.join("."),
+            alias_path.join(".")
+        ));
+        set_path_replacing_non_tables(json, internal_path, value)
+            .expect("top-level TOML value was already validated as a table");
+    }
+    if canonical_path != internal_path {
+        remove_path(json, canonical_path);
+    }
+    if alias_path != internal_path {
+        remove_path(json, alias_path);
+    }
+}
+
+fn set_path_replacing_non_tables(value: &mut Value, path: &[&str], new_value: Value) -> Option<()> {
+    let (last, parents) = path.split_last()?;
+    let mut current = value;
+    for key in parents {
+        let object = current.as_object_mut()?;
+        current = object
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !current.is_object() {
+            *current = Value::Object(serde_json::Map::new());
+        }
+    }
+    current
+        .as_object_mut()?
+        .insert((*last).to_string(), new_value);
+    Some(())
+}
+
+fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |current, key| current.get(key))
+}
+
+fn set_path(value: &mut Value, path: &[&str], new_value: Value) -> bool {
+    let Some((last, parents)) = path.split_last() else {
+        return false;
+    };
+    let mut current = value;
+    for key in parents {
+        let Some(object) = current.as_object_mut() else {
+            return false;
+        };
+        current = object
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    }
+    let Some(object) = current.as_object_mut() else {
+        return false;
+    };
+    object.insert((*last).to_string(), new_value);
+    true
+}
+
+fn remove_path(value: &mut Value, path: &[&str]) {
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let mut current = value;
+    for key in parents {
+        let Some(next) = current.get_mut(key) else {
+            return;
+        };
+        current = next;
+    }
+    if let Some(object) = current.as_object_mut() {
+        object.remove(*last);
+    }
 }
 
 /// Recursive TOML → JSON conversion. TOML's date/time types are stringified
@@ -240,5 +388,109 @@ foo = 42
     fn malformed_toml_returns_none() {
         let toml = "this is not = valid = toml = at all";
         assert!(load_str(toml, "test").is_none());
+    }
+
+    #[test]
+    fn normalizes_shared_canonical_paths() {
+        let out = load_str(
+            r#"
+[workspace]
+exclude = ["generated/**"]
+
+[diagnostics.severity]
+undefinedVariable = "error"
+
+[crossFile.diagnostics]
+missingFile = "off"
+caseMismatch = "auto"
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(
+            out.settings["workspace"]["exclude"],
+            serde_json::json!(["generated/**"])
+        );
+        assert_eq!(
+            out.settings["diagnostics"]["undefinedVariableSeverity"],
+            "error"
+        );
+        assert_eq!(out.settings["crossFile"]["missingFileSeverity"], "off");
+        assert_eq!(out.settings["crossFile"]["caseMismatchSeverity"], "auto");
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn accepts_legacy_shared_paths_and_canonical_wins_collisions() {
+        let out = load_str(
+            r#"
+exclude = ["legacy/**"]
+
+[workspace]
+exclude = ["canonical/**"]
+
+[diagnostics]
+undefinedVariableSeverity = "warning"
+
+[diagnostics.severity]
+undefinedVariable = "error"
+
+[crossFile]
+missingFileSeverity = "warning"
+caseMismatchSeverity = "warning"
+
+[crossFile.diagnostics]
+missingFile = "error"
+caseMismatch = "off"
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(
+            out.settings["workspace"]["exclude"],
+            serde_json::json!(["canonical/**"])
+        );
+        assert_eq!(
+            out.settings["diagnostics"]["undefinedVariableSeverity"],
+            "error"
+        );
+        assert_eq!(out.settings["crossFile"]["missingFileSeverity"], "error");
+        assert_eq!(out.settings["crossFile"]["caseMismatchSeverity"], "off");
+        assert_eq!(out.warnings.len(), 4);
+        assert!(out.warnings.iter().all(|warning| warning.contains("using")));
+    }
+
+    #[test]
+    fn root_exclude_alias_reaches_workspace_exclusion_compiler() {
+        let out = load_str(r#"exclude = ["generated/**"]"#, "test").unwrap();
+        let root = std::path::PathBuf::from("/workspace");
+        let exclusions =
+            crate::config_file::compile_workspace_exclusions(&out.settings, vec![root.clone()]);
+
+        assert!(out.warnings.is_empty());
+        assert!(out.settings.get("exclude").is_none());
+        assert!(exclusions.is_excluded_path(&root.join("generated/file.R")));
+    }
+
+    #[test]
+    fn malformed_workspace_does_not_disable_root_exclude_alias() {
+        let out = load_str(
+            r#"
+workspace = "bad"
+exclude = ["generated/**"]
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(
+            out.settings["workspace"]["exclude"],
+            serde_json::json!(["generated/**"])
+        );
+        assert!(out.settings.get("exclude").is_none());
+        assert_eq!(out.warnings.len(), 1);
+        assert!(out.warnings[0].contains("replacing it to apply compatibility alias 'exclude'"));
     }
 }
