@@ -479,21 +479,17 @@ fn apply_linter_call(
             if styles_emitted {
                 emit_object_name_list(linting, "objectNameStyle", &accepted_styles);
             }
-            // When the call determines the style policy but supplies no
-            // `regexes` argument, lintr's regexes default to none — so clear
-            // regexes too, otherwise per-key config merging would leave
-            // client-layer regexes ORed in. This covers both `styles = c()`
-            // ("disable this check") and a styles-only call like
-            // `object_name_linter("camelCase")`.
-            let clears_regexes = styles_emitted
-                && !regexes_supplied
-                && accepted_regexes.is_empty()
-                && !rejected_regex;
-            // Like the styles case above, an explicit empty `regexes = c()`
-            // emits `[]` so the project layer overrides (clears) any
-            // client-layer regexes during config merging, rather than
-            // silently leaving them in effect.
-            if !accepted_regexes.is_empty() || explicit_empty_regexes || clears_regexes {
+            // Invariant: whenever the call determines the style policy, it
+            // determines the regex policy too — a lintr call replaces both
+            // formals (unsupplied `regexes` defaults to none). So any styles
+            // emission is paired with a regexes emission (accepted patterns,
+            // or `[]` to clear client-layer regexes during per-key config
+            // merging). This holds even when supplied regexes were all
+            // rejected: the project explicitly stated its pattern policy, so
+            // unrelated client regexes must not silently survive as an OR.
+            // An explicit empty `regexes = c()` emits `[]` for the same
+            // clearing reason even when no styles are emitted.
+            if styles_emitted || !accepted_regexes.is_empty() || explicit_empty_regexes {
                 emit_object_name_list(linting, "objectNameRegexes", &accepted_regexes);
             }
         }
@@ -2470,6 +2466,27 @@ mod tests {
             json!([])
         );
         assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn object_name_rejected_regexes_still_clear_client_regexes() {
+        // The call states a pattern policy even when its regexes are all
+        // rejected: emitting `[]` keeps client-layer regexes from surviving
+        // per-key merging as an accidental OR with the accepted styles.
+        for input in [
+            "object_name_linter(styles = \"camelCase\", regexes = \"(?=bad)\")",
+            "object_name_linter(c(\"camelCase\", \"(?=bad)\"))",
+        ] {
+            let out = load_str(&format!("linters: linters_with_defaults({input})\n"));
+            let linting = &out.settings["linting"];
+            assert_eq!(
+                linting["objectNameStyleFunction"],
+                json!(["camelCase"]),
+                "{input}"
+            );
+            assert_eq!(linting["objectNameRegexesFunction"], json!([]), "{input}");
+            assert!(has_unrecognized_warning(&out), "{input}");
+        }
     }
 
     #[test]

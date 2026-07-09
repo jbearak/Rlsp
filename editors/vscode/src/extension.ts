@@ -51,7 +51,6 @@ import { registerKnit, disposeKnitGrammarRegistryForDeactivation } from './knit'
 import { validateServerBinary } from './server-binary-check';
 import { dotLintrAutoEnableAllowed } from './lintr-auto-enable';
 
-
 /**
  * Read all raven.* settings from VS Code configuration and construct
  * the initializationOptions object for the LSP server.
