@@ -401,6 +401,7 @@ fn apply_linter_call(
             let mut accepted_regexes = Vec::new();
             let mut emit_styles = false;
             let mut explicit_empty_styles = false;
+            let mut rejected_regex = false;
             if let Some(styles) = parse_object_name_styles(args, unrecognized_constructs) {
                 explicit_empty_styles = styles.explicit_empty_vector;
                 for style in styles.values {
@@ -410,7 +411,11 @@ fn apply_linter_call(
                         accepted_styles.push(style);
                     } else {
                         warn_if_object_name_style_case_hint(&style);
-                        accepted_regexes.push(style);
+                        rejected_regex |= !accept_object_name_regex(
+                            style,
+                            &mut accepted_regexes,
+                            unrecognized_constructs,
+                        );
                     }
                 }
                 if !accepted_styles.is_empty() || !accepted_regexes.is_empty() {
@@ -428,17 +433,25 @@ fn apply_linter_call(
                     // the user never sees.
                     if regex.is_empty() {
                         *unrecognized_constructs += 1;
+                        rejected_regex = true;
                     } else {
-                        accepted_regexes.push(regex);
+                        rejected_regex |= !accept_object_name_regex(
+                            regex,
+                            &mut accepted_regexes,
+                            unrecognized_constructs,
+                        );
                     }
                 }
             }
-            // An explicit empty `styles` vector always emits `[]` so the
-            // backend's empty/empty -> disabled and empty+regexes ->
-            // regex-only semantics apply, matching what the same
-            // configuration means in raven.toml / VS Code settings. Only a
-            // missing `styles` argument leaves Raven's defaults untouched.
-            if emit_styles || explicit_empty_styles {
+            // An explicit empty `styles` vector emits `[]` so the backend's
+            // empty/empty -> disabled and empty+regexes -> regex-only semantics
+            // apply, matching raven.toml / VS Code settings. The exception is
+            // a regex-only configuration whose patterns were all rejected:
+            // leave styles unset so Raven retains its defaults rather than
+            // silently disabling the check.
+            if emit_styles
+                || (explicit_empty_styles && (!accepted_regexes.is_empty() || !rejected_regex))
+            {
                 emit_object_name_list(linting, "objectNameStyle", &accepted_styles);
             }
             // Like the styles case above, an explicit empty `regexes = c()`
@@ -484,6 +497,24 @@ fn apply_linter_call(
             *unrecognized_constructs += 1;
         }
     }
+}
+
+/// Validate a `.lintr` object-name regex before forwarding it to the backend.
+///
+/// Invalid Rust regex syntax must use the loader's user-visible warning path;
+/// deferring rejection to backend logging can silently disable regex-only
+/// configurations after their empty style list has already been applied.
+fn accept_object_name_regex(
+    source: String,
+    accepted: &mut Vec<String>,
+    unrecognized_constructs: &mut usize,
+) -> bool {
+    if crate::linting::CompiledRegex::new(&source).is_err() {
+        *unrecognized_constructs += 1;
+        return false;
+    }
+    accepted.push(source);
+    true
 }
 
 fn disable_rule(
@@ -1714,22 +1745,43 @@ mod tests {
     }
 
     #[test]
-    fn object_name_positional_regex_with_equals_maps() {
+    fn object_name_invalid_positional_regex_warns_without_disabling_check() {
         // A positional raw regex that contains '=' (e.g. a lookahead) must
         // still bind to `styles` rather than being mistaken for a named arg.
-        // The loader emits it; backend regex compilation rejects lookahead.
+        // Raven rejects unsupported lookahead through the visible `.lintr`
+        // warning path and leaves its default styles in place.
         let out = load_str(
             "linters: linters_with_defaults(object_name_linter(\"^(?=.*[A-Z])[a-z]+$\"))\n",
         );
+        let linting = &out.settings["linting"];
+        assert!(linting.get("objectNameRegexesFunction").is_none());
+        assert!(linting.get("objectNameStyleFunction").is_none());
+        assert!(has_unrecognized_warning(&out));
+
+        let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
         assert_eq!(
-            out.settings["linting"]["objectNameRegexesFunction"],
-            json!(["^(?=.*[A-Z])[a-z]+$"])
+            cfg.object_name_style_function,
+            vec![crate::linting::ObjectNameStyle::SnakeCase]
         );
+        assert!(cfg.object_name_regexes_function.is_empty());
+    }
+
+    #[test]
+    fn object_name_explicit_regex_only_invalid_regex_keeps_default_styles() {
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(styles = c(), regexes = \"(?=bad)\"))\n",
+        );
+        let linting = &out.settings["linting"];
+        assert!(linting.get("objectNameStyleFunction").is_none());
+        assert!(linting.get("objectNameRegexesFunction").is_none());
+        assert!(has_unrecognized_warning(&out));
+
+        let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
         assert_eq!(
-            out.settings["linting"]["objectNameStyleFunction"],
-            json!([])
+            cfg.object_name_style_function,
+            vec![crate::linting::ObjectNameStyle::SnakeCase]
         );
-        assert!(out.warnings.is_empty());
+        assert!(cfg.object_name_regexes_function.is_empty());
     }
 
     #[test]

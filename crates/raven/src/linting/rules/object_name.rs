@@ -240,8 +240,10 @@ fn check_parameters(
 
 /// Report a diagnostic for `name` when it does not match `patterns`.
 ///
-/// Callers must pre-check [`KindPatterns::is_disabled`] so the disabled fast
-/// path is evaluated exactly once at the assignment/parameter call site.
+/// Callers pre-check [`KindPatterns::is_disabled`] as a fast path, while this
+/// function also guards the invariant so future call sites cannot report every
+/// name for a disabled symbol kind.
+// The diagnostic construction inputs are clearer kept flat at this leaf helper.
 #[allow(clippy::too_many_arguments)]
 fn report_if_bad(
     name_node: Node<'_>,
@@ -253,7 +255,9 @@ fn report_if_bad(
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    debug_assert!(!patterns.is_disabled());
+    if patterns.is_disabled() {
+        return;
+    }
     if should_skip_name(name, kind) {
         return;
     }
