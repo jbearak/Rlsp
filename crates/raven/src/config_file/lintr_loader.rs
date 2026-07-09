@@ -395,8 +395,9 @@ fn apply_linter_call(
             // that pass raw regexes through `styles`. Empty elements are still
             // unrepresentable because an empty regex would match every name.
             //
-            // `regexes =` is named-only. It must not use `resolve_arg`, whose
-            // positional fallback would steal the positional `styles` value.
+            // Resolve both formals using R's named-then-positional argument
+            // binding so `object_name_linter(character(), "^x$")` maps the
+            // second positional value to `regexes`.
             let mut accepted_styles = Vec::new();
             let mut accepted_regexes = Vec::new();
             let mut emit_styles = false;
@@ -610,13 +611,18 @@ fn apply_exclusions(body: &str, overrides: &mut Vec<Value>, unrecognized_constru
 /// [`split_top_level_commas`] on what counts as "inside a string" and on bracket
 /// depth.
 fn has_unquoted_eq(s: &str) -> bool {
+    split_top_level_eq(s).is_some()
+}
+
+/// Split at the first top-level `=` outside strings, comments, and brackets.
+fn split_top_level_eq(s: &str) -> Option<(&str, &str)> {
     let mut st = ScanState::default();
-    for c in s.chars() {
+    for (index, c) in s.char_indices() {
         if st.step(c) && c == '=' && st.depth == 0 {
-            return true;
+            return Some((&s[..index], &s[index + c.len_utf8()..]));
         }
     }
-    false
+    None
 }
 
 /// Shared lexical state for scanning a `.lintr` field value as R-ish text:
@@ -796,9 +802,40 @@ fn resolve_arg<'a>(args: &'a str, name: &str) -> Option<&'a str> {
 /// `lhs = "\"a"`, which never equals a bare `name`.
 fn find_named_arg<'a>(tokens: &[&'a str], name: &str) -> Option<&'a str> {
     tokens.iter().find_map(|tok| {
-        let (lhs, rhs) = tok.split_once('=')?;
+        let (lhs, rhs) = split_top_level_eq(tok)?;
         (lhs.trim() == name).then_some(rhs.trim())
     })
+}
+
+/// Resolve one of `object_name_linter`'s `styles` and `regexes` formals using
+/// R's exact-name-then-positional binding rules.
+fn resolve_object_name_arg<'a>(args: &'a str, target: &str) -> Option<&'a str> {
+    const FORMALS: [&str; 2] = ["styles", "regexes"];
+    let target_index = FORMALS.iter().position(|formal| *formal == target)?;
+    let tokens = split_top_level_commas(args);
+    if let Some(value) = find_named_arg(&tokens, target) {
+        return Some(value);
+    }
+
+    let named = FORMALS.map(|formal| find_named_arg(&tokens, formal).is_some());
+    let mut next_formal = 0;
+    for token in tokens
+        .into_iter()
+        .map(str::trim)
+        .filter(|token| !token.is_empty() && !has_unquoted_eq(token))
+    {
+        while next_formal < FORMALS.len() && named[next_formal] {
+            next_formal += 1;
+        }
+        if next_formal == FORMALS.len() {
+            break;
+        }
+        if next_formal == target_index {
+            return Some(token);
+        }
+        next_formal += 1;
+    }
+    None
 }
 
 /// Resolve an unsigned-integer linter argument (named `name = N`, else the first
@@ -830,25 +867,17 @@ fn parse_object_name_styles(
     args: &str,
     unrecognized_constructs: &mut usize,
 ) -> Option<ObjectNameStringList> {
-    // Named `styles = ...`, else the first positional argument (a positional
-    // value such as a quoted scalar or `c(...)` vector binds to lintr's first
-    // formal `styles`, even when a named arg like `regexes =` precedes it). See
-    // [`resolve_arg`].
-    let raw = resolve_arg(args, "styles")?.trim();
+    let raw = resolve_object_name_arg(args, "styles")?.trim();
     Some(parse_object_name_string_list(raw, unrecognized_constructs))
 }
 
-/// Resolve the named-only `regexes` argument of `object_name_linter`.
-///
-/// lintr's `regexes` formal has no positional binding in Raven's loader:
-/// positional values belong to `styles`, so this intentionally uses
-/// [`find_named_arg`] directly instead of [`resolve_arg`].
+/// Resolve the `regexes` argument of `object_name_linter` by name or as the
+/// positional value that binds to its second formal.
 fn parse_object_name_regexes(
     args: &str,
     unrecognized_constructs: &mut usize,
 ) -> Option<ObjectNameStringList> {
-    let tokens = split_top_level_commas(args);
-    let raw = find_named_arg(&tokens, "regexes")?.trim();
+    let raw = resolve_object_name_arg(args, "regexes")?.trim();
     Some(parse_object_name_string_list(raw, unrecognized_constructs))
 }
 
@@ -861,7 +890,12 @@ fn parse_object_name_string_list(
     raw: &str,
     unrecognized_constructs: &mut usize,
 ) -> ObjectNameStringList {
-    if let Some(inner) = strip_c_vector(raw) {
+    if strip_named_call(raw, "character").is_some_and(|inner| inner.trim().is_empty()) {
+        ObjectNameStringList {
+            values: Vec::new(),
+            explicit_empty_vector: true,
+        }
+    } else if let Some(inner) = strip_c_vector(raw) {
         // Drop *syntactically* empty tokens (e.g. a trailing comma) before
         // parsing string literals, so a quoted-empty element `""` survives as
         // a real degenerate value. The caller decides whether that empty string
@@ -874,7 +908,12 @@ fn parse_object_name_string_list(
                 continue;
             }
             had_elements = true;
-            if let Some(value) = parse_r_string_literal(token) {
+            // Named character-vector entries use their names as diagnostic
+            // labels in lintr; Raven needs only the regex/style value.
+            let value_token = split_top_level_eq(token)
+                .filter(|(name, _)| !name.trim().is_empty())
+                .map_or(token, |(_, value)| value.trim());
+            if let Some(value) = parse_r_string_literal(value_token) {
                 values.push(value);
             } else {
                 *unrecognized_constructs += 1;
@@ -1821,6 +1860,35 @@ mod tests {
         assert_eq!(
             out.settings["linting"]["objectNameRegexesFunction"],
             json!(["^x$", "Bar"])
+        );
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn object_name_second_positional_argument_maps_to_regexes() {
+        for input in [
+            "object_name_linter(character(), \"^x$\")",
+            "object_name_linter(styles = character(), \"^x$\")",
+        ] {
+            let out = load_str(&format!("linters: linters_with_defaults({input})\n"));
+            let linting = &out.settings["linting"];
+            assert_eq!(linting["objectNameStyleFunction"], json!([]));
+            assert_eq!(linting["objectNameRegexesFunction"], json!(["^x$"]));
+            assert!(out.warnings.is_empty(), "{input}: {:?}", out.warnings);
+        }
+    }
+
+    #[test]
+    fn object_name_named_regex_vector_entries_use_values() {
+        let out = load_str(
+            r#"linters: linters_with_defaults(object_name_linter(styles = character(), regexes = c(public = "^[a-z]", internal = "^\\.")))
+"#,
+        );
+        let linting = &out.settings["linting"];
+        assert_eq!(linting["objectNameStyleFunction"], json!([]));
+        assert_eq!(
+            linting["objectNameRegexesFunction"],
+            json!(["^[a-z]", r"^\."])
         );
         assert!(out.warnings.is_empty());
     }

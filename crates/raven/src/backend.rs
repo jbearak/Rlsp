@@ -822,20 +822,29 @@ pub(crate) fn parse_lint_config(
     {
         config.object_name_style_argument = styles;
     }
-    if let Some(value) = linting.get("objectNameRegexesFunction")
-        && let Some(regexes) = parse_object_name_regexes(value, "objectNameRegexesFunction")
-    {
-        config.object_name_regexes_function = regexes;
+    if let Some(value) = linting.get("objectNameRegexesFunction") {
+        apply_object_name_regex_setting(
+            value,
+            "objectNameRegexesFunction",
+            &mut config.object_name_style_function,
+            &mut config.object_name_regexes_function,
+        );
     }
-    if let Some(value) = linting.get("objectNameRegexesVariable")
-        && let Some(regexes) = parse_object_name_regexes(value, "objectNameRegexesVariable")
-    {
-        config.object_name_regexes_variable = regexes;
+    if let Some(value) = linting.get("objectNameRegexesVariable") {
+        apply_object_name_regex_setting(
+            value,
+            "objectNameRegexesVariable",
+            &mut config.object_name_style_variable,
+            &mut config.object_name_regexes_variable,
+        );
     }
-    if let Some(value) = linting.get("objectNameRegexesArgument")
-        && let Some(regexes) = parse_object_name_regexes(value, "objectNameRegexesArgument")
-    {
-        config.object_name_regexes_argument = regexes;
+    if let Some(value) = linting.get("objectNameRegexesArgument") {
+        apply_object_name_regex_setting(
+            value,
+            "objectNameRegexesArgument",
+            &mut config.object_name_style_argument,
+            &mut config.object_name_regexes_argument,
+        );
     }
     if let Some(sev) = linting.get("objectNameSeverity").and_then(|v| v.as_str()) {
         config.object_name_severity = parse_severity(sev);
@@ -1071,8 +1080,8 @@ fn parse_object_name_style_setting(
 fn parse_object_name_regexes(
     value: &serde_json::Value,
     setting_name: &str,
-) -> Option<Vec<crate::linting::CompiledRegex>> {
-    let (_, entries) = parse_object_name_string_entries(value, setting_name, false)?;
+) -> Option<(bool, Vec<crate::linting::CompiledRegex>)> {
+    let (had_elements, entries) = parse_object_name_string_entries(value, setting_name, false)?;
 
     let mut regexes = Vec::new();
     for source in entries {
@@ -1092,7 +1101,31 @@ fn parse_object_name_regexes(
         }
     }
 
-    Some(regexes)
+    Some((had_elements, regexes))
+}
+
+/// Apply compiled regexes while keeping an invalid regex-only configuration
+/// from silently disabling the corresponding object-name check.
+fn apply_object_name_regex_setting(
+    value: &serde_json::Value,
+    setting_name: &str,
+    styles: &mut Vec<crate::linting::ObjectNameStyle>,
+    target: &mut Vec<crate::linting::CompiledRegex>,
+) {
+    let Some((had_elements, regexes)) = parse_object_name_regexes(value, setting_name) else {
+        if styles.is_empty() {
+            styles.push(crate::linting::ObjectNameStyle::default());
+        }
+        return;
+    };
+
+    if styles.is_empty() && had_elements && regexes.is_empty() {
+        log::warn!(
+            "linting.{setting_name} contained no valid regexes for regex-only mode; retaining the default object-name style."
+        );
+        styles.push(crate::linting::ObjectNameStyle::default());
+    }
+    *target = regexes;
 }
 
 fn parse_object_name_string_entries<'a>(
@@ -13267,6 +13300,51 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["^ok$", "   "]
             );
+        }
+
+        #[test]
+        fn parse_lint_config_invalid_regex_only_mode_retains_default_style() {
+            use crate::linting::ObjectNameStyle;
+            let settings = json!({
+                "linting": {
+                    "objectNameStyleFunction": [],
+                    "objectNameRegexesFunction": ["(?=bad)"],
+                    "objectNameStyleVariable": [],
+                    "objectNameRegexesVariable": ["", 42],
+                    "objectNameStyleArgument": [],
+                    "objectNameRegexesArgument": "not-an-array"
+                }
+            });
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+
+            assert_eq!(
+                cfg.object_name_style_function,
+                vec![ObjectNameStyle::SnakeCase]
+            );
+            assert_eq!(
+                cfg.object_name_style_variable,
+                vec![ObjectNameStyle::SnakeCase]
+            );
+            assert_eq!(
+                cfg.object_name_style_argument,
+                vec![ObjectNameStyle::SnakeCase]
+            );
+            assert!(cfg.object_name_regexes_function.is_empty());
+            assert!(cfg.object_name_regexes_variable.is_empty());
+            assert!(cfg.object_name_regexes_argument.is_empty());
+        }
+
+        #[test]
+        fn parse_lint_config_explicit_empty_regex_only_mode_stays_disabled() {
+            let settings = json!({
+                "linting": {
+                    "objectNameStyleFunction": [],
+                    "objectNameRegexesFunction": []
+                }
+            });
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+            assert!(cfg.object_name_style_function.is_empty());
+            assert!(cfg.object_name_regexes_function.is_empty());
         }
 
         #[test]
