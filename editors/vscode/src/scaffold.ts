@@ -1,4 +1,4 @@
-import type * as Vscode from 'vscode';
+import * as vscode from 'vscode';
 import {
     parseTree,
     visit,
@@ -78,19 +78,6 @@ interface LintingGroup {
 const LINTING_SETTING_PREFIX = 'raven.linting.';
 
 const CLIENT_ONLY_LINTING_SETTINGS = new Set(['raven.linting.readHomeLintr']);
-
-const ARRAY_LINTING_SETTINGS = new Set([
-    'raven.linting.objectNameStyleFunction',
-    'raven.linting.objectNameStyleVariable',
-    'raven.linting.objectNameStyleArgument',
-    'raven.linting.objectNameRegexesFunction',
-    'raven.linting.objectNameRegexesVariable',
-    'raven.linting.objectNameRegexesArgument',
-]);
-
-function getVscode(): typeof Vscode {
-    return require('vscode') as typeof Vscode;
-}
 
 export function isProjectScopedLintingSettingKey(key: string): boolean {
     return key.startsWith(LINTING_SETTING_PREFIX) && !CLIENT_ONLY_LINTING_SETTINGS.has(key);
@@ -197,6 +184,18 @@ const LINTING_GROUPS: LintingGroup[] = [
         ],
     },
 ];
+
+/**
+ * The linting settings whose values are arrays, derived from
+ * `LINTING_GROUPS` so a new array-valued scaffold entry is automatically
+ * accepted by `classifyExisting` instead of requiring a second list to be
+ * kept in sync by hand.
+ */
+const ARRAY_LINTING_SETTINGS = new Set(
+    LINTING_GROUPS.flatMap((group) => group.entries)
+        .filter((entry) => Array.isArray(entry.value))
+        .map((entry) => entry.key),
+);
 
 const LINTING_BLOCK_HEADER =
     'Raven native style/lint diagnostics. Severities accept: "error",\n' +
@@ -713,8 +712,7 @@ function toTomlScalar(v: unknown): string {
  * `undefined` if none is open. Without a workspace folder there is no
  * unambiguous place to write the scaffold file.
  */
-function getTargetWorkspaceFolder(): Vscode.WorkspaceFolder | undefined {
-    const vscode = getVscode();
+function getTargetWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) {
         void vscode.window.showErrorMessage(
@@ -730,11 +728,10 @@ function getTargetWorkspaceFolder(): Vscode.WorkspaceFolder | undefined {
  * before overwriting an existing file. Returns the target URI on success.
  */
 export async function createScaffoldFile(
-    folder: Vscode.WorkspaceFolder,
+    folder: vscode.WorkspaceFolder,
     fileName: string,
     content: string,
-): Promise<Vscode.Uri | undefined> {
-    const vscode = getVscode();
+): Promise<vscode.Uri | undefined> {
     const target = vscode.Uri.joinPath(folder.uri, fileName);
 
     let exists = false;
@@ -782,8 +779,7 @@ async function runScaffoldCommand(fileName: string, content: string): Promise<vo
     try {
         await createScaffoldFile(folder, fileName, content);
     } catch (err) {
-        const vscode = getVscode();
-        void vscode.window.showErrorMessage(
+            void vscode.window.showErrorMessage(
             `Raven: failed to create ${fileName}: ${err instanceof Error ? err.message : String(err)}`,
         );
     }
@@ -796,9 +792,8 @@ async function runScaffoldCommand(fileName: string, content: string): Promise<vo
  * before overwriting them; unrelated keys and comments are preserved.
  */
 async function runLintingSettingsScaffold(
-    folder: Vscode.WorkspaceFolder,
-): Promise<Vscode.Uri | undefined> {
-    const vscode = getVscode();
+    folder: vscode.WorkspaceFolder,
+): Promise<vscode.Uri | undefined> {
     const vscodeDir = vscode.Uri.joinPath(folder.uri, '.vscode');
     const settingsUri = vscode.Uri.joinPath(vscodeDir, 'settings.json');
     const displayName = '.vscode/settings.json';
@@ -881,8 +876,7 @@ async function runLintingSettingsScaffold(
     return settingsUri;
 }
 
-export function registerScaffoldCommands(context: Vscode.ExtensionContext): void {
-    const vscode = getVscode();
+export function registerScaffoldCommands(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand('raven.scaffold.gitignore', () =>
             runScaffoldCommand('.gitignore', GITIGNORE_TEMPLATE),

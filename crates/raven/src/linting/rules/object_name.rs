@@ -28,8 +28,11 @@
 //! * **Leading-dot "hidden" names** (`.foo`, `.my_helper`, `.onLoad`) are
 //!   accepted under every scheme — an optional leading dot is stripped before
 //!   scheme classification, mirroring lintr.
-//! * **Non-ASCII identifiers** are skipped — case is locale-dependent and a
-//!   simple regex can't classify them.
+//! * **Non-ASCII identifiers** are skipped by style-based configurations —
+//!   case is locale-dependent and the named styles' simple ASCII schemes
+//!   can't classify them. Regex-only configurations (an empty style list
+//!   with regexes) do check non-ASCII names against the regexes, since the
+//!   user's patterns are the entire policy there.
 //! * **Named-argument `=`** (`f(name = value)`) is never an assignment target,
 //!   so it isn't checked. `=` elsewhere (top level, function bodies, braced
 //!   blocks) *is* treated as assignment and the LHS is checked.
@@ -258,7 +261,7 @@ fn report_if_bad(
     if patterns.is_disabled() {
         return;
     }
-    if should_skip_name(name, kind) {
+    if should_skip_name(name, kind, patterns) {
         return;
     }
     if matches_patterns(name, patterns) {
@@ -308,14 +311,18 @@ fn matches_patterns(name: &str, patterns: KindPatterns<'_>) -> bool {
 }
 
 /// Names that should be skipped regardless of the configured scheme.
-fn should_skip_name(name: &str, kind: SymbolKind) -> bool {
+fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) -> bool {
     // Backtick-quoted identifiers (operator overloads, names with spaces).
     if name.starts_with('`') {
         return true;
     }
-    // Non-ASCII identifiers can't be classified by simple ASCII regex.
+    // Non-ASCII identifiers can't be classified by the named styles' simple
+    // ASCII schemes, so style-based configurations skip them. Regex-only
+    // configurations (empty style list) must NOT skip: the user's regexes are
+    // the whole policy and can express Unicode constraints, so exempting
+    // non-ASCII names would make such policies unenforceable.
     if !name.is_ascii() {
-        return true;
+        return !patterns.styles.is_empty();
     }
     // S3 method dispatch: only relevant for function definitions. A name like
     // `print.MyClass` is `<generic>.<ClassName>` — exempt when some prefix
@@ -584,6 +591,19 @@ mod tests {
     use crate::linting::nolint::Suppressions;
     use crate::parser_pool::with_parser;
 
+    /// [`should_skip_name`] under a typical style-based configuration —
+    /// the carve-outs exercised by most tests don't depend on the patterns.
+    fn skip_default(name: &str, kind: SymbolKind) -> bool {
+        should_skip_name(
+            name,
+            kind,
+            KindPatterns {
+                styles: &[ObjectNameStyle::SnakeCase],
+                regexes: &[],
+            },
+        )
+    }
+
     #[test]
     fn snake_case_classifier_accepts_common_names() {
         assert!(is_snake_case("foo"));
@@ -633,17 +653,17 @@ mod tests {
     #[test]
     fn s3_method_detected_for_function_kind_only() {
         // Prefix is a known base R generic — exempt.
-        assert!(should_skip_name("print.MyClass", SymbolKind::Function));
-        assert!(should_skip_name("format.Date", SymbolKind::Function));
-        assert!(should_skip_name("summary.lm", SymbolKind::Function));
+        assert!(skip_default("print.MyClass", SymbolKind::Function));
+        assert!(skip_default("format.Date", SymbolKind::Function));
+        assert!(skip_default("summary.lm", SymbolKind::Function));
         // For variables, dotted names are checked normally — `print.MyClass`
         // isn't a method definition when bound to a non-function value.
-        assert!(!should_skip_name("print.MyClass", SymbolKind::Variable));
+        assert!(!skip_default("print.MyClass", SymbolKind::Variable));
         // All-lowercase dotted name with unknown prefix is still checked.
-        assert!(!should_skip_name("my.func", SymbolKind::Function));
+        assert!(!skip_default("my.func", SymbolKind::Function));
         // Unknown prefix + capitalized suffix (regression for over-broad
         // exemption): `foo` is not a known generic, so `foo.Bar` is checked.
-        assert!(!should_skip_name("foo.Bar", SymbolKind::Function));
+        assert!(!skip_default("foo.Bar", SymbolKind::Function));
     }
 
     #[test]
@@ -653,20 +673,14 @@ mod tests {
         // lookup gave `"as"` (not in the list), so the method was wrongly
         // flagged. The progressive-prefix scan tries `as`, then `as.Date`,
         // and exempts on the second.
-        assert!(should_skip_name("as.Date.character", SymbolKind::Function));
-        assert!(should_skip_name("as.numeric.foo", SymbolKind::Function));
-        assert!(should_skip_name(
-            "is.character.MyClass",
-            SymbolKind::Function
-        ));
-        assert!(should_skip_name("all.equal.default", SymbolKind::Function));
-        assert!(should_skip_name(
-            "fitted.values.MyModel",
-            SymbolKind::Function
-        ));
+        assert!(skip_default("as.Date.character", SymbolKind::Function));
+        assert!(skip_default("as.numeric.foo", SymbolKind::Function));
+        assert!(skip_default("is.character.MyClass", SymbolKind::Function));
+        assert!(skip_default("all.equal.default", SymbolKind::Function));
+        assert!(skip_default("fitted.values.MyModel", SymbolKind::Function));
         // Class names containing dots also work because the leftmost matching
         // generic wins.
-        assert!(should_skip_name("print.data.frame", SymbolKind::Function));
+        assert!(skip_default("print.data.frame", SymbolKind::Function));
         // Generic name itself (no class suffix) still requires at least one
         // dot to be considered S3 — bare `as.Date` defining the generic is
         // checked by the scheme (and would pass `dotted.case`).
@@ -677,10 +691,10 @@ mod tests {
         // Hidden S3 methods (`.print.MyClass`) — a leading `.` is stripped
         // before the generic lookup, so `.print.MyClass` still resolves
         // through `print`.
-        assert!(should_skip_name(".print.MyClass", SymbolKind::Function));
-        assert!(should_skip_name(".as.Date.character", SymbolKind::Function));
+        assert!(skip_default(".print.MyClass", SymbolKind::Function));
+        assert!(skip_default(".as.Date.character", SymbolKind::Function));
         // `.foo.Bar` — `foo` is not a generic, so still flagged.
-        assert!(!should_skip_name(".foo.Bar", SymbolKind::Function));
+        assert!(!skip_default(".foo.Bar", SymbolKind::Function));
     }
 
     #[test]
@@ -852,12 +866,27 @@ mod tests {
 
     #[test]
     fn backtick_quoted_names_are_skipped() {
-        assert!(should_skip_name("`with spaces`", SymbolKind::Variable));
-        assert!(should_skip_name("`+.foo`", SymbolKind::Function));
+        assert!(skip_default("`with spaces`", SymbolKind::Variable));
+        assert!(skip_default("`+.foo`", SymbolKind::Function));
     }
 
     #[test]
-    fn non_ascii_names_are_skipped() {
-        assert!(should_skip_name("\u{03b1}", SymbolKind::Variable));
+    fn non_ascii_names_are_skipped_for_style_configs_only() {
+        // Style-based configurations skip non-ASCII names (the ASCII schemes
+        // can't classify them)...
+        assert!(skip_default("\u{03b1}", SymbolKind::Variable));
+        // ...but regex-only configurations check them against the regexes:
+        // the user's patterns are the entire policy.
+        let regexes = [CompiledRegex::new("^[a-z]+$").unwrap()];
+        let regex_only = KindPatterns {
+            styles: &[],
+            regexes: &regexes,
+        };
+        assert!(!should_skip_name(
+            "\u{03b1}",
+            SymbolKind::Variable,
+            regex_only
+        ));
+        assert!(!matches_patterns("\u{e9}Bad", regex_only));
     }
 }

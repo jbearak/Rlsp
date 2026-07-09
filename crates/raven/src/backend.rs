@@ -807,45 +807,24 @@ pub(crate) fn parse_lint_config(
     {
         config.assignment_operator_severity = parse_severity(sev);
     }
-    if let Some(value) = linting.get("objectNameStyleFunction")
-        && let Some(styles) = parse_object_name_style_setting(value, "objectNameStyleFunction")
-    {
-        config.object_name_style_function = styles;
-    }
-    if let Some(value) = linting.get("objectNameStyleVariable")
-        && let Some(styles) = parse_object_name_style_setting(value, "objectNameStyleVariable")
-    {
-        config.object_name_style_variable = styles;
-    }
-    if let Some(value) = linting.get("objectNameStyleArgument")
-        && let Some(styles) = parse_object_name_style_setting(value, "objectNameStyleArgument")
-    {
-        config.object_name_style_argument = styles;
-    }
-    if let Some(value) = linting.get("objectNameRegexesFunction") {
-        apply_object_name_regex_setting(
-            value,
-            "objectNameRegexesFunction",
-            &mut config.object_name_style_function,
-            &mut config.object_name_regexes_function,
-        );
-    }
-    if let Some(value) = linting.get("objectNameRegexesVariable") {
-        apply_object_name_regex_setting(
-            value,
-            "objectNameRegexesVariable",
-            &mut config.object_name_style_variable,
-            &mut config.object_name_regexes_variable,
-        );
-    }
-    if let Some(value) = linting.get("objectNameRegexesArgument") {
-        apply_object_name_regex_setting(
-            value,
-            "objectNameRegexesArgument",
-            &mut config.object_name_style_argument,
-            &mut config.object_name_regexes_argument,
-        );
-    }
+    parse_object_name_kind_settings(
+        linting,
+        ("objectNameStyleFunction", "objectNameRegexesFunction"),
+        &mut config.object_name_style_function,
+        &mut config.object_name_regexes_function,
+    );
+    parse_object_name_kind_settings(
+        linting,
+        ("objectNameStyleVariable", "objectNameRegexesVariable"),
+        &mut config.object_name_style_variable,
+        &mut config.object_name_regexes_variable,
+    );
+    parse_object_name_kind_settings(
+        linting,
+        ("objectNameStyleArgument", "objectNameRegexesArgument"),
+        &mut config.object_name_style_argument,
+        &mut config.object_name_regexes_argument,
+    );
     if let Some(sev) = linting.get("objectNameSeverity").and_then(|v| v.as_str()) {
         config.object_name_severity = parse_severity(sev);
     }
@@ -1038,15 +1017,47 @@ mod case_mismatch_severity_parse_tests {
     }
 }
 
+/// Parse one symbol kind's paired `objectNameStyle*` / `objectNameRegexes*`
+/// settings into the config's style and regex vectors.
+///
+/// The two keys are deliberately resolved together in one place because they
+/// interact:
+///
+/// * An absent style key leaves the default `[snake_case]` in place; a
+///   present empty array means "no named styles" (regex-only mode when the
+///   regex list is nonempty, disabled when it is empty too).
+/// * A present nonempty style value with no valid elements is treated as an
+///   empty list — the kind is disabled *unless* valid regexes are configured,
+///   which then still apply. (Historically this failed safe to `[any]`, which
+///   also silently discarded valid regexes.)
+/// * A regex-only configuration (empty styles) whose regex value is invalid
+///   or contains no valid patterns falls back to the default style rather
+///   than silently disabling the check.
+fn parse_object_name_kind_settings(
+    linting: &serde_json::Value,
+    (style_key, regex_key): (&str, &str),
+    styles: &mut Vec<crate::linting::ObjectNameStyle>,
+    regexes: &mut Vec<crate::linting::CompiledRegex>,
+) {
+    if let Some(value) = linting.get(style_key)
+        && let Some(parsed) = parse_object_name_style_setting(value, style_key)
+    {
+        *styles = parsed;
+    }
+    if let Some(value) = linting.get(regex_key) {
+        apply_object_name_regex_setting(value, regex_key, styles, regexes);
+    }
+}
+
 /// Parse an object-name named-style setting.
 ///
 /// Scalar strings are parsed through the same path as one-element arrays for
 /// backward compatibility. An absent key is handled by the caller and leaves
 /// the default `[snake_case]` in place. A present empty array means "no named
 /// styles" (useful for regex-only checks). A present nonempty value with no
-/// valid style elements fails safe to `[any]`, preserving the historical
-/// scalar-unknown behavior of disabling that kind instead of unexpectedly
-/// enforcing the default.
+/// valid style elements is treated as empty: the kind is disabled unless the
+/// paired regex setting supplies valid patterns (see
+/// [`parse_object_name_kind_settings`]).
 fn parse_object_name_style_setting(
     value: &serde_json::Value,
     setting_name: &str,
@@ -1064,9 +1075,8 @@ fn parse_object_name_style_setting(
 
     if styles.is_empty() && had_elements {
         log::warn!(
-            "linting.{setting_name} did not contain any recognised object-name styles; disabling this kind (treating as ['any'])."
+            "linting.{setting_name} did not contain any recognised object-name styles; the kind is disabled unless valid regexes are configured for it."
         );
-        styles.push(crate::linting::ObjectNameStyle::Any);
     }
 
     Some(styles)
@@ -13224,13 +13234,37 @@ mod tests {
         }
 
         #[test]
-        fn parse_lint_config_unrecognized_object_name_style_falls_back_to_any() {
-            use crate::linting::ObjectNameStyle;
+        fn parse_lint_config_unrecognized_object_name_style_disables_kind() {
+            // With no valid style elements and no regexes, the kind resolves
+            // to empty lists, which `is_disabled` treats as off — the same
+            // fail-safe as the historical `[any]` fallback.
             let settings = json!({
                 "linting": { "objectNameStyleFunction": "kebab-case" }
             });
             let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
-            assert_eq!(cfg.object_name_style_function, vec![ObjectNameStyle::Any]);
+            assert!(cfg.object_name_style_function.is_empty());
+            assert!(cfg.object_name_regexes_function.is_empty());
+        }
+
+        #[test]
+        fn parse_lint_config_unrecognized_style_with_regexes_keeps_regexes() {
+            // An all-invalid style list must not discard valid regexes for
+            // the same kind: the kind becomes regex-only instead of disabled.
+            let settings = json!({
+                "linting": {
+                    "objectNameStyleFunction": ["typo"],
+                    "objectNameRegexesFunction": ["^Foo$"]
+                }
+            });
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+            assert!(cfg.object_name_style_function.is_empty());
+            assert_eq!(
+                cfg.object_name_regexes_function
+                    .iter()
+                    .map(|regex| regex.source())
+                    .collect::<Vec<_>>(),
+                vec!["^Foo$"]
+            );
         }
 
         #[test]
@@ -13248,7 +13282,9 @@ mod tests {
                 cfg.object_name_style_function,
                 vec![ObjectNameStyle::SnakeCase, ObjectNameStyle::CamelCase]
             );
-            assert_eq!(cfg.object_name_style_variable, vec![ObjectNameStyle::Any]);
+            // No valid elements and no regexes: empty means the kind is
+            // disabled (see `parse_object_name_kind_settings`).
+            assert!(cfg.object_name_style_variable.is_empty());
             assert!(cfg.object_name_style_argument.is_empty());
         }
 

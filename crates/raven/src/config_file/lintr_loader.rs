@@ -183,7 +183,7 @@ fn dcf_fold(text: &str) -> FoldResult {
         // literal text, not a header, so the string guard keeps folding it (the
         // preceding `\n` step already closed any open comment).
         if st.depth > 0
-            && !(st.in_str.is_none() && starts_new_field(raw_line))
+            && (st.in_string_literal() || !starts_new_field(raw_line))
             && let Some((_, val)) = current.as_mut()
         {
             if trimmed.is_empty() {
@@ -390,10 +390,13 @@ fn apply_linter_call(
         "object_name_linter" => {
             // lintr's first positional formal is `styles`; accept positional
             // and named, scalar and `c(...)` forms. Known names map to the
-            // named-style arrays. Non-empty unknown elements are treated as
-            // regexes, a lenient extension over lintr that preserves configs
-            // that pass raw regexes through `styles`. Empty elements are still
-            // unrepresentable because an empty regex would match every name.
+            // named-style arrays; names that are valid *lintr* styles with no
+            // Raven equivalent (and near-miss casings of Raven names) are
+            // warned about and skipped. Any other non-empty unknown element
+            // is treated as a regex, a lenient extension over lintr that
+            // preserves configs that pass raw regexes through `styles`.
+            // Empty elements are still unrepresentable because an empty
+            // regex would match every name.
             //
             // Resolve both formals using R's named-then-positional argument
             // binding so `object_name_linter(character(), "^x$")` maps the
@@ -403,15 +406,18 @@ fn apply_linter_call(
             let mut emit_styles = false;
             let mut explicit_empty_styles = false;
             let mut rejected_regex = false;
-            if let Some(styles) = parse_object_name_styles(args, unrecognized_constructs) {
+            let styles_arg = parse_object_name_styles(args, unrecognized_constructs);
+            let styles_supplied = styles_arg.is_some();
+            if let Some(styles) = styles_arg {
                 explicit_empty_styles = styles.explicit_empty_vector;
                 for style in styles.values {
                     if style.is_empty() {
                         *unrecognized_constructs += 1;
                     } else if crate::linting::ObjectNameStyle::from_config_name(&style).is_some() {
                         accepted_styles.push(style);
+                    } else if note_unsupported_object_name_style(&style, warnings) {
+                        // Warned and skipped; remaining elements still apply.
                     } else {
-                        warn_if_object_name_style_case_hint(&style);
                         rejected_regex |= !accept_object_name_regex(
                             style,
                             &mut accepted_regexes,
@@ -424,8 +430,18 @@ fn apply_linter_call(
                 }
             }
             let mut explicit_empty_regexes = false;
-            if let Some(regexes) = parse_object_name_regexes(args, unrecognized_constructs) {
+            let regexes_arg = parse_object_name_regexes(args, unrecognized_constructs);
+            let regexes_supplied = regexes_arg.is_some();
+            if let Some(regexes) = regexes_arg {
                 explicit_empty_regexes = regexes.explicit_empty_vector;
+                // A supplied `regexes` value that yields no elements and is
+                // not an explicit empty vector is an unparseable expression
+                // (e.g. `regexes = paste0(...)`, already counted above).
+                // Treat it as rejected so an explicit empty `styles` retains
+                // the defaults instead of silently disabling the kind.
+                if regexes.values.is_empty() && !explicit_empty_regexes {
+                    rejected_regex = true;
+                }
                 for regex in regexes.values {
                     // A quoted-empty regex would match every identifier;
                     // count it as unrecognized here — same treatment as an
@@ -444,6 +460,13 @@ fn apply_linter_call(
                     }
                 }
             }
+            // lintr semantics: explicitly supplying `regexes` REPLACES the
+            // default styles — regex-only mode — unless `styles` is also
+            // explicitly supplied ("if you want to combine `regexes` and
+            // `styles`, both need to be explicitly specified"). Emitting the
+            // empty style arrays makes the backend's empty+regexes ->
+            // regex-only semantics apply.
+            let regex_only = regexes_supplied && !styles_supplied && !accepted_regexes.is_empty();
             // An explicit empty `styles` vector emits `[]` so the backend's
             // empty/empty -> disabled and empty+regexes -> regex-only semantics
             // apply, matching raven.toml / VS Code settings. The exception is
@@ -451,15 +474,24 @@ fn apply_linter_call(
             // leave styles unset so Raven retains its defaults rather than
             // silently disabling the check.
             if emit_styles
+                || regex_only
                 || (explicit_empty_styles && (!accepted_regexes.is_empty() || !rejected_regex))
             {
                 emit_object_name_list(linting, "objectNameStyle", &accepted_styles);
             }
+            // An explicit empty `styles = c()` with no `regexes` argument at
+            // all means "disable this check": clear regexes too, otherwise
+            // per-key config merging would leave client-layer regexes in
+            // effect as an accidental regex-only mode.
+            let clears_regexes = explicit_empty_styles
+                && !regexes_supplied
+                && accepted_regexes.is_empty()
+                && !rejected_regex;
             // Like the styles case above, an explicit empty `regexes = c()`
             // emits `[]` so the project layer overrides (clears) any
             // client-layer regexes during config merging, rather than
             // silently leaving them in effect.
-            if !accepted_regexes.is_empty() || explicit_empty_regexes {
+            if !accepted_regexes.is_empty() || explicit_empty_regexes || clears_regexes {
                 emit_object_name_list(linting, "objectNameRegexes", &accepted_regexes);
             }
         }
@@ -627,9 +659,11 @@ fn split_top_level_eq(s: &str) -> Option<(&str, &str)> {
 
 /// Shared lexical state for scanning a `.lintr` field value as R-ish text:
 /// tracks whether we are inside a string literal (with backslash-escape
-/// handling), inside a `#` comment, and the net bracket depth. One state
-/// machine so `dcf_fold` (continuation detection), `split_top_level_commas`,
-/// and `strip_comments` cannot drift on what counts as "inside a string /
+/// handling), inside an R >= 4.0 raw string (`r"(...)"` and friends, where
+/// nothing is escaped and quotes/brackets/commas in the body are content),
+/// inside a `#` comment, and the net bracket depth. One state machine so
+/// `dcf_fold` (continuation detection), `split_top_level_commas`, and
+/// `strip_comments` cannot drift on what counts as "inside a string /
 /// comment / bracket".
 #[derive(Default)]
 struct ScanState {
@@ -642,20 +676,146 @@ struct ScanState {
     in_comment: bool,
     /// Net `(`/`[`/`{` minus `)`/`]`/`}`, floored at 0.
     depth: i32,
+    /// Raw-string sub-state; `RawScan::None` outside raw strings.
+    raw: RawScan,
+    /// `true` when the previous structural char could continue an identifier
+    /// (`str`, `attr2`), so a following `r`/`R` is not a raw-string prefix.
+    prev_ident: bool,
+}
+
+/// Raw-string scanning sub-state for [`ScanState`], mirroring how R lexes
+/// `r"---(body)---"` (any of `(`/`[`/`{` as the opening delimiter, matched by
+/// `)`/`]`/`}` plus the same dash run plus the quote).
+#[derive(Default, Clone, Copy)]
+enum RawScan {
+    /// Not in (or entering) a raw string.
+    #[default]
+    None,
+    /// Just consumed a standalone `r`/`R`; a quote next starts a raw string.
+    Prefix,
+    /// Consumed `r` + quote; consuming optional dashes until the opening
+    /// bracket. Any other character means this was NOT a raw string after all
+    /// (e.g. `r"abc"` — R rejects it, but we degrade to an ordinary string).
+    Dashes { quote: char, dashes: usize },
+    /// Inside the raw body. `progress` counts how many characters of the
+    /// closing sequence (`close`, then `dashes` dashes, then `quote`) have
+    /// matched so far.
+    Body {
+        quote: char,
+        dashes: usize,
+        close: char,
+        progress: usize,
+    },
 }
 
 impl ScanState {
+    /// True while inside an ordinary string literal or a raw string whose
+    /// opening quote has been consumed — i.e. positions where text is string
+    /// content, not structure.
+    fn in_string_literal(&self) -> bool {
+        self.in_str.is_some() || matches!(self.raw, RawScan::Dashes { .. } | RawScan::Body { .. })
+    }
+
     /// Advance over one character `c`. Returns `true` when `c` is a
-    /// *structural* character — not inside a string or comment — so callers can
-    /// act on `,` / brackets only when this is `true`. Escape state is tracked
-    /// internally (no `prev` parameter needed), so a string ending in an
-    /// escaped backslash (`"a\\"`) closes correctly.
+    /// *structural* character — not inside a string, raw string, or comment —
+    /// so callers can act on `,` / brackets only when this is `true`. Escape
+    /// state is tracked internally (no `prev` parameter needed), so a string
+    /// ending in an escaped backslash (`"a\\"`) closes correctly.
     fn step(&mut self, c: char) -> bool {
         if self.in_comment {
             if c == '\n' {
                 self.in_comment = false;
             }
             return false;
+        }
+        match self.raw {
+            RawScan::None => {}
+            RawScan::Prefix => {
+                if c == '"' || c == '\'' {
+                    self.raw = RawScan::Dashes {
+                        quote: c,
+                        dashes: 0,
+                    };
+                    return false;
+                }
+                // Not a raw string; fall through to normal processing.
+                self.raw = RawScan::None;
+            }
+            RawScan::Dashes { quote, dashes } => {
+                match c {
+                    '-' => {
+                        self.raw = RawScan::Dashes {
+                            quote,
+                            dashes: dashes + 1,
+                        };
+                        return false;
+                    }
+                    '(' | '[' | '{' => {
+                        let close = match c {
+                            '(' => ')',
+                            '[' => ']',
+                            _ => '}',
+                        };
+                        self.raw = RawScan::Body {
+                            quote,
+                            dashes,
+                            close,
+                            progress: 0,
+                        };
+                        return false;
+                    }
+                    _ => {
+                        // `r"abc"` — malformed as a raw string; treat the
+                        // quote as having opened an ordinary string and
+                        // reprocess `c` as its content.
+                        self.raw = RawScan::None;
+                        self.in_str = Some(quote);
+                        if c == quote {
+                            self.in_str = None;
+                        } else if c == '\\' {
+                            self.escaped = true;
+                        }
+                        return false;
+                    }
+                }
+            }
+            RawScan::Body {
+                quote,
+                dashes,
+                close,
+                progress,
+            } => {
+                // The closing sequence is `close`, then `dashes` dashes, then
+                // `quote`. Match it incrementally; on a mismatch, the char is
+                // body content and a `close` restarts a potential match.
+                let expected = if progress == 0 {
+                    close
+                } else if progress <= dashes {
+                    '-'
+                } else {
+                    quote
+                };
+                if c == expected {
+                    if progress == dashes + 1 {
+                        self.raw = RawScan::None;
+                    } else {
+                        self.raw = RawScan::Body {
+                            quote,
+                            dashes,
+                            close,
+                            progress: progress + 1,
+                        };
+                    }
+                } else {
+                    self.raw = RawScan::Body {
+                        quote,
+                        dashes,
+                        close,
+                        progress: usize::from(c == close),
+                    };
+                }
+                return false;
+            }
         }
         if let Some(q) = self.in_str {
             if self.escaped {
@@ -667,7 +827,13 @@ impl ScanState {
             }
             return false;
         }
+        let was_ident = self.prev_ident;
+        self.prev_ident = c.is_alphanumeric() || c == '_' || c == '.';
         match c {
+            'r' | 'R' if !was_ident => {
+                self.raw = RawScan::Prefix;
+                true
+            }
             '"' | '\'' => {
                 self.in_str = Some(c);
                 false
@@ -727,7 +893,7 @@ fn strip_comments(s: &str) -> String {
     let mut st = ScanState::default();
     for c in s.chars() {
         let was_comment = st.in_comment;
-        let was_str = st.in_str.is_some();
+        let was_str = st.in_string_literal();
         st.step(c);
         if was_comment {
             // Drop comment body; keep only the newline that ends it.
@@ -890,7 +1056,12 @@ fn parse_object_name_string_list(
     raw: &str,
     unrecognized_constructs: &mut usize,
 ) -> ObjectNameStringList {
-    if strip_named_call(raw, "character").is_some_and(|inner| inner.trim().is_empty()) {
+    // `character()`, `character(0)`, and `character(0L)` are all zero-length
+    // character vectors in R — any of them is an explicit empty list.
+    if strip_named_call(raw, "character").is_some_and(|inner| {
+        let inner = inner.trim();
+        inner.is_empty() || inner == "0" || inner == "0L"
+    }) {
         ObjectNameStringList {
             values: Vec::new(),
             explicit_empty_vector: true,
@@ -1060,12 +1231,35 @@ fn emit_object_name_list(
     }
 }
 
-fn warn_if_object_name_style_case_hint(value: &str) {
-    if let Some(known) = object_name_style_hint(value) {
-        log::warn!(
-            ".lintr: object_name_linter style '{value}' is not a recognized Raven style name; did you mean '{known}'? Treating it as a regex."
-        );
+/// lintr style names Raven has no equivalent named style for. These are valid
+/// `object_name_linter(styles = ...)` values in lintr, so they must not fall
+/// through to the treat-as-regex leniency: compiling e.g. `"symbols"` as a
+/// literal regex silently scrambles which names pass. (lintr's full style set
+/// is `snake_case`, `symbols`, `camelCase`, `CamelCase`, `dotted.case`,
+/// `lowercase`, `UPPERCASE`, `SNAKE_CASE`; Raven's is
+/// [`crate::linting::ObjectNameStyle`]. `UPPERCASE`/`SNAKE_CASE` are *not*
+/// mapped to Raven's `UPPER_CASE` because their accepted-character sets
+/// differ.)
+const LINTR_ONLY_STYLE_NAMES: &[&str] = &["symbols", "CamelCase", "UPPERCASE", "SNAKE_CASE"];
+
+/// If `value` is a lintr-valid style Raven can't express, or a near-miss
+/// casing of a Raven style name, push a user-visible warning and return
+/// `true` so the caller skips the element instead of misinterpreting it as a
+/// regex. Returns `false` for anything else (the treat-as-regex leniency).
+fn note_unsupported_object_name_style(value: &str, warnings: &mut Vec<String>) -> bool {
+    if LINTR_ONLY_STYLE_NAMES.contains(&value) {
+        warnings.push(format!(
+            ".lintr: object_name_linter style '{value}' has no Raven equivalent; skipping it"
+        ));
+        return true;
     }
+    if let Some(known) = object_name_style_hint(value) {
+        warnings.push(format!(
+            ".lintr: object_name_linter style '{value}' is not a recognized Raven style name; did you mean '{known}'? Skipping it"
+        ));
+        return true;
+    }
+    false
 }
 
 fn object_name_style_hint(value: &str) -> Option<&'static str> {
@@ -1840,10 +2034,16 @@ mod tests {
     }
 
     #[test]
-    fn object_name_regexes_named_arg_maps() {
+    fn object_name_regexes_named_arg_maps_regex_only() {
+        // lintr semantics: explicitly supplying `regexes` REPLACES the default
+        // styles unless `styles` is also explicitly supplied, so the loader
+        // emits empty style arrays (regex-only mode).
         let out =
             load_str("linters: linters_with_defaults(object_name_linter(regexes = \"^x$\"))\n");
-        assert!(!mapped_object_name_style(&out));
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!([])
+        );
         assert_eq!(
             out.settings["linting"]["objectNameRegexesFunction"],
             json!(["^x$"])
@@ -1852,14 +2052,35 @@ mod tests {
     }
 
     #[test]
-    fn object_name_regexes_named_vector_maps() {
+    fn object_name_regexes_named_vector_maps_regex_only() {
         let out = load_str(
             "linters: linters_with_defaults(object_name_linter(regexes = c(\"^x$\", \"Bar\")))\n",
         );
-        assert!(!mapped_object_name_style(&out));
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!([])
+        );
         assert_eq!(
             out.settings["linting"]["objectNameRegexesFunction"],
             json!(["^x$", "Bar"])
+        );
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn object_name_regexes_with_explicit_styles_combine() {
+        // Both formals explicitly supplied: styles and regexes combine (OR),
+        // exactly like lintr when both are specified.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(styles = \"camelCase\", regexes = \"^x$\"))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!(["camelCase"])
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!(["^x$"])
         );
         assert!(out.warnings.is_empty());
     }
@@ -1899,7 +2120,10 @@ mod tests {
             r#"linters: linters_with_defaults(object_name_linter(regexes = "^\\.on[A-Z]"))
 "#,
         );
-        assert!(!mapped_object_name_style(&out));
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!([])
+        );
         assert_eq!(
             out.settings["linting"]["objectNameRegexesFunction"],
             json!([r"^\.on[A-Z]"])
@@ -1938,6 +2162,11 @@ mod tests {
         assert_eq!(
             out.settings["linting"]["objectNameRegexesFunction"],
             json!(["^x$"])
+        );
+        // A valid regex survived, so regex-only mode still applies.
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!([])
         );
         assert!(has_unrecognized_warning(&out));
 
@@ -2090,15 +2319,17 @@ mod tests {
         // An explicit empty styles vector maps to empty style arrays, which
         // the backend resolves (with no regexes) to "check disabled" — the
         // same meaning the equivalent raven.toml / VS Code configuration has.
+        // With no `regexes` argument at all, empty regex arrays are emitted
+        // too, so client-layer regexes are cleared during per-key config
+        // merging instead of surviving as an accidental regex-only mode.
         let out = load_str("linters: linters_with_defaults(object_name_linter(c()))\n");
         assert_eq!(
             out.settings["linting"]["objectNameStyleFunction"],
             json!([])
         );
-        assert!(
-            out.settings["linting"]
-                .get("objectNameRegexesFunction")
-                .is_none()
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!([])
         );
         assert!(out.warnings.is_empty());
 
@@ -2117,6 +2348,135 @@ mod tests {
             json!([])
         );
         assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn object_name_character_zero_is_explicit_empty() {
+        // `character(0)` and `character(0L)` are zero-length vectors like
+        // `character()`: regex-only mode must engage, with no warning.
+        for empty in ["character(0)", "character(0L)"] {
+            let out = load_str(&format!(
+                "linters: linters_with_defaults(object_name_linter(styles = {empty}, regexes = \"^x$\"))\n"
+            ));
+            assert_eq!(
+                out.settings["linting"]["objectNameStyleFunction"],
+                json!([]),
+                "{empty}"
+            );
+            assert_eq!(
+                out.settings["linting"]["objectNameRegexesFunction"],
+                json!(["^x$"]),
+                "{empty}"
+            );
+            assert!(out.warnings.is_empty(), "{empty}: {:?}", out.warnings);
+        }
+    }
+
+    #[test]
+    fn object_name_lintr_only_styles_warn_and_skip() {
+        // "symbols" (and CamelCase/UPPERCASE/SNAKE_CASE) are valid lintr
+        // styles with no Raven equivalent: they must not be misread as
+        // regexes. A lone unsupported style leaves the defaults in place.
+        let out = load_str("linters: linters_with_defaults(object_name_linter(\"symbols\"))\n");
+        assert!(!mapped_object_name_style(&out));
+        assert!(
+            out.settings["linting"]
+                .get("objectNameRegexesFunction")
+                .is_none()
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("'symbols'") && w.contains("no Raven equivalent")),
+            "{:?}",
+            out.warnings
+        );
+
+        // Mixed with a supported style, the supported one still applies.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(c(\"snake_case\", \"SNAKE_CASE\")))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!(["snake_case"])
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("'SNAKE_CASE'") && w.contains("no Raven equivalent")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn object_name_style_case_typo_warns_and_skips() {
+        // A near-miss casing of a Raven style name is a typo, not a regex:
+        // warn with the did-you-mean hint and keep the defaults.
+        let out = load_str("linters: linters_with_defaults(object_name_linter(\"Snake_Case\"))\n");
+        assert!(!mapped_object_name_style(&out));
+        assert!(
+            out.settings["linting"]
+                .get("objectNameRegexesFunction")
+                .is_none()
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("did you mean 'snake_case'")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn object_name_unparseable_regexes_expression_keeps_defaults() {
+        // `regexes = paste0(...)` can't be evaluated statically. With an
+        // explicit empty `styles`, the kind must NOT be silently disabled:
+        // the defaults are retained and the batch warning fires.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(styles = c(), regexes = paste0(\"^\", \"x$\")))\n",
+        );
+        assert!(!mapped_object_name_style(&out));
+        assert!(
+            out.settings["linting"]
+                .get("objectNameRegexesFunction")
+                .is_none()
+        );
+        assert!(has_unrecognized_warning(&out));
+
+        let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
+        assert_eq!(
+            cfg.object_name_style_function,
+            vec![crate::linting::ObjectNameStyle::SnakeCase]
+        );
+    }
+
+    #[test]
+    fn object_name_raw_string_with_embedded_quote_maps() {
+        // The raw-string body contains a double-quote: the argument scanner
+        // must not desync on it, and both vector elements must survive.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(regexes = c(r\"(foo\"bar)\", \"^x$\")))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!(["foo\"bar", "^x$"])
+        );
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn split_top_level_commas_understands_raw_strings() {
+        // Quotes, commas, and brackets inside a raw-string body are content.
+        let parts = split_top_level_commas(r#"r"(a"b,c))", "^x$""#);
+        assert_eq!(parts, vec![r#"r"(a"b,c))""#, r#" "^x$""#]);
+        // Dash-extended delimiters.
+        let parts = split_top_level_commas(r#"r"--(a)-",b)--", d"#);
+        assert_eq!(parts, vec![r#"r"--(a)-",b)--""#, " d"]);
+        // An identifier ending in `r` does not start a raw string.
+        let parts = split_top_level_commas(r#"var"a", b"#);
+        assert_eq!(parts, vec![r#"var"a""#, " b"]);
     }
 
     #[test]

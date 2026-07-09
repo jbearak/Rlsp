@@ -92,26 +92,60 @@ impl ObjectNameStyle {
 ///
 /// The compiled form is stored in [`LintConfig`] so lint passes can test names
 /// without recompiling user patterns on every debounced edit. `Debug` and
-/// equality intentionally use only the original source string because
-/// `regex::Regex` does not implement equality and the source is the stable
-/// configuration value users supplied.
+/// equality intentionally use only the original source string (via
+/// `Regex::as_str`) because `regex::Regex` does not implement equality and
+/// the source is the stable configuration value users supplied.
 pub struct CompiledRegex {
-    source: String,
     regex: regex::Regex,
 }
 
+/// Cap on [`compile_cached`]'s process-wide pattern cache. Real configurations
+/// hold a handful of patterns; the cap only guards against pathological churn
+/// (e.g. a config file rewritten with generated patterns), where the whole map
+/// is dropped and rebuilt rather than tracking recency.
+const REGEX_CACHE_CAP: usize = 512;
+
+/// Compile `source`, memoizing successes in a process-wide cache.
+///
+/// Some callers re-parse lint configuration repeatedly — per-document
+/// `[[linting.overrides]]` resolution re-runs on every debounced edit, and the
+/// `.lintr` loader validates each pattern before the backend compiles it again
+/// — so compilation must be cheap on repeat. `regex::Regex` is internally
+/// reference-counted, making the cached clone trivial. Errors are not cached:
+/// they are already rare, warned about once per parse, and re-erroring is
+/// cheap relative to a successful compile.
+fn compile_cached(source: &str) -> Result<regex::Regex, regex::Error> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, regex::Regex>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock()
+        && let Some(regex) = map.get(source)
+    {
+        return Ok(regex.clone());
+    }
+    let regex = regex::Regex::new(source)?;
+    if let Ok(mut map) = cache.lock() {
+        if map.len() >= REGEX_CACHE_CAP {
+            map.clear();
+        }
+        map.insert(source.to_string(), regex.clone());
+    }
+    Ok(regex)
+}
+
 impl CompiledRegex {
-    /// Compile a user-provided regex source string.
+    /// Compile a user-provided regex source string (memoized; see
+    /// `compile_cached`).
     pub fn new(source: &str) -> Result<Self, regex::Error> {
         Ok(Self {
-            source: source.to_string(),
-            regex: regex::Regex::new(source)?,
+            regex: compile_cached(source)?,
         })
     }
 
     /// Original pattern text from the user's configuration.
     pub fn source(&self) -> &str {
-        &self.source
+        self.regex.as_str()
     }
 
     /// Return whether this pattern matches `name`.
@@ -122,14 +156,15 @@ impl CompiledRegex {
 
 impl fmt::Debug for CompiledRegex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("CompiledRegex").field(&self.source).finish()
+        f.debug_tuple("CompiledRegex")
+            .field(&self.source())
+            .finish()
     }
 }
 
 impl Clone for CompiledRegex {
     fn clone(&self) -> Self {
         Self {
-            source: self.source.clone(),
             regex: self.regex.clone(),
         }
     }
@@ -137,7 +172,7 @@ impl Clone for CompiledRegex {
 
 impl PartialEq for CompiledRegex {
     fn eq(&self, other: &Self) -> bool {
-        self.source == other.source
+        self.source() == other.source()
     }
 }
 
