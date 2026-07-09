@@ -224,10 +224,13 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 | `raven.linting.noTabSeverity` | `"information"` | Severity for tab characters |
 | `raven.linting.trailingBlankLinesSeverity` | `"information"` | Severity for blank lines or missing newline at end of file |
 | `raven.linting.assignmentOperatorSeverity` | `"information"` | Severity for mismatched assignment operator |
-| `raven.linting.objectNameStyleFunction` | `"snake_case"` | Naming scheme for functions (`"snake_case" \| "camelCase" \| "dotted.case" \| "UPPER_CASE" \| "lowercase" \| "any"`) |
-| `raven.linting.objectNameStyleVariable` | `"snake_case"` | Naming scheme for variables (same enum as above) |
-| `raven.linting.objectNameStyleArgument` | `"snake_case"` | Naming scheme for function formal arguments (same enum as above) |
-| `raven.linting.objectNameSeverity` | `"information"` | Severity for the object-name lint (set to `"off"` to disable entirely; set a specific style to `"any"` to disable just that kind) |
+| `raven.linting.objectNameStyleFunction` | `"snake_case"` | Naming schemes for functions. Accepts one style string or an array of styles (`"snake_case"` \| `"camelCase"` \| `"dotted.case"` \| `"UPPER_CASE"` \| `"lowercase"` \| `"any"`); styles are ORed with function regexes. |
+| `raven.linting.objectNameStyleVariable` | `"snake_case"` | Naming schemes for variables (same string-or-array enum as above); styles are ORed with variable regexes. |
+| `raven.linting.objectNameStyleArgument` | `"snake_case"` | Naming schemes for function formal arguments (same string-or-array enum as above); styles are ORed with argument regexes. |
+| `raven.linting.objectNameRegexesFunction` | `[]` | Additional Rust regexes accepted for function names. Partial match against the full identifier, including any leading `.`; use `^...$` for whole-name matches. Empty strings are rejected. |
+| `raven.linting.objectNameRegexesVariable` | `[]` | Additional Rust regexes accepted for variable names (same matching rules as above). |
+| `raven.linting.objectNameRegexesArgument` | `[]` | Additional Rust regexes accepted for function formal argument names (same matching rules as above). |
+| `raven.linting.objectNameSeverity` | `"information"` | Severity for the object-name lint (set to `"off"` to disable entirely; include `"any"` in a kind's style setting to disable just that kind) |
 | `raven.linting.infixSpacesSeverity` | `"information"` | Severity for the infix-spaces lint (whitespace around operators) |
 | `raven.linting.commentedCodeSeverity` | `"information"` | Severity for the commented-code lint (standalone comments whose body parses as R code) |
 | `raven.linting.quotesSeverity` | `"information"` | Severity for the quotes lint (string-literal delimiter style) |
@@ -241,7 +244,7 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 | `raven.linting.spacesInsideSeverity` | `"information"` | Severity for the spaces-inside lint (whitespace inside `(`, `[`, `[[`) |
 | `raven.linting.indentationSeverity` | `"information"` | Severity for the indentation lint (lines whose leading whitespace doesn't match the expected indent for their AST scope) |
 
-To disable an individual rule while leaving the rest enabled, set its severity to `"off"`. For the object-name lint, you can also set any of the three style settings to `"any"` to disable just that symbol kind while keeping the others active.
+To disable an individual rule while leaving the rest enabled, set its severity to `"off"`. For the object-name lint, you can also include `"any"` in any of the three style settings to disable just that symbol kind while keeping the others active. An explicit empty style array with regexes is regex-only mode; empty styles and empty regexes together disable that kind.
 
 ## Editor Integration Settings (VS Code only)
 

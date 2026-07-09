@@ -1678,67 +1678,145 @@
           "description": "Severity for the assignment-operator lint. Set to \"off\" to disable the rule."
         },
         "raven.linting.objectNameStyleFunction": {
-          "type": "string",
-          "enum": [
-            "snake_case",
-            "camelCase",
-            "dotted.case",
-            "UPPER_CASE",
-            "lowercase",
-            "any"
-          ],
-          "enumDescriptions": [
-            "Require lowercase words separated by underscores (e.g. my_function)",
-            "Require lowercase first letter, capitalized subsequent words (e.g. myFunction)",
-            "Require lowercase words separated by dots (e.g. my.function)",
-            "Require uppercase words separated by underscores (e.g. MY_CONSTANT)",
-            "Require a single all-lowercase word (e.g. mything)",
-            "Disable the function-name check (variable and argument checks may still run)"
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "snake_case",
+                "camelCase",
+                "dotted.case",
+                "UPPER_CASE",
+                "lowercase",
+                "any"
+              ],
+              "enumDescriptions": [
+                "Require lowercase words separated by underscores (e.g. my_function)",
+                "Require lowercase first letter, capitalized subsequent words (e.g. myFunction)",
+                "Require lowercase words separated by dots (e.g. my.function)",
+                "Require uppercase words separated by underscores (e.g. MY_CONSTANT)",
+                "Require a single all-lowercase word (e.g. mything)",
+                "Disable the function-name check (variable and argument checks may still run)"
+              ]
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "snake_case",
+                  "camelCase",
+                  "dotted.case",
+                  "UPPER_CASE",
+                  "lowercase",
+                  "any"
+                ]
+              }
+            }
           ],
           "default": "snake_case",
-          "description": "Required naming scheme for functions (assignments whose value is a function definition). Names that look like S3 method dispatch (e.g. print.MyClass) are exempted automatically."
+          "description": "Required naming scheme for functions (assignments whose value is a function definition). Accepts one named style or an array of named styles; a function name passes if it matches any listed style or any raven.linting.objectNameRegexesFunction regex. Include \"any\" to accept all function names. Set an explicit empty array to require regex matches only when raven.linting.objectNameRegexesFunction is non-empty; with both arrays empty, the function-name check is disabled. Names that look like S3 method dispatch (e.g. print.MyClass) are exempted automatically."
         },
         "raven.linting.objectNameStyleVariable": {
-          "type": "string",
-          "enum": [
-            "snake_case",
-            "camelCase",
-            "dotted.case",
-            "UPPER_CASE",
-            "lowercase",
-            "any"
-          ],
-          "enumDescriptions": [
-            "Require lowercase words separated by underscores (e.g. my_variable)",
-            "Require lowercase first letter, capitalized subsequent words (e.g. myVariable)",
-            "Require lowercase words separated by dots (e.g. my.variable)",
-            "Require uppercase words separated by underscores (e.g. MY_CONSTANT)",
-            "Require a single all-lowercase word (e.g. myvar)",
-            "Disable the variable-name check (function and argument checks may still run)"
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "snake_case",
+                "camelCase",
+                "dotted.case",
+                "UPPER_CASE",
+                "lowercase",
+                "any"
+              ],
+              "enumDescriptions": [
+                "Require lowercase words separated by underscores (e.g. my_variable)",
+                "Require lowercase first letter, capitalized subsequent words (e.g. myVariable)",
+                "Require lowercase words separated by dots (e.g. my.variable)",
+                "Require uppercase words separated by underscores (e.g. MY_CONSTANT)",
+                "Require a single all-lowercase word (e.g. myvar)",
+                "Disable the variable-name check (function and argument checks may still run)"
+              ]
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "snake_case",
+                  "camelCase",
+                  "dotted.case",
+                  "UPPER_CASE",
+                  "lowercase",
+                  "any"
+                ]
+              }
+            }
           ],
           "default": "snake_case",
-          "description": "Required naming scheme for variables (assignments whose value is not a function definition)."
+          "description": "Required naming scheme for variables (assignments whose value is not a function definition). Accepts one named style or an array of named styles; a variable name passes if it matches any listed style or any raven.linting.objectNameRegexesVariable regex. Include \"any\" to accept all variable names. Set an explicit empty array to require regex matches only when raven.linting.objectNameRegexesVariable is non-empty; with both arrays empty, the variable-name check is disabled."
         },
         "raven.linting.objectNameStyleArgument": {
-          "type": "string",
-          "enum": [
-            "snake_case",
-            "camelCase",
-            "dotted.case",
-            "UPPER_CASE",
-            "lowercase",
-            "any"
-          ],
-          "enumDescriptions": [
-            "Require lowercase words separated by underscores (e.g. my_arg)",
-            "Require lowercase first letter, capitalized subsequent words (e.g. myArg)",
-            "Require lowercase words separated by dots (e.g. my.arg)",
-            "Require uppercase words separated by underscores (e.g. MY_ARG)",
-            "Require a single all-lowercase word (e.g. arg)",
-            "Disable the argument-name check (function and variable checks may still run)"
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "snake_case",
+                "camelCase",
+                "dotted.case",
+                "UPPER_CASE",
+                "lowercase",
+                "any"
+              ],
+              "enumDescriptions": [
+                "Require lowercase words separated by underscores (e.g. my_arg)",
+                "Require lowercase first letter, capitalized subsequent words (e.g. myArg)",
+                "Require lowercase words separated by dots (e.g. my.arg)",
+                "Require uppercase words separated by underscores (e.g. MY_ARG)",
+                "Require a single all-lowercase word (e.g. arg)",
+                "Disable the argument-name check (function and variable checks may still run)"
+              ]
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "snake_case",
+                  "camelCase",
+                  "dotted.case",
+                  "UPPER_CASE",
+                  "lowercase",
+                  "any"
+                ]
+              }
+            }
           ],
           "default": "snake_case",
-          "description": "Required naming scheme for function formal arguments."
+          "description": "Required naming scheme for function formal arguments. Accepts one named style or an array of named styles; an argument name passes if it matches any listed style or any raven.linting.objectNameRegexesArgument regex. Include \"any\" to accept all argument names. Set an explicit empty array to require regex matches only when raven.linting.objectNameRegexesArgument is non-empty; with both arrays empty, the argument-name check is disabled."
+        },
+        "raven.linting.objectNameRegexesFunction": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional regexes accepted for function names. Each Rust regex is applied as a partial match against the full identifier, including any leading dot; anchor with ^...$ to require a whole-name match. Regexes are ORed with raven.linting.objectNameStyleFunction named styles. Rust regex syntax is used, so lookaround is not supported. Empty strings are ignored."
+        },
+        "raven.linting.objectNameRegexesVariable": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional regexes accepted for variable names. Each Rust regex is applied as a partial match against the full identifier, including any leading dot; anchor with ^...$ to require a whole-name match. Regexes are ORed with raven.linting.objectNameStyleVariable named styles. Rust regex syntax is used, so lookaround is not supported. Empty strings are ignored."
+        },
+        "raven.linting.objectNameRegexesArgument": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional regexes accepted for function formal argument names. Each Rust regex is applied as a partial match against the full identifier, including any leading dot; anchor with ^...$ to require a whole-name match. Regexes are ORed with raven.linting.objectNameStyleArgument named styles. Rust regex syntax is used, so lookaround is not supported. Empty strings are ignored."
         },
         "raven.chunks.highlight.enabled": {
           "type": "boolean",

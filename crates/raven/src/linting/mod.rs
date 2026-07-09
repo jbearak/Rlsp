@@ -11,8 +11,8 @@
 //!   the first tab on that line.
 //! * `trailing_blank_lines` — blank lines at the very end of the file.
 //! * `assignment_operator` — enforce `<-` (or `=`) for top-level assignment.
-//! * `object_name` — enforce a naming scheme (snake_case, camelCase, etc.)
-//!   on assignment targets and function arguments.
+//! * `object_name` — enforce accepted naming styles and regex patterns on
+//!   assignment targets and function arguments.
 //! * `infix_spaces` — flag missing spaces around binary infix operators and
 //!   stray spaces around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`).
 //! * `commented_code` — flag standalone comment blocks whose body parses as R
@@ -97,7 +97,8 @@ use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter::Node;
 
 pub use self::config::{
-    AssignmentOperatorStyle, LintConfig, LintEnabled, ObjectNameStyle, StringDelimiter,
+    AssignmentOperatorStyle, CompiledRegex, LintConfig, LintEnabled, ObjectNameStyle,
+    StringDelimiter,
 };
 
 /// Source identifier set on every diagnostic produced by this module.
@@ -167,9 +168,18 @@ fn run_lints_with(
             text,
             tree_root,
             rules::object_name::ObjectNameStyles {
-                function: config.object_name_style_function,
-                variable: config.object_name_style_variable,
-                argument: config.object_name_style_argument,
+                function: rules::object_name::KindPatterns {
+                    styles: &config.object_name_style_function,
+                    regexes: &config.object_name_regexes_function,
+                },
+                variable: rules::object_name::KindPatterns {
+                    styles: &config.object_name_style_variable,
+                    regexes: &config.object_name_regexes_variable,
+                },
+                argument: rules::object_name::KindPatterns {
+                    styles: &config.object_name_style_argument,
+                    regexes: &config.object_name_regexes_argument,
+                },
             },
             sev,
             &suppressions,
@@ -795,7 +805,7 @@ mod tests {
     #[test]
     fn object_name_camel_case_style_flags_snake_case() {
         let mut config = object_name_only_config();
-        config.object_name_style_variable = ObjectNameStyle::CamelCase;
+        config.object_name_style_variable = vec![ObjectNameStyle::CamelCase];
         let diags = lint("my_var <- 1\n", &config);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("camelCase"));
@@ -804,7 +814,7 @@ mod tests {
     #[test]
     fn object_name_any_disables_specific_kind() {
         let mut config = object_name_only_config();
-        config.object_name_style_function = ObjectNameStyle::Any;
+        config.object_name_style_function = vec![ObjectNameStyle::Any];
         // Variable is still checked, function is not.
         let diags = lint("BadName <- function() badVar <- 1\n", &config);
         // BadName (function): exempt; badVar (variable inside function): flagged.

@@ -1,4 +1,4 @@
-import * as vscode from 'vscode';
+import type * as Vscode from 'vscode';
 import {
     parseTree,
     visit,
@@ -79,6 +79,19 @@ const LINTING_SETTING_PREFIX = 'raven.linting.';
 
 const CLIENT_ONLY_LINTING_SETTINGS = new Set(['raven.linting.readHomeLintr']);
 
+const ARRAY_LINTING_SETTINGS = new Set([
+    'raven.linting.objectNameStyleFunction',
+    'raven.linting.objectNameStyleVariable',
+    'raven.linting.objectNameStyleArgument',
+    'raven.linting.objectNameRegexesFunction',
+    'raven.linting.objectNameRegexesVariable',
+    'raven.linting.objectNameRegexesArgument',
+]);
+
+function getVscode(): typeof Vscode {
+    return require('vscode') as typeof Vscode;
+}
+
 export function isProjectScopedLintingSettingKey(key: string): boolean {
     return key.startsWith(LINTING_SETTING_PREFIX) && !CLIENT_ONLY_LINTING_SETTINGS.has(key);
 }
@@ -115,11 +128,14 @@ const LINTING_GROUPS: LintingGroup[] = [
         ],
     },
     {
-        comment: 'lintr: object_name_linter(styles = ...)',
+        comment: 'lintr: object_name_linter(styles = ..., regexes = ...)',
         entries: [
-            { key: 'raven.linting.objectNameStyleFunction', value: 'snake_case' },
-            { key: 'raven.linting.objectNameStyleVariable', value: 'snake_case' },
-            { key: 'raven.linting.objectNameStyleArgument', value: 'snake_case' },
+            { key: 'raven.linting.objectNameStyleFunction', value: ['snake_case'] },
+            { key: 'raven.linting.objectNameStyleVariable', value: ['snake_case'] },
+            { key: 'raven.linting.objectNameStyleArgument', value: ['snake_case'] },
+            { key: 'raven.linting.objectNameRegexesFunction', value: [] },
+            { key: 'raven.linting.objectNameRegexesVariable', value: [] },
+            { key: 'raven.linting.objectNameRegexesArgument', value: [] },
             { key: 'raven.linting.objectNameSeverity', value: 'information' },
         ],
     },
@@ -246,13 +262,11 @@ export const LINTING_SETTINGS_TEMPLATE = `{\n${formatLintingBlock('  ')}\n}\n`;
  *   - `nonObjectRoot`: parsed fine but root isn't a JSON object (e.g. an
  *     array, scalar, or `null`). Can't safely merge into it.
  *   - `unsupportedValue`: a top-level project-scoped `raven.linting.*` key has
- *     a non-scalar value (object or array). All declared project-scoped
- *     `raven.linting.*` settings are scalars; a non-scalar value would span
- *     multiple lines and the per-key remover (which targets the single
- *     key/value range jsonc-parser identifies) can't migrate the surrounding
- *     context cleanly.
+ *     a structured value Raven settings don't use (an object, or an array
+ *     containing objects/arrays). Project-scoped `raven.linting.*` settings are
+ *     scalars or arrays of scalars; deeper structures are likely user mistakes.
  *   - `object`: parsed as an object. `userManagedKeys` lists the top-level
- *     project-scoped `raven.linting.*` keys whose values are scalars — these
+ *     project-scoped `raven.linting.*` keys whose values are supported — these
  *     are the keys the scaffold prompts about before overwriting.
  */
 type LintingClassification =
@@ -343,7 +357,7 @@ function* iterateLintingProperties(
 /**
  * Classify `text` for the scaffold's merge step. Wraps `jsonc-parser`'s
  * `parseTree` and adds the project-specific checks (non-object root,
- * non-scalar project-scoped `raven.linting.*` value).
+ * unsupported structured project-scoped `raven.linting.*` value).
  */
 function classifyExisting(text: string): LintingClassification {
     if (text.trim().length === 0) return { kind: 'empty' };
@@ -353,12 +367,21 @@ function classifyExisting(text: string): LintingClassification {
     if (!root || root.type !== 'object') return { kind: 'nonObjectRoot' };
     const userManagedKeys: string[] = [];
     for (const { key, valueNode } of iterateLintingProperties(root)) {
-        if (valueNode.type === 'object' || valueNode.type === 'array') {
+        if (!isSupportedLintingValueNode(key, valueNode)) {
             return { kind: 'unsupportedValue', key };
         }
         userManagedKeys.push(key);
     }
     return { kind: 'object', userManagedKeys };
+}
+
+function isSupportedLintingValueNode(key: string, valueNode: Node): boolean {
+    if (valueNode.type === 'object') return false;
+    if (valueNode.type !== 'array') return true;
+    if (!ARRAY_LINTING_SETTINGS.has(key)) return false;
+    return (valueNode.children ?? []).every(
+        (child) => child.type !== 'object' && child.type !== 'array',
+    );
 }
 
 /**
@@ -544,8 +567,8 @@ function hasCommaBetween(text: string, after: number, before: number): boolean {
  *
  *   1. Strip any prior sentinel-managed block we wrote.
  *   2. Classify the rest via `jsonc-parser` (parse errors / non-object
- *      root / non-scalar project-scoped `raven.linting.*` value all return
- *      `null`).
+ *      root / unsupported structured project-scoped `raven.linting.*` value
+ *      all return `null`).
  *   3. Remove every remaining top-level project-scoped `raven.linting.*` key
  *      via `removeTopLevelLintingKeys`'s `parseTree`-driven line splice —
  *      `jsonc-parser`'s `modify` + `applyEdits` looked tempting here
@@ -608,12 +631,90 @@ export function buildLintingSettingsContent(existing: string | undefined): strin
     return `${trimmedBefore}\n${formatLintingBlock('  ')}\n${after}`;
 }
 
+export function renderRavenToml(linting: Record<string, unknown> | undefined): string {
+    const lines: string[] = ['# Generated by Raven: Create raven.toml', ''];
+    lines.push('[linting]');
+    // Keep this list exhaustive across the `raven.linting.*` keys that have
+    // portable `raven.toml` equivalents, excluding client-only discovery or
+    // environment signals. Missing a severity here would create behavior drift
+    // for CLI / non-VS-Code consumers, where `raven.toml` is the shared source
+    // of truth. Any new lint rule should add both its value key (if it has one)
+    // and its severity key here at the time the rule is added.
+    const severities: [string, string][] = [
+        ['lineLengthSeverity', 'information'],
+        ['trailingWhitespaceSeverity', 'information'],
+        ['noTabSeverity', 'information'],
+        ['trailingBlankLinesSeverity', 'information'],
+        ['assignmentOperatorSeverity', 'information'],
+        ['objectNameSeverity', 'information'],
+        ['infixSpacesSeverity', 'information'],
+        ['commentedCodeSeverity', 'information'],
+        ['quotesSeverity', 'information'],
+        ['commasSeverity', 'information'],
+        ['tAndFSymbolSeverity', 'information'],
+        ['semicolonSeverity', 'information'],
+        ['equalsNaSeverity', 'information'],
+        ['objectLengthSeverity', 'information'],
+        ['vectorLogicSeverity', 'information'],
+        ['functionLeftParenthesesSeverity', 'information'],
+        ['spacesInsideSeverity', 'information'],
+        ['indentationSeverity', 'information'],
+    ];
+    const entries: [string, unknown, string][] = [
+        ['enabled', false, 'master switch'],
+        ['lineLength', 80, 'maximum line length (UTF-16 code units)'],
+        ['objectLength', 30, 'maximum identifier length'],
+        ['indentationUnit', 2, 'expected indent unit'],
+        ['assignmentOperator', '<-', '"<-" or "="'],
+        ['stringDelimiter', '"', '"\\"" or "\'"'],
+        [
+            'objectNameStyleFunction',
+            'snake_case',
+            'string or array: snake_case, camelCase, dotted.case, UPPER_CASE, lowercase, any',
+        ],
+        ['objectNameStyleVariable', 'snake_case', 'same string-or-array form'],
+        ['objectNameStyleArgument', 'snake_case', 'same string-or-array form'],
+        ['objectNameRegexesFunction', [], 'array of Rust regexes; partial match'],
+        ['objectNameRegexesVariable', [], 'array of Rust regexes; partial match'],
+        ['objectNameRegexesArgument', [], 'array of Rust regexes; partial match'],
+        ...severities.map<[string, unknown, string]>(([k, d]) => [
+            k,
+            d,
+            'error | warning | information | hint | off',
+        ]),
+    ];
+    const ravenDefaultEnabled = false; // mirror VS Code package.json default
+    for (const [key, dflt, comment] of entries) {
+        const fromUser = linting?.[key];
+        // `enabled` is special: the init-options factory always emits it
+        // (see initializationOptions.ts:367), so the "is this explicit?"
+        // heuristic above doesn't apply. Treat enabled as explicit only when
+        // it differs from the package.json default.
+        const isExplicit =
+            key === 'enabled'
+                ? fromUser !== undefined && fromUser !== ravenDefaultEnabled
+                : fromUser !== undefined;
+        const value = isExplicit ? fromUser : dflt;
+        const prefix = isExplicit ? '' : '# ';
+        lines.push(`${prefix}${key} = ${toTomlScalar(value)}    # ${comment}`);
+    }
+    lines.push('');
+    return lines.join('\n');
+}
+
+function toTomlScalar(v: unknown): string {
+    if (typeof v === 'string') return JSON.stringify(v);
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    return JSON.stringify(v);
+}
+
 /**
  * Return the first workspace folder, or surface a message and return
  * `undefined` if none is open. Without a workspace folder there is no
  * unambiguous place to write the scaffold file.
  */
-function getTargetWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
+function getTargetWorkspaceFolder(): Vscode.WorkspaceFolder | undefined {
+    const vscode = getVscode();
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) {
         void vscode.window.showErrorMessage(
@@ -629,10 +730,11 @@ function getTargetWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
  * before overwriting an existing file. Returns the target URI on success.
  */
 export async function createScaffoldFile(
-    folder: vscode.WorkspaceFolder,
+    folder: Vscode.WorkspaceFolder,
     fileName: string,
     content: string,
-): Promise<vscode.Uri | undefined> {
+): Promise<Vscode.Uri | undefined> {
+    const vscode = getVscode();
     const target = vscode.Uri.joinPath(folder.uri, fileName);
 
     let exists = false;
@@ -680,6 +782,7 @@ async function runScaffoldCommand(fileName: string, content: string): Promise<vo
     try {
         await createScaffoldFile(folder, fileName, content);
     } catch (err) {
+        const vscode = getVscode();
         void vscode.window.showErrorMessage(
             `Raven: failed to create ${fileName}: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -693,8 +796,9 @@ async function runScaffoldCommand(fileName: string, content: string): Promise<vo
  * before overwriting them; unrelated keys and comments are preserved.
  */
 async function runLintingSettingsScaffold(
-    folder: vscode.WorkspaceFolder,
-): Promise<vscode.Uri | undefined> {
+    folder: Vscode.WorkspaceFolder,
+): Promise<Vscode.Uri | undefined> {
+    const vscode = getVscode();
     const vscodeDir = vscode.Uri.joinPath(folder.uri, '.vscode');
     const settingsUri = vscode.Uri.joinPath(vscodeDir, 'settings.json');
     const displayName = '.vscode/settings.json';
@@ -727,7 +831,7 @@ async function runLintingSettingsScaffold(
         }
         if (classification.kind === 'unsupportedValue') {
             void vscode.window.showErrorMessage(
-                `Raven: ${displayName} sets ${classification.key} to a non-scalar value (object or array). All project-scoped raven.linting.* settings are scalars (boolean, number, or string); please correct the value before re-running this command.`,
+                `Raven: ${displayName} sets ${classification.key} to an unsupported structured value. Project-scoped raven.linting.* settings must be scalars or arrays of scalars; please correct the value before re-running this command.`,
             );
             return undefined;
         }
@@ -777,7 +881,8 @@ async function runLintingSettingsScaffold(
     return settingsUri;
 }
 
-export function registerScaffoldCommands(context: vscode.ExtensionContext): void {
+export function registerScaffoldCommands(context: Vscode.ExtensionContext): void {
+    const vscode = getVscode();
     context.subscriptions.push(
         vscode.commands.registerCommand('raven.scaffold.gitignore', () =>
             runScaffoldCommand('.gitignore', GITIGNORE_TEMPLATE),

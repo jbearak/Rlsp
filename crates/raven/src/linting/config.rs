@@ -4,6 +4,8 @@
 //! assignment, all rules disabled by default at the master switch so the
 //! feature stays opt-in until it stabilizes (per upstream issue #211).
 
+use std::fmt;
+
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
 /// Preferred assignment operator. Mirrors `lintr::assignment_linter`.
@@ -29,9 +31,9 @@ pub enum StringDelimiter {
 
 /// Naming scheme used by the `object_name` lint.
 ///
-/// Mirrors `lintr::object_name_linter` styles. `Any` disables the check for a
-/// given symbol kind without disabling the rule entirely — useful when only
-/// one of function/variable/argument naming should be enforced.
+/// Mirrors `lintr::object_name_linter` named styles. `Any` disables the check
+/// for a given symbol kind without disabling the rule entirely — useful when
+/// only one of function/variable/argument naming should be enforced.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ObjectNameStyle {
     /// `snake_case` — lowercase with underscores (e.g. `my_function`).
@@ -49,25 +51,93 @@ pub enum ObjectNameStyle {
     Any,
 }
 
+/// The `(config name, variant)` table backing [`ObjectNameStyle::from_config_name`]
+/// and [`ObjectNameStyle::config_names`], so the recognized set and the
+/// human-visible name list cannot drift apart.
+const OBJECT_NAME_STYLE_NAMES: &[(&str, ObjectNameStyle)] = &[
+    ("snake_case", ObjectNameStyle::SnakeCase),
+    ("camelCase", ObjectNameStyle::CamelCase),
+    ("dotted.case", ObjectNameStyle::DottedCase),
+    ("UPPER_CASE", ObjectNameStyle::UpperCase),
+    ("lowercase", ObjectNameStyle::Lowercase),
+    ("any", ObjectNameStyle::Any),
+];
+
 impl ObjectNameStyle {
     /// Parse an object-name style name (as written in `.lintr` or
     /// `raven.toml`) into the enum, returning `None` for any value Raven
-    /// cannot represent (e.g. a raw regex passed to `object_name_linter`).
+    /// does not recognize as a named style.
     ///
     /// This is the **single source of truth** for the set of style names
-    /// Raven understands. Both `backend::parse_object_name_style` (the
-    /// JSON/severity path) and the `.lintr` loader's `object_name_linter`
-    /// handling consult it, so the recognized set cannot drift between them.
+    /// Raven understands. The JSON/TOML parser skips unknown style elements;
+    /// the `.lintr` loader deliberately treats non-empty unknown `styles`
+    /// elements as regexes, which is a lenient extension over lintr's own
+    /// style-name validation.
     pub fn from_config_name(value: &str) -> Option<Self> {
-        match value {
-            "snake_case" => Some(Self::SnakeCase),
-            "camelCase" => Some(Self::CamelCase),
-            "dotted.case" => Some(Self::DottedCase),
-            "UPPER_CASE" => Some(Self::UpperCase),
-            "lowercase" => Some(Self::Lowercase),
-            "any" => Some(Self::Any),
-            _ => None,
+        OBJECT_NAME_STYLE_NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|&(_, style)| style)
+    }
+
+    /// All recognized config-name strings, in canonical order. Reused by the
+    /// `.lintr` loader's did-you-mean hint so its name list cannot drift from
+    /// [`Self::from_config_name`].
+    pub fn config_names() -> impl Iterator<Item = &'static str> {
+        OBJECT_NAME_STYLE_NAMES.iter().map(|&(name, _)| name)
+    }
+}
+
+/// Regex accepted by the `object_name` lint.
+///
+/// The compiled form is stored in [`LintConfig`] so lint passes can test names
+/// without recompiling user patterns on every debounced edit. `Debug` and
+/// equality intentionally use only the original source string because
+/// `regex::Regex` does not implement equality and the source is the stable
+/// configuration value users supplied.
+pub struct CompiledRegex {
+    source: String,
+    regex: regex::Regex,
+}
+
+impl CompiledRegex {
+    /// Compile a user-provided regex source string.
+    pub fn new(source: &str) -> Result<Self, regex::Error> {
+        Ok(Self {
+            source: source.to_string(),
+            regex: regex::Regex::new(source)?,
+        })
+    }
+
+    /// Original pattern text from the user's configuration.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Return whether this pattern matches `name`.
+    pub(crate) fn is_match(&self, name: &str) -> bool {
+        self.regex.is_match(name)
+    }
+}
+
+impl fmt::Debug for CompiledRegex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CompiledRegex").field(&self.source).finish()
+    }
+}
+
+impl Clone for CompiledRegex {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            regex: self.regex.clone(),
         }
+    }
+}
+
+impl PartialEq for CompiledRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
     }
 }
 
@@ -95,19 +165,36 @@ pub struct LintConfig {
     pub assignment_operator_style: AssignmentOperatorStyle,
     /// Preferred string-literal delimiter (used by the `quotes` rule).
     pub string_delimiter: StringDelimiter,
-    /// Required naming scheme for top-level functions (assignments whose RHS
-    /// is a `function() ...` expression). Set to [`ObjectNameStyle::Any`] to
-    /// disable just the function-name check while keeping variable and
-    /// argument checks active.
-    pub object_name_style_function: ObjectNameStyle,
-    /// Required naming scheme for variable assignments (assignments whose RHS
-    /// is not a function definition). Set to [`ObjectNameStyle::Any`] to
-    /// disable just the variable-name check.
-    pub object_name_style_variable: ObjectNameStyle,
-    /// Required naming scheme for function formal arguments. Applies to all
-    /// `function(...)` definitions, whether anonymous or assigned. Set to
-    /// [`ObjectNameStyle::Any`] to disable just the argument-name check.
-    pub object_name_style_argument: ObjectNameStyle,
+    /// Accepted named styles for top-level functions (assignments whose RHS is
+    /// a `function() ...` expression). The name passes if it matches any named
+    /// style here or any regex in [`Self::object_name_regexes_function`].
+    ///
+    /// `Any` anywhere in this list disables the whole function-name check and
+    /// short-circuits regex matching. When this list and the regex list are
+    /// both empty, the function-name check is disabled; an explicit empty
+    /// styles list with regexes is regex-only mode.
+    pub object_name_style_function: Vec<ObjectNameStyle>,
+    /// Accepted named styles for variable assignments (assignments whose RHS
+    /// is not a function definition). See
+    /// [`Self::object_name_style_function`] for `Any`, empty-list, and regex
+    /// combination semantics.
+    pub object_name_style_variable: Vec<ObjectNameStyle>,
+    /// Accepted named styles for function formal arguments. Applies to all
+    /// `function(...)` definitions, whether anonymous or assigned. See
+    /// [`Self::object_name_style_function`] for `Any`, empty-list, and regex
+    /// combination semantics.
+    pub object_name_style_argument: Vec<ObjectNameStyle>,
+    /// Accepted regexes for top-level function names. Regexes are partial
+    /// matches against the full identifier, including a leading dot when one
+    /// is present. They are ignored when the corresponding style list contains
+    /// [`ObjectNameStyle::Any`].
+    pub object_name_regexes_function: Vec<CompiledRegex>,
+    /// Accepted regexes for variable names. See
+    /// [`Self::object_name_regexes_function`] for matching semantics.
+    pub object_name_regexes_variable: Vec<CompiledRegex>,
+    /// Accepted regexes for argument names. See
+    /// [`Self::object_name_regexes_function`] for matching semantics.
+    pub object_name_regexes_argument: Vec<CompiledRegex>,
     /// Severity for the line-length rule. `None` disables the rule.
     pub line_length_severity: Option<DiagnosticSeverity>,
     /// Severity for the trailing-whitespace rule. `None` disables the rule.
@@ -119,7 +206,8 @@ pub struct LintConfig {
     /// Severity for the assignment-operator rule. `None` disables the rule.
     pub assignment_operator_severity: Option<DiagnosticSeverity>,
     /// Severity for the object-name rule. `None` disables the rule entirely;
-    /// per-kind `Any` styles disable individual checks while still running.
+    /// per-kind `Any` styles or empty styles+regexes disable individual
+    /// checks while still running other object-name checks.
     pub object_name_severity: Option<DiagnosticSeverity>,
     /// Severity for the infix-spaces rule. `None` disables the rule.
     pub infix_spaces_severity: Option<DiagnosticSeverity>,
@@ -158,9 +246,12 @@ impl Default for LintConfig {
             indentation_unit: 2,
             assignment_operator_style: AssignmentOperatorStyle::default(),
             string_delimiter: StringDelimiter::default(),
-            object_name_style_function: ObjectNameStyle::SnakeCase,
-            object_name_style_variable: ObjectNameStyle::SnakeCase,
-            object_name_style_argument: ObjectNameStyle::SnakeCase,
+            object_name_style_function: vec![ObjectNameStyle::SnakeCase],
+            object_name_style_variable: vec![ObjectNameStyle::SnakeCase],
+            object_name_style_argument: vec![ObjectNameStyle::SnakeCase],
+            object_name_regexes_function: Vec::new(),
+            object_name_regexes_variable: Vec::new(),
+            object_name_regexes_argument: Vec::new(),
             // Default severities mirror lintr's "style" tier and surface as
             // LSP Information, matching REditorSupport's languageserver.
             line_length_severity: Some(DiagnosticSeverity::INFORMATION),
@@ -235,5 +326,16 @@ mod tests {
         assert_eq!(ObjectNameStyle::from_config_name("kebab-case"), None);
         assert_eq!(ObjectNameStyle::from_config_name("^[a-z][a-z0-9_]*$"), None);
         assert_eq!(ObjectNameStyle::from_config_name(""), None);
+    }
+
+    #[test]
+    fn compiled_regex_debug_clone_and_eq_use_source() {
+        let regex = CompiledRegex::new("^x").unwrap();
+        let cloned = regex.clone();
+
+        assert_eq!(regex, cloned);
+        assert_eq!(regex.source(), "^x");
+        assert_eq!(format!("{regex:?}"), "CompiledRegex(\"^x\")");
+        assert!(regex.is_match("xyz"));
     }
 }
