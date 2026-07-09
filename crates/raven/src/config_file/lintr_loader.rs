@@ -429,17 +429,15 @@ fn apply_linter_call(
                     emit_styles = true;
                 }
             }
-            let mut explicit_empty_regexes = false;
             let regexes_arg = parse_object_name_regexes(args, unrecognized_constructs);
             let regexes_supplied = regexes_arg.is_some();
             if let Some(regexes) = regexes_arg {
-                explicit_empty_regexes = regexes.explicit_empty_vector;
                 // A supplied `regexes` value that yields no elements and is
                 // not an explicit empty vector is an unparseable expression
                 // (e.g. `regexes = paste0(...)`, already counted above).
                 // Treat it as rejected so an explicit empty `styles` retains
                 // the defaults instead of silently disabling the kind.
-                if regexes.values.is_empty() && !explicit_empty_regexes {
+                if regexes.values.is_empty() && !regexes.explicit_empty_vector {
                     rejected_regex = true;
                 }
                 for regex in regexes.values {
@@ -479,17 +477,18 @@ fn apply_linter_call(
             if styles_emitted {
                 emit_object_name_list(linting, "objectNameStyle", &accepted_styles);
             }
-            // Invariant: whenever the call determines the style policy, it
-            // determines the regex policy too — a lintr call replaces both
-            // formals (unsupplied `regexes` defaults to none). So any styles
-            // emission is paired with a regexes emission (accepted patterns,
-            // or `[]` to clear client-layer regexes during per-key config
-            // merging). This holds even when supplied regexes were all
-            // rejected: the project explicitly stated its pattern policy, so
-            // unrelated client regexes must not silently survive as an OR.
-            // An explicit empty `regexes = c()` emits `[]` for the same
-            // clearing reason even when no styles are emitted.
-            if styles_emitted || !accepted_regexes.is_empty() || explicit_empty_regexes {
+            // Invariant: a call that states any pattern policy states the
+            // regex policy — a lintr call replaces both formals (an
+            // unsupplied `regexes` defaults to none). So the regex arrays
+            // are emitted whenever styles were emitted OR a `regexes`
+            // argument was supplied (accepted patterns, or `[]` to clear
+            // client-layer regexes during per-key config merging). This
+            // holds even when every supplied regex was rejected or the
+            // argument was unparseable: the project explicitly stated its
+            // regex policy, so unrelated client regexes must not silently
+            // survive as an OR. (Accepted style-leniency regexes always set
+            // `emit_styles`, so they are covered by `styles_emitted`.)
+            if styles_emitted || regexes_supplied {
                 emit_object_name_list(linting, "objectNameRegexes", &accepted_regexes);
             }
         }
@@ -2025,7 +2024,10 @@ mod tests {
         );
         let linting = &out.settings["linting"];
         assert!(linting.get("objectNameStyleFunction").is_none());
-        assert!(linting.get("objectNameRegexesFunction").is_none());
+        // The call stated a regex policy (even though every pattern was
+        // rejected), so empty regex arrays are emitted to clear client-layer
+        // regexes; the default styles are retained.
+        assert_eq!(linting["objectNameRegexesFunction"], json!([]));
         assert!(has_unrecognized_warning(&out));
 
         let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
@@ -2191,11 +2193,14 @@ mod tests {
         assert!(has_unrecognized_warning(&out));
 
         let out = load_str("linters: linters_with_defaults(object_name_linter(regexes = \"\"))\n");
-        assert!(
-            out.settings["linting"]
-                .get("objectNameRegexesFunction")
-                .is_none()
+        // The degenerate regex is rejected, but the call still stated a
+        // regex policy: empty arrays clear client-layer regexes while the
+        // default styles are retained.
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!([])
         );
+        assert!(!mapped_object_name_style(&out));
         assert!(has_unrecognized_warning(&out));
     }
 
@@ -2297,10 +2302,12 @@ mod tests {
             "linters: linters_with_defaults(object_name_linter(styles = my_style_var, regexes = my_regex_var))\n",
         );
         assert!(!mapped_object_name_style(&out));
-        assert!(
-            out.settings["linting"]
-                .get("objectNameRegexesFunction")
-                .is_none()
+        // The unresolvable `regexes` variable still counts as a stated regex
+        // policy: empty arrays are emitted (with the batch warning) so
+        // client-layer regexes don't silently survive.
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!([])
         );
         assert!(has_unrecognized_warning(&out));
     }
@@ -2551,10 +2558,11 @@ mod tests {
             "linters: linters_with_defaults(object_name_linter(styles = c(), regexes = paste0(\"^\", \"x$\")))\n",
         );
         assert!(!mapped_object_name_style(&out));
-        assert!(
-            out.settings["linting"]
-                .get("objectNameRegexesFunction")
-                .is_none()
+        // The unparseable expression still counts as a stated regex policy:
+        // empty arrays are emitted so client-layer regexes are cleared.
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!([])
         );
         assert!(has_unrecognized_warning(&out));
 
@@ -2594,14 +2602,15 @@ mod tests {
 
     #[test]
     fn object_name_all_empty_tokens_vector_warns_not_explicit_empty() {
-        // `c(,)` is an error in real R, not an empty vector: warn and emit
-        // nothing rather than silently clearing/disabling.
+        // `c(,)` is an error in real R, not an empty vector: warn, but the
+        // call still stated a regex policy, so empty arrays are emitted and
+        // the default styles are retained.
         let out = load_str("linters: linters_with_defaults(object_name_linter(regexes = c(,)))\n");
-        assert!(
-            out.settings["linting"]
-                .get("objectNameRegexesFunction")
-                .is_none()
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!([])
         );
+        assert!(!mapped_object_name_style(&out));
         assert!(has_unrecognized_warning(&out));
 
         let out = load_str("linters: linters_with_defaults(object_name_linter(styles = c(,)))\n");
