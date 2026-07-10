@@ -4947,24 +4947,33 @@ async fn run_debounced_diagnostics(
     // same predicate as can_publish, and on success updates last_published
     // and consumes one force-republish marker — closing the race where
     // two same-version publishes could share one marker.
-    let can_publish = {
+    let (can_publish, open_at_publish) = {
         let state = state_arc.read().await;
         let doc = state.documents.get(&affected_uri);
         let current_version = doc.and_then(|d| d.version);
         let current_revision = doc.map(|d| d.revision);
 
-        if current_version != trigger_version || current_revision != trigger_revision {
-            false
-        } else if let Some(ver) = current_version {
-            state
-                .diagnostics_gate
-                .try_consume_publish(&affected_uri, ver)
-        } else {
-            true
-        }
+        let can_publish =
+            if current_version != trigger_version || current_revision != trigger_revision {
+                false
+            } else if let Some(ver) = current_version {
+                state
+                    .diagnostics_gate
+                    .try_consume_publish(&affected_uri, ver)
+            } else {
+                true
+            };
+        (can_publish, doc.is_some())
     };
 
     if can_publish {
+        log::trace!(
+            "diagnostics lifecycle: publish uri={} count={} path=debounced trigger_version={:?} open={}",
+            affected_uri,
+            diagnostics.len(),
+            trigger_version,
+            open_at_publish
+        );
         client
             .publish_diagnostics(affected_uri.clone(), diagnostics, None)
             .await;
@@ -6108,6 +6117,12 @@ impl LanguageServer for Backend {
         let language_id = params.text_document.language_id;
         let text = params.text_document.text;
         let version = params.text_document.version;
+        log::trace!(
+            "diagnostics lifecycle: didOpen uri={} version={} language_id={}",
+            uri,
+            version,
+            language_id
+        );
 
         // Captured inside the lock block when the opened doc is the
         // workspace-root `.Rprofile`; drives an off-lock prelude refresh after.
@@ -7720,6 +7735,7 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
+        log::trace!("diagnostics lifecycle: didClose uri={}", uri);
 
         let (package_close_uri, package_close_excluded): (Option<Url>, bool) = {
             let state = self.state.read().await;
@@ -10854,7 +10870,7 @@ pub(crate) async fn publish_diagnostics_inner(
 
     // Re-check freshness after async work, atomically commit gate state, before publishing.
     // try_consume_publish replaces the racy can_publish + record_publish pair.
-    {
+    let open_at_publish = {
         let state = state_arc.read().await;
         if let Some(ver) = version {
             let current_version = state.documents.get(uri).and_then(|d| d.version);
@@ -10876,8 +10892,16 @@ pub(crate) async fn publish_diagnostics_inner(
                 return;
             }
         }
-    }
+        state.documents.contains_key(uri)
+    };
 
+    log::trace!(
+        "diagnostics lifecycle: publish uri={} count={} path=direct version={:?} open={}",
+        uri,
+        diagnostics.len(),
+        version,
+        open_at_publish
+    );
     client
         .publish_diagnostics(uri.clone(), diagnostics, None)
         .await;
