@@ -31,9 +31,11 @@ pub enum StringDelimiter {
 
 /// Continuation style for an infix-operator chain whose operator ends its
 /// line, used by the indentation rule (`rules::indentation`). Raven-specific —
-/// no `lintr` or `.lintr` equivalent, so a discovered `.lintr` always yields
-/// the default. Assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`)
-/// are exempt: their continuations behave as [`Self::Indented`] in every mode.
+/// no `lintr` or `.lintr` equivalent: a `.lintr` can neither configure nor
+/// override it, so it stays [`Self::Indented`] unless another settings layer
+/// (`raven.toml` or the LSP client) supplies it. Assignment operators (`<-`,
+/// `<<-`, `=`, `:=`, `->`, `->>`) are exempt: their continuations behave as
+/// [`Self::Indented`] in every mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InfixContinuationStyle {
     /// Block-indent the continuation one unit beyond the enclosing
