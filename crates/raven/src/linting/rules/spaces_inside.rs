@@ -2,19 +2,17 @@
 //!
 //! Mirrors `lintr::spaces_inside_linter`. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`
 //! all have stray space against the brackets. The community convention is
-//! tight: `f(x)`, `df[1]`, `mat[[i]]`. Empty groupings — `f()`, `f( )`,
-//! `mat[]`, `mat[ ]` — are left alone: there's no token next to the bracket
-//! to crowd, and forcing `f()` vs `f( )` is too pedantic for a hint.
+//! tight: `f(x)`, `df[1]`, `mat[[i]]`. Truly empty groupings (`f()`, `mat[]`)
+//! pass, while whitespace-only single-line groupings (`f( )`, `mat[ ]`) are
+//! flagged on both sides, matching lintr.
 //! For `subset` and `subset2` only, a trailing comma that marks an omitted
 //! dimension keeps its before-close space (`x[i, ]`, `x[[i, ]]`) so this rule
 //! does not conflict with `commas_linter`; `call` nodes such as `f(a, )` are
 //! intentionally not carved out, keeping the exception scoped to R subsetting.
 //!
-//! Applies to `call`, `subset`, `subset2`, and `parenthesized_expression`
-//! nodes. The `open` and `close` field positions are used to anchor the
-//! check; the interior content is the gap between `open` and the first
-//! non-whitespace child, and between the last non-whitespace child and
-//! `close`.
+//! Applies to calls, subsetting, parenthesized expressions, formal parameter
+//! lists, and control-flow conditions. The `open` and `close` field positions
+//! anchor the check.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -55,6 +53,14 @@ fn visit(
         "parenthesized_expression" => {
             check_bracketed(node, false, text, severity, suppressions, out);
         }
+        "function_definition" => {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                check_bracketed(parameters, false, text, severity, suppressions, out);
+            }
+        }
+        "if_statement" | "while_statement" | "for_statement" => {
+            check_bracketed(node, false, text, severity, suppressions, out);
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -82,12 +88,38 @@ fn check_bracketed(
     if close_start <= open_end {
         return;
     }
-    // Empty grouping (only whitespace between brackets) — allowed.
+    // A truly empty grouping is allowed. A whitespace-only single-line
+    // grouping is not: lintr emits both after-open and before-close lints.
     let interior = match text.get(open_end..close_start) {
         Some(s) => s,
         None => return,
     };
+    if interior.is_empty() {
+        return;
+    }
     if interior.chars().all(|c| c.is_whitespace()) {
+        if !interior.contains('\n') {
+            let open_text = text.get(open.start_byte()..open.end_byte()).unwrap_or("");
+            emit_after_open(
+                open,
+                open_text,
+                interior.len(),
+                text,
+                severity,
+                suppressions,
+                out,
+            );
+            let close_text = text.get(close.start_byte()..close.end_byte()).unwrap_or("");
+            emit_before_close(
+                close,
+                close_text,
+                interior.len(),
+                text,
+                severity,
+                suppressions,
+                out,
+            );
+        }
         return;
     }
 

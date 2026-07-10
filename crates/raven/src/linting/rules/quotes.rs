@@ -1,9 +1,10 @@
 //! Enforce a single string-literal delimiter (`"` or `'`).
 //!
 //! Mirrors `lintr::quotes_linter` / `lintr::single_quotes_linter` — the
-//! configured delimiter is required for every regular string literal. Raw
-//! strings (`r"(...)"`, `R'(...)'`, `r"---(...)---"`) are skipped: their outer
-//! quote choice is constrained by the body, not by user style.
+//! configured delimiter is required for regular and raw string literals when
+//! switching delimiters would not require escaping a delimiter already in the
+//! body. This matches lintr's default: `'plain'` and `R'(plain)'` are flagged
+//! under double-quote policy, while `'"already quoted"'` is left alone.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -56,18 +57,19 @@ fn check_string(
         Some(s) => s,
         None => return,
     };
-    if is_raw_string(lit) {
+    let Some(got) = string_delimiter(lit) else {
         return;
-    }
-    let first = match lit.as_bytes().first() {
-        Some(b) => *b,
-        None => return,
     };
-    let (wanted, got) = match (delimiter, first) {
-        (StringDelimiter::Double, b'\'') => ('"', '\''),
-        (StringDelimiter::Single, b'"') => ('\'', '"'),
+    let (wanted, got) = match (delimiter, got) {
+        (StringDelimiter::Double, '\'') => ('"', '\''),
+        (StringDelimiter::Single, '"') => ('\'', '"'),
         _ => return,
     };
+    // lintr avoids a quote-style lint when changing the outer delimiter would
+    // force escaping an occurrence of the preferred delimiter in the body.
+    if lit.contains(wanted) {
+        return;
+    }
     let line_no = node.start_position().row as u32;
     if suppressions.is_suppressed_code(line_no, rule_ids::QUOTES) {
         return;
@@ -107,6 +109,18 @@ fn is_raw_string(lit: &str) -> bool {
     matches!(bytes[1], b'"' | b'\'')
 }
 
+fn string_delimiter(lit: &str) -> Option<char> {
+    let bytes = lit.as_bytes();
+    if is_raw_string(lit) {
+        return char::from_u32(*bytes.get(1)? as u32);
+    }
+    match bytes.first().copied()? {
+        b'\'' => Some('\''),
+        b'"' => Some('"'),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +135,12 @@ mod tests {
         // `r` alone (e.g. identifier) is not a raw string.
         assert!(!is_raw_string("r"));
         assert!(!is_raw_string(""));
+    }
+
+    #[test]
+    fn delimiter_is_found_for_regular_and_raw_strings() {
+        assert_eq!(string_delimiter("'hi'"), Some('\''));
+        assert_eq!(string_delimiter("r\"(hi)\""), Some('"'));
+        assert_eq!(string_delimiter("R'(hi)'"), Some('\''));
     }
 }

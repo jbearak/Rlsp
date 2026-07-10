@@ -650,6 +650,33 @@ cargo test -p raven --test package_corpus -- --ignored --nocapture
 - Bun tests (`tests/bun/`) cover TypeScript extension logic: plot viewer, data viewer, help viewer, send-to-R, config validation.
 - VS Code extension tests (`editors/vscode/src/test/`) use `@vscode/test-cli` with Mocha.
 
+### Native lint parity audit
+
+`crates/raven/src/linting/lintr_parity.rs` is the cross-rule compatibility
+gate for every lintr equivalent Raven advertises. The matrix was derived from
+r-lib/lintr's `tests/testthat/test-*_linter.R` files at commit
+`603ab79e6db25d380c5ee96f35ffd6ba16d223aa` (3.3.0.9000, 2026-07-07) and
+spot-checked against release 3.3.0.1. Its coverage assertion fails when a rule
+is added to Raven without a matrix entry. Keep focused tests beside each rule
+for exact messages/ranges, suppression behavior, parse-recovery cases, and
+Raven-specific extensions; the matrix owns default clean-vs-violation behavior
+across the full supported set.
+
+The parity boundary is lintr's default, statically decidable behavior. It does
+not imply support for every optional linter argument or analysis that depends
+on an installed package namespace. Raven's `.lintr` loader warns and ignores
+unsupported calls, and `docs/linting.md` documents the supported mapping.
+During an audit, use a one-linter R oracle to disambiguate behavior before
+translating a fixture, for example:
+
+```r
+lintr::lint(text = "x^2", linters = lintr::infix_spaces_linter())
+```
+
+Pin the upstream commit in the matrix comment when adopting changed upstream
+behavior, and describe any intentional divergence in both the rule's module
+docs and `docs/linting.md` rather than silently changing the fixture.
+
 ### AST inspection utility
 
 For quickly validating tree-sitter node kinds, use the `inspect_ast()` helper (see `crates/raven/src/handlers.rs`). Run with `--nocapture` to print.

@@ -34,7 +34,10 @@
 //!   `find_chain_start_from_ast`; the linter currently approximates this
 //!   with `node.start_position().column`, which agrees in the common cases
 //!   exercised by the test suite.) Nested binary operators may push the
-//!   expectation deeper (lintr's "tidy" default).
+//!   expectation deeper (lintr's "tidy" default). One common Boolean layout
+//!   is also accepted: when both sides of a binary operator are parenthesized
+//!   clauses inside an outer parenthesized expression, the clauses may align
+//!   with each other instead of indenting the RHS by another unit.
 //!
 //! Lines skipped without checks:
 //! * Suppressed lines (`# nolint`, `# nolint start/end`, `# raven: ignore`,
@@ -588,7 +591,16 @@ fn set_binary_operator(
     // wider assignment such as `result <- foo() +` — we accept both forms
     // so the linter doesn't disagree with the formatter's output.
     let chain_start_col = node.start_position().column as u32;
-    let expected = if chain_start_col > hanging {
+    let aligned_parenthesized_clauses = node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "parenthesized_expression")
+        && node
+            .child_by_field_name("lhs")
+            .is_some_and(|lhs| lhs.kind() == "parenthesized_expression")
+        && node
+            .child_by_field_name("rhs")
+            .is_some_and(|rhs| rhs.kind() == "parenthesized_expression");
+    let expected = if chain_start_col > hanging || aligned_parenthesized_clauses {
         Expected::with_alternative(hanging, chain_start_col)
     } else {
         Expected::single(hanging)
@@ -1117,12 +1129,10 @@ mod tests {
             "expected no diagnostic on closing paren line; got {:?}",
             diags
         );
-        let operand_diag = diagnostic_on_line(&diags, 2)
-            .expect("expected continuation diagnostic on second operand line");
         assert!(
-            operand_diag.message.contains("8"),
-            "expected message to mention 8 spaces; got {:?}",
-            operand_diag
+            diagnostic_on_line(&diags, 2).is_none(),
+            "aligned parenthesized clauses should be accepted; got {:?}",
+            diags
         );
     }
 
@@ -1136,12 +1146,10 @@ mod tests {
             "expected no diagnostic on closing paren line; got {:?}",
             diags
         );
-        let operand_diag = diagnostic_on_line(&diags, 4)
-            .expect("expected continuation diagnostic on second operand line");
         assert!(
-            operand_diag.message.contains("16"),
-            "expected message to mention 16 spaces; got {:?}",
-            operand_diag
+            diagnostic_on_line(&diags, 4).is_none(),
+            "aligned parenthesized clauses should be accepted; got {:?}",
+            diags
         );
     }
 

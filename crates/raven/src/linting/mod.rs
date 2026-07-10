@@ -6,38 +6,40 @@
 //!
 //! Scope:
 //! * `line_length` — flag lines wider than the configured maximum.
-//! * `trailing_whitespace` — trailing spaces/tabs at end of line.
-//! * `no_tab` — one diagnostic per line that contains a tab, anchored at
-//!   the first tab on that line.
+//! * `trailing_whitespace` — trailing spaces/tabs at end of line, except line
+//!   endings inside multi-line strings (matching lintr's default).
+//! * `no_tab` — one diagnostic per line that uses a tab for indentation.
 //! * `trailing_blank_lines` — blank lines at the very end of the file.
-//! * `assignment_operator` — enforce `<-` (or `=`) for top-level assignment.
+//! * `assignment_operator` — enforce `<-` (or `=`) for assignments; the
+//!   default also rejects `<<-`, `->`, `->>`, and `%<>%`.
 //! * `object_name` — enforce accepted naming styles and regex patterns on
 //!   assignment targets and function arguments.
-//! * `infix_spaces` — flag missing spaces around binary infix operators and
+//! * `infix_spaces` — flag missing spaces around low-precedence binary infix operators and
 //!   stray spaces around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`).
+//!   Exponentiation is excluded, matching lintr.
 //! * `commented_code` — flag standalone comment blocks whose body parses as R
-//!   and contains a call, assignment, operator, or function definition. This
+//!   and code-shaped end-of-line comments. This
 //!   rule re-parses each candidate comment body via the thread-local parser
 //!   pool. The same parser pool is also exercised by the suppression parser
 //!   on the rare commented-code line that carries an inline `# nolint` (see
 //!   below).
-//! * `quotes` — flag string literals not using the configured delimiter (`"`
-//!   or `'`). Raw strings are exempt.
+//! * `quotes` — flag regular or raw string literals not using the configured
+//!   delimiter (`"` or `'`) when switching would not introduce escaping.
 //! * `commas` — flag whitespace before `,` and missing whitespace after `,`
 //!   (newline after is fine).
-//! * `t_and_f_symbol` — flag bare `T` / `F` identifiers used as references to
-//!   `TRUE` / `FALSE`. Assignment targets, named arguments, formal
-//!   parameters, and `$` / `@` field names are exempt.
+//! * `t_and_f_symbol` — flag bare `T` / `F` identifiers used as references or
+//!   assignment targets. Formula terms, named argument/formal names, and
+//!   extraction/subsetting object names are exempt.
 //! * `semicolon` — flag `;` statement separators in source. Unlike the other
 //!   rules, this one byte-scans the raw source (skipping ranges that the AST
 //!   marks as `string` or `comment`) because tree-sitter-r does not emit `;`
 //!   as a node.
-//! * `equals_na` — flag `x == NA`, `x != NA`, and the typed `NA_*` variants
-//!   on either side.
+//! * `equals_na` — flag `x == NA`, `x != NA`, `x %in% NA`, and the typed
+//!   `NA_*` variants.
 //! * `object_length` — flag identifier names longer than the configured
 //!   maximum length.
-//! * `vector_logic` — flag `&` / `|` in `if` / `while` conditions; call
-//!   boundaries stop the scan so `if (any(x & y))` is left alone.
+//! * `vector_logic` — flag `&` / `|` in scalar conditions/assertions and
+//!   `&&` / `||` in `filter()` / `subset()` predicates.
 //! * `mixed_logical` — flag `|` / `||` whose immediate operand is a bare
 //!   `&` / `&&` (without parentheses), e.g. `a & b | c`. `&` binds tighter
 //!   than `|` in R, making the grouping easy to mis-read; adding parentheses
@@ -46,8 +48,8 @@
 //!   inside an `if` or `while` condition. R rejects `if (x = 1)` as a
 //!   syntax error at runtime but tree-sitter-r accepts it silently; use `==`
 //!   for equality tests and `<-` for assignment.
-//! * `function_left_parentheses` — flag whitespace between `function`
-//!   (or `\`) and `(`.
+//! * `function_left_parentheses` — flag whitespace before `(` in function
+//!   definitions and calls.
 //! * `spaces_inside` — flag whitespace immediately inside `(`, `[`, `[[`
 //!   and their closers. Empty groupings and multi-line wrapping are exempt.
 //! * `indentation` — flag lines whose leading whitespace doesn't match the
@@ -90,6 +92,8 @@ mod parse_gate;
 pub(crate) use nolint::{
     Suppressions as SuppressionsForParityTest, first_hash_body_for_parity_test,
 };
+#[cfg(test)]
+mod lintr_parity;
 pub mod rule_ids;
 mod rules;
 
@@ -145,10 +149,10 @@ fn run_lints_with(
         rules::line_length::collect(text, config.line_length, sev, &suppressions, &mut out);
     }
     if let Some(sev) = config.trailing_whitespace_severity {
-        rules::trailing_whitespace::collect(text, sev, &suppressions, &mut out);
+        rules::trailing_whitespace::collect(text, tree_root, sev, &suppressions, &mut out);
     }
     if let Some(sev) = config.no_tab_severity {
-        rules::no_tab::collect(text, sev, &suppressions, &mut out);
+        rules::no_tab::collect(text, tree_root, sev, &suppressions, &mut out);
     }
     if let Some(sev) = config.trailing_blank_lines_severity {
         rules::trailing_blank_lines::collect(text, sev, &suppressions, &mut out);
@@ -476,6 +480,29 @@ mod tests {
     }
 
     #[test]
+    fn trailing_whitespace_inside_multiline_strings_is_allowed() {
+        let mut config = solo_config();
+        config.trailing_whitespace_severity = Some(DiagnosticSeverity::HINT);
+        let diags = lint("x <- 'two spaces  \n  \n'  \n", &config);
+        assert_eq!(
+            diags.len(),
+            1,
+            "only whitespace after the string should lint: {diags:?}"
+        );
+        assert_eq!(diags[0].range.start.line, 2);
+    }
+
+    #[test]
+    fn no_tab_only_checks_indentation() {
+        let mut config = solo_config();
+        config.no_tab_severity = Some(DiagnosticSeverity::HINT);
+        let text = "#\ttab in comment\nx <- \"a\tb\"\n\tbad_indent <- 1\n";
+        let diags = lint(text, &config);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert_eq!(diags[0].range.start.line, 2);
+    }
+
+    #[test]
     fn no_tab_flags_first_run_per_line() {
         let config = LintConfig {
             line_length_severity: None,
@@ -617,6 +644,22 @@ mod tests {
         let diags = lint("x <- 1\n", &config);
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("Use `=`"));
+    }
+
+    #[test]
+    fn assignment_operator_default_flags_other_assignment_forms() {
+        let mut config = solo_config();
+        config.assignment_operator_severity = Some(DiagnosticSeverity::HINT);
+        for (source, operator) in [
+            ("value -> name\n", "->"),
+            ("value ->> name\n", "->>"),
+            ("name <<- value\n", "<<-"),
+            ("name %<>% transform()\n", "%<>%"),
+        ] {
+            let diags = lint(source, &config);
+            assert_eq!(diags.len(), 1, "{operator}: {diags:?}");
+            assert!(diags[0].message.contains(operator), "{operator}: {diags:?}");
+        }
     }
 
     #[test]
@@ -792,14 +835,40 @@ mod tests {
     }
 
     #[test]
-    fn object_name_skips_backtick_quoted_names() {
+    fn object_name_checks_base_of_compound_lhs() {
         let config = object_name_only_config();
-        let diags = lint("`with spaces` <- 1\n", &config);
-        assert!(
-            diags.is_empty(),
-            "backtick names should be skipped: {:?}",
-            diags
-        );
+        let diags = lint("badName$externalField <- 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert!(diags[0].message.contains("badName"));
+    }
+
+    #[test]
+    fn object_name_checks_backtick_quoted_names() {
+        let config = object_name_only_config();
+        let diags = lint("`badName` <- 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("Variable name `badName`"));
+    }
+
+    #[test]
+    fn object_name_regexes_receive_unquoted_backtick_name() {
+        let mut config = object_name_only_config();
+        config.object_name_style_variable.clear();
+        config.object_name_regexes_variable =
+            vec![CompiledRegex::new("^badName$").expect("valid regex")];
+        let regex_only = lint("`badName` <- 1\n", &config);
+        assert!(regex_only.is_empty(), "got {regex_only:?}");
+
+        config.object_name_style_variable = vec![ObjectNameStyle::SnakeCase];
+        let combined = lint("`badName` <- 1\n", &config);
+        assert!(combined.is_empty(), "got {combined:?}");
+    }
+
+    #[test]
+    fn object_name_exempts_backtick_operator_s3_methods() {
+        let config = object_name_only_config();
+        let diags = lint("`+.my_class` <- function(x) x\n", &config);
+        assert!(diags.is_empty(), "got {diags:?}");
     }
 
     #[test]
@@ -964,6 +1033,18 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn infix_spaces_ignores_exponentiation_spacing() {
+        let config = infix_spaces_only_config();
+        for text in ["x <- x^2\n", "x <- x ^ 2\n"] {
+            let diags = lint(text, &config);
+            assert!(
+                diags.is_empty(),
+                "exponentiation is outside lintr's infix-spacing policy: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
     fn infix_spaces_does_not_flag_alignment_whitespace() {
         // Multiple spaces around an operator are allowed — alignment is a
         // common pattern and collapsing it would be more annoying than helpful.
@@ -1077,33 +1158,19 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
-    fn infix_spaces_does_not_flag_named_argument() {
+    fn infix_spaces_checks_named_argument_equals() {
         let config = infix_spaces_only_config();
-        // tree-sitter-r parses `name=value` inside a call as an `argument`
-        // node, never a `binary_operator`. The infix-spaces rule must never
-        // touch named arguments — they are an unrelated syntactic form.
         let diags = lint("f(name=value)\n", &config);
-        assert!(
-            diags.is_empty(),
-            "named arguments must not be flagged: {:?}",
-            diags
-        );
+        assert_eq!(diags.len(), 2, "got {diags:?}");
+        assert!(lint("f(name = value)\n", &config).is_empty());
     }
 
     #[test]
-    fn infix_spaces_does_not_flag_function_default_argument() {
+    fn infix_spaces_checks_function_default_argument() {
         let config = infix_spaces_only_config();
-        // tree-sitter-r parses formal-parameter defaults like `x=1` as a
-        // `parameter` node (operator `=` is a direct child), not as a
-        // `binary_operator`. The rule must therefore leave both spaced and
-        // unspaced defaults alone.
         let no_space = lint("f <- function(x=1) x\n", &config);
         let with_space = lint("f <- function(x = 1) x\n", &config);
-        assert!(
-            no_space.is_empty(),
-            "function(x=1) defaults must not be flagged: {:?}",
-            no_space
-        );
+        assert_eq!(no_space.len(), 2, "got {no_space:?}");
         assert!(
             with_space.is_empty(),
             "function(x = 1) defaults must not be flagged: {:?}",
@@ -1341,16 +1408,11 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
-    fn commented_code_skips_end_of_line_comments() {
+    fn commented_code_checks_code_shaped_end_of_line_comments() {
         let config = commented_code_only_config();
-        // The `# x <- 2` is an end-of-line annotation, not standalone dead
-        // code. Don't flag.
         let diags = lint("x <- 1 # x <- 2\n", &config);
-        assert!(
-            diags.is_empty(),
-            "end-of-line comment must not be flagged: {:?}",
-            diags
-        );
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert!(lint("x <- 1 # explanatory prose\n", &config).is_empty());
     }
 
     #[test]
@@ -1594,15 +1656,17 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
-    fn quotes_skips_raw_strings() {
+    fn quotes_checks_raw_string_delimiter() {
         let config = quotes_only_config();
-        // Raw strings — both quote types are common because the body picks.
         let diags = lint("x <- r'(hi)'\n", &config);
-        assert!(
-            diags.is_empty(),
-            "raw strings must not be flagged: {:?}",
-            diags
-        );
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
+    #[test]
+    fn quotes_allows_alternate_delimiter_to_avoid_escaping() {
+        let config = quotes_only_config();
+        let diags = lint("x <- '\"already quoted\"'\n", &config);
+        assert!(diags.is_empty(), "got {diags:?}");
     }
 
     #[test]
@@ -1746,11 +1810,10 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
-    fn t_and_f_skips_assignment_target() {
+    fn t_and_f_flags_assignment_target() {
         let config = t_and_f_only_config();
-        // `T <- 0` — the LHS itself is the assignment target, not a read.
         let diags = lint("T <- 0\n", &config);
-        assert!(diags.is_empty(), "got {:?}", diags);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
     }
 
     #[test]
@@ -1770,11 +1833,10 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
-    fn t_and_f_flags_extract_lhs() {
+    fn t_and_f_skips_extract_and_subset_object_names() {
         let config = t_and_f_only_config();
-        // `T$foo` — `T` on the LHS *is* a read of the boolean.
-        let diags = lint("x <- T$foo\n", &config);
-        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        let diags = lint("T$field\nT[1]\nT[[1]]\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
     }
 
     #[test]
@@ -1784,6 +1846,21 @@ print.data.frame <- function(x, ...) NULL
         let diags = lint("f <- function(T) T + 1\n", &config);
         // Only the *use* of `T` in the body is a read.
         assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn t_and_f_formula_terms_are_not_boolean_usages() {
+        let config = t_and_f_only_config();
+        let diags = lint(
+            "y ~ T + F\ny ~ foo(T, F)\ny ~ foo(arg = T + 1)\ny ~ foo(arg = !F)\ny ~ foo(arg = c(T))\n",
+            &config,
+        );
+        assert!(diags.is_empty(), "got {diags:?}");
+
+        // lintr checks a bare alias used as the *direct* named-argument value,
+        // but nested expressions remain formula terms.
+        let value = lint("y ~ foo(arg = T)\n", &config);
+        assert_eq!(value.len(), 1, "got {value:?}");
     }
 
     // ------------------------------------------------------------------
@@ -1877,6 +1954,15 @@ print.data.frame <- function(x, ...) NULL
         assert!(diags.is_empty(), "got {:?}", diags);
     }
 
+    #[test]
+    fn equals_na_flags_membership_only_when_na_is_rhs() {
+        let config = equals_na_only_config();
+        let bad = lint("x %in% NA\n", &config);
+        assert_eq!(bad.len(), 1, "got {bad:?}");
+        let good = lint("NA %in% x\n", &config);
+        assert!(good.is_empty(), "got {good:?}");
+    }
+
     // ------------------------------------------------------------------
     // object_length
     // ------------------------------------------------------------------
@@ -1924,10 +2010,10 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
-    fn object_length_skips_backtick_names() {
+    fn object_length_checks_backtick_names_without_delimiters() {
         let config = object_length_only_config(5);
         let diags = lint("`a very long backtick name` <- 1\n", &config);
-        assert!(diags.is_empty(), "got {:?}", diags);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
     }
 
     #[test]
@@ -1936,6 +2022,13 @@ print.data.frame <- function(x, ...) NULL
         // `obj$longer_field <- 1` — assignment doesn't introduce a new symbol.
         let diags = lint("obj$longer_field <- 1\n", &config);
         assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn object_length_checks_compound_lhs_base_and_unicode() {
+        let config = object_length_only_config(5);
+        let diags = lint("résumé_name$field <- 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
     }
 
     // ------------------------------------------------------------------
@@ -1992,6 +2085,60 @@ print.data.frame <- function(x, ...) NULL
         let config = vector_logic_only_config();
         let diags = lint("if (a & b || c) 1\n", &config);
         assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn vector_logic_checks_testthat_assertions() {
+        let config = vector_logic_only_config();
+        for source in ["expect_true(x & y)\n", "testthat::expect_false(x | y)\n"] {
+            assert_eq!(lint(source, &config).len(), 1, "{source:?}");
+        }
+        assert!(lint("expect_true(any(x & y))\n", &config).is_empty());
+    }
+
+    #[test]
+    fn vector_logic_checks_filter_and_subset_predicates() {
+        let config = vector_logic_only_config();
+        for source in ["filter(data, x && y)\n", "subset(data, x || y)\n"] {
+            assert_eq!(lint(source, &config).len(), 1, "{source:?}");
+        }
+        assert!(lint("filter(data, x & y)\n", &config).is_empty());
+        assert!(lint("stats::filter(data, x && y)\n", &config).is_empty());
+    }
+
+    #[test]
+    fn vector_logic_skips_filter_and_subset_control_arguments() {
+        let config = vector_logic_only_config();
+        for source in [
+            "dplyr::filter(data, .preserve = a && b)\n",
+            "filter(data, .by = a && b)\n",
+            "subset(data, select = a && b)\n",
+            "subset(data, drop = a || b)\n",
+        ] {
+            assert!(lint(source, &config).is_empty(), "{source:?}");
+        }
+
+        let filter = lint("dplyr::filter(data, x && y, .preserve = a && b)\n", &config);
+        assert_eq!(filter.len(), 1, "got {filter:?}");
+
+        let subset = lint(
+            "subset(data, subset = x || y, select = a && b, drop = c || d)\n",
+            &config,
+        );
+        assert_eq!(subset.len(), 1, "got {subset:?}");
+    }
+
+    #[test]
+    fn vector_logic_checks_pipe_fed_predicates() {
+        let config = vector_logic_only_config();
+        for source in [
+            "data %>% filter(x && y)\n",
+            "data %<>% filter(x && y)\n",
+            "data |> filter(x || y)\n",
+            "data |> subset(x && y)\n",
+        ] {
+            assert_eq!(lint(source, &config).len(), 1, "{source:?}");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2264,6 +2411,23 @@ print.data.frame <- function(x, ...) NULL
         assert!(diags.is_empty(), "got {:?}", diags);
     }
 
+    #[test]
+    fn flp_checks_named_function_calls() {
+        let config = flp_only_config();
+        for source in ["mean (x)\n", "base::mean (x)\n", "object$method (x)\n"] {
+            let diags = lint(source, &config);
+            assert_eq!(diags.len(), 1, "{source:?}: {diags:?}");
+        }
+        assert!(lint("mean(x)\n", &config).is_empty());
+    }
+
+    #[test]
+    fn flp_checks_calls_split_across_lines() {
+        let config = flp_only_config();
+        let diags = lint("if (y > mean\n(x)) TRUE\n", &config);
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
     // ------------------------------------------------------------------
     // spaces_inside
     // ------------------------------------------------------------------
@@ -2290,13 +2454,12 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
-    fn spaces_inside_allows_empty_call() {
+    fn spaces_inside_distinguishes_empty_from_whitespace_only_call() {
         let config = spaces_inside_only_config();
-        // `f()` and `f( )` are both fine — empty groupings are exempt.
         let diags_empty = lint("f()\n", &config);
         let diags_padded = lint("f(  )\n", &config);
         assert!(diags_empty.is_empty(), "got {:?}", diags_empty);
-        assert!(diags_padded.is_empty(), "got {:?}", diags_padded);
+        assert_eq!(diags_padded.len(), 2, "got {:?}", diags_padded);
     }
 
     #[test]

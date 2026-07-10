@@ -52,11 +52,15 @@ fn check_comma(
     let end = node.end_byte();
 
     // Space before comma: look at the byte immediately before. Only flag a
-    // *single-line* space — a comma at column 0 (after a leading newline) is
-    // a multi-line continuation, not a style violation.
+    // *single-line* space — a comma that is the first non-whitespace token on
+    // its line is a multi-line continuation, not a style violation.
     if start > 0 {
         let prev = bytes[start - 1];
-        if prev == b' ' || prev == b'\t' {
+        let line_start = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
+        let comma_is_first_token = text[line_start..start]
+            .bytes()
+            .all(|byte| byte == b' ' || byte == b'\t');
+        if (prev == b' ' || prev == b'\t') && !comma_is_first_token {
             emit(
                 node,
                 text,

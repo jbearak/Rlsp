@@ -9,15 +9,18 @@
 //! reports them, except in positions where the identifier doesn't actually
 //! reference the value:
 //!
-//! * **Assignment targets** (`T <- 0`, `0 -> T`, top-level `T = 0`). The user
-//!   is explicitly overwriting the name — that *is* the bug, but reporting it
-//!   on the LHS would be redundant with the other reads we already flag, so
-//!   matching lintr we skip the LHS itself.
-//! * **`$` / `@` RHS** (`obj$T`, `obj@F`). These are field names, not symbol
-//!   lookups in the calling scope.
+//! * **Extraction/subsetting object names** (`T[1]`, `T[[1]]`, `T$field`,
+//!   `obj$T`). These spell objects or fields rather than the Boolean alias.
 //! * **Named arguments** (`foo(T = TRUE)`) and **formal parameters**
 //!   (`function(T) ...`). The `T` here is a name in the local syntax, not a
 //!   reference to the boolean.
+//! * **Formula symbols** (`y ~ T + F`) are model terms, not Boolean aliases.
+//!   A bare `T`/`F` used as the direct value of a named argument inside a
+//!   formula call (`y ~ foo(arg = T)`) remains checked, matching lintr. Nested
+//!   expressions such as `y ~ foo(arg = T + 1)` remain formula terms.
+//!
+//! Assignment targets are deliberately reported: rebinding `T` or `F` is
+//! exactly what makes later code relying on the aliases unsafe.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -59,18 +62,17 @@ fn visit(
 /// True if the identifier is in a non-reference position — somewhere a `T`/`F`
 /// spelling doesn't read the boolean value.
 fn is_excluded_position(ident: Node<'_>) -> bool {
+    if is_inside_formula(ident) && !is_named_argument_value(ident) {
+        return true;
+    }
     let Some(parent) = ident.parent() else {
         return false;
     };
     match parent.kind() {
-        "binary_operator" => is_assignment_target(parent, ident),
-        "extract_operator" => {
-            // `$` / `@`: skip the RHS field name; LHS is a real reference.
-            // Centralized in `crate::extract_op` so this predicate,
-            // go-to-def's qualified-member resolver, and
-            // `handlers.rs::is_structural_label` cannot drift on the AST shape.
-            crate::extract_op::extract_operator_rhs(ident).is_some()
-        }
+        "extract_operator" => true,
+        "subset" | "subset2" => parent
+            .child_by_field_name("function")
+            .is_some_and(|function| function.id() == ident.id()),
         "argument" => {
             // Named argument: `foo(T = TRUE)` — `T` here is a parameter label.
             parent
@@ -87,18 +89,28 @@ fn is_excluded_position(ident: Node<'_>) -> bool {
     }
 }
 
-/// True iff this identifier is the assignment-target side of `binop`.
-fn is_assignment_target(binop: Node<'_>, ident: Node<'_>) -> bool {
-    let Some(op) = binop.child_by_field_name("operator") else {
-        return false;
-    };
-    let op_text = op.kind();
-    let target = match op_text {
-        "<-" | "<<-" | "=" => binop.child_by_field_name("lhs"),
-        "->" | "->>" => binop.child_by_field_name("rhs"),
-        _ => return false,
-    };
-    target.is_some_and(|t| t.id() == ident.id())
+fn is_inside_formula(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "binary_operator"
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "~")
+        {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn is_named_argument_value(ident: Node<'_>) -> bool {
+    ident.parent().is_some_and(|parent| {
+        parent.kind() == "argument"
+            && parent.child_by_field_name("name").is_some()
+            && parent
+                .child_by_field_name("value")
+                .is_some_and(|value| value.id() == ident.id())
+    })
 }
 
 fn emit(

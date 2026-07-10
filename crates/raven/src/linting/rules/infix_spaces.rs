@@ -3,9 +3,12 @@
 //! Walks the tree-sitter AST and flags whitespace that disagrees with R's
 //! community style (matching `lintr::infix_spaces_linter` semantics):
 //!
-//! * Most binary operators (`+`, `-`, `*`, `/`, `^`, comparison, logical,
+//! * Most low-precedence binary operators (`+`, `-`, `*`, `/`, comparison, logical,
 //!   assignment, pipe, formula `~`, `%any%` user-defined operators) require at
 //!   least one space on each side.
+//! * Exponentiation (`^`) is not checked. Both `x^2` and `x ^ 2` are accepted,
+//!   matching `lintr::infix_spaces_linter`, which excludes high-precedence
+//!   operators from this rule.
 //! * Tight-binding operators (`:` sequence, `::`/`:::` namespace, `$`/`@`
 //!   member access) take no spaces on either side.
 //! * Unary `-`, `+`, `!`, and unary `?` take no space between the operator and
@@ -19,8 +22,8 @@
 //!
 //! Disambiguation between unary and binary forms is handled by tree-sitter:
 //! `-x` parses as a `unary_operator`, `a - b` as a `binary_operator`. Named
-//! arguments (`f(name = value)`) are parsed as `argument` nodes, never
-//! `binary_operator`, so they're naturally exempt.
+//! arguments and formal defaults are separate `argument` / `parameter` nodes;
+//! their `=` tokens are checked explicitly, as lintr does.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -53,12 +56,67 @@ fn visit(
             check_tight_binary(node, text, severity, suppressions, out)
         }
         "unary_operator" => check_unary(node, text, severity, suppressions, out),
+        "argument" | "parameter" => check_named_equals(node, text, severity, suppressions, out),
         _ => {}
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         visit(child, text, severity, suppressions, out);
+    }
+}
+
+fn check_named_equals(
+    node: Node<'_>,
+    text: &str,
+    severity: DiagnosticSeverity,
+    suppressions: &Suppressions,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(lhs) = node.child_by_field_name("name") else {
+        return;
+    };
+    let Some(rhs) = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("default"))
+    else {
+        return;
+    };
+    let mut operator = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "=" {
+            operator = Some(child);
+            break;
+        }
+    }
+    let Some(operator) = operator else {
+        return;
+    };
+
+    if gap_text(text, lhs.end_byte(), operator.start_byte()).is_some_and(str::is_empty) {
+        report(
+            text,
+            operator,
+            "missing space before `",
+            "=",
+            "`",
+            severity,
+            suppressions,
+            out,
+        );
+    }
+    if gap_text(text, operator.end_byte(), rhs.start_byte()).is_some_and(str::is_empty) {
+        report(
+            text,
+            operator,
+            "missing space after `",
+            "=",
+            "`",
+            severity,
+            suppressions,
+            out,
+        );
     }
 }
 
@@ -81,9 +139,10 @@ fn classify_binary(op_text: &str) -> BinaryStyle {
     }
 
     match op_text {
-        "+" | "-" | "*" | "/" | "^" | "<" | ">" | "<=" | ">=" | "==" | "!=" | "&" | "|" | "&&"
-        | "||" | "<-" | "<<-" | "->" | "->>" | "=" | "|>" | "~" => BinaryStyle::RequireSpaces,
+        "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" | "==" | "!=" | "&" | "|" | "&&" | "||"
+        | "<-" | "<<-" | "->" | "->>" | "=" | "|>" | "~" => BinaryStyle::RequireSpaces,
         ":" => BinaryStyle::NoSpaces,
+        "^" => BinaryStyle::Skip,
         _ => BinaryStyle::Skip,
     }
 }
