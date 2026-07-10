@@ -594,7 +594,7 @@ fn collect_changes(node: Node<'_>, lines: &[&str], out: &mut Vec<Change>) {
             }
         }
         "binary_operator" | "extract_operator" | "namespace_operator" => {
-            operator_change(node, out);
+            operator_change(node, lines, out);
         }
         "argument" | "parameter" => named_eq_change(node, out),
         _ => {}
@@ -660,7 +660,7 @@ fn bracket_change(
     // A trailing `#` comment after the opener doesn't count as content — the
     // aligned-style tolerance needs a real code argument to align to.
     let has_content_after_opener = first_non_whitespace_is_code(after_opener);
-    let opener_end_col = open.end_position().column as u32;
+    let opener_end_col = char_col(lines, open_row, open.end_position().column);
 
     // Tidyverse double-indent definitions: `function(` with no parameter on
     // the `function` line and the closer trailing the last parameter.
@@ -739,7 +739,7 @@ fn subtree_has_eol_opener(node: Node<'_>, lines: &[&str]) -> bool {
 
 /// Emit the continuation change for an infix operator whose right-hand side
 /// starts on a later line, subject to the `assignment_as_infix` suppression.
-fn operator_change(node: Node<'_>, out: &mut Vec<Change>) {
+fn operator_change(node: Node<'_>, lines: &[&str], out: &mut Vec<Change>) {
     let Some(op) = node.child_by_field_name("operator") else {
         return;
     };
@@ -772,7 +772,11 @@ fn operator_change(node: Node<'_>, out: &mut Vec<Change>) {
         // The on-type formatter may align continuations with the chain's
         // start column; accept that too so the linter never disagrees with
         // the formatter's output.
-        alt: AltRule::AlsoCol(node.start_position().column as u32),
+        alt: AltRule::AlsoCol(char_col(
+            lines,
+            node.start_position().row as u32,
+            node.start_position().column,
+        )),
     });
 }
 
@@ -924,6 +928,18 @@ fn collect_string_interior_lines(node: Node<'_>, set: &mut HashSet<u32>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_string_interior_lines(child, set);
+    }
+}
+
+/// Character column for a tree-sitter *byte* column on `line`. Expected
+/// indents are measured in characters (`leading_space_count`), so absolute
+/// columns fed into `Hanging`/`AlsoCol` must be converted — a non-ASCII
+/// character before the opener would otherwise shift the expectation.
+fn char_col(lines: &[&str], line: u32, byte_col: usize) -> u32 {
+    let text = line_text(lines, line);
+    match text.get(..byte_col) {
+        Some(prefix) => prefix.chars().count() as u32,
+        None => byte_col as u32,
     }
 }
 
@@ -1508,6 +1524,14 @@ mod tests {
             "expected diagnostic on the misindented `)`; got {:?}",
             diags
         );
+    }
+
+    #[test]
+    fn hanging_columns_measure_characters_not_bytes() {
+        // `é` is 2 bytes, 1 char. The hanging column after `foo(` is the
+        // 9th *character*; real lintr accepts this layout (verified).
+        let text = "\u{e9} <- foo(a,\n         b)\n";
+        assert!(lint(text, 2).is_empty(), "got {:?}", lint(text, 2));
     }
 
     #[test]

@@ -1123,18 +1123,25 @@ fn apply_object_name_regex_setting(
     styles: &mut Vec<crate::linting::ObjectNameStyle>,
     target: &mut Vec<crate::linting::CompiledRegex>,
 ) {
+    // The restored default must match `LintConfig::default()`'s per-kind
+    // styles — snake_case + symbols (lintr's default `styles`) — not just
+    // the enum default, or `%+%` definitions become false positives.
+    let default_styles = [
+        crate::linting::ObjectNameStyle::SnakeCase,
+        crate::linting::ObjectNameStyle::Symbols,
+    ];
     let Some((had_elements, regexes)) = parse_object_name_regexes(value, setting_name) else {
         if styles.is_empty() {
-            styles.push(crate::linting::ObjectNameStyle::default());
+            styles.extend(default_styles);
         }
         return;
     };
 
     if styles.is_empty() && had_elements && regexes.is_empty() {
         log::warn!(
-            "linting.{setting_name} contained no valid regexes for regex-only mode; retaining the default object-name style."
+            "linting.{setting_name} contained no valid regexes for regex-only mode; retaining the default object-name styles."
         );
-        styles.push(crate::linting::ObjectNameStyle::default());
+        styles.extend(default_styles);
     }
     *target = regexes;
 }
@@ -13354,18 +13361,12 @@ mod tests {
             });
             let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
 
-            assert_eq!(
-                cfg.object_name_style_function,
-                vec![ObjectNameStyle::SnakeCase]
-            );
-            assert_eq!(
-                cfg.object_name_style_variable,
-                vec![ObjectNameStyle::SnakeCase]
-            );
-            assert_eq!(
-                cfg.object_name_style_argument,
-                vec![ObjectNameStyle::SnakeCase]
-            );
+            // The restored fallback matches `LintConfig::default()`'s per-kind
+            // styles: snake_case + symbols (lintr's default `styles`).
+            let default_styles = vec![ObjectNameStyle::SnakeCase, ObjectNameStyle::Symbols];
+            assert_eq!(cfg.object_name_style_function, default_styles);
+            assert_eq!(cfg.object_name_style_variable, default_styles);
+            assert_eq!(cfg.object_name_style_argument, default_styles);
             assert!(cfg.object_name_regexes_function.is_empty());
             assert!(cfg.object_name_regexes_variable.is_empty());
             assert!(cfg.object_name_regexes_argument.is_empty());

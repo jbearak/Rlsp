@@ -123,6 +123,16 @@ fn scan_subset_args(
     if node.kind() == "function_definition" {
         return;
     }
+    // A nested `subset()`/`filter()` call is its own subsetting context and
+    // gets scanned when the outer AST walk reaches it — descending into it
+    // here would emit duplicate diagnostics (`filter(x, subset(y, a && b))`
+    // is one lint in lintr, not two).
+    if node.kind() == "call"
+        && matches!(callee_name(node, text), Some("filter") | Some("subset"))
+        && !is_stats_qualified(node, text)
+    {
+        return;
+    }
     if node.kind() == "binary_operator"
         && let Some(op) = node.child_by_field_name("operator")
     {

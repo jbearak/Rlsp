@@ -429,7 +429,15 @@ fn report_if_bad(
     }
     let line_text = text.lines().nth(line_no as usize).unwrap_or("");
     let start_col = byte_offset_to_utf16_column(line_text, name_node.start_position().column);
-    let end_col = byte_offset_to_utf16_column(line_text, name_node.end_position().column);
+    // The node can span lines (a multi-line string target), so the end
+    // column must be converted against the *end* line's text.
+    let end_line_no = name_node.end_position().row as u32;
+    let end_line_text = if end_line_no == line_no {
+        line_text
+    } else {
+        text.lines().nth(end_line_no as usize).unwrap_or("")
+    };
+    let end_col = byte_offset_to_utf16_column(end_line_text, name_node.end_position().column);
     let kind_label = match kind {
         SymbolKind::Function => "Function",
         SymbolKind::Variable => "Variable",

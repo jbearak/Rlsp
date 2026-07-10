@@ -36,10 +36,19 @@ pub(crate) fn collect(
         if width <= max_len {
             continue;
         }
+        // Width is measured in characters (lintr parity), but LSP ranges are
+        // UTF-16 code units — convert the char positions so the underline
+        // starts at the limit and never splits a surrogate pair.
+        let start_utf16: u32 = line
+            .chars()
+            .take(max_len as usize)
+            .map(|c| c.len_utf16() as u32)
+            .sum();
+        let end_utf16: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
         out.push(Diagnostic {
             range: Range {
-                start: Position::new(line_no, max_len),
-                end: Position::new(line_no, width),
+                start: Position::new(line_no, start_utf16),
+                end: Position::new(line_no, end_utf16),
             },
             severity: Some(severity),
             source: Some(LINT_SOURCE.to_string()),
@@ -53,6 +62,26 @@ pub(crate) fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_columns_are_utf16_even_though_width_is_characters() {
+        // Three emoji: width 3 chars (limit 2 → flagged), but the LSP range
+        // must be in UTF-16 units (2 per emoji) so it never splits a
+        // surrogate pair: start after 2 chars = 4 units, end = 6 units.
+        let suppressions = Suppressions::from_text("\u{1F600}\u{1F600}\u{1F600}\n");
+        let mut out = Vec::new();
+        collect(
+            "\u{1F600}\u{1F600}\u{1F600}\n",
+            2,
+            DiagnosticSeverity::INFORMATION,
+            &suppressions,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert_eq!(out[0].range.start.character, 4);
+        assert_eq!(out[0].range.end.character, 6);
+        assert!(out[0].message.contains("3 characters"));
+    }
 
     fn widths(text: &str, max_len: u32) -> Vec<u32> {
         let suppressions = Suppressions::from_text(text);

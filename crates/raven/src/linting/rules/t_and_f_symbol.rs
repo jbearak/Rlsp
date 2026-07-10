@@ -166,23 +166,16 @@ fn in_formula_context(ident: Node<'_>) -> bool {
                     return false;
                 }
             }
-            "binary_operator" => {
+            "binary_operator" | "unary_operator"
                 if parent
                     .child_by_field_name("operator")
-                    .is_some_and(|op| op.kind() == "~")
-                {
-                    return true;
-                }
+                    .is_some_and(|op| op.kind() == "~") =>
+            {
+                return true;
             }
-            "unary_operator" => {
-                if parent
-                    .child_by_field_name("operator")
-                    .is_some_and(|op| op.kind() == "~")
-                {
-                    return true;
-                }
-            }
-            "braced_expression" | "function_definition" => return false,
+            // Braces and lambdas inside a formula do not end the formula
+            // exemption — lintr leaves `y ~ {T}` and
+            // `y ~ sapply(x, function(i) T)` alone (verified empirically).
             _ => {}
         }
         child = parent;

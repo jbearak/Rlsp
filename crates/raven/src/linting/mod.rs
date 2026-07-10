@@ -6,38 +6,47 @@
 //!
 //! Scope:
 //! * `line_length` — flag lines wider than the configured maximum.
-//! * `trailing_whitespace` — trailing spaces/tabs at end of line.
-//! * `no_tab` — one diagnostic per line that contains a tab, anchored at
-//!   the first tab on that line.
+//! * `trailing_whitespace` — trailing spaces/tabs at end of line (inside
+//!   multi-line strings is exempt, like lintr's `allow_in_strings`).
+//! * `no_tab` — tabs used for indentation (tabs in comments, strings, or
+//!   between tokens are left alone, matching `lintr::whitespace_linter`).
 //! * `trailing_blank_lines` — blank lines at the very end of the file.
-//! * `assignment_operator` — enforce `<-` (or `=`) for top-level assignment.
+//! * `assignment_operator` — enforce the preferred assignment operator;
+//!   also flags `->`/`->>`/`%<>%`, with lintr's implicit-assignment
+//!   exclusion for call arguments and conditions.
 //! * `object_name` — enforce accepted naming styles and regex patterns on
 //!   assignment targets and function arguments.
-//! * `infix_spaces` — flag missing spaces around binary infix operators and
-//!   stray spaces around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`).
-//! * `commented_code` — flag standalone comment blocks whose body parses as R
+//! * `infix_spaces` — flag missing spaces around lintr's low-precedence
+//!   operator set (including named-argument and formal-default `=`);
+//!   high-precedence operators (`^`, `:`, `::`, `$`, `@`) and unary forms
+//!   are never linted.
+//! * `commented_code` — flag comment blocks and end-of-line comments whose body parses as R
 //!   and contains a call, assignment, operator, or function definition. This
 //!   rule re-parses each candidate comment body via the thread-local parser
 //!   pool. The same parser pool is also exercised by the suppression parser
 //!   on the rare commented-code line that carries an inline `# nolint` (see
 //!   below).
 //! * `quotes` — flag string literals not using the configured delimiter (`"`
-//!   or `'`). Raw strings are exempt.
+//!   or `'`), raw strings included; a literal containing the preferred
+//!   quote character is exempt (switching would force escaping).
 //! * `commas` — flag whitespace before `,` and missing whitespace after `,`
 //!   (newline after is fine).
-//! * `t_and_f_symbol` — flag bare `T` / `F` identifiers used as references to
-//!   `TRUE` / `FALSE`. Assignment targets, named arguments, formal
-//!   parameters, and `$` / `@` field names are exempt.
+//! * `t_and_f_symbol` — flag bare `T` / `F` identifiers used as references
+//!   to `TRUE` / `FALSE` (assignment targets get a dedicated variable-name
+//!   message). Named arguments, formal parameters, `$` / `@` field names,
+//!   formula terms, subscripted uses, and callees are exempt.
 //! * `semicolon` — flag `;` statement separators in source. Unlike the other
-//!   rules, this one byte-scans the raw source (skipping ranges that the AST
-//!   marks as `string` or `comment`) because tree-sitter-r does not emit `;`
-//!   as a node.
+//!   rules, this one byte-scans the raw source (skipping every leaf-token
+//!   range: strings, comments, backticked identifiers, `%…%` operators)
+//!   because tree-sitter-r does not emit `;` as a node.
 //! * `equals_na` — flag `x == NA`, `x != NA`, and the typed `NA_*` variants
-//!   on either side.
+//!   on either side, plus `x %in% NA`.
 //! * `object_length` — flag identifier names longer than the configured
 //!   maximum length.
-//! * `vector_logic` — flag `&` / `|` in `if` / `while` conditions; call
-//!   boundaries stop the scan so `if (any(x & y))` is left alone.
+//! * `vector_logic` — flag `&` / `|` in `if` / `while` (and
+//!   `expect_true`/`expect_false`) conditions, and the mirror `&&` / `||`
+//!   inside `subset()`/`filter()` arguments; call boundaries stop the
+//!   condition scan and bitwise-arithmetic operands are exempt.
 //! * `mixed_logical` — flag `|` / `||` whose immediate operand is a bare
 //!   `&` / `&&` (without parentheses), e.g. `a & b | c`. `&` binds tighter
 //!   than `|` in R, making the grouping easy to mis-read; adding parentheses
@@ -47,14 +56,15 @@
 //!   syntax error at runtime but tree-sitter-r accepts it silently; use `==`
 //!   for equality tests and `<-` for assignment.
 //! * `function_left_parentheses` — flag whitespace between `function`
-//!   (or `\`) and `(`.
+//!   (or `\`) and `(`, and between a call's function name and its `(`.
 //! * `spaces_inside` — flag whitespace immediately inside `(`, `[`, `[[`
-//!   and their closers. Empty groupings and multi-line wrapping are exempt.
+//!   and their closers (whitespace-only groupings flag both sides);
+//!   multi-line wrapping, comma/`= )` neighbors, and comment-after-opener
+//!   are exempt.
 //! * `indentation` — flag lines whose leading whitespace doesn't match the
-//!   expected indent for their AST scope. Implements lintr's tidy-default
-//!   hanging indent for braced blocks, multi-line argument lists, and
-//!   continuation lines; also accepts the on-type formatter's aligned style
-//!   for argument lists that carry content on the opener line.
+//!   expected indent, using lintr's accumulated indent-change model (tidy
+//!   style); Raven additionally accepts the aligned/block/chain-start forms
+//!   the on-type formatter produces.
 //!
 //! Implementation note: most rules walk the already-parsed tree directly.
 //! `commented_code` re-parses each candidate comment body; `semicolon`
@@ -1865,6 +1875,15 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn t_and_f_formula_exemption_spans_braces_and_lambdas() {
+        // lintr exempts T/F anywhere under `~`, including inside braces and
+        // lambda bodies (verified against 3.3.0.1).
+        let config = t_and_f_only_config();
+        assert!(lint("m <- y ~ {T}\n", &config).is_empty());
+        assert!(lint("m <- y ~ sapply(x, function(i) T)\n", &config).is_empty());
+    }
+
+    #[test]
     fn t_and_f_skips_formula_and_subscript_contexts() {
         let config = t_and_f_only_config();
         // Formula terms, subscripted uses, and callees are not boolean reads.
@@ -2688,6 +2707,15 @@ print.data.frame <- function(x, ...) NULL
         assert!(lint("stats::filter(x, y && z)\n", &config).is_empty());
         // The vectorised forms are fine there.
         assert!(lint("filter(x, a & b, c | d)\n", &config).is_empty());
+    }
+
+    #[test]
+    fn vector_logic_nested_subset_contexts_emit_one_diagnostic() {
+        // The inner `subset` is scanned when the walk reaches it; the outer
+        // `filter` scan must not also descend into it (lintr emits one lint).
+        let config = vector_logic_only_config();
+        let diags = lint("filter(x, subset(y, a && b))\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
     }
 
     #[test]
