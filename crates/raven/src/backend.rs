@@ -12368,8 +12368,24 @@ mod tests {
 
             // … and re-add it. The document version and revision are
             // unchanged; only the fresh epoch distinguishes the lifecycles.
-            // The re-add's own bounded republish stays parked in its 60s
-            // debounce so this test controls every observable publication.
+            // With the pause armed BEFORE the re-add and the debounce
+            // flipped to 0, the re-add's OWN bounded worker (the production
+            // path, spawned by the handler) runs to the pause point and
+            // parks there: scheduled (pending in the revalidation map, token
+            // live), diagnostics computed, commit not yet run. This is the
+            // worker a stale schedule() would cancel.
+            backend
+                .state
+                .write()
+                .await
+                .cross_file_config
+                .revalidation_debounce_ms = 0;
+            let pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_test_pause
+                .arm(uri.clone());
             backend
                 .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
                     active_uri: Some(uri.to_string()),
@@ -12378,10 +12394,20 @@ mod tests {
                     timestamp_ms: 3,
                 })
                 .await;
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_arrived())
+                .await
+                .expect("the re-add's own worker must reach the pre-commit pause point");
+            {
+                let state = backend.state.read().await;
+                let fresh_trigger = crate::state::DiagnosticsTrigger::capture(&state, &uri);
+                assert_ne!(fresh_trigger.epoch, stale_trigger.epoch);
+            }
 
             // The retired worker resumes: it must decline at schedule time
-            // (stale epoch), publish nothing, and leave the fresh gate
-            // untouched.
+            // (stale epoch), publish nothing — and, critically, NOT
+            // schedule(), which would cancel the parked fresh worker. The
+            // parked worker's own publish below is the detector: it survives
+            // only if the stale worker never superseded it.
             super::super::run_debounced_diagnostics(
                 backend.state.clone(),
                 backend.client.clone(),
@@ -12398,21 +12424,17 @@ mod tests {
                     .is_err(),
                 "the retired worker must not publish after tab re-addition"
             );
-            assert!(
-                backend
-                    .state
-                    .read()
-                    .await
-                    .diagnostics_gate
-                    .can_publish(&uri, 1),
-                "the retired worker must not consume the re-added lifecycle's gate"
-            );
 
-            // The re-added lifecycle must still publish at the same version.
-            backend.publish_diagnostics(&uri).await;
+            // The re-added lifecycle's own worker — not a manual republish —
+            // must still deliver diagnostics at the same version.
+            pause.release();
             let restored = tokio::time::timeout(Duration::from_secs(5), socket.next())
                 .await
-                .expect("the re-added tab must publish diagnostics")
+                .expect(
+                    "the re-added tab's own worker must publish: a stale worker \
+                     superseding (cancelling) it would leave the tab without \
+                     diagnostics until an unrelated trigger",
+                )
                 .expect("client socket must remain open");
             let restored: PublishDiagnosticsParams =
                 serde_json::from_value(restored.params().unwrap().clone()).unwrap();
@@ -12555,15 +12577,18 @@ mod tests {
             assert!(!restored.diagnostics.is_empty());
         }
 
-        /// The debounced pipeline's commit-side epoch check, exercised in
-        /// isolation. Every real retirement also cancels the worker's token,
-        /// so the epoch is unreachable on that path while cancellation works
-        /// — this test models the failure mode the epoch exists for (a
-        /// lifecycle transition whose cancel cannot reach the worker) by
-        /// retiring and re-minting the gate's epoch directly, without
-        /// touching the cancellation token. The parked worker must then be
-        /// stopped by the epoch comparison alone: no publish, and the fresh
-        /// lifecycle's gate left unconsumed.
+        /// The debounced pipeline stopped by the epoch dimension alone.
+        /// Every real retirement also cancels the worker's token, so this
+        /// test models the failure mode the epoch exists for (a lifecycle
+        /// transition whose cancel cannot reach the worker) by retiring and
+        /// re-minting the gate's epoch directly, without touching the
+        /// cancellation token: version, revision, and eligibility all still
+        /// match, so only the trigger's epoch comparison (`is_stale` at the
+        /// final commit) can stop the parked worker. The gate-INTERNAL epoch
+        /// guard inside `try_consume_publish` is structurally unreachable
+        /// with a stale epoch from this path — `is_stale` includes the epoch
+        /// and always runs first — and is pinned separately by the gate unit
+        /// tests (`test_try_consume_publish_rejects_stale_epoch_*`).
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn debounced_commit_declines_stale_epoch_without_cancellation() {
             let tmp = TempDir::new().unwrap();

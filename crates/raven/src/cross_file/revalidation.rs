@@ -1244,6 +1244,16 @@ mod tests {
         // surviving entry after all threads join proves the guard-lifetime
         // bug. `can_publish(uri, i32::MIN)` is true iff no entry survived
         // (consumers only commit versions >= 0).
+        //
+        // This is a STRESS test: the postcondition is sound (a failure is
+        // always a real bug; no false positives), but detection is
+        // opportunistic — nothing can force clear() into a hypothetical
+        // broken implementation's dropped-guard window from outside the
+        // gate's public API. The deterministic epoch-guard coverage lives in
+        // test_try_consume_publish_rejects_stale_epoch_and_preserves_marker
+        // and test_try_consume_publish_rejects_retired_epoch, which pin the
+        // check-under-guard behavior directly. What this test guarantees on
+        // every run is the no-deadlock property under real contention.
         use std::sync::{Arc, Barrier};
         use std::thread;
 
