@@ -226,7 +226,30 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
   - An unbraced `if`/`else`/`for`/`while`/`repeat`/function body, or a multi-line condition, indents one unit.
 - A run of consecutive lines mis-indented by the same amount produces a single diagnostic, matching `lintr`.
-- Under the default `infixContinuationStyle = "indented"`, Raven additionally accepts (never requires) three shapes `lintr` would flag: the aligned-argument style, the block form where `lintr` demands hanging or double indents, and — only when it sits *deeper* than the block indent — the operator chain-start column, which is where Raven's [smart indentation](indentation.md) (the AST-aware auto-indent applied when you press Enter) places such continuations (e.g. `bar()` aligned under `foo()` in `result <- foo() +`). The linter therefore never flags indentation that Raven's own auto-indent just produced, and flags a strict subset of what `lintr` flags on those shapes. This is not the `"either"` setting: `"either"` is what additionally accepts the chain-start column when it sits at or *left of* the block indent, as in the aligned example below, which the default flags.
+- Under the default `infixContinuationStyle = "indented"`, Raven additionally accepts (never requires) three shapes `lintr` would flag (all examples use a 2-space unit):
+  - The aligned-argument style. `lintr` wants `b` at the block indent (column 2); Raven also accepts it aligned after the opener:
+
+    ```r
+    foo(a,
+        b
+    )
+    ```
+
+  - The block form where `lintr` demands a hanging or double indent. Here the closer trails the last argument, so `lintr` insists on alignment after the opener (column 4); Raven also accepts the plain block indent:
+
+    ```r
+    foo(a,
+      b)
+    ```
+
+  - The operator chain-start column, but *only when it sits deeper than the block indent*. `lintr` wants `bar()` at column 2; Raven also accepts column 10, aligned under `foo()` — which is where Raven's [smart indentation](indentation.md) (the AST-aware auto-indent applied when you press Enter) puts it, so the linter never flags indentation its own auto-indent just produced:
+
+    ```r
+    result <- foo() +
+              bar()
+    ```
+
+  These tolerances only ever *add* accepted layouts, so under the default Raven flags a strict subset of what `lintr` flags on those shapes. The chain-start tolerance is not the `"either"` setting: in the `"aligned"` example further below, the chain-start column (4) sits *left of* the block indent (8), so the default flags it — accepting that shape too is exactly what `"either"` adds.
 - A standalone comment-only line aligned with the trailing-comment column of an adjacent line expecting the same indent is not flagged — a common intentional documentation style. Directive/suppression markers (`# nolint`, `# raven: ...`, `# @lsp-...`) never get this exemption and are never used as alignment anchors.
 - `raven.linting.infixContinuationStyle` (Raven-specific; no `lintr` or `.lintr` equivalent — a `.lintr` can neither configure nor override it, so it stays `"indented"` unless set via `raven.toml` or editor settings) controls how a line continuing an end-of-line infix operator (`|`, `&`, `+`, comparisons, pipes, `%…%`, `$`/`@` chains) is judged:
   - `"indented"` (default) — require the extra continuation level described above, matching `lintr`. With a 4-space unit this is clean, while the aligned form below is flagged:
