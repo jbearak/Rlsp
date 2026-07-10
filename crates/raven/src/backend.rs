@@ -4990,6 +4990,23 @@ async fn run_debounced_diagnostics(
         Arc::clone(&state.diagnostics_publish_lock)
     };
     let _publish_guard = publish_lock.lock().await;
+
+    // Re-check cancellation now that the publish lock is held. A `did_close`
+    // racing with this task cancels the token, clears the gate, and a
+    // same-version reopen resets `revision` to 0 — so the version/revision
+    // freshness check below cannot distinguish the reopened document from
+    // the one this task's snapshot was built against. Without this re-check,
+    // a cancelled task that wedged on the read lock across close+reopen
+    // would consume the cleared gate, publish stale diagnostics, and gate
+    // out the reopen's own fresh republish at the same version.
+    if cancel.is_cancelled() {
+        log::trace!(
+            "Diagnostics cancelled after acquiring publish lock for {}",
+            affected_uri
+        );
+        return;
+    }
+
     let (can_publish, open_at_publish) = {
         let state = state_arc.read().await;
         let doc = state.documents.get(&affected_uri);
