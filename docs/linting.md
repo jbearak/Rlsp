@@ -224,7 +224,15 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
   Unbraced `if`/`else`/`for`/`while`/`repeat`/function bodies and multi-line conditions indent one unit, and a run of consecutive lines mis-indented by the same amount produces a single diagnostic. Under the default `infixContinuationStyle = "indented"`, Raven additionally accepts (never requires) the aligned-argument style, the block form where `lintr` demands hanging or double indents, and the chain-start column the on-type formatter produces — so Raven never disagrees with its own formatter, and flags a strict subset of what `lintr` flags on those shapes. A standalone comment-only line aligned with the trailing-comment column of an adjacent line expecting the same indent is not flagged, matching a common intentional documentation style; directive/suppression marker comments such as `# nolint`, `# raven: ...`, and `# @lsp-...` are excluded from this exemption and are never used as anchors.
 - `raven.linting.infixContinuationStyle` (Raven-specific; no `lintr` or `.lintr` equivalent — a `.lintr` can neither configure nor override it, so it stays `"indented"` unless set via `raven.toml` or editor settings) controls how a line continuing an end-of-line infix operator (`|`, `&`, `+`, comparisons, pipes, `%…%`, `$`/`@` chains) is judged:
-  - `"indented"` (default) — require the extra continuation level described above, matching `lintr`.
+  - `"indented"` (default) — require the extra continuation level described above, matching `lintr`. With a 4-space unit this is clean, while the aligned form below is flagged:
+
+    ```r
+    changed <- !(
+        first_condition |
+            second_condition
+    )
+    ```
+
   - `"aligned"` — require the continuation exactly at the operator chain's starting column, so peer operands line up. With a 4-space unit this is clean, while the extra-indent form is flagged:
 
     ```r
