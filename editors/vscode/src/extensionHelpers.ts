@@ -31,7 +31,7 @@ export function isRDocument(
     return R_DOCUMENT_EXTENSIONS.has(path.extname(document.uri.fsPath).toLowerCase());
 }
 
-type TabLike = { input: unknown };
+type TabLike = { input: unknown; isActive?: boolean };
 type TabGroupLike = { tabs: readonly TabLike[] };
 type VisibleEditorLike = { document: { uri: vscode.Uri } };
 
@@ -44,7 +44,10 @@ type VisibleEditorLike = { document: { uri: vscode.Uri } };
  * acquire their own Problems entries. Diff tabs contribute their modified
  * resource, matching vscode-languageclient's pull-diagnostics policy. Other
  * visible editors are unioned in so peek editors count even though they have
- * no tab; a diff's visible original side is excluded from that union.
+ * no tab; a diff's visible original side is excluded from that union. Only
+ * the active tab of a group can render its editors, so only active diff tabs
+ * contribute to that exclusion — an inactive diff must not suppress the same
+ * resource shown independently (e.g. in a peek editor).
  *
  * The tab input inspection is structural so newer VS Code resource-backed tab
  * kinds automatically work when they expose `uri` or `modified`.
@@ -75,7 +78,8 @@ export function diagnosticResourceUris(
                 uris.add(resource.toString());
             }
             if (
-                input.modified instanceof vscode.Uri
+                tab.isActive
+                && input.modified instanceof vscode.Uri
                 && input.original instanceof vscode.Uri
             ) {
                 diffOriginalUris.add(input.original.toString());

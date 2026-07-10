@@ -20,7 +20,7 @@ suite('Extension Helpers', () => {
             [{
                 tabs: [
                     { input: { uri: tabbed } },
-                    { input: { original, modified } },
+                    { input: { original, modified }, isActive: true },
                     { input: { uri: tabbed } },
                     { input: { viewType: 'terminal' } },
                 ],
@@ -57,6 +57,34 @@ suite('Extension Helpers', () => {
         );
 
         assert.deepStrictEqual(result, [modified.toString(), original.toString()]);
+    });
+
+    test('diagnosticResourceUris keeps a peeked file matching an inactive diff original', () => {
+        // An inactive diff renders no editors, so its original side cannot be
+        // the source of a visible editor; a matching visible editor must come
+        // from an independent element (e.g. a peek editor) and must count.
+        const original = vscode.Uri.file('/tmp/inactive-diff-original.R');
+        const modified = vscode.Uri.file('/tmp/inactive-diff-modified.R');
+        const activeTab = vscode.Uri.file('/tmp/active-tab.R');
+
+        const result = diagnosticResourceUris(
+            [{
+                tabs: [
+                    { input: { original, modified }, isActive: false },
+                    { input: { uri: activeTab }, isActive: true },
+                ],
+            }],
+            [
+                { document: { uri: activeTab } },
+                { document: { uri: original } },
+            ],
+        );
+
+        assert.deepStrictEqual(result, [
+            modified.toString(),
+            activeTab.toString(),
+            original.toString(),
+        ]);
     });
 
     test('clearIneligibleDiagnostics prunes only retained background resources', () => {
