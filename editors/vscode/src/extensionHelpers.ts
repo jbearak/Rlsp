@@ -47,7 +47,10 @@ type VisibleEditorLike = { document: { uri: vscode.Uri } };
  * no tab; a diff's visible original side is excluded from that union. Only
  * the active tab of a group can render its editors, so only active diff tabs
  * contribute to that exclusion — an inactive diff must not suppress the same
- * resource shown independently (e.g. in a peek editor).
+ * resource shown independently (e.g. in a peek editor). The exclusion is
+ * counted per occurrence, not per URI: one active diff-original accounts for
+ * exactly one visible editor, so a second visible editor with the same URI
+ * (an independent peek) still counts.
  *
  * The tab input inspection is structural so newer VS Code resource-backed tab
  * kinds automatically work when they expose `uri` or `modified`.
@@ -57,7 +60,7 @@ export function diagnosticResourceUris(
     visibleEditors: readonly VisibleEditorLike[] = vscode.window.visibleTextEditors,
 ): string[] {
     const uris = new Set<string>();
-    const diffOriginalUris = new Set<string>();
+    const diffOriginalCounts = new Map<string, number>();
 
     for (const group of tabGroups) {
         for (const tab of group.tabs) {
@@ -82,16 +85,23 @@ export function diagnosticResourceUris(
                 && input.modified instanceof vscode.Uri
                 && input.original instanceof vscode.Uri
             ) {
-                diffOriginalUris.add(input.original.toString());
+                const key = input.original.toString();
+                diffOriginalCounts.set(key, (diffOriginalCounts.get(key) ?? 0) + 1);
             }
         }
     }
 
     for (const editor of visibleEditors) {
         const uri = editor.document.uri.toString();
-        if (!diffOriginalUris.has(uri)) {
-            uris.add(uri);
+        const remaining = diffOriginalCounts.get(uri) ?? 0;
+        if (remaining > 0) {
+            // This occurrence is attributable to the active diff's own
+            // rendered original side; consume it so an additional visible
+            // editor with the same URI still counts.
+            diffOriginalCounts.set(uri, remaining - 1);
+            continue;
         }
+        uris.add(uri);
     }
 
     return [...uris];

@@ -87,6 +87,33 @@ suite('Extension Helpers', () => {
         ]);
     });
 
+    test('diagnosticResourceUris keeps an independent peek of an active diff original', () => {
+        // One active diff renders exactly one visible editor for its original
+        // side; a second visible editor with the same URI must come from an
+        // independent element (e.g. a peek editor in another group) and must
+        // count.
+        const original = vscode.Uri.file('/tmp/active-diff-original.R');
+        const modified = vscode.Uri.file('/tmp/active-diff-modified.R');
+
+        const result = diagnosticResourceUris(
+            [{
+                tabs: [
+                    { input: { original, modified }, isActive: true },
+                ],
+            }],
+            [
+                { document: { uri: original } },
+                { document: { uri: modified } },
+                { document: { uri: original } },
+            ],
+        );
+
+        assert.deepStrictEqual(result, [
+            modified.toString(),
+            original.toString(),
+        ]);
+    });
+
     test('clearIneligibleDiagnostics prunes only retained background resources', () => {
         const eligible = vscode.Uri.file('/tmp/eligible.R');
         const hidden = vscode.Uri.file('/tmp/hidden.R');
