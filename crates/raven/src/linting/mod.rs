@@ -64,7 +64,9 @@
 //! * `indentation` — flag lines whose leading whitespace doesn't match the
 //!   expected indent, using lintr's accumulated indent-change model (tidy
 //!   style); Raven additionally accepts the aligned/block/chain-start forms
-//!   the on-type formatter produces.
+//!   the on-type formatter produces. `infix_continuation_style` makes the
+//!   treatment of end-of-line infix-operator continuations configurable
+//!   (block-indented, chain-start aligned, or either).
 //!
 //! Implementation note: most rules walk the already-parsed tree directly.
 //! `commented_code` re-parses each candidate comment body; `semicolon`
@@ -109,8 +111,8 @@ use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter::Node;
 
 pub use self::config::{
-    AssignmentOperatorStyle, CompiledRegex, LintConfig, LintEnabled, ObjectNameStyle,
-    StringDelimiter,
+    AssignmentOperatorStyle, CompiledRegex, InfixContinuationStyle, LintConfig, LintEnabled,
+    ObjectNameStyle, StringDelimiter,
 };
 
 /// Source identifier set on every diagnostic produced by this module.
@@ -250,6 +252,7 @@ fn run_lints_with(
             text,
             tree_root,
             config.indentation_unit,
+            config.infix_continuation_style,
             sev,
             &suppressions,
             &mut out,
@@ -2611,6 +2614,40 @@ print.data.frame <- function(x, ...) NULL
         let diags = lint("f <- function() {\n  x <- 1\n}\n", &config);
         assert_eq!(diags.len(), 1, "got {:?}", diags);
         assert!(diags[0].message.contains("should be 4 spaces"));
+    }
+
+    #[test]
+    fn indentation_dispatcher_honors_infix_continuation_style() {
+        // End-to-end through LintConfig: aligned peer operands pass only
+        // when the configured style accepts them.
+        let text = "changed <- !(\n    a |\n    b\n)\n";
+        let base = LintConfig {
+            indentation_unit: 4,
+            ..indentation_only_config()
+        };
+
+        let indented = base.clone();
+        assert!(!lint(text, &indented).is_empty(), "default flags alignment");
+
+        let either = LintConfig {
+            infix_continuation_style: InfixContinuationStyle::Either,
+            ..base.clone()
+        };
+        assert!(
+            lint(text, &either).is_empty(),
+            "got {:?}",
+            lint(text, &either)
+        );
+
+        let aligned = LintConfig {
+            infix_continuation_style: InfixContinuationStyle::Aligned,
+            ..base
+        };
+        assert!(
+            lint(text, &aligned).is_empty(),
+            "got {:?}",
+            lint(text, &aligned)
+        );
     }
 
     fn trailing_whitespace_only_config() -> LintConfig {

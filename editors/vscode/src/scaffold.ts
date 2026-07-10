@@ -183,6 +183,10 @@ const LINTING_GROUPS: LintingGroup[] = [
             { key: 'raven.linting.indentationSeverity', value: 'information' },
         ],
     },
+    {
+        comment: 'Raven-only, no lintr equivalent: infix continuation style',
+        entries: [{ key: 'raven.linting.infixContinuationStyle', value: 'indented' }],
+    },
 ];
 
 /**
@@ -200,7 +204,8 @@ const ARRAY_LINTING_SETTINGS = new Set(
 const LINTING_BLOCK_HEADER =
     'Raven native style/lint diagnostics. Severities accept: "error",\n' +
     '"warning", "information", "hint", or "off". Each group below names\n' +
-    'the lintr linter it mirrors. See docs/linting.md for details.';
+    'the lintr linter it mirrors (or is marked Raven-only). See\n' +
+    'docs/linting.md for details.';
 
 /**
  * Sentinel markers that delimit the block this scaffold manages. A
@@ -683,6 +688,7 @@ export function renderRavenToml(linting: Record<string, unknown> | undefined): s
         ['lineLength', 80, 'maximum line length (characters)'],
         ['objectLength', 30, 'maximum identifier length'],
         ['indentationUnit', 2, 'expected indent unit'],
+        ['infixContinuationStyle', 'indented', '"indented" | "aligned" | "either" (Raven-only)'],
         ['assignmentOperator', '<-', '"<-" or "="'],
         ['stringDelimiter', '"', '"\\"" or "\'"'],
         [

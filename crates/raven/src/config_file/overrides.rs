@@ -192,6 +192,27 @@ mod tests {
     }
 
     #[test]
+    fn matching_glob_switches_infix_continuation_style() {
+        let base = LintConfig::default();
+        assert_eq!(
+            base.infix_continuation_style,
+            crate::linting::InfixContinuationStyle::Indented
+        );
+        let section = json!({ "enabled": true });
+        let root = PathBuf::from("/proj");
+        let overrides = make_overrides(
+            &root,
+            vec![("R/**/*.R", json!({ "infixContinuationStyle": "either" }))],
+        );
+        let uri = Url::parse("file:///proj/R/foo.R").unwrap();
+        let out = resolve_lint_for_document(&base, &section, &overrides, &uri);
+        assert_eq!(
+            out.infix_continuation_style,
+            crate::linting::InfixContinuationStyle::Either
+        );
+    }
+
+    #[test]
     fn non_matching_glob_returns_base() {
         let mut base = LintConfig::default();
         base.line_length = 80;
