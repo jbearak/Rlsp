@@ -273,8 +273,32 @@ Cross-file revalidation is debounced and cancelable.
 A diagnostics gate enforces monotonic publishing:
 - never publish diagnostics for an older document version
 - allow “force republish” at the same version for dependency-triggered revalidation
+- never let retired work publish into a reused URI lifecycle
+
+The third rule is the per-URI **lifecycle epoch** (#603). Version and revision
+cannot identify a lifecycle — a client may reopen at the same version, and
+`Document::revision` restarts at 0 on every open, so a worker retired by a
+close, tab removal, or shutdown could otherwise pass every freshness check
+against the URI's next lifecycle. The gate mints a globally unique epoch when
+a URI becomes diagnostic-eligible (`did_open`, or a tab re-addition after the
+`editor_diagnostic_uris` replacement), retires it on `did_close`/tab
+removal/shutdown, and refuses any commit whose captured epoch is no longer
+current — without consuming a force marker. `begin_epoch` also resets the
+URI's version/force state so a fresh lifecycle can neither inherit a stale
+same-version high-water mark nor orphaned force markers. Both publish
+pipelines carry the epoch inside `DiagnosticsTrigger` (`state.rs`), captured
+when the work is spawned; the debounced path additionally declines to
+`schedule()` on a stale or missing epoch so retired workers cannot supersede
+the live lifecycle's pending worker. Lifecycle transitions go through
+`WorldState::begin_diagnostic_lifecycle` / `retire_diagnostic_lifecycle` so
+the cancel + gate-clear pairing cannot drift between call sites.
 
 See `crates/raven/src/cross_file/revalidation.rs`.
+
+For deterministic race tests, `WorldState::diagnostics_test_pause`
+(test/test-support builds only) can park a diagnostics worker in the
+post-compute, pre-commit window; see the `#603` regression tests in
+`backend.rs`'s `diagnostic_lifecycle` module.
 
 The VS Code extension sends an optional `diagnosticUris` set in both initialization options and `raven/activeDocumentsChanged`. Initialization seeds the policy before vscode-languageclient synchronizes already-open documents; the notification keeps it current. The set is the union of resource-backed tabs (the modified side for a diff tab) and visible text editors (to include peek editors). This is intentionally distinct from `workspace.textDocuments`: review/comment extensions can call `workspace.openTextDocument()` for background files, which sends LSP `didOpen` even though no editor tab exists. Raven keeps those documents synchronized for cross-file analysis but gates their own push diagnostics. An absent set preserves standard `didOpen` behavior for older and non-VS Code clients.
 

@@ -70,6 +70,16 @@ impl CrossFileRevalidationState {
         }
     }
 
+    /// Test-only: whether a pending revalidation entry currently exists for
+    /// `uri`. Race tests use this to wait until a spawned worker has
+    /// `schedule()`d (and parked in its debounce) before superseding it —
+    /// spawning a competing worker earlier would race the first worker's
+    /// own `schedule()`, which cancels whichever token is pending.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_pending_for_test(&self, uri: &Url) -> bool {
+        self.pending.read().unwrap().contains_key(uri)
+    }
+
     /// Cancel pending revalidation for a URI
     pub fn cancel(&self, uri: &Url) {
         let mut pending = self.pending.write().unwrap();
@@ -98,6 +108,23 @@ impl CrossFileRevalidationState {
 /// more" is enough.
 const MAX_FORCE_REPUBLISH: u32 = 64;
 
+/// Globally unique identifier for one diagnostic-eligible lifecycle of a URI
+/// (issue #603): from the moment the URI becomes eligible to own push
+/// diagnostics (a fresh `didOpen`, or a tab re-addition via
+/// `raven/activeDocumentsChanged` while the document stays LSP-open) until it
+/// stops being eligible (`didClose`, tab removal, or server shutdown).
+///
+/// Wrapping the bare `u64` prevents an epoch from being compared against a
+/// version or revision at a call site. Neither of those fields can identify a
+/// lifecycle: the client may reopen at the same version, and
+/// `Document::revision` restarts at 0 on every open. Epochs are minted from a
+/// single process-wide counter that is never reset, so a captured epoch can
+/// never coincidentally match a later lifecycle of the same URI. (`u64`
+/// exhaustion is unreachable in practice; the counter wraps rather than
+/// panics, matching the `next_generation` idiom above.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiagnosticsEpoch(u64);
+
 /// Diagnostics publish gating to enforce monotonic publishing
 ///
 /// `force_republish` is a counter, not a set: each `mark_force_republish` adds
@@ -107,17 +134,70 @@ const MAX_FORCE_REPUBLISH: u32 = 64;
 /// multiple concurrent forced-republish requests, leaving later publishes
 /// blocked at the same version. Each marker reliably gets one matching publish
 /// through the gate.
+///
+/// `current_epoch` tracks each URI's live diagnostic lifecycle (issue #603).
+/// An entry exists iff the URI is currently diagnostic-eligible;
+/// [`Self::begin_epoch`] installs a fresh one and [`Self::clear`] retires it.
+/// [`Self::try_consume_publish`] refuses to commit a captured epoch that is no
+/// longer current, so work retired by a close or tab removal cannot publish
+/// after the URI's lifecycle is reused — even when version and revision
+/// coincide with the retired lifecycle's.
+///
+/// Lock discipline: every method that touches more than one map acquires the
+/// guards in the fixed order `current_epoch` → `last_published_version` →
+/// `force_republish` and holds all of them until its mutations are complete
+/// (nested lifetimes, not just acquisition order). Dropping the
+/// `current_epoch` guard before the version/force commit would let a
+/// concurrent retire + re-begin interleave between the epoch check and the
+/// commit, reintroducing the stale-publish race the epoch exists to close.
 #[derive(Debug, Default)]
 pub struct CrossFileDiagnosticsGate {
     /// Last published document version per URI
     last_published_version: RwLock<HashMap<Url, i32>>,
     /// Outstanding forced-republish markers per URI (dependency-triggered, version unchanged)
     force_republish: RwLock<HashMap<Url, u32>>,
+    /// Each URI's current diagnostic lifecycle epoch. Present iff the URI is
+    /// currently diagnostic-eligible and has not been retired via `clear`.
+    current_epoch: RwLock<HashMap<Url, DiagnosticsEpoch>>,
+    /// Process-wide monotonic source for `begin_epoch`. Never reset, so
+    /// retired epochs are never reused.
+    next_epoch: AtomicU64,
 }
 
 impl CrossFileDiagnosticsGate {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Begin a fresh diagnostic lifecycle for `uri`: mint a new epoch and
+    /// reset ALL gate state for the URI in one critical section.
+    ///
+    /// Called via `WorldState::begin_diagnostic_lifecycle` on every "URI
+    /// becomes diagnostic-eligible" transition (`did_open`, and
+    /// `raven/activeDocumentsChanged`'s `added` set). Clearing
+    /// `last_published_version` and `force_republish` here — rather than
+    /// relying on every caller pairing this with a prior [`Self::clear`] —
+    /// guarantees a new lifecycle can neither inherit a stale same-version
+    /// high-water mark (which would gate out its first publish) nor surplus
+    /// force markers accumulated while the URI had no live epoch (which
+    /// would authorize an unrelated same-version publish later).
+    pub fn begin_epoch(&self, uri: &Url) -> DiagnosticsEpoch {
+        let epoch = DiagnosticsEpoch(self.next_epoch.fetch_add(1, Ordering::Relaxed));
+        let mut current = self.current_epoch.write().unwrap();
+        let mut last_published = self.last_published_version.write().unwrap();
+        let mut force = self.force_republish.write().unwrap();
+        last_published.remove(uri);
+        force.remove(uri);
+        current.insert(uri.clone(), epoch);
+        epoch
+    }
+
+    /// The URI's live diagnostic lifecycle epoch, or `None` if the URI is
+    /// not currently diagnostic-eligible (never began, or retired by
+    /// [`Self::clear`]). Captured alongside version/revision when diagnostic
+    /// work starts and validated by [`Self::try_consume_publish`] at commit.
+    pub fn current_epoch(&self, uri: &Url) -> Option<DiagnosticsEpoch> {
+        self.current_epoch.read().unwrap().get(uri).copied()
     }
 
     /// Check if diagnostics can be published for this version.
@@ -180,13 +260,26 @@ impl CrossFileDiagnosticsGate {
     /// two concurrent same-version publishes each observe
     /// `force_active = true` and both proceed off a single marker.
     ///
-    /// Predicate matches `can_publish`:
+    /// `epoch` is the lifecycle epoch the caller captured when its
+    /// diagnostic work started. The commit fails closed — no version update,
+    /// no marker consumed — unless it still equals the URI's current epoch,
+    /// so work retired by a close/tab-removal can neither publish after the
+    /// lifecycle is reused nor steal the new lifecycle's force marker. The
+    /// `current_epoch` guard is held across the entire commit (see the
+    /// struct-level lock-discipline note).
+    ///
+    /// Predicate otherwise matches `can_publish`:
     ///   - if `version < last_published`: false (never publish older)
     ///   - if force counter > 0: `version >= last_published` (same OK)
     ///   - else: `version > last_published` (strictly newer)
-    pub fn try_consume_publish(&self, uri: &Url, version: i32) -> bool {
+    pub fn try_consume_publish(&self, uri: &Url, version: i32, epoch: DiagnosticsEpoch) -> bool {
+        let current = self.current_epoch.read().unwrap();
         let mut last_published = self.last_published_version.write().unwrap();
         let mut force = self.force_republish.write().unwrap();
+
+        if current.get(uri) != Some(&epoch) {
+            return false;
+        }
 
         let allowed = match last_published.get(uri) {
             Some(&last) => {
@@ -261,12 +354,30 @@ impl CrossFileDiagnosticsGate {
         force.remove(uri);
     }
 
-    /// Clear all state for a URI (e.g., when document is closed)
+    /// Clear all state for a URI, retiring its lifecycle epoch. Called (via
+    /// `WorldState::retire_diagnostic_lifecycle`) when the document closes or
+    /// its tab is removed from the editor diagnostic set. After this, no
+    /// worker holding the retired epoch can commit through
+    /// [`Self::try_consume_publish`].
     pub fn clear(&self, uri: &Url) {
+        let mut current = self.current_epoch.write().unwrap();
         let mut last_published = self.last_published_version.write().unwrap();
         let mut force = self.force_republish.write().unwrap();
+        current.remove(uri);
         last_published.remove(uri);
         force.remove(uri);
+    }
+
+    /// Clear all state for every URI, retiring every lifecycle epoch. Called
+    /// on server shutdown so no in-flight diagnostic work can publish after
+    /// the shutdown response.
+    pub fn clear_all(&self) {
+        let mut current = self.current_epoch.write().unwrap();
+        let mut last_published = self.last_published_version.write().unwrap();
+        let mut force = self.force_republish.write().unwrap();
+        current.clear();
+        last_published.clear();
+        force.clear();
     }
 
     /// Test-only accessor for the outstanding force-republish counter for
@@ -280,6 +391,76 @@ impl CrossFileDiagnosticsGate {
     pub fn force_republish_count_for_test(&self, uri: &Url) -> u32 {
         let force = self.force_republish.read().unwrap();
         force.get(uri).copied().unwrap_or(0)
+    }
+}
+
+/// Test-only pause points for the diagnostics publish pipelines (issue
+/// #603): lets a test park a worker in the post-compute, pre-commit window
+/// so it can race a lifecycle transition (close+reopen, tab removal +
+/// re-addition, shutdown) against the pending commit deterministically.
+///
+/// Lives as a field on `WorldState` — not a global static — so an armed
+/// pause's lifetime is tied to the backend under test and cannot leak into
+/// unrelated tests sharing the process.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct DiagnosticsPublishPause {
+    gates: RwLock<HashMap<Url, std::sync::Arc<PauseGate>>>,
+}
+
+/// One armed pause point. `arrived`/`release` are `Notify`s, so the
+/// signal is retained even if the notifier runs before the awaiter.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct PauseGate {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DiagnosticsPublishPause {
+    /// Arm a one-shot pause for `uri`. The returned handle lets the test
+    /// wait for a worker to arrive at the pause point and later release it.
+    pub fn arm(&self, uri: Url) -> PauseHandle {
+        let gate = std::sync::Arc::new(PauseGate::default());
+        self.gates.write().unwrap().insert(uri, gate.clone());
+        PauseHandle { gate }
+    }
+
+    /// Worker-side lookup, consuming the armed entry (one-shot so a respawn
+    /// for the same URI does not park again with nobody left to release
+    /// it). Returns an owned handle: callers MUST drop any outer lock guard
+    /// before awaiting [`PauseGate::pause`] on it.
+    pub fn take_armed(&self, uri: &Url) -> Option<std::sync::Arc<PauseGate>> {
+        self.gates.write().unwrap().remove(uri)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PauseGate {
+    /// Worker side: signal arrival, then park until the test releases.
+    pub async fn pause(&self) {
+        self.arrived.notify_one();
+        self.release.notified().await;
+    }
+}
+
+/// Test-side handle to an armed [`DiagnosticsPublishPause`] entry.
+#[cfg(any(test, feature = "test-support"))]
+pub struct PauseHandle {
+    gate: std::sync::Arc<PauseGate>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PauseHandle {
+    /// Wait until a worker has arrived at the pause point.
+    pub async fn wait_arrived(&self) {
+        self.gate.arrived.notified().await;
+    }
+
+    /// Release the parked worker.
+    pub fn release(&self) {
+        self.gate.release.notify_one();
     }
 }
 
@@ -817,6 +998,7 @@ mod tests {
         let gate = Arc::new(CrossFileDiagnosticsGate::new());
         let uri = test_uri("test.R");
 
+        let epoch = gate.begin_epoch(&uri);
         gate.record_publish(&uri, 1);
         gate.mark_force_republish(&uri);
 
@@ -832,7 +1014,7 @@ mod tests {
             let successes = successes.clone();
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                if gate.try_consume_publish(&uri, 1) {
+                if gate.try_consume_publish(&uri, 1, epoch) {
                     successes.fetch_add(1, Ordering::Relaxed);
                 }
             }));
@@ -867,6 +1049,7 @@ mod tests {
         let gate = Arc::new(CrossFileDiagnosticsGate::new());
         let uri = test_uri("test.R");
 
+        let epoch = gate.begin_epoch(&uri);
         gate.record_publish(&uri, 1);
 
         const N_THREADS: usize = 32;
@@ -882,7 +1065,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 gate.mark_force_republish(&uri);
                 barrier.wait();
-                if gate.try_consume_publish(&uri, 1) {
+                if gate.try_consume_publish(&uri, 1, epoch) {
                     successes.fetch_add(1, Ordering::Relaxed);
                 }
             }));
@@ -909,6 +1092,221 @@ mod tests {
 
         // After clear, any version should be allowed
         assert!(gate.can_publish(&uri, 1));
+    }
+
+    // Lifecycle-epoch tests (issue #603)
+
+    #[test]
+    fn test_begin_epoch_mints_unique_epochs() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+
+        let e1 = gate.begin_epoch(&uri1);
+        let e2 = gate.begin_epoch(&uri2);
+        let e3 = gate.begin_epoch(&uri1); // same URI, new lifecycle
+
+        assert_ne!(e1, e2);
+        assert_ne!(e1, e3);
+        assert_ne!(e2, e3);
+        assert_eq!(gate.current_epoch(&uri1), Some(e3));
+        assert_eq!(gate.current_epoch(&uri2), Some(e2));
+    }
+
+    #[test]
+    fn test_current_epoch_absent_before_begin_and_after_clear() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = test_uri("test.R");
+
+        assert_eq!(gate.current_epoch(&uri), None);
+        let e = gate.begin_epoch(&uri);
+        assert_eq!(gate.current_epoch(&uri), Some(e));
+        gate.clear(&uri);
+        assert_eq!(gate.current_epoch(&uri), None);
+    }
+
+    #[test]
+    fn test_try_consume_publish_rejects_stale_epoch_and_preserves_marker() {
+        // The core #603 regression: a retired lifecycle's epoch must be
+        // refused at commit even when the force marker + same-version
+        // predicate would otherwise allow the publish — and the refusal must
+        // NOT consume the marker meant for the live lifecycle.
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = test_uri("test.R");
+
+        let old = gate.begin_epoch(&uri);
+        assert!(gate.try_consume_publish(&uri, 1, old));
+
+        let new = gate.begin_epoch(&uri); // reopen: retires `old`
+        assert!(gate.try_consume_publish(&uri, 1, new));
+        gate.mark_force_republish(&uri);
+
+        assert!(
+            !gate.try_consume_publish(&uri, 1, old),
+            "stale epoch must be refused despite an active force marker"
+        );
+        assert_eq!(
+            gate.force_republish_count_for_test(&uri),
+            1,
+            "a refused stale-epoch commit must not consume the marker"
+        );
+        assert!(
+            gate.try_consume_publish(&uri, 1, new),
+            "the live lifecycle must still get the marker's publish"
+        );
+    }
+
+    #[test]
+    fn test_try_consume_publish_rejects_retired_epoch() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = test_uri("test.R");
+
+        let e = gate.begin_epoch(&uri);
+        gate.clear(&uri); // didClose / tab removal
+        assert!(
+            !gate.try_consume_publish(&uri, 1, e),
+            "no live epoch: commit must fail closed"
+        );
+        assert!(
+            gate.can_publish(&uri, 1),
+            "the refused commit must not have recorded a version"
+        );
+    }
+
+    #[test]
+    fn test_begin_epoch_resets_version_state() {
+        // A duplicate lifecycle start (no intervening clear) must not
+        // inherit the previous lifecycle's same-version high-water mark,
+        // which would gate out the new lifecycle's first publish.
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = test_uri("test.R");
+
+        let e1 = gate.begin_epoch(&uri);
+        assert!(gate.try_consume_publish(&uri, 1, e1));
+
+        let e2 = gate.begin_epoch(&uri);
+        assert!(
+            gate.try_consume_publish(&uri, 1, e2),
+            "fresh lifecycle must publish at the same version without a force marker"
+        );
+    }
+
+    #[test]
+    fn test_begin_epoch_drops_orphaned_force_markers() {
+        // Markers accumulated while the URI had no live epoch (e.g. a hidden
+        // tab-ineligible document swept up in bulk mark_force_republish_many
+        // calls whose workers bail at the eligibility check) must not
+        // survive into the new lifecycle, where a surplus marker would
+        // authorize an unrelated same-version publish.
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri = test_uri("test.R");
+
+        gate.mark_force_republish(&uri);
+        gate.mark_force_republish(&uri);
+
+        let e = gate.begin_epoch(&uri);
+        assert_eq!(
+            gate.force_republish_count_for_test(&uri),
+            0,
+            "begin_epoch must start with clean force state"
+        );
+        assert!(gate.try_consume_publish(&uri, 1, e));
+        assert!(
+            !gate.try_consume_publish(&uri, 1, e),
+            "no marker may leak into the new lifecycle"
+        );
+    }
+
+    #[test]
+    fn test_clear_all_retires_every_epoch() {
+        let gate = CrossFileDiagnosticsGate::new();
+        let uri1 = test_uri("a.R");
+        let uri2 = test_uri("b.R");
+
+        let e1 = gate.begin_epoch(&uri1);
+        let e2 = gate.begin_epoch(&uri2);
+        gate.clear_all();
+
+        assert_eq!(gate.current_epoch(&uri1), None);
+        assert_eq!(gate.current_epoch(&uri2), None);
+        assert!(!gate.try_consume_publish(&uri1, 1, e1));
+        assert!(!gate.try_consume_publish(&uri2, 1, e2));
+    }
+
+    #[test]
+    fn test_gate_clear_races_try_consume_publish_without_wedging() {
+        // The gate is presented as the lifecycle authority, so its internal
+        // lock discipline must hold even when clear() runs concurrently with
+        // try_consume_publish() (nothing at the gate level enforces the
+        // outer WorldState lock choreography). Assert two things under real
+        // contention: no deadlock, and the nested-guard-lifetime invariant —
+        // try_consume_publish must hold the `current_epoch` guard across the
+        // entire version/force commit.
+        //
+        // Detector: the lifecycle thread retires the epoch with a single
+        // clear() and never re-mints it. clear() takes all three write
+        // guards, so in a correct implementation every commit either fully
+        // precedes it (its `last_published_version` entry is then removed by
+        // the clear) or fully follows it (the epoch check fails; no entry is
+        // written). Only an implementation that releases the epoch guard
+        // between the check and the commit can interleave with the clear and
+        // write an entry AFTER the clear removed everything — so any
+        // surviving entry after all threads join proves the guard-lifetime
+        // bug. `can_publish(uri, i32::MIN)` is true iff no entry survived
+        // (consumers only commit versions >= 0).
+        //
+        // This is a STRESS test: the postcondition is sound (a failure is
+        // always a real bug; no false positives), but detection is
+        // opportunistic — nothing can force clear() into a hypothetical
+        // broken implementation's dropped-guard window from outside the
+        // gate's public API. The deterministic epoch-guard coverage lives in
+        // test_try_consume_publish_rejects_stale_epoch_and_preserves_marker
+        // and test_try_consume_publish_rejects_retired_epoch, which pin the
+        // check-under-guard behavior directly. What this test guarantees on
+        // every run is the no-deadlock property under real contention.
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let gate = Arc::new(CrossFileDiagnosticsGate::new());
+        let uri = test_uri("test.R");
+        let initial = gate.begin_epoch(&uri);
+
+        const N_CONSUMERS: usize = 16;
+        const N_CYCLES: usize = 200;
+        let barrier = Arc::new(Barrier::new(N_CONSUMERS + 1));
+        let mut handles = Vec::new();
+
+        for _ in 0..N_CONSUMERS {
+            let gate = gate.clone();
+            let uri = uri.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for v in 0..N_CYCLES as i32 {
+                    gate.try_consume_publish(&uri, v, initial);
+                }
+            }));
+        }
+
+        let lifecycle_gate = gate.clone();
+        let lifecycle_uri = uri.clone();
+        let lifecycle_barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            lifecycle_barrier.wait();
+            lifecycle_gate.clear(&lifecycle_uri);
+        }));
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(
+            gate.can_publish(&uri, i32::MIN),
+            "a last_published_version entry survived the retiring clear: a \
+             commit interleaved between the epoch check and the version/force \
+             write, so the current_epoch guard was not held across the commit"
+        );
+        assert_eq!(gate.current_epoch(&uri), None);
     }
 
     #[test]

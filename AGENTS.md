@@ -88,6 +88,7 @@ Each item below either spans multiple systems or is a discipline that applies in
 - **Diagnostics publishing monotonicity**
   - Diagnostics publish monotonically by document version. Dependency-triggered revalidation may republish at the same version via the force-republish mechanism, but never older.
   - Production commit paths MUST use `CrossFileDiagnosticsGate::try_consume_publish` (atomic). The `can_publish` + `record_publish` pair is racy and is for advisory pre-flight checks and tests only — see the gate's own doc comments for the TOCTOU details.
+  - Each diagnostic-eligible URI lifecycle carries a globally unique epoch (#603): minted on `did_open`/tab re-addition, retired on `did_close`/tab removal/shutdown, validated by the atomic commit so retired work can never publish into a reused lifecycle (version + revision cannot distinguish one — `Document::revision` restarts at 0 on reopen). Lifecycle transitions go through `WorldState::begin_diagnostic_lifecycle` / `retire_diagnostic_lifecycle`; mechanics live in the gate's doc comments in `cross_file/revalidation.rs`.
 
 - **LRU caches under locks**
   - Read locks: `peek()` (no promotion). Write locks: `push()` (eviction/promotion).
