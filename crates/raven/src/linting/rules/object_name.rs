@@ -1,8 +1,8 @@
 //! Enforce a naming scheme on user-defined symbols.
 //!
-//! Walks the tree-sitter AST and flags assignment targets and function
-//! parameters whose names don't match the configured [`ObjectNameStyle`] or
-//! custom regexes. Mirrors `lintr::object_name_linter` with three per-kind
+//! Walks the tree-sitter AST and flags assignment targets, function
+//! parameters, and literal `assign()` / `setGeneric()` binding names that do
+//! not match the configured [`ObjectNameStyle`] or custom regexes. Mirrors `lintr::object_name_linter` with three per-kind
 //! settings: `function`, `variable`, and `argument`. Each kind defaults to
 //! `snake_case` and can be independently disabled by including
 //! [`ObjectNameStyle::Any`] in its style list.
@@ -13,8 +13,9 @@
 //!
 //! Carve-outs:
 //!
-//! * **Backtick-quoted names** (`` `with spaces` <- 1 ``, operator overloads
-//!   like `` `+.foo` <- function(x, y) ... ``) are skipped, matching lintr.
+//! * **Quoted names** are checked after removing one matching pair of
+//!   backticks. This matches lintr's `strip_names()` behavior: quoting changes
+//!   what R accepts syntactically, not which naming policy applies.
 //! * **S3 method dispatch**: a function definition whose name has the shape
 //!   `<generic>.<class>` is exempt when `<generic>` is a known base R S3
 //!   generic (see [`is_known_s3_generic`]). Every dot is tried as a possible
@@ -36,8 +37,9 @@
 //! * **Named-argument `=`** (`f(name = value)`) is never an assignment target,
 //!   so it isn't checked. `=` elsewhere (top level, function bodies, braced
 //!   blocks) *is* treated as assignment and the LHS is checked.
-//! * **Compound LHS** (`obj$field <- ...`, `obj[[i]] <- ...`) is skipped: the
-//!   assignment doesn't introduce a new symbol name.
+//! * **Compound LHS** (`obj$field <- ...`, `obj[[i]] <- ...`) checks only the
+//!   leftmost object (`obj`). Field names and index expressions are ignored,
+//!   matching lintr.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -99,6 +101,7 @@ fn visit(
     match node.kind() {
         "binary_operator" => check_assignment(node, text, styles, severity, suppressions, out),
         "function_definition" => check_parameters(node, text, styles, severity, suppressions, out),
+        "call" => check_binding_call(node, text, styles, severity, suppressions, out),
         _ => {}
     }
 
@@ -106,6 +109,50 @@ fn visit(
     for child in node.children(&mut cursor) {
         visit(child, text, styles, severity, suppressions, out);
     }
+}
+
+fn check_binding_call(
+    node: Node<'_>,
+    text: &str,
+    styles: &ObjectNameStyles<'_>,
+    severity: DiagnosticSeverity,
+    suppressions: &Suppressions,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(function) = node.child_by_field_name("function") else {
+        return;
+    };
+    let function_text = node_text(function, text);
+    let kind = if function_text == "assign" || function_text.ends_with("::assign") {
+        SymbolKind::Variable
+    } else if function_text == "setGeneric" || function_text.ends_with("::setGeneric") {
+        SymbolKind::Function
+    } else {
+        return;
+    };
+    let formal = if kind == SymbolKind::Variable {
+        "x"
+    } else {
+        "name"
+    };
+    let Some(name_node) = binding_name_argument(node, formal, text) else {
+        return;
+    };
+    let name = node_text(name_node, text);
+    let patterns = patterns_for(kind, styles);
+    if patterns.is_disabled() {
+        return;
+    }
+    report_if_bad(
+        name_node,
+        name,
+        kind,
+        patterns,
+        text,
+        severity,
+        suppressions,
+        out,
+    );
 }
 
 /// Check the assignment target of a `binary_operator` node.
@@ -147,9 +194,9 @@ fn check_assignment(
         return;
     }
 
-    if target.kind() != "identifier" {
+    let Some(target) = assignment_name_target(target) else {
         return;
-    }
+    };
 
     let name = node_text(target, text);
     if name.is_empty() {
@@ -261,10 +308,11 @@ fn report_if_bad(
     if patterns.is_disabled() {
         return;
     }
-    if should_skip_name(name, kind, patterns) {
+    let policy_name = strip_name_delimiters(name);
+    if should_skip_name(policy_name, kind, patterns) {
         return;
     }
-    if matches_patterns(name, patterns) {
+    if matches_patterns(policy_name, patterns) {
         return;
     }
     let line_no = name_node.start_position().row as u32;
@@ -279,7 +327,7 @@ fn report_if_bad(
         SymbolKind::Variable => "Variable",
         SymbolKind::Argument => "Argument",
     };
-    let message = object_name_message(kind_label, name, patterns);
+    let message = object_name_message(kind_label, policy_name, patterns);
     out.push(Diagnostic {
         range: Range {
             start: Position::new(line_no, start_col),
@@ -312,10 +360,6 @@ fn matches_patterns(name: &str, patterns: KindPatterns<'_>) -> bool {
 
 /// Names that should be skipped regardless of the configured scheme.
 fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) -> bool {
-    // Backtick-quoted identifiers (operator overloads, names with spaces).
-    if name.starts_with('`') {
-        return true;
-    }
     // Non-ASCII identifiers can't be classified by the named styles' simple
     // ASCII schemes, so configurations with no regexes skip them. When
     // regexes ARE configured — regex-only or combined with styles — the name
@@ -346,6 +390,12 @@ fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) ->
     // We also strip an optional leading `.` so hidden S3 methods like
     // `.print.MyClass` resolve through `print`.
     if kind == SymbolKind::Function {
+        if matches!(
+            name,
+            ".onLoad" | ".onAttach" | ".onUnload" | ".onDetach" | ".Last.lib" | ".First" | ".Last"
+        ) {
+            return true;
+        }
         let body = name.strip_prefix('.').unwrap_or(name);
         for (i, c) in body.char_indices() {
             if c == '.' && is_known_s3_generic(&body[..i]) {
@@ -354,6 +404,69 @@ fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) ->
         }
     }
     false
+}
+
+/// Remove one matching syntactic delimiter pair before applying name policy.
+/// Only complete pairs are removed; malformed parse-recovery fragments are
+/// left untouched rather than normalized into a different name.
+fn strip_name_delimiters(name: &str) -> &str {
+    for delimiter in ['`', '\'', '"'] {
+        if let Some(inner) = name
+            .strip_prefix(delimiter)
+            .and_then(|rest| rest.strip_suffix(delimiter))
+        {
+            return inner;
+        }
+    }
+    name
+}
+
+/// Find the leftmost object governed by a compound assignment target.
+fn assignment_name_target(mut target: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match target.kind() {
+            "identifier" | "string" => return Some(target),
+            "extract_operator" => target = target.child_by_field_name("lhs")?,
+            "subset" | "subset2" => target = target.child_by_field_name("function")?,
+            "call" => {
+                let arguments = target.child_by_field_name("arguments")?;
+                target = first_positional_argument(arguments)?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn binding_name_argument<'tree>(
+    call: Node<'tree>,
+    formal: &str,
+    text: &str,
+) -> Option<Node<'tree>> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut first_positional = None;
+    let mut cursor = arguments.walk();
+    for argument in arguments
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        let name = argument.child_by_field_name("name");
+        let value = argument.child_by_field_name("value");
+        if name.and_then(|name| text.get(name.start_byte()..name.end_byte())) == Some(formal) {
+            return value.filter(|value| value.kind() == "string");
+        }
+        if name.is_none() && first_positional.is_none() {
+            first_positional = value;
+        }
+    }
+    first_positional.filter(|value| value.kind() == "string")
+}
+
+fn first_positional_argument(arguments: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = arguments.walk();
+    arguments
+        .children(&mut cursor)
+        .find(|child| child.kind() == "argument" && child.child_by_field_name("name").is_none())?
+        .child_by_field_name("value")
 }
 
 /// Base R S3 generics whose `<generic>.<class>` methods are conventionally
@@ -369,6 +482,9 @@ fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) ->
 fn is_known_s3_generic(name: &str) -> bool {
     // Sorted alphabetically so `binary_search` works.
     const GENERICS: &[&str] = &[
+        "$",
+        "+",
+        "-",
         "AIC",
         "BIC",
         "Complex",
@@ -870,9 +986,11 @@ mod tests {
     }
 
     #[test]
-    fn backtick_quoted_names_are_skipped() {
-        assert!(skip_default("`with spaces`", SymbolKind::Variable));
-        assert!(skip_default("`+.foo`", SymbolKind::Function));
+    fn backtick_quoted_names_are_checked_after_stripping_quotes() {
+        assert_eq!(strip_name_delimiters("`badName`"), "badName");
+        assert_eq!(strip_name_delimiters("\"badName\""), "badName");
+        assert_eq!(strip_name_delimiters("plain_name"), "plain_name");
+        assert!(!skip_default("badName", SymbolKind::Variable));
     }
 
     #[test]

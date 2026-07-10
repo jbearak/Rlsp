@@ -2,15 +2,14 @@
 //!
 //! Mirrors `lintr::object_length_linter`. Length is measured in characters
 //! after stripping the same decorative leading-dot that `object_name` accepts
-//! ("hidden identifier" convention). Backtick-quoted names and non-ASCII
-//! identifiers are skipped — matching `object_name`'s carve-outs.
+//! ("hidden identifier" convention). Quoted names are measured without their
+//! delimiters, and Unicode names are measured in characters.
 //!
 //! Only positions that introduce a new symbol are checked:
-//! assignment targets (`<-`, `<<-`, top-level `=`, `->`, `->>`) and formal
-//! parameters of `function_definition`. Compound assignment targets like
-//! `obj$field <- ...` are skipped (the assignment doesn't introduce a new
-//! symbol name — only the LHS field does, and `object_name` already won't
-//! flag those for the same reason).
+//! assignment targets (`<-`, `<<-`, top-level `=`, `->`, `->>`), formal
+//! parameters, and literal binding names passed to `assign()` / `setGeneric()`.
+//! Compound assignment targets like
+//! `obj$field <- ...` check only the leftmost object name (`obj`).
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -44,12 +43,51 @@ fn visit(
         "function_definition" => {
             check_parameters(node, text, max_length, severity, suppressions, out)
         }
+        "call" => check_binding_call(node, text, max_length, severity, suppressions, out),
         _ => {}
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         visit(child, text, max_length, severity, suppressions, out);
     }
+}
+
+fn check_binding_call(
+    node: Node<'_>,
+    text: &str,
+    max_length: u32,
+    severity: DiagnosticSeverity,
+    suppressions: &Suppressions,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(function) = node.child_by_field_name("function") else {
+        return;
+    };
+    let function_text = text
+        .get(function.start_byte()..function.end_byte())
+        .unwrap_or("");
+    let formal = if function_text == "assign" || function_text.ends_with("::assign") {
+        "x"
+    } else if function_text == "setGeneric" || function_text.ends_with("::setGeneric") {
+        "name"
+    } else {
+        return;
+    };
+    let Some(name_node) = binding_name_argument(node, formal, text) else {
+        return;
+    };
+    let name = text
+        .get(name_node.start_byte()..name_node.end_byte())
+        .unwrap_or("");
+    check_name(
+        name_node,
+        name,
+        max_length,
+        text,
+        severity,
+        suppressions,
+        out,
+    );
 }
 
 fn check_assignment(
@@ -75,9 +113,9 @@ fn check_assignment(
     let Some(target) = target else {
         return;
     };
-    if target.kind() != "identifier" {
+    let Some(target) = assignment_name_target(target) else {
         return;
-    }
+    };
     let name = text
         .get(target.start_byte()..target.end_byte())
         .unwrap_or("");
@@ -123,7 +161,8 @@ fn check_name(
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    if name.is_empty() || should_skip_name(name) {
+    let name = strip_name_delimiters(name);
+    if name.is_empty() {
         return;
     }
     // Strip the optional leading `.` (hidden identifier convention) before
@@ -157,12 +196,61 @@ fn check_name(
     });
 }
 
-fn should_skip_name(name: &str) -> bool {
-    if name.starts_with('`') {
-        return true;
+fn strip_name_delimiters(name: &str) -> &str {
+    for delimiter in ['`', '\'', '"'] {
+        if let Some(inner) = name
+            .strip_prefix(delimiter)
+            .and_then(|rest| rest.strip_suffix(delimiter))
+        {
+            return inner;
+        }
     }
-    if !name.is_ascii() {
-        return true;
+    name
+}
+
+fn assignment_name_target(mut target: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match target.kind() {
+            "identifier" | "string" => return Some(target),
+            "extract_operator" => target = target.child_by_field_name("lhs")?,
+            "subset" | "subset2" => target = target.child_by_field_name("function")?,
+            "call" => {
+                let arguments = target.child_by_field_name("arguments")?;
+                target = first_positional_argument(arguments)?;
+            }
+            _ => return None,
+        }
     }
-    false
+}
+
+fn binding_name_argument<'tree>(
+    call: Node<'tree>,
+    formal: &str,
+    text: &str,
+) -> Option<Node<'tree>> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut first_positional = None;
+    let mut cursor = arguments.walk();
+    for argument in arguments
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "argument")
+    {
+        let name = argument.child_by_field_name("name");
+        let value = argument.child_by_field_name("value");
+        if name.and_then(|name| text.get(name.start_byte()..name.end_byte())) == Some(formal) {
+            return value.filter(|value| value.kind() == "string");
+        }
+        if name.is_none() && first_positional.is_none() {
+            first_positional = value;
+        }
+    }
+    first_positional.filter(|value| value.kind() == "string")
+}
+
+fn first_positional_argument(arguments: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = arguments.walk();
+    arguments
+        .children(&mut cursor)
+        .find(|child| child.kind() == "argument" && child.child_by_field_name("name").is_none())?
+        .child_by_field_name("value")
 }

@@ -104,7 +104,7 @@ See [Development Notes](docs/development.md) for build/test, profiling, and inte
 
 ## Provenance
 
-Raven includes code derived from [Ark](https://github.com/posit-dev/ark) (MIT License, Posit Software, PBC) — initial LSP wiring and tree-sitter scaffolding — and from Raven's sister project [Sight](https://github.com/jbearak/sight) (also GPL-3.0) — the cross-file awareness system (directives + position-aware scope model). The bundled R and R Markdown TextMate grammars come from [vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax) (MIT).
+Raven includes code derived from [Ark](https://github.com/posit-dev/ark) (MIT License, Posit Software, PBC) — initial LSP wiring and tree-sitter scaffolding — and from Raven's sister project [Sight](https://github.com/jbearak/sight) (also GPL-3.0) — the cross-file awareness system (directives + position-aware scope model). The bundled R and R Markdown TextMate grammars come from [vscode-R-syntax](https://github.com/REditorSupport/vscode-R-syntax) (MIT). Raven's native lint compatibility tests adapt behavioral cases from [lintr](https://github.com/r-lib/lintr)'s test suite (MIT).
 
 Raven's downloadable package-symbol database is built from CRAN/Bioconductor metadata published by [r-universe](https://r-universe.dev), maintained by [rOpenSci](https://ropensci.org/r-universe/). See [Package database](docs/package-database.md#data-source-and-acknowledgement).
 

@@ -4,7 +4,8 @@
 //! is itself `NA`, never `TRUE`/`FALSE`. The idiomatic check is `is.na(x)`.
 //! Applies to every typed `NA` token tree-sitter-r recognises (`NA`,
 //! `NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`), both as `==`
-//! and `!=`, on either side.
+//! and `!=` on either side, plus `x %in% NA`. `NA %in% x` is not equivalent
+//! to testing whether `x` is missing and is left alone, matching lintr.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -51,12 +52,14 @@ fn check(
         return;
     };
     let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
-    if op_text != "==" && op_text != "!=" {
+    if !matches!(op_text, "==" | "!=" | "%in%") {
         return;
     }
     let lhs = node.child_by_field_name("lhs");
     let rhs = node.child_by_field_name("rhs");
-    let na_side = if lhs.is_some_and(is_na_literal) {
+    let na_side = if op_text == "%in%" {
+        rhs.filter(|node| is_na_literal(*node))
+    } else if lhs.is_some_and(is_na_literal) {
         lhs
     } else if rhs.is_some_and(is_na_literal) {
         rhs

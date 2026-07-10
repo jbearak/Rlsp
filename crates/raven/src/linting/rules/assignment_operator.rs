@@ -1,7 +1,8 @@
-//! Enforce a single assignment operator at top-level.
+//! Enforce the configured assignment operator.
 //!
-//! Walks the tree-sitter AST for `binary_operator` nodes whose `operator`
-//! field is `<-` or `=`. A `=` whose `binary_operator` lives *directly* under
+//! Walks the tree-sitter AST for assignment `binary_operator` nodes. With the
+//! default `<-` policy, `=`, `<<-`, `->`, `->>`, and `%<>%` are reported,
+//! matching `lintr::assignment_linter()` defaults. A `=` whose node lives *directly* under
 //! an `argument` node is named-argument syntax (`f(name = value)`) and is
 //! never reported. Assignments inside nested expressions — function bodies,
 //! braced blocks, control flow — are reported normally even when they appear
@@ -44,10 +45,7 @@ fn visit(
         // condition_assignment handles it with a more specific message.
         let skip_for_condition = op_text == "=" && is_if_while_condition_directly(node);
         if !skip_for_condition && !is_named_argument(node, op_text) {
-            let bad = match style {
-                AssignmentOperatorStyle::LeftArrow => op_text == "=",
-                AssignmentOperatorStyle::Equals => op_text == "<-",
-            };
+            let bad = is_disallowed_assignment(op_text, style);
             if bad {
                 let line_no = op_node.start_position().row as u32;
                 if !suppressions.is_suppressed_code(line_no, rule_ids::ASSIGNMENT_OPERATOR) {
@@ -83,6 +81,17 @@ fn visit(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         visit(child, text, style, severity, suppressions, out);
+    }
+}
+
+fn is_disallowed_assignment(op_text: &str, style: AssignmentOperatorStyle) -> bool {
+    match style {
+        AssignmentOperatorStyle::LeftArrow => {
+            matches!(op_text, "=" | "<<-" | "->" | "->>" | "%<>%")
+        }
+        AssignmentOperatorStyle::Equals => {
+            matches!(op_text, "<-" | "<<-" | "->" | "->>" | "%<>%")
+        }
     }
 }
 
