@@ -112,10 +112,9 @@ fn visit(
 /// expression in a call's argument list in an `argument` node, so a named
 /// argument's `=` `binary_operator` has `argument` as its direct parent.
 ///
-/// Anything nested deeper — assignments inside a function body
-/// (`lapply(xs, function(x) { y = x; y })`), inside a braced block
-/// (`f({ y = 1 })`), or inside control flow (`f(if (cond) y = 1)`) — is a
-/// real assignment and must be reported.
+/// Assignments nested deeper inside an argument are not named arguments
+/// either, but they don't need this guard: they fall under
+/// [`in_implicit_assignment_context`]'s exclusion, which mirrors lintr.
 fn is_named_argument(binop: Node<'_>, op_text: &str) -> bool {
     if op_text != "=" {
         return false;

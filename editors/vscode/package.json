@@ -1577,10 +1577,10 @@
             "="
           ],
           "enumDescriptions": [
-            "Require `<-` for assignment; flag top-level `=` assignments.",
-            "Require `=` for assignment; flag top-level `<-` assignments."
+            "Require `<-` for assignment; flag `=`, `->`, `->>`, and `%<>%` assignments.",
+            "Require `=` for assignment; flag `<-`, `<<-`, `->`, `->>`, and `%<>%` assignments."
           ],
-          "description": "Preferred assignment operator. The lint never flags `=` inside argument lists (named arguments)."
+          "description": "Preferred assignment operator. Named-argument `=` is never flagged, and assignments nested inside call arguments or if/while/for conditions are excluded, matching lintr's default."
         },
         "raven.linting.lineLengthSeverity": {
           "type": "string",

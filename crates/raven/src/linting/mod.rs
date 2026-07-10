@@ -1875,6 +1875,13 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn t_and_f_formula_exemption_covers_assignment_targets() {
+        // lintr leaves even `y ~ {T <- 1}` alone.
+        let config = t_and_f_only_config();
+        assert!(lint("m <- y ~ {T <- 1}\n", &config).is_empty());
+    }
+
+    #[test]
     fn t_and_f_formula_exemption_spans_braces_and_lambdas() {
         // lintr exempts T/F anywhere under `~`, including inside braces and
         // lambda bodies (verified against 3.3.0.1).
@@ -2727,6 +2734,20 @@ print.data.frame <- function(x, ...) NULL
             1
         );
         assert!(lint("expect_true(any(x | y))\n", &config).is_empty());
+        // The tested expression is the `object` argument, wherever it sits.
+        assert_eq!(
+            lint("expect_true(info = \"x\", object = x & y)\n", &config).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn vector_logic_subset_scan_stops_at_call_boundaries() {
+        // lintr leaves `filter(data, foo(a && b))` alone — the nested call is
+        // its own evaluation context.
+        let config = vector_logic_only_config();
+        assert!(lint("filter(data, foo(a && b))\n", &config).is_empty());
+        assert_eq!(lint("filter(x, y && z)\n", &config).len(), 1);
     }
 
     #[test]
@@ -2761,7 +2782,21 @@ print.data.frame <- function(x, ...) NULL
         let diags = lint("x <- 1\n\n ", &config);
         assert_eq!(diags.len(), 2, "got {:?}", diags);
         assert!(diags.iter().any(|d| d.message.contains("newline")));
-        assert!(diags.iter().any(|d| d.message.contains("blank")));
+        // Without a final newline the blank-region range clamps to the last
+        // existing line's end (line 2, one space wide).
+        let blank = diags
+            .iter()
+            .find(|d| d.message.contains("blank"))
+            .expect("blank-lines diagnostic");
+        assert_eq!(blank.range.end.line, 2);
+        assert_eq!(blank.range.end.character, 1);
+
+        // With a final newline, the range still covers the blank region
+        // through the document end.
+        let diags = lint("x <- 1\n\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.line, 1);
+        assert_eq!(diags[0].range.end.line, 2);
     }
 }
 

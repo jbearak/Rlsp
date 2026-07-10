@@ -57,8 +57,8 @@ fn visit(
         match callee_name(node, text) {
             // testthat conditions behave like `if`/`while` conditions.
             Some("expect_true") | Some("expect_false") => {
-                if let Some(first) = first_argument_value(node) {
-                    scan_condition(first, text, severity, suppressions, out);
+                if let Some(object) = object_argument_value(node, text) {
+                    scan_condition(object, text, severity, suppressions, out);
                 }
             }
             // Subsetting contexts: scalar `&&`/`||` are wrong. `stats::filter`
@@ -100,14 +100,30 @@ fn is_stats_qualified(call: Node<'_>, text: &str) -> bool {
         == Some("stats")
 }
 
-/// The value of the call's first argument, if any.
-fn first_argument_value<'t>(call: Node<'t>) -> Option<Node<'t>> {
+/// The tested expression of an `expect_true()`/`expect_false()` call: the
+/// argument named `object` when present, otherwise the first *positional*
+/// argument — `expect_true(info = "x", object = x & y)` tests `x & y`.
+fn object_argument_value<'t>(call: Node<'t>, text: &str) -> Option<Node<'t>> {
     let args = call.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
-    let first = args
-        .children(&mut cursor)
-        .find(|child| child.kind() == "argument")?;
-    first.child_by_field_name("value")
+    let mut first_positional = None;
+    for child in args.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        match child.child_by_field_name("name") {
+            Some(name) if text.get(name.start_byte()..name.end_byte()) == Some("object") => {
+                return child.child_by_field_name("value");
+            }
+            Some(_) => {}
+            None => {
+                if first_positional.is_none() {
+                    first_positional = child.child_by_field_name("value");
+                }
+            }
+        }
+    }
+    first_positional
 }
 
 /// Flag scalar `&&` / `||` inside `subset()` / `filter()` arguments. Recurses
@@ -123,14 +139,11 @@ fn scan_subset_args(
     if node.kind() == "function_definition" {
         return;
     }
-    // A nested `subset()`/`filter()` call is its own subsetting context and
-    // gets scanned when the outer AST walk reaches it — descending into it
-    // here would emit duplicate diagnostics (`filter(x, subset(y, a && b))`
-    // is one lint in lintr, not two).
-    if node.kind() == "call"
-        && matches!(callee_name(node, text), Some("filter") | Some("subset"))
-        && !is_stats_qualified(node, text)
-    {
+    // Any nested call is its own evaluation context: lintr leaves
+    // `filter(data, foo(a && b))` alone, and a nested `subset()`/`filter()`
+    // gets scanned when the outer AST walk reaches it (descending here would
+    // duplicate its diagnostics). Subscripts likewise reset the context.
+    if matches!(node.kind(), "call" | "subset" | "subset2") {
         return;
     }
     if node.kind() == "binary_operator"

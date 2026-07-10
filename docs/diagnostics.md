@@ -283,7 +283,7 @@ Native style diagnostics (18 of [`lintr`](https://lintr.r-lib.org/)'s default ru
 | Commas | information | Whitespace before `,` (`a , b`) or missing whitespace after `,` (`c(1,2)`). Newline after comma is fine |
 | `T` / `F` symbol | information | Bare `T` / `F` used in reference position (use `TRUE` / `FALSE`), with a dedicated message at assignment targets. Skipped for named arguments, formal parameters, `$`/`@` field names, formula terms, subscripted uses, and callees |
 | Semicolon | information | `;` separator outside strings/comments (`a; b`, trailing `a;`) |
-| Equals NA | information | `x == NA`, `x != NA`, or any typed-`NA` variant on either side. Use `is.na(x)` |
+| Equals NA | information | `x == NA`, `x != NA` (either side), any typed-`NA` variant, or `x %in% NA`. Use `is.na(x)` |
 | Vector logic | information | `&` or `\|` in an `if` / `while` / `expect_true()` condition, and `&&` / `\|\|` inside `subset()` / `filter()` arguments. Condition scan stops at call boundaries; bitwise-arithmetic operands are exempt |
 | Function left parentheses | information | Whitespace between `function` (or `\`) and `(`, or between a call's function name and its `(` (`blah (1)`) |
 | Spaces inside | information | Whitespace immediately inside `(`, `[`, or `[[` (`f( x )`, `df[ 1 ]`, `f( )`). Multi-line wrapping and comma/`= )` neighbors are exempt |

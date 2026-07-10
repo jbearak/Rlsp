@@ -130,6 +130,8 @@ fn check_definition(
 
 /// Flag the whitespace gap between `left` (callee / keyword) and `right`
 /// (the `(...)` node), choosing the same-line or cross-line message.
+// One flat leaf helper shared by the call and definition checks; a params
+// struct would just re-window the same values.
 #[allow(clippy::too_many_arguments)]
 fn emit_gap_between(
     _node: Node<'_>,

@@ -194,6 +194,8 @@ fn check_named_eq(
 
 /// Flag zero-width gaps on either side of `op`. `None` bounds (unresolvable
 /// neighbors) skip that side, as do cross-line gaps.
+// One flat leaf helper shared by two call shapes; a params struct would just
+// re-window the same seven values.
 #[allow(clippy::too_many_arguments)]
 fn check_gaps(
     text: &str,

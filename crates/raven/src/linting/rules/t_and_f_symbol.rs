@@ -53,7 +53,10 @@ fn visit(
     if node.kind() == "identifier" {
         let name = text.get(node.start_byte()..node.end_byte()).unwrap_or("");
         if name == "T" || name == "F" {
-            if let Some(target_op) = assignment_target_of(node) {
+            if in_formula_context(node) {
+                // Formula terms are exempt in every position — lintr leaves
+                // even `y ~ {T <- 1}` alone.
+            } else if let Some(target_op) = assignment_target_of(node) {
                 // lintr flags assignment targets with a dedicated message.
                 emit(
                     node,

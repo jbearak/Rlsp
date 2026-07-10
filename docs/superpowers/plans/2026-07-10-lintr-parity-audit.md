@@ -58,14 +58,16 @@ continuation one unit deeper).
 - **object_name**: hidden S3 methods (`.print.MyClass`) stay exempt (lintr
   flags them); non-ASCII names skipped when no regexes configured (lintr's
   ASCII regexes flag them).
-- **commented_code**: end-of-line comments next to code are not checked
-  (lintr checks them); block grouping can merge/shift diagnostics vs lintr's
-  per-line lints; annotation prefixes (`# TODO:` …) are skipped.
+- **commented_code**: end-of-line comments next to code are checked (kept
+  from PR #600, matching lintr); block grouping can merge/shift diagnostics
+  vs lintr's per-line lints; annotation prefixes (`# TODO:` …) are skipped.
 - **trailing_blank_lines**: `.Rmd`/`.qmd` exempt (lintr lints chunk shape).
 - **vector_logic**: `if`/`while` conditions nested inside call arguments are
   still checked (matches lintr dev; 3.3.0.1 suppressed them) and `x[[a | b]]`
-  is treated as a vector context (lintr only resets at `[`). Lambdas inside
-  `filter()`/`subset()` args are skipped (matches lintr dev; 3.3.0.1 flagged).
+  is treated as a vector context (lintr only resets at `[`). The subset/filter
+  scan stops at nested call boundaries and skips lambdas (matches lintr dev
+  and 3.3.0.1's `filter(data, foo(a && b))` behavior; 3.3.0.1's quirk of
+  flagging `&&` inside a lambda nested in a call is not reproduced).
 - **Message wording** differs throughout (Raven's messages are more specific,
   e.g. per-side infix messages); locations match.
 - **semicolon/commas**: Raven anchors diagnostics on the token, lintr on the
