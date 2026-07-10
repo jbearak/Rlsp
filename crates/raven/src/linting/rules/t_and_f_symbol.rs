@@ -15,8 +15,9 @@
 //!   (`function(T) ...`). The `T` here is a name in the local syntax, not a
 //!   reference to the boolean.
 //! * **Formula symbols** (`y ~ T + F`) are model terms, not Boolean aliases.
-//!   A `T`/`F` used as a named-argument value inside a formula call is still a
-//!   value and remains checked.
+//!   A bare `T`/`F` used as the direct value of a named argument inside a
+//!   formula call (`y ~ foo(arg = T)`) remains checked, matching lintr. Nested
+//!   expressions such as `y ~ foo(arg = T + 1)` remain formula terms.
 //!
 //! Assignment targets are deliberately reported: rebinding `T` or `F` is
 //! exactly what makes later code relying on the aliases unsafe.

@@ -1851,9 +1851,14 @@ print.data.frame <- function(x, ...) NULL
     #[test]
     fn t_and_f_formula_terms_are_not_boolean_usages() {
         let config = t_and_f_only_config();
-        let diags = lint("y ~ T + F\ny ~ foo(T, F)\n", &config);
+        let diags = lint(
+            "y ~ T + F\ny ~ foo(T, F)\ny ~ foo(arg = T + 1)\ny ~ foo(arg = !F)\ny ~ foo(arg = c(T))\n",
+            &config,
+        );
         assert!(diags.is_empty(), "got {diags:?}");
 
+        // lintr checks a bare alias used as the *direct* named-argument value,
+        // but nested expressions remain formula terms.
         let value = lint("y ~ foo(arg = T)\n", &config);
         assert_eq!(value.len(), 1, "got {value:?}");
     }
@@ -2099,6 +2104,41 @@ print.data.frame <- function(x, ...) NULL
         }
         assert!(lint("filter(data, x & y)\n", &config).is_empty());
         assert!(lint("stats::filter(data, x && y)\n", &config).is_empty());
+    }
+
+    #[test]
+    fn vector_logic_skips_filter_and_subset_control_arguments() {
+        let config = vector_logic_only_config();
+        for source in [
+            "dplyr::filter(data, .preserve = a && b)\n",
+            "filter(data, .by = a && b)\n",
+            "subset(data, select = a && b)\n",
+            "subset(data, drop = a || b)\n",
+        ] {
+            assert!(lint(source, &config).is_empty(), "{source:?}");
+        }
+
+        let filter = lint("dplyr::filter(data, x && y, .preserve = a && b)\n", &config);
+        assert_eq!(filter.len(), 1, "got {filter:?}");
+
+        let subset = lint(
+            "subset(data, subset = x || y, select = a && b, drop = c || d)\n",
+            &config,
+        );
+        assert_eq!(subset.len(), 1, "got {subset:?}");
+    }
+
+    #[test]
+    fn vector_logic_checks_pipe_fed_predicates() {
+        let config = vector_logic_only_config();
+        for source in [
+            "data %>% filter(x && y)\n",
+            "data %<>% filter(x && y)\n",
+            "data |> filter(x || y)\n",
+            "data |> subset(x && y)\n",
+        ] {
+            assert_eq!(lint(source, &config).len(), 1, "{source:?}");
+        }
     }
 
     // ------------------------------------------------------------------

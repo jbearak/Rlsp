@@ -225,6 +225,18 @@ const CASES: &[Case] = &[
     case(Rule::TAndF, "bare alias", "x <- T\n", true),
     case(Rule::TAndF, "alias assignment", "T <- 1\n", true),
     case(Rule::TAndF, "formula terms", "y ~ T + F\n", false),
+    case(
+        Rule::TAndF,
+        "nested named-argument formula term",
+        "y ~ foo(arg = T + 1)\n",
+        false,
+    ),
+    case(
+        Rule::TAndF,
+        "direct named-argument formula value",
+        "y ~ foo(arg = T)\n",
+        true,
+    ),
     case(Rule::TAndF, "subset object", "T[1]\n", false),
     case(Rule::TAndF, "named argument value", "f(na.rm = T)\n", true),
     case(Rule::Semicolon, "no separator", "x <- 1\n", false),
@@ -302,6 +314,18 @@ const CASES: &[Case] = &[
         "filter vector op",
         "filter(data, x & y)\n",
         false,
+    ),
+    case(
+        Rule::VectorLogic,
+        "magrittr-piped filter predicate",
+        "data %>% filter(x && y)\n",
+        true,
+    ),
+    case(
+        Rule::VectorLogic,
+        "native-piped filter predicate",
+        "data |> filter(x && y)\n",
+        true,
     ),
     case(
         Rule::FunctionLeftParentheses,

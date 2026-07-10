@@ -205,6 +205,9 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
   flags assignment targets (`T <- 0`) because rebinding these aliases can
   break later code. Formula terms (`y ~ T + F`), named argument/formal names,
   and extraction/subsetting object or field names (`T[1]`, `obj$T`) are exempt.
+  Matching `lintr`, a bare alias used directly as a named-argument value in a
+  formula (`y ~ foo(arg = T)`) is checked, while an alias nested in a formula
+  expression (`y ~ foo(arg = T + 1)`) remains a formula term.
 
 ### Semicolon
 
@@ -237,8 +240,10 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 - Flags `&` or `|` in `if` / `while` conditions and `expect_true()` /
   `expect_false()` assertions (where `&&` / `||` is the scalar short-circuit
   form). It also flags `&&` / `||` in `filter()` / `subset()` predicates, where
-  vectorized `&` / `|` is required. Nested call boundaries remain conservative:
-  `if (any(x & y))` is left alone.
+  vectorized `&` / `|` is required, including when the data is supplied by
+  `%>%`, `%<>%`, or `|>`. Scalar/control arguments are excluded: `.preserve`
+  and `.by` for `filter()`, and `select`, `drop`, and `...` for `subset()`.
+  Nested call boundaries remain conservative: `if (any(x & y))` is left alone.
 
 ### Function left parentheses
 

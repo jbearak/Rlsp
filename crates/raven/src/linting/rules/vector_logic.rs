@@ -9,6 +9,10 @@
 //! `expect_false()` assertions, reporting `&` / `|` where scalar `&&` / `||`
 //! is expected. It also checks `filter()` / `subset()` predicates in the other
 //! direction, reporting `&&` / `||` where vectorized `&` / `|` is expected.
+//! For `filter()`, known scalar/control arguments (`.preserve`, `.by`, and the
+//! base `circular` argument) are excluded. For `subset()`, only the `subset`
+//! predicate is scanned; `select`, `drop`, and `...` arguments are not vector
+//! predicate contexts. Pipe-fed calls treat the data argument as implicit.
 //! Function-call boundaries stop the recursion: `if (any(x & y))` is fine
 //! because the `&` is evaluated inside `any()` on a vector, not on the
 //! condition itself. lintr applies the same carve-out.
@@ -84,7 +88,8 @@ fn check_call_context(
         return;
     }
 
-    let mut skipped_data_argument = false;
+    let mut data_supplied = call_is_pipe_fed(node, text);
+    let mut subset_predicate_supplied = false;
     let mut cursor = arguments.walk();
     for argument in arguments
         .children(&mut cursor)
@@ -93,19 +98,61 @@ fn check_call_context(
         let name = argument
             .child_by_field_name("name")
             .and_then(|name| text.get(name.start_byte()..name.end_byte()));
-        if name == Some("circular") {
-            continue;
+
+        if is_filter {
+            if matches!(name, Some("circular" | ".preserve" | ".by")) {
+                continue;
+            }
+            if name == Some(".data") {
+                data_supplied = true;
+                continue;
+            }
+            if name.is_none() && !data_supplied {
+                data_supplied = true;
+                continue;
+            }
+        } else {
+            match name {
+                Some("x") => {
+                    data_supplied = true;
+                    continue;
+                }
+                Some("subset") => subset_predicate_supplied = true,
+                Some(_) => continue,
+                None if !data_supplied => {
+                    data_supplied = true;
+                    continue;
+                }
+                None if !subset_predicate_supplied => subset_predicate_supplied = true,
+                None => continue,
+            }
         }
-        let is_named_data_argument =
-            (is_filter && name == Some(".data")) || (is_subset && name == Some("x"));
-        if !skipped_data_argument && (name.is_none() || is_named_data_argument) {
-            skipped_data_argument = true;
-            continue;
-        }
-        if let Some(value) = argument.child_by_field_name("value") {
-            scan_filter_predicate(value, text, severity, suppressions, out);
+
+        if let Some(predicate) = argument.child_by_field_name("value") {
+            scan_filter_predicate(predicate, text, severity, suppressions, out);
         }
     }
+}
+
+/// True when a forward pipe supplies the call's data argument implicitly.
+fn call_is_pipe_fed(call: Node<'_>, text: &str) -> bool {
+    let Some(parent) = call.parent() else {
+        return false;
+    };
+    if parent.kind() != "binary_operator"
+        || parent.child_by_field_name("rhs").map(|rhs| rhs.id()) != Some(call.id())
+    {
+        return false;
+    }
+
+    let mut cursor = parent.walk();
+    parent.children(&mut cursor).any(|child| {
+        child.kind() == "|>"
+            || (child.kind() == "special"
+                && text
+                    .get(child.start_byte()..child.end_byte())
+                    .is_some_and(|operator| matches!(operator, "%>%" | "%<>%")))
+    })
 }
 
 fn matches_function(actual: &str, name: &str) -> bool {
