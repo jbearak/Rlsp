@@ -1238,6 +1238,11 @@ fn parse_r_string_literal(raw: &str) -> Option<String> {
     let inner = &raw[quote.len_utf8()..raw.len() - quote.len_utf8()];
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars().peekable();
+    // R refuses to mix byte escapes (octal / `\x`) with Unicode escapes
+    // (`\u` / `\U`) in one literal ("mixing Unicode and octal/hex escapes
+    // ... is not allowed"); track both kinds so the mix is rejected too.
+    let mut has_byte_escape = false;
+    let mut has_unicode_escape = false;
     while let Some(c) = chars.next() {
         if c == quote {
             // Unescaped matching quote before the end of the token: the
@@ -1261,7 +1266,8 @@ fn parse_r_string_literal(raw: &str) -> Option<String> {
             Some('f') => out.push('\u{0C}'),
             Some('v') => out.push('\u{0B}'),
             Some(digit @ '0'..='7') => {
-                // Octal: the digit just consumed plus up to two more.
+                // Octal: the digit just consumed plus up to two more. R caps
+                // octal escapes at `\377` (one byte); larger values error.
                 let mut value = digit.to_digit(8).unwrap_or(0);
                 for _ in 0..2 {
                     match chars.peek().and_then(|next| next.to_digit(8)) {
@@ -1272,17 +1278,33 @@ fn parse_r_string_literal(raw: &str) -> Option<String> {
                         None => break,
                     }
                 }
+                if value > 0xFF {
+                    return None;
+                }
+                has_byte_escape = true;
                 out.push(decode_code_point(value)?);
             }
-            Some('x') => out.push(decode_code_point(read_hex_escape(&mut chars, 2, false)?)?),
-            Some('u') => out.push(decode_code_point(read_hex_escape(&mut chars, 4, true)?)?),
-            Some('U') => out.push(decode_code_point(read_hex_escape(&mut chars, 8, true)?)?),
+            Some('x') => {
+                has_byte_escape = true;
+                out.push(decode_code_point(read_hex_escape(&mut chars, 2, false)?)?);
+            }
+            Some('u') => {
+                has_unicode_escape = true;
+                out.push(decode_code_point(read_hex_escape(&mut chars, 4, true)?)?);
+            }
+            Some('U') => {
+                has_unicode_escape = true;
+                out.push(decode_code_point(read_hex_escape(&mut chars, 8, true)?)?);
+            }
             // Any other escape (`\p`, `\s`, ...) is an error in R strings.
             Some(_) => return None,
             // Trailing lone backslash: the "closing" quote is actually
             // escaped (`"abc\"`), i.e. the literal never terminated.
             None => return None,
         }
+    }
+    if has_byte_escape && has_unicode_escape {
+        return None;
     }
     Some(out)
 }
@@ -2417,6 +2439,13 @@ mod tests {
         assert_eq!(parse_r_string_literal(r#""\u{2e""#), None);
         // Escapes R rejects (`\p`, `\s`) are literal errors, not passthrough.
         assert_eq!(parse_r_string_literal(r#""\p""#), None);
+        // R caps octal at \377 and refuses to mix byte and Unicode escapes.
+        assert_eq!(parse_r_string_literal(r#""\400""#), None);
+        assert_eq!(
+            parse_r_string_literal(r#""\377""#),
+            Some("\u{FF}".to_string())
+        );
+        assert_eq!(parse_r_string_literal(r#""\x5e\u0061""#), None);
     }
 
     #[test]
