@@ -143,12 +143,25 @@ fn in_implicit_assignment_context(binop: Node<'_>) -> bool {
                 .is_some_and(|sequence| sequence.id() == child.id()),
             _ => false,
         };
-        if excludes && child.kind() != "parenthesized_expression" {
+        // lintr's exclusion requires the argument/condition subtree to be
+        // free of explicit parentheses anywhere (`fun((blah = 1))` and
+        // `fun(foo + (blah = 1))` are both still flagged).
+        if excludes && !subtree_contains_parenthesized(child) {
             return true;
         }
         child = parent;
     }
     false
+}
+
+/// True when the subtree contains a `parenthesized_expression`.
+fn subtree_contains_parenthesized(node: Node<'_>) -> bool {
+    if node.kind() == "parenthesized_expression" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(subtree_contains_parenthesized)
 }
 
 /// Returns `true` if `binop` is the direct `condition` field of an

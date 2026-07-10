@@ -2749,6 +2749,26 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn vector_logic_nested_if_condition_emits_one_diagnostic() {
+        // The inner `if` is scanned when the walk reaches it; the outer
+        // condition scan must not also descend into it.
+        let config = vector_logic_only_config();
+        let diags = lint("if (if (x & y) TRUE else FALSE) 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn vector_logic_resolves_extracted_callees_and_partial_matching() {
+        let config = vector_logic_only_config();
+        // `env$as.raw(12)` is still bitwise arithmetic.
+        assert!(lint("if (info & env$as.raw(12)) 1\n", &config).is_empty());
+        // `env$expect_true(...)` is still a testthat condition.
+        assert_eq!(lint("env$expect_true(x & y)\n", &config).len(), 1);
+        // R partially matches `obj =` to expect_true's `object` formal.
+        assert_eq!(lint("expect_true(obj = x & y)\n", &config).len(), 1);
+    }
+
+    #[test]
     fn vector_logic_exempts_circular_control_argument() {
         // stats::filter's scalar control argument, exempted by name in lintr.
         let config = vector_logic_only_config();
@@ -2788,6 +2808,44 @@ print.data.frame <- function(x, ...) NULL
         assert!(lint("x <- c(1,\t2)\n", &config).is_empty());
         // A line starting inside a multi-line string is part of its value.
         assert!(lint("x <- 'a\n\tb'\n", &config).is_empty());
+    }
+
+    #[test]
+    fn object_name_descends_compound_targets_like_lintr() {
+        // lintr checks the base object through subscripts and replacement
+        // calls, not just `$`/`@` chains.
+        let config = object_name_only_config();
+        assert_eq!(lint("badName[[1]] <- 1\n", &config).len(), 1);
+        assert_eq!(lint("badName$field[[1]] <- 1\n", &config).len(), 1);
+        assert_eq!(lint("names(badName) <- 1\n", &config).len(), 1);
+        assert_eq!(lint("attr(badName, \"x\") <- 1\n", &config).len(), 1);
+        assert!(lint("names(good_name) <- 1\n", &config).is_empty());
+        // Index symbols are not assignment targets.
+        assert!(lint("x[badName] <- 1\n", &config).is_empty());
+    }
+
+    #[test]
+    fn assignment_operator_parenthesized_anywhere_in_argument_still_flags() {
+        // lintr's exclusion requires the argument subtree to be paren-free.
+        let config = LintConfig {
+            line_length_severity: None,
+            trailing_whitespace_severity: None,
+            no_tab_severity: None,
+            trailing_blank_lines_severity: None,
+            ..enabled_config()
+        };
+        let diags = lint("fun(foo + (blah = 1))\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+    }
+
+    #[test]
+    fn function_left_parentheses_flags_call_with_comment_gap() {
+        // A comment between the callee and its `(` is still a wrong-line
+        // call in lintr.
+        let config = function_left_parentheses_only_config();
+        let diags = lint("if (foo # note\n  (x)) TRUE\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(diags[0].message.contains("same line"), "{:?}", diags);
     }
 
     #[test]

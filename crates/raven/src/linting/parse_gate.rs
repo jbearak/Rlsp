@@ -60,26 +60,31 @@ pub(crate) fn looks_like_code(stripped: &str) -> bool {
     contains_code_like(root, &text)
 }
 
-/// True when two consecutive top-level expressions share a line with no `;`
-/// between them — valid to tree-sitter, a syntax error to R.
-fn has_same_line_juxtaposition(root: Node<'_>, text: &str) -> bool {
-    let mut cursor = root.walk();
-    let mut prev: Option<Node<'_>> = None;
-    for child in root.children(&mut cursor) {
-        if child.kind() == "comment" {
-            continue;
+/// True when two consecutive expressions in a statement sequence (the
+/// program root or a braced block) share a line with no `;` between them —
+/// valid to tree-sitter, a syntax error to R.
+fn has_same_line_juxtaposition(node: Node<'_>, text: &str) -> bool {
+    if matches!(node.kind(), "program" | "braced_expression") {
+        let mut cursor = node.walk();
+        let mut prev: Option<Node<'_>> = None;
+        for child in node.children(&mut cursor) {
+            if child.kind() == "comment" || !child.is_named() {
+                continue;
+            }
+            if let Some(prev) = prev
+                && prev.end_position().row == child.start_position().row
+                && !text
+                    .get(prev.end_byte()..child.start_byte())
+                    .is_some_and(|gap| gap.contains(';'))
+            {
+                return true;
+            }
+            prev = Some(child);
         }
-        if let Some(prev) = prev
-            && prev.end_position().row == child.start_position().row
-            && !text
-                .get(prev.end_byte()..child.start_byte())
-                .is_some_and(|gap| gap.contains(';'))
-        {
-            return true;
-        }
-        prev = Some(child);
     }
-    false
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| has_same_line_juxtaposition(child, text))
 }
 
 fn contains_code_like(node: Node<'_>, text: &str) -> bool {
@@ -153,6 +158,9 @@ mod tests {
         assert!(!looks_like_code("non-code comment"));
         // `;`-separated expressions on one line are real R.
         assert!(looks_like_code("x <- 1; y <- 2"));
+        // Juxtaposition nested inside braces is still invalid R.
+        assert!(!looks_like_code("{ use foo(x) instead }"));
+        assert!(looks_like_code("{ foo(x) }"));
     }
 
     #[test]

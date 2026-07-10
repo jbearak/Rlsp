@@ -182,10 +182,13 @@ fn emit_gap_between(
         return;
     }
     // Any whitespace at all (spaces, tabs, or even newlines) is reported —
-    // the rule wants tight `function(`. Use the slice contents rather than a
-    // separate "any non-whitespace" check because a non-empty gap that's not
-    // whitespace would be a parse anomaly we shouldn't pretend to handle.
-    if !gap.chars().all(|c| c.is_whitespace()) {
+    // the rule wants tight `function(`. A gap may also carry comments
+    // (`foo # note\n(x)` is still a wrong-line call in lintr); anything else
+    // in the gap would be a parse anomaly we shouldn't pretend to handle.
+    let gap_is_whitespace_and_comments = gap
+        .lines()
+        .all(|line| line.trim_start().is_empty() || line.trim_start().starts_with('#'));
+    if !gap_is_whitespace_and_comments {
         return;
     }
     let line_no = name.end_position().row as u32;

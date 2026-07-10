@@ -160,18 +160,33 @@ pub(crate) fn collect_declared_s3_generics(root: Node<'_>, text: &str) -> HashSe
     out
 }
 
-/// Descend a `$`/`@` extract chain to its leftmost object. Any other shape
-/// (subscripts, calls) is returned as-is and skipped by the caller's kind
-/// check.
+/// Descend a compound assignment target to its base object: through
+/// `$`/`@` chains (`a$b$c <- 1` checks `a`), subscripts `[`/`[[`
+/// (`a[[1]] <- 1` checks `a`), and replacement calls (`names(a) <- 1`,
+/// `attr(a, "x") <- 1` check the first argument) — all shapes real lintr
+/// flags. Anything else is returned as-is and skipped by the caller's kind
+/// check. (lintr can also flag a *non-first* symbol argument of a
+/// replacement call, e.g. `foo(1, badName) <- 1`; that shape is rare and
+/// not descended here.)
 pub(crate) fn leftmost_extract_object<'t>(node: Node<'t>) -> Node<'t> {
     let mut current = node;
-    while current.kind() == "extract_operator" {
-        match current.child_by_field_name("lhs") {
-            Some(lhs) => current = lhs,
-            None => break,
+    loop {
+        let next = match current.kind() {
+            "extract_operator" => current.child_by_field_name("lhs"),
+            "subset" | "subset2" => current.child_by_field_name("function"),
+            "call" => current.child_by_field_name("arguments").and_then(|args| {
+                let mut cursor = args.walk();
+                args.children(&mut cursor)
+                    .find(|child| child.kind() == "argument")
+                    .and_then(|arg| arg.child_by_field_name("value"))
+            }),
+            _ => return current,
+        };
+        match next {
+            Some(next) => current = next,
+            None => return current,
         }
     }
-    current
 }
 
 /// True when the subtree contains a call to `UseMethod` (bare or

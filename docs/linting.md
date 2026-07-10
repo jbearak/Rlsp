@@ -202,7 +202,7 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 - **Raven:** `raven.linting.functionLeftParenthesesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::function_left_parentheses_linter()`.
-- Flags whitespace between `function` (or the `\` lambda shorthand) and the parameter `(`, and between a call's function name and its argument `(` — `blah (1)`, `base::print (x)`, `` `+` (1, 1) ``, `x$foo (1)`. A `(` on a later line than the function name gets a dedicated message. String "callees" (`"print"(x)`), `@` slot access, and computed callees (IIFEs, `f(x)(y)`) are left alone, matching `lintr`.
+- Flags whitespace between `function` (or the `\` lambda shorthand) and the parameter `(`, and between a call's function name and its argument `(` — `blah (1)`, `base::print (x)`, `` `+` (1, 1) ``, `x$foo (1)`. A `(` on a later line than the function name gets a dedicated message; `@` slot calls get only that cross-line check (same-line whitespace after `@` access is not flagged). String "callees" (`"print"(x)`, `base::"mean"(x)`) and computed callees (IIFEs, `f(x)(y)`) are left alone, matching `lintr`.
 
 ### Spaces inside
 

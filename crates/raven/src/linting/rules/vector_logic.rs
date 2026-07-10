@@ -83,7 +83,10 @@ fn callee_name<'a>(call: Node<'_>, text: &'a str) -> Option<&'a str> {
     let function = call.child_by_field_name("function")?;
     match function.kind() {
         "identifier" => text.get(function.start_byte()..function.end_byte()),
-        "namespace_operator" => {
+        // `pkg::name(...)` and `env$name(...)` both resolve by the rightmost
+        // name — R's parser marks either as a function call, and lintr's
+        // carve-outs match on that name.
+        "namespace_operator" | "extract_operator" => {
             let rhs = function.child_by_field_name("rhs")?;
             text.get(rhs.start_byte()..rhs.end_byte())
         }
@@ -112,7 +115,13 @@ fn object_argument_value<'t>(call: Node<'t>, text: &str) -> Option<Node<'t>> {
             continue;
         }
         match child.child_by_field_name("name") {
-            Some(name) if text.get(name.start_byte()..name.end_byte()) == Some("object") => {
+            // R partially matches formals: `obj =` binds to `object`
+            // (expect_true's other formals start with different letters).
+            Some(name)
+                if text
+                    .get(name.start_byte()..name.end_byte())
+                    .is_some_and(|n| !n.is_empty() && "object".starts_with(n)) =>
+            {
                 return child.child_by_field_name("value");
             }
             Some(_) => {}
@@ -182,8 +191,13 @@ fn scan_condition(
     out: &mut Vec<Diagnostic>,
 ) {
     // Stop at call boundaries — the operands of a call are evaluated as a
-    // vector context independently of the surrounding scalar condition.
-    if matches!(node.kind(), "call" | "subset" | "subset2") {
+    // vector context independently of the surrounding scalar condition. A
+    // nested `if`/`while` is its own condition and is scanned when the outer
+    // AST walk reaches it (rescanning here would duplicate diagnostics).
+    if matches!(
+        node.kind(),
+        "call" | "subset" | "subset2" | "if_statement" | "while_statement"
+    ) {
         return;
     }
     if node.kind() == "binary_operator"
