@@ -4931,11 +4931,21 @@ async fn run_debounced_diagnostics(
         let current_version = doc.and_then(|d| d.version);
         let current_revision = doc.map(|d| d.revision);
 
+        // Every non-cancelled exit below completes this task's own pending
+        // entry (generation-aware, so a successor's entry is never touched).
+        // Cancelled exits skip it: cancellation always removed or replaced
+        // the entry already. Without this, a worker that schedules and then
+        // bails early would strand its entry in the pending map — e.g. a
+        // closed document's worker (trigger and current both absent) whose
+        // URI is never scheduled again.
         if current_version != trigger_version || current_revision != trigger_revision {
             log::trace!(
                 "Skipping stale diagnostics for {}: revision changed",
                 affected_uri
             );
+            state
+                .cross_file_revalidation
+                .complete(&affected_uri, generation);
             return;
         }
 
@@ -4944,6 +4954,9 @@ async fn run_debounced_diagnostics(
                 "Skipping diagnostics for {}: no editor diagnostic resource",
                 affected_uri
             );
+            state
+                .cross_file_revalidation
+                .complete(&affected_uri, generation);
             return;
         }
 
@@ -4951,6 +4964,9 @@ async fn run_debounced_diagnostics(
             && !state.diagnostics_gate.can_publish(&affected_uri, ver)
         {
             log::trace!("Skipping diagnostics for {}: monotonic gate", affected_uri);
+            state
+                .cross_file_revalidation
+                .complete(&affected_uri, generation);
             return;
         }
 
@@ -4963,6 +4979,10 @@ async fn run_debounced_diagnostics(
     }; // Read lock released here
 
     let Some((snapshot, workspace_folder, missing_file_severity)) = snapshot_data else {
+        let state = state_arc.read().await;
+        state
+            .cross_file_revalidation
+            .complete(&affected_uri, generation);
         return;
     };
 
@@ -5113,6 +5133,13 @@ async fn run_debounced_diagnostics(
                 traversal_truncation.clone(),
             ));
         }
+    } else if !cancel.is_cancelled() {
+        // Gate or eligibility refused the publish and nothing cancelled this
+        // task, so nothing else will remove its pending entry — complete it.
+        let state = state_arc.read().await;
+        state
+            .cross_file_revalidation
+            .complete(&affected_uri, generation);
     }
 }
 
