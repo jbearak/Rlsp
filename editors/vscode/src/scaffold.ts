@@ -467,11 +467,22 @@ function removeTopLevelLintingKeys(text: string): string {
         let removeEnd = propNode.offset + propNode.length;
 
         // Phase 1: try to absorb a trailing `,` (standard "comma-after"
-        // style) — skipping intermediate whitespace and tabs.
+        // style) — skipping intermediate whitespace, tabs, and inline
+        // `/* ... */` block comments (`"key": [..] /* note */,` must not
+        // leave the comment + comma orphaned as invalid JSONC).
         let trailingCommaAbsorbed = false;
         {
             let j = removeEnd;
-            while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+            for (;;) {
+                while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+                if (current[j] === '/' && current[j + 1] === '*') {
+                    const close = current.indexOf('*/', j + 2);
+                    if (close === -1) break;
+                    j = close + 2;
+                    continue;
+                }
+                break;
+            }
             if (current[j] === ',') {
                 removeEnd = j + 1;
                 trailingCommaAbsorbed = true;
@@ -627,7 +638,15 @@ export function buildLintingSettingsContent(existing: string | undefined): strin
 
     const trimmedBefore = beforeInsertion.replace(/[ \t\n\r]+$/, '');
     const after = withoutLintingKeys.slice(closingBracePos);
-    return `${trimmedBefore}\n${formatLintingBlock('  ')}\n${after}`;
+    const merged = `${trimmedBefore}\n${formatLintingBlock('  ')}\n${after}`;
+
+    // Final safety net: the splice-based removal above handles the comment
+    // and comma layouts we know about, but a layout it mishandles must never
+    // be written back as invalid JSONC. Refuse to merge instead.
+    const verifyErrors: ParseError[] = [];
+    parseTree(merged, verifyErrors, { allowTrailingComma: true });
+    if (verifyErrors.length > 0) return null;
+    return merged;
 }
 
 export function renderRavenToml(linting: Record<string, unknown> | undefined): string {

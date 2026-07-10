@@ -4,6 +4,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { parseTree } from 'jsonc-parser';
 import { activate } from './helper';
 import {
     GITIGNORE_TEMPLATE,
@@ -370,6 +371,27 @@ suite('scaffold linting-settings merge', () => {
 
     test('returns null for a non-object root (e.g. array)', () => {
         assert.strictEqual(buildLintingSettingsContent('[1, 2, 3]'), null);
+    });
+
+    test('absorbs an inline block comment between an array value and its comma', () => {
+        // Removing `"key": [..] /* note */,` must not orphan the comment and
+        // comma as invalid JSONC; the comma scan skips block comments, and
+        // the final revalidation would refuse the merge if it ever did.
+        const existing = `{
+  "raven.linting.objectNameRegexesFunction": ["^x$"] /* note */,
+  "editor.tabSize": 4
+}
+`;
+        const merged = buildLintingSettingsContent(existing);
+        assert.ok(merged !== null, 'the merge must succeed for this layout');
+        const errors: import('jsonc-parser').ParseError[] = [];
+        parseTree(merged, errors, { allowTrailingComma: true });
+        assert.strictEqual(errors.length, 0, `merged output must be valid JSONC:\n${merged}`);
+        assert.ok(merged.includes('"editor.tabSize": 4'), 'unrelated keys survive');
+        assert.ok(
+            !/\/\* note \*\/\s*,/.test(merged.replace(/"raven\.linting\.[^"]+": [^\n]*/g, '')),
+            `no orphaned comment+comma:\n${merged}`,
+        );
     });
 
     test('returns null for a parse-error file', () => {

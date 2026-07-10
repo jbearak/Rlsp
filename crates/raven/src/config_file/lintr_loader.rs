@@ -833,7 +833,10 @@ impl ScanState {
                 self.raw = RawScan::Prefix;
                 true
             }
-            '"' | '\'' => {
+            // Backticks quote R names (`a=b` as a vector-entry label), so
+            // their contents — including `=`, commas, and brackets — are not
+            // structural, exactly like string literals.
+            '"' | '\'' | '`' => {
                 self.in_str = Some(c);
                 false
             }
@@ -1073,7 +1076,7 @@ fn parse_object_name_string_list(
 ) -> ObjectNameStringList {
     // `character()`, `character(0)`, and `character(0L)` are all zero-length
     // character vectors in R — any of them is an explicit empty list.
-    if strip_named_call(raw, "character").is_some_and(|inner| {
+    if strip_complete_call(raw, "character").is_some_and(|inner| {
         let inner = inner.trim();
         inner.is_empty() || inner == "0" || inner == "0L"
     }) {
@@ -1081,7 +1084,7 @@ fn parse_object_name_string_list(
             values: Vec::new(),
             explicit_empty_vector: true,
         }
-    } else if let Some(inner) = strip_c_vector(raw) {
+    } else if let Some(inner) = strip_complete_call(raw, "c") {
         // Drop *syntactically* empty tokens (e.g. a trailing comma) before
         // parsing string literals, so a quoted-empty element `""` survives as
         // a real degenerate value. The caller decides whether that empty string
@@ -1332,12 +1335,35 @@ fn strip_named_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
-/// Strip a `c(...)` vector wrapper, tolerating optional whitespace between the
-/// `c` and the `(` so valid R like `c ("snake_case")` parses identically to
-/// `c("snake_case")`. Returns the inner argument text, or `None` if `s` is not
-/// a `c(...)` call.
-fn strip_c_vector(s: &str) -> Option<&str> {
-    strip_named_call(s, "c")
+/// [`strip_named_call`], but requiring the call to consume the *entire*
+/// expression: any non-whitespace content after the matching close paren
+/// (e.g. a pipe — `c("^foo") |> paste0("$")`) means the call's contents are
+/// not the whole value, so the caller must treat the expression as
+/// unrecognized instead of silently dropping the trailing operator. Used for
+/// `object_name_linter`'s `c(...)` / `character(...)` argument values, where
+/// truncating a larger expression would change which names pass. Tolerates
+/// optional whitespace between the name and the `(` (valid R: `c ("x")`).
+fn strip_complete_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let after = s.trim().strip_prefix(name)?.trim_start();
+    let inner = after.strip_prefix('(')?;
+    let mut st = ScanState::default();
+    let mut depth = 1i32;
+    for (i, c) in inner.char_indices() {
+        if !st.step(c) {
+            continue;
+        }
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return inner[i + 1..].trim().is_empty().then_some(&inner[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2524,6 +2550,35 @@ mod tests {
         assert_eq!(
             out.settings["linting"]["objectNameRegexesFunction"],
             json!(["camelCase"])
+        );
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn object_name_trailing_expression_after_vector_is_unrecognized() {
+        // A pipe after the vector means `c(...)`'s contents are NOT the whole
+        // value: warn instead of silently truncating `paste0("$")` away.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(regexes = c(\"^foo\") |> paste0(\"$\")))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!([])
+        );
+        assert!(!mapped_object_name_style(&out));
+        assert!(has_unrecognized_warning(&out));
+    }
+
+    #[test]
+    fn object_name_backtick_labels_do_not_desync_tokenization() {
+        // Backtick-quoted vector-entry labels may contain `=` and commas;
+        // they are names, not structure, and the values must survive.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(styles = c(), regexes = c(`a=b` = \"^x$\", `c,d` = \"^y$\")))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameRegexesFunction"],
+            json!(["^x$", "^y$"])
         );
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
