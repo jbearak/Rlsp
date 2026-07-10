@@ -972,22 +972,28 @@ fn resolve_arg<'a>(args: &'a str, name: &str) -> Option<&'a str> {
 fn find_named_arg<'a>(tokens: &[&'a str], name: &str) -> Option<&'a str> {
     tokens.iter().find_map(|tok| {
         let (lhs, rhs) = split_top_level_eq(tok)?;
-        (strip_name_quotes(lhs.trim()) == name).then_some(rhs.trim())
+        arg_tag_matches(lhs.trim(), name).then_some(rhs.trim())
     })
 }
 
-/// Strip one matching pair of backticks or quotes from an argument tag.
-/// `` `a` ``, `"a"`, and `'a'` all name the formal `a` in an R call.
-fn strip_name_quotes(s: &str) -> &str {
-    for quote in ['`', '"', '\''] {
-        if let Some(inner) = s
-            .strip_prefix(quote)
-            .and_then(|rest| rest.strip_suffix(quote))
-        {
-            return inner;
-        }
+/// True when an argument tag names the formal `name`. Handles the bare form,
+/// backtick-quoted names (`` `a` `` — verbatim contents), and string-literal
+/// tags (`"a"`, `'a'`, raw strings), which R decodes like any string literal.
+/// Escapes that [`parse_r_string_literal`] deliberately preserves verbatim
+/// (hex/octal) are not decoded here either — an escaped-tag `.lintr` call is
+/// far outside real-world configs, and sharing the one decoder keeps the two
+/// paths from drifting.
+fn arg_tag_matches(tag: &str, name: &str) -> bool {
+    if tag == name {
+        return true;
     }
-    s
+    if let Some(inner) = tag
+        .strip_prefix('`')
+        .and_then(|rest| rest.strip_suffix('`'))
+    {
+        return inner == name;
+    }
+    parse_r_string_literal(tag).is_some_and(|decoded| decoded == name)
 }
 
 /// Resolve one of `object_name_linter`'s `styles` and `regexes` formals using
@@ -2586,9 +2592,9 @@ mod tests {
 
     #[test]
     fn object_name_quoted_formal_tags_bind_by_name() {
-        // R accepts quoted argument tags: `regexes` = / "regexes" = bind the
-        // formal exactly like the bare name.
-        for tag in ["`regexes`", "\"regexes\""] {
+        // R accepts quoted argument tags: `regexes` = / "regexes" = / raw
+        // strings bind the formal exactly like the bare name.
+        for tag in ["`regexes`", "\"regexes\"", "r\"(regexes)\""] {
             let out = load_str(&format!(
                 "linters: linters_with_defaults(object_name_linter(styles = character(), {tag} = \"^x$\"))\n"
             ));
