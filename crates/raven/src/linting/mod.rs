@@ -2627,6 +2627,13 @@ print.data.frame <- function(x, ...) NULL
         }
     }
 
+    fn function_left_parentheses_only_config() -> LintConfig {
+        LintConfig {
+            function_left_parentheses_severity: Some(DiagnosticSeverity::INFORMATION),
+            ..all_lint_rules_off()
+        }
+    }
+
     fn trailing_blank_lines_only_config() -> LintConfig {
         LintConfig {
             trailing_blank_lines_severity: Some(DiagnosticSeverity::INFORMATION),
@@ -2742,6 +2749,13 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
+    fn vector_logic_exempts_circular_control_argument() {
+        // stats::filter's scalar control argument, exempted by name in lintr.
+        let config = vector_logic_only_config();
+        assert!(lint("filter(data, circular = lhs && rhs)\n", &config).is_empty());
+    }
+
+    #[test]
     fn vector_logic_subset_scan_stops_at_call_boundaries() {
         // lintr leaves `filter(data, foo(a && b))` alone — the nested call is
         // its own evaluation context.
@@ -2774,6 +2788,30 @@ print.data.frame <- function(x, ...) NULL
         assert!(lint("x <- c(1,\t2)\n", &config).is_empty());
         // A line starting inside a multi-line string is part of its value.
         assert!(lint("x <- 'a\n\tb'\n", &config).is_empty());
+    }
+
+    #[test]
+    fn object_name_recognizes_qualified_use_method_declarations() {
+        // `base::UseMethod(...)` declares a generic just like the bare call.
+        let config = object_name_only_config();
+        let src = "my_generic <- function(x) base::UseMethod(\"my_generic\")\nmy_generic.BadName <- function(x) x\n";
+        assert!(
+            lint(src, &config).is_empty(),
+            "got {:?}",
+            lint(src, &config)
+        );
+    }
+
+    #[test]
+    fn function_left_parentheses_callee_edge_cases_match_lintr() {
+        let config = function_left_parentheses_only_config();
+        // A string callee via `::` is not symbol-like — exempt.
+        assert!(lint("base::\"mean\" (1)\n", &config).is_empty());
+        // `@` slot calls: same-line whitespace exempt, cross-line `(` flagged.
+        assert!(lint("obj@predicate (1)\n", &config).is_empty());
+        let cross = lint("if (obj@predicate\n(1)) TRUE\n", &config);
+        assert_eq!(cross.len(), 1, "got {:?}", cross);
+        assert!(cross[0].message.contains("same line"), "{:?}", cross);
     }
 
     #[test]

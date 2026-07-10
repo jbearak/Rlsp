@@ -9,9 +9,10 @@
 //!   have stray whitespace between the callee and the argument list; a
 //!   newline gets the "left parenthesis should be on the same line as the
 //!   function's symbol" message. Matching lintr, only symbol-like callees
-//!   are checked: identifiers, `::`/`:::`-qualified names, and `$` access.
-//!   String "callees" (`"print"(x)`), `@` slot access, and computed callees
-//!   — IIFEs `(function() 1)()`, chained `f(x)(y)` — are left alone.
+//!   are checked: identifiers, `::`/`:::`-qualified names, and `$` access;
+//!   `@` slot access gets only the cross-line check. String "callees"
+//!   (`"print"(x)`, `base::"mean"(x)`) and computed callees — IIFEs
+//!   `(function() 1)()`, chained `f(x)(y)` — are left alone.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -50,21 +51,37 @@ fn visit(
     }
 }
 
-/// True when a call's function node is a symbol-like callee lintr checks.
-fn is_checked_callee(function: Node<'_>, text: &str) -> bool {
+/// Which checks apply to a call's function node. lintr's same-line-spaces
+/// XPath covers SYMBOL_FUNCTION_CALL and `$` access, while its wrong-line
+/// XPath additionally covers `@` slot access; string callees (bare or via
+/// `::`) and computed callees get neither.
+enum CalleeChecks {
+    None,
+    /// Same-line whitespace and cross-line `(` both flagged.
+    Full,
+    /// Only a `(` on a later line is flagged (`@` slot calls).
+    CrossLineOnly,
+}
+
+fn callee_checks(function: Node<'_>, text: &str) -> CalleeChecks {
     match function.kind() {
-        "identifier" => true,
-        "namespace_operator" => true,
-        // `$` member access is checked; `@` slot access is not (lintr's
-        // same-line-spaces XPath covers SYMBOL_FUNCTION_CALL and `$`, but
-        // omits SLOT).
+        "identifier" => CalleeChecks::Full,
+        // `pkg::name(...)` — but `pkg::"name"(...)` is a string callee.
+        "namespace_operator" => match function.child_by_field_name("rhs") {
+            Some(rhs) if rhs.kind() == "identifier" => CalleeChecks::Full,
+            _ => CalleeChecks::None,
+        },
         "extract_operator" => {
-            function
+            match function
                 .child_by_field_name("operator")
                 .and_then(|op| text.get(op.start_byte()..op.end_byte()))
-                == Some("$")
+            {
+                Some("$") => CalleeChecks::Full,
+                Some("@") => CalleeChecks::CrossLineOnly,
+                _ => CalleeChecks::None,
+            }
         }
-        _ => false,
+        _ => CalleeChecks::None,
     }
 }
 
@@ -81,7 +98,15 @@ fn check_call(
     let Some(args) = node.child_by_field_name("arguments") else {
         return;
     };
-    if !is_checked_callee(function, text) {
+    let checks = callee_checks(function, text);
+    if matches!(checks, CalleeChecks::None) {
+        return;
+    }
+    // `@` slot calls: lintr only flags a `(` on a later line, not same-line
+    // whitespace.
+    if matches!(checks, CalleeChecks::CrossLineOnly)
+        && function.end_position().row == args.start_position().row
+    {
         return;
     }
     emit_gap_between(

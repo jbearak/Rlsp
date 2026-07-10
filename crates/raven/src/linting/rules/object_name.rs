@@ -174,12 +174,19 @@ pub(crate) fn leftmost_extract_object<'t>(node: Node<'t>) -> Node<'t> {
     current
 }
 
-/// True when the subtree contains a call to `UseMethod`.
+/// True when the subtree contains a call to `UseMethod` (bare or
+/// namespace-qualified — R's parser emits the same call token either way,
+/// and lintr recognizes both).
 fn contains_use_method_call(node: Node<'_>, text: &str) -> bool {
     if node.kind() == "call"
-        && node
-            .child_by_field_name("function")
-            .is_some_and(|f| f.kind() == "identifier" && node_text(f, text) == "UseMethod")
+        && node.child_by_field_name("function").is_some_and(|f| {
+            let name = match f.kind() {
+                "identifier" => Some(f),
+                "namespace_operator" => f.child_by_field_name("rhs"),
+                _ => None,
+            };
+            name.is_some_and(|n| node_text(n, text) == "UseMethod")
+        })
     {
         return true;
     }

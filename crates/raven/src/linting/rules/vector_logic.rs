@@ -139,6 +139,16 @@ fn scan_subset_args(
     if node.kind() == "function_definition" {
         return;
     }
+    // `filter(x, circular = ...)` is stats::filter's scalar control
+    // argument, not a subsetting expression — lintr exempts it by name.
+    if node.kind() == "argument"
+        && node
+            .child_by_field_name("name")
+            .and_then(|name| text.get(name.start_byte()..name.end_byte()))
+            == Some("circular")
+    {
+        return;
+    }
     // Any nested call is its own evaluation context: lintr leaves
     // `filter(data, foo(a && b))` alone, and a nested `subset()`/`filter()`
     // gets scanned when the outer AST walk reaches it (descending here would
