@@ -4882,7 +4882,7 @@ async fn run_debounced_diagnostics(
     traversal_truncation: Option<Arc<TraversalTruncationState>>,
 ) {
     // Schedule with cancellation token
-    let token = {
+    let (generation, token) = {
         let state = state_arc.read().await;
         state.cross_file_revalidation.schedule(affected_uri.clone())
     };
@@ -5009,6 +5009,21 @@ async fn run_debounced_diagnostics(
 
     let (can_publish, open_at_publish) = {
         let state = state_arc.read().await;
+
+        // Final cancellation re-check under the state read lock, immediately
+        // before try_consume_publish: a superseding schedule (e.g. from a
+        // dependency edit) may have cancelled this task between the post-lock
+        // re-check above and this point. Defense in depth alongside the
+        // generation-aware complete() — it narrows the window in which a
+        // superseded task can still consume the gate with an older snapshot.
+        if cancel.is_cancelled() {
+            log::trace!(
+                "Diagnostics cancelled before gate consume for {}",
+                affected_uri
+            );
+            return;
+        }
+
         let doc = state.documents.get(&affected_uri);
         let current_version = doc.and_then(|d| d.version);
         let current_revision = doc.map(|d| d.revision);
@@ -5041,7 +5056,9 @@ async fn run_debounced_diagnostics(
             .await;
 
         let state = state_arc.read().await;
-        state.cross_file_revalidation.complete(&affected_uri);
+        state
+            .cross_file_revalidation
+            .complete(&affected_uri, generation);
     }
 }
 

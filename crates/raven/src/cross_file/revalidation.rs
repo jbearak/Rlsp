@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio_util::sync::CancellationToken;
 use tower_lsp::lsp_types::Url;
@@ -16,8 +17,12 @@ use super::types::CrossFileMetadata;
 /// Tracks pending revalidation work per file
 #[derive(Debug, Default)]
 pub struct CrossFileRevalidationState {
-    /// Pending revalidation tasks keyed by URI
-    pending: RwLock<HashMap<Url, CancellationToken>>,
+    /// Pending revalidation tasks keyed by URI, tagged with the generation
+    /// returned by `schedule` so `complete` can tell its own entry from a
+    /// successor's.
+    pending: RwLock<HashMap<Url, (u64, CancellationToken)>>,
+    /// Monotonic generation counter for `schedule`.
+    next_generation: AtomicU64,
 }
 
 impl CrossFileRevalidationState {
@@ -26,28 +31,39 @@ impl CrossFileRevalidationState {
     }
 
     /// Schedule revalidation for a file, cancelling any pending work.
-    /// Returns a cancellation token for the new task.
-    pub fn schedule(&self, uri: Url) -> CancellationToken {
+    /// Returns the new task's generation and cancellation token.
+    pub fn schedule(&self, uri: Url) -> (u64, CancellationToken) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut pending = self.pending.write().unwrap();
         // Cancel existing pending work for this URI
-        if let Some(old_token) = pending.remove(&uri) {
+        if let Some((_, old_token)) = pending.remove(&uri) {
             old_token.cancel();
         }
         let token = CancellationToken::new();
-        pending.insert(uri, token.clone());
-        token
+        pending.insert(uri, (generation, token.clone()));
+        (generation, token)
     }
 
-    /// Mark revalidation as complete
-    pub fn complete(&self, uri: &Url) {
+    /// Mark revalidation as complete.
+    ///
+    /// Removes the pending entry only if it still belongs to the caller's
+    /// `schedule` generation. A task that was superseded (its token cancelled
+    /// by a newer `schedule`) but still runs its completion tail must not
+    /// evict the successor's token — otherwise `cancel` (e.g. from
+    /// `did_close`) finds no entry and the successor becomes uncancellable,
+    /// reopening the stale-publish race the publish-lock cancellation
+    /// re-check closes.
+    pub fn complete(&self, uri: &Url, generation: u64) {
         let mut pending = self.pending.write().unwrap();
-        pending.remove(uri);
+        if pending.get(uri).map(|(g, _)| *g) == Some(generation) {
+            pending.remove(uri);
+        }
     }
 
     /// Cancel pending revalidation for a URI
     pub fn cancel(&self, uri: &Url) {
         let mut pending = self.pending.write().unwrap();
-        if let Some(token) = pending.remove(uri) {
+        if let Some((_, token)) = pending.remove(uri) {
             token.cancel();
         }
     }
@@ -55,7 +71,7 @@ impl CrossFileRevalidationState {
     /// Cancel all pending revalidations
     pub fn cancel_all(&self) {
         let mut pending = self.pending.write().unwrap();
-        for (_, token) in pending.drain() {
+        for (_, (_, token)) in pending.drain() {
             token.cancel();
         }
     }
@@ -566,7 +582,7 @@ mod tests {
     fn test_revalidation_schedule_returns_token() {
         let state = CrossFileRevalidationState::new();
         let uri = test_uri("test.R");
-        let token = state.schedule(uri);
+        let (_, token) = state.schedule(uri);
         assert!(!token.is_cancelled());
     }
 
@@ -575,8 +591,8 @@ mod tests {
         let state = CrossFileRevalidationState::new();
         let uri = test_uri("test.R");
 
-        let token1 = state.schedule(uri.clone());
-        let token2 = state.schedule(uri);
+        let (_, token1) = state.schedule(uri.clone());
+        let (_, token2) = state.schedule(uri);
 
         assert!(token1.is_cancelled());
         assert!(!token2.is_cancelled());
@@ -587,12 +603,28 @@ mod tests {
         let state = CrossFileRevalidationState::new();
         let uri = test_uri("test.R");
 
-        let _token = state.schedule(uri.clone());
-        state.complete(&uri);
+        let (generation, _token) = state.schedule(uri.clone());
+        state.complete(&uri, generation);
 
         // Scheduling again should not cancel anything (no previous pending)
-        let token2 = state.schedule(uri);
+        let (_, token2) = state.schedule(uri);
         assert!(!token2.is_cancelled());
+    }
+
+    #[test]
+    fn test_revalidation_complete_ignores_superseded_generation() {
+        let state = CrossFileRevalidationState::new();
+        let uri = test_uri("test.R");
+
+        let (gen1, token1) = state.schedule(uri.clone());
+        let (_, token2) = state.schedule(uri.clone());
+        assert!(token1.is_cancelled());
+
+        // A superseded task's complete must not evict the successor's entry:
+        // cancel() must still reach the successor's token afterwards.
+        state.complete(&uri, gen1);
+        state.cancel(&uri);
+        assert!(token2.is_cancelled());
     }
 
     #[test]
@@ -600,7 +632,7 @@ mod tests {
         let state = CrossFileRevalidationState::new();
         let uri = test_uri("test.R");
 
-        let token = state.schedule(uri.clone());
+        let (_, token) = state.schedule(uri.clone());
         assert!(!token.is_cancelled());
 
         state.cancel(&uri);
@@ -613,8 +645,8 @@ mod tests {
         let uri1 = test_uri("test1.R");
         let uri2 = test_uri("test2.R");
 
-        let token1 = state.schedule(uri1);
-        let token2 = state.schedule(uri2);
+        let (_, token1) = state.schedule(uri1);
+        let (_, token2) = state.schedule(uri2);
 
         state.cancel_all();
 
