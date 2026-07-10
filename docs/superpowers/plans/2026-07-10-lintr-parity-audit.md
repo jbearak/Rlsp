@@ -85,6 +85,10 @@ continuation one unit deeper).
   `indentation_linter(hanging_indent_style =, assignment_as_infix =)`,
   `infix_spaces_linter(exclude_operators =, allow_multiple_spaces = FALSE)`.
   Defaults coincide everywhere, so default-config behavior is unaffected.
+- **object_name/object_length**: a replacement call whose *first* argument
+  is not the assigned object (`foo(1, badName) <- 1`) is not descended —
+  lintr flags any symbol argument there, but real replacement functions take
+  the object first, so the shape is pathological.
 - **t_and_f_symbol**: lintr in packages also consults NAMESPACE imports for
   generics; Raven has no package-NAMESPACE model in the linter.
 - **line_length**: `raven.linting.lineLength` thresholds by character while
