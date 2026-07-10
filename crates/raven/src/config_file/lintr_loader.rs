@@ -966,13 +966,28 @@ fn resolve_arg<'a>(args: &'a str, name: &str) -> Option<&'a str> {
 /// Find the value of `name = value` among already-split `tokens`, comparing the
 /// left-hand side to `name` exactly. The single named-argument matching rule
 /// used by [`resolve_arg`], so every linter argument resolves named args the
-/// same way. A `split_once('=')` is safe here: a positional `"a=b"` splits to
-/// `lhs = "\"a"`, which never equals a bare `name`.
+/// same way. R also accepts quoted argument tags (`` `regexes` = "^x$" ``,
+/// `"regexes" = "^x$"`), which bind by the unquoted name, so a matching pair
+/// of backticks or quotes around the tag is stripped before comparing.
 fn find_named_arg<'a>(tokens: &[&'a str], name: &str) -> Option<&'a str> {
     tokens.iter().find_map(|tok| {
         let (lhs, rhs) = split_top_level_eq(tok)?;
-        (lhs.trim() == name).then_some(rhs.trim())
+        (strip_name_quotes(lhs.trim()) == name).then_some(rhs.trim())
     })
+}
+
+/// Strip one matching pair of backticks or quotes from an argument tag.
+/// `` `a` ``, `"a"`, and `'a'` all name the formal `a` in an R call.
+fn strip_name_quotes(s: &str) -> &str {
+    for quote in ['`', '"', '\''] {
+        if let Some(inner) = s
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    s
 }
 
 /// Resolve one of `object_name_linter`'s `styles` and `regexes` formals using
@@ -2567,6 +2582,28 @@ mod tests {
         );
         assert!(!mapped_object_name_style(&out));
         assert!(has_unrecognized_warning(&out));
+    }
+
+    #[test]
+    fn object_name_quoted_formal_tags_bind_by_name() {
+        // R accepts quoted argument tags: `regexes` = / "regexes" = bind the
+        // formal exactly like the bare name.
+        for tag in ["`regexes`", "\"regexes\""] {
+            let out = load_str(&format!(
+                "linters: linters_with_defaults(object_name_linter(styles = character(), {tag} = \"^x$\"))\n"
+            ));
+            assert_eq!(
+                out.settings["linting"]["objectNameStyleFunction"],
+                json!([]),
+                "{tag}"
+            );
+            assert_eq!(
+                out.settings["linting"]["objectNameRegexesFunction"],
+                json!(["^x$"]),
+                "{tag}"
+            );
+            assert!(out.warnings.is_empty(), "{tag}: {:?}", out.warnings);
+        }
     }
 
     #[test]
