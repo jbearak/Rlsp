@@ -4234,7 +4234,11 @@ static CLOSE_RESYNC_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::co
 /// extra — or one gate-skipped — same-version republish of already-current
 /// diagnostics, bounded by `MAX_FORCE_REPUBLISH`; monotonicity is never
 /// violated. Trigger-scoped accounting would be a gate redesign, out of
-/// scope here.
+/// scope here. (Trigger-ordered scheduling narrows the class: `schedule`
+/// declines a candidate whose trigger is strictly older than the pending
+/// incumbent's, so a late-polled or respawned worker can no longer cancel a
+/// strictly fresher pending worker — see
+/// `CrossFileRevalidationState::schedule`.)
 #[allow(clippy::too_many_arguments)]
 async fn run_close_resync(
     state_arc: Arc<RwLock<WorldState>>,
@@ -4881,10 +4885,22 @@ async fn run_debounced_diagnostics(
     trigger_revision: Option<u64>,
     traversal_truncation: Option<Arc<TraversalTruncationState>>,
 ) {
-    // Schedule with cancellation token
-    let (generation, token) = {
+    // Schedule with cancellation token; a decline means a strictly fresher
+    // worker is already pending and this task's trigger is obsolete.
+    let scheduled = {
         let state = state_arc.read().await;
-        state.cross_file_revalidation.schedule(affected_uri.clone())
+        state.cross_file_revalidation.schedule(
+            affected_uri.clone(),
+            trigger_version,
+            trigger_revision,
+        )
+    };
+    let Some((generation, token)) = scheduled else {
+        log::trace!(
+            "Skipping diagnostics for {}: a fresher revalidation is pending",
+            affected_uri
+        );
+        return;
     };
 
     // Clone token before select so we can pass it into diagnostic computation

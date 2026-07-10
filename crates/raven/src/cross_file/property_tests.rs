@@ -2643,7 +2643,7 @@ proptest! {
         // Schedule revalidation for multiple files
         for i in 0..num_files {
             let uri = make_url(&format!("file{}", i));
-            let (_, token) = state.schedule(uri);
+            let (_, token) = state.schedule(uri, None, None).unwrap();
             tokens.push(token);
         }
 
@@ -2676,7 +2676,7 @@ proptest! {
 
         // Simulate rapid changes by scheduling multiple times
         for _ in 0..num_changes {
-            let (_, token) = state.schedule(uri.clone());
+            let (_, token) = state.schedule(uri.clone(), None, None).unwrap();
             tokens.push(token);
         }
 
