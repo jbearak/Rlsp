@@ -474,9 +474,10 @@ fn comment_run_member(
 /// so Raven flags a subset of what lintr flags on these shapes and primaries
 /// match lintr. The non-default styles change that for infix-operator
 /// continuations only: `Aligned` replaces the block primary with the
-/// chain-start column, and `Either` also accepts the chain-start column at or
-/// left of the block primary (never below the minimum already-accepted value,
-/// so genuine under-indentation stays flagged).
+/// chain-start column, and `Either` also accepts the chain-start column even
+/// at or left of the block primary — a strict superset of both other styles.
+/// Genuine under-indentation stays flagged in every style because the
+/// chain-start line itself is still checked against its own expectation.
 fn set_expectations(
     root: Node<'_>,
     lines: &[&str],
@@ -500,20 +501,6 @@ fn set_expectations(
         }
         for line in begin..=end {
             let current = primary[line];
-            // Minimum value accepted before this change runs (primary or any
-            // alternative). `AlsoColFloor` compares against this rather than
-            // `current` alone so that stacked operator changes compose: a
-            // chain-start column accepted by an outer operator's floor must
-            // stay acceptable when an inner operator's `Block` bump lands on
-            // the same line, otherwise `Either` would reject code `Aligned`
-            // accepts. Alternatives from `AlsoCol`/`AlsoBlock` are always
-            // deeper than `current`, so this differs from `current` only when
-            // an earlier floor already accepted a shallower column.
-            let min_accepted = alternatives[line]
-                .iter()
-                .copied()
-                .min()
-                .map_or(current, |m| m.min(current));
             match change.ty {
                 ChangeType::Block => {
                     primary[line] = current + indent_unit;
@@ -539,15 +526,21 @@ fn set_expectations(
                 // deeper than the block/hanging primary. A column at or left
                 // of the primary would legalize under-indented continuations
                 // (`x <- (\n  a +\n  b\n)` must still flag `b` under the
-                // default `Indented` style; `Either` uses `AlsoColFloor`).
+                // default `Indented` style; `Either` uses `AlsoColAligned`).
                 AltRule::AlsoCol(col) if col > primary[line] => alternatives[line].push(col),
                 AltRule::AlsoCol(_) => {}
                 AltRule::AlsoBlock => alternatives[line].push(current + indent_unit),
-                // `Either` accepts the chain-start column at or left of the
-                // block primary, floored at the minimum already-accepted
-                // value so genuine under-indentation stays flagged.
-                AltRule::AlsoColFloor(col) if col >= min_accepted => alternatives[line].push(col),
-                AltRule::AlsoColFloor(_) => {}
+                // `Either` accepts the chain-start column unconditionally —
+                // exactly the value `Aligned`'s `Hanging` pin would make the
+                // primary. Any guard here would break the superset property
+                // (`Aligned`'s pin replaces enclosing expectations, e.g. for
+                // `(a +\n b\n)` the chain starts left of the paren's block
+                // indent). Subsequent `Block`/`Double` changes shift this
+                // alternative just like the pin's base accumulates, so the
+                // aligned value stays represented. Under-indentation stays
+                // flagged because the chain-start line itself is still
+                // checked against its own expectation.
+                AltRule::AlsoColAligned(col) => alternatives[line].push(col),
             }
         }
     }
@@ -590,14 +583,16 @@ enum AltRule {
     /// Accept one `indent_unit` over the pre-change expectation too (the
     /// block form where lintr demands hanging/double).
     AlsoBlock,
-    /// Accept this absolute column too, even at or left of the post-change
-    /// primary, as long as it is not shallower than the minimum value the
-    /// line already accepted before this change ran. Emitted only by
-    /// `operator_change` under `InfixContinuationStyle::Either` — the looser
-    /// guard is what lets a chain-start column sitting at the enclosing
-    /// paren's own indent (an operand aligned with its peer) pass without
-    /// legalizing genuinely under-indented continuations.
-    AlsoColFloor(u32),
+    /// Accept this absolute column too, unconditionally — even at or left of
+    /// the post-change primary. Emitted only by `operator_change` under
+    /// `InfixContinuationStyle::Either`, carrying the chain-start column that
+    /// `InfixContinuationStyle::Aligned` would pin as the primary; accepting
+    /// it without a guard is what keeps `Either` a strict superset of
+    /// `Aligned` (the pin, too, replaces enclosing expectations). This never
+    /// legalizes a whole under-indented block: the chain-start line itself
+    /// carries no such alternative and is still checked against its own
+    /// expectation.
+    AlsoColAligned(u32),
 }
 
 /// One indent-inducing token and the line range it governs.
@@ -806,7 +801,7 @@ fn subtree_has_eol_opener(node: Node<'_>, lines: &[&str]) -> bool {
 /// Non-assignment operators honor `InfixContinuationStyle`: `Indented` keeps
 /// the block bump with the strictly-deeper chain-start tolerance, `Aligned`
 /// pins the continuation to the chain-start column outright, and `Either`
-/// accepts both (via `AltRule::AlsoColFloor`). Assignment operators are
+/// accepts both (via `AltRule::AlsoColAligned`). Assignment operators are
 /// exempt and always use the `Indented` shape: their RHS is not a peer
 /// operand of the LHS, so "align with the preceding operand" has no meaning
 /// there — `Aligned` would otherwise demand `x <-\n  a` put `a` in the
@@ -859,7 +854,9 @@ fn operator_change(
         match infix_style {
             InfixContinuationStyle::Indented => (ChangeType::Block, AltRule::AlsoCol(chain_col)),
             InfixContinuationStyle::Aligned => (ChangeType::Hanging(chain_col), AltRule::None),
-            InfixContinuationStyle::Either => (ChangeType::Block, AltRule::AlsoColFloor(chain_col)),
+            InfixContinuationStyle::Either => {
+                (ChangeType::Block, AltRule::AlsoColAligned(chain_col))
+            }
         }
     };
     out.push(Change {
@@ -1827,24 +1824,46 @@ mod tests {
     }
 
     #[test]
-    fn either_style_still_flags_under_indented_continuation() {
+    fn under_indented_block_still_flagged_on_chain_start_line() {
         // Both operands sit at column 0 inside a paren expecting 4. The
-        // chain-start column (0) is below the inherited expectation, so the
-        // floor rejects it and the continuation stays flagged.
+        // chain-start line carries no aligned alternative, so it stays
+        // flagged in every style; the continuation aligned with it inherits
+        // its (wrong) column under Aligned/Either — the cascade a Hanging
+        // anchor always produces — but the code as a whole is never clean.
         let text = "changed <- !(\nfirst_condition |\nsecond_condition\n)\n";
-        let diags = lint_with_style(text, 4, InfixContinuationStyle::Either);
-        assert!(
-            diagnostic_on_line(&diags, 2).is_some(),
-            "under-indented continuation must stay flagged under Either; got {diags:?}"
-        );
+        for style in ALL_STYLES {
+            let diags = lint_with_style(text, 4, style);
+            assert!(
+                diagnostic_on_line(&diags, 1).is_some(),
+                "chain-start line must stay flagged under {style:?}; got {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn either_style_accepts_chain_starting_on_opener_line() {
+        // The chain starts one column right of the paren opener — *left* of
+        // the paren's block indent (2). Aligned pins to column 1, so Either
+        // must accept it too; this is the shape that rules out any
+        // enclosing-expectation guard on the aligned alternative.
+        let text = "(a +\n b\n)\n";
+        for style in [
+            InfixContinuationStyle::Aligned,
+            InfixContinuationStyle::Either,
+        ] {
+            assert!(
+                lint_with_style(text, 2, style).is_empty(),
+                "got {:?} under {style:?}",
+                lint_with_style(text, 2, style)
+            );
+        }
     }
 
     #[test]
     fn either_style_accepts_nested_mixed_precedence_aligned_chain() {
-        // Regression for the floor guard: the inner `|>` Block shifts the
-        // outer floor alternative, so the guard must compare against the
-        // minimum already-accepted column, not the current primary alone —
-        // otherwise Either would reject this shape while Aligned accepts it.
+        // The inner `|>` Block shifts the outer aligned alternative; the
+        // inner operator's own aligned alternative must still be accepted so
+        // Either keeps accepting this shape exactly as Aligned does.
         let text = "x <- (\n  a +\n  b |>\n  c\n)\n";
         assert!(
             lint_with_style(text, 2, InfixContinuationStyle::Either).is_empty(),
@@ -1871,7 +1890,9 @@ mod tests {
             "data |>\n  f()\n",
             "x <- (\n  a +\n  b |>\n  c\n)\n",
             "x <- (\n  a +\n    b |>\n      c\n)\n",
+            "(a +\n b\n)\n",
             "obj$\nfield$\nvalue\n",
+            "changed <- !(\nfirst_condition |\nsecond_condition\n)\n",
             "x <- f() |>\n     g() + y +\n     z\n",
             "x <- f() |>\n  g() + y +\n  z\n",
         ];

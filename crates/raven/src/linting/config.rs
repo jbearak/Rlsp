@@ -49,8 +49,8 @@ pub enum InfixContinuationStyle {
     Aligned,
     /// Accept both the block-indent form and the chain-start column,
     /// including when the chain-start column sits at or left of the block
-    /// primary — but never below the expectation the line inherited from
-    /// its enclosing scope.
+    /// primary — a strict superset of the other two styles. Genuinely
+    /// under-indented code stays flagged on the chain-start line itself.
     Either,
 }
 
