@@ -42,8 +42,9 @@ type VisibleEditorLike = { document: { uri: vscode.Uri } };
  * create hidden text models with `workspace.openTextDocument()`. Those models
  * must remain synchronized with Raven for cross-file analysis, but should not
  * acquire their own Problems entries. Diff tabs contribute their modified
- * resource, matching vscode-languageclient's pull-diagnostics policy; visible
- * editors are unioned in so peek editors count even though they have no tab.
+ * resource, matching vscode-languageclient's pull-diagnostics policy. Other
+ * visible editors are unioned in so peek editors count even though they have
+ * no tab; a diff's visible original side is excluded from that union.
  *
  * The tab input inspection is structural so newer VS Code resource-backed tab
  * kinds automatically work when they expose `uri` or `modified`.
@@ -53,13 +54,18 @@ export function diagnosticResourceUris(
     visibleEditors: readonly VisibleEditorLike[] = vscode.window.visibleTextEditors,
 ): string[] {
     const uris = new Set<string>();
+    const diffOriginalUris = new Set<string>();
 
     for (const group of tabGroups) {
         for (const tab of group.tabs) {
             if (typeof tab.input !== 'object' || tab.input === null) {
                 continue;
             }
-            const input = tab.input as { modified?: unknown; uri?: unknown };
+            const input = tab.input as {
+                original?: unknown;
+                modified?: unknown;
+                uri?: unknown;
+            };
             const resource = input.modified instanceof vscode.Uri
                 ? input.modified
                 : input.uri instanceof vscode.Uri
@@ -68,14 +74,49 @@ export function diagnosticResourceUris(
             if (resource) {
                 uris.add(resource.toString());
             }
+            if (
+                input.modified instanceof vscode.Uri
+                && input.original instanceof vscode.Uri
+            ) {
+                diffOriginalUris.add(input.original.toString());
+            }
         }
     }
 
     for (const editor of visibleEditors) {
-        uris.add(editor.document.uri.toString());
+        const uri = editor.document.uri.toString();
+        if (!diffOriginalUris.has(uri)) {
+            uris.add(uri);
+        }
     }
 
     return [...uris];
+}
+
+/**
+ * Remove diagnostics retained for resources outside the current editor-owned
+ * set. vscode-languageclient deliberately reuses its push-diagnostic
+ * collection after an automatic server restart, so server-side clearing alone
+ * cannot reconcile tabs that changed while the server was unavailable.
+ */
+export function clearIneligibleDiagnostics(
+    collection: vscode.DiagnosticCollection | undefined,
+    eligibleUris: readonly string[],
+): void {
+    if (!collection) {
+        return;
+    }
+
+    const eligible = new Set(eligibleUris);
+    const stale: vscode.Uri[] = [];
+    collection.forEach((uri) => {
+        if (!eligible.has(uri.toString())) {
+            stale.push(uri);
+        }
+    });
+    for (const uri of stale) {
+        collection.delete(uri);
+    }
 }
 
 /**

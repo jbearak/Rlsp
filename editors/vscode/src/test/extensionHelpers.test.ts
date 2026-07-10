@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
+    clearIneligibleDiagnostics,
     diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
     isRDocument,
@@ -25,6 +26,7 @@ suite('Extension Helpers', () => {
                 ],
             }],
             [
+                { document: { uri: original } },
                 { document: { uri: modified } },
                 { document: { uri: peeked } },
             ],
@@ -35,6 +37,47 @@ suite('Extension Helpers', () => {
             modified.toString(),
             peeked.toString(),
         ]);
+    });
+
+    test('diagnosticResourceUris keeps a diff original that has its own tab', () => {
+        const original = vscode.Uri.file('/tmp/original-with-tab.R');
+        const modified = vscode.Uri.file('/tmp/modified-with-tab.R');
+
+        const result = diagnosticResourceUris(
+            [{
+                tabs: [
+                    { input: { original, modified } },
+                    { input: { uri: original } },
+                ],
+            }],
+            [
+                { document: { uri: original } },
+                { document: { uri: modified } },
+            ],
+        );
+
+        assert.deepStrictEqual(result, [modified.toString(), original.toString()]);
+    });
+
+    test('clearIneligibleDiagnostics prunes only retained background resources', () => {
+        const eligible = vscode.Uri.file('/tmp/eligible.R');
+        const hidden = vscode.Uri.file('/tmp/hidden.R');
+        const collection = vscode.languages.createDiagnosticCollection(
+            'raven-diagnostic-ownership-test',
+        );
+        const marker = new vscode.Diagnostic(new vscode.Range(0, 0, 0, 1), 'marker');
+
+        try {
+            collection.set(eligible, [marker]);
+            collection.set(hidden, [marker]);
+
+            clearIneligibleDiagnostics(collection, [eligible.toString()]);
+
+            assert.strictEqual(collection.get(eligible)?.length, 1);
+            assert.strictEqual((collection.get(hidden) ?? []).length, 0);
+        } finally {
+            collection.dispose();
+        }
     });
 
     test('isRDocument accepts untitled R-like documents by language id', () => {

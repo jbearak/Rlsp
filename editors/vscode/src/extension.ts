@@ -14,12 +14,14 @@ import {
     RavenInitializationOptions,
 } from './initializationOptions';
 import {
+    clearIneligibleDiagnostics,
     diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
     isRDocument,
     planDotInWordMigration,
     resolveTabSizeForDocument,
 } from './extensionHelpers';
+import { registerRunningStateReconciliation } from './client-state';
 import {
     shouldTriggerDirectivePathSuggest,
     shouldTriggerNestedPathSuggest,
@@ -155,6 +157,13 @@ function sendDocumentIndentUnitsNotification() {
  * Send editor activity and diagnostic-resource ownership to the server.
  */
 function sendActivityNotification() {
+    const diagnosticUris = diagnosticResourceUris();
+
+    // vscode-languageclient keeps this collection across automatic crash
+    // restarts. Prune it even while the server is down so a tab closed during
+    // downtime cannot leave stale Problems behind.
+    clearIneligibleDiagnostics(client?.diagnostics, diagnosticUris);
+
     // Same guard as sendDocumentIndentUnitsNotification: editor-activity
     // listeners can fire before the client starts (or when it never did),
     // and sendNotification throws unless the client is running.
@@ -178,9 +187,15 @@ function sendActivityNotification() {
     client.sendNotification('raven/activeDocumentsChanged', {
         activeUri: activeUriStr,
         visibleUris: visibleUris,
-        diagnosticUris: diagnosticResourceUris(),
+        diagnosticUris,
         timestampMs: Date.now(),
     });
+}
+
+/** Resend all editor-owned document state after a language-client start. */
+function synchronizeClientDocumentState() {
+    sendDocumentIndentUnitsNotification();
+    sendActivityNotification();
 }
 
 /**
@@ -311,6 +326,19 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         clientOptions
     );
 
+    // The listener survives vscode-languageclient's internal crash cleanup.
+    // `Running` fires before start() resolves, so the helper waits for that
+    // same in-flight promise before resending current ownership.
+    context.subscriptions.push(
+        registerRunningStateReconciliation(
+            client,
+            synchronizeClientDocumentState,
+            (error) => outputChannel.appendLine(
+                `Raven: failed to reconcile document state after restart: ${String(error)}`,
+            ),
+        ),
+    );
+
     // Pre-check the binary before starting the LSP. vscode-languageclient's
     // generic "couldn't create connection to server" toast hides the real
     // cause (missing binary, no exec bit, wrong target). Surface the actual
@@ -365,12 +393,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     );
 
     if (binaryCheck.ok) {
-        void client.start().then(() => {
-            // Send client-owned state after the LSP handshake completes so the
-            // server has correct values for documents that were already open.
-            sendDocumentIndentUnitsNotification();
-            sendActivityNotification();
-        });
+        void client.start();
     } else {
         const detail = configuredPath
             ? `Raven LSP cannot start: configured raven.server.path "${serverPath}" is not a usable binary (${binaryCheck.reason}). Update raven.server.path or clear it to use the bundled binary.`
@@ -461,8 +484,10 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         vscode.commands.registerCommand('raven.restart', async () => {
             (serverOptions as { options: { env: Record<string, string> | undefined } }).options.env = buildRustLogEnv();
             await client.restart();
-            sendDocumentIndentUnitsNotification();
-            sendActivityNotification();
+            // Preserve the command's completion contract. The Running-state
+            // listener also covers this transition, but its continuation need
+            // not complete before executeCommand's caller resumes.
+            synchronizeClientDocumentState();
         })
     );
 
