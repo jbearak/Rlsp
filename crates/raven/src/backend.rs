@@ -5059,6 +5059,19 @@ async fn run_debounced_diagnostics(
         state
             .cross_file_revalidation
             .complete(&affected_uri, generation);
+
+        // Convergence backstop for the unserialized cancel-vs-consume window:
+        // a superseding schedule (dependency edit) can cancel this task in the
+        // instants between the final pre-consume re-check and
+        // try_consume_publish, in which case this publish consumed the force
+        // marker meant for the successor and the successor would be gated out
+        // at the same version. Restoring a marker here lets the successor's
+        // fresh publish through; if the cancellation instead came from
+        // did_close, the surplus marker is either cleared by the close or
+        // admits at most one redundant fresh same-version republish.
+        if cancel.is_cancelled() {
+            state.diagnostics_gate.mark_force_republish(&affected_uri);
+        }
     }
 }
 
