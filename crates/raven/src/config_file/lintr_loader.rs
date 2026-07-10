@@ -401,6 +401,15 @@ fn apply_linter_call(
             // Resolve both formals using R's named-then-positional argument
             // binding so `object_name_linter(character(), "^x$")` maps the
             // second positional value to `regexes`.
+            //
+            // Structural fail-safe: any named token whose tag matches
+            // neither formal (a typo, an R construct the static parser
+            // can't interpret, an abbreviated tag, ...) is counted as an
+            // unrecognized construct. Such tokens are excluded from both
+            // named and positional binding, so without this they would be
+            // dropped in silence — the batch warning is the guarantee that
+            // no argument is ever ignored without the user hearing about it.
+            note_unmatched_named_args(args, &["styles", "regexes"], unrecognized_constructs);
             let mut accepted_styles = Vec::new();
             let mut accepted_regexes = Vec::new();
             let mut emit_styles = false;
@@ -646,8 +655,15 @@ fn has_unquoted_eq(s: &str) -> bool {
 /// Split at the first top-level `=` outside strings, comments, and brackets.
 fn split_top_level_eq(s: &str) -> Option<(&str, &str)> {
     let mut st = ScanState::default();
+    let bytes = s.as_bytes();
     for (index, c) in s.char_indices() {
         if st.step(c) && c == '=' && st.depth == 0 {
+            // A `=` that is part of a comparison operator (`==`, `!=`, `<=`,
+            // `>=`) is not a named-argument separator.
+            let prev = s[..index].chars().next_back();
+            if matches!(prev, Some('=' | '!' | '<' | '>')) || bytes.get(index + 1) == Some(&b'=') {
+                continue;
+            }
             return Some((&s[..index], &s[index + c.len_utf8()..]));
         }
     }
@@ -976,13 +992,47 @@ fn find_named_arg<'a>(tokens: &[&'a str], name: &str) -> Option<&'a str> {
     })
 }
 
+/// Count every named token whose tag matches none of `formals` as an
+/// unrecognized construct. Named tokens with unmatched tags are excluded
+/// from both named and positional binding, so this is the single guard that
+/// keeps them from being dropped silently — whatever exotic-but-valid R
+/// produced them (typos, abbreviated tags, tags the static parser can't
+/// decode), the user gets the batch warning and the untouched formals keep
+/// their fail-safe defaults.
+fn note_unmatched_named_args(args: &str, formals: &[&str], unrecognized_constructs: &mut usize) {
+    if args.trim().is_empty() {
+        return;
+    }
+    let mut matched = vec![false; formals.len()];
+    let mut positional = 0usize;
+    for token in split_top_level_commas(args) {
+        if let Some((lhs, _)) = split_top_level_eq(token) {
+            let tag = lhs.trim();
+            match formals
+                .iter()
+                .position(|formal| arg_tag_matches(tag, formal))
+            {
+                Some(index) if !matched[index] => matched[index] = true,
+                // A duplicate tag (R errors: "matched by multiple actual
+                // arguments") or an unmatched one — either way the token is
+                // dropped from binding, so it must be warned about.
+                _ => *unrecognized_constructs += 1,
+            }
+        } else {
+            positional += 1;
+        }
+    }
+    // Positional tokens (including missing-argument placeholders) beyond the
+    // formals left unclaimed by named tags are unused arguments in R; count
+    // them so extra values are never dropped in silence.
+    let free = formals.len() - matched.iter().filter(|hit| **hit).count();
+    *unrecognized_constructs += positional.saturating_sub(free);
+}
+
 /// True when an argument tag names the formal `name`. Handles the bare form,
 /// backtick-quoted names (`` `a` `` — verbatim contents), and string-literal
-/// tags (`"a"`, `'a'`, raw strings), which R decodes like any string literal.
-/// Escapes that [`parse_r_string_literal`] deliberately preserves verbatim
-/// (hex/octal) are not decoded here either — an escaped-tag `.lintr` call is
-/// far outside real-world configs, and sharing the one decoder keeps the two
-/// paths from drifting.
+/// tags (`"a"`, `'a'`, raw strings), which decode through the same
+/// [`parse_r_string_literal`] used for values so the two paths cannot drift.
 fn arg_tag_matches(tag: &str, name: &str) -> bool {
     if tag == name {
         return true;
@@ -1164,17 +1214,15 @@ fn parse_object_name_string_list(
 /// R raw string literals (`r"(...)"` and friends) are handled by
 /// [`parse_r_raw_string_literal`] first — their content is taken verbatim.
 ///
-/// Decoded escapes: `\\`, `\"`, `\'`, and R's single-char control escapes
-/// (`\n`, `\t`, `\r`, `\a`, `\b`, `\f`, `\v`) — the control set matters
-/// because the regex engine would otherwise reinterpret sequences like `\b`
-/// (R: backspace char) as regex syntax (word boundary). Remaining sequences
-/// are preserved verbatim (best-effort): R's `\xNN` / `\uNNNN` escapes reach
-/// the regex engine, which interprets them identically, and style names are
-/// never written with them in practice. Octal escapes (`\0`–`\7`...) also
-/// pass through verbatim — deliberately NOT decoded, because `\0` may start a
-/// multi-digit octal like `\056` and a partial decode would corrupt it; the
-/// regex engine rejects octal syntax, so such patterns fail closed
-/// (warned and dropped) instead of silently changing meaning.
+/// Decoded escapes: `\\`, `\"`, `\'`, R's single-char control escapes
+/// (`\n`, `\t`, `\r`, `\a`, `\b`, `\f`, `\v`), and R's numeric escapes —
+/// octal (`\056`, 1–3 digits), hex (`\x2e`, 1–2 digits), and unicode
+/// (`\uNNNN` / `\u{NNNN}`, `\UNNNNNNNN` / `\U{...}`). Full decoding matters
+/// because the regex engine must see the same characters R would produce:
+/// `\b` left undecoded would be a word boundary instead of a backspace, and
+/// `\x5e` would be a *literal* caret where R's decoded `^` is an anchor.
+/// Any sequence R itself rejects (`\p`, empty `\x`, NUL, out-of-range code
+/// points) returns `None` so the caller counts it as unrecognized.
 fn parse_r_string_literal(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if let Some(value) = parse_r_raw_string_literal(raw) {
@@ -1189,7 +1237,7 @@ fn parse_r_string_literal(raw: &str) -> Option<String> {
     }
     let inner = &raw[quote.len_utf8()..raw.len() - quote.len_utf8()];
     let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
+    let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
         if c == quote {
             // Unescaped matching quote before the end of the token: the
@@ -1212,16 +1260,74 @@ fn parse_r_string_literal(raw: &str) -> Option<String> {
             Some('b') => out.push('\u{08}'),
             Some('f') => out.push('\u{0C}'),
             Some('v') => out.push('\u{0B}'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
+            Some(digit @ '0'..='7') => {
+                // Octal: the digit just consumed plus up to two more.
+                let mut value = digit.to_digit(8).unwrap_or(0);
+                for _ in 0..2 {
+                    match chars.peek().and_then(|next| next.to_digit(8)) {
+                        Some(d) => {
+                            chars.next();
+                            value = value * 8 + d;
+                        }
+                        None => break,
+                    }
+                }
+                out.push(decode_code_point(value)?);
             }
+            Some('x') => out.push(decode_code_point(read_hex_escape(&mut chars, 2, false)?)?),
+            Some('u') => out.push(decode_code_point(read_hex_escape(&mut chars, 4, true)?)?),
+            Some('U') => out.push(decode_code_point(read_hex_escape(&mut chars, 8, true)?)?),
+            // Any other escape (`\p`, `\s`, ...) is an error in R strings.
+            Some(_) => return None,
             // Trailing lone backslash: the "closing" quote is actually
             // escaped (`"abc\"`), i.e. the literal never terminated.
             None => return None,
         }
     }
     Some(out)
+}
+
+/// Read the digits of an R hex escape (`\xNN`, `\uNNNN`, `\U...`), consuming
+/// up to `max_digits` hex digits, optionally wrapped in `{...}` braces
+/// (`allow_braces`, R's `\u{...}` form). Returns `None` for zero digits or a
+/// missing closing brace — both are string-literal errors in R.
+fn read_hex_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    max_digits: usize,
+    allow_braces: bool,
+) -> Option<u32> {
+    let braced = allow_braces && chars.peek() == Some(&'{');
+    if braced {
+        chars.next();
+    }
+    let mut value = 0u32;
+    let mut digits = 0usize;
+    while digits < max_digits {
+        match chars.peek().and_then(|next| next.to_digit(16)) {
+            Some(d) => {
+                chars.next();
+                value = value * 16 + d;
+                digits += 1;
+            }
+            None => break,
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    if braced && chars.next() != Some('}') {
+        return None;
+    }
+    Some(value)
+}
+
+/// Convert a decoded escape value into a character, rejecting NUL (R: "nul
+/// character not allowed") and out-of-range code points like R does.
+fn decode_code_point(value: u32) -> Option<char> {
+    if value == 0 {
+        return None;
+    }
+    char::from_u32(value)
 }
 
 /// Parse a *single, complete* R raw string literal token (R >= 4.0):
@@ -2284,14 +2390,33 @@ mod tests {
             parse_r_string_literal(r#""\a\f\v""#),
             Some("\u{07}\u{0C}\u{0B}".to_string())
         );
-        // Octal escapes pass through verbatim — `\0` must NOT be decoded in
-        // isolation, or a multi-digit octal like `\056` (R for `.`) would be
-        // corrupted into NUL + "56". Verbatim octal fails regex compilation
-        // downstream, which is the fail-closed path.
+        // Numeric escapes decode with R semantics: octal `\056` is `.`,
+        // hex `\x2e` is `.`, `\x5e` is a caret (an anchor once the regex
+        // engine sees it, exactly as R would produce), and both unicode
+        // forms work. NUL and empty/invalid escapes are string errors.
+        assert_eq!(parse_r_string_literal(r#""\056""#), Some(".".to_string()));
+        assert_eq!(parse_r_string_literal(r#""\x2e""#), Some(".".to_string()));
         assert_eq!(
-            parse_r_string_literal(r#""\056""#),
-            Some(r"\056".to_string())
+            parse_r_string_literal(r#""\x5efoo$""#),
+            Some("^foo$".to_string())
         );
+        assert_eq!(
+            parse_r_string_literal(r#""\u2e19""#),
+            Some("\u{2e19}".to_string())
+        );
+        assert_eq!(
+            parse_r_string_literal(r#""\u{2e}x""#),
+            Some(".x".to_string())
+        );
+        assert_eq!(
+            parse_r_string_literal(r#""\U0001F600""#),
+            Some("\u{1F600}".to_string())
+        );
+        assert_eq!(parse_r_string_literal(r#""\0""#), None);
+        assert_eq!(parse_r_string_literal(r#""\x""#), None);
+        assert_eq!(parse_r_string_literal(r#""\u{2e""#), None);
+        // Escapes R rejects (`\p`, `\s`) are literal errors, not passthrough.
+        assert_eq!(parse_r_string_literal(r#""\p""#), None);
     }
 
     #[test]
@@ -2588,6 +2713,30 @@ mod tests {
         );
         assert!(!mapped_object_name_style(&out));
         assert!(has_unrecognized_warning(&out));
+    }
+
+    #[test]
+    fn object_name_unmatched_named_tokens_warn_instead_of_silence() {
+        // Named tokens whose tag matches no formal — typos, R's partial
+        // matching (`sty =`), tags the static parser can't decode — are
+        // excluded from binding; the structural guard makes them surface in
+        // the batch warning rather than vanish silently.
+        for input in [
+            "object_name_linter(sty = \"camelCase\")",
+            "object_name_linter(stylez = \"camelCase\", regexes = \"^x$\")",
+            "object_name_linter(\"reg\\\\x65xes\" = \"^x$\")",
+        ] {
+            let out = load_str(&format!("linters: linters_with_defaults({input})\n"));
+            assert!(
+                has_unrecognized_warning(&out),
+                "{input}: {:?}",
+                out.warnings
+            );
+        }
+        // The defaults are retained for the untouched formals.
+        let out =
+            load_str("linters: linters_with_defaults(object_name_linter(sty = \"camelCase\"))\n");
+        assert!(!mapped_object_name_style(&out));
     }
 
     #[test]
