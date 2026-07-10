@@ -3,8 +3,9 @@
 //! Mirrors `lintr::equals_na_linter`. `x == NA` is silently wrong: the result
 //! is itself `NA`, never `TRUE`/`FALSE`. The idiomatic check is `is.na(x)`.
 //! Applies to every typed `NA` token tree-sitter-r recognises (`NA`,
-//! `NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`), both as `==`
-//! and `!=`, on either side.
+//! `NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`), as `==` and
+//! `!=` on either side, and as `x %in% NA` (RHS only — `NA %in% x` is a
+//! legitimate membership test, and lintr leaves it alone).
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -51,12 +52,12 @@ fn check(
         return;
     };
     let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
-    if op_text != "==" && op_text != "!=" {
+    if op_text != "==" && op_text != "!=" && op_text != "%in%" {
         return;
     }
     let lhs = node.child_by_field_name("lhs");
     let rhs = node.child_by_field_name("rhs");
-    let na_side = if lhs.is_some_and(is_na_literal) {
+    let na_side = if op_text != "%in%" && lhs.is_some_and(is_na_literal) {
         lhs
     } else if rhs.is_some_and(is_na_literal) {
         rhs

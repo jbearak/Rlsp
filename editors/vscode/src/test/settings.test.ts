@@ -138,9 +138,9 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.noTabSeverity', jsonPath: ['linting', 'noTabSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
     { vsCodeKey: 'linting.trailingBlankLinesSeverity', jsonPath: ['linting', 'trailingBlankLinesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
     { vsCodeKey: 'linting.assignmentOperatorSeverity', jsonPath: ['linting', 'assignmentOperatorSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.objectNameStyleFunction', jsonPath: ['linting', 'objectNameStyleFunction'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
-    { vsCodeKey: 'linting.objectNameStyleVariable', jsonPath: ['linting', 'objectNameStyleVariable'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
-    { vsCodeKey: 'linting.objectNameStyleArgument', jsonPath: ['linting', 'objectNameStyleArgument'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
+    { vsCodeKey: 'linting.objectNameStyleFunction', jsonPath: ['linting', 'objectNameStyleFunction'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'symbols', 'any'] as const, defaultWhenUnconfigured: ['snake_case', 'symbols'] },
+    { vsCodeKey: 'linting.objectNameStyleVariable', jsonPath: ['linting', 'objectNameStyleVariable'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'symbols', 'any'] as const, defaultWhenUnconfigured: ['snake_case', 'symbols'] },
+    { vsCodeKey: 'linting.objectNameStyleArgument', jsonPath: ['linting', 'objectNameStyleArgument'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'symbols', 'any'] as const, defaultWhenUnconfigured: ['snake_case', 'symbols'] },
     { vsCodeKey: 'linting.objectNameRegexesFunction', jsonPath: ['linting', 'objectNameRegexesFunction'], type: 'array', defaultWhenUnconfigured: [] },
     { vsCodeKey: 'linting.objectNameRegexesVariable', jsonPath: ['linting', 'objectNameRegexesVariable'], type: 'array', defaultWhenUnconfigured: [] },
     { vsCodeKey: 'linting.objectNameRegexesArgument', jsonPath: ['linting', 'objectNameRegexesArgument'], type: 'array', defaultWhenUnconfigured: [] },
@@ -392,9 +392,9 @@ suite('Settings Transmission Property Tests', () => {
                 indentationUnit: 2,
                 assignmentOperator: '<-',
                 stringDelimiter: '"',
-                objectNameStyleFunction: 'snake_case',
-                objectNameStyleVariable: 'snake_case',
-                objectNameStyleArgument: 'snake_case',
+                objectNameStyleFunction: ['snake_case', 'symbols'],
+                objectNameStyleVariable: ['snake_case', 'symbols'],
+                objectNameStyleArgument: ['snake_case', 'symbols'],
                 objectNameRegexesFunction: [],
                 objectNameRegexesVariable: [],
                 objectNameRegexesArgument: [],
@@ -586,9 +586,9 @@ suite('Settings Transmission Unit Tests', () => {
             indentationUnit: 2,
             assignmentOperator: '<-',
             stringDelimiter: '"',
-            objectNameStyleFunction: 'snake_case',
-            objectNameStyleVariable: 'snake_case',
-            objectNameStyleArgument: 'snake_case',
+            objectNameStyleFunction: ['snake_case', 'symbols'],
+            objectNameStyleVariable: ['snake_case', 'symbols'],
+            objectNameStyleArgument: ['snake_case', 'symbols'],
             objectNameRegexesFunction: [],
             objectNameRegexesVariable: [],
             objectNameRegexesArgument: [],
@@ -644,7 +644,7 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.linting?.commentedCodeSeverity, 'warning');
         // Untouched keys still emit their defaults.
         assert.strictEqual(options.linting?.trailingWhitespaceSeverity, 'information');
-        assert.strictEqual(options.linting?.objectNameStyleArgument, 'snake_case');
+        assert.deepStrictEqual(options.linting?.objectNameStyleArgument, ['snake_case', 'symbols']);
         assert.deepStrictEqual(options.linting?.objectNameRegexesVariable, []);
         assert.deepStrictEqual(options.linting?.objectNameRegexesArgument, []);
     });

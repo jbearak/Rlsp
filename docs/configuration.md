@@ -224,7 +224,7 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 |---|---|---|
 | `raven.linting.enabled` | `"auto"` | Master switch (`"auto"` / `"on"` / `"off"` / `true` / `false`). See the [behavior matrix](linting.md#behavior-matrix). |
 | `raven.linting.readHomeLintr` | `false` | VS Code/LSP-client-only. Include the literal home-directory `~/.lintr` in discovery. Workspace and non-home parent `.lintr` files are still discovered when this is `false`; the CLI uses literal `~/.lintr` only when passed explicitly with `--config ~/.lintr`. |
-| `raven.linting.lineLength` | `80` | Maximum line length (UTF-16 code units) |
+| `raven.linting.lineLength` | `80` | Maximum line length (characters) |
 | `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
 | `raven.linting.indentationUnit` | `"auto"` | Spaces per indent level used by the indentation lint. In VS Code, `"auto"` tracks each file's resolved `editor.tabSize`; set an integer `1..=8` for a fixed unit. |
 | `raven.linting.assignmentOperator` | `"<-"` | Preferred assignment operator (`"<-"` or `"="`) |
@@ -234,9 +234,9 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 | `raven.linting.noTabSeverity` | `"information"` | Severity for tab characters |
 | `raven.linting.trailingBlankLinesSeverity` | `"information"` | Severity for blank lines or missing newline at end of file |
 | `raven.linting.assignmentOperatorSeverity` | `"information"` | Severity for mismatched assignment operator |
-| `raven.linting.objectNameStyleFunction` | `"snake_case"` | Naming schemes for functions. Accepts one style string or an array of styles (`"snake_case"` \| `"camelCase"` \| `"dotted.case"` \| `"UPPER_CASE"` \| `"lowercase"` \| `"any"`); styles are ORed with function regexes. |
-| `raven.linting.objectNameStyleVariable` | `"snake_case"` | Naming schemes for variables (same string-or-array enum as above); styles are ORed with variable regexes. |
-| `raven.linting.objectNameStyleArgument` | `"snake_case"` | Naming schemes for function formal arguments (same string-or-array enum as above); styles are ORed with argument regexes. |
+| `raven.linting.objectNameStyleFunction` | `["snake_case", "symbols"]` | Naming schemes for functions. Accepts one style string or an array of styles (`"snake_case"` \| `"camelCase"` \| `"dotted.case"` \| `"UPPER_CASE"` \| `"lowercase"` \| `"symbols"` \| `"any"`); styles are ORed with function regexes. |
+| `raven.linting.objectNameStyleVariable` | `["snake_case", "symbols"]` | Naming schemes for variables (same string-or-array enum as above); styles are ORed with variable regexes. |
+| `raven.linting.objectNameStyleArgument` | `["snake_case", "symbols"]` | Naming schemes for function formal arguments (same string-or-array enum as above); styles are ORed with argument regexes. |
 | `raven.linting.objectNameRegexesFunction` | `[]` | Additional Rust regexes accepted for function names. Partial match against the full identifier, including any leading `.`; use `^...$` for whole-name matches. Empty strings are rejected. |
 | `raven.linting.objectNameRegexesVariable` | `[]` | Additional Rust regexes accepted for variable names (same matching rules as above). |
 | `raven.linting.objectNameRegexesArgument` | `[]` | Additional Rust regexes accepted for function formal argument names (same matching rules as above). |

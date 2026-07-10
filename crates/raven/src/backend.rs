@@ -675,7 +675,8 @@ pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
 /// * `objectNameStyleFunction`, `objectNameStyleVariable`,
 ///   `objectNameStyleArgument` (string or array of strings, each one of
 ///   `"snake_case" | "camelCase" | "dotted.case" | "UPPER_CASE" |
-///   "lowercase" | "any"`) — accepted named styles for each symbol kind.
+///   "lowercase" | "symbols" | "any"`) — accepted named styles for each
+///   symbol kind.
 ///   `"any"` anywhere in the list disables that kind without disabling the
 ///   rule entirely. An explicit empty array plus regexes means regex-only.
 /// * `objectNameRegexesFunction`, `objectNameRegexesVariable`,

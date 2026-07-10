@@ -1,6 +1,8 @@
 //! Flag lines wider than the configured maximum.
 //!
-//! Width is measured in UTF-16 code units to align with LSP positions. Tabs
+//! Width is measured in characters (Unicode scalar values), matching lintr's
+//! `nchar()` — an emoji counts as 1 even though it spans two UTF-16 units in
+//! LSP positions. Tabs
 //! count as one unit, matching `lintr::line_length_linter`'s convention.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
@@ -30,7 +32,7 @@ pub(crate) fn collect(
         } else {
             line
         };
-        let width: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
+        let width: u32 = line.chars().count() as u32;
         if width <= max_len {
             continue;
         }

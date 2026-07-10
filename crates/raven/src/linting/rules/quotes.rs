@@ -1,9 +1,12 @@
 //! Enforce a single string-literal delimiter (`"` or `'`).
 //!
 //! Mirrors `lintr::quotes_linter` / `lintr::single_quotes_linter` — the
-//! configured delimiter is required for every regular string literal. Raw
-//! strings (`r"(...)"`, `R'(...)'`, `r"---(...)---"`) are skipped: their outer
-//! quote choice is constrained by the body, not by user style.
+//! configured delimiter is required for every string literal, *including* raw
+//! strings (`R'(...)'` is flagged under the double-quote default, matching
+//! lintr). A literal whose source text contains the preferred quote character
+//! anywhere (e.g. `'he said "hi"'`, `'\"hi\"'`, `r'(")'`) is exempt — the
+//! author could not switch delimiters without escaping, and lintr's regex
+//! (`^'([^"]|\\')*'$`) skips exactly those.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -56,18 +59,27 @@ fn check_string(
         Some(s) => s,
         None => return,
     };
-    if is_raw_string(lit) {
-        return;
-    }
-    let first = match lit.as_bytes().first() {
-        Some(b) => *b,
-        None => return,
+    let bytes = lit.as_bytes();
+    // The delimiter quote is the first byte, or the second for raw strings
+    // (`r"(...)"` / `R'(...)'`).
+    let quote = match (bytes.first(), bytes.get(1)) {
+        (Some(b'r') | Some(b'R'), Some(&q)) if matches!(q, b'"' | b'\'') => q,
+        (Some(&q), _) => q,
+        (None, _) => return,
     };
-    let (wanted, got) = match (delimiter, first) {
+    let (wanted, got) = match (delimiter, quote) {
         (StringDelimiter::Double, b'\'') => ('"', '\''),
         (StringDelimiter::Single, b'"') => ('\'', '"'),
         _ => return,
     };
+    // Content exemption: if the literal's raw source contains the preferred
+    // quote character anywhere, switching delimiters would force escaping —
+    // lintr leaves these alone. (The literal's own delimiters are the `got`
+    // character, so scanning the whole text is equivalent to scanning the
+    // content.)
+    if lit.contains(wanted) {
+        return;
+    }
     let line_no = node.start_position().row as u32;
     if suppressions.is_suppressed_code(line_no, rule_ids::QUOTES) {
         return;
@@ -91,35 +103,4 @@ fn check_string(
         message: format!("String uses `{got}`; configured delimiter is `{wanted}`."),
         ..Default::default()
     });
-}
-
-/// Detect R raw-string literals: `r"(...)"`, `R"[...]"`, `r"---(...)---"` etc.
-/// They start with `r`/`R`, then a quote, then optional dashes, then `(` / `[`
-/// / `{`. We only need a minimal prefix check to skip the rule.
-fn is_raw_string(lit: &str) -> bool {
-    let bytes = lit.as_bytes();
-    if bytes.len() < 2 {
-        return false;
-    }
-    if bytes[0] != b'r' && bytes[0] != b'R' {
-        return false;
-    }
-    matches!(bytes[1], b'"' | b'\'')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_string_prefix_is_detected() {
-        assert!(is_raw_string("r\"(hi)\""));
-        assert!(is_raw_string("R\"[hi]\""));
-        assert!(is_raw_string("r'---(hi)---'"));
-        assert!(!is_raw_string("\"hi\""));
-        assert!(!is_raw_string("'hi'"));
-        // `r` alone (e.g. identifier) is not a raw string.
-        assert!(!is_raw_string("r"));
-        assert!(!is_raw_string(""));
-    }
 }

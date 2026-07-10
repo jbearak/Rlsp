@@ -1,9 +1,15 @@
 //! Flag identifier names longer than the configured maximum.
 //!
-//! Mirrors `lintr::object_length_linter`. Length is measured in characters
-//! after stripping the same decorative leading-dot that `object_name` accepts
-//! ("hidden identifier" convention). Backtick-quoted names and non-ASCII
-//! identifiers are skipped — matching `object_name`'s carve-outs.
+//! Mirrors `lintr::object_length_linter`. The raw token is normalized with
+//! `object_name`'s `strip_name` (backticks, quotes, `%`, trailing `<-`), a
+//! leading `<generic>.` prefix is removed when `<generic>` is a known base
+//! S3 generic or a generic declared in this file (lintr: "only lints S3
+//! implementations if the class names are too long"), and the remainder is
+//! measured in characters. Unlike `object_name`, there is no leading-dot or
+//! non-ASCII carve-out — lintr counts those characters, and so do we. Where
+//! lintr's generic-prefix removal is order-dependent (its regex alternation
+//! follows the vector order of `.base_s3_generics`), Raven deterministically
+//! removes the *longest* matching generic prefix.
 //!
 //! Only positions that introduce a new symbol are checked:
 //! assignment targets (`<-`, `<<-`, top-level `=`, `->`, `->>`) and formal
@@ -18,6 +24,9 @@ use tree_sitter::Node;
 use crate::linting::LINT_SOURCE;
 use crate::linting::nolint::Suppressions;
 use crate::linting::rule_ids;
+use crate::linting::rules::object_name::{
+    collect_declared_s3_generics, is_known_s3_generic, strip_name,
+};
 use crate::utf16::byte_offset_to_utf16_column;
 
 pub(crate) fn collect(
@@ -28,27 +37,39 @@ pub(crate) fn collect(
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    visit(root, text, max_length, severity, suppressions, out);
+    let declared_generics = collect_declared_s3_generics(root, text);
+    let cx = CheckContext {
+        declared_generics: &declared_generics,
+        severity,
+        suppressions,
+    };
+    visit(root, text, max_length, &cx, out);
+}
+
+/// Immutable per-run inputs threaded through the AST walk.
+struct CheckContext<'a> {
+    /// Same-file `UseMethod` generics (see `object_name`), so methods of
+    /// locally declared generics get the generic-prefix removal too.
+    declared_generics: &'a std::collections::HashSet<String>,
+    severity: DiagnosticSeverity,
+    suppressions: &'a Suppressions,
 }
 
 fn visit(
     node: Node<'_>,
     text: &str,
     max_length: u32,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
+    cx: &CheckContext<'_>,
     out: &mut Vec<Diagnostic>,
 ) {
     match node.kind() {
-        "binary_operator" => check_assignment(node, text, max_length, severity, suppressions, out),
-        "function_definition" => {
-            check_parameters(node, text, max_length, severity, suppressions, out)
-        }
+        "binary_operator" => check_assignment(node, text, max_length, cx, out),
+        "function_definition" => check_parameters(node, text, max_length, cx, out),
         _ => {}
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit(child, text, max_length, severity, suppressions, out);
+        visit(child, text, max_length, cx, out);
     }
 }
 
@@ -56,8 +77,7 @@ fn check_assignment(
     node: Node<'_>,
     text: &str,
     max_length: u32,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
+    cx: &CheckContext<'_>,
     out: &mut Vec<Diagnostic>,
 ) {
     let Some(op) = node.child_by_field_name("operator") else {
@@ -81,15 +101,14 @@ fn check_assignment(
     let name = text
         .get(target.start_byte()..target.end_byte())
         .unwrap_or("");
-    check_name(target, name, max_length, text, severity, suppressions, out);
+    check_name(target, name, max_length, text, cx, out);
 }
 
 fn check_parameters(
     node: Node<'_>,
     text: &str,
     max_length: u32,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
+    cx: &CheckContext<'_>,
     out: &mut Vec<Diagnostic>,
 ) {
     let Some(params) = node.child_by_field_name("parameters") else {
@@ -110,7 +129,7 @@ fn check_parameters(
             continue;
         }
         let name = text.get(ident.start_byte()..ident.end_byte()).unwrap_or("");
-        check_name(ident, name, max_length, text, severity, suppressions, out);
+        check_name(ident, name, max_length, text, cx, out);
     }
 }
 
@@ -119,24 +138,22 @@ fn check_name(
     name: &str,
     max_length: u32,
     text: &str,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
+    cx: &CheckContext<'_>,
     out: &mut Vec<Diagnostic>,
 ) {
-    if name.is_empty() || should_skip_name(name) {
+    let name = strip_name(name);
+    if name.is_empty() {
         return;
     }
-    // Strip the optional leading `.` (hidden identifier convention) before
-    // measuring, matching `object_name`'s carve-out.
-    let body = match name.strip_prefix('.') {
-        Some(rest) if !rest.starts_with('.') && !rest.is_empty() => rest,
-        Some(_) => name,
-        None => name,
-    };
+    // Remove the longest `<generic>.` prefix so S3 methods are only flagged
+    // when the class-name remainder is itself too long (lintr behavior).
+    let body = strip_generic_prefix(name, cx.declared_generics);
     let len = body.chars().count() as u32;
     if len <= max_length {
         return;
     }
+    let severity = cx.severity;
+    let suppressions = cx.suppressions;
     let line_no = name_node.start_position().row as u32;
     if suppressions.is_suppressed_code(line_no, rule_ids::OBJECT_LENGTH) {
         return;
@@ -157,12 +174,24 @@ fn check_name(
     });
 }
 
-fn should_skip_name(name: &str) -> bool {
-    if name.starts_with('`') {
-        return true;
+/// Remove the longest leading `<generic>.` prefix whose generic is a known
+/// base S3 generic or one declared in this file. Returns the remainder (the
+/// class part for S3 methods), or the whole name when no prefix matches.
+fn strip_generic_prefix<'a>(
+    name: &'a str,
+    declared_generics: &std::collections::HashSet<String>,
+) -> &'a str {
+    let mut best: Option<usize> = None;
+    for (i, c) in name.char_indices() {
+        if c == '.'
+            && i + 1 < name.len()
+            && (is_known_s3_generic(&name[..i]) || declared_generics.contains(&name[..i]))
+        {
+            best = Some(i);
+        }
     }
-    if !name.is_ascii() {
-        return true;
+    match best {
+        Some(i) => &name[i + 1..],
+        None => name,
     }
-    false
 }

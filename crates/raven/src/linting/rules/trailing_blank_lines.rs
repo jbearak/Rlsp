@@ -40,7 +40,8 @@ pub(crate) fn collect(
                 ..Default::default()
             });
         }
-        return;
+        // Fall through: a file can be missing its terminal newline AND have
+        // trailing blank lines (e.g. `x <- 1\n\n `) — lintr reports both.
     }
 
     // Count trailing blank lines.
