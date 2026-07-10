@@ -31,6 +31,53 @@ export function isRDocument(
     return R_DOCUMENT_EXTENSIONS.has(path.extname(document.uri.fsPath).toLowerCase());
 }
 
+type TabLike = { input: unknown };
+type TabGroupLike = { tabs: readonly TabLike[] };
+type VisibleEditorLike = { document: { uri: vscode.Uri } };
+
+/**
+ * Return the resources that are genuinely represented in the editor UI.
+ *
+ * `workspace.textDocuments` is deliberately not used: other extensions can
+ * create hidden text models with `workspace.openTextDocument()`. Those models
+ * must remain synchronized with Raven for cross-file analysis, but should not
+ * acquire their own Problems entries. Diff tabs contribute their modified
+ * resource, matching vscode-languageclient's pull-diagnostics policy; visible
+ * editors are unioned in so peek editors count even though they have no tab.
+ *
+ * The tab input inspection is structural so newer VS Code resource-backed tab
+ * kinds automatically work when they expose `uri` or `modified`.
+ */
+export function diagnosticResourceUris(
+    tabGroups: readonly TabGroupLike[] = vscode.window.tabGroups.all,
+    visibleEditors: readonly VisibleEditorLike[] = vscode.window.visibleTextEditors,
+): string[] {
+    const uris = new Set<string>();
+
+    for (const group of tabGroups) {
+        for (const tab of group.tabs) {
+            if (typeof tab.input !== 'object' || tab.input === null) {
+                continue;
+            }
+            const input = tab.input as { modified?: unknown; uri?: unknown };
+            const resource = input.modified instanceof vscode.Uri
+                ? input.modified
+                : input.uri instanceof vscode.Uri
+                    ? input.uri
+                    : undefined;
+            if (resource) {
+                uris.add(resource.toString());
+            }
+        }
+    }
+
+    for (const editor of visibleEditors) {
+        uris.add(editor.document.uri.toString());
+    }
+
+    return [...uris];
+}
+
 /**
  * Resolve the effective `editor.tabSize` for a document. The scope MUST
  * include `languageId` so VS Code returns language-scoped overrides (e.g.

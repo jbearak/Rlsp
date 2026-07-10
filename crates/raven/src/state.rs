@@ -652,6 +652,13 @@ pub struct WorldState {
     pub signature_cache: Arc<SignatureCache>,
     pub cross_file_file_cache: CrossFileFileCache,
     pub diagnostics_gate: CrossFileDiagnosticsGate,
+    /// Serializes each final diagnostic eligibility check + client publish
+    /// with editor-resource removal and document-close clears.
+    ///
+    /// The lock is separate from `WorldState` so no state guard is held across
+    /// the client send. Without it, a computation could pass its final tab
+    /// check, lose a race to an empty clear, and then republish stale Problems.
+    pub diagnostics_publish_lock: Arc<tokio::sync::Mutex<()>>,
 
     // Cross-file state
     pub cross_file_config: CrossFileConfig,
@@ -714,6 +721,14 @@ pub struct WorldState {
     pub package_config_generation: u64,
     pub cross_file_revalidation: CrossFileRevalidationState,
     pub cross_file_activity: CrossFileActivityState,
+    /// Editor resources eligible to own push diagnostics, when the client
+    /// supplies an explicit UI-resource set.
+    ///
+    /// `None` preserves normal LSP behavior for clients that do not implement
+    /// Raven's VS Code-specific tab notification: every `didOpen` document may
+    /// receive diagnostics. `Some` keeps hidden client-created text models as
+    /// analysis inputs while preventing them from acquiring Problems entries.
+    pub editor_diagnostic_uris: Option<HashSet<Url>>,
     pub cross_file_workspace_index: CrossFileWorkspaceIndex,
     /// Last-known editor-derived chunk classification for file-backed
     /// documents whose editor language made the file behave differently from
@@ -1032,6 +1047,7 @@ impl WorldState {
             signature_cache: Arc::new(SignatureCache::new(500)),
             cross_file_file_cache: CrossFileFileCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),
+            diagnostics_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
 
             // Cross-file state
             cross_file_config: config,
@@ -1053,6 +1069,7 @@ impl WorldState {
             package_config_generation: 0,
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
+            editor_diagnostic_uris: None,
             cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
             editor_chunk_kind_overrides: HashMap::new(),
             watched_file_resync_generation_counter: 0,
@@ -1075,6 +1092,16 @@ impl WorldState {
     pub fn clear_help_caches(&self) {
         self.help_cache.drain();
         self.html_help_cache.drain();
+    }
+
+    /// Whether `uri` may own editor diagnostics under the client's policy.
+    ///
+    /// This predicate must be checked again at the atomic publish commit, not
+    /// only before computation: a tab can close while diagnostics are running.
+    pub(crate) fn diagnostics_publish_allowed(&self, uri: &Url) -> bool {
+        self.editor_diagnostic_uris
+            .as_ref()
+            .is_none_or(|uris| uris.contains(uri))
     }
 
     fn open_alias_candidates_for_uri(&self, uri: &Url) -> Vec<Url> {

@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
+    diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
     isRDocument,
     planDotInWordMigration,
@@ -8,6 +9,34 @@ import {
 } from '../extensionHelpers';
 
 suite('Extension Helpers', () => {
+    test('diagnosticResourceUris includes tabs, modified diff sides, and peek editors', () => {
+        const tabbed = vscode.Uri.file('/tmp/tabbed.R');
+        const original = vscode.Uri.file('/tmp/original.R');
+        const modified = vscode.Uri.file('/tmp/modified.R');
+        const peeked = vscode.Uri.file('/tmp/peeked.R');
+
+        const result = diagnosticResourceUris(
+            [{
+                tabs: [
+                    { input: { uri: tabbed } },
+                    { input: { original, modified } },
+                    { input: { uri: tabbed } },
+                    { input: { viewType: 'terminal' } },
+                ],
+            }],
+            [
+                { document: { uri: modified } },
+                { document: { uri: peeked } },
+            ],
+        );
+
+        assert.deepStrictEqual(result, [
+            tabbed.toString(),
+            modified.toString(),
+            peeked.toString(),
+        ]);
+    });
+
     test('isRDocument accepts untitled R-like documents by language id', () => {
         const makeUntitledDocument = (
             languageId: string,

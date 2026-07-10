@@ -114,7 +114,29 @@ fn namespace_warm_packages(meta: &crate::cross_file::CrossFileMetadata) -> Vec<S
 struct ActiveDocumentsChangedParams {
     active_uri: Option<String>,
     visible_uris: Vec<String>,
+    /// Resources represented by a real editor tab or visible peek editor.
+    /// Absent for older/non-VS Code clients, which retain normal `didOpen`
+    /// diagnostic behavior.
+    #[serde(default)]
+    diagnostic_uris: Option<Vec<String>>,
     timestamp_ms: u64,
+}
+
+/// Parse the VS Code client's initial tab/peek resource set.
+///
+/// Absence (including for non-object initialization options) deliberately
+/// returns `None`, preserving standard LSP `didOpen` diagnostic behavior for
+/// clients that do not implement Raven's private editor-resource protocol.
+fn initial_editor_diagnostic_uris(
+    options: &serde_json::Value,
+) -> Option<std::collections::HashSet<Url>> {
+    let uris = options.get("diagnosticUris")?.as_array()?;
+    Some(
+        uris.iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(|uri| Url::parse(uri).ok())
+            .collect(),
+    )
 }
 
 /// One entry in the raven/documentIndentUnitsChanged notification.
@@ -4882,6 +4904,14 @@ async fn run_debounced_diagnostics(
             return;
         }
 
+        if !state.diagnostics_publish_allowed(&affected_uri) {
+            log::trace!(
+                "Skipping diagnostics for {}: no editor diagnostic resource",
+                affected_uri
+            );
+            return;
+        }
+
         if let Some(ver) = current_version
             && !state.diagnostics_gate.can_publish(&affected_uri, ver)
         {
@@ -4947,22 +4977,29 @@ async fn run_debounced_diagnostics(
     // same predicate as can_publish, and on success updates last_published
     // and consumes one force-republish marker — closing the race where
     // two same-version publishes could share one marker.
+    let publish_lock = {
+        let state = state_arc.read().await;
+        Arc::clone(&state.diagnostics_publish_lock)
+    };
+    let _publish_guard = publish_lock.lock().await;
     let (can_publish, open_at_publish) = {
         let state = state_arc.read().await;
         let doc = state.documents.get(&affected_uri);
         let current_version = doc.and_then(|d| d.version);
         let current_revision = doc.map(|d| d.revision);
 
-        let can_publish =
-            if current_version != trigger_version || current_revision != trigger_revision {
-                false
-            } else if let Some(ver) = current_version {
-                state
-                    .diagnostics_gate
-                    .try_consume_publish(&affected_uri, ver)
-            } else {
-                true
-            };
+        let can_publish = if !state.diagnostics_publish_allowed(&affected_uri)
+            || current_version != trigger_version
+            || current_revision != trigger_revision
+        {
+            false
+        } else if let Some(ver) = current_version {
+            state
+                .diagnostics_gate
+                .try_consume_publish(&affected_uri, ver)
+        } else {
+            true
+        };
         (can_publish, doc.is_some())
     };
 
@@ -5269,6 +5306,7 @@ impl LanguageServer for Backend {
             .initialization_options
             .clone()
             .unwrap_or(serde_json::Value::Null);
+        let editor_diagnostic_uris = initial_editor_diagnostic_uris(&raw_client);
         let discovery_options = self.discovery_options_from_client_settings(&raw_client);
         let project_layer = project_root
             .as_deref()
@@ -5286,6 +5324,7 @@ impl LanguageServer for Backend {
         {
             let mut state = self.state.write().await;
             state.raw_client_settings = raw_client;
+            state.editor_diagnostic_uris = editor_diagnostic_uris;
             apply_project_config_layer(&mut state, project_layer);
             // `recompute_parsed_configs` now also recompiles
             // `state.lint_overrides` — callers no longer need a
@@ -7829,6 +7868,16 @@ impl LanguageServer for Backend {
         let mut resync_chunk_kind: Option<crate::chunks::ChunkKind> = None;
         let mut close_resync_uris: Vec<Url> = Vec::new();
 
+        // Serialize the close commit + empty publish with diagnostic commit
+        // tails. Cancellation alone has a narrow race after a worker's final
+        // state check; this lock guarantees the empty publication is ordered
+        // after every diagnostic publish that observed the document as open.
+        let diagnostics_publish_lock = {
+            let state = self.state.read().await;
+            Arc::clone(&state.diagnostics_publish_lock)
+        };
+        let _diagnostics_publish_guard = diagnostics_publish_lock.lock().await;
+
         let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
             let mut state = self.state.write().await;
 
@@ -8072,6 +8121,7 @@ impl LanguageServer for Backend {
         self.client
             .publish_diagnostics(uri.clone(), Vec::new(), None)
             .await;
+        drop(_diagnostics_publish_guard);
 
         // Switch the prelude to a remaining live `.Rprofile` alias, or revert
         // it to on-disk `.Rprofile` after a close (off-lock).
@@ -10632,9 +10682,10 @@ impl Backend {
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
     async fn handle_active_documents_changed(&self, params: ActiveDocumentsChangedParams) {
         log::trace!(
-            "Received activeDocumentsChanged: active={:?}, visible={}, timestamp={}",
+            "Received activeDocumentsChanged: active={:?}, visible={}, diagnostic_resources={:?}, timestamp={}",
             params.active_uri,
             params.visible_uris.len(),
+            params.diagnostic_uris.as_ref().map(Vec::len),
             params.timestamp_ms
         );
 
@@ -10645,10 +10696,88 @@ impl Backend {
             .filter_map(|s| Url::parse(s).ok())
             .collect();
 
-        let mut state = self.state.write().await;
-        state
-            .cross_file_activity
-            .update(active_uri, visible_uris, params.timestamp_ms);
+        let diagnostic_uris = params.diagnostic_uris.map(|uris| {
+            uris.into_iter()
+                .filter_map(|uri| Url::parse(&uri).ok())
+                .collect::<std::collections::HashSet<_>>()
+        });
+
+        let Some(new_uris) = diagnostic_uris else {
+            let mut state = self.state.write().await;
+            state
+                .cross_file_activity
+                .update(active_uri, visible_uris, params.timestamp_ms);
+            return;
+        };
+
+        // Serialize a tab-set transition and its empty publications with the
+        // final commit+send tail of every diagnostic computation.
+        let diagnostics_publish_lock = {
+            let state = self.state.read().await;
+            Arc::clone(&state.diagnostics_publish_lock)
+        };
+        let diagnostics_publish_guard = diagnostics_publish_lock.lock().await;
+
+        let (removed, added) = {
+            let mut state = self.state.write().await;
+            state
+                .cross_file_activity
+                .update(active_uri, visible_uris, params.timestamp_ms);
+
+            let previously_eligible: std::collections::HashSet<Url> = state
+                .documents
+                .keys()
+                .filter(|uri| state.diagnostics_publish_allowed(uri))
+                .cloned()
+                .collect();
+            let newly_eligible: std::collections::HashSet<Url> = state
+                .documents
+                .keys()
+                .filter(|uri| new_uris.contains(*uri))
+                .cloned()
+                .collect();
+
+            let removed: Vec<Url> = previously_eligible
+                .difference(&newly_eligible)
+                .cloned()
+                .collect();
+            let added: Vec<Url> = newly_eligible
+                .difference(&previously_eligible)
+                .cloned()
+                .collect();
+
+            state.editor_diagnostic_uris = Some(new_uris);
+            for uri in &removed {
+                // In-flight work also re-checks eligibility at commit. Clearing
+                // both states retracts Problems now and lets a later tab-open
+                // publish the same document version without a force marker.
+                state.cross_file_revalidation.cancel(uri);
+                state.diagnostics_gate.clear(uri);
+            }
+
+            (removed, added)
+        };
+
+        for uri in removed {
+            log::trace!(
+                "diagnostics lifecycle: publish uri={} count=0 path=tab-clear open=true",
+                uri
+            );
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        }
+        drop(diagnostics_publish_guard);
+
+        if !added.is_empty() {
+            // A tab can appear for a document that another extension already
+            // kept LSP-open, so there may be no new didOpen to trigger this.
+            // Run the normal bounded pipeline explicitly.
+            tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
+                Arc::clone(&self.state),
+                self.client.clone(),
+                added,
+                Some(Arc::clone(&self.traversal_truncation)),
+            ));
+        }
     }
 
     /// Handle the raven/semanticTokensForRString custom request.
@@ -10790,6 +10919,14 @@ pub(crate) async fn publish_diagnostics_inner(
         let state = state_arc.read().await;
         let version = state.documents.get(uri).and_then(|d| d.version);
 
+        if !state.diagnostics_publish_allowed(uri) {
+            log::trace!(
+                "Skipping diagnostics for {}: no editor diagnostic resource",
+                uri
+            );
+            return;
+        }
+
         // Check if we can publish (monotonic gate)
         if let Some(ver) = version {
             if !state.diagnostics_gate.can_publish(uri, ver) {
@@ -10893,8 +11030,20 @@ pub(crate) async fn publish_diagnostics_inner(
 
     // Re-check freshness after async work, atomically commit gate state, before publishing.
     // try_consume_publish replaces the racy can_publish + record_publish pair.
+    let publish_lock = {
+        let state = state_arc.read().await;
+        Arc::clone(&state.diagnostics_publish_lock)
+    };
+    let _publish_guard = publish_lock.lock().await;
     let open_at_publish = {
         let state = state_arc.read().await;
+        if !state.diagnostics_publish_allowed(uri) {
+            log::trace!(
+                "Skipping diagnostics for {}: editor diagnostic resource removed",
+                uri
+            );
+            return;
+        }
         if let Some(ver) = version {
             let current_version = state.documents.get(uri).and_then(|d| d.version);
             if current_version != Some(ver) {
@@ -11655,6 +11804,181 @@ mod tests {
                 "closed document diagnostics must be cleared, got {:?}",
                 cleared.diagnostics
             );
+        }
+
+        /// Clients that do not send Raven's VS Code-specific tab set retain
+        /// ordinary LSP semantics: a `didOpen` document may own diagnostics.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn absent_diagnostic_resource_set_preserves_did_open_behavior() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("generic-client.R");
+            let text = "x <- (\n";
+            std::fs::write(&path, text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+            backend.publish_diagnostics(&uri).await;
+
+            let published = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("generic clients must receive diagnostics for didOpen documents")
+                .expect("client socket must remain open");
+            assert_eq!(published.method(), "textDocument/publishDiagnostics");
+            let published: PublishDiagnosticsParams =
+                serde_json::from_value(published.params().unwrap().clone()).unwrap();
+            assert_eq!(published.uri, uri);
+            assert!(
+                !published.diagnostics.is_empty(),
+                "the malformed open document should have diagnostics"
+            );
+        }
+
+        /// The VS Code client keeps hidden text models synchronized, but only
+        /// real tabs (and visible peek editors) may own Problems entries.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn diagnostic_resource_set_hides_and_restores_open_document_diagnostics() {
+            let tmp = TempDir::new().unwrap();
+            let visible_path = tmp.path().join("visible.R");
+            let hidden_path = tmp.path().join("hidden.R");
+            let text = "x <- (\n";
+            std::fs::write(&visible_path, text).unwrap();
+            std::fs::write(&hidden_path, text).unwrap();
+            let visible_uri = Url::from_file_path(visible_path).unwrap();
+            let hidden_uri = Url::from_file_path(hidden_path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(
+                    serde_json::to_value(InitializeParams {
+                        initialization_options: Some(serde_json::json!({
+                            "diagnosticUris": [visible_uri.to_string()],
+                        })),
+                        ..InitializeParams::default()
+                    })
+                    .unwrap(),
+                )
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                // Keep didOpen work pending so each assertion controls the
+                // publication that follows.
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            for uri in [&visible_uri, &hidden_uri] {
+                backend
+                    .did_open(DidOpenTextDocumentParams {
+                        text_document: TextDocumentItem {
+                            uri: uri.clone(),
+                            language_id: "r".into(),
+                            version: 1,
+                            text: text.into(),
+                        },
+                    })
+                    .await;
+            }
+
+            backend.publish_diagnostics(&hidden_uri).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err(),
+                "a hidden LSP-open document must not publish diagnostics"
+            );
+
+            backend.publish_diagnostics(&visible_uri).await;
+            let visible = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("the tabbed document must publish diagnostics")
+                .expect("client socket must remain open");
+            let visible: PublishDiagnosticsParams =
+                serde_json::from_value(visible.params().unwrap().clone()).unwrap();
+            assert_eq!(visible.uri, visible_uri);
+            assert!(!visible.diagnostics.is_empty());
+
+            // Removing the tab retracts its existing Problems while retaining
+            // the document in WorldState as a cross-file analysis input.
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: None,
+                    visible_uris: Vec::new(),
+                    diagnostic_uris: Some(Vec::new()),
+                    timestamp_ms: 2,
+                })
+                .await;
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("removing the tab must clear diagnostics")
+                .expect("client socket must remain open");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert_eq!(cleared.uri, visible_uri);
+            assert!(cleared.diagnostics.is_empty());
+            assert!(
+                backend
+                    .state
+                    .read()
+                    .await
+                    .documents
+                    .contains_key(&visible_uri)
+            );
+
+            // A later tab-open may not produce didOpen because the hidden model
+            // never closed. The tab transition itself must republish it.
+            backend
+                .state
+                .write()
+                .await
+                .cross_file_config
+                .revalidation_debounce_ms = 0;
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(visible_uri.to_string()),
+                    visible_uris: vec![visible_uri.to_string()],
+                    diagnostic_uris: Some(vec![visible_uri.to_string()]),
+                    timestamp_ms: 3,
+                })
+                .await;
+            let restored = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("restoring the tab must republish diagnostics")
+                .expect("client socket must remain open");
+            let restored: PublishDiagnosticsParams =
+                serde_json::from_value(restored.params().unwrap().clone()).unwrap();
+            assert_eq!(restored.uri, visible_uri);
+            assert!(!restored.diagnostics.is_empty());
         }
     }
 

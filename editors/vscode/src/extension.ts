@@ -14,6 +14,7 @@ import {
     RavenInitializationOptions,
 } from './initializationOptions';
 import {
+    diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
     isRDocument,
     planDotInWordMigration,
@@ -58,13 +59,19 @@ import { dotLintrAutoEnableAllowed } from './lintr-auto-enable';
  * are included when the server contract requires them.
  */
 function getInitializationOptions(): RavenInitializationOptions {
-    return buildInitializationOptions(
+    const options = buildInitializationOptions(
         vscode.workspace.getConfiguration('raven'),
         // Client-only environment signal gating `.lintr` auto-enable (#337).
         // Recomputed on every call so it tracks REditorSupport / Positron and
         // `r.lsp.*` state when settings change (see the config listener below).
         dotLintrAutoEnableAllowed(),
     );
+    return {
+        ...options,
+        // Seed the server before vscode-languageclient synchronizes didOpen
+        // documents, preventing even a startup-only hidden-diagnostic pass.
+        diagnosticUris: diagnosticResourceUris(),
+    };
 }
 
 let client: LanguageClient;
@@ -145,7 +152,7 @@ function sendDocumentIndentUnitsNotification() {
 }
 
 /**
- * Send activity notification to the server for cross-file revalidation prioritization.
+ * Send editor activity and diagnostic-resource ownership to the server.
  */
 function sendActivityNotification() {
     // Same guard as sendDocumentIndentUnitsNotification: editor-activity
@@ -171,6 +178,7 @@ function sendActivityNotification() {
     client.sendNotification('raven/activeDocumentsChanged', {
         activeUri: activeUriStr,
         visibleUris: visibleUris,
+        diagnosticUris: diagnosticResourceUris(),
         timestampMs: Date.now(),
     });
 }
@@ -358,10 +366,10 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     if (binaryCheck.ok) {
         void client.start().then(() => {
-            // Send initial per-document indent units after the LSP handshake completes
-            // so the server has correct values for already-open R files when
-            // raven.linting.indentationUnit is "auto".
+            // Send client-owned state after the LSP handshake completes so the
+            // server has correct values for documents that were already open.
             sendDocumentIndentUnitsNotification();
+            sendActivityNotification();
         });
     } else {
         const detail = configuredPath
@@ -454,6 +462,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
             (serverOptions as { options: { env: Record<string, string> | undefined } }).options.env = buildRustLogEnv();
             await client.restart();
             sendDocumentIndentUnitsNotification();
+            sendActivityNotification();
         })
     );
 
@@ -567,7 +576,9 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // prompt the user to reload when the resolved activation flips.
     registerActivationReactivity(context, r_console_resolved);
 
-    // Register activity signal listeners for cross-file revalidation prioritization
+    // Register activity and tab-ownership listeners. A hidden text model can
+    // be opened by another extension without appearing in visible editors, so
+    // tab changes are the authoritative diagnostic-ownership signal.
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(() => {
             sendActivityNotification();
@@ -576,6 +587,12 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     context.subscriptions.push(
         vscode.window.onDidChangeVisibleTextEditors(() => {
+            sendActivityNotification();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.window.tabGroups.onDidChangeTabs(() => {
             sendActivityNotification();
         })
     );
