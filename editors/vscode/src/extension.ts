@@ -14,11 +14,14 @@ import {
     RavenInitializationOptions,
 } from './initializationOptions';
 import {
+    clearIneligibleDiagnostics,
+    diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
     isRDocument,
     planDotInWordMigration,
     resolveTabSizeForDocument,
 } from './extensionHelpers';
+import { registerRunningStateReconciliation } from './client-state';
 import {
     shouldTriggerDirectivePathSuggest,
     shouldTriggerNestedPathSuggest,
@@ -58,13 +61,19 @@ import { dotLintrAutoEnableAllowed } from './lintr-auto-enable';
  * are included when the server contract requires them.
  */
 function getInitializationOptions(): RavenInitializationOptions {
-    return buildInitializationOptions(
+    const options = buildInitializationOptions(
         vscode.workspace.getConfiguration('raven'),
         // Client-only environment signal gating `.lintr` auto-enable (#337).
         // Recomputed on every call so it tracks REditorSupport / Positron and
         // `r.lsp.*` state when settings change (see the config listener below).
         dotLintrAutoEnableAllowed(),
     );
+    return {
+        ...options,
+        // Seed the server before vscode-languageclient synchronizes didOpen
+        // documents, preventing even a startup-only hidden-diagnostic pass.
+        diagnosticUris: diagnosticResourceUris(),
+    };
 }
 
 let client: LanguageClient;
@@ -145,9 +154,16 @@ function sendDocumentIndentUnitsNotification() {
 }
 
 /**
- * Send activity notification to the server for cross-file revalidation prioritization.
+ * Send editor activity and diagnostic-resource ownership to the server.
  */
 function sendActivityNotification() {
+    const diagnosticUris = diagnosticResourceUris();
+
+    // vscode-languageclient keeps this collection across automatic crash
+    // restarts. Prune it even while the server is down so a tab closed during
+    // downtime cannot leave stale Problems behind.
+    clearIneligibleDiagnostics(client?.diagnostics, diagnosticUris);
+
     // Same guard as sendDocumentIndentUnitsNotification: editor-activity
     // listeners can fire before the client starts (or when it never did),
     // and sendNotification throws unless the client is running.
@@ -171,8 +187,15 @@ function sendActivityNotification() {
     client.sendNotification('raven/activeDocumentsChanged', {
         activeUri: activeUriStr,
         visibleUris: visibleUris,
+        diagnosticUris,
         timestampMs: Date.now(),
     });
+}
+
+/** Resend all editor-owned document state after a language-client start. */
+function synchronizeClientDocumentState() {
+    sendDocumentIndentUnitsNotification();
+    sendActivityNotification();
 }
 
 /**
@@ -303,6 +326,19 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         clientOptions
     );
 
+    // The listener survives vscode-languageclient's internal crash cleanup.
+    // `Running` fires before start() resolves, so the helper waits for that
+    // same in-flight promise before resending current ownership.
+    context.subscriptions.push(
+        registerRunningStateReconciliation(
+            client,
+            synchronizeClientDocumentState,
+            (error) => outputChannel.appendLine(
+                `Raven: failed to reconcile document state after restart: ${String(error)}`,
+            ),
+        ),
+    );
+
     // Pre-check the binary before starting the LSP. vscode-languageclient's
     // generic "couldn't create connection to server" toast hides the real
     // cause (missing binary, no exec bit, wrong target). Surface the actual
@@ -357,12 +393,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     );
 
     if (binaryCheck.ok) {
-        void client.start().then(() => {
-            // Send initial per-document indent units after the LSP handshake completes
-            // so the server has correct values for already-open R files when
-            // raven.linting.indentationUnit is "auto".
-            sendDocumentIndentUnitsNotification();
-        });
+        void client.start();
     } else {
         const detail = configuredPath
             ? `Raven LSP cannot start: configured raven.server.path "${serverPath}" is not a usable binary (${binaryCheck.reason}). Update raven.server.path or clear it to use the bundled binary.`
@@ -453,7 +484,10 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
         vscode.commands.registerCommand('raven.restart', async () => {
             (serverOptions as { options: { env: Record<string, string> | undefined } }).options.env = buildRustLogEnv();
             await client.restart();
-            sendDocumentIndentUnitsNotification();
+            // Preserve the command's completion contract. The Running-state
+            // listener also covers this transition, but its continuation need
+            // not complete before executeCommand's caller resumes.
+            synchronizeClientDocumentState();
         })
     );
 
@@ -567,7 +601,9 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // prompt the user to reload when the resolved activation flips.
     registerActivationReactivity(context, r_console_resolved);
 
-    // Register activity signal listeners for cross-file revalidation prioritization
+    // Register activity and tab-ownership listeners. A hidden text model can
+    // be opened by another extension without appearing in visible editors, so
+    // tab changes are the authoritative diagnostic-ownership signal.
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(() => {
             sendActivityNotification();
@@ -576,6 +612,12 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     context.subscriptions.push(
         vscode.window.onDidChangeVisibleTextEditors(() => {
+            sendActivityNotification();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.window.tabGroups.onDidChangeTabs(() => {
             sendActivityNotification();
         })
     );

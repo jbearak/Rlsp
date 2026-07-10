@@ -1,6 +1,8 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
+    clearIneligibleDiagnostics,
+    diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
     isRDocument,
     planDotInWordMigration,
@@ -8,6 +10,131 @@ import {
 } from '../extensionHelpers';
 
 suite('Extension Helpers', () => {
+    test('diagnosticResourceUris includes tabs, modified diff sides, and peek editors', () => {
+        const tabbed = vscode.Uri.file('/tmp/tabbed.R');
+        const original = vscode.Uri.file('/tmp/original.R');
+        const modified = vscode.Uri.file('/tmp/modified.R');
+        const peeked = vscode.Uri.file('/tmp/peeked.R');
+
+        const result = diagnosticResourceUris(
+            [{
+                tabs: [
+                    { input: { uri: tabbed } },
+                    { input: { original, modified }, isActive: true },
+                    { input: { uri: tabbed } },
+                    { input: { viewType: 'terminal' } },
+                ],
+            }],
+            [
+                { document: { uri: original } },
+                { document: { uri: modified } },
+                { document: { uri: peeked } },
+            ],
+        );
+
+        assert.deepStrictEqual(result, [
+            tabbed.toString(),
+            modified.toString(),
+            peeked.toString(),
+        ]);
+    });
+
+    test('diagnosticResourceUris keeps a diff original that has its own tab', () => {
+        const original = vscode.Uri.file('/tmp/original-with-tab.R');
+        const modified = vscode.Uri.file('/tmp/modified-with-tab.R');
+
+        const result = diagnosticResourceUris(
+            [{
+                tabs: [
+                    { input: { original, modified } },
+                    { input: { uri: original } },
+                ],
+            }],
+            [
+                { document: { uri: original } },
+                { document: { uri: modified } },
+            ],
+        );
+
+        assert.deepStrictEqual(result, [modified.toString(), original.toString()]);
+    });
+
+    test('diagnosticResourceUris keeps a peeked file matching an inactive diff original', () => {
+        // An inactive diff renders no editors, so its original side cannot be
+        // the source of a visible editor; a matching visible editor must come
+        // from an independent element (e.g. a peek editor) and must count.
+        const original = vscode.Uri.file('/tmp/inactive-diff-original.R');
+        const modified = vscode.Uri.file('/tmp/inactive-diff-modified.R');
+        const activeTab = vscode.Uri.file('/tmp/active-tab.R');
+
+        const result = diagnosticResourceUris(
+            [{
+                tabs: [
+                    { input: { original, modified }, isActive: false },
+                    { input: { uri: activeTab }, isActive: true },
+                ],
+            }],
+            [
+                { document: { uri: activeTab } },
+                { document: { uri: original } },
+            ],
+        );
+
+        assert.deepStrictEqual(result, [
+            modified.toString(),
+            activeTab.toString(),
+            original.toString(),
+        ]);
+    });
+
+    test('diagnosticResourceUris keeps an independent peek of an active diff original', () => {
+        // One active diff renders exactly one visible editor for its original
+        // side; a second visible editor with the same URI must come from an
+        // independent element (e.g. a peek editor in another group) and must
+        // count.
+        const original = vscode.Uri.file('/tmp/active-diff-original.R');
+        const modified = vscode.Uri.file('/tmp/active-diff-modified.R');
+
+        const result = diagnosticResourceUris(
+            [{
+                tabs: [
+                    { input: { original, modified }, isActive: true },
+                ],
+            }],
+            [
+                { document: { uri: original } },
+                { document: { uri: modified } },
+                { document: { uri: original } },
+            ],
+        );
+
+        assert.deepStrictEqual(result, [
+            modified.toString(),
+            original.toString(),
+        ]);
+    });
+
+    test('clearIneligibleDiagnostics prunes only retained background resources', () => {
+        const eligible = vscode.Uri.file('/tmp/eligible.R');
+        const hidden = vscode.Uri.file('/tmp/hidden.R');
+        const collection = vscode.languages.createDiagnosticCollection(
+            'raven-diagnostic-ownership-test',
+        );
+        const marker = new vscode.Diagnostic(new vscode.Range(0, 0, 0, 1), 'marker');
+
+        try {
+            collection.set(eligible, [marker]);
+            collection.set(hidden, [marker]);
+
+            clearIneligibleDiagnostics(collection, [eligible.toString()]);
+
+            assert.strictEqual(collection.get(eligible)?.length, 1);
+            assert.strictEqual((collection.get(hidden) ?? []).length, 0);
+        } finally {
+            collection.dispose();
+        }
+    });
+
     test('isRDocument accepts untitled R-like documents by language id', () => {
         const makeUntitledDocument = (
             languageId: string,

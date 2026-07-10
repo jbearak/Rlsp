@@ -48,6 +48,11 @@ export interface RavenWorkspaceConfiguration {
  * `parse_cross_file_config()` and related parsing functions.
  */
 export interface RavenInitializationOptions {
+    /**
+     * VS Code resources represented by a tab or visible peek editor at LSP
+     * startup. This is client state, not a user-configurable Raven setting.
+     */
+    diagnosticUris?: string[];
     crossFile?: {
         backwardDependencies?: "auto" | "explicit";
         maxBackwardDepth?: number;

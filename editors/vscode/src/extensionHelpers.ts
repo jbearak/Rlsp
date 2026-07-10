@@ -31,6 +31,108 @@ export function isRDocument(
     return R_DOCUMENT_EXTENSIONS.has(path.extname(document.uri.fsPath).toLowerCase());
 }
 
+type TabLike = { input: unknown; isActive?: boolean };
+type TabGroupLike = { tabs: readonly TabLike[] };
+type VisibleEditorLike = { document: { uri: vscode.Uri } };
+
+/**
+ * Return the resources that are genuinely represented in the editor UI.
+ *
+ * `workspace.textDocuments` is deliberately not used: other extensions can
+ * create hidden text models with `workspace.openTextDocument()`. Those models
+ * must remain synchronized with Raven for cross-file analysis, but should not
+ * acquire their own Problems entries. Diff tabs contribute their modified
+ * resource, matching vscode-languageclient's pull-diagnostics policy. Other
+ * visible editors are unioned in so peek editors count even though they have
+ * no tab; a diff's visible original side is excluded from that union. Only
+ * the active tab of a group can render its editors, so only active diff tabs
+ * contribute to that exclusion — an inactive diff must not suppress the same
+ * resource shown independently (e.g. in a peek editor). The exclusion is
+ * counted per occurrence, not per URI: one active diff-original accounts for
+ * exactly one visible editor, so a second visible editor with the same URI
+ * (an independent peek) still counts.
+ *
+ * The tab input inspection is structural so newer VS Code resource-backed tab
+ * kinds automatically work when they expose `uri` or `modified`.
+ */
+export function diagnosticResourceUris(
+    tabGroups: readonly TabGroupLike[] = vscode.window.tabGroups.all,
+    visibleEditors: readonly VisibleEditorLike[] = vscode.window.visibleTextEditors,
+): string[] {
+    const uris = new Set<string>();
+    const diffOriginalCounts = new Map<string, number>();
+
+    for (const group of tabGroups) {
+        for (const tab of group.tabs) {
+            if (typeof tab.input !== 'object' || tab.input === null) {
+                continue;
+            }
+            const input = tab.input as {
+                original?: unknown;
+                modified?: unknown;
+                uri?: unknown;
+            };
+            const resource = input.modified instanceof vscode.Uri
+                ? input.modified
+                : input.uri instanceof vscode.Uri
+                    ? input.uri
+                    : undefined;
+            if (resource) {
+                uris.add(resource.toString());
+            }
+            if (
+                tab.isActive
+                && input.modified instanceof vscode.Uri
+                && input.original instanceof vscode.Uri
+            ) {
+                const key = input.original.toString();
+                diffOriginalCounts.set(key, (diffOriginalCounts.get(key) ?? 0) + 1);
+            }
+        }
+    }
+
+    for (const editor of visibleEditors) {
+        const uri = editor.document.uri.toString();
+        const remaining = diffOriginalCounts.get(uri) ?? 0;
+        if (remaining > 0) {
+            // This occurrence is attributable to the active diff's own
+            // rendered original side; consume it so an additional visible
+            // editor with the same URI still counts.
+            diffOriginalCounts.set(uri, remaining - 1);
+            continue;
+        }
+        uris.add(uri);
+    }
+
+    return [...uris];
+}
+
+/**
+ * Remove diagnostics retained for resources outside the current editor-owned
+ * set. vscode-languageclient deliberately reuses its push-diagnostic
+ * collection after an automatic server restart, so server-side clearing alone
+ * cannot reconcile tabs that changed while the server was unavailable.
+ */
+export function clearIneligibleDiagnostics(
+    collection: vscode.DiagnosticCollection | undefined,
+    eligibleUris: readonly string[],
+): void {
+    if (!collection) {
+        return;
+    }
+
+    const eligible = new Set(eligibleUris);
+    const stale: vscode.Uri[] = [];
+    collection.forEach((uri) => {
+        if (!eligible.has(uri.toString())) {
+            stale.push(uri);
+        }
+    });
+    for (const uri of stale) {
+        collection.delete(uri);
+    }
+}
+
 /**
  * Resolve the effective `editor.tabSize` for a document. The scope MUST
  * include `languageId` so VS Code returns language-scoped overrides (e.g.

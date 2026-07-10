@@ -114,7 +114,29 @@ fn namespace_warm_packages(meta: &crate::cross_file::CrossFileMetadata) -> Vec<S
 struct ActiveDocumentsChangedParams {
     active_uri: Option<String>,
     visible_uris: Vec<String>,
+    /// Resources represented by a real editor tab or visible peek editor.
+    /// Absent for older/non-VS Code clients, which retain normal `didOpen`
+    /// diagnostic behavior.
+    #[serde(default)]
+    diagnostic_uris: Option<Vec<String>>,
     timestamp_ms: u64,
+}
+
+/// Parse the VS Code client's initial tab/peek resource set.
+///
+/// Absence (including for non-object initialization options) deliberately
+/// returns `None`, preserving standard LSP `didOpen` diagnostic behavior for
+/// clients that do not implement Raven's private editor-resource protocol.
+fn initial_editor_diagnostic_uris(
+    options: &serde_json::Value,
+) -> Option<std::collections::HashSet<Url>> {
+    let uris = options.get("diagnosticUris")?.as_array()?;
+    Some(
+        uris.iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(|uri| Url::parse(uri).ok())
+            .collect(),
+    )
 }
 
 /// One entry in the raven/documentIndentUnitsChanged notification.
@@ -4212,7 +4234,12 @@ static CLOSE_RESYNC_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::co
 /// extra — or one gate-skipped — same-version republish of already-current
 /// diagnostics, bounded by `MAX_FORCE_REPUBLISH`; monotonicity is never
 /// violated. Trigger-scoped accounting would be a gate redesign, out of
-/// scope here.
+/// scope here. (The schedule-time freshness guard narrows the class: a
+/// worker only registers with `CrossFileRevalidationState::schedule` when
+/// its trigger still equals the document's current `(version, revision)`,
+/// so a late-polled, respawned, or dead-epoch worker exits without
+/// cancelling a strictly fresher pending worker — see the guard in
+/// `run_debounced_diagnostics`.)
 #[allow(clippy::too_many_arguments)]
 async fn run_close_resync(
     state_arc: Arc<RwLock<WorldState>>,
@@ -4859,10 +4886,32 @@ async fn run_debounced_diagnostics(
     trigger_revision: Option<u64>,
     traversal_truncation: Option<Arc<TraversalTruncationState>>,
 ) {
-    // Schedule with cancellation token
-    let token = {
+    // Schedule with cancellation token, gated on the trigger still matching
+    // the document's current (version, revision) under the same read lock.
+    // A mismatched worker is already obsolete (a newer edit's worker owns
+    // the current state) or belongs to a dead open epoch (spawned before a
+    // close+reopen reset the version, which did_close's cancel cannot reach
+    // because the worker had not scheduled yet). Letting it schedule anyway
+    // would cancel a strictly fresher pending worker and then die on the
+    // same freshness comparison after the debounce, leaving the newest
+    // version unpublished until the next trigger.
+    let scheduled = {
         let state = state_arc.read().await;
-        state.cross_file_revalidation.schedule(affected_uri.clone())
+        let doc = state.documents.get(&affected_uri);
+        let current_version = doc.and_then(|d| d.version);
+        let current_revision = doc.map(|d| d.revision);
+        if current_version != trigger_version || current_revision != trigger_revision {
+            None
+        } else {
+            Some(state.cross_file_revalidation.schedule(affected_uri.clone()))
+        }
+    };
+    let Some((generation, token)) = scheduled else {
+        log::trace!(
+            "Skipping diagnostics for {}: trigger is stale at schedule time",
+            affected_uri
+        );
+        return;
     };
 
     // Clone token before select so we can pass it into diagnostic computation
@@ -4882,11 +4931,32 @@ async fn run_debounced_diagnostics(
         let current_version = doc.and_then(|d| d.version);
         let current_revision = doc.map(|d| d.revision);
 
+        // Every non-cancelled exit below completes this task's own pending
+        // entry (generation-aware, so a successor's entry is never touched).
+        // Cancelled exits skip it: cancellation always removed or replaced
+        // the entry already. Without this, a worker that schedules and then
+        // bails early would strand its entry in the pending map — e.g. a
+        // closed document's worker (trigger and current both absent) whose
+        // URI is never scheduled again.
         if current_version != trigger_version || current_revision != trigger_revision {
             log::trace!(
                 "Skipping stale diagnostics for {}: revision changed",
                 affected_uri
             );
+            state
+                .cross_file_revalidation
+                .complete(&affected_uri, generation);
+            return;
+        }
+
+        if !state.diagnostics_publish_allowed(&affected_uri) {
+            log::trace!(
+                "Skipping diagnostics for {}: no editor diagnostic resource",
+                affected_uri
+            );
+            state
+                .cross_file_revalidation
+                .complete(&affected_uri, generation);
             return;
         }
 
@@ -4894,6 +4964,9 @@ async fn run_debounced_diagnostics(
             && !state.diagnostics_gate.can_publish(&affected_uri, ver)
         {
             log::trace!("Skipping diagnostics for {}: monotonic gate", affected_uri);
+            state
+                .cross_file_revalidation
+                .complete(&affected_uri, generation);
             return;
         }
 
@@ -4906,6 +4979,10 @@ async fn run_debounced_diagnostics(
     }; // Read lock released here
 
     let Some((snapshot, workspace_folder, missing_file_severity)) = snapshot_data else {
+        let state = state_arc.read().await;
+        state
+            .cross_file_revalidation
+            .complete(&affected_uri, generation);
         return;
     };
 
@@ -4955,13 +5032,53 @@ async fn run_debounced_diagnostics(
     // same predicate as can_publish, and on success updates last_published
     // and consumes one force-republish marker — closing the race where
     // two same-version publishes could share one marker.
-    let can_publish = {
+    let publish_lock = {
         let state = state_arc.read().await;
+        Arc::clone(&state.diagnostics_publish_lock)
+    };
+    let _publish_guard = publish_lock.lock().await;
+
+    // Re-check cancellation now that the publish lock is held. A `did_close`
+    // racing with this task cancels the token, clears the gate, and a
+    // same-version reopen resets `revision` to 0 — so the version/revision
+    // freshness check below cannot distinguish the reopened document from
+    // the one this task's snapshot was built against. Without this re-check,
+    // a cancelled task that wedged on the read lock across close+reopen
+    // would consume the cleared gate, publish stale diagnostics, and gate
+    // out the reopen's own fresh republish at the same version.
+    if cancel.is_cancelled() {
+        log::trace!(
+            "Diagnostics cancelled after acquiring publish lock for {}",
+            affected_uri
+        );
+        return;
+    }
+
+    let (can_publish, open_at_publish) = {
+        let state = state_arc.read().await;
+
+        // Final cancellation re-check under the state read lock, immediately
+        // before try_consume_publish: a superseding schedule (e.g. from a
+        // dependency edit) may have cancelled this task between the post-lock
+        // re-check above and this point. Defense in depth alongside the
+        // generation-aware complete() — it narrows the window in which a
+        // superseded task can still consume the gate with an older snapshot.
+        if cancel.is_cancelled() {
+            log::trace!(
+                "Diagnostics cancelled before gate consume for {}",
+                affected_uri
+            );
+            return;
+        }
+
         let doc = state.documents.get(&affected_uri);
         let current_version = doc.and_then(|d| d.version);
         let current_revision = doc.map(|d| d.revision);
 
-        if current_version != trigger_version || current_revision != trigger_revision {
+        let can_publish = if !state.diagnostics_publish_allowed(&affected_uri)
+            || current_version != trigger_version
+            || current_revision != trigger_revision
+        {
             false
         } else if let Some(ver) = current_version {
             state
@@ -4969,17 +5086,80 @@ async fn run_debounced_diagnostics(
                 .try_consume_publish(&affected_uri, ver)
         } else {
             true
-        }
+        };
+        (can_publish, doc.is_some())
     };
 
     if can_publish {
+        log::trace!(
+            "diagnostics lifecycle: publish uri={} count={} path=debounced trigger_version={:?} open={}",
+            affected_uri,
+            diagnostics.len(),
+            trigger_version,
+            open_at_publish
+        );
         client
             .publish_diagnostics(affected_uri.clone(), diagnostics, None)
             .await;
 
         let state = state_arc.read().await;
-        state.cross_file_revalidation.complete(&affected_uri);
+        state
+            .cross_file_revalidation
+            .complete(&affected_uri, generation);
+
+        // Convergence backstop for the unserialized cancel-vs-consume window:
+        // a superseding schedule (dependency edit) can cancel this task in the
+        // instants between the final pre-consume re-check and
+        // try_consume_publish, in which case this publish consumed the force
+        // marker meant for the successor and the successor would be gated out
+        // at the same version. Restore a marker AND respawn a fresh consumer:
+        // the marker alone can be stranded (the successor's unlocked advisory
+        // pre-check can observe the consumed gate and give up before this
+        // restore lands), while the respawn guarantees a consumer exists for
+        // the restored marker. The respawn's schedule() supersedes any pending
+        // successor, it blocks on the publish lock until this task releases
+        // it, and it only re-enters this branch if it loses the same race to
+        // yet another superseding edit — so it cannot loop absent new edits.
+        // If the cancellation instead came from did_close, the close's
+        // gate.clear (serialized behind the publish lock this task holds)
+        // removes the surplus marker and the respawn bails at its
+        // eligibility checks.
+        if cancel.is_cancelled() {
+            state.diagnostics_gate.mark_force_republish(&affected_uri);
+            tokio::spawn(respawn_publish_after_superseded(
+                Arc::clone(&state_arc),
+                client.clone(),
+                affected_uri.clone(),
+                traversal_truncation.clone(),
+            ));
+        }
+    } else if !cancel.is_cancelled() {
+        // Gate or eligibility refused the publish and nothing cancelled this
+        // task, so nothing else will remove its pending entry — complete it.
+        let state = state_arc.read().await;
+        state
+            .cross_file_revalidation
+            .complete(&affected_uri, generation);
     }
+}
+
+/// Respawn helper for the cancel-vs-consume backstop in
+/// `run_debounced_diagnostics`: runs the normal debounced pipeline for the
+/// URI so the restored force marker has a guaranteed consumer.
+///
+/// Returned as a boxed trait object with an explicit signature because the
+/// respawn makes the future type recursive (`run_debounced_diagnostics` →
+/// `publish_diagnostics_via_arc` → `run_debounced_diagnostics`); without the
+/// named indirection the compiler cannot resolve the cyclic `Send` obligation.
+fn respawn_publish_after_superseded(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    uri: Url,
+    traversal_truncation: Option<Arc<TraversalTruncationState>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        Backend::publish_diagnostics_via_arc(state_arc, client, &uri, traversal_truncation).await;
+    })
 }
 
 pub(crate) enum RavenProjectConfigLoaded {}
@@ -5268,6 +5448,7 @@ impl LanguageServer for Backend {
             .initialization_options
             .clone()
             .unwrap_or(serde_json::Value::Null);
+        let editor_diagnostic_uris = initial_editor_diagnostic_uris(&raw_client);
         let discovery_options = self.discovery_options_from_client_settings(&raw_client);
         let project_layer = project_root
             .as_deref()
@@ -5285,6 +5466,7 @@ impl LanguageServer for Backend {
         {
             let mut state = self.state.write().await;
             state.raw_client_settings = raw_client;
+            state.editor_diagnostic_uris = editor_diagnostic_uris;
             apply_project_config_layer(&mut state, project_layer);
             // `recompute_parsed_configs` now also recompiles
             // `state.lint_overrides` — callers no longer need a
@@ -6116,6 +6298,12 @@ impl LanguageServer for Backend {
         let language_id = params.text_document.language_id;
         let text = params.text_document.text;
         let version = params.text_document.version;
+        log::trace!(
+            "diagnostics lifecycle: didOpen uri={} version={} language_id={}",
+            uri,
+            version,
+            language_id
+        );
 
         // Captured inside the lock block when the opened doc is the
         // workspace-root `.Rprofile`; drives an off-lock prelude refresh after.
@@ -7726,8 +7914,19 @@ impl LanguageServer for Backend {
         self.check_and_warn_traversal_truncation().await;
     }
 
+    /// Close the live document and clear its editor diagnostics before any
+    /// asynchronous disk resync or dependent revalidation begins.
+    ///
+    /// Raven publishes diagnostics only for live documents. LSP push
+    /// diagnostics are server-owned, so removing the document from
+    /// [`WorldState::documents`] is not enough: the client may retain the last
+    /// published Problems entries indefinitely. Publishing an empty list after
+    /// the close commit prevents those stale entries from causing VS Code to
+    /// load the closed resources as hidden text documents, which would send a
+    /// new `didOpen` and repopulate the diagnostics.
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
+        log::trace!("diagnostics lifecycle: didClose uri={}", uri);
 
         let (package_close_uri, package_close_excluded): (Option<Url>, bool) = {
             let state = self.state.read().await;
@@ -7810,6 +8009,16 @@ impl LanguageServer for Backend {
         let mut resync_old_interface_hash: Option<u64> = None;
         let mut resync_chunk_kind: Option<crate::chunks::ChunkKind> = None;
         let mut close_resync_uris: Vec<Url> = Vec::new();
+
+        // Serialize the close commit + empty publish with diagnostic commit
+        // tails. Cancellation alone has a narrow race after a worker's final
+        // state check; this lock guarantees the empty publication is ordered
+        // after every diagnostic publish that observed the document as open.
+        let diagnostics_publish_lock = {
+            let state = self.state.read().await;
+            Arc::clone(&state.diagnostics_publish_lock)
+        };
+        let _diagnostics_publish_guard = diagnostics_publish_lock.lock().await;
 
         let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
             let mut state = self.state.write().await;
@@ -8041,6 +8250,20 @@ impl LanguageServer for Backend {
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
             (sibling_fanout, debounce_ms)
         };
+
+        // Push diagnostics are owned by the server and survive document close
+        // unless explicitly replaced. Clear the raw client URI after the state
+        // commit (pending work is cancelled and the gate is cleared above) but
+        // before slower close-time rescans. With the LSP dispatcher serialized,
+        // a subsequent didOpen cannot overtake this empty publication.
+        log::trace!(
+            "diagnostics lifecycle: publish uri={} count=0 path=close-clear open=false",
+            uri
+        );
+        self.client
+            .publish_diagnostics(uri.clone(), Vec::new(), None)
+            .await;
+        drop(_diagnostics_publish_guard);
 
         // Switch the prelude to a remaining live `.Rprofile` alias, or revert
         // it to on-disk `.Rprofile` after a close (off-lock).
@@ -10601,9 +10824,10 @@ impl Backend {
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
     async fn handle_active_documents_changed(&self, params: ActiveDocumentsChangedParams) {
         log::trace!(
-            "Received activeDocumentsChanged: active={:?}, visible={}, timestamp={}",
+            "Received activeDocumentsChanged: active={:?}, visible={}, diagnostic_resources={:?}, timestamp={}",
             params.active_uri,
             params.visible_uris.len(),
+            params.diagnostic_uris.as_ref().map(Vec::len),
             params.timestamp_ms
         );
 
@@ -10614,10 +10838,88 @@ impl Backend {
             .filter_map(|s| Url::parse(s).ok())
             .collect();
 
-        let mut state = self.state.write().await;
-        state
-            .cross_file_activity
-            .update(active_uri, visible_uris, params.timestamp_ms);
+        let diagnostic_uris = params.diagnostic_uris.map(|uris| {
+            uris.into_iter()
+                .filter_map(|uri| Url::parse(&uri).ok())
+                .collect::<std::collections::HashSet<_>>()
+        });
+
+        let Some(new_uris) = diagnostic_uris else {
+            let mut state = self.state.write().await;
+            state
+                .cross_file_activity
+                .update(active_uri, visible_uris, params.timestamp_ms);
+            return;
+        };
+
+        // Serialize a tab-set transition and its empty publications with the
+        // final commit+send tail of every diagnostic computation.
+        let diagnostics_publish_lock = {
+            let state = self.state.read().await;
+            Arc::clone(&state.diagnostics_publish_lock)
+        };
+        let diagnostics_publish_guard = diagnostics_publish_lock.lock().await;
+
+        let (removed, added) = {
+            let mut state = self.state.write().await;
+            state
+                .cross_file_activity
+                .update(active_uri, visible_uris, params.timestamp_ms);
+
+            let previously_eligible: std::collections::HashSet<Url> = state
+                .documents
+                .keys()
+                .filter(|uri| state.diagnostics_publish_allowed(uri))
+                .cloned()
+                .collect();
+            let newly_eligible: std::collections::HashSet<Url> = state
+                .documents
+                .keys()
+                .filter(|uri| new_uris.contains(*uri))
+                .cloned()
+                .collect();
+
+            let removed: Vec<Url> = previously_eligible
+                .difference(&newly_eligible)
+                .cloned()
+                .collect();
+            let added: Vec<Url> = newly_eligible
+                .difference(&previously_eligible)
+                .cloned()
+                .collect();
+
+            state.editor_diagnostic_uris = Some(new_uris);
+            for uri in &removed {
+                // In-flight work also re-checks eligibility at commit. Clearing
+                // both states retracts Problems now and lets a later tab-open
+                // publish the same document version without a force marker.
+                state.cross_file_revalidation.cancel(uri);
+                state.diagnostics_gate.clear(uri);
+            }
+
+            (removed, added)
+        };
+
+        for uri in removed {
+            log::trace!(
+                "diagnostics lifecycle: publish uri={} count=0 path=tab-clear open=true",
+                uri
+            );
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        }
+        drop(diagnostics_publish_guard);
+
+        if !added.is_empty() {
+            // A tab can appear for a document that another extension already
+            // kept LSP-open, so there may be no new didOpen to trigger this.
+            // Run the normal bounded pipeline explicitly.
+            tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
+                Arc::clone(&self.state),
+                self.client.clone(),
+                added,
+                Some(Arc::clone(&self.traversal_truncation)),
+            ));
+        }
     }
 
     /// Handle the raven/semanticTokensForRString custom request.
@@ -10759,6 +11061,14 @@ pub(crate) async fn publish_diagnostics_inner(
         let state = state_arc.read().await;
         let version = state.documents.get(uri).and_then(|d| d.version);
 
+        if !state.diagnostics_publish_allowed(uri) {
+            log::trace!(
+                "Skipping diagnostics for {}: no editor diagnostic resource",
+                uri
+            );
+            return;
+        }
+
         // Check if we can publish (monotonic gate)
         if let Some(ver) = version {
             if !state.diagnostics_gate.can_publish(uri, ver) {
@@ -10862,8 +11172,20 @@ pub(crate) async fn publish_diagnostics_inner(
 
     // Re-check freshness after async work, atomically commit gate state, before publishing.
     // try_consume_publish replaces the racy can_publish + record_publish pair.
-    {
+    let publish_lock = {
         let state = state_arc.read().await;
+        Arc::clone(&state.diagnostics_publish_lock)
+    };
+    let _publish_guard = publish_lock.lock().await;
+    let open_at_publish = {
+        let state = state_arc.read().await;
+        if !state.diagnostics_publish_allowed(uri) {
+            log::trace!(
+                "Skipping diagnostics for {}: editor diagnostic resource removed",
+                uri
+            );
+            return;
+        }
         if let Some(ver) = version {
             let current_version = state.documents.get(uri).and_then(|d| d.version);
             if current_version != Some(ver) {
@@ -10884,8 +11206,16 @@ pub(crate) async fn publish_diagnostics_inner(
                 return;
             }
         }
-    }
+        state.documents.contains_key(uri)
+    };
 
+    log::trace!(
+        "diagnostics lifecycle: publish uri={} count={} path=direct version={:?} open={}",
+        uri,
+        diagnostics.len(),
+        version,
+        open_at_publish
+    );
     client
         .publish_diagnostics(uri.clone(), diagnostics, None)
         .await;
@@ -11517,6 +11847,283 @@ async fn run_libpath_consumer(
 
 #[cfg(test)]
 mod tests {
+    mod diagnostic_lifecycle {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::Request;
+        use tower_lsp::lsp_types::{
+            Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
+            PublishDiagnosticsParams, Range, TextDocumentIdentifier, TextDocumentItem, Url,
+        };
+        use tower_lsp::{LanguageServer, LspService};
+
+        /// Push diagnostics are server-owned. Closing Raven's last live buffer
+        /// for a URI must therefore replace its nonempty Problems entries with
+        /// an empty publication; removing the URI from `WorldState::documents`
+        /// alone does not clear the client collection.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn did_close_publishes_empty_diagnostics_for_closed_uri() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("close-me.R");
+            let text = "definitely_missing_close_clear\n";
+            std::fs::write(&path, text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                // Keep didOpen's own diagnostic task pending; didClose below
+                // must cancel it before it can race the explicit stale marker.
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+
+            // Model the nonempty push diagnostics already owned by the client.
+            // The close handler, not a fresh diagnostic computation, is what
+            // must replace this marker with an empty list.
+            backend
+                .client
+                .publish_diagnostics(
+                    uri.clone(),
+                    vec![Diagnostic::new_simple(
+                        Range::default(),
+                        "stale diagnostic".into(),
+                    )],
+                    None,
+                )
+                .await;
+            let initial = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("seed diagnostic must publish")
+                .expect("client socket must remain open");
+            assert_eq!(initial.method(), "textDocument/publishDiagnostics");
+            let initial: PublishDiagnosticsParams =
+                serde_json::from_value(initial.params().unwrap().clone()).unwrap();
+            assert_eq!(initial.uri, uri);
+            assert!(
+                !initial.diagnostics.is_empty(),
+                "precondition: the open document must own nonempty diagnostics"
+            );
+
+            backend
+                .did_close(DidCloseTextDocumentParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                })
+                .await;
+
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("close must clear diagnostics")
+                .expect("client socket must remain open");
+            assert_eq!(cleared.method(), "textDocument/publishDiagnostics");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert_eq!(cleared.uri, uri);
+            assert!(
+                cleared.diagnostics.is_empty(),
+                "closed document diagnostics must be cleared, got {:?}",
+                cleared.diagnostics
+            );
+        }
+
+        /// Clients that do not send Raven's VS Code-specific tab set retain
+        /// ordinary LSP semantics: a `didOpen` document may own diagnostics.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn absent_diagnostic_resource_set_preserves_did_open_behavior() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("generic-client.R");
+            let text = "x <- (\n";
+            std::fs::write(&path, text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+            backend.publish_diagnostics(&uri).await;
+
+            let published = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("generic clients must receive diagnostics for didOpen documents")
+                .expect("client socket must remain open");
+            assert_eq!(published.method(), "textDocument/publishDiagnostics");
+            let published: PublishDiagnosticsParams =
+                serde_json::from_value(published.params().unwrap().clone()).unwrap();
+            assert_eq!(published.uri, uri);
+            assert!(
+                !published.diagnostics.is_empty(),
+                "the malformed open document should have diagnostics"
+            );
+        }
+
+        /// The VS Code client keeps hidden text models synchronized, but only
+        /// real tabs (and visible peek editors) may own Problems entries.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn diagnostic_resource_set_hides_and_restores_open_document_diagnostics() {
+            let tmp = TempDir::new().unwrap();
+            let visible_path = tmp.path().join("visible.R");
+            let hidden_path = tmp.path().join("hidden.R");
+            let text = "x <- (\n";
+            std::fs::write(&visible_path, text).unwrap();
+            std::fs::write(&hidden_path, text).unwrap();
+            let visible_uri = Url::from_file_path(visible_path).unwrap();
+            let hidden_uri = Url::from_file_path(hidden_path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(
+                    serde_json::to_value(InitializeParams {
+                        initialization_options: Some(serde_json::json!({
+                            "diagnosticUris": [visible_uri.to_string()],
+                        })),
+                        ..InitializeParams::default()
+                    })
+                    .unwrap(),
+                )
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                // Keep didOpen work pending so each assertion controls the
+                // publication that follows.
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            for uri in [&visible_uri, &hidden_uri] {
+                backend
+                    .did_open(DidOpenTextDocumentParams {
+                        text_document: TextDocumentItem {
+                            uri: uri.clone(),
+                            language_id: "r".into(),
+                            version: 1,
+                            text: text.into(),
+                        },
+                    })
+                    .await;
+            }
+
+            backend.publish_diagnostics(&hidden_uri).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err(),
+                "a hidden LSP-open document must not publish diagnostics"
+            );
+
+            backend.publish_diagnostics(&visible_uri).await;
+            let visible = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("the tabbed document must publish diagnostics")
+                .expect("client socket must remain open");
+            let visible: PublishDiagnosticsParams =
+                serde_json::from_value(visible.params().unwrap().clone()).unwrap();
+            assert_eq!(visible.uri, visible_uri);
+            assert!(!visible.diagnostics.is_empty());
+
+            // Removing the tab retracts its existing Problems while retaining
+            // the document in WorldState as a cross-file analysis input.
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: None,
+                    visible_uris: Vec::new(),
+                    diagnostic_uris: Some(Vec::new()),
+                    timestamp_ms: 2,
+                })
+                .await;
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("removing the tab must clear diagnostics")
+                .expect("client socket must remain open");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert_eq!(cleared.uri, visible_uri);
+            assert!(cleared.diagnostics.is_empty());
+            assert!(
+                backend
+                    .state
+                    .read()
+                    .await
+                    .documents
+                    .contains_key(&visible_uri)
+            );
+
+            // A later tab-open may not produce didOpen because the hidden model
+            // never closed. The tab transition itself must republish it.
+            backend
+                .state
+                .write()
+                .await
+                .cross_file_config
+                .revalidation_debounce_ms = 0;
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(visible_uri.to_string()),
+                    visible_uris: vec![visible_uri.to_string()],
+                    diagnostic_uris: Some(vec![visible_uri.to_string()]),
+                    timestamp_ms: 3,
+                })
+                .await;
+            let restored = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("restoring the tab must republish diagnostics")
+                .expect("client socket must remain open");
+            let restored: PublishDiagnosticsParams =
+                serde_json::from_value(restored.params().unwrap().clone()).unwrap();
+            assert_eq!(restored.uri, visible_uri);
+            assert!(!restored.diagnostics.is_empty());
+        }
+    }
+
     mod document_indent_units {
         #[test]
         fn normalizes_client_supplied_indent_units() {
