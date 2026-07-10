@@ -70,6 +70,16 @@ impl CrossFileRevalidationState {
         }
     }
 
+    /// Test-only: whether a pending revalidation entry currently exists for
+    /// `uri`. Race tests use this to wait until a spawned worker has
+    /// `schedule()`d (and parked in its debounce) before superseding it —
+    /// spawning a competing worker earlier would race the first worker's
+    /// own `schedule()`, which cancels whichever token is pending.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_pending_for_test(&self, uri: &Url) -> bool {
+        self.pending.read().unwrap().contains_key(uri)
+    }
+
     /// Cancel pending revalidation for a URI
     pub fn cancel(&self, uri: &Url) {
         let mut pending = self.pending.write().unwrap();

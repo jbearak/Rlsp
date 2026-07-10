@@ -11898,6 +11898,32 @@ mod tests {
         };
         use tower_lsp::{LanguageServer, LspService};
 
+        /// Poll until a pending revalidation entry exists for `uri` — i.e.
+        /// the document's own spawned debounced worker has `schedule()`d and
+        /// parked in its debounce. Tests that spawn a competing worker for
+        /// the same URI must wait for this first: a spawn racing the first
+        /// worker's schedule() can be cancelled by it instead of
+        /// deterministically superseding it.
+        async fn wait_until_pending(backend: &super::super::Backend, uri: &Url) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if backend
+                    .state
+                    .read()
+                    .await
+                    .cross_file_revalidation
+                    .has_pending_for_test(uri)
+                {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the document's own worker must schedule before the test proceeds"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
         /// Push diagnostics are server-owned. Closing Raven's last live buffer
         /// for a URI must therefore replace its nonempty Problems entries with
         /// an empty publication; removing the URI from `WorldState::documents`
@@ -12499,6 +12525,15 @@ mod tests {
                 })
                 .await;
 
+            // did_open spawned this document's own debounced worker; wait
+            // until it has schedule()d (it then parks in its 60s debounce)
+            // so the manual zero-debounce worker below deterministically
+            // supersedes it. Spawning first would race the did_open
+            // worker's late schedule(), which — same lifecycle, trigger not
+            // stale — would cancel the manual worker before it reaches the
+            // pause point.
+            wait_until_pending(backend, &uri).await;
+
             let trigger = {
                 let state = backend.state.read().await;
                 crate::state::DiagnosticsTrigger::capture(&state, &uri)
@@ -12623,6 +12658,15 @@ mod tests {
                     },
                 })
                 .await;
+
+            // did_open spawned this document's own debounced worker; wait
+            // until it has schedule()d (it then parks in its 60s debounce)
+            // so the manual zero-debounce worker below deterministically
+            // supersedes it. Spawning first would race the did_open
+            // worker's late schedule(), which — same lifecycle, trigger not
+            // stale — would cancel the manual worker before it reaches the
+            // pause point.
+            wait_until_pending(backend, &uri).await;
 
             let trigger = {
                 let state = backend.state.read().await;
