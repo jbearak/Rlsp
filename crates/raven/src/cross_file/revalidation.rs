@@ -1226,12 +1226,24 @@ mod tests {
     #[test]
     fn test_gate_clear_races_try_consume_publish_without_wedging() {
         // The gate is presented as the lifecycle authority, so its internal
-        // lock discipline must hold even when clear()/begin_epoch() run
-        // concurrently with try_consume_publish() (nothing at the gate level
-        // enforces the outer WorldState lock choreography). Assert two
-        // things under real contention: no deadlock, and a commit only ever
-        // succeeds for an epoch that was current at commit time.
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        // lock discipline must hold even when clear() runs concurrently with
+        // try_consume_publish() (nothing at the gate level enforces the
+        // outer WorldState lock choreography). Assert two things under real
+        // contention: no deadlock, and the nested-guard-lifetime invariant —
+        // try_consume_publish must hold the `current_epoch` guard across the
+        // entire version/force commit.
+        //
+        // Detector: the lifecycle thread retires the epoch with a single
+        // clear() and never re-mints it. clear() takes all three write
+        // guards, so in a correct implementation every commit either fully
+        // precedes it (its `last_published_version` entry is then removed by
+        // the clear) or fully follows it (the epoch check fails; no entry is
+        // written). Only an implementation that releases the epoch guard
+        // between the check and the commit can interleave with the clear and
+        // write an entry AFTER the clear removed everything — so any
+        // surviving entry after all threads join proves the guard-lifetime
+        // bug. `can_publish(uri, i32::MIN)` is true iff no entry survived
+        // (consumers only commit versions >= 0).
         use std::sync::{Arc, Barrier};
         use std::thread;
 
@@ -1242,30 +1254,16 @@ mod tests {
         const N_CONSUMERS: usize = 16;
         const N_CYCLES: usize = 200;
         let barrier = Arc::new(Barrier::new(N_CONSUMERS + 1));
-        // Set to true only AFTER the retiring clear() has fully completed:
-        // a consumer that observes `true` before calling try_consume_publish
-        // has a happens-before edge past the retirement, so any success it
-        // then gets with `initial` is a definite stale commit (the initial
-        // epoch is never re-minted). Attempts that race the clear itself are
-        // not judged — this avoids false positives while still catching
-        // deadlocks and guard-lifetime bugs under real contention.
-        let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stale_commits = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
 
         for _ in 0..N_CONSUMERS {
             let gate = gate.clone();
             let uri = uri.clone();
             let barrier = barrier.clone();
-            let retired = retired.clone();
-            let stale_commits = stale_commits.clone();
             handles.push(thread::spawn(move || {
                 barrier.wait();
                 for v in 0..N_CYCLES as i32 {
-                    let was_retired = retired.load(Ordering::SeqCst);
-                    if gate.try_consume_publish(&uri, v, initial) && was_retired {
-                        stale_commits.fetch_add(1, Ordering::Relaxed);
-                    }
+                    gate.try_consume_publish(&uri, v, initial);
                 }
             }));
         }
@@ -1273,27 +1271,22 @@ mod tests {
         let lifecycle_gate = gate.clone();
         let lifecycle_uri = uri.clone();
         let lifecycle_barrier = barrier.clone();
-        let lifecycle_retired = retired.clone();
         handles.push(thread::spawn(move || {
             lifecycle_barrier.wait();
             lifecycle_gate.clear(&lifecycle_uri);
-            lifecycle_retired.store(true, Ordering::SeqCst);
-            // Keep churning lifecycles to contend with the consumers.
-            for _ in 0..N_CYCLES {
-                lifecycle_gate.begin_epoch(&lifecycle_uri);
-                lifecycle_gate.clear(&lifecycle_uri);
-            }
         }));
 
         for h in handles {
             h.join().unwrap();
         }
 
-        assert_eq!(
-            stale_commits.load(Ordering::Relaxed),
-            0,
-            "no retired-epoch commit may succeed after retirement completed"
+        assert!(
+            gate.can_publish(&uri, i32::MIN),
+            "a last_published_version entry survived the retiring clear: a \
+             commit interleaved between the epoch check and the version/force \
+             write, so the current_epoch guard was not held across the commit"
         );
+        assert_eq!(gate.current_epoch(&uri), None);
     }
 
     #[test]

@@ -12421,14 +12421,16 @@ mod tests {
         }
 
         /// Companion to `stale_debounced_worker_declines_after_tab_readdition`
-        /// covering the commit side of the debounced pipeline: a worker that
-        /// already computed diagnostics and is parked in the post-compute,
-        /// pre-commit window when the tab removal + re-addition happens must
-        /// not publish afterwards, and must leave the re-added lifecycle's
-        /// gate untouched. (Cancellation catches this interleaving first;
-        /// the epoch is the backstop for workers cancellation cannot reach —
-        /// this test pins the observable outcome regardless of which check
-        /// fires.)
+        /// covering the parked-worker interleaving of the debounced pipeline:
+        /// a worker that already computed diagnostics and is parked in the
+        /// post-compute, pre-commit window when the tab removal + re-addition
+        /// happens must not publish afterwards, and must leave the re-added
+        /// lifecycle's gate untouched. On this interleaving the retirement's
+        /// cancellation reaches the worker's token first and the epoch is
+        /// defense-in-depth — this test pins the observable outcome
+        /// regardless of which check fires; see
+        /// `debounced_commit_declines_stale_epoch_without_cancellation` for
+        /// the commit-side epoch check exercised in isolation.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn paused_debounced_worker_cannot_publish_after_tab_readdition() {
             let tmp = TempDir::new().unwrap();
@@ -12551,6 +12553,101 @@ mod tests {
                 serde_json::from_value(restored.params().unwrap().clone()).unwrap();
             assert_eq!(restored.uri, uri);
             assert!(!restored.diagnostics.is_empty());
+        }
+
+        /// The debounced pipeline's commit-side epoch check, exercised in
+        /// isolation. Every real retirement also cancels the worker's token,
+        /// so the epoch is unreachable on that path while cancellation works
+        /// — this test models the failure mode the epoch exists for (a
+        /// lifecycle transition whose cancel cannot reach the worker) by
+        /// retiring and re-minting the gate's epoch directly, without
+        /// touching the cancellation token. The parked worker must then be
+        /// stopped by the epoch comparison alone: no publish, and the fresh
+        /// lifecycle's gate left unconsumed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn debounced_commit_declines_stale_epoch_without_cancellation() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("epoch-only-race.R");
+            let text = "x <- (\n";
+            std::fs::write(&path, text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+
+            let trigger = {
+                let state = backend.state.read().await;
+                crate::state::DiagnosticsTrigger::capture(&state, &uri)
+            };
+            let pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_test_pause
+                .arm(uri.clone());
+            let worker = tokio::spawn(super::super::run_debounced_diagnostics(
+                backend.state.clone(),
+                backend.client.clone(),
+                uri.clone(),
+                0,
+                trigger,
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_arrived())
+                .await
+                .expect("debounced worker must reach the pre-commit pause point");
+
+            // Retire and re-mint the epoch WITHOUT cancelling: the worker's
+            // token stays live, so only the commit-side epoch comparison can
+            // stop it.
+            {
+                let state = backend.state.write().await;
+                state.diagnostics_gate.clear(&uri);
+                state.diagnostics_gate.begin_epoch(&uri);
+            }
+
+            pause.release();
+            worker.await.unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err(),
+                "a live-token worker with a stale epoch must not publish"
+            );
+            assert!(
+                backend
+                    .state
+                    .read()
+                    .await
+                    .diagnostics_gate
+                    .can_publish(&uri, 1),
+                "the stale-epoch worker must not consume the fresh lifecycle's gate"
+            );
         }
 
         /// Server shutdown retires every diagnostic lifecycle: an in-flight
