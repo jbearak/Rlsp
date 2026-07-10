@@ -29,7 +29,7 @@ use tower_lsp::lsp_types::*;
 use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::indentation;
-use crate::state::{IndentationSettings, SymbolConfig, WorldState};
+use crate::state::{DiagnosticsTrigger, IndentationSettings, SymbolConfig, WorldState};
 use crate::utf16::utf16_column_to_byte_offset;
 tokio::task_local! {
     static CURRENT_LSP_REQUEST_ID: JsonRpcId;
@@ -1698,7 +1698,7 @@ fn collect_close_fanout_siblings(
     state: &WorldState,
     closing_uri: &Url,
     workspace_root: &std::path::Path,
-) -> Vec<(Url, Option<i32>, Option<u64>)> {
+) -> Vec<(Url, DiagnosticsTrigger)> {
     let mut candidates: Vec<Url> = state
         .documents
         .keys()
@@ -1715,21 +1715,20 @@ fn collect_close_fanout_siblings(
     );
     candidates
         .into_iter()
-        .filter_map(|sibling_uri| {
-            state
-                .documents
-                .get(&sibling_uri)
-                .map(|doc| (sibling_uri, doc.version, Some(doc.revision)))
+        .filter(|sibling_uri| state.documents.contains_key(sibling_uri))
+        .map(|sibling_uri| {
+            let trigger = DiagnosticsTrigger::capture(state, &sibling_uri);
+            (sibling_uri, trigger)
         })
         .collect()
 }
 
 fn add_close_fanout_uris(
     state: &WorldState,
-    fanout: &mut Vec<(Url, Option<i32>, Option<u64>)>,
+    fanout: &mut Vec<(Url, DiagnosticsTrigger)>,
     additional: impl IntoIterator<Item = Url>,
 ) {
-    let mut candidates: Vec<Url> = fanout.iter().map(|(uri, _, _)| uri.clone()).collect();
+    let mut candidates: Vec<Url> = fanout.iter().map(|(uri, _)| uri.clone()).collect();
     let mut seen: std::collections::HashSet<Url> = candidates.iter().cloned().collect();
     for uri in additional {
         if state.documents.contains_key(&uri) && seen.insert(uri.clone()) {
@@ -1743,11 +1742,10 @@ fn add_close_fanout_uris(
     );
     *fanout = candidates
         .into_iter()
-        .filter_map(|uri| {
-            state
-                .documents
-                .get(&uri)
-                .map(|doc| (uri, doc.version, Some(doc.revision)))
+        .filter(|uri| state.documents.contains_key(uri))
+        .map(|uri| {
+            let trigger = DiagnosticsTrigger::capture(state, &uri);
+            (uri, trigger)
         })
         .collect();
 }
@@ -2393,6 +2391,10 @@ mod manifest_extend_tests {
         let gate = CrossFileDiagnosticsGate::new();
         let max_revalidations = 10usize;
         let open_uris: Vec<Url> = (0..20).map(|i| test_uri(&format!("R/f{i}.R"))).collect();
+        let epochs: std::collections::HashMap<Url, _> = open_uris
+            .iter()
+            .map(|u| (u.clone(), gate.begin_epoch(u)))
+            .collect();
         for u in &open_uris {
             gate.record_publish(u, 1);
         }
@@ -2407,7 +2409,7 @@ mod manifest_extend_tests {
         gate.mark_force_republish_many(affected_for_async.iter());
         for u in &affected_for_async {
             assert!(
-                gate.try_consume_publish(u, 1),
+                gate.try_consume_publish(u, 1, epochs[u]),
                 "force-marked URI must publish at v=1"
             );
         }
@@ -4800,13 +4802,13 @@ fn merge_and_cap_reenrichment_revalidations(
 /// by the cap don't carry orphaned force counters.
 fn rebuild_work_items_after_reenrichment(
     pinned_uri: &Url,
-    prev_work_items: &[(Url, Option<i32>, Option<u64>)],
+    prev_work_items: &[(Url, DiagnosticsTrigger)],
     new_neighbors: Vec<Url>,
     state: &WorldState,
-) -> Vec<(Url, Option<i32>, Option<u64>)> {
+) -> Vec<(Url, DiagnosticsTrigger)> {
     let max_revalidations = state.cross_file_config.max_revalidations_per_trigger;
     let prev_uris: std::collections::HashSet<Url> =
-        prev_work_items.iter().map(|(u, _, _)| u.clone()).collect();
+        prev_work_items.iter().map(|(u, _)| u.clone()).collect();
     let final_uris = merge_and_cap_reenrichment_revalidations(
         pinned_uri,
         prev_uris,
@@ -4817,10 +4819,8 @@ fn rebuild_work_items_after_reenrichment(
     final_uris
         .into_iter()
         .map(|u| {
-            let doc = state.documents.get(&u);
-            let trigger_version = doc.and_then(|d| d.version);
-            let trigger_revision = doc.map(|d| d.revision);
-            (u, trigger_version, trigger_revision)
+            let trigger = DiagnosticsTrigger::capture(state, &u);
+            (u, trigger)
         })
         .collect()
 }
@@ -4872,6 +4872,27 @@ async fn check_and_warn_traversal_truncation(
     }
 }
 
+/// Test-only pause point for the diagnostics publish pipelines: parks the
+/// calling worker post-compute, pre-commit when a test armed a pause for
+/// `uri` (see `DiagnosticsPublishPause`). Sits BEFORE the publish-lock
+/// acquisition so `did_close` / tab handlers (which take that lock) can run
+/// while the worker is parked. The armed gate is looked up in its own
+/// statement so the `WorldState` read guard drops before the await.
+#[cfg(any(test, feature = "test-support"))]
+async fn pause_if_armed_for_test(state_arc: &Arc<RwLock<WorldState>>, uri: &Url) {
+    let armed = {
+        let state = state_arc.read().await;
+        state.diagnostics_test_pause.take_armed(uri)
+    };
+    if let Some(pause_gate) = armed {
+        pause_gate.pause().await;
+    }
+}
+
+/// Production builds compile the pause point to a no-op.
+#[cfg(not(any(test, feature = "test-support")))]
+async fn pause_if_armed_for_test(_state_arc: &Arc<RwLock<WorldState>>, _uri: &Url) {}
+
 /// Run debounced diagnostics for a single URI.
 ///
 /// This is the shared diagnostics pipeline used by both `did_open`/`did_change`
@@ -4882,25 +4903,27 @@ async fn run_debounced_diagnostics(
     client: Client,
     affected_uri: Url,
     debounce_ms: u64,
-    trigger_version: Option<i32>,
-    trigger_revision: Option<u64>,
+    trigger: DiagnosticsTrigger,
     traversal_truncation: Option<Arc<TraversalTruncationState>>,
 ) {
     // Schedule with cancellation token, gated on the trigger still matching
-    // the document's current (version, revision) under the same read lock.
-    // A mismatched worker is already obsolete (a newer edit's worker owns
-    // the current state) or belongs to a dead open epoch (spawned before a
-    // close+reopen reset the version, which did_close's cancel cannot reach
-    // because the worker had not scheduled yet). Letting it schedule anyway
-    // would cancel a strictly fresher pending worker and then die on the
-    // same freshness comparison after the debounce, leaving the newest
-    // version unpublished until the next trigger.
+    // the document's current (version, revision, epoch) under the same read
+    // lock. A mismatched worker is already obsolete (a newer edit's worker
+    // owns the current state) or belongs to a retired lifecycle (spawned
+    // before a close+reopen or tab removal, which did_close's cancel cannot
+    // reach because the worker had not scheduled yet — the epoch comparison
+    // is what catches it even when version and revision coincide). Letting
+    // it schedule anyway would cancel a strictly fresher pending worker and
+    // then die on the same freshness comparison after the debounce, leaving
+    // the newest version unpublished until the next trigger.
+    //
+    // An epoch-less trigger is declined outright: it can never legally
+    // publish (the final commit requires a live epoch), and an all-`None`
+    // trigger would otherwise compare equal to a still-absent document and
+    // let a retired worker participate in schedule() supersession.
     let scheduled = {
         let state = state_arc.read().await;
-        let doc = state.documents.get(&affected_uri);
-        let current_version = doc.and_then(|d| d.version);
-        let current_revision = doc.map(|d| d.revision);
-        if current_version != trigger_version || current_revision != trigger_revision {
+        if trigger.epoch.is_none() || trigger.is_stale(&state, &affected_uri) {
             None
         } else {
             Some(state.cross_file_revalidation.schedule(affected_uri.clone()))
@@ -4927,10 +4950,6 @@ async fn run_debounced_diagnostics(
     let snapshot_data = {
         let state = state_arc.read().await;
 
-        let doc = state.documents.get(&affected_uri);
-        let current_version = doc.and_then(|d| d.version);
-        let current_revision = doc.map(|d| d.revision);
-
         // Every non-cancelled exit below completes this task's own pending
         // entry (generation-aware, so a successor's entry is never touched).
         // Cancelled exits skip it: cancellation always removed or replaced
@@ -4938,9 +4957,9 @@ async fn run_debounced_diagnostics(
         // bails early would strand its entry in the pending map — e.g. a
         // closed document's worker (trigger and current both absent) whose
         // URI is never scheduled again.
-        if current_version != trigger_version || current_revision != trigger_revision {
+        if trigger.is_stale(&state, &affected_uri) {
             log::trace!(
-                "Skipping stale diagnostics for {}: revision changed",
+                "Skipping stale diagnostics for {}: trigger no longer current",
                 affected_uri
             );
             state
@@ -4960,7 +4979,7 @@ async fn run_debounced_diagnostics(
             return;
         }
 
-        if let Some(ver) = current_version
+        if let Some(ver) = trigger.version
             && !state.diagnostics_gate.can_publish(&affected_uri, ver)
         {
             log::trace!("Skipping diagnostics for {}: monotonic gate", affected_uri);
@@ -5027,6 +5046,8 @@ async fn run_debounced_diagnostics(
         return;
     }
 
+    pause_if_armed_for_test(&state_arc, &affected_uri).await;
+
     // Second freshness check + atomic gate commit before publishing.
     // try_consume_publish takes write locks on the gate's maps, evaluates the
     // same predicate as can_publish, and on success updates last_published
@@ -5071,23 +5092,14 @@ async fn run_debounced_diagnostics(
             return;
         }
 
-        let doc = state.documents.get(&affected_uri);
-        let current_version = doc.and_then(|d| d.version);
-        let current_revision = doc.map(|d| d.revision);
-
         let can_publish = if !state.diagnostics_publish_allowed(&affected_uri)
-            || current_version != trigger_version
-            || current_revision != trigger_revision
+            || trigger.is_stale(&state, &affected_uri)
         {
             false
-        } else if let Some(ver) = current_version {
-            state
-                .diagnostics_gate
-                .try_consume_publish(&affected_uri, ver)
         } else {
-            true
+            trigger.commit_publish(&state.diagnostics_gate, &affected_uri)
         };
-        (can_publish, doc.is_some())
+        (can_publish, state.documents.contains_key(&affected_uri))
     };
 
     if can_publish {
@@ -5095,7 +5107,7 @@ async fn run_debounced_diagnostics(
             "diagnostics lifecycle: publish uri={} count={} path=debounced trigger_version={:?} open={}",
             affected_uri,
             diagnostics.len(),
-            trigger_version,
+            trigger.version,
             open_at_publish
         );
         client
@@ -5120,10 +5132,12 @@ async fn run_debounced_diagnostics(
         // successor, it blocks on the publish lock until this task releases
         // it, and it only re-enters this branch if it loses the same race to
         // yet another superseding edit — so it cannot loop absent new edits.
-        // If the cancellation instead came from did_close, the close's
-        // gate.clear (serialized behind the publish lock this task holds)
-        // removes the surplus marker and the respawn bails at its
-        // eligibility checks.
+        // did_close cannot be the canceller in this window: it must acquire
+        // the publish lock this task still holds before it can cancel, so a
+        // close-sourced cancellation is only observable at the earlier
+        // re-checks. A close that queues behind this task still converges:
+        // its gate.clear removes the surplus marker and the respawn bails
+        // at its trigger/eligibility checks.
         if cancel.is_cancelled() {
             state.diagnostics_gate.mark_force_republish(&affected_uri);
             tokio::spawn(respawn_publish_after_superseded(
@@ -5702,13 +5716,11 @@ impl LanguageServer for Backend {
                             state
                                 .diagnostics_gate
                                 .mark_force_republish_many(open_keys.iter());
-                            let items: Vec<(Url, Option<i32>, Option<u64>)> = open_keys
+                            let items: Vec<(Url, DiagnosticsTrigger)> = open_keys
                                 .into_iter()
                                 .map(|uri| {
-                                    let doc = state.documents.get(&uri);
-                                    let v = doc.and_then(|d| d.version);
-                                    let r = doc.map(|d| d.revision);
-                                    (uri, v, r)
+                                    let trigger = DiagnosticsTrigger::capture(&state, &uri);
+                                    (uri, trigger)
                                 })
                                 .collect();
                             let debounce = state.cross_file_config.revalidation_debounce_ms;
@@ -5755,7 +5767,7 @@ impl LanguageServer for Backend {
                         }
 
                         // Revalidate all open documents to pick up auto-detected backward edges
-                        for (uri, trigger_version, trigger_revision) in work_items {
+                        for (uri, trigger) in work_items {
                             let state_arc = state_clone.clone();
                             let client = client_clone.clone();
                             let traversal_truncation = traversal_truncation.clone();
@@ -5764,8 +5776,7 @@ impl LanguageServer for Backend {
                                 client,
                                 uri,
                                 debounce_ms,
-                                trigger_version,
-                                trigger_revision,
+                                trigger,
                                 Some(traversal_truncation),
                             ));
                         }
@@ -6045,6 +6056,21 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         log::info!("ark-lsp shutting down");
+        // Retire every diagnostic lifecycle under the publish lock so no
+        // in-flight worker can publish after this response: workers already
+        // past their final commit hold the lock (we order behind them), and
+        // everything earlier fails its epoch check once we clear. Ordering
+        // matches every other lifecycle transition: publish lock first, then
+        // the state lock.
+        let diagnostics_publish_lock = {
+            let state = self.state.read().await;
+            Arc::clone(&state.diagnostics_publish_lock)
+        };
+        let _publish_guard = diagnostics_publish_lock.lock().await;
+        {
+            let state = self.state.read().await;
+            state.retire_all_diagnostic_lifecycles();
+        }
         Ok(())
     }
 
@@ -6356,6 +6382,11 @@ impl LanguageServer for Backend {
                     Some(version),
                     Some(language_id.as_str()),
                 );
+                // Fresh diagnostic lifecycle for this open (issue #603). Once
+                // per didOpen: the re-enrichment second pass re-opens the same
+                // document without an eligibility transition and must NOT mint
+                // again.
+                state.begin_diagnostic_lifecycle(&uri);
                 state.cross_file_activity.record_recent(uri.clone());
                 for graph_root in state.authoritative_revalidation_roots_for_uri(&uri) {
                     remove_file_from_cross_file_state(&mut state, &graph_root);
@@ -6454,6 +6485,11 @@ impl LanguageServer for Backend {
                 Some(version),
                 Some(language_id.as_str()),
             );
+            // Fresh diagnostic lifecycle for this open (issue #603). Once per
+            // didOpen: the re-enrichment second pass re-opens the same
+            // document without an eligibility transition and must NOT mint
+            // again.
+            state.begin_diagnostic_lifecycle(&uri);
             // Record as recently opened for activity prioritization
             state.cross_file_activity.record_recent(uri.clone());
 
@@ -6766,10 +6802,8 @@ impl LanguageServer for Backend {
             let work_items: Vec<_> = affected
                 .into_iter()
                 .map(|affected_uri| {
-                    let doc = state.documents.get(&affected_uri);
-                    let trigger_version = doc.and_then(|d| d.version);
-                    let trigger_revision = doc.map(|d| d.revision);
-                    (affected_uri, trigger_version, trigger_revision)
+                    let trigger = DiagnosticsTrigger::capture(&state, &affected_uri);
+                    (affected_uri, trigger)
                 })
                 .collect();
 
@@ -7186,12 +7220,12 @@ impl LanguageServer for Backend {
         {
             let state = self.state.read().await;
             state.diagnostics_gate.mark_force_republish_many(
-                work_items.iter().map(|(u, _, _)| u).filter(|u| **u != uri),
+                work_items.iter().map(|(u, _)| u).filter(|u| **u != uri),
             );
         }
 
         // Schedule debounced diagnostics for all affected files via revalidation system
-        for (affected_uri, trigger_version, trigger_revision) in work_items {
+        for (affected_uri, trigger) in work_items {
             let state_arc = self.state.clone();
             let client = self.client.clone();
             let traversal_truncation = self.traversal_truncation.clone();
@@ -7201,8 +7235,7 @@ impl LanguageServer for Backend {
                 client,
                 affected_uri,
                 debounce_ms,
-                trigger_version,
-                trigger_revision,
+                trigger,
                 Some(traversal_truncation),
             ));
         }
@@ -7214,7 +7247,7 @@ impl LanguageServer for Backend {
             let traversal_truncation = self.traversal_truncation.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-                let (trigger_version, trigger_revision) = {
+                let trigger = {
                     let state = state_arc.read().await;
                     if !state.documents.contains_key(&stabilization_uri) {
                         return;
@@ -7222,10 +7255,7 @@ impl LanguageServer for Backend {
                     state
                         .diagnostics_gate
                         .mark_force_republish(&stabilization_uri);
-                    let doc = state.documents.get(&stabilization_uri);
-                    let ver = doc.and_then(|d| d.version);
-                    let rev = doc.map(|d| d.revision);
-                    (ver, rev)
+                    DiagnosticsTrigger::capture(&state, &stabilization_uri)
                 };
 
                 run_debounced_diagnostics(
@@ -7233,8 +7263,7 @@ impl LanguageServer for Backend {
                     client,
                     stabilization_uri,
                     0,
-                    trigger_version,
-                    trigger_revision,
+                    trigger,
                     Some(traversal_truncation),
                 )
                 .await;
@@ -7693,14 +7722,12 @@ impl LanguageServer for Backend {
                 .diagnostics_gate
                 .mark_force_republish_many(affected.iter().filter(|u| **u != uri));
 
-            // Build work items with trigger revision snapshot for freshness guard
+            // Build work items with trigger snapshot for the freshness guard
             let work_items: Vec<_> = affected
                 .into_iter()
                 .map(|affected_uri| {
-                    let doc = state.documents.get(&affected_uri);
-                    let trigger_version = doc.and_then(|d| d.version);
-                    let trigger_revision = doc.map(|d| d.revision);
-                    (affected_uri, trigger_version, trigger_revision)
+                    let trigger = DiagnosticsTrigger::capture(&state, &affected_uri);
+                    (affected_uri, trigger)
                 })
                 .collect();
 
@@ -7745,7 +7772,7 @@ impl LanguageServer for Backend {
             // leak a phantom marker (a later same-URI job cancels an earlier
             // one before it consumes its mark).
             let scheduled_uris: std::collections::HashSet<Url> =
-                work_items.iter().map(|(u, _, _)| u.clone()).collect();
+                work_items.iter().map(|(u, _)| u.clone()).collect();
             tokio::spawn(async move {
                 // Extend direct library_calls with inherited packages from
                 // parent source() chains. Snapshot under the lock, release it,
@@ -7825,7 +7852,7 @@ impl LanguageServer for Backend {
                 let warmed: std::collections::HashSet<String> = packages_vec.into_iter().collect();
 
                 // After prefetch completes, trigger diagnostic revalidation
-                let (debounce_ms, trigger_version, trigger_revision, sibling_jobs) = {
+                let (debounce_ms, trigger, sibling_jobs) = {
                     let state = state_arc.read().await;
                     if !state.documents.contains_key(&revalidation_uri) {
                         return; // Document was closed during prefetch
@@ -7833,13 +7860,11 @@ impl LanguageServer for Backend {
                     state
                         .diagnostics_gate
                         .mark_force_republish(&revalidation_uri);
-                    let doc = state.documents.get(&revalidation_uri);
-                    let ver = doc.and_then(|d| d.version);
-                    let rev = doc.map(|d| d.revision);
+                    let trigger = DiagnosticsTrigger::capture(&state, &revalidation_uri);
 
                     // Cross-document sibling republish (issue #503), excluding the
                     // edited file (revalidated below by its own version bump).
-                    let mut sibling_jobs: Vec<(Url, Option<i32>, Option<u64>)> = Vec::new();
+                    let mut sibling_jobs: Vec<(Url, DiagnosticsTrigger)> = Vec::new();
                     for sib in open_docs_referencing_packages(&state, &warmed) {
                         // Skip the edited file (revalidated by its own version
                         // bump) and any URI the synchronous path already marked +
@@ -7849,27 +7874,23 @@ impl LanguageServer for Backend {
                             continue;
                         }
                         state.diagnostics_gate.mark_force_republish(&sib);
-                        let sdoc = state.documents.get(&sib);
-                        let sver = sdoc.and_then(|d| d.version);
-                        let srev = sdoc.map(|d| d.revision);
-                        sibling_jobs.push((sib, sver, srev));
+                        let strigger = DiagnosticsTrigger::capture(&state, &sib);
+                        sibling_jobs.push((sib, strigger));
                     }
                     (
                         state.cross_file_config.revalidation_debounce_ms,
-                        ver,
-                        rev,
+                        trigger,
                         sibling_jobs,
                     )
                 };
 
-                for (sib, sver, srev) in sibling_jobs {
+                for (sib, strigger) in sibling_jobs {
                     tokio::spawn(run_debounced_diagnostics(
                         state_arc.clone(),
                         client.clone(),
                         sib,
                         debounce_ms,
-                        sver,
-                        srev,
+                        strigger,
                         Some(traversal_truncation.clone()),
                     ));
                 }
@@ -7879,8 +7900,7 @@ impl LanguageServer for Backend {
                     client,
                     revalidation_uri,
                     debounce_ms,
-                    trigger_version,
-                    trigger_revision,
+                    trigger,
                     Some(traversal_truncation),
                 )
                 .await;
@@ -7890,7 +7910,7 @@ impl LanguageServer for Backend {
         // Schedule debounced diagnostics for all affected files (Requirement 0.5)
         // The edited file uses a shorter debounce for near-instant feedback;
         // dependent files use the longer revalidation debounce.
-        for (affected_uri, trigger_version, trigger_revision) in work_items {
+        for (affected_uri, trigger) in work_items {
             let state_arc = self.state.clone();
             let client = self.client.clone();
             let traversal_truncation = self.traversal_truncation.clone();
@@ -7905,8 +7925,7 @@ impl LanguageServer for Backend {
                 client,
                 affected_uri,
                 debounce,
-                trigger_version,
-                trigger_revision,
+                trigger,
                 Some(traversal_truncation),
             ));
         }
@@ -8020,7 +8039,7 @@ impl LanguageServer for Backend {
         };
         let _diagnostics_publish_guard = diagnostics_publish_lock.lock().await;
 
-        let (sibling_fanout, debounce_ms): (Vec<(Url, Option<i32>, Option<u64>)>, u64) = {
+        let (sibling_fanout, debounce_ms): (Vec<(Url, DiagnosticsTrigger)>, u64) = {
             let mut state = self.state.write().await;
 
             // Capture the pre-close view the disk resync needs, BEFORE the
@@ -8079,11 +8098,11 @@ impl LanguageServer for Backend {
             // Close in new DocumentStore (Requirement 1.5)
             state.document_store.close(uri);
 
-            // Clear diagnostics gate state
-            state.diagnostics_gate.clear(uri);
-
-            // Cancel pending revalidation
-            state.cross_file_revalidation.cancel(uri);
+            // Retire the diagnostic lifecycle: cancel pending revalidation
+            // and clear the gate, including the lifecycle epoch (#603) so a
+            // worker this cancel cannot reach (not yet scheduled) still
+            // cannot publish into a reopen at the same version/revision.
+            state.retire_diagnostic_lifecycle(uri);
 
             // Remove from activity tracking
             state.cross_file_activity.remove(uri);
@@ -8178,7 +8197,7 @@ impl LanguageServer for Backend {
             // and any open sibling that referenced them needs its diagnostics
             // recomputed. Mirrors the watched-file fanout above (including
             // `max_revalidations_per_trigger`).
-            let mut sibling_fanout: Vec<(Url, Option<i32>, Option<u64>)> = Vec::new();
+            let mut sibling_fanout: Vec<(Url, DiagnosticsTrigger)> = Vec::new();
             let pkg_visibility_changed = state.package_state.namespace_model()
                 != old_ns_model.as_ref()
                 || state.package_state.scope_contribution() != &old_contribution;
@@ -8193,7 +8212,7 @@ impl LanguageServer for Backend {
                 // watcher-driven visibility fanout already widens this
                 // way. Re-cap the union so the extension cannot bypass
                 // `max_revalidations_per_trigger`.
-                let mut uris: Vec<Url> = sibling_fanout.iter().map(|(u, _, _)| u.clone()).collect();
+                let mut uris: Vec<Url> = sibling_fanout.iter().map(|(u, _)| u.clone()).collect();
                 let mut seen: std::collections::HashSet<Url> = uris.iter().cloned().collect();
                 seen.insert(uri.clone());
                 extend_affected_for_load_all_revalidation_from_state(
@@ -8206,9 +8225,10 @@ impl LanguageServer for Backend {
                 );
                 sibling_fanout = uris
                     .into_iter()
-                    .filter_map(|u| {
-                        let doc = state.documents.get(&u)?;
-                        Some((u, doc.version, Some(doc.revision)))
+                    .filter(|u| state.documents.contains_key(u))
+                    .map(|u| {
+                        let trigger = DiagnosticsTrigger::capture(&state, &u);
+                        (u, trigger)
                     })
                     .collect();
             }
@@ -8230,7 +8250,7 @@ impl LanguageServer for Backend {
             if !sibling_fanout.is_empty() && !close_resync {
                 state
                     .diagnostics_gate
-                    .mark_force_republish_many(sibling_fanout.iter().map(|(u, _, _)| u));
+                    .mark_force_republish_many(sibling_fanout.iter().map(|(u, _)| u));
             }
 
             // Invalidate the workspace index entry so the next scan re-reads from disk.
@@ -8284,8 +8304,7 @@ impl LanguageServer for Backend {
             // the commit — through the normal gate. A close-then-reopen race
             // is handled by the resync's commit-time veto. Never calls
             // `scan_workspace` — this re-reads exactly one file.
-            let mut sibling_uris: Vec<Url> =
-                sibling_fanout.into_iter().map(|(u, _, _)| u).collect();
+            let mut sibling_uris: Vec<Url> = sibling_fanout.into_iter().map(|(u, _)| u).collect();
             for resync_uri in close_resync_uris {
                 let package_siblings = std::mem::take(&mut sibling_uris);
                 tokio::spawn(run_close_resync(
@@ -8305,7 +8324,7 @@ impl LanguageServer for Backend {
             // write lock. The debounce window collapses bursts (e.g. "close
             // all" closing many files in quick succession) into a single
             // republish per sibling.
-            for (sibling_uri, trigger_version, trigger_revision) in sibling_fanout {
+            for (sibling_uri, trigger) in sibling_fanout {
                 let state_arc = self.state.clone();
                 let client = self.client.clone();
                 let traversal_truncation = self.traversal_truncation.clone();
@@ -8314,8 +8333,7 @@ impl LanguageServer for Backend {
                     client,
                     sibling_uri,
                     debounce_ms,
-                    trigger_version,
-                    trigger_revision,
+                    trigger,
                     Some(traversal_truncation),
                 ));
             }
@@ -10665,20 +10683,21 @@ impl Backend {
         uri: &Url,
         traversal_truncation: Option<Arc<TraversalTruncationState>>,
     ) {
-        let (debounce_ms, trigger_version, trigger_revision) = {
+        let (debounce_ms, trigger) = {
             let state = state_arc.read().await;
-            let doc = state.documents.get(uri);
-            let v = doc.and_then(|d| d.version);
-            let r = doc.map(|d| d.revision);
-            (state.cross_file_config.revalidation_debounce_ms, v, r)
+            // Deliberately a FRESH capture (never inherited from a
+            // predecessor task): a respawned consumer must validate against
+            // the URI's current lifecycle, not the one its predecessor was
+            // spawned under.
+            let trigger = DiagnosticsTrigger::capture(&state, uri);
+            (state.cross_file_config.revalidation_debounce_ms, trigger)
         };
         run_debounced_diagnostics(
             state_arc,
             client,
             uri.clone(),
             debounce_ms,
-            trigger_version,
-            trigger_revision,
+            trigger,
             traversal_truncation,
         )
         .await;
@@ -10890,11 +10909,19 @@ impl Backend {
 
             state.editor_diagnostic_uris = Some(new_uris);
             for uri in &removed {
-                // In-flight work also re-checks eligibility at commit. Clearing
-                // both states retracts Problems now and lets a later tab-open
-                // publish the same document version without a force marker.
-                state.cross_file_revalidation.cancel(uri);
-                state.diagnostics_gate.clear(uri);
+                // In-flight work also re-checks eligibility at commit.
+                // Retiring the lifecycle (cancel + gate clear, including the
+                // epoch — #603) retracts Problems now, lets a later tab-open
+                // publish the same document version without a force marker,
+                // and dooms in-flight workers this cancel cannot reach.
+                state.retire_diagnostic_lifecycle(uri);
+            }
+            for uri in &added {
+                // Fresh lifecycle for each re-added tab. Must run AFTER the
+                // `editor_diagnostic_uris` replacement above: eligibility is
+                // read from it, and minting before the replacement would be
+                // a silent no-op that fails every subsequent publish closed.
+                state.begin_diagnostic_lifecycle(uri);
             }
 
             (removed, added)
@@ -11050,7 +11077,7 @@ pub(crate) async fn publish_diagnostics_inner(
     // snapshot, capture inputs for the off-lock work. NO scope
     // resolution or other heavy work happens inside this scope.
     let (
-        version,
+        trigger,
         diagnostics_enabled,
         snapshot,
         directive_meta,
@@ -11059,7 +11086,12 @@ pub(crate) async fn publish_diagnostics_inner(
         case_mismatch_severity,
     ) = {
         let state = state_arc.read().await;
-        let version = state.documents.get(uri).and_then(|d| d.version);
+        // Full trigger capture (version + revision + epoch): the direct
+        // path has no cancellation token, so the commit-time comparison
+        // against this snapshot is its only defense against a lifecycle
+        // reuse (close+reopen) or a same-version edit racing the off-lock
+        // compute below.
+        let trigger = DiagnosticsTrigger::capture(&state, uri);
 
         if !state.diagnostics_publish_allowed(uri) {
             log::trace!(
@@ -11069,8 +11101,18 @@ pub(crate) async fn publish_diagnostics_inner(
             return;
         }
 
+        // No live lifecycle epoch: the URI is closed or was retired; the
+        // final commit would fail closed anyway, so skip the compute.
+        if trigger.epoch.is_none() {
+            log::trace!(
+                "Skipping diagnostics for {}: no live diagnostic lifecycle",
+                uri
+            );
+            return;
+        }
+
         // Check if we can publish (monotonic gate)
-        if let Some(ver) = version {
+        if let Some(ver) = trigger.version {
             if !state.diagnostics_gate.can_publish(uri, ver) {
                 log::trace!(
                     "Skipping diagnostics for {}: monotonic gate (version={})",
@@ -11123,7 +11165,7 @@ pub(crate) async fn publish_diagnostics_inner(
         let case_mismatch_severity = state.cross_file_config.case_mismatch_severity;
 
         (
-            version,
+            trigger,
             diagnostics_enabled,
             snapshot,
             directive_meta,
@@ -11170,6 +11212,8 @@ pub(crate) async fn publish_diagnostics_inner(
         Vec::new()
     };
 
+    pause_if_armed_for_test(state_arc, uri).await;
+
     // Re-check freshness after async work, atomically commit gate state, before publishing.
     // try_consume_publish replaces the racy can_publish + record_publish pair.
     let publish_lock = {
@@ -11186,25 +11230,20 @@ pub(crate) async fn publish_diagnostics_inner(
             );
             return;
         }
-        if let Some(ver) = version {
-            let current_version = state.documents.get(uri).and_then(|d| d.version);
-            if current_version != Some(ver) {
-                log::trace!(
-                    "Skipping diagnostics for {}: version changed (was {:?}, now {:?})",
-                    uri,
-                    version,
-                    current_version
-                );
-                return;
-            }
-            if !state.diagnostics_gate.try_consume_publish(uri, ver) {
-                log::trace!(
-                    "Skipping diagnostics for {}: monotonic gate after async (version={})",
-                    uri,
-                    ver
-                );
-                return;
-            }
+        if trigger.is_stale(&state, uri) {
+            log::trace!(
+                "Skipping diagnostics for {}: trigger no longer current after async",
+                uri
+            );
+            return;
+        }
+        if !trigger.commit_publish(&state.diagnostics_gate, uri) {
+            log::trace!(
+                "Skipping diagnostics for {}: gate refused after async (version={:?})",
+                uri,
+                trigger.version
+            );
+            return;
         }
         state.documents.contains_key(uri)
     };
@@ -11213,7 +11252,7 @@ pub(crate) async fn publish_diagnostics_inner(
         "diagnostics lifecycle: publish uri={} count={} path=direct version={:?} open={}",
         uri,
         diagnostics.len(),
-        version,
+        trigger.version,
         open_at_publish
     );
     client
@@ -12122,6 +12161,467 @@ mod tests {
             assert_eq!(restored.uri, visible_uri);
             assert!(!restored.diagnostics.is_empty());
         }
+
+        /// Issue #603, race 1 (close → reopen at the same version/revision),
+        /// direct path. `publish_diagnostics_inner` has no cancellation
+        /// token, so before the lifecycle epoch its commit-time checks —
+        /// version equality and the (cleared) gate — could not tell the
+        /// reopened document from the one its snapshot was built against,
+        /// and the retired worker's stale diagnostics would publish.
+        ///
+        /// The old and new lifecycles carry distinguishable content: the old
+        /// text's syntax error is on line 0, the reopened text's on line 2.
+        /// The stale worker's diagnostics (line 0) must NEVER reach the
+        /// client after the close — not even transiently before a correct
+        /// republish — and the reopened lifecycle must still be able to
+        /// publish at the same document version.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stale_direct_worker_cannot_publish_into_reopened_lifecycle() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("reopen-race.R");
+            let old_text = "x <- (\n"; // syntax error on line 0
+            let new_text = "\n\nx <- (\n"; // syntax error on line 2
+            std::fs::write(&path, old_text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                // Park every debounced worker forever; this test drives the
+                // direct path explicitly.
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: old_text.into(),
+                    },
+                })
+                .await;
+
+            // Direct-path worker for the OLD lifecycle, parked post-compute,
+            // pre-commit at the armed pause point.
+            let pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_test_pause
+                .arm(uri.clone());
+            let worker = {
+                let state_arc = backend.state.clone();
+                let client = backend.client.clone();
+                let task_uri = uri.clone();
+                tokio::spawn(async move {
+                    super::super::publish_diagnostics_inner(&state_arc, &client, &task_uri).await;
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_arrived())
+                .await
+                .expect("direct worker must reach the pre-commit pause point");
+
+            // Close (retires the lifecycle, publishes empty) and reopen at
+            // the SAME version — a fresh Document restarts revision at 0, so
+            // only the epoch distinguishes the lifecycles.
+            backend
+                .did_close(DidCloseTextDocumentParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                })
+                .await;
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("close must clear diagnostics")
+                .expect("client socket must remain open");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert_eq!(cleared.uri, uri);
+            assert!(cleared.diagnostics.is_empty());
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: new_text.into(),
+                    },
+                })
+                .await;
+
+            // Release the retired worker: its epoch is stale, so it must
+            // fall out at the commit without publishing.
+            pause.release();
+            worker.await.unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err(),
+                "the retired worker must not publish after close+reopen"
+            );
+
+            // The reopened lifecycle must still publish at the same version.
+            backend.publish_diagnostics(&uri).await;
+            let fresh = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("the reopened lifecycle must publish at the same version")
+                .expect("client socket must remain open");
+            let fresh: PublishDiagnosticsParams =
+                serde_json::from_value(fresh.params().unwrap().clone()).unwrap();
+            assert_eq!(fresh.uri, uri);
+            assert!(!fresh.diagnostics.is_empty());
+            assert!(
+                fresh.diagnostics.iter().all(|d| d.range.start.line >= 2),
+                "published diagnostics must come from the reopened text \
+                 (line >= 2), never the retired lifecycle's (line 0): {:?}",
+                fresh.diagnostics
+            );
+        }
+
+        /// Issue #603, race 2 (tab removal → re-addition while the document
+        /// stays LSP-open): version and revision never change, so before the
+        /// epoch a retired debounced worker that had not yet scheduled when
+        /// the removal's cancel ran would pass the schedule-time freshness
+        /// check, supersede the re-added lifecycle's pending worker, and
+        /// consume the fresh gate. The epoch comparison must decline it at
+        /// schedule time, leaving the gate untouched for the new lifecycle.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stale_debounced_worker_declines_after_tab_readdition() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("tab-race.R");
+            let text = "x <- (\n";
+            std::fs::write(&path, text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(
+                    serde_json::to_value(InitializeParams {
+                        initialization_options: Some(serde_json::json!({
+                            "diagnosticUris": [uri.to_string()],
+                        })),
+                        ..InitializeParams::default()
+                    })
+                    .unwrap(),
+                )
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+
+            // A trigger captured in the pre-removal lifecycle, exactly what a
+            // worker spawned before the tab change would carry.
+            let stale_trigger = {
+                let state = backend.state.read().await;
+                crate::state::DiagnosticsTrigger::capture(&state, &uri)
+            };
+            assert!(stale_trigger.epoch.is_some());
+
+            // Remove the tab (retires the lifecycle; publishes empty) …
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: None,
+                    visible_uris: Vec::new(),
+                    diagnostic_uris: Some(Vec::new()),
+                    timestamp_ms: 2,
+                })
+                .await;
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("removing the tab must clear diagnostics")
+                .expect("client socket must remain open");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert!(cleared.diagnostics.is_empty());
+
+            // … and re-add it. The document version and revision are
+            // unchanged; only the fresh epoch distinguishes the lifecycles.
+            // The re-add's own bounded republish stays parked in its 60s
+            // debounce so this test controls every observable publication.
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(uri.to_string()),
+                    visible_uris: vec![uri.to_string()],
+                    diagnostic_uris: Some(vec![uri.to_string()]),
+                    timestamp_ms: 3,
+                })
+                .await;
+
+            // The retired worker resumes: it must decline at schedule time
+            // (stale epoch), publish nothing, and leave the fresh gate
+            // untouched.
+            super::super::run_debounced_diagnostics(
+                backend.state.clone(),
+                backend.client.clone(),
+                uri.clone(),
+                0,
+                stale_trigger,
+                None,
+            )
+            .await;
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err(),
+                "the retired worker must not publish after tab re-addition"
+            );
+            assert!(
+                backend
+                    .state
+                    .read()
+                    .await
+                    .diagnostics_gate
+                    .can_publish(&uri, 1),
+                "the retired worker must not consume the re-added lifecycle's gate"
+            );
+
+            // The re-added lifecycle must still publish at the same version.
+            backend.publish_diagnostics(&uri).await;
+            let restored = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("the re-added tab must publish diagnostics")
+                .expect("client socket must remain open");
+            let restored: PublishDiagnosticsParams =
+                serde_json::from_value(restored.params().unwrap().clone()).unwrap();
+            assert_eq!(restored.uri, uri);
+            assert!(!restored.diagnostics.is_empty());
+        }
+
+        /// Companion to `stale_debounced_worker_declines_after_tab_readdition`
+        /// covering the commit side of the debounced pipeline: a worker that
+        /// already computed diagnostics and is parked in the post-compute,
+        /// pre-commit window when the tab removal + re-addition happens must
+        /// not publish afterwards, and must leave the re-added lifecycle's
+        /// gate untouched. (Cancellation catches this interleaving first;
+        /// the epoch is the backstop for workers cancellation cannot reach —
+        /// this test pins the observable outcome regardless of which check
+        /// fires.)
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn paused_debounced_worker_cannot_publish_after_tab_readdition() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("tab-pause-race.R");
+            let text = "x <- (\n";
+            std::fs::write(&path, text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(
+                    serde_json::to_value(InitializeParams {
+                        initialization_options: Some(serde_json::json!({
+                            "diagnosticUris": [uri.to_string()],
+                        })),
+                        ..InitializeParams::default()
+                    })
+                    .unwrap(),
+                )
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                // Parks did_open's own worker and the re-add's bounded
+                // republish; the manually spawned worker below passes
+                // debounce 0 explicitly.
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+
+            let trigger = {
+                let state = backend.state.read().await;
+                crate::state::DiagnosticsTrigger::capture(&state, &uri)
+            };
+            let pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_test_pause
+                .arm(uri.clone());
+            let worker = tokio::spawn(super::super::run_debounced_diagnostics(
+                backend.state.clone(),
+                backend.client.clone(),
+                uri.clone(),
+                0,
+                trigger,
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_arrived())
+                .await
+                .expect("debounced worker must reach the pre-commit pause point");
+
+            // Remove and re-add the tab while the worker is parked. Version
+            // and revision never change; the epoch is the only distinction.
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: None,
+                    visible_uris: Vec::new(),
+                    diagnostic_uris: Some(Vec::new()),
+                    timestamp_ms: 2,
+                })
+                .await;
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("removing the tab must clear diagnostics")
+                .expect("client socket must remain open");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert!(cleared.diagnostics.is_empty());
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(uri.to_string()),
+                    visible_uris: vec![uri.to_string()],
+                    diagnostic_uris: Some(vec![uri.to_string()]),
+                    timestamp_ms: 3,
+                })
+                .await;
+
+            pause.release();
+            worker.await.unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err(),
+                "the parked worker must not publish after tab re-addition"
+            );
+            assert!(
+                backend
+                    .state
+                    .read()
+                    .await
+                    .diagnostics_gate
+                    .can_publish(&uri, 1),
+                "the parked worker must not consume the re-added lifecycle's gate"
+            );
+
+            backend.publish_diagnostics(&uri).await;
+            let restored = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("the re-added tab must publish diagnostics")
+                .expect("client socket must remain open");
+            let restored: PublishDiagnosticsParams =
+                serde_json::from_value(restored.params().unwrap().clone()).unwrap();
+            assert_eq!(restored.uri, uri);
+            assert!(!restored.diagnostics.is_empty());
+        }
+
+        /// Server shutdown retires every diagnostic lifecycle: an in-flight
+        /// worker (here the direct path, which has no cancellation token)
+        /// that computed diagnostics before the shutdown request must not
+        /// publish after the shutdown response.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn in_flight_worker_cannot_publish_after_shutdown() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("shutdown-race.R");
+            let text = "x <- (\n";
+            std::fs::write(&path, text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+
+            let pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_test_pause
+                .arm(uri.clone());
+            let worker = {
+                let state_arc = backend.state.clone();
+                let client = backend.client.clone();
+                let task_uri = uri.clone();
+                tokio::spawn(async move {
+                    super::super::publish_diagnostics_inner(&state_arc, &client, &task_uri).await;
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_arrived())
+                .await
+                .expect("direct worker must reach the pre-commit pause point");
+
+            backend.shutdown().await.unwrap();
+
+            pause.release();
+            worker.await.unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err(),
+                "no diagnostic may publish after the shutdown response"
+            );
+        }
     }
 
     mod document_indent_units {
@@ -12705,11 +13205,11 @@ mod tests {
                 "should fan out to the two non-closing siblings"
             );
             assert!(
-                fanout.iter().all(|(u, _, _)| u != &closing),
+                fanout.iter().all(|(u, _)| u != &closing),
                 "fanout must not include the closing URI"
             );
-            assert!(fanout.iter().any(|(u, _, _)| u == &r_uri("b.R")));
-            assert!(fanout.iter().any(|(u, _, _)| u == &r_uri("c.R")));
+            assert!(fanout.iter().any(|(u, _)| u == &r_uri("b.R")));
+            assert!(fanout.iter().any(|(u, _)| u == &r_uri("c.R")));
         }
 
         #[test]
@@ -12730,9 +13230,7 @@ mod tests {
             let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
 
             assert!(
-                fanout
-                    .iter()
-                    .all(|(u, _, _)| u != &scratch && u != &outside),
+                fanout.iter().all(|(u, _)| u != &scratch && u != &outside),
                 "files outside R/ and tests/testthat/ must not appear in fanout"
             );
         }
@@ -12752,7 +13250,7 @@ mod tests {
             let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
 
             assert!(
-                fanout.iter().any(|(u, _, _)| u == &test_uri),
+                fanout.iter().any(|(u, _)| u == &test_uri),
                 "tests/testthat/ siblings should refresh on R/ close"
             );
         }
@@ -12787,13 +13285,13 @@ mod tests {
             let closing = r_uri("a.R");
             let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
 
-            let (got_uri, got_version, got_revision) = fanout
+            let (got_uri, got_trigger) = fanout
                 .into_iter()
-                .find(|(u, _, _)| u == &b)
+                .find(|(u, _)| u == &b)
                 .expect("b.R in fanout");
             assert_eq!(got_uri, b);
-            assert_eq!(got_version, Some(7));
-            assert_eq!(got_revision, Some(42));
+            assert_eq!(got_trigger.version, Some(7));
+            assert_eq!(got_trigger.revision, Some(42));
         }
 
         #[test]

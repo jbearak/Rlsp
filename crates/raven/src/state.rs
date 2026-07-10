@@ -135,7 +135,7 @@ use tree_sitter::Tree;
 
 use crate::chunks::{ChunkKind, classify_chunk_document, classify_chunk_document_for};
 use crate::content_provider::DefaultContentProvider;
-use crate::cross_file::revalidation::CrossFileDiagnosticsGate;
+use crate::cross_file::revalidation::{CrossFileDiagnosticsGate, DiagnosticsEpoch};
 use crate::cross_file::{
     CrossFileActivityState, CrossFileConfig, CrossFileFileCache, CrossFileRevalidationState,
     CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
@@ -659,6 +659,10 @@ pub struct WorldState {
     /// the client send. Without it, a computation could pass its final tab
     /// check, lose a race to an empty clear, and then republish stale Problems.
     pub diagnostics_publish_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Test-only pause points for the diagnostics publish pipelines; see
+    /// `DiagnosticsPublishPause`. Compiled out of production builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub diagnostics_test_pause: crate::cross_file::revalidation::DiagnosticsPublishPause,
 
     // Cross-file state
     pub cross_file_config: CrossFileConfig,
@@ -782,6 +786,74 @@ pub struct WorldState {
     /// Inputs to the package-mode `derive` function. Updated by event handlers
     /// before calling `apply_package_event`. See package_state::PackageInputs.
     pub package_inputs: crate::package_state::PackageInputs,
+}
+
+/// A snapshot of the lifecycle state a diagnostics run was triggered
+/// against: the URI's `(version, revision, epoch)` captured under a
+/// `WorldState` lock when the work was spawned, carried through the
+/// debounce → compute → publish pipeline, and re-compared at every
+/// freshness checkpoint via [`Self::is_stale`].
+///
+/// Bundling the three fields keeps every checkpoint epoch-aware by
+/// construction. The loose `(version, revision)` pair this replaces cannot
+/// identify a lifecycle (issue #603): a client may reopen at the same
+/// version, and `Document::revision` restarts at 0 on every open, so a
+/// worker retired by a close or tab removal could pass both comparisons
+/// against the URI's next lifecycle. The epoch is globally unique per
+/// lifecycle and never reused.
+///
+/// `version`/`revision` are `None` when the document is not open;
+/// `epoch` is `None` when the URI is not diagnostic-eligible (never began,
+/// or retired). Workers must decline to schedule when `epoch` is `None` —
+/// an all-`None` trigger compares equal to a still-absent document, but
+/// such a worker can never legally publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiagnosticsTrigger {
+    pub(crate) version: Option<i32>,
+    pub(crate) revision: Option<u64>,
+    pub(crate) epoch: Option<DiagnosticsEpoch>,
+}
+
+impl DiagnosticsTrigger {
+    /// Capture `uri`'s current trigger snapshot. The caller must hold a
+    /// `WorldState` lock for the duration so the three reads are coherent.
+    pub(crate) fn capture(state: &WorldState, uri: &Url) -> Self {
+        let doc = state.documents.get(uri);
+        Self {
+            version: doc.and_then(|d| d.version),
+            revision: doc.map(|d| d.revision),
+            epoch: state.diagnostics_gate.current_epoch(uri),
+        }
+    }
+
+    /// Whether the URI's current state no longer matches this trigger: the
+    /// worker is obsolete (a newer edit's worker owns the current state) or
+    /// belongs to a retired lifecycle, and must not schedule, compute, or
+    /// publish past this point.
+    pub(crate) fn is_stale(&self, state: &WorldState, uri: &Url) -> bool {
+        *self != Self::capture(state, uri)
+    }
+
+    /// Atomically commit a publish for this trigger through `gate`,
+    /// returning whether the caller may proceed to send. Encapsulates the
+    /// commit contract shared by the debounced and direct pipelines so the
+    /// two cannot drift:
+    /// - no live epoch (`epoch: None`): never publish — a retired lifecycle
+    ///   fails closed even though callers' earlier checks make this
+    ///   unreachable in practice;
+    /// - versioned: the gate's monotonic + force-marker predicate decides,
+    ///   validating the epoch under the gate's own locks;
+    /// - versionless (`version: None` with a live epoch): publish — there is
+    ///   no version to gate monotonically, so the live-epoch requirement
+    ///   (the caller's `is_stale` re-check under the publish lock) is the
+    ///   gate.
+    pub(crate) fn commit_publish(&self, gate: &CrossFileDiagnosticsGate, uri: &Url) -> bool {
+        match (self.version, self.epoch) {
+            (_, None) => false,
+            (Some(ver), Some(epoch)) => gate.try_consume_publish(uri, ver, epoch),
+            (None, Some(_)) => true,
+        }
+    }
 }
 
 impl WorldState {
@@ -1048,6 +1120,9 @@ impl WorldState {
             cross_file_file_cache: CrossFileFileCache::new(),
             diagnostics_gate: CrossFileDiagnosticsGate::new(),
             diagnostics_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(any(test, feature = "test-support"))]
+            diagnostics_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
 
             // Cross-file state
             cross_file_config: config,
@@ -1102,6 +1177,40 @@ impl WorldState {
         self.editor_diagnostic_uris
             .as_ref()
             .is_none_or(|uris| uris.contains(uri))
+    }
+
+    /// Begin a fresh diagnostics lifecycle for `uri` if it is currently
+    /// eligible to own push diagnostics ([`Self::diagnostics_publish_allowed`]);
+    /// returns `None` without minting an epoch otherwise.
+    ///
+    /// Call on every "URI becomes diagnostic-eligible" transition: `did_open`
+    /// (both the project-excluded and normal branches) and a tab re-addition
+    /// via `raven/activeDocumentsChanged` — for the latter, only AFTER
+    /// `editor_diagnostic_uris` has been replaced, since eligibility is read
+    /// from it (calling before the replacement silently mints nothing and
+    /// the re-added tab's publishes all fail closed).
+    pub(crate) fn begin_diagnostic_lifecycle(&self, uri: &Url) -> Option<DiagnosticsEpoch> {
+        self.diagnostics_publish_allowed(uri)
+            .then(|| self.diagnostics_gate.begin_epoch(uri))
+    }
+
+    /// Retire `uri`'s diagnostics lifecycle: cancel pending debounced work
+    /// and clear all gate state including the lifecycle epoch. Call on every
+    /// "URI stops being diagnostic-eligible" transition: `did_close` and tab
+    /// removal. In-flight workers holding the retired epoch fail their next
+    /// [`DiagnosticsTrigger::is_stale`] check or the atomic gate commit, so
+    /// they cannot publish into the URI's next lifecycle.
+    pub(crate) fn retire_diagnostic_lifecycle(&self, uri: &Url) {
+        self.cross_file_revalidation.cancel(uri);
+        self.diagnostics_gate.clear(uri);
+    }
+
+    /// Retire every diagnostics lifecycle and cancel all pending debounced
+    /// work. Called on server shutdown so no in-flight diagnostic work can
+    /// publish after the shutdown response.
+    pub(crate) fn retire_all_diagnostic_lifecycles(&self) {
+        self.cross_file_revalidation.cancel_all();
+        self.diagnostics_gate.clear_all();
     }
 
     fn open_alias_candidates_for_uri(&self, uri: &Url) -> Vec<Url> {
