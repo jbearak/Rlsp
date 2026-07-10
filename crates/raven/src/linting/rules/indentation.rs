@@ -938,7 +938,9 @@ fn collect_string_interior_lines(node: Node<'_>, set: &mut HashSet<u32>) {
 fn char_col(lines: &[&str], line: u32, byte_col: usize) -> u32 {
     let text = line_text(lines, line);
     match text.get(..byte_col) {
-        Some(prefix) => prefix.chars().count() as u32,
+        // A leading BOM (line 0 only) is invisible and must not count —
+        // `leading_space_count` never sees it either.
+        Some(prefix) => strip_leading_bom_for_scan(prefix).chars().count() as u32,
         None => byte_col as u32,
     }
 }

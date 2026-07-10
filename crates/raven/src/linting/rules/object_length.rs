@@ -12,11 +12,11 @@
 //! removes the *longest* matching generic prefix.
 //!
 //! Only positions that introduce a new symbol are checked:
-//! assignment targets (`<-`, `<<-`, top-level `=`, `->`, `->>`) and formal
-//! parameters of `function_definition`. Compound assignment targets like
-//! `obj$field <- ...` are skipped (the assignment doesn't introduce a new
-//! symbol name — only the LHS field does, and `object_name` already won't
-//! flag those for the same reason).
+//! assignment targets (`<-`, `<<-`, top-level `=`, `->`, `->>`, including
+//! quoted-string targets and the leftmost object of a `$`/`@` compound
+//! target), formal parameters of `function_definition`, and the literal
+//! names of `assign()` / `setGeneric()` calls. Subscripted targets
+//! (`x[[i]] <- ...`) are skipped, matching lintr.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -214,7 +214,13 @@ fn check_name(
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
         code: Some(NumberOrString::String(rule_ids::OBJECT_LENGTH.to_string())),
-        message: format!("Identifier `{name}` is {len} characters long; maximum is {max_length}."),
+        message: if body == name {
+            format!("Identifier `{name}` is {len} characters long; maximum is {max_length}.")
+        } else {
+            format!(
+                "Identifier `{name}` has a {len}-character name after its generic prefix; maximum is {max_length}."
+            )
+        },
         ..Default::default()
     });
 }

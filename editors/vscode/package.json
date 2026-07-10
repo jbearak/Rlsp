@@ -1637,7 +1637,7 @@
             "Disable the no-tab lint"
           ],
           "default": "information",
-          "description": "Severity for tab characters in source. Set to \"off\" to disable the rule."
+          "description": "Severity for tabs used in indentation (tabs in comments, strings, or between tokens are not flagged, matching lintr). Set to \"off\" to disable the rule."
         },
         "raven.linting.trailingBlankLinesSeverity": {
           "type": "string",
@@ -1897,7 +1897,7 @@
             "Disable the infix-spaces lint"
           ],
           "default": "information",
-          "description": "Severity for the infix-spaces lint. Flags missing spaces around binary operators (`+`, `==`, `<-`, `|>`, `%>%`, etc.) and stray whitespace around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`). Alignment whitespace (multiple spaces) and line-continuations are not flagged."
+          "description": "Severity for the infix-spaces lint. Flags missing spaces around lintr's low-precedence operators (`+`, `==`, `<-`, `|>`, `%>%`, named-argument `=`, etc.). High-precedence operators (`^`, `:`, `::`, `$`, `@`) and unary forms are never linted. Alignment whitespace (multiple spaces) and line-continuations are not flagged."
         },
         "raven.linting.commentedCodeSeverity": {
           "type": "string",
@@ -1929,7 +1929,7 @@
             "Require double quotes (\"...\") for string literals.",
             "Require single quotes ('...') for string literals."
           ],
-          "description": "Preferred string-literal delimiter. Used by the quotes lint. Raw strings (r\"(...)\") are exempt."
+          "description": "Preferred string-literal delimiter. Used by the quotes lint. Literals containing the preferred quote character are exempt (switching would force escaping)."
         },
         "raven.linting.quotesSeverity": {
           "type": "string",
@@ -1948,7 +1948,7 @@
             "Disable the quotes lint"
           ],
           "default": "information",
-          "description": "Severity for the quotes lint. Flags string literals not using the configured `raven.linting.stringDelimiter`. Raw strings are exempt."
+          "description": "Severity for the quotes lint. Flags string literals (raw strings included) not using the configured `raven.linting.stringDelimiter`; literals containing the preferred quote character are exempt."
         },
         "raven.linting.commasSeverity": {
           "type": "string",
@@ -1986,7 +1986,7 @@
             "Disable the T/F symbol lint"
           ],
           "default": "information",
-          "description": "Severity for the T/F-symbol lint. Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`. Assignment targets, named arguments, formal parameters, and `$`/`@` field names are exempt."
+          "description": "Severity for the T/F-symbol lint. Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`; assignment targets get a dedicated variable-name message. Named arguments, formal parameters, `$`/`@` field names, formula terms, subscripted uses, and callees are exempt."
         },
         "raven.linting.semicolonSeverity": {
           "type": "string",
@@ -2031,7 +2031,7 @@
           "default": 30,
           "minimum": 5,
           "maximum": 1000,
-          "description": "Maximum allowed identifier length for the object-length lint. The leading `.` of hidden-identifier names is not counted; backtick-quoted and non-ASCII names are exempt."
+          "description": "Maximum allowed identifier length for the object-length lint. Names are measured after stripping backticks/quotes, and S3 methods measure only the part after a known generic prefix, matching lintr."
         },
         "raven.linting.objectLengthSeverity": {
           "type": "string",
@@ -2069,7 +2069,7 @@
             "Disable the vector-logic lint"
           ],
           "default": "information",
-          "description": "Severity for the vector-logic lint. Flags `&` or `|` in `if` / `while` conditions (where `&&` / `||` is the scalar form). Function-call boundaries stop the scan, so `if (any(x & y))` is left alone."
+          "description": "Severity for the vector-logic lint. Flags `&` or `|` in `if` / `while` / `expect_true()` conditions, and `&&` / `||` inside `subset()` / `filter()` arguments. Function-call boundaries stop the condition scan (`if (any(x & y))` is left alone) and bitwise-arithmetic operands are exempt."
         },
         "raven.linting.functionLeftParenthesesSeverity": {
           "type": "string",
@@ -2088,7 +2088,7 @@
             "Disable the function-left-parens lint"
           ],
           "default": "information",
-          "description": "Severity for the function-left-parentheses lint. Flags whitespace between `function` (or `\\`) and the parameter `(`."
+          "description": "Severity for the function-left-parentheses lint. Flags whitespace between `function` (or `\\`) and the parameter `(`, and between a call's function name and its argument `(` (e.g. `blah (1)`)."
         },
         "raven.linting.spacesInsideSeverity": {
           "type": "string",
@@ -2107,7 +2107,7 @@
             "Disable the spaces-inside lint"
           ],
           "default": "information",
-          "description": "Severity for the spaces-inside lint. Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are left alone."
+          "description": "Severity for the spaces-inside lint. Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`, `f( )`). Multi-line wrapping and comma/`= )` neighbors are left alone."
         },
         "raven.linting.indentationUnit": {
           "oneOf": [

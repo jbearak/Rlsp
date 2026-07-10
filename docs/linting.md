@@ -160,7 +160,7 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 - **Raven:** `raven.linting.stringDelimiter` (default `"\""`, alternative `"'"`), `raven.linting.quotesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::quotes_linter()` / `lintr::single_quotes_linter()` (the two map to the two settings above).
-- Raw strings (`r"(...)"`, `R'(...)'`, `r"---(...)---"`) are exempt — the outer quote is constrained by the body.
+- Raw strings are checked like ordinary literals (`R'(plain)'` is flagged under the double-quote default). Any literal whose source contains the preferred quote character is exempt — switching delimiters would force escaping (`'he said "hi"'`, `r'(")'`).
 
 ### Commas
 

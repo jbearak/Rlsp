@@ -1024,7 +1024,7 @@ mod case_mismatch_severity_parse_tests {
 /// The two keys are deliberately resolved together in one place because they
 /// interact:
 ///
-/// * An absent style key leaves the default `[snake_case]` in place; a
+/// * An absent style key leaves the default `[snake_case, symbols]` in place; a
 ///   present empty array means "no named styles" (regex-only mode when the
 ///   regex list is nonempty, disabled when it is empty too).
 /// * A present nonempty style value with no valid elements is treated as an
@@ -1054,7 +1054,7 @@ fn parse_object_name_kind_settings(
 ///
 /// Scalar strings are parsed through the same path as one-element arrays for
 /// backward compatibility. An absent key is handled by the caller and leaves
-/// the default `[snake_case]` in place. A present empty array means "no named
+/// the default `[snake_case, symbols]` in place. A present empty array means "no named
 /// styles" (useful for regex-only checks). A present nonempty value with no
 /// valid style elements is treated as empty: the kind is disabled unless the
 /// paired regex setting supplies valid patterns (see

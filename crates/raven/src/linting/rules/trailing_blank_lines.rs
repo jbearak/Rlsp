@@ -62,10 +62,18 @@ pub(crate) fn collect(
     if suppressions.is_suppressed_code(line_no, rule_ids::TRAILING_BLANK_LINES) {
         return;
     }
+    // End at the last existing line's end — when the file lacks a final
+    // newline there is no line after the last, so `(lines.len(), 0)` would
+    // be out of bounds.
+    let last_line_idx = (lines.len() - 1) as u32;
+    let last_line_utf16: u32 = lines[lines.len() - 1]
+        .chars()
+        .map(|c| c.len_utf16() as u32)
+        .sum();
     out.push(Diagnostic {
         range: Range {
             start: Position::new(line_no, 0),
-            end: Position::new(lines.len() as u32, 0),
+            end: Position::new(last_line_idx, last_line_utf16),
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),

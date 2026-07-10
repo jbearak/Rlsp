@@ -680,7 +680,7 @@ export function renderRavenToml(linting: Record<string, unknown> | undefined): s
     ];
     const entries: [string, unknown, string][] = [
         ['enabled', false, 'master switch'],
-        ['lineLength', 80, 'maximum line length (UTF-16 code units)'],
+        ['lineLength', 80, 'maximum line length (characters)'],
         ['objectLength', 30, 'maximum identifier length'],
         ['indentationUnit', 2, 'expected indent unit'],
         ['assignmentOperator', '<-', '"<-" or "="'],

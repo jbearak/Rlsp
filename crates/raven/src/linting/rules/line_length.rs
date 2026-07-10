@@ -27,10 +27,14 @@ pub(crate) fn collect(
         // `strip_leading_bom_for_scan`). Only line 0 can carry a BOM; a later
         // U+FEFF is a zero-width no-break space that must still count, so the
         // guard is load-bearing, not defensive. Issue #346.
-        let line = if line_no == 0 {
-            crate::utf16::strip_leading_bom_for_scan(line)
+        let (line, bom_utf16) = if line_no == 0 {
+            let stripped = crate::utf16::strip_leading_bom_for_scan(line);
+            // LSP positions include the BOM character (one UTF-16 unit), even
+            // though it doesn't count toward the width.
+            let offset = if stripped.len() != line.len() { 1 } else { 0 };
+            (stripped, offset)
         } else {
-            line
+            (line, 0)
         };
         let width: u32 = line.chars().count() as u32;
         if width <= max_len {
@@ -39,12 +43,13 @@ pub(crate) fn collect(
         // Width is measured in characters (lintr parity), but LSP ranges are
         // UTF-16 code units — convert the char positions so the underline
         // starts at the limit and never splits a surrogate pair.
-        let start_utf16: u32 = line
-            .chars()
-            .take(max_len as usize)
-            .map(|c| c.len_utf16() as u32)
-            .sum();
-        let end_utf16: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
+        let start_utf16: u32 = bom_utf16
+            + line
+                .chars()
+                .take(max_len as usize)
+                .map(|c| c.len_utf16() as u32)
+                .sum::<u32>();
+        let end_utf16: u32 = bom_utf16 + line.chars().map(|c| c.len_utf16() as u32).sum::<u32>();
         out.push(Diagnostic {
             range: Range {
                 start: Position::new(line_no, start_utf16),
@@ -118,7 +123,21 @@ mod tests {
 
     #[test]
     fn leading_bom_first_line_over_limit_reports_bomless_width() {
-        // "abcde" past the BOM is 5 chars; the reported width excludes the BOM.
-        assert_eq!(widths("\u{FEFF}abcde\n", 4), vec![5]);
+        // "abcde" past the BOM is 5 chars; the reported *width* excludes the
+        // BOM, while the LSP range includes its one UTF-16 unit (positions
+        // index the buffer as the client sees it).
+        let suppressions = Suppressions::from_text("\u{FEFF}abcde\n");
+        let mut out = Vec::new();
+        collect(
+            "\u{FEFF}abcde\n",
+            4,
+            DiagnosticSeverity::INFORMATION,
+            &suppressions,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert!(out[0].message.contains("5 characters"), "{:?}", out[0]);
+        assert_eq!(out[0].range.start.character, 5); // BOM + 4 chars
+        assert_eq!(out[0].range.end.character, 6);
     }
 }
