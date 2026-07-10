@@ -16,6 +16,8 @@ export type ObjectNameStyle =
     | "lowercase"
     | "any";
 
+export type ObjectNameStyleSetting = ObjectNameStyle | ObjectNameStyle[];
+
 /**
  * Subset of VS Code's configuration inspection result used when building
  * initialization options.
@@ -115,9 +117,12 @@ export interface RavenInitializationOptions {
         indentationUnit?: number | "auto";
         assignmentOperator?: "<-" | "=";
         stringDelimiter?: "\"" | "'";
-        objectNameStyleFunction?: ObjectNameStyle;
-        objectNameStyleVariable?: ObjectNameStyle;
-        objectNameStyleArgument?: ObjectNameStyle;
+        objectNameStyleFunction?: ObjectNameStyleSetting;
+        objectNameStyleVariable?: ObjectNameStyleSetting;
+        objectNameStyleArgument?: ObjectNameStyleSetting;
+        objectNameRegexesFunction?: string[];
+        objectNameRegexesVariable?: string[];
+        objectNameRegexesArgument?: string[];
         lineLengthSeverity?: SeverityLevel;
         trailingWhitespaceSeverity?: SeverityLevel;
         noTabSeverity?: SeverityLevel;
@@ -416,9 +421,12 @@ export function getInitializationOptions(
         })(),
         assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
         stringDelimiter: config.get<"\"" | "'">('linting.stringDelimiter', '"'),
-        objectNameStyleFunction: config.get<ObjectNameStyle>('linting.objectNameStyleFunction', 'snake_case'),
-        objectNameStyleVariable: config.get<ObjectNameStyle>('linting.objectNameStyleVariable', 'snake_case'),
-        objectNameStyleArgument: config.get<ObjectNameStyle>('linting.objectNameStyleArgument', 'snake_case'),
+        objectNameStyleFunction: config.get<ObjectNameStyleSetting>('linting.objectNameStyleFunction', 'snake_case'),
+        objectNameStyleVariable: config.get<ObjectNameStyleSetting>('linting.objectNameStyleVariable', 'snake_case'),
+        objectNameStyleArgument: config.get<ObjectNameStyleSetting>('linting.objectNameStyleArgument', 'snake_case'),
+        objectNameRegexesFunction: config.get<string[]>('linting.objectNameRegexesFunction', []),
+        objectNameRegexesVariable: config.get<string[]>('linting.objectNameRegexesVariable', []),
+        objectNameRegexesArgument: config.get<string[]>('linting.objectNameRegexesArgument', []),
         lineLengthSeverity: config.get<SeverityLevel>('linting.lineLengthSeverity', 'information'),
         trailingWhitespaceSeverity: config.get<SeverityLevel>('linting.trailingWhitespaceSeverity', 'information'),
         noTabSeverity: config.get<SeverityLevel>('linting.noTabSeverity', 'information'),

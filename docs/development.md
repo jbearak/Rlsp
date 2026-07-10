@@ -255,6 +255,8 @@ Default capacities are defined close to each cache:
 
 Cache sizes are configurable via VS Code settings and applied during initialization/config change.
 
+One cache lives outside the cross-file system: `compile_cached` in `crates/raven/src/linting/config.rs` memoizes compiled object-name regexes in a process-wide `Mutex<LruCache>` (cap 512, not configurable). It exists because per-document `[[linting.overrides]]` resolution re-parses the lint config on every debounced edit, which would otherwise recompile every configured pattern each time. The lock is exclusive but only config parsing takes it; the per-name `is_match` hot loop never touches the cache. See the function's doc comment for the full rationale.
+
 ### Self-contained isolated-scope cache (#483 / WI2b)
 
 `# raven: self-contained` callees (alias: `# raven: standalone`; see `docs/cross-file-analysis-performance.md`) are resolved in isolation: no backward parent-prefix walk (WI2a) and - when resolved as a caller's forward `source()` child - canonical, caller-independent inputs (empty packages, no `data()` provider, the file's own `PathContext`; WI2b "part 2"). That makes a self-contained file's depth >= 1 isolated EOF scope a pure function of the file and its own forward `source()` closure plus the traversal config, independent of who sources it, so it is cached **across snapshots** rather than per-query - collapsing the per-caller, xN-revalidation-fan-out, and per-file-`raven check`-snapshot re-resolutions into one compute plus cheap `Arc` clones. The Rust module and type names still use `standalone` as the historical internal name for this self-contained-file optimization.

@@ -275,7 +275,7 @@ Native style diagnostics (18 of [`lintr`](https://lintr.r-lib.org/)'s default ru
 | Tab character | information | Tab character anywhere in source |
 | Trailing blank lines | information | Blank lines at end of file, or missing final newline |
 | Assignment operator | information | Top-level assignment uses an operator other than the preferred one (`<-` by default; configurable via `raven.linting.assignmentOperator`) |
-| Object name | information | Function, variable, or argument name doesn't match the configured naming scheme (`snake_case` by default; configurable per kind via `raven.linting.objectNameStyle*`) |
+| Object name | information | Function, variable, or argument name doesn't match the configured named styles or regexes (`snake_case` by default; configurable per kind via `raven.linting.objectNameStyle*` and `raven.linting.objectNameRegexes*`) |
 | Object length | information | Identifier name exceeds `raven.linting.objectLength` characters (default 30; leading `.` not counted) |
 | Infix spaces | information | Missing space around a binary operator (`a+b`, `x<-1`, `a%>%b`, `if (a<=b)`), or stray space around a tight-binding operator (`obj $ field`, `1 : 10`, unary `- x`) |
 | Commented code | information | A standalone comment whose body parses as R and contains a call, assignment, or operator (`# foo(bar)`, `# x <- 1 + 2`) |
@@ -295,13 +295,13 @@ The infix-spaces lint flags two opposing cases. **Spaces required** on both side
 
 The commented-code lint groups consecutive standalone comment lines and try-parses their bodies as R. A block is reported when it parses without errors **and** contains at least one call, assignment, binary/unary operator, function definition, or control-flow construct — bare identifiers and literals are treated as prose. End-of-line comments next to real code (`x <- 1 # explain`) are never flagged. Roxygen lines (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines (`# -*- ... -*-`), and `# nolint` / `# raven:` / `# @lsp-…` directives are skipped up front.
 
-The object-name lint has independent style settings for **functions** (`objectNameStyleFunction`), **variables** (`objectNameStyleVariable`), and **arguments** (`objectNameStyleArgument`). Each accepts `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any`. Using `any` accepts all names for that kind — since the three are checked independently, you can enforce a style on two while opting out of the third.
+The object-name lint has independent settings for **functions** (`objectNameStyleFunction`, `objectNameRegexesFunction`), **variables** (`objectNameStyleVariable`, `objectNameRegexesVariable`), and **arguments** (`objectNameStyleArgument`, `objectNameRegexesArgument`). Each style key accepts one named style or an array of styles: `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any`. Names pass when they match any named style or regex for that kind. Using `any` accepts all names for that kind; an empty style array with regexes is regex-only mode.
 
 > [!NOTE]
 > Some names are always accepted regardless of the configured style:
-> - An optional leading `.` is always valid; the rest of the name must still match (e.g. `.helper` under `snake_case` is fine, `.myHelper` is not).
+> - Named styles treat an optional leading `.` as decorative; the rest of the name must still match (e.g. `.helper` under `snake_case` is fine, `.myHelper` is not). Custom regexes match the full identifier including the leading dot.
 > - Function definitions with the shape `<generic>.<class>` are exempt when `<generic>` is a known base R S3 generic (`print.MyClass`, `as.Date.character`, `print.data.frame`, etc.). For less-common generics, use `# nolint` or `# raven: ignore`.
-> - Backtick-quoted names (e.g. `` `with spaces` ``, `` `+.MyClass` ``) and non-ASCII identifiers are skipped entirely.
+> - Backtick-quoted names (e.g. `` `with spaces` ``, `` `+.MyClass` ``) are skipped entirely. Non-ASCII identifiers are skipped only when no regexes are configured for the kind; with regexes configured they are checked against the regexes.
 
 **Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
 

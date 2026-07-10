@@ -74,7 +74,7 @@ function assertSettingsValues(
 const SETTINGS_MAPPING: Array<{
     vsCodeKey: string;
     jsonPath: string[];
-    type: 'number' | 'boolean' | 'string' | 'enum' | 'array';
+    type: 'number' | 'boolean' | 'string' | 'enum' | 'enumOrArray' | 'array';
     enumValues?: readonly (string | boolean)[];
     defaultWhenUnconfigured?: unknown;
 }> = [
@@ -138,9 +138,12 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.noTabSeverity', jsonPath: ['linting', 'noTabSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
     { vsCodeKey: 'linting.trailingBlankLinesSeverity', jsonPath: ['linting', 'trailingBlankLinesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
     { vsCodeKey: 'linting.assignmentOperatorSeverity', jsonPath: ['linting', 'assignmentOperatorSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
-    { vsCodeKey: 'linting.objectNameStyleFunction', jsonPath: ['linting', 'objectNameStyleFunction'], type: 'enum', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
-    { vsCodeKey: 'linting.objectNameStyleVariable', jsonPath: ['linting', 'objectNameStyleVariable'], type: 'enum', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
-    { vsCodeKey: 'linting.objectNameStyleArgument', jsonPath: ['linting', 'objectNameStyleArgument'], type: 'enum', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
+    { vsCodeKey: 'linting.objectNameStyleFunction', jsonPath: ['linting', 'objectNameStyleFunction'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
+    { vsCodeKey: 'linting.objectNameStyleVariable', jsonPath: ['linting', 'objectNameStyleVariable'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
+    { vsCodeKey: 'linting.objectNameStyleArgument', jsonPath: ['linting', 'objectNameStyleArgument'], type: 'enumOrArray', enumValues: ['snake_case', 'camelCase', 'dotted.case', 'UPPER_CASE', 'lowercase', 'any'] as const, defaultWhenUnconfigured: 'snake_case' },
+    { vsCodeKey: 'linting.objectNameRegexesFunction', jsonPath: ['linting', 'objectNameRegexesFunction'], type: 'array', defaultWhenUnconfigured: [] },
+    { vsCodeKey: 'linting.objectNameRegexesVariable', jsonPath: ['linting', 'objectNameRegexesVariable'], type: 'array', defaultWhenUnconfigured: [] },
+    { vsCodeKey: 'linting.objectNameRegexesArgument', jsonPath: ['linting', 'objectNameRegexesArgument'], type: 'array', defaultWhenUnconfigured: [] },
     { vsCodeKey: 'linting.objectNameSeverity', jsonPath: ['linting', 'objectNameSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
     { vsCodeKey: 'linting.infixSpacesSeverity', jsonPath: ['linting', 'infixSpacesSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
     { vsCodeKey: 'linting.commentedCodeSeverity', jsonPath: ['linting', 'commentedCodeSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
@@ -175,6 +178,13 @@ function arbitraryForSetting(setting: typeof SETTINGS_MAPPING[number]): fc.Arbit
             return fc.string({ minLength: 0, maxLength: 50 });
         case 'enum':
             return fc.constantFrom(...(setting.enumValues ?? []));
+        case 'enumOrArray': {
+            const enumValues = setting.enumValues ?? [];
+            return fc.oneof(
+                fc.constantFrom(...enumValues),
+                fc.array(fc.constantFrom(...enumValues), { minLength: 0, maxLength: 5 }),
+            );
+        }
         case 'array':
             return fc.array(fc.string({ minLength: 1, maxLength: 20 }), { minLength: 0, maxLength: 5 });
         default:
@@ -385,6 +395,9 @@ suite('Settings Transmission Property Tests', () => {
                 objectNameStyleFunction: 'snake_case',
                 objectNameStyleVariable: 'snake_case',
                 objectNameStyleArgument: 'snake_case',
+                objectNameRegexesFunction: [],
+                objectNameRegexesVariable: [],
+                objectNameRegexesArgument: [],
                 lineLengthSeverity: 'information',
                 trailingWhitespaceSeverity: 'information',
                 noTabSeverity: 'information',
@@ -576,6 +589,9 @@ suite('Settings Transmission Unit Tests', () => {
             objectNameStyleFunction: 'snake_case',
             objectNameStyleVariable: 'snake_case',
             objectNameStyleArgument: 'snake_case',
+            objectNameRegexesFunction: [],
+            objectNameRegexesVariable: [],
+            objectNameRegexesArgument: [],
             lineLengthSeverity: 'information',
             trailingWhitespaceSeverity: 'information',
             noTabSeverity: 'information',
@@ -607,6 +623,7 @@ suite('Settings Transmission Unit Tests', () => {
             ['linting.assignmentOperatorSeverity', 'off'],
             ['linting.objectNameStyleFunction', 'camelCase'],
             ['linting.objectNameStyleVariable', 'any'],
+            ['linting.objectNameRegexesFunction', ['^\\.on[A-Z]', 'Factory$']],
             ['linting.objectNameSeverity', 'warning'],
             ['linting.infixSpacesSeverity', 'off'],
             ['linting.commentedCodeSeverity', 'warning'],
@@ -621,12 +638,67 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.linting?.assignmentOperatorSeverity, 'off');
         assert.strictEqual(options.linting?.objectNameStyleFunction, 'camelCase');
         assert.strictEqual(options.linting?.objectNameStyleVariable, 'any');
+        assert.deepStrictEqual(options.linting?.objectNameRegexesFunction, ['^\\.on[A-Z]', 'Factory$']);
         assert.strictEqual(options.linting?.objectNameSeverity, 'warning');
         assert.strictEqual(options.linting?.infixSpacesSeverity, 'off');
         assert.strictEqual(options.linting?.commentedCodeSeverity, 'warning');
         // Untouched keys still emit their defaults.
         assert.strictEqual(options.linting?.trailingWhitespaceSeverity, 'information');
         assert.strictEqual(options.linting?.objectNameStyleArgument, 'snake_case');
+        assert.deepStrictEqual(options.linting?.objectNameRegexesVariable, []);
+        assert.deepStrictEqual(options.linting?.objectNameRegexesArgument, []);
+    });
+
+    test('object name style scalar string transmits for backcompat', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['linting.objectNameStyleFunction', 'camelCase'],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.strictEqual(options.linting?.objectNameStyleFunction, 'camelCase');
+    });
+
+    test('object name style arrays transmit correctly', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['linting.objectNameStyleFunction', ['snake_case', 'camelCase']],
+            ['linting.objectNameStyleVariable', ['dotted.case', 'snake_case']],
+            ['linting.objectNameStyleArgument', ['lowercase']],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.deepStrictEqual(options.linting?.objectNameStyleFunction, ['snake_case', 'camelCase']);
+        assert.deepStrictEqual(options.linting?.objectNameStyleVariable, ['dotted.case', 'snake_case']);
+        assert.deepStrictEqual(options.linting?.objectNameStyleArgument, ['lowercase']);
+    });
+
+    test('empty array for objectNameStyle transmits correctly', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['linting.objectNameStyleFunction', []],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.deepStrictEqual(options.linting?.objectNameStyleFunction, []);
+    });
+
+    test('object name regex arrays transmit correctly', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['linting.objectNameRegexesFunction', ['^\\.on[A-Z]', 'Factory$']],
+            ['linting.objectNameRegexesVariable', ['^tmp_', 'Result$']],
+            ['linting.objectNameRegexesArgument', ['^\\.x$', '^data$']],
+        ]);
+
+        const mockConfig = createMockConfig(configuredSettings);
+        const options = getInitializationOptions(mockConfig);
+
+        assert.deepStrictEqual(options.linting?.objectNameRegexesFunction, ['^\\.on[A-Z]', 'Factory$']);
+        assert.deepStrictEqual(options.linting?.objectNameRegexesVariable, ['^tmp_', 'Result$']);
+        assert.deepStrictEqual(options.linting?.objectNameRegexesArgument, ['^\\.x$', '^data$']);
     });
 
     /**

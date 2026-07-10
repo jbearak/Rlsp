@@ -115,11 +115,14 @@ const LINTING_GROUPS: LintingGroup[] = [
         ],
     },
     {
-        comment: 'lintr: object_name_linter(styles = ...)',
+        comment: 'lintr: object_name_linter(styles = ..., regexes = ...)',
         entries: [
-            { key: 'raven.linting.objectNameStyleFunction', value: 'snake_case' },
-            { key: 'raven.linting.objectNameStyleVariable', value: 'snake_case' },
-            { key: 'raven.linting.objectNameStyleArgument', value: 'snake_case' },
+            { key: 'raven.linting.objectNameStyleFunction', value: ['snake_case'] },
+            { key: 'raven.linting.objectNameStyleVariable', value: ['snake_case'] },
+            { key: 'raven.linting.objectNameStyleArgument', value: ['snake_case'] },
+            { key: 'raven.linting.objectNameRegexesFunction', value: [] },
+            { key: 'raven.linting.objectNameRegexesVariable', value: [] },
+            { key: 'raven.linting.objectNameRegexesArgument', value: [] },
             { key: 'raven.linting.objectNameSeverity', value: 'information' },
         ],
     },
@@ -181,6 +184,18 @@ const LINTING_GROUPS: LintingGroup[] = [
         ],
     },
 ];
+
+/**
+ * The linting settings whose values are arrays, derived from
+ * `LINTING_GROUPS` so a new array-valued scaffold entry is automatically
+ * accepted by `classifyExisting` instead of requiring a second list to be
+ * kept in sync by hand.
+ */
+const ARRAY_LINTING_SETTINGS = new Set(
+    LINTING_GROUPS.flatMap((group) => group.entries)
+        .filter((entry) => Array.isArray(entry.value))
+        .map((entry) => entry.key),
+);
 
 const LINTING_BLOCK_HEADER =
     'Raven native style/lint diagnostics. Severities accept: "error",\n' +
@@ -246,13 +261,11 @@ export const LINTING_SETTINGS_TEMPLATE = `{\n${formatLintingBlock('  ')}\n}\n`;
  *   - `nonObjectRoot`: parsed fine but root isn't a JSON object (e.g. an
  *     array, scalar, or `null`). Can't safely merge into it.
  *   - `unsupportedValue`: a top-level project-scoped `raven.linting.*` key has
- *     a non-scalar value (object or array). All declared project-scoped
- *     `raven.linting.*` settings are scalars; a non-scalar value would span
- *     multiple lines and the per-key remover (which targets the single
- *     key/value range jsonc-parser identifies) can't migrate the surrounding
- *     context cleanly.
+ *     a structured value Raven settings don't use (an object, or an array
+ *     containing objects/arrays). Project-scoped `raven.linting.*` settings are
+ *     scalars or arrays of scalars; deeper structures are likely user mistakes.
  *   - `object`: parsed as an object. `userManagedKeys` lists the top-level
- *     project-scoped `raven.linting.*` keys whose values are scalars — these
+ *     project-scoped `raven.linting.*` keys whose values are supported — these
  *     are the keys the scaffold prompts about before overwriting.
  */
 type LintingClassification =
@@ -343,7 +356,7 @@ function* iterateLintingProperties(
 /**
  * Classify `text` for the scaffold's merge step. Wraps `jsonc-parser`'s
  * `parseTree` and adds the project-specific checks (non-object root,
- * non-scalar project-scoped `raven.linting.*` value).
+ * unsupported structured project-scoped `raven.linting.*` value).
  */
 function classifyExisting(text: string): LintingClassification {
     if (text.trim().length === 0) return { kind: 'empty' };
@@ -353,12 +366,21 @@ function classifyExisting(text: string): LintingClassification {
     if (!root || root.type !== 'object') return { kind: 'nonObjectRoot' };
     const userManagedKeys: string[] = [];
     for (const { key, valueNode } of iterateLintingProperties(root)) {
-        if (valueNode.type === 'object' || valueNode.type === 'array') {
+        if (!isSupportedLintingValueNode(key, valueNode)) {
             return { kind: 'unsupportedValue', key };
         }
         userManagedKeys.push(key);
     }
     return { kind: 'object', userManagedKeys };
+}
+
+function isSupportedLintingValueNode(key: string, valueNode: Node): boolean {
+    if (valueNode.type === 'object') return false;
+    if (valueNode.type !== 'array') return true;
+    if (!ARRAY_LINTING_SETTINGS.has(key)) return false;
+    return (valueNode.children ?? []).every(
+        (child) => child.type !== 'object' && child.type !== 'array',
+    );
 }
 
 /**
@@ -445,11 +467,22 @@ function removeTopLevelLintingKeys(text: string): string {
         let removeEnd = propNode.offset + propNode.length;
 
         // Phase 1: try to absorb a trailing `,` (standard "comma-after"
-        // style) — skipping intermediate whitespace and tabs.
+        // style) — skipping intermediate whitespace, tabs, and inline
+        // `/* ... */` block comments (`"key": [..] /* note */,` must not
+        // leave the comment + comma orphaned as invalid JSONC).
         let trailingCommaAbsorbed = false;
         {
             let j = removeEnd;
-            while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+            for (;;) {
+                while (j < current.length && (current[j] === ' ' || current[j] === '\t')) j++;
+                if (current[j] === '/' && current[j + 1] === '*') {
+                    const close = current.indexOf('*/', j + 2);
+                    if (close === -1) break;
+                    j = close + 2;
+                    continue;
+                }
+                break;
+            }
             if (current[j] === ',') {
                 removeEnd = j + 1;
                 trailingCommaAbsorbed = true;
@@ -544,8 +577,8 @@ function hasCommaBetween(text: string, after: number, before: number): boolean {
  *
  *   1. Strip any prior sentinel-managed block we wrote.
  *   2. Classify the rest via `jsonc-parser` (parse errors / non-object
- *      root / non-scalar project-scoped `raven.linting.*` value all return
- *      `null`).
+ *      root / unsupported structured project-scoped `raven.linting.*` value
+ *      all return `null`).
  *   3. Remove every remaining top-level project-scoped `raven.linting.*` key
  *      via `removeTopLevelLintingKeys`'s `parseTree`-driven line splice —
  *      `jsonc-parser`'s `modify` + `applyEdits` looked tempting here
@@ -605,7 +638,91 @@ export function buildLintingSettingsContent(existing: string | undefined): strin
 
     const trimmedBefore = beforeInsertion.replace(/[ \t\n\r]+$/, '');
     const after = withoutLintingKeys.slice(closingBracePos);
-    return `${trimmedBefore}\n${formatLintingBlock('  ')}\n${after}`;
+    const merged = `${trimmedBefore}\n${formatLintingBlock('  ')}\n${after}`;
+
+    // Final safety net: the splice-based removal above handles the comment
+    // and comma layouts we know about, but a layout it mishandles must never
+    // be written back as invalid JSONC. Refuse to merge instead.
+    const verifyErrors: ParseError[] = [];
+    parseTree(merged, verifyErrors, { allowTrailingComma: true });
+    if (verifyErrors.length > 0) return null;
+    return merged;
+}
+
+export function renderRavenToml(linting: Record<string, unknown> | undefined): string {
+    const lines: string[] = ['# Generated by Raven: Create raven.toml', ''];
+    lines.push('[linting]');
+    // Keep this list exhaustive across the `raven.linting.*` keys that have
+    // portable `raven.toml` equivalents, excluding client-only discovery or
+    // environment signals. Missing a severity here would create behavior drift
+    // for CLI / non-VS-Code consumers, where `raven.toml` is the shared source
+    // of truth. Any new lint rule should add both its value key (if it has one)
+    // and its severity key here at the time the rule is added.
+    const severities: [string, string][] = [
+        ['lineLengthSeverity', 'information'],
+        ['trailingWhitespaceSeverity', 'information'],
+        ['noTabSeverity', 'information'],
+        ['trailingBlankLinesSeverity', 'information'],
+        ['assignmentOperatorSeverity', 'information'],
+        ['objectNameSeverity', 'information'],
+        ['infixSpacesSeverity', 'information'],
+        ['commentedCodeSeverity', 'information'],
+        ['quotesSeverity', 'information'],
+        ['commasSeverity', 'information'],
+        ['tAndFSymbolSeverity', 'information'],
+        ['semicolonSeverity', 'information'],
+        ['equalsNaSeverity', 'information'],
+        ['objectLengthSeverity', 'information'],
+        ['vectorLogicSeverity', 'information'],
+        ['functionLeftParenthesesSeverity', 'information'],
+        ['spacesInsideSeverity', 'information'],
+        ['indentationSeverity', 'information'],
+    ];
+    const entries: [string, unknown, string][] = [
+        ['enabled', false, 'master switch'],
+        ['lineLength', 80, 'maximum line length (UTF-16 code units)'],
+        ['objectLength', 30, 'maximum identifier length'],
+        ['indentationUnit', 2, 'expected indent unit'],
+        ['assignmentOperator', '<-', '"<-" or "="'],
+        ['stringDelimiter', '"', '"\\"" or "\'"'],
+        [
+            'objectNameStyleFunction',
+            'snake_case',
+            'string or array: snake_case, camelCase, dotted.case, UPPER_CASE, lowercase, any',
+        ],
+        ['objectNameStyleVariable', 'snake_case', 'same string-or-array form'],
+        ['objectNameStyleArgument', 'snake_case', 'same string-or-array form'],
+        ['objectNameRegexesFunction', [], 'array of Rust regexes; partial match'],
+        ['objectNameRegexesVariable', [], 'array of Rust regexes; partial match'],
+        ['objectNameRegexesArgument', [], 'array of Rust regexes; partial match'],
+        ...severities.map<[string, unknown, string]>(([k, d]) => [
+            k,
+            d,
+            'error | warning | information | hint | off',
+        ]),
+    ];
+    const ravenDefaultEnabled = false; // mirror VS Code package.json default
+    for (const [key, dflt, comment] of entries) {
+        const fromUser = linting?.[key];
+        // `enabled` is special: the init-options factory always emits it
+        // (see getInitializationOptions in initializationOptions.ts), so the "is this explicit?"
+        // heuristic above doesn't apply. Treat enabled as explicit only when
+        // it differs from the package.json default.
+        const isExplicit =
+            key === 'enabled'
+                ? fromUser !== undefined && fromUser !== ravenDefaultEnabled
+                : fromUser !== undefined;
+        const value = isExplicit ? fromUser : dflt;
+        const prefix = isExplicit ? '' : '# ';
+        lines.push(`${prefix}${key} = ${toTomlScalar(value)}    # ${comment}`);
+    }
+    lines.push('');
+    return lines.join('\n');
+}
+
+function toTomlScalar(v: unknown): string {
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    return JSON.stringify(v);
 }
 
 /**
@@ -727,7 +844,7 @@ async function runLintingSettingsScaffold(
         }
         if (classification.kind === 'unsupportedValue') {
             void vscode.window.showErrorMessage(
-                `Raven: ${displayName} sets ${classification.key} to a non-scalar value (object or array). All project-scoped raven.linting.* settings are scalars (boolean, number, or string); please correct the value before re-running this command.`,
+                `Raven: ${displayName} sets ${classification.key} to an unsupported structured value. Project-scoped raven.linting.* settings must be scalars or arrays of scalars; please correct the value before re-running this command.`,
             );
             return undefined;
         }

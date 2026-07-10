@@ -1,10 +1,15 @@
 //! Enforce a naming scheme on user-defined symbols.
 //!
 //! Walks the tree-sitter AST and flags assignment targets and function
-//! parameters whose names don't match the configured [`ObjectNameStyle`].
-//! Mirrors `lintr::object_name_linter` with three per-kind settings:
-//! `function`, `variable`, and `argument`. Each kind defaults to `snake_case`
-//! and can be independently disabled by setting its style to [`ObjectNameStyle::Any`].
+//! parameters whose names don't match the configured [`ObjectNameStyle`] or
+//! custom regexes. Mirrors `lintr::object_name_linter` with three per-kind
+//! settings: `function`, `variable`, and `argument`. Each kind defaults to
+//! `snake_case` and can be independently disabled by including
+//! [`ObjectNameStyle::Any`] in its style list.
+//! A name passes when it matches any accepted named style or any accepted
+//! regex. Named styles keep lintr's decorative-leading-dot behavior; regexes
+//! are matched unanchored (partial match) against the full identifier text as
+//! written in source; anchor with `^...$` to require a whole-name match.
 //!
 //! Carve-outs:
 //!
@@ -23,8 +28,11 @@
 //! * **Leading-dot "hidden" names** (`.foo`, `.my_helper`, `.onLoad`) are
 //!   accepted under every scheme — an optional leading dot is stripped before
 //!   scheme classification, mirroring lintr.
-//! * **Non-ASCII identifiers** are skipped — case is locale-dependent and a
-//!   simple regex can't classify them.
+//! * **Non-ASCII identifiers** are skipped when no regexes are configured
+//!   for the kind — case is locale-dependent and the named styles' simple
+//!   ASCII schemes can't classify them. When regexes are configured
+//!   (regex-only or combined with styles), non-ASCII names are checked
+//!   against the regexes; the named styles never match them.
 //! * **Named-argument `=`** (`f(name = value)`) is never an assignment target,
 //!   so it isn't checked. `=` elsewhere (top level, function bodies, braced
 //!   blocks) *is* treated as assignment and the LHS is checked.
@@ -35,28 +43,42 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Posit
 use tree_sitter::Node;
 
 use crate::linting::LINT_SOURCE;
-use crate::linting::config::ObjectNameStyle;
+use crate::linting::config::{CompiledRegex, ObjectNameStyle};
 use crate::linting::nolint::Suppressions;
 use crate::linting::rule_ids;
 use crate::utf16::byte_offset_to_utf16_column;
 
-/// Per-kind style configuration for the rule.
+/// Accepted named styles and regexes for one symbol kind.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ObjectNameStyles {
-    pub function: ObjectNameStyle,
-    pub variable: ObjectNameStyle,
-    pub argument: ObjectNameStyle,
+pub(crate) struct KindPatterns<'a> {
+    pub styles: &'a [ObjectNameStyle],
+    pub regexes: &'a [CompiledRegex],
+}
+
+impl KindPatterns<'_> {
+    fn is_disabled(self) -> bool {
+        self.styles.contains(&ObjectNameStyle::Any)
+            || (self.styles.is_empty() && self.regexes.is_empty())
+    }
+}
+
+/// Per-kind pattern configuration for the rule.
+#[derive(Debug, Clone)]
+pub(crate) struct ObjectNameStyles<'a> {
+    pub function: KindPatterns<'a>,
+    pub variable: KindPatterns<'a>,
+    pub argument: KindPatterns<'a>,
 }
 
 pub(crate) fn collect(
     text: &str,
     root: Node<'_>,
-    styles: ObjectNameStyles,
+    styles: ObjectNameStyles<'_>,
     severity: DiagnosticSeverity,
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    visit(root, text, styles, severity, suppressions, out);
+    visit(root, text, &styles, severity, suppressions, out);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +91,7 @@ enum SymbolKind {
 fn visit(
     node: Node<'_>,
     text: &str,
-    styles: ObjectNameStyles,
+    styles: &ObjectNameStyles<'_>,
     severity: DiagnosticSeverity,
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
@@ -90,7 +112,7 @@ fn visit(
 fn check_assignment(
     node: Node<'_>,
     text: &str,
-    styles: ObjectNameStyles,
+    styles: &ObjectNameStyles<'_>,
     severity: DiagnosticSeverity,
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
@@ -143,11 +165,16 @@ fn check_assignment(
         SymbolKind::Variable
     };
 
+    let patterns = patterns_for(kind, styles);
+    if patterns.is_disabled() {
+        return;
+    }
+
     report_if_bad(
         target,
         name,
         kind,
-        style_for(kind, styles),
+        patterns,
         text,
         severity,
         suppressions,
@@ -159,12 +186,13 @@ fn check_assignment(
 fn check_parameters(
     node: Node<'_>,
     text: &str,
-    styles: ObjectNameStyles,
+    styles: &ObjectNameStyles<'_>,
     severity: DiagnosticSeverity,
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    if styles.argument == ObjectNameStyle::Any {
+    let patterns = patterns_for(SymbolKind::Argument, styles);
+    if patterns.is_disabled() {
         return;
     }
     let params_node = node.child_by_field_name("parameters").or_else(|| {
@@ -203,7 +231,7 @@ fn check_parameters(
                 ident,
                 name,
                 SymbolKind::Argument,
-                style_for(SymbolKind::Argument, styles),
+                patterns,
                 text,
                 severity,
                 suppressions,
@@ -213,24 +241,30 @@ fn check_parameters(
     }
 }
 
+/// Report a diagnostic for `name` when it does not match `patterns`.
+///
+/// Callers pre-check [`KindPatterns::is_disabled`] as a fast path, while this
+/// function also guards the invariant so future call sites cannot report every
+/// name for a disabled symbol kind.
+// The diagnostic construction inputs are clearer kept flat at this leaf helper.
 #[allow(clippy::too_many_arguments)]
 fn report_if_bad(
     name_node: Node<'_>,
     name: &str,
     kind: SymbolKind,
-    style: ObjectNameStyle,
+    patterns: KindPatterns<'_>,
     text: &str,
     severity: DiagnosticSeverity,
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    if style == ObjectNameStyle::Any {
+    if patterns.is_disabled() {
         return;
     }
-    if should_skip_name(name, kind) {
+    if should_skip_name(name, kind, patterns) {
         return;
     }
-    if matches_scheme(name, style) {
+    if matches_patterns(name, patterns) {
         return;
     }
     let line_no = name_node.start_position().row as u32;
@@ -245,7 +279,7 @@ fn report_if_bad(
         SymbolKind::Variable => "Variable",
         SymbolKind::Argument => "Argument",
     };
-    let scheme_label = scheme_label(style);
+    let message = object_name_message(kind_label, name, patterns);
     out.push(Diagnostic {
         range: Range {
             start: Position::new(line_no, start_col),
@@ -254,15 +288,13 @@ fn report_if_bad(
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
         code: Some(NumberOrString::String(rule_ids::OBJECT_NAME.to_string())),
-        message: format!(
-            "{kind_label} name `{name}` does not match the {scheme_label} naming style."
-        ),
+        message,
         ..Default::default()
     });
 }
 
-/// Look up the configured style for a given symbol kind.
-fn style_for(kind: SymbolKind, styles: ObjectNameStyles) -> ObjectNameStyle {
+/// Look up the configured patterns for a given symbol kind.
+fn patterns_for<'a>(kind: SymbolKind, styles: &ObjectNameStyles<'a>) -> KindPatterns<'a> {
     match kind {
         SymbolKind::Function => styles.function,
         SymbolKind::Variable => styles.variable,
@@ -270,15 +302,28 @@ fn style_for(kind: SymbolKind, styles: ObjectNameStyles) -> ObjectNameStyle {
     }
 }
 
+fn matches_patterns(name: &str, patterns: KindPatterns<'_>) -> bool {
+    patterns
+        .styles
+        .iter()
+        .any(|&style| matches_scheme(name, style))
+        || patterns.regexes.iter().any(|regex| regex.is_match(name))
+}
+
 /// Names that should be skipped regardless of the configured scheme.
-fn should_skip_name(name: &str, kind: SymbolKind) -> bool {
+fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) -> bool {
     // Backtick-quoted identifiers (operator overloads, names with spaces).
     if name.starts_with('`') {
         return true;
     }
-    // Non-ASCII identifiers can't be classified by simple ASCII regex.
+    // Non-ASCII identifiers can't be classified by the named styles' simple
+    // ASCII schemes, so configurations with no regexes skip them. When
+    // regexes ARE configured — regex-only or combined with styles — the name
+    // is checked: regexes can express Unicode constraints, so exempting
+    // non-ASCII names would make such policies unenforceable (the named
+    // styles never match a non-ASCII name; see `matches_scheme`).
     if !name.is_ascii() {
-        return true;
+        return patterns.regexes.is_empty();
     }
     // S3 method dispatch: only relevant for function definitions. A name like
     // `print.MyClass` is `<generic>.<ClassName>` — exempt when some prefix
@@ -408,8 +453,12 @@ fn is_known_s3_generic(name: &str) -> bool {
 
 fn matches_scheme(name: &str, style: ObjectNameStyle) -> bool {
     if !name.is_ascii() {
-        // Should already be handled by `should_skip_name`, but be defensive.
-        return true;
+        // The ASCII schemes can never classify a non-ASCII name. Returning
+        // false matters in combined style+regex configurations, where
+        // `should_skip_name` lets non-ASCII names through so the regexes can
+        // judge them — a style must not auto-accept what it cannot classify.
+        // Configurations without regexes never reach here (skipped earlier).
+        return false;
     }
     // R treats a leading dot as the "hidden identifier" marker (e.g. `.foo`).
     // lintr accepts an optional leading dot for every scheme — match that so
@@ -481,6 +530,33 @@ fn scheme_label(style: ObjectNameStyle) -> &'static str {
     }
 }
 
+fn object_name_message(kind_label: &str, name: &str, patterns: KindPatterns<'_>) -> String {
+    if patterns.styles.len() == 1 && patterns.regexes.is_empty() {
+        let scheme_label = scheme_label(patterns.styles[0]);
+        return format!(
+            "{kind_label} name `{name}` does not match the {scheme_label} naming style."
+        );
+    }
+
+    if patterns.styles.is_empty() {
+        return format!("{kind_label} name `{name}` does not match any accepted naming pattern.");
+    }
+
+    let labels = patterns
+        .styles
+        .iter()
+        .map(|&style| scheme_label(style))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if patterns.regexes.is_empty() {
+        format!("{kind_label} name `{name}` does not match any accepted naming style ({labels}).")
+    } else {
+        format!(
+            "{kind_label} name `{name}` does not match any accepted naming style ({labels}) or pattern."
+        )
+    }
+}
+
 /// Walk through `parenthesized_expression` wrappers and report whether the
 /// inner node is a `function_definition`. Mirrors the helper in
 /// `cross_file/scope.rs` so paren-wrapped functions still classify as such
@@ -517,6 +593,21 @@ fn node_text<'a>(node: Node<'_>, text: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linting::nolint::Suppressions;
+    use crate::parser_pool::with_parser;
+
+    /// [`should_skip_name`] under a typical style-based configuration —
+    /// the carve-outs exercised by most tests don't depend on the patterns.
+    fn skip_default(name: &str, kind: SymbolKind) -> bool {
+        should_skip_name(
+            name,
+            kind,
+            KindPatterns {
+                styles: &[ObjectNameStyle::SnakeCase],
+                regexes: &[],
+            },
+        )
+    }
 
     #[test]
     fn snake_case_classifier_accepts_common_names() {
@@ -567,17 +658,17 @@ mod tests {
     #[test]
     fn s3_method_detected_for_function_kind_only() {
         // Prefix is a known base R generic — exempt.
-        assert!(should_skip_name("print.MyClass", SymbolKind::Function));
-        assert!(should_skip_name("format.Date", SymbolKind::Function));
-        assert!(should_skip_name("summary.lm", SymbolKind::Function));
+        assert!(skip_default("print.MyClass", SymbolKind::Function));
+        assert!(skip_default("format.Date", SymbolKind::Function));
+        assert!(skip_default("summary.lm", SymbolKind::Function));
         // For variables, dotted names are checked normally — `print.MyClass`
         // isn't a method definition when bound to a non-function value.
-        assert!(!should_skip_name("print.MyClass", SymbolKind::Variable));
+        assert!(!skip_default("print.MyClass", SymbolKind::Variable));
         // All-lowercase dotted name with unknown prefix is still checked.
-        assert!(!should_skip_name("my.func", SymbolKind::Function));
+        assert!(!skip_default("my.func", SymbolKind::Function));
         // Unknown prefix + capitalized suffix (regression for over-broad
         // exemption): `foo` is not a known generic, so `foo.Bar` is checked.
-        assert!(!should_skip_name("foo.Bar", SymbolKind::Function));
+        assert!(!skip_default("foo.Bar", SymbolKind::Function));
     }
 
     #[test]
@@ -587,20 +678,14 @@ mod tests {
         // lookup gave `"as"` (not in the list), so the method was wrongly
         // flagged. The progressive-prefix scan tries `as`, then `as.Date`,
         // and exempts on the second.
-        assert!(should_skip_name("as.Date.character", SymbolKind::Function));
-        assert!(should_skip_name("as.numeric.foo", SymbolKind::Function));
-        assert!(should_skip_name(
-            "is.character.MyClass",
-            SymbolKind::Function
-        ));
-        assert!(should_skip_name("all.equal.default", SymbolKind::Function));
-        assert!(should_skip_name(
-            "fitted.values.MyModel",
-            SymbolKind::Function
-        ));
+        assert!(skip_default("as.Date.character", SymbolKind::Function));
+        assert!(skip_default("as.numeric.foo", SymbolKind::Function));
+        assert!(skip_default("is.character.MyClass", SymbolKind::Function));
+        assert!(skip_default("all.equal.default", SymbolKind::Function));
+        assert!(skip_default("fitted.values.MyModel", SymbolKind::Function));
         // Class names containing dots also work because the leftmost matching
         // generic wins.
-        assert!(should_skip_name("print.data.frame", SymbolKind::Function));
+        assert!(skip_default("print.data.frame", SymbolKind::Function));
         // Generic name itself (no class suffix) still requires at least one
         // dot to be considered S3 — bare `as.Date` defining the generic is
         // checked by the scheme (and would pass `dotted.case`).
@@ -611,10 +696,10 @@ mod tests {
         // Hidden S3 methods (`.print.MyClass`) — a leading `.` is stripped
         // before the generic lookup, so `.print.MyClass` still resolves
         // through `print`.
-        assert!(should_skip_name(".print.MyClass", SymbolKind::Function));
-        assert!(should_skip_name(".as.Date.character", SymbolKind::Function));
+        assert!(skip_default(".print.MyClass", SymbolKind::Function));
+        assert!(skip_default(".as.Date.character", SymbolKind::Function));
         // `.foo.Bar` — `foo` is not a generic, so still flagged.
-        assert!(!should_skip_name(".foo.Bar", SymbolKind::Function));
+        assert!(!skip_default(".foo.Bar", SymbolKind::Function));
     }
 
     #[test]
@@ -644,13 +729,183 @@ mod tests {
     }
 
     #[test]
-    fn backtick_quoted_names_are_skipped() {
-        assert!(should_skip_name("`with spaces`", SymbolKind::Variable));
-        assert!(should_skip_name("`+.foo`", SymbolKind::Function));
+    fn matches_patterns_accepts_any_named_style_or_regex() {
+        let styles = [ObjectNameStyle::SnakeCase, ObjectNameStyle::CamelCase];
+        let regexes = [CompiledRegex::new("^x[0-9]+$").unwrap()];
+        let patterns = KindPatterns {
+            styles: &styles,
+            regexes: &regexes,
+        };
+
+        assert!(matches_patterns("foo_bar", patterns));
+        assert!(matches_patterns("fooBar", patterns));
+        assert!(matches_patterns("x123", patterns));
+        assert!(!matches_patterns("BadName", patterns));
     }
 
     #[test]
-    fn non_ascii_names_are_skipped() {
-        assert!(should_skip_name("\u{03b1}", SymbolKind::Variable));
+    fn regex_patterns_match_full_name_and_are_partial() {
+        let dot_regexes = [CompiledRegex::new(r"^\.").unwrap()];
+        assert!(matches_patterns(
+            ".Foo",
+            KindPatterns {
+                styles: &[],
+                regexes: &dot_regexes,
+            }
+        ));
+
+        let partial_regexes = [CompiledRegex::new("Bar").unwrap()];
+        assert!(matches_patterns(
+            "fooBarBaz",
+            KindPatterns {
+                styles: &[],
+                regexes: &partial_regexes,
+            }
+        ));
+    }
+
+    #[test]
+    fn kind_patterns_disabled_predicate() {
+        let any_styles = [ObjectNameStyle::Any];
+        let regexes = [CompiledRegex::new("^x").unwrap()];
+        assert!(
+            KindPatterns {
+                styles: &any_styles,
+                regexes: &regexes,
+            }
+            .is_disabled()
+        );
+        assert!(
+            KindPatterns {
+                styles: &[],
+                regexes: &[],
+            }
+            .is_disabled()
+        );
+        assert!(
+            !KindPatterns {
+                styles: &[],
+                regexes: &regexes,
+            }
+            .is_disabled()
+        );
+    }
+
+    #[test]
+    fn diagnostic_message_preserves_single_style_wording() {
+        let styles = [ObjectNameStyle::SnakeCase];
+        assert_eq!(
+            object_name_message(
+                "Variable",
+                "fooBar",
+                KindPatterns {
+                    styles: &styles,
+                    regexes: &[],
+                },
+            ),
+            "Variable name `fooBar` does not match the snake_case naming style."
+        );
+    }
+
+    #[test]
+    fn diagnostic_message_describes_multi_style_and_regex_patterns() {
+        let styles = [ObjectNameStyle::SnakeCase, ObjectNameStyle::CamelCase];
+        let regexes = [CompiledRegex::new("^x").unwrap()];
+        assert_eq!(
+            object_name_message(
+                "Function",
+                "BadName",
+                KindPatterns {
+                    styles: &styles,
+                    regexes: &regexes,
+                },
+            ),
+            "Function name `BadName` does not match any accepted naming style (snake_case, camelCase) or pattern."
+        );
+        assert_eq!(
+            object_name_message(
+                "Argument",
+                "badArg",
+                KindPatterns {
+                    styles: &[],
+                    regexes: &regexes,
+                },
+            ),
+            "Argument name `badArg` does not match any accepted naming pattern."
+        );
+    }
+
+    #[test]
+    fn regex_only_argument_check_does_not_early_return() {
+        let tree =
+            with_parser(|p| p.parse("f <- function(y) y\n", None)).expect("parse must succeed");
+        let any_styles = [ObjectNameStyle::Any];
+        let argument_regexes = [CompiledRegex::new("^x").unwrap()];
+        let styles = ObjectNameStyles {
+            function: KindPatterns {
+                styles: &any_styles,
+                regexes: &[],
+            },
+            variable: KindPatterns {
+                styles: &any_styles,
+                regexes: &[],
+            },
+            argument: KindPatterns {
+                styles: &[],
+                regexes: &argument_regexes,
+            },
+        };
+        let mut diags = Vec::new();
+        collect(
+            "f <- function(y) y\n",
+            tree.root_node(),
+            styles,
+            DiagnosticSeverity::INFORMATION,
+            &Suppressions::default(),
+            &mut diags,
+        );
+
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert!(diags[0].message.contains("Argument name `y`"));
+    }
+
+    #[test]
+    fn backtick_quoted_names_are_skipped() {
+        assert!(skip_default("`with spaces`", SymbolKind::Variable));
+        assert!(skip_default("`+.foo`", SymbolKind::Function));
+    }
+
+    #[test]
+    fn non_ascii_names_are_skipped_for_style_configs_only() {
+        // Style-based configurations skip non-ASCII names (the ASCII schemes
+        // can't classify them)...
+        assert!(skip_default("\u{03b1}", SymbolKind::Variable));
+        // ...but regex-only configurations check them against the regexes:
+        // the user's patterns are the entire policy.
+        let regexes = [CompiledRegex::new("^[a-z]+$").unwrap()];
+        let regex_only = KindPatterns {
+            styles: &[],
+            regexes: &regexes,
+        };
+        assert!(!should_skip_name(
+            "\u{03b1}",
+            SymbolKind::Variable,
+            regex_only
+        ));
+        assert!(!matches_patterns("\u{e9}Bad", regex_only));
+        // Combined style+regex configurations also check non-ASCII names —
+        // the regexes may exist precisely to govern Unicode identifiers, and
+        // the ASCII styles never match them.
+        let styles = [ObjectNameStyle::SnakeCase];
+        let combined = KindPatterns {
+            styles: &styles,
+            regexes: &regexes,
+        };
+        assert!(!should_skip_name(
+            "\u{e9}Bad",
+            SymbolKind::Variable,
+            combined
+        ));
+        assert!(!matches_patterns("\u{e9}Bad", combined));
     }
 }

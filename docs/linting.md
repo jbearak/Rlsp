@@ -33,13 +33,14 @@ To change the line-length threshold or pick a different naming scheme:
 {
   "raven.linting.enabled": true,
   "raven.linting.lineLength": 120,
-  "raven.linting.objectNameStyleFunction": "camelCase",
+  "raven.linting.objectNameStyleFunction": ["snake_case", "camelCase"],
   "raven.linting.objectNameStyleVariable": "snake_case",
-  "raven.linting.objectNameStyleArgument": "any"
+  "raven.linting.objectNameStyleArgument": [],
+  "raven.linting.objectNameRegexesArgument": ["^\\.?(x|y)$"]
 }
 ```
 
-Setting an `objectNameStyle*` to `"any"` disables the check for that symbol kind while leaving the other two active. Setting `raven.linting.objectNameSeverity` to `"off"` disables the rule entirely.
+Each `objectNameStyle*` accepts either a single style string or an array of styles. A name passes when it matches any named style for that kind or any regex in the matching `objectNameRegexes*` setting. Setting an `objectNameStyle*` to `"any"` (or including `"any"` in the array) disables the check for that symbol kind and ignores regexes for that kind while leaving the other two active. An explicit empty style array with regexes is regex-only mode; empty styles and empty regexes together disable that kind. Setting `raven.linting.objectNameSeverity` to `"off"` disables the rule entirely.
 
 Lint diagnostics carry the `source` field `raven (lint)`, so they're easy to filter from Raven's other diagnostics in the Problems pane.
 
@@ -134,10 +135,12 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 ### Object names
 
-- **Raven:** `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument` (each defaults to `"snake_case"`), `raven.linting.objectNameSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::object_name_linter(styles = ...)`.
-- Each kind accepts `"snake_case"`, `"camelCase"`, `"dotted.case"`, `"UPPER_CASE"`, `"lowercase"`, or `"any"` (disable that kind).
-- Carve-outs: an optional leading `.` is always valid, but the rest of the name must still match the configured style (so `.helper` is fine under `snake_case`, but `.onLoad` is not — pick `camelCase` for that kind, or suppress it); S3-method names of the form `<known-base-generic>.<class>` (e.g. `print.MyClass`, `as.Date.character`) are exempt; backtick-quoted names and non-ASCII identifiers are skipped.
+- **Raven:** `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument` (each defaults to `"snake_case"`), `raven.linting.objectNameRegexesFunction`, `raven.linting.objectNameRegexesVariable`, `raven.linting.objectNameRegexesArgument` (each defaults to `[]`), `raven.linting.objectNameSeverity` (default `"information"`).
+- **`lintr` equivalent:** `lintr::object_name_linter(styles = ..., regexes = ...)`.
+- Each style key accepts `"snake_case"`, `"camelCase"`, `"dotted.case"`, `"UPPER_CASE"`, `"lowercase"`, `"any"` (disable that kind and ignore its regexes), or an array of those styles. Multiple styles are ORed. A name also passes if it matches any regex for that kind.
+- Regexes are Rust regexes applied as partial matches against the full identifier, including any leading `.`. Use anchors such as `^...$` when you need the whole name to match. Rust's regex engine does not support PCRE lookaround such as `(?=...)`; unsupported patterns are warned about and skipped (for the settings/`raven.toml` path the warning goes to the server log; a `.lintr` file surfaces a visible warning notification). Empty regex strings are rejected because they would match every identifier. If regex-only mode supplies regexes but none are valid, Raven retains the default named style instead of silently disabling the check (in `.lintr` the invalid call still clears editor-level regexes, since it stated the project's regex policy).
+- An explicit empty style array with regexes is regex-only mode. If both the style array and regex array are empty, that kind's object-name check is disabled. A style value with no recognized style names is warned about and treated as empty: with valid regexes configured the kind becomes regex-only, with no regex setting at all it is disabled, and if the regex setting is present but contains no valid patterns the default style is restored rather than silently disabling the check.
+- Carve-outs: named styles always allow an optional leading `.`, but the rest of the name must still match the configured style (so `.helper` is fine under `snake_case`, but `.onLoad` is not — pick `camelCase`, add a regex for that kind, or suppress it); S3-method names of the form `<known-base-generic>.<class>` (e.g. `print.MyClass`, `as.Date.character`) are exempt; backtick-quoted names are skipped. Non-ASCII identifiers are skipped when no regexes are configured for that kind; when regexes are configured (regex-only or combined with styles), non-ASCII names are checked against the regexes — the named ASCII styles never match them.
 
 ### Infix spaces
 
@@ -227,7 +230,7 @@ The recommended path is to configure Raven via `raven.toml` at the project root 
 | `whitespace_linter()` (no-tab portion) | `raven.linting.noTabSeverity` |
 | `trailing_blank_lines_linter()` | `raven.linting.trailingBlankLinesSeverity` |
 | `assignment_linter()` | `raven.linting.assignmentOperator`, `raven.linting.assignmentOperatorSeverity` |
-| `object_name_linter(styles = c("snake_case"))` | `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument`, `raven.linting.objectNameSeverity` |
+| `object_name_linter(styles = c("snake_case"), regexes = c("^x$"))` | `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument`, `raven.linting.objectNameRegexesFunction`, `raven.linting.objectNameRegexesVariable`, `raven.linting.objectNameRegexesArgument`, `raven.linting.objectNameSeverity` |
 | `infix_spaces_linter()` | `raven.linting.infixSpacesSeverity` |
 | `commented_code_linter()` | `raven.linting.commentedCodeSeverity` |
 | `quotes_linter()` / `single_quotes_linter()` | `raven.linting.stringDelimiter`, `raven.linting.quotesSeverity` |
@@ -243,7 +246,7 @@ The recommended path is to configure Raven via `raven.toml` at the project root 
 
 Numeric-argument linters accept both the named and the first-positional form: `line_length_linter(80)` and `line_length_linter(length = 80)` are equivalent, as are `object_length_linter(40)` / `object_length_linter(length = 40)` and `indentation_linter(4)` / `indentation_linter(indent = 4)`.
 
-`object_name_linter` accepts a **single** style name — positionally or via `styles =`, as a scalar or a one-element vector (e.g. `object_name_linter("camelCase")`, `object_name_linter(styles = c("snake_case"))`) — applied to functions, variables, and arguments. Style names must be one of `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any`. Forms Raven cannot represent — a raw regex style, or a multi-style vector such as `c("snake_case", "camelCase")` (which `lintr` treats as "matches any of these") — are reported in the batch warning and otherwise ignored, leaving the default `snake_case` checks in place. (`object_name_linter`'s `regexes =` argument is likewise unsupported; it is ignored.)
+`object_name_linter` accepts styles positionally or via `styles =`, as a scalar or a `c(...)` vector (e.g. `object_name_linter("camelCase")`, `object_name_linter(styles = c("snake_case", "camelCase"))`) and applies them to functions, variables, and arguments. Known style names (`snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, `any`) map to the three style arrays and are ORed. Regexes may be named (`regexes =`) or passed as the second positional argument, as a scalar or vector; names on vector entries (such as `c(public = "^[a-z]")`) are diagnostic labels and do not change the patterns. Matching `lintr`, explicitly supplying `regexes` **replaces** the default styles (regex-only mode) unless `styles` is also explicitly supplied — specify both to combine them. R string escapes are processed, so `"^\\.on[A-Z]"` means the regex `^\.on[A-Z]`; R raw strings (`r"(^\.on[A-Z])"`) are also supported and taken verbatim. R's numeric escapes (octal `"\056"`, hex `"\x2e"`, unicode `"\u{2e}"`) also decode with R semantics before the pattern reaches the regex engine; escape sequences R itself rejects (such as a bare `"\d"` — write `"\\d"`) are warned about as unrecognized. `lintr` styles Raven has no equivalent for (`symbols`, `CamelCase`, `UPPERCASE`, `SNAKE_CASE`) are warned about and skipped, as are case/punctuation typos of Raven's style names (with a did-you-mean hint); any other unknown non-empty `styles` element is treated leniently as a regex, a Raven extension over `lintr`. Empty style elements are still unrecognized because an empty regex would match every identifier. An explicit empty vector (`styles = c()`, `styles = character()`, or `character(0)`) maps to empty style arrays — regex-only mode when regexes are also given, otherwise "check disabled". Whenever a call states a pattern policy it states the regex policy too: a styles-only call (including the empty-vector forms) or any call with a `regexes` argument — even one whose patterns were all rejected — emits regex arrays (the accepted patterns, or `[]`), so editor-level `objectNameRegexes*` values are cleared rather than silently ORed in.
 
 To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"information"` to `"warning"`.
 

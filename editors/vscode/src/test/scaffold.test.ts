@@ -4,6 +4,8 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { parseTree } from 'jsonc-parser';
+import { activate } from './helper';
 import {
     GITIGNORE_TEMPLATE,
     LINTING_SENTINEL_BEGIN,
@@ -14,9 +16,8 @@ import {
     detectExistingLintingKeys,
     detectUserManagedLintingKeys,
     isProjectScopedLintingSettingKey,
+    renderRavenToml,
 } from '../scaffold';
-import { renderRavenToml } from '../extension';
-import { activate } from './helper';
 
 declare const suite: Mocha.SuiteFunction;
 declare const test: Mocha.TestFunction;
@@ -372,6 +373,27 @@ suite('scaffold linting-settings merge', () => {
         assert.strictEqual(buildLintingSettingsContent('[1, 2, 3]'), null);
     });
 
+    test('absorbs an inline block comment between an array value and its comma', () => {
+        // Removing `"key": [..] /* note */,` must not orphan the comment and
+        // comma as invalid JSONC; the comma scan skips block comments, and
+        // the final revalidation would refuse the merge if it ever did.
+        const existing = `{
+  "raven.linting.objectNameRegexesFunction": ["^x$"] /* note */,
+  "editor.tabSize": 4
+}
+`;
+        const merged = buildLintingSettingsContent(existing);
+        assert.ok(merged !== null, 'the merge must succeed for this layout');
+        const errors: import('jsonc-parser').ParseError[] = [];
+        parseTree(merged, errors, { allowTrailingComma: true });
+        assert.strictEqual(errors.length, 0, `merged output must be valid JSONC:\n${merged}`);
+        assert.ok(merged.includes('"editor.tabSize": 4'), 'unrelated keys survive');
+        assert.ok(
+            !/\/\* note \*\/\s*,/.test(merged.replace(/"raven\.linting\.[^"]+": [^\n]*/g, '')),
+            `no orphaned comment+comma:\n${merged}`,
+        );
+    });
+
     test('returns null for a parse-error file', () => {
         assert.strictEqual(buildLintingSettingsContent('{ this is not json'), null);
     });
@@ -489,9 +511,10 @@ suite('scaffold linting-settings merge', () => {
     });
 
     test('returns null when a raven.linting.* key has a non-scalar (object) value', () => {
-        // raven.linting.* values are scalars; an object value would span
-        // multiple lines, and the line-based stripper can't safely delete
-        // a multi-line value. We refuse to merge instead.
+        // raven.linting.* values are scalars, except the object-name style and
+        // regex settings which allow arrays of scalars. An object value is
+        // outside the declared settings surface. We refuse to merge rather
+        // than erase something that may be user-managed structure.
         const existing = `{
   "raven.linting.foo": {
     "nested": 1
@@ -501,9 +524,38 @@ suite('scaffold linting-settings merge', () => {
         assert.strictEqual(buildLintingSettingsContent(existing), null);
     });
 
-    test('returns null when a raven.linting.* key has a non-scalar (array) value', () => {
+    test('removes array-valued object-name linting keys when merging', () => {
         const existing = `{
-  "raven.linting.bar": [1, 2, 3]
+  "raven.linting.objectNameStyleFunction": ["snake_case", "camelCase"],
+  "raven.linting.objectNameRegexesFunction": ["^x$"]
+}
+`;
+        const merged = mergeOrThrow(existing);
+        assert.ok(
+            merged.includes('"raven.linting.objectNameStyleFunction": ["snake_case"]'),
+            `expected scaffold array defaults in merged output; got:\n${merged}`,
+        );
+        assert.ok(
+            merged.includes('"raven.linting.objectNameRegexesFunction": []'),
+            `expected scaffold regex array defaults in merged output; got:\n${merged}`,
+        );
+        assert.ok(
+            !merged.includes('["snake_case", "camelCase"]') && !merged.includes('"^x$"'),
+            `expected user-managed arrays to be replaced; got:\n${merged}`,
+        );
+    });
+
+    test('returns null when a scalar-only raven.linting.* key has an array value', () => {
+        const existing = `{
+  "raven.linting.lineLength": [120]
+}
+`;
+        assert.strictEqual(buildLintingSettingsContent(existing), null);
+    });
+
+    test('returns null when a raven.linting.* array contains a structured value', () => {
+        const existing = `{
+  "raven.linting.objectNameRegexesFunction": [{ "pattern": "^x$" }]
 }
 `;
         assert.strictEqual(buildLintingSettingsContent(existing), null);
@@ -665,12 +717,14 @@ suite('detectExistingLintingKeys', () => {
   "editor.tabSize": 2,
   "raven.linting.enabled": true,
   "raven.linting.lineLength": 120,
+  "raven.linting.objectNameRegexesFunction": ["^x$"],
   "raven.crossFile.indexWorkspace": true
 }`;
         const keys = (detectExistingLintingKeys(text) ?? []).sort();
         assert.deepStrictEqual(keys, [
             'raven.linting.enabled',
             'raven.linting.lineLength',
+            'raven.linting.objectNameRegexesFunction',
         ]);
     });
 
