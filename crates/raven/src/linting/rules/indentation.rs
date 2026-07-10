@@ -10,9 +10,9 @@
 //! `InfixContinuationStyle::Indented`; in that mode the deliberate
 //! differences are all lenient (Raven additionally accepts the
 //! aligned-argument style, the block form where lintr demands hanging/double
-//! indents, and the chain-start column the on-type formatter produces — so
-//! Raven never flags code those styles produce, while every primary
-//! expectation matches lintr's).
+//! indents, and — only when deeper than the block indent — the chain-start
+//! column the on-type formatter produces, so Raven never flags code those
+//! styles produce, while every primary expectation matches lintr's).
 //!
 //! `InfixContinuationStyle` (Raven-specific, no lintr equivalent) changes how
 //! end-of-line infix-operator continuations are judged: `Aligned` requires
