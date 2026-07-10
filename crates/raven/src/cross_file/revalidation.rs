@@ -14,53 +14,15 @@ use tower_lsp::lsp_types::Url;
 use super::dependency::DependencyGraph;
 use super::types::CrossFileMetadata;
 
-/// A pending revalidation entry: the scheduling generation, the trigger
-/// freshness the task was scheduled for, and its cancellation token.
-#[derive(Debug)]
-struct PendingRevalidation {
-    generation: u64,
-    trigger_version: Option<i32>,
-    trigger_revision: Option<u64>,
-    token: CancellationToken,
-}
-
 /// Tracks pending revalidation work per file
 #[derive(Debug, Default)]
 pub struct CrossFileRevalidationState {
     /// Pending revalidation tasks keyed by URI, tagged with the generation
     /// returned by `schedule` so `complete` can tell its own entry from a
     /// successor's.
-    pending: RwLock<HashMap<Url, PendingRevalidation>>,
+    pending: RwLock<HashMap<Url, (u64, CancellationToken)>>,
     /// Monotonic generation counter for `schedule`.
     next_generation: AtomicU64,
-}
-
-/// Whether the incumbent trigger is unambiguously strictly newer than the
-/// candidate. Only comparable triggers decline a schedule: both versions must
-/// be `Some` (versions are client-owned and monotonic within one open epoch;
-/// `did_close` removes the pending entry, so cross-epoch comparisons cannot
-/// arise), and a version tie falls back to the revision when both are `Some`.
-/// Anything ambiguous — a `None` on either side, or a full tie — compares as
-/// not-newer, preserving supersede-by-default.
-fn incumbent_strictly_newer(
-    incumbent: (Option<i32>, Option<u64>),
-    candidate: (Option<i32>, Option<u64>),
-) -> bool {
-    match (incumbent.0, candidate.0) {
-        (Some(incumbent_version), Some(candidate_version)) => {
-            if incumbent_version != candidate_version {
-                incumbent_version > candidate_version
-            } else {
-                match (incumbent.1, candidate.1) {
-                    (Some(incumbent_revision), Some(candidate_revision)) => {
-                        incumbent_revision > candidate_revision
-                    }
-                    _ => false,
-                }
-            }
-        }
-        _ => false,
-    }
 }
 
 impl CrossFileRevalidationState {
@@ -69,50 +31,27 @@ impl CrossFileRevalidationState {
     }
 
     /// Schedule revalidation for a file, superseding (cancelling) any pending
-    /// work — unless the incumbent's trigger is strictly newer than the
-    /// candidate's, in which case the candidate is declined and `None` is
-    /// returned (the caller must exit without touching the diagnostics gate).
+    /// work. Returns the new task's generation and cancellation token.
     ///
-    /// The trigger ordering exists because spawned workers are not polled in
-    /// spawn order: a worker carrying an older trigger (a starved edit
-    /// worker, or a respawned backstop that captured its trigger before an
-    /// intervening edit) could otherwise cancel a strictly fresher pending
-    /// worker and then exit on its own freshness check, leaving the newest
-    /// version unpublished until the next trigger. Ties supersede, so a
-    /// respawned consumer still replaces a same-trigger successor.
-    ///
-    /// Returns the new task's generation and cancellation token.
-    pub fn schedule(
-        &self,
-        uri: Url,
-        trigger_version: Option<i32>,
-        trigger_revision: Option<u64>,
-    ) -> Option<(u64, CancellationToken)> {
-        let mut pending = self.pending.write().unwrap();
-        if let Some(existing) = pending.get(&uri)
-            && incumbent_strictly_newer(
-                (existing.trigger_version, existing.trigger_revision),
-                (trigger_version, trigger_revision),
-            )
-        {
-            return None;
-        }
+    /// Callers must gate this on the trigger-matches-current check (see
+    /// `run_debounced_diagnostics`): a worker whose trigger no longer equals
+    /// the document's current `(version, revision)` — a starved edit worker,
+    /// a respawned backstop that captured its trigger before an intervening
+    /// edit, or a worker spawned in a previous open epoch — must exit without
+    /// scheduling. Spawned workers are not polled in spawn order, so an
+    /// unconditional schedule would let such a worker cancel a strictly
+    /// fresher pending worker, then die on its own freshness check, leaving
+    /// the newest version unpublished until the next trigger.
+    pub fn schedule(&self, uri: Url) -> (u64, CancellationToken) {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let mut pending = self.pending.write().unwrap();
         // Cancel existing pending work for this URI
-        if let Some(old) = pending.remove(&uri) {
-            old.token.cancel();
+        if let Some((_, old_token)) = pending.remove(&uri) {
+            old_token.cancel();
         }
         let token = CancellationToken::new();
-        pending.insert(
-            uri,
-            PendingRevalidation {
-                generation,
-                trigger_version,
-                trigger_revision,
-                token: token.clone(),
-            },
-        );
-        Some((generation, token))
+        pending.insert(uri, (generation, token.clone()));
+        (generation, token)
     }
 
     /// Mark revalidation as complete.
@@ -126,7 +65,7 @@ impl CrossFileRevalidationState {
     /// re-check closes.
     pub fn complete(&self, uri: &Url, generation: u64) {
         let mut pending = self.pending.write().unwrap();
-        if pending.get(uri).map(|p| p.generation) == Some(generation) {
+        if pending.get(uri).map(|(g, _)| *g) == Some(generation) {
             pending.remove(uri);
         }
     }
@@ -134,16 +73,16 @@ impl CrossFileRevalidationState {
     /// Cancel pending revalidation for a URI
     pub fn cancel(&self, uri: &Url) {
         let mut pending = self.pending.write().unwrap();
-        if let Some(entry) = pending.remove(uri) {
-            entry.token.cancel();
+        if let Some((_, token)) = pending.remove(uri) {
+            token.cancel();
         }
     }
 
     /// Cancel all pending revalidations
     pub fn cancel_all(&self) {
         let mut pending = self.pending.write().unwrap();
-        for (_, entry) in pending.drain() {
-            entry.token.cancel();
+        for (_, (_, token)) in pending.drain() {
+            token.cancel();
         }
     }
 }
@@ -653,7 +592,7 @@ mod tests {
     fn test_revalidation_schedule_returns_token() {
         let state = CrossFileRevalidationState::new();
         let uri = test_uri("test.R");
-        let (_, token) = state.schedule(uri, None, None).unwrap();
+        let (_, token) = state.schedule(uri);
         assert!(!token.is_cancelled());
     }
 
@@ -662,8 +601,8 @@ mod tests {
         let state = CrossFileRevalidationState::new();
         let uri = test_uri("test.R");
 
-        let (_, token1) = state.schedule(uri.clone(), None, None).unwrap();
-        let (_, token2) = state.schedule(uri, None, None).unwrap();
+        let (_, token1) = state.schedule(uri.clone());
+        let (_, token2) = state.schedule(uri);
 
         assert!(token1.is_cancelled());
         assert!(!token2.is_cancelled());
@@ -674,11 +613,11 @@ mod tests {
         let state = CrossFileRevalidationState::new();
         let uri = test_uri("test.R");
 
-        let (generation, _token) = state.schedule(uri.clone(), None, None).unwrap();
+        let (generation, _token) = state.schedule(uri.clone());
         state.complete(&uri, generation);
 
         // Scheduling again should not cancel anything (no previous pending)
-        let (_, token2) = state.schedule(uri, None, None).unwrap();
+        let (_, token2) = state.schedule(uri);
         assert!(!token2.is_cancelled());
     }
 
@@ -687,8 +626,8 @@ mod tests {
         let state = CrossFileRevalidationState::new();
         let uri = test_uri("test.R");
 
-        let (gen1, token1) = state.schedule(uri.clone(), None, None).unwrap();
-        let (_, token2) = state.schedule(uri.clone(), None, None).unwrap();
+        let (gen1, token1) = state.schedule(uri.clone());
+        let (_, token2) = state.schedule(uri.clone());
         assert!(token1.is_cancelled());
 
         // A superseded task's complete must not evict the successor's entry:
@@ -703,40 +642,11 @@ mod tests {
         let state = CrossFileRevalidationState::new();
         let uri = test_uri("test.R");
 
-        let (_, token) = state.schedule(uri.clone(), None, None).unwrap();
+        let (_, token) = state.schedule(uri.clone());
         assert!(!token.is_cancelled());
 
         state.cancel(&uri);
         assert!(token.is_cancelled());
-    }
-
-    #[test]
-    fn test_revalidation_schedule_declines_older_trigger() {
-        let state = CrossFileRevalidationState::new();
-        let uri = test_uri("test.R");
-
-        let (_, token_v3) = state.schedule(uri.clone(), Some(3), Some(0)).unwrap();
-
-        // A strictly older trigger must not supersede a fresher incumbent.
-        assert!(state.schedule(uri.clone(), Some(2), Some(0)).is_none());
-        assert!(!token_v3.is_cancelled());
-
-        // A tie supersedes (e.g. a respawned consumer replacing its
-        // same-trigger successor).
-        let (_, token_tie) = state.schedule(uri.clone(), Some(3), Some(0)).unwrap();
-        assert!(token_v3.is_cancelled());
-
-        // Same version, strictly newer revision supersedes; older declines.
-        let (_, token_r5) = state.schedule(uri.clone(), Some(3), Some(5)).unwrap();
-        assert!(token_tie.is_cancelled());
-        assert!(state.schedule(uri.clone(), Some(3), Some(4)).is_none());
-        assert!(!token_r5.is_cancelled());
-
-        // Ambiguous triggers (None on either side) preserve supersede-by-default.
-        let (_, token_none) = state.schedule(uri.clone(), None, None).unwrap();
-        assert!(token_r5.is_cancelled());
-        let (_, _token_v1) = state.schedule(uri, Some(1), Some(0)).unwrap();
-        assert!(token_none.is_cancelled());
     }
 
     #[test]
@@ -745,8 +655,8 @@ mod tests {
         let uri1 = test_uri("test1.R");
         let uri2 = test_uri("test2.R");
 
-        let (_, token1) = state.schedule(uri1, None, None).unwrap();
-        let (_, token2) = state.schedule(uri2, None, None).unwrap();
+        let (_, token1) = state.schedule(uri1);
+        let (_, token2) = state.schedule(uri2);
 
         state.cancel_all();
 

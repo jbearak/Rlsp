@@ -4234,11 +4234,12 @@ static CLOSE_RESYNC_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::co
 /// extra — or one gate-skipped — same-version republish of already-current
 /// diagnostics, bounded by `MAX_FORCE_REPUBLISH`; monotonicity is never
 /// violated. Trigger-scoped accounting would be a gate redesign, out of
-/// scope here. (Trigger-ordered scheduling narrows the class: `schedule`
-/// declines a candidate whose trigger is strictly older than the pending
-/// incumbent's, so a late-polled or respawned worker can no longer cancel a
-/// strictly fresher pending worker — see
-/// `CrossFileRevalidationState::schedule`.)
+/// scope here. (The schedule-time freshness guard narrows the class: a
+/// worker only registers with `CrossFileRevalidationState::schedule` when
+/// its trigger still equals the document's current `(version, revision)`,
+/// so a late-polled, respawned, or dead-epoch worker exits without
+/// cancelling a strictly fresher pending worker — see the guard in
+/// `run_debounced_diagnostics`.)
 #[allow(clippy::too_many_arguments)]
 async fn run_close_resync(
     state_arc: Arc<RwLock<WorldState>>,
@@ -4885,19 +4886,29 @@ async fn run_debounced_diagnostics(
     trigger_revision: Option<u64>,
     traversal_truncation: Option<Arc<TraversalTruncationState>>,
 ) {
-    // Schedule with cancellation token; a decline means a strictly fresher
-    // worker is already pending and this task's trigger is obsolete.
+    // Schedule with cancellation token, gated on the trigger still matching
+    // the document's current (version, revision) under the same read lock.
+    // A mismatched worker is already obsolete (a newer edit's worker owns
+    // the current state) or belongs to a dead open epoch (spawned before a
+    // close+reopen reset the version, which did_close's cancel cannot reach
+    // because the worker had not scheduled yet). Letting it schedule anyway
+    // would cancel a strictly fresher pending worker and then die on the
+    // same freshness comparison after the debounce, leaving the newest
+    // version unpublished until the next trigger.
     let scheduled = {
         let state = state_arc.read().await;
-        state.cross_file_revalidation.schedule(
-            affected_uri.clone(),
-            trigger_version,
-            trigger_revision,
-        )
+        let doc = state.documents.get(&affected_uri);
+        let current_version = doc.and_then(|d| d.version);
+        let current_revision = doc.map(|d| d.revision);
+        if current_version != trigger_version || current_revision != trigger_revision {
+            None
+        } else {
+            Some(state.cross_file_revalidation.schedule(affected_uri.clone()))
+        }
     };
     let Some((generation, token)) = scheduled else {
         log::trace!(
-            "Skipping diagnostics for {}: a fresher revalidation is pending",
+            "Skipping diagnostics for {}: trigger is stale at schedule time",
             affected_uri
         );
         return;
