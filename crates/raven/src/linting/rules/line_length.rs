@@ -1,6 +1,8 @@
 //! Flag lines wider than the configured maximum.
 //!
-//! Width is measured in UTF-16 code units to align with LSP positions. Tabs
+//! Width is measured in characters (Unicode scalar values), matching lintr's
+//! `nchar()` — an emoji counts as 1 even though it spans two UTF-16 units in
+//! LSP positions. Tabs
 //! count as one unit, matching `lintr::line_length_linter`'s convention.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
@@ -25,19 +27,33 @@ pub(crate) fn collect(
         // `strip_leading_bom_for_scan`). Only line 0 can carry a BOM; a later
         // U+FEFF is a zero-width no-break space that must still count, so the
         // guard is load-bearing, not defensive. Issue #346.
-        let line = if line_no == 0 {
-            crate::utf16::strip_leading_bom_for_scan(line)
+        let (line, bom_utf16) = if line_no == 0 {
+            let stripped = crate::utf16::strip_leading_bom_for_scan(line);
+            // LSP positions include the BOM character (one UTF-16 unit), even
+            // though it doesn't count toward the width.
+            let offset = if stripped.len() != line.len() { 1 } else { 0 };
+            (stripped, offset)
         } else {
-            line
+            (line, 0)
         };
-        let width: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
+        let width: u32 = line.chars().count() as u32;
         if width <= max_len {
             continue;
         }
+        // Width is measured in characters (lintr parity), but LSP ranges are
+        // UTF-16 code units — convert the char positions so the underline
+        // starts at the limit and never splits a surrogate pair.
+        let start_utf16: u32 = bom_utf16
+            + line
+                .chars()
+                .take(max_len as usize)
+                .map(|c| c.len_utf16() as u32)
+                .sum::<u32>();
+        let end_utf16: u32 = bom_utf16 + line.chars().map(|c| c.len_utf16() as u32).sum::<u32>();
         out.push(Diagnostic {
             range: Range {
-                start: Position::new(line_no, max_len),
-                end: Position::new(line_no, width),
+                start: Position::new(line_no, start_utf16),
+                end: Position::new(line_no, end_utf16),
             },
             severity: Some(severity),
             source: Some(LINT_SOURCE.to_string()),
@@ -51,6 +67,26 @@ pub(crate) fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_columns_are_utf16_even_though_width_is_characters() {
+        // Three emoji: width 3 chars (limit 2 → flagged), but the LSP range
+        // must be in UTF-16 units (2 per emoji) so it never splits a
+        // surrogate pair: start after 2 chars = 4 units, end = 6 units.
+        let suppressions = Suppressions::from_text("\u{1F600}\u{1F600}\u{1F600}\n");
+        let mut out = Vec::new();
+        collect(
+            "\u{1F600}\u{1F600}\u{1F600}\n",
+            2,
+            DiagnosticSeverity::INFORMATION,
+            &suppressions,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert_eq!(out[0].range.start.character, 4);
+        assert_eq!(out[0].range.end.character, 6);
+        assert!(out[0].message.contains("3 characters"));
+    }
 
     fn widths(text: &str, max_len: u32) -> Vec<u32> {
         let suppressions = Suppressions::from_text(text);
@@ -87,7 +123,21 @@ mod tests {
 
     #[test]
     fn leading_bom_first_line_over_limit_reports_bomless_width() {
-        // "abcde" past the BOM is 5 chars; the reported width excludes the BOM.
-        assert_eq!(widths("\u{FEFF}abcde\n", 4), vec![5]);
+        // "abcde" past the BOM is 5 chars; the reported *width* excludes the
+        // BOM, while the LSP range includes its one UTF-16 unit (positions
+        // index the buffer as the client sees it).
+        let suppressions = Suppressions::from_text("\u{FEFF}abcde\n");
+        let mut out = Vec::new();
+        collect(
+            "\u{FEFF}abcde\n",
+            4,
+            DiagnosticSeverity::INFORMATION,
+            &suppressions,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert!(out[0].message.contains("5 characters"), "{:?}", out[0]);
+        assert_eq!(out[0].range.start.character, 5); // BOM + 4 chars
+        assert_eq!(out[0].range.end.character, 6);
     }
 }

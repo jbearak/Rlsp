@@ -1395,14 +1395,14 @@ fn emit_object_name_list(
 
 /// lintr style names Raven has no equivalent named style for. These are valid
 /// `object_name_linter(styles = ...)` values in lintr, so they must not fall
-/// through to the treat-as-regex leniency: compiling e.g. `"symbols"` as a
+/// through to the treat-as-regex leniency: compiling e.g. `"CamelCase"` as a
 /// literal regex silently scrambles which names pass. (lintr's full style set
 /// is `snake_case`, `symbols`, `camelCase`, `CamelCase`, `dotted.case`,
 /// `lowercase`, `UPPERCASE`, `SNAKE_CASE`; Raven's is
 /// [`crate::linting::ObjectNameStyle`]. `UPPERCASE`/`SNAKE_CASE` are *not*
 /// mapped to Raven's `UPPER_CASE` because their accepted-character sets
 /// differ.)
-const LINTR_ONLY_STYLE_NAMES: &[&str] = &["symbols", "CamelCase", "UPPERCASE", "SNAKE_CASE"];
+const LINTR_ONLY_STYLE_NAMES: &[&str] = &["CamelCase", "UPPERCASE", "SNAKE_CASE"];
 
 /// If `value` is a lintr-valid style Raven can't express, or a near-miss
 /// casing of a Raven style name, push a user-visible warning and return
@@ -2187,7 +2187,10 @@ mod tests {
         let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
         assert_eq!(
             cfg.object_name_style_function,
-            vec![crate::linting::ObjectNameStyle::SnakeCase]
+            vec![
+                crate::linting::ObjectNameStyle::SnakeCase,
+                crate::linting::ObjectNameStyle::Symbols
+            ]
         );
         assert!(cfg.object_name_regexes_function.is_empty());
     }
@@ -2208,7 +2211,10 @@ mod tests {
         let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
         assert_eq!(
             cfg.object_name_style_function,
-            vec![crate::linting::ObjectNameStyle::SnakeCase]
+            vec![
+                crate::linting::ObjectNameStyle::SnakeCase,
+                crate::linting::ObjectNameStyle::Symbols
+            ]
         );
         assert!(cfg.object_name_regexes_function.is_empty());
     }
@@ -2601,11 +2607,24 @@ mod tests {
     }
 
     #[test]
+    fn object_name_symbols_style_is_supported() {
+        // lintr's default styles are c("snake_case", "symbols"); both map.
+        let out = load_str(
+            "linters: linters_with_defaults(object_name_linter(c(\"snake_case\", \"symbols\")))\n",
+        );
+        assert_eq!(
+            out.settings["linting"]["objectNameStyleFunction"],
+            json!(["snake_case", "symbols"])
+        );
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
     fn object_name_lintr_only_styles_warn_and_skip() {
-        // "symbols" (and CamelCase/UPPERCASE/SNAKE_CASE) are valid lintr
-        // styles with no Raven equivalent: they must not be misread as
-        // regexes. A lone unsupported style leaves the defaults in place.
-        let out = load_str("linters: linters_with_defaults(object_name_linter(\"symbols\"))\n");
+        // CamelCase/UPPERCASE/SNAKE_CASE are valid lintr styles with no Raven
+        // equivalent: they must not be misread as regexes. A lone unsupported
+        // style leaves the defaults in place.
+        let out = load_str("linters: linters_with_defaults(object_name_linter(\"UPPERCASE\"))\n");
         assert!(!mapped_object_name_style(&out));
         assert!(
             out.settings["linting"]
@@ -2615,7 +2634,7 @@ mod tests {
         assert!(
             out.warnings
                 .iter()
-                .any(|w| w.contains("'symbols'") && w.contains("no Raven equivalent")),
+                .any(|w| w.contains("'UPPERCASE'") && w.contains("no Raven equivalent")),
             "{:?}",
             out.warnings
         );
@@ -2845,7 +2864,10 @@ mod tests {
         let cfg = crate::backend::parse_lint_config(&out.settings, true).unwrap();
         assert_eq!(
             cfg.object_name_style_function,
-            vec![crate::linting::ObjectNameStyle::SnakeCase]
+            vec![
+                crate::linting::ObjectNameStyle::SnakeCase,
+                crate::linting::ObjectNameStyle::Symbols
+            ]
         );
     }
 

@@ -14,6 +14,7 @@ export type ObjectNameStyle =
     | "dotted.case"
     | "UPPER_CASE"
     | "lowercase"
+    | "symbols"
     | "any";
 
 export type ObjectNameStyleSetting = ObjectNameStyle | ObjectNameStyle[];
@@ -426,9 +427,9 @@ export function getInitializationOptions(
         })(),
         assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
         stringDelimiter: config.get<"\"" | "'">('linting.stringDelimiter', '"'),
-        objectNameStyleFunction: config.get<ObjectNameStyleSetting>('linting.objectNameStyleFunction', 'snake_case'),
-        objectNameStyleVariable: config.get<ObjectNameStyleSetting>('linting.objectNameStyleVariable', 'snake_case'),
-        objectNameStyleArgument: config.get<ObjectNameStyleSetting>('linting.objectNameStyleArgument', 'snake_case'),
+        objectNameStyleFunction: config.get<ObjectNameStyleSetting>('linting.objectNameStyleFunction', ['snake_case', 'symbols']),
+        objectNameStyleVariable: config.get<ObjectNameStyleSetting>('linting.objectNameStyleVariable', ['snake_case', 'symbols']),
+        objectNameStyleArgument: config.get<ObjectNameStyleSetting>('linting.objectNameStyleArgument', ['snake_case', 'symbols']),
         objectNameRegexesFunction: config.get<string[]>('linting.objectNameRegexesFunction', []),
         objectNameRegexesVariable: config.get<string[]>('linting.objectNameRegexesVariable', []),
         objectNameRegexesArgument: config.get<string[]>('linting.objectNameRegexesArgument', []),

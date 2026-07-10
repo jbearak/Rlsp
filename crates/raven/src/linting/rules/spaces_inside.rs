@@ -2,17 +2,26 @@
 //!
 //! Mirrors `lintr::spaces_inside_linter`. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`
 //! all have stray space against the brackets. The community convention is
-//! tight: `f(x)`, `df[1]`, `mat[[i]]`. Truly empty groupings (`f()`, `mat[]`)
-//! pass, while whitespace-only single-line groupings (`f( )`, `mat[ ]`) are
-//! flagged on both sides, matching lintr.
-//! For `subset` and `subset2` only, a trailing comma that marks an omitted
-//! dimension keeps its before-close space (`x[i, ]`, `x[[i, ]]`) so this rule
-//! does not conflict with `commas_linter`; `call` nodes such as `f(a, )` are
-//! intentionally not carved out, keeping the exception scoped to R subsetting.
+//! tight: `f(x)`, `df[1]`, `mat[[i]]`. Whitespace-only groupings like `f( )`
+//! or `x[ ]` are flagged on both sides, as in lintr (`f()` is of course
+//! fine, and a multi-line `f(\n)` is too).
 //!
-//! Applies to calls, subsetting, parenthesized expressions, formal parameter
-//! lists, and control-flow conditions. The `open` and `close` field positions
-//! anchor the check.
+//! Exemptions, matching lintr:
+//! * A comma before the closer is exempt everywhere — `x[i, ]`, `x[[i, ]]`,
+//!   and `f(a, )` — so this rule never fights `commas_linter`.
+//! * A value-less named argument's `=` before a `)` is exempt
+//!   (`alist(missing_arg = )`); lintr scopes this to parentheses only, so
+//!   `x[j = ]` is still flagged.
+//! * An opener followed by a same-line comment (`or( #code`) is exempt.
+//! * Multi-line wrapping (newline in the gap) is never flagged.
+//!
+//! Applies to `call`, `subset`, `subset2`, `parenthesized_expression`,
+//! `function_definition` parameter lists (including lambdas), and the
+//! condition/clause parens of `if`/`while`/`for` — lintr's XPath matches
+//! every `(`/`[`/`[[` token. The `open` and `close` field positions anchor
+//! the check; the interior content is the gap between `open` and the first
+//! non-whitespace child, and between the last non-whitespace child and
+//! `close`.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -54,8 +63,8 @@ fn visit(
             check_bracketed(node, false, text, severity, suppressions, out);
         }
         "function_definition" => {
-            if let Some(parameters) = node.child_by_field_name("parameters") {
-                check_bracketed(parameters, false, text, severity, suppressions, out);
+            if let Some(params) = node.child_by_field_name("parameters") {
+                check_bracketed(params, false, text, severity, suppressions, out);
             }
         }
         "if_statement" | "while_statement" | "for_statement" => {
@@ -88,17 +97,14 @@ fn check_bracketed(
     if close_start <= open_end {
         return;
     }
-    // A truly empty grouping is allowed. A whitespace-only single-line
-    // grouping is not: lintr emits both after-open and before-close lints.
     let interior = match text.get(open_end..close_start) {
         Some(s) => s,
         None => return,
     };
-    if interior.is_empty() {
-        return;
-    }
+    // Whitespace-only grouping: lintr flags both sides of `f( )` / `x[ ]`.
+    // Multi-line `f(\n)` stays fine (the newline guard below).
     if interior.chars().all(|c| c.is_whitespace()) {
-        if !interior.contains('\n') {
+        if !interior.is_empty() && !interior.contains('\n') {
             let open_text = text.get(open.start_byte()..open.end_byte()).unwrap_or("");
             emit_after_open(
                 open,
@@ -138,7 +144,9 @@ fn check_bracketed(
 
     if let Some(first_rel) = first_non_ws_rel {
         let after_open = &interior[..first_rel];
-        if !after_open.is_empty() && !after_open.contains('\n') {
+        // An opener followed by a same-line comment is exempt (lintr #636).
+        let first_is_comment = interior[first_rel..].starts_with('#');
+        if !after_open.is_empty() && !after_open.contains('\n') && !first_is_comment {
             // Open bracket has *single-line* whitespace before the first
             // real token — that's the violation. Multi-line wrapping is fine.
             let open_text = text.get(open.start_byte()..open.end_byte()).unwrap_or("");
@@ -156,19 +164,24 @@ fn check_bracketed(
     if let Some(last_rel) = last_non_ws_rel {
         let before_close = &interior[last_rel..];
         if !before_close.is_empty() && !before_close.contains('\n') {
-            if is_subset
-                && close
-                    .prev_sibling()
-                    .is_some_and(|prev| prev.kind() == "comma")
-            {
-                // Accept canonical omitted-dimension subsets like `x[i, ]` so
-                // `spaces_inside` does not conflict with `commas_linter`,
-                // which flags the alternative `x[i,]`. This applies only to
-                // subset/subset2 nodes when the last token before `]` is a
-                // comma. Comment-before-`]` cases such as `x[i, # c\n]` stay
-                // safe because the pre-existing newline guard above suppresses
-                // them, so that guard must not be removed.
-                return;
+            // A comma before the closer is exempt everywhere (`x[i, ]`,
+            // `f(a, )`), and a value-less named argument's `=` is exempt
+            // before `)` only (`alist(a = )` clean, `x[j = ]` flagged) —
+            // both match lintr. Comment-before-closer cases such as
+            // `x[i, # c\n]` stay safe because the newline guard above
+            // suppresses them, so that guard must not be removed.
+            if let Some(prev) = close.prev_sibling() {
+                if prev.kind() == "comma" {
+                    return;
+                }
+                if !is_subset
+                    && prev.kind() == "argument"
+                    && prev
+                        .child(prev.child_count().saturating_sub(1) as u32)
+                        .is_some_and(|last| last.kind() == "=")
+                {
+                    return;
+                }
             }
             let close_text = text.get(close.start_byte()..close.end_byte()).unwrap_or("");
             emit_before_close(

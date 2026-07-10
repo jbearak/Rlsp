@@ -107,163 +107,114 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 - **Raven:** `raven.linting.lineLength` (default `80`), `raven.linting.lineLengthSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::line_length_linter(length = 80L)`.
-- Line length is measured in UTF-16 code units to match how LSP positions are reported.
+- Line length is measured in characters, matching `lintr`'s `nchar()` (an emoji counts as 1).
 
 ### Trailing whitespace
 
 - **Raven:** `raven.linting.trailingWhitespaceSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::trailing_whitespace_linter()`.
-- Whitespace at a line ending inside a multi-line string is allowed, matching
-  lintr's default `allow_in_strings = TRUE`; whitespace after the closing
-  delimiter is still flagged.
+- **`lintr` equivalent:** `lintr::trailing_whitespace_linter()` with its defaults (`allow_empty_lines = FALSE`, `allow_in_strings = TRUE`).
+- Whitespace-only lines are flagged; trailing whitespace inside a multi-line string literal is part of the string's value and is not.
 
 ### Tab characters
 
 - **Raven:** `raven.linting.noTabSeverity` (default `"information"`).
-- **`lintr` equivalent:** `lintr::whitespace_linter()` (the no-tab portion).
-- One diagnostic per line using a tab for indentation, anchored at the first
-  indentation tab. Tabs after the first non-whitespace character (for example
-  inside a comment or string) are not indentation and are ignored.
+- **`lintr` equivalent:** `lintr::whitespace_linter()`.
+- Flags tabs used for *indentation* only (matching `lintr`): tabs in comments, strings, or between tokens are left alone, and a line starting inside a multi-line string is part of the string's value. One diagnostic per offending line, anchored at the tab run.
 
 ### Trailing blank lines
 
 - **Raven:** `raven.linting.trailingBlankLinesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::trailing_blank_lines_linter()`.
-- Also fires when the file is missing a final newline.
-- Does not apply to `.Rmd` / `.qmd` documents: the rule describes the file's shape, and a chunk document's shape is Markdown, not R.
+- Also fires when the file is missing a final newline; a file can get both diagnostics (trailing blanks *and* the missing newline), as in `lintr`.
+- Does not apply to `.Rmd` / `.qmd` documents: the rule describes the file's shape, and a chunk document's shape is Markdown, not R. (Deliberate deviation: `lintr` checks chunk contents in knitr documents.)
 
 ### Assignment operator
 
 - **Raven:** `raven.linting.assignmentOperator` (default `"<-"`, alternative `"="`), `raven.linting.assignmentOperatorSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::assignment_linter()`.
-- Named-argument `=` inside function calls (`f(name = value)`) is never flagged. Assignments inside nested expressions — function bodies, braced blocks, control flow — are checked even when they appear inside an argument list.
-- With the default `"<-"` policy, `=`, `<<-`, `->`, `->>`, and the `%<>%`
-  assignment pipe are flagged. Raven's alternative `"="` policy accepts `=`
-  and flags the other assignment forms.
+- Under the default `<-` style, the flagged operators are `=`, `->`, `->>`, and the magrittr assignment pipe `%<>%` (`<<-` is allowed, matching `lintr` 3.3's default `operator = c("<-", "<<-")`; `:=` is never linted). Under the `=` style, `<-`, `<<-`, `->`, `->>`, and `%<>%` are flagged. Named-argument `=` (`f(name = value)`) is never flagged, and `lintr`'s implicit-assignment exclusion is mirrored: an assignment nested inside a call argument, an `if`/`while` condition, or a `for` sequence is skipped (`lapply(xs, function(x) { y = x; y })` and `if ({a = TRUE}) 1` are clean) unless the enclosing expression is explicitly parenthesized (`fun((blah = fun(1)))` is still flagged).
 
 ### Object names
 
-- **Raven:** `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument` (each defaults to `"snake_case"`), `raven.linting.objectNameRegexesFunction`, `raven.linting.objectNameRegexesVariable`, `raven.linting.objectNameRegexesArgument` (each defaults to `[]`), `raven.linting.objectNameSeverity` (default `"information"`).
+- **Raven:** `raven.linting.objectNameStyleFunction`, `raven.linting.objectNameStyleVariable`, `raven.linting.objectNameStyleArgument` (each defaults to `["snake_case", "symbols"]`, matching `lintr`'s default `styles`), `raven.linting.objectNameRegexesFunction`, `raven.linting.objectNameRegexesVariable`, `raven.linting.objectNameRegexesArgument` (each defaults to `[]`), `raven.linting.objectNameSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::object_name_linter(styles = ..., regexes = ...)`.
-- Each style key accepts `"snake_case"`, `"camelCase"`, `"dotted.case"`, `"UPPER_CASE"`, `"lowercase"`, `"any"` (disable that kind and ignore its regexes), or an array of those styles. Multiple styles are ORed. A name also passes if it matches any regex for that kind.
-- Regexes are Rust regexes applied as partial matches against the unquoted
-  identifier (backticks or string quotes are removed), including any leading
-  `.`. Use anchors such as `^...$` when you need the whole name to match. Rust's regex engine does not support PCRE lookaround such as `(?=...)`; unsupported patterns are warned about and skipped (for the settings/`raven.toml` path the warning goes to the server log; a `.lintr` file surfaces a visible warning notification). Empty regex strings are rejected because they would match every identifier. If regex-only mode supplies regexes but none are valid, Raven retains the default named style instead of silently disabling the check (in `.lintr` the invalid call still clears editor-level regexes, since it stated the project's regex policy).
+- Each style key accepts `"snake_case"`, `"camelCase"`, `"dotted.case"`, `"UPPER_CASE"`, `"lowercase"`, `"symbols"` (names made up entirely of non-alphanumeric characters, e.g. an operator overload like `` `%+%` ``), `"any"` (disable that kind and ignore its regexes), or an array of those styles. Multiple styles are ORed. A name also passes if it matches any regex for that kind.
+- Regexes are Rust regexes applied as partial matches against the full identifier, including any leading `.`. Use anchors such as `^...$` when you need the whole name to match. Rust's regex engine does not support PCRE lookaround such as `(?=...)`; unsupported patterns are warned about and skipped (for the settings/`raven.toml` path the warning goes to the server log; a `.lintr` file surfaces a visible warning notification). Empty regex strings are rejected because they would match every identifier. If regex-only mode supplies regexes but none are valid, Raven retains the default named style instead of silently disabling the check (in `.lintr` the invalid call still clears editor-level regexes, since it stated the project's regex policy).
 - An explicit empty style array with regexes is regex-only mode. If both the style array and regex array are empty, that kind's object-name check is disabled. A style value with no recognized style names is warned about and treated as empty: with valid regexes configured the kind becomes regex-only, with no regex setting at all it is disabled, and if the regex setting is present but contains no valid patterns the default style is restored rather than silently disabling the check.
-- Quoting is not a carve-out: `` `badName` `` is checked as `badName` in
-  named-style, regex-only, and combined modes. Compound assignment targets
-  check only their leftmost object (`badName$field <- 1` checks `badName`, not
-  `field`). Named styles always allow an optional leading `.`, but the rest of
-  the name must still match the configured style. Standard namespace/startup
-  hooks (`.onLoad`, `.onAttach`, `.onUnload`, `.onDetach`, `.Last.lib`,
-  `.First`, `.Last`) and S3-method names of the form
-  `<known-base-generic>.<class>` (e.g. `print.MyClass`, `as.Date.character`,
-  `` `+.my_class` ``) are exempt. Non-ASCII identifiers are skipped when no
-  regexes are configured for that kind; when regexes are configured
-  (regex-only or combined with styles), non-ASCII names are checked against
-  the regexes — the named ASCII styles never match them.
-- Literal names passed to `assign()` / `setGeneric()` are checked as binding
-  names as well; other string arguments to those calls are not.
+- Backtick-quoted and string names are normalized the way `lintr` does it (`strip_names`): surrounding backticks/quotes and `%` are removed, as is a trailing `<-` (so a replacement function `` `height<-` `` checks as `height`), and the remaining name goes through the normal matching — `` `myBadName` <- 1 `` is flagged exactly like `myBadName <- 1`, while `` `%+%` `` strips to `+` and passes via the default `symbols` style. A name that strips to nothing (e.g. `` `%%` ``) is skipped.
+- Carve-outs: named styles always allow an optional leading `.`, but the rest of the name must still match the configured style (so `.helper` is fine under `snake_case`, but `.onLoad` is exempt as one of `lintr`'s special functions — `.onLoad`, `.onAttach`, `.onUnload`, `.onDetach`, `.Last.lib`, `.First`, `.Last`, and `...` are never flagged); S3-method names of the form `<generic>.<class>` (e.g. `print.MyClass`, `as.Date.character`, `` `+.foo` ``) are exempt when the generic is a base R S3 generic (the list is ported from `lintr`, including operator generics) or a generic declared in the same file via `UseMethod` (`lintr`'s `declared_s3_generics`). Hidden methods (`.print.MyClass`) are also exempt — a deliberate leniency over `lintr`, which flags them. Non-ASCII identifiers are skipped when no regexes are configured for that kind; when regexes are configured (regex-only or combined with styles), non-ASCII names are checked against the regexes — the named ASCII styles never match them (a deliberate leniency over `lintr`, whose ASCII style regexes flag non-ASCII names). A compound target checks its base object through `$`/`@` chains, subscripts, and replacement calls (`a$b$c <- 1`, `a[[1]] <- 1`, and `names(a) <- 1` all check `a`, matching `lintr`); symbols used as subscript indices (`x[i] <- 1`) are not targets. Literal binding names in `assign("name", …)` / `setGeneric("name", …)` are checked.
 
 ### Infix spaces
 
 - **Raven:** `raven.linting.infixSpacesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::infix_spaces_linter()`.
-- Spaces required on both sides of low-precedence arithmetic, comparison,
-  logical, assignment, pipe (`|>`, `%>%`, and any `%...%` user-defined
-  operator), and binary `~`; named-argument and formal-default `=` are checked
-  too. Exponentiation is outside this rule, so both `x^2` and `x ^ 2` are
-  accepted. No spaces on either side of `:`, `::`, `:::`, `$`, `@`. No space between a unary `-`, `+`, `!`, or `?` and its operand (the gap after the operator is checked; no constraint on what precedes it). Alignment whitespace (`x   <- 1`) is allowed; operator-at-end-of-line line continuations are skipped.
+- Lints exactly `lintr`'s default operator set (the style guide's low-precedence operators): arithmetic (`+`, `-`, `*`, `/`), comparison, logical, assignment (`<-`, `<<-`, `:=`, `->`, `->>`, `=` — including named-argument `=` in calls and formal defaults, `lintr`'s `EQ_SUB`/`EQ_FORMALS`), pipe (`|>`, `%>%`, and any `%...%` user-defined operator), and binary `~`. Each requires at least one space on both sides. High-precedence operators (`^`/`**`, `:`, `::`, `:::`, `$`, `@`, `?`) and unary `-`/`+`/`!`/`~` are never linted, matching `lintr` — `x^2`, `x ^ 2`, and `1:10` are all fine. Alignment whitespace (`x   <- 1`) is allowed; operator-at-end-of-line line continuations are skipped; `/` inside `box::use(...)` module paths is exempt. A named argument with a missing value still needs a space after `=` (`alist(a = )` is fine, `alist(a =)` is flagged) — pinned by `lintr`'s own test suite.
 
 ### Commented code
 
 - **Raven:** `raven.linting.commentedCodeSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::commented_code_linter()`.
-- Flags a standalone comment block (consecutive `#` lines) or end-of-line
-  comment whose body parses as R and contains a call, assignment, operator, or
-  function definition. Roxygen (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines, and `# nolint` / `# raven:` / `# @lsp-…` directives are skipped. Ordinary end-of-line prose (`x <- 1 # explain`) remains clean; code-shaped text (`x <- 1 # other_call()`) is flagged.
+- Flags a standalone comment block (consecutive `#` lines) whose body parses as R and contains a call, assignment, operator, or function definition. Prose that merely contains code shapes is rejected: juxtaposed expressions (`# use foo(x) instead`) are not valid R, and binary `-` / unary `-`, `+`, `?` alone are not evidence (`# 1-a`, `# ?data.frame` are prose, matching `lintr`). A dangling trailing `,` / `%>%` / `|>` or leading `,` is stripped before the parse test, so commented-out argument-list lines and pipe fragments are still caught. Roxygen (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines, and `# nolint` / `# raven:` / `# @lsp-…` directives are skipped. End-of-line comments next to real code are checked too, like `lintr`: `x <- 1 # other_call()` is flagged, `x <- 1 # explain` is not.
 
 ### Quotes
 
 - **Raven:** `raven.linting.stringDelimiter` (default `"\""`, alternative `"'"`), `raven.linting.quotesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::quotes_linter()` / `lintr::single_quotes_linter()` (the two map to the two settings above).
-- Regular and raw strings follow the same delimiter policy. An alternate outer
-  delimiter is allowed when switching would require escaping the preferred
-  delimiter already present in the body (for example `'"quoted"'`).
+- Raw strings are checked like ordinary literals (`R'(plain)'` is flagged under the double-quote default). Any literal whose source contains the preferred quote character is exempt — switching delimiters would force escaping (`'he said "hi"'`, `r'(")'`).
 
 ### Commas
 
 - **Raven:** `raven.linting.commasSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::commas_linter()`.
-- Flags whitespace before `,` and missing whitespace after `,`. A newline after a comma is fine, so multi-line argument lists are not flagged. Matches `lintr`'s default `allow_trailing = FALSE` — a comma directly against a closing bracket (`a[1,]`) is still flagged.
+- Flags whitespace before `,` and missing whitespace after `,`. A newline after a comma is fine, so multi-line argument lists are not flagged. Matches `lintr`'s exemptions: a comma that starts its own line (leading-comma continuation style), a comma preceded by another comma (`a[1, , 2]` missing-argument style), and a comma preceded by a value-less named argument's `=` (`switch(op, x = , y = bar)`) are all clean. Matches `lintr`'s default `allow_trailing = FALSE` — a comma directly against a closing bracket (`a[1,]`) is still flagged.
 
 ### T / F symbol
 
 - **Raven:** `raven.linting.tAndFSymbolSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::T_and_F_symbol_linter()`.
-- Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`, and
-  flags assignment targets (`T <- 0`) because rebinding these aliases can
-  break later code. Formula terms (`y ~ T + F`), named argument/formal names,
-  and extraction/subsetting object or field names (`T[1]`, `obj$T`) are exempt.
+- Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`. Assignment targets (`T <- 0`) get `lintr`'s dedicated "don't use `T` as a variable name" message. Named arguments (`foo(T = TRUE)`), formal parameters (`function(T) ...`), `$` / `@` field names (`obj$T`), formula terms (`y ~ T + F` — though a named-argument value inside a formula call is still a real read), subscripted uses (`T[1]`), and callees (`T(1)`) are exempt — those positions don't read the boolean.
 
 ### Semicolon
 
 - **Raven:** `raven.linting.semicolonSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::semicolon_linter()`.
-- Flags `;` separators in source. `;` inside string literals or comments is left alone. One diagnostic per `;`.
+- Flags `;` separators in source. A `;` inside any token — string literals, comments, backtick-quoted identifiers (`` `a;b` ``), user infix operators (`%;%`) — is left alone. One diagnostic per `;`.
 
 ### Equals NA
 
 - **Raven:** `raven.linting.equalsNaSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::equals_na_linter()`.
-- Flags `x == NA`, `x != NA`, `x %in% NA`, and the typed variants
-  (`NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`). Equality and
-  inequality work on either side; `NA %in% x` is intentionally left alone.
+- Flags `x == NA`, `x != NA`, and the typed variants (`NA_integer_`, `NA_real_`, `NA_character_`, `NA_complex_`) on either side, plus `x %in% NA` (right-hand side only — `NA %in% x` is a legitimate membership test). The comparison always returns `NA`; use `is.na(x)` instead.
 
 ### Object length
 
 - **Raven:** `raven.linting.objectLength` (default `30`), `raven.linting.objectLengthSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::object_length_linter(length = 30)`.
-- Flags assignment targets and formal parameters whose names exceed the
-  configured length. An optional leading `.` (hidden identifier convention)
-  and syntactic quote delimiters are not counted. Unicode names are measured
-  in characters. Compound targets check only their leftmost object.
-- Literal names passed to `assign()` / `setGeneric()` are measured too.
+- Flags assignment targets and formal parameters whose names exceed the configured length. Names are normalized like `object_name` (backticks/quotes stripped), and a leading `<generic>.` prefix is removed for S3 methods so only an overlong class part is flagged, matching `lintr`. All characters of the remaining name count, including a leading `.`.
 
 ### Vector logic
 
 - **Raven:** `raven.linting.vectorLogicSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::vector_logic_linter()`.
-- Flags `&` or `|` in `if` / `while` conditions and `expect_true()` /
-  `expect_false()` assertions (where `&&` / `||` is the scalar short-circuit
-  form). It also flags `&&` / `||` in `filter()` / `subset()` predicates, where
-  vectorized `&` / `|` is required. Nested call boundaries remain conservative:
-  `if (any(x & y))` is left alone.
+- Flags `&` or `|` in `if` / `while` conditions (where `&&` / `||` is the scalar short-circuit form) and in `expect_true()` / `expect_false()`. The scan recurses through nested logical operators but stops at call boundaries — `if (any(x & y))` is left alone because the `&` is evaluated on a vector inside `any()`. Bitwise arithmetic is exempt: an operand that is a string literal or an `as.raw()` / `as.octmode()` / `as.hexmode()` call (`if (info & as.raw(12))`) marks the operator as bitwise, matching `lintr`. The mirror check flags scalar `&&` / `||` inside `subset()` / `filter()` arguments (bare, `pkg::`-qualified except `stats::filter`, or as a pipe target) — subsetting is a vector context; nested function definitions inside those arguments are skipped.
 
 ### Function left parentheses
 
 - **Raven:** `raven.linting.functionLeftParenthesesSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::function_left_parentheses_linter()`.
-- Flags whitespace before `(` in function definitions and calls. The community
-  convention is tight: `function(x)`, `\(x)`, and `mean(x)`.
+- Flags whitespace between `function` (or the `\` lambda shorthand) and the parameter `(`, and between a call's function name and its argument `(` — `blah (1)`, `base::print (x)`, `` `+` (1, 1) ``, `x$foo (1)`. A `(` on a later line than the function name gets a dedicated message; `@` slot calls get only that cross-line check (same-line whitespace after `@` access is not flagged). String "callees" (`"print"(x)`, `base::"mean"(x)`) and computed callees (IIFEs, `f(x)(y)`) are left alone, matching `lintr`.
 
 ### Spaces inside
 
 - **Raven:** `raven.linting.spacesInsideSeverity` (default `"information"`).
 - **`lintr` equivalent:** `lintr::spaces_inside_linter()`.
-- Flags whitespace immediately inside `(`, `[`, `[[` and their closing
-  counterparts (e.g. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`). Truly empty
-  groupings (`f()`, `mat[]`) and multi-line wrapping are exempt;
-  whitespace-only single-line groupings (`f( )`, `mat[ ]`) are flagged. A
-  trailing comma that marks an omitted subset dimension keeps its space
-  (`x[i, ]`) and is not flagged, keeping the rule consistent with `commas`.
+- Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`, `mat[[ i ]]`), including the parens of `if`/`while`/`for` and function/lambda parameter lists. Whitespace-only groupings (`f( )`, `x[ ]`) are flagged on both sides, as in `lintr`; multi-line wrapping is never flagged. Exemptions, matching `lintr`: a comma before the closer (`x[i, ]`, `f(a, )`), a value-less named argument's `=` before `)` only (`alist(a = )` is clean, `x[j = ]` is flagged), and an opener followed by a same-line comment.
 
 ### Indentation
 
 - **Raven:** `raven.linting.indentationUnit` (default `"auto"`, or a fixed integer clamped to `1..=8`), `raven.linting.indentationSeverity` (default `"information"`). When set to `"auto"` (the default), each R file is linted against VS Code's `editor.tabSize` for that specific file, so files with different tab-size settings in the same workspace are each linted correctly. Set to a fixed integer (e.g. `2` or `4`) to use the same unit for all R files regardless of editor settings. Note: if a `[[linting.overrides]]` entry explicitly sets `indentationUnit` for a file, it takes precedence over the per-file `editor.tabSize`.
 - **`lintr` equivalent:** `lintr::indentation_linter()` with its tidy-default hanging style.
-- Flags lines whose leading whitespace doesn't match the indent expected by the AST scope the line sits in: braced blocks (one unit deeper than the line of `{`); multi-line argument lists (either aligned with the column after the opener — `foo(a,\n    b)` — or hanging one unit deeper than the opener's line); continuation lines under a binary operator (one unit deeper than the line where the chain starts). Parenthesized Boolean clauses may align with one another, so the common `(condition) |` / `(condition)` layout does not gain a spurious extra level. A closing delimiter (`)`, `]`, `]]`, `}`) that begins its own line aligns with the line of its opener; that closer alignment takes precedence even when a multi-line binary-operator scope also covers the closer's line. A standalone comment-only line aligned with the trailing-comment column of an adjacent line expecting the same indent is not flagged, matching a common intentional documentation style; directive/suppression marker comments such as `# nolint`, `# raven: ...`, and `# @lsp-...` are excluded from this exemption and are never used as anchors — a suppressed marker like `# nolint` still has its diagnostics skipped entirely by the normal suppression mechanism, while a non-suppressing marker like `# raven: ...` or `# @lsp-ignore-next` still gets the ordinary indentation check.
-- Skipped without checks: blank lines, lines whose leading whitespace contains any tab (left to the `no_tab` rule), and lines that start strictly inside a multi-line string. Suppression markers behave as on every other rule.
+- Uses `lintr`'s accumulated "indent change" model (tidy hanging-indent style), verified against a 112-case differential corpus vs real `lintr`: bracket openers indent the lines up to (but not including) a closer that starts its own line — so a standalone closing delimiter aligns with its opener's context; a closer that trails content demands the hanging (aligned-after-the-opener) indent; tidyverse double-indent function definitions are recognized; end-of-line operators (`+`, pipes, `$`/`@` chains, named-argument `=`) indent their continuation one more unit — except on the right-hand side of an assignment whose operator ends the line (`lintr`'s `assignment_as_infix` default), so `x <-\n  a +\n  b` is flat; unbraced `if`/`else`/`for`/`while`/`repeat`/function bodies and multi-line conditions indent one unit; and a run of consecutive lines mis-indented by the same amount produces a single diagnostic. Raven additionally accepts (never requires) the aligned-argument style, the block form where `lintr` demands hanging or double indents, and the chain-start column the on-type formatter produces — so Raven never disagrees with its own formatter, and flags a strict subset of what `lintr` flags on those shapes. A standalone comment-only line aligned with the trailing-comment column of an adjacent line expecting the same indent is not flagged, matching a common intentional documentation style; directive/suppression marker comments such as `# nolint`, `# raven: ...`, and `# @lsp-...` are excluded from this exemption and are never used as anchors.
 
 ## Migrating from `.lintr`
 
@@ -296,7 +247,7 @@ The recommended path is to configure Raven via `raven.toml` at the project root 
 
 Numeric-argument linters accept both the named and the first-positional form: `line_length_linter(80)` and `line_length_linter(length = 80)` are equivalent, as are `object_length_linter(40)` / `object_length_linter(length = 40)` and `indentation_linter(4)` / `indentation_linter(indent = 4)`.
 
-`object_name_linter` accepts styles positionally or via `styles =`, as a scalar or a `c(...)` vector (e.g. `object_name_linter("camelCase")`, `object_name_linter(styles = c("snake_case", "camelCase"))`) and applies them to functions, variables, and arguments. Known style names (`snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, `any`) map to the three style arrays and are ORed. Regexes may be named (`regexes =`) or passed as the second positional argument, as a scalar or vector; names on vector entries (such as `c(public = "^[a-z]")`) are diagnostic labels and do not change the patterns. Matching `lintr`, explicitly supplying `regexes` **replaces** the default styles (regex-only mode) unless `styles` is also explicitly supplied — specify both to combine them. R string escapes are processed, so `"^\\.on[A-Z]"` means the regex `^\.on[A-Z]`; R raw strings (`r"(^\.on[A-Z])"`) are also supported and taken verbatim. R's numeric escapes (octal `"\056"`, hex `"\x2e"`, unicode `"\u{2e}"`) also decode with R semantics before the pattern reaches the regex engine; escape sequences R itself rejects (such as a bare `"\d"` — write `"\\d"`) are warned about as unrecognized. `lintr` styles Raven has no equivalent for (`symbols`, `CamelCase`, `UPPERCASE`, `SNAKE_CASE`) are warned about and skipped, as are case/punctuation typos of Raven's style names (with a did-you-mean hint); any other unknown non-empty `styles` element is treated leniently as a regex, a Raven extension over `lintr`. Empty style elements are still unrecognized because an empty regex would match every identifier. An explicit empty vector (`styles = c()`, `styles = character()`, or `character(0)`) maps to empty style arrays — regex-only mode when regexes are also given, otherwise "check disabled". Whenever a call states a pattern policy it states the regex policy too: a styles-only call (including the empty-vector forms) or any call with a `regexes` argument — even one whose patterns were all rejected — emits regex arrays (the accepted patterns, or `[]`), so editor-level `objectNameRegexes*` values are cleared rather than silently ORed in.
+`object_name_linter` accepts styles positionally or via `styles =`, as a scalar or a `c(...)` vector (e.g. `object_name_linter("camelCase")`, `object_name_linter(styles = c("snake_case", "camelCase"))`) and applies them to functions, variables, and arguments. Known style names (`snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, `symbols`, `any`) map to the three style arrays and are ORed. Regexes may be named (`regexes =`) or passed as the second positional argument, as a scalar or vector; names on vector entries (such as `c(public = "^[a-z]")`) are diagnostic labels and do not change the patterns. Matching `lintr`, explicitly supplying `regexes` **replaces** the default styles (regex-only mode) unless `styles` is also explicitly supplied — specify both to combine them. R string escapes are processed, so `"^\\.on[A-Z]"` means the regex `^\.on[A-Z]`; R raw strings (`r"(^\.on[A-Z])"`) are also supported and taken verbatim. R's numeric escapes (octal `"\056"`, hex `"\x2e"`, unicode `"\u{2e}"`) also decode with R semantics before the pattern reaches the regex engine; escape sequences R itself rejects (such as a bare `"\d"` — write `"\\d"`) are warned about as unrecognized. `lintr` styles Raven has no equivalent for (`CamelCase`, `UPPERCASE`, `SNAKE_CASE`) are warned about and skipped, as are case/punctuation typos of Raven's style names (with a did-you-mean hint); any other unknown non-empty `styles` element is treated leniently as a regex, a Raven extension over `lintr`. Empty style elements are still unrecognized because an empty regex would match every identifier. An explicit empty vector (`styles = c()`, `styles = character()`, or `character(0)`) maps to empty style arrays — regex-only mode when regexes are also given, otherwise "check disabled". Whenever a call states a pattern policy it states the regex policy too: a styles-only call (including the empty-vector forms) or any call with a `regexes` argument — even one whose patterns were all rejected — emits regex arrays (the accepted patterns, or `[]`), so editor-level `objectNameRegexes*` values are cleared rather than silently ORed in.
 
 To disable a rule from a `.lintr` `linters_with_defaults(..., default = list())` setup, set its severity to `"off"`. To raise a rule that `lintr` would flag as a `warning`, raise its severity from `"information"` to `"warning"`.
 
@@ -379,7 +330,6 @@ Notes:
 
 - **R Markdown / Quarto.** Lint rules apply inside R chunk bodies of `.Rmd` / `.qmd` documents — both in the editor and via `raven lint`. Prose, YAML front matter, and non-R chunks are never linted. `# nolint`, `# nolint start` / `# nolint end`, and `# raven: ignore` markers work inside chunk bodies exactly as in plain `.R` files. You can also suppress a whole chunk with the `raven.ignore` chunk option or an in-chunk `# raven: ignore-chunk` directive — see [Code chunks → Suppressing diagnostics in a chunk](chunks.md#suppressing-diagnostics-in-a-chunk). The one exception is [trailing blank lines](#trailing-blank-lines), which describes the file's shape — Markdown, not R — and is disabled for chunk documents.
 - **Static, no R subprocess.** Raven's lint rules run against the tree-sitter parse it already maintains for completions and diagnostics. There's no `lintr` install, no `R` process, no startup cost. The `commented_code` rule re-parses each candidate comment body via a thread-local parser pool; every other rule walks only the already-parsed tree.
-- **UTF-16 line length.** Raven measures line length in UTF-16 code units (matching LSP position reporting), so a non-BMP character counts as two. `lintr` counts characters; for ASCII-only code the two agree.
 - **`commented_code` differs subtly from `lintr`.** Both decide whether a comment body "looks like code" by parsing it, but Raven parses with tree-sitter and `lintr` parses with R itself. Edge cases that exercise R-specific syntax (very old `_` assignment, non-ASCII operator overloads, etc.) may be classified differently.
 - **Position-aware, but not call-flow-aware.** Raven walks the AST top-down for most rules and does not run R-level data-flow analysis. Rules that would need that (`object_usage_linter`, `cyclocomp_linter`, `seq_linter`) are intentionally out of scope for the native linter — run `lintr` for those (see [above](#filling-the-gaps-with-lintr-itself)).
 

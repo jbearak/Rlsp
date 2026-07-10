@@ -1,17 +1,27 @@
-//! Flag vector/scalar logical operators used in the opposite context.
+//! Flag `&` / `|` in `if` / `while` conditions, where `&&` / `||` is expected.
 //!
 //! Mirrors `lintr::vector_logic_linter`. `if (x & y)` triggers a warning in
 //! R 4.3+ (`condition has length > 1`) and silently does the wrong thing on
 //! older R when either side returns a vector. Scalar short-circuit operators
 //! (`&&` / `||`) are the correct choice in scalar contexts.
 //!
-//! The scan walks `if` / `while` conditions and `expect_true()` /
-//! `expect_false()` assertions, reporting `&` / `|` where scalar `&&` / `||`
-//! is expected. It also checks `filter()` / `subset()` predicates in the other
-//! direction, reporting `&&` / `||` where vectorized `&` / `|` is expected.
-//! Function-call boundaries stop the recursion: `if (any(x & y))` is fine
-//! because the `&` is evaluated inside `any()` on a vector, not on the
-//! condition itself. lintr applies the same carve-out.
+//! The scan walks the condition expression of each `if_statement` /
+//! `while_statement` (and of `expect_true()` / `expect_false()`, which
+//! testthat evaluates as scalar conditions) and reports every `&` / `|`
+//! operator inside, recursively. Function-call boundaries stop the
+//! recursion: `if (any(x & y))` is fine because the `&` is evaluated inside
+//! `any()` on a vector, not on the condition itself. lintr applies the same
+//! carve-out. An operator with a string-literal or
+//! `as.raw()`/`as.octmode()`/`as.hexmode()` operand is skipped — that is
+//! bitwise arithmetic, not boolean logic (`if (info & as.raw(12еко))` is fine;
+//! lintr has the same exemption).
+//!
+//! The mirror half: `&&` / `||` inside `subset()` / `filter()` arguments
+//! (bare, `pkg::`-qualified except `stats::filter`, or as a pipe RHS) are
+//! flagged the other way — subsetting is a vector context, so the scalar
+//! operators are wrong there. Nested function definitions inside those
+//! arguments are skipped (matching lintr's development branch; lintr 3.3.0
+//! flagged them).
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -44,7 +54,31 @@ fn visit(
         scan_condition(cond, text, severity, suppressions, out);
     }
     if node.kind() == "call" {
-        check_call_context(node, text, severity, suppressions, out);
+        match callee_name(node, text) {
+            // testthat conditions behave like `if`/`while` conditions.
+            // lintr scans every direct argument expression, not just the
+            // resolved `object` (`expect_true(info = x & y, ...)` flags too).
+            Some("expect_true") | Some("expect_false") => {
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    let mut cursor = args.walk();
+                    for child in args.children(&mut cursor) {
+                        if child.kind() == "argument"
+                            && let Some(value) = child.child_by_field_name("value")
+                        {
+                            scan_condition(value, text, severity, suppressions, out);
+                        }
+                    }
+                }
+            }
+            // Subsetting contexts: scalar `&&`/`||` are wrong. `stats::filter`
+            // is linear filtering, not subsetting — lintr exempts it too.
+            Some("filter") | Some("subset") if !is_stats_qualified(node, text) => {
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    scan_subset_args(args, text, severity, suppressions, out);
+                }
+            }
+            _ => {}
+        }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -52,85 +86,60 @@ fn visit(
     }
 }
 
-fn check_call_context(
+/// The called function's bare name: `filter` for both `filter(...)` and
+/// `dplyr::filter(...)`.
+fn callee_name<'a>(call: Node<'_>, text: &'a str) -> Option<&'a str> {
+    let function = call.child_by_field_name("function")?;
+    match function.kind() {
+        "identifier" => text.get(function.start_byte()..function.end_byte()),
+        // `pkg::name(...)` and `env$name(...)` both resolve by the rightmost
+        // name — R's parser marks either as a function call, and lintr's
+        // carve-outs match on that name.
+        "namespace_operator" | "extract_operator" => {
+            let rhs = function.child_by_field_name("rhs")?;
+            text.get(rhs.start_byte()..rhs.end_byte())
+        }
+        _ => None,
+    }
+}
+
+/// True for `stats::filter(...)` / `stats:::filter(...)`.
+fn is_stats_qualified(call: Node<'_>, text: &str) -> bool {
+    call.child_by_field_name("function")
+        .filter(|f| f.kind() == "namespace_operator")
+        .and_then(|f| f.child_by_field_name("lhs"))
+        .and_then(|lhs| text.get(lhs.start_byte()..lhs.end_byte()))
+        == Some("stats")
+}
+
+/// Flag scalar `&&` / `||` inside `subset()` / `filter()` arguments. Recurses
+/// through nested expressions but not into function definitions (a lambda's
+/// body is its own scope, not part of the subsetting expression).
+fn scan_subset_args(
     node: Node<'_>,
     text: &str,
     severity: DiagnosticSeverity,
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    let Some(function) = node.child_by_field_name("function") else {
-        return;
-    };
-    let function_text = text
-        .get(function.start_byte()..function.end_byte())
-        .unwrap_or("");
-    let Some(arguments) = node.child_by_field_name("arguments") else {
-        return;
-    };
-
-    if matches_function(function_text, "expect_true")
-        || matches_function(function_text, "expect_false")
-    {
-        if let Some(value) = first_argument_value(arguments) {
-            scan_condition(value, text, severity, suppressions, out);
-        }
+    if node.kind() == "function_definition" {
         return;
     }
-
-    let is_filter = matches_function(function_text, "filter") && function_text != "stats::filter";
-    let is_subset = matches_function(function_text, "subset");
-    if !is_filter && !is_subset {
-        return;
-    }
-
-    let mut skipped_data_argument = false;
-    let mut cursor = arguments.walk();
-    for argument in arguments
-        .children(&mut cursor)
-        .filter(|child| child.kind() == "argument")
-    {
-        let name = argument
+    // `filter(x, circular = ...)` is stats::filter's scalar control
+    // argument, not a subsetting expression — lintr exempts it by name.
+    if node.kind() == "argument"
+        && node
             .child_by_field_name("name")
-            .and_then(|name| text.get(name.start_byte()..name.end_byte()));
-        if name == Some("circular") {
-            continue;
-        }
-        let is_named_data_argument =
-            (is_filter && name == Some(".data")) || (is_subset && name == Some("x"));
-        if !skipped_data_argument && (name.is_none() || is_named_data_argument) {
-            skipped_data_argument = true;
-            continue;
-        }
-        if let Some(value) = argument.child_by_field_name("value") {
-            scan_filter_predicate(value, text, severity, suppressions, out);
-        }
+            .and_then(|name| text.get(name.start_byte()..name.end_byte()))
+            == Some("circular")
+    {
+        return;
     }
-}
-
-fn matches_function(actual: &str, name: &str) -> bool {
-    actual == name || actual.rsplit(':').next() == Some(name)
-}
-
-fn first_argument_value(arguments: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = arguments.walk();
-    arguments
-        .children(&mut cursor)
-        .find(|child| child.kind() == "argument")?
-        .child_by_field_name("value")
-}
-
-fn scan_filter_predicate(
-    node: Node<'_>,
-    text: &str,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
-    out: &mut Vec<Diagnostic>,
-) {
-    if matches!(
-        node.kind(),
-        "call" | "subset" | "subset2" | "function_definition"
-    ) {
+    // Any nested call is its own evaluation context: lintr leaves
+    // `filter(data, foo(a && b))` alone, and a nested `subset()`/`filter()`
+    // gets scanned when the outer AST walk reaches it (descending here would
+    // duplicate its diagnostics). Subscripts likewise reset the context.
+    if matches!(node.kind(), "call" | "subset" | "subset2") {
         return;
     }
     if node.kind() == "binary_operator"
@@ -139,12 +148,15 @@ fn scan_filter_predicate(
         let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
         if op_text == "&&" || op_text == "||" {
             let preferred = if op_text == "&&" { "&" } else { "|" };
-            emit(op, op_text, preferred, text, severity, suppressions, out);
+            let message = format!(
+                "Use `{preferred}` in subsetting expressions; `{op_text}` is the scalar form."
+            );
+            emit(op, &message, text, severity, suppressions, out);
         }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        scan_filter_predicate(child, text, severity, suppressions, out);
+        scan_subset_args(child, text, severity, suppressions, out);
     }
 }
 
@@ -156,17 +168,25 @@ fn scan_condition(
     out: &mut Vec<Diagnostic>,
 ) {
     // Stop at call boundaries — the operands of a call are evaluated as a
-    // vector context independently of the surrounding scalar condition.
-    if matches!(node.kind(), "call" | "subset" | "subset2") {
+    // vector context independently of the surrounding scalar condition. A
+    // nested `if`/`while` is its own condition and is scanned when the outer
+    // AST walk reaches it (rescanning here would duplicate diagnostics).
+    if matches!(
+        node.kind(),
+        "call" | "subset" | "subset2" | "if_statement" | "while_statement"
+    ) {
         return;
     }
     if node.kind() == "binary_operator"
         && let Some(op) = node.child_by_field_name("operator")
     {
         let op_text = text.get(op.start_byte()..op.end_byte()).unwrap_or("");
-        if op_text == "&" || op_text == "|" {
+        if (op_text == "&" || op_text == "|") && !has_bitwise_operand(node, text) {
             let preferred = if op_text == "&" { "&&" } else { "||" };
-            emit(op, op_text, preferred, text, severity, suppressions, out);
+            let message = format!(
+                "Use `{preferred}` in `if` / `while` conditions; `{op_text}` is the vectorised form."
+            );
+            emit(op, &message, text, severity, suppressions, out);
         }
     }
     let mut cursor = node.walk();
@@ -175,10 +195,25 @@ fn scan_condition(
     }
 }
 
+/// True when either direct operand marks bitwise arithmetic: a string
+/// literal (`info & "111"`) or a call to `as.raw` / `as.octmode` /
+/// `as.hexmode`. lintr exempts these from the condition check.
+fn has_bitwise_operand(binop: Node<'_>, text: &str) -> bool {
+    ["lhs", "rhs"].iter().any(|field| {
+        binop.child_by_field_name(field).is_some_and(|operand| {
+            operand.kind() == "string"
+                || (operand.kind() == "call"
+                    && matches!(
+                        callee_name(operand, text),
+                        Some("as.raw") | Some("as.octmode") | Some("as.hexmode")
+                    ))
+        })
+    })
+}
+
 fn emit(
     op: Node<'_>,
-    op_text: &str,
-    preferred: &str,
+    message: &str,
     text: &str,
     severity: DiagnosticSeverity,
     suppressions: &Suppressions,
@@ -199,7 +234,7 @@ fn emit(
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),
         code: Some(NumberOrString::String(rule_ids::VECTOR_LOGIC.to_string())),
-        message: format!("Use `{preferred}` for this logical context instead of `{op_text}`."),
+        message: message.to_string(),
         ..Default::default()
     });
 }

@@ -697,7 +697,8 @@ pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
 /// * `objectNameStyleFunction`, `objectNameStyleVariable`,
 ///   `objectNameStyleArgument` (string or array of strings, each one of
 ///   `"snake_case" | "camelCase" | "dotted.case" | "UPPER_CASE" |
-///   "lowercase" | "any"`) — accepted named styles for each symbol kind.
+///   "lowercase" | "symbols" | "any"`) — accepted named styles for each
+///   symbol kind.
 ///   `"any"` anywhere in the list disables that kind without disabling the
 ///   rule entirely. An explicit empty array plus regexes means regex-only.
 /// * `objectNameRegexesFunction`, `objectNameRegexesVariable`,
@@ -1045,7 +1046,7 @@ mod case_mismatch_severity_parse_tests {
 /// The two keys are deliberately resolved together in one place because they
 /// interact:
 ///
-/// * An absent style key leaves the default `[snake_case]` in place; a
+/// * An absent style key leaves the default `[snake_case, symbols]` in place; a
 ///   present empty array means "no named styles" (regex-only mode when the
 ///   regex list is nonempty, disabled when it is empty too).
 /// * A present nonempty style value with no valid elements is treated as an
@@ -1075,7 +1076,7 @@ fn parse_object_name_kind_settings(
 ///
 /// Scalar strings are parsed through the same path as one-element arrays for
 /// backward compatibility. An absent key is handled by the caller and leaves
-/// the default `[snake_case]` in place. A present empty array means "no named
+/// the default `[snake_case, symbols]` in place. A present empty array means "no named
 /// styles" (useful for regex-only checks). A present nonempty value with no
 /// valid style elements is treated as empty: the kind is disabled unless the
 /// paired regex setting supplies valid patterns (see
@@ -1144,18 +1145,25 @@ fn apply_object_name_regex_setting(
     styles: &mut Vec<crate::linting::ObjectNameStyle>,
     target: &mut Vec<crate::linting::CompiledRegex>,
 ) {
+    // The restored default must match `LintConfig::default()`'s per-kind
+    // styles — snake_case + symbols (lintr's default `styles`) — not just
+    // the enum default, or `%+%` definitions become false positives.
+    let default_styles = [
+        crate::linting::ObjectNameStyle::SnakeCase,
+        crate::linting::ObjectNameStyle::Symbols,
+    ];
     let Some((had_elements, regexes)) = parse_object_name_regexes(value, setting_name) else {
         if styles.is_empty() {
-            styles.push(crate::linting::ObjectNameStyle::default());
+            styles.extend(default_styles);
         }
         return;
     };
 
     if styles.is_empty() && had_elements && regexes.is_empty() {
         log::warn!(
-            "linting.{setting_name} contained no valid regexes for regex-only mode; retaining the default object-name style."
+            "linting.{setting_name} contained no valid regexes for regex-only mode; retaining the default object-name styles."
         );
-        styles.push(crate::linting::ObjectNameStyle::default());
+        styles.extend(default_styles);
     }
     *target = regexes;
 }
@@ -13826,18 +13834,12 @@ mod tests {
             });
             let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
 
-            assert_eq!(
-                cfg.object_name_style_function,
-                vec![ObjectNameStyle::SnakeCase]
-            );
-            assert_eq!(
-                cfg.object_name_style_variable,
-                vec![ObjectNameStyle::SnakeCase]
-            );
-            assert_eq!(
-                cfg.object_name_style_argument,
-                vec![ObjectNameStyle::SnakeCase]
-            );
+            // The restored fallback matches `LintConfig::default()`'s per-kind
+            // styles: snake_case + symbols (lintr's default `styles`).
+            let default_styles = vec![ObjectNameStyle::SnakeCase, ObjectNameStyle::Symbols];
+            assert_eq!(cfg.object_name_style_function, default_styles);
+            assert_eq!(cfg.object_name_style_variable, default_styles);
+            assert_eq!(cfg.object_name_style_argument, default_styles);
             assert!(cfg.object_name_regexes_function.is_empty());
             assert!(cfg.object_name_regexes_variable.is_empty());
             assert!(cfg.object_name_regexes_argument.is_empty());

@@ -51,16 +51,19 @@ fn check_comma(
     let start = node.start_byte();
     let end = node.end_byte();
 
-    // Space before comma: look at the byte immediately before. Only flag a
-    // *single-line* space — a comma that is the first non-whitespace token on
-    // its line is a multi-line continuation, not a style violation.
+    // Space before comma: look at the byte immediately before. lintr's
+    // exemptions (all verified against lintr 3.3.0.1):
+    // * The check only applies when the preceding token sits on the *same
+    //   line* — a comma that starts its own line (leading-comma continuation
+    //   style, `fun(1\n  , 2)`) is exempt at any indentation.
+    // * A preceding comma is exempt: `a[1, , 2]` marks a missing argument.
+    // * A preceding `=` is exempt: `switch(op, x = , y = bar)`.
     if start > 0 {
         let prev = bytes[start - 1];
-        let line_start = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
-        let comma_is_first_token = text[line_start..start]
-            .bytes()
-            .all(|byte| byte == b' ' || byte == b'\t');
-        if (prev == b' ' || prev == b'\t') && !comma_is_first_token {
+        if (prev == b' ' || prev == b'\t')
+            && !is_first_token_on_line(text, node)
+            && !prev_token_exempts_space_before(node)
+        {
             emit(
                 node,
                 text,
@@ -88,6 +91,33 @@ fn check_comma(
                 out,
             );
         }
+    }
+}
+
+/// True when only whitespace precedes `node` on its line.
+fn is_first_token_on_line(text: &str, node: Node<'_>) -> bool {
+    let line_no = node.start_position().row;
+    let col = node.start_position().column;
+    text.lines()
+        .nth(line_no)
+        .and_then(|line| line.get(..col))
+        .is_some_and(|prefix| prefix.bytes().all(|b| b == b' ' || b == b'\t'))
+}
+
+/// True when the token before the comma is another comma or a value-less
+/// named argument's `=` — lintr exempts whitespace-before-comma in both.
+fn prev_token_exempts_space_before(node: Node<'_>) -> bool {
+    let Some(prev) = node.prev_sibling() else {
+        return false;
+    };
+    match prev.kind() {
+        "comma" => true,
+        // `switch(op, x = , y = bar)` — the missing-value argument node ends
+        // with its `=` token.
+        "argument" => prev
+            .child(prev.child_count().saturating_sub(1) as u32)
+            .is_some_and(|last| last.kind() == "="),
+        _ => false,
     }
 }
 
