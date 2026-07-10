@@ -153,8 +153,12 @@ fn in_formula_context(ident: Node<'_>) -> bool {
     while let Some(parent) = child.parent() {
         match parent.kind() {
             "argument" => {
-                // A named argument's value is a real read even in a formula.
-                if parent.child_by_field_name("name").is_some()
+                // A named argument whose value is *exactly* this symbol is a
+                // real read even in a formula (`y ~ foo(x, arg = T)`); a `T`
+                // nested deeper in the value (`y ~ foo(arg = T + 1)`) stays
+                // exempt, matching lintr.
+                if child.id() == ident.id()
+                    && parent.child_by_field_name("name").is_some()
                     && parent
                         .child_by_field_name("value")
                         .is_some_and(|v| v.id() == child.id())

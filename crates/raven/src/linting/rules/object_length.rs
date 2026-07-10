@@ -25,7 +25,8 @@ use crate::linting::LINT_SOURCE;
 use crate::linting::nolint::Suppressions;
 use crate::linting::rule_ids;
 use crate::linting::rules::object_name::{
-    collect_declared_s3_generics, is_known_s3_generic, strip_name,
+    binding_call_literal_name, collect_declared_s3_generics, is_known_s3_generic,
+    leftmost_extract_object, strip_name,
 };
 use crate::utf16::byte_offset_to_utf16_column;
 
@@ -65,6 +66,7 @@ fn visit(
     match node.kind() {
         "binary_operator" => check_assignment(node, text, max_length, cx, out),
         "function_definition" => check_parameters(node, text, max_length, cx, out),
+        "call" => check_binding_call(node, text, max_length, cx, out),
         _ => {}
     }
     let mut cursor = node.walk();
@@ -95,13 +97,48 @@ fn check_assignment(
     let Some(target) = target else {
         return;
     };
-    if target.kind() != "identifier" {
+    // A `$`/`@` compound LHS measures its leftmost object (`abcdef` in
+    // `abcdef$field <- 1`), like lintr; quoted-string targets are measured
+    // after stripping, and subscripted targets are skipped.
+    let target = leftmost_extract_object(target);
+    if !matches!(target.kind(), "identifier" | "string") {
         return;
     }
     let name = text
         .get(target.start_byte()..target.end_byte())
         .unwrap_or("");
     check_name(target, name, max_length, text, cx, out);
+}
+
+/// Measure the literal binding name of `assign("name", …)` /
+/// `setGeneric("name", …)`, which lintr's object_length also lints.
+fn check_binding_call(
+    node: Node<'_>,
+    text: &str,
+    max_length: u32,
+    cx: &CheckContext<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(function) = node.child_by_field_name("function") else {
+        return;
+    };
+    let function_text = text
+        .get(function.start_byte()..function.end_byte())
+        .unwrap_or("");
+    let formal = match function_text {
+        "assign" => "x",
+        "setGeneric" => "name",
+        _ if function_text.ends_with("::assign") => "x",
+        _ if function_text.ends_with("::setGeneric") => "name",
+        _ => return,
+    };
+    let Some(name_node) = binding_call_literal_name(node, formal, text) else {
+        return;
+    };
+    let name = text
+        .get(name_node.start_byte()..name_node.end_byte())
+        .unwrap_or("");
+    check_name(name_node, name, max_length, text, cx, out);
 }
 
 fn check_parameters(

@@ -90,6 +90,8 @@ mod parse_gate;
 pub(crate) use nolint::{
     Suppressions as SuppressionsForParityTest, first_hash_body_for_parity_test,
 };
+#[cfg(test)]
+mod lintr_parity;
 pub mod rule_ids;
 mod rules;
 
@@ -1441,16 +1443,13 @@ print.data.frame <- function(x, ...) NULL
     }
 
     #[test]
-    fn commented_code_skips_end_of_line_comments() {
+    fn commented_code_checks_end_of_line_comments() {
         let config = commented_code_only_config();
-        // The `# x <- 2` is an end-of-line annotation, not standalone dead
-        // code. Don't flag.
+        // lintr checks trailing comments too: a code-shaped end-of-line
+        // comment is flagged, prose is not.
         let diags = lint("x <- 1 # x <- 2\n", &config);
-        assert!(
-            diags.is_empty(),
-            "end-of-line comment must not be flagged: {:?}",
-            diags
-        );
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert!(lint("x <- 1 # for example only\n", &config).is_empty());
     }
 
     #[test]

@@ -2,10 +2,7 @@
 //!
 //! Mirrors `lintr::commented_code_linter`. A comment is flagged when:
 //!
-//! 1. It is the only content on its line (end-of-line comments next to real
-//!    code are left alone — those are annotations on the statement, not dead
-//!    code).
-//! 2. After stripping the leading `#` characters and whitespace, the remaining
+//! 1. After stripping the leading `#` characters and whitespace, the remaining
 //!    text parses cleanly as R (no `ERROR` nodes) and contains at least one
 //!    "code-like" construct — a call, an assignment, a binary or unary
 //!    operator, or a function definition. Bare identifiers, literals, and
@@ -59,7 +56,37 @@ pub(crate) fn collect(
     // preceding the `#` on its line is whitespace. End-of-line comments next
     // to code (`x <- 1 # explain`) are intentionally left alone.
     let mut standalone: Vec<StandaloneComment> = Vec::new();
-    collect_standalone(root, &lines, &mut standalone);
+    let mut inline: Vec<InlineComment> = Vec::new();
+    collect_comments(root, &lines, &mut standalone, &mut inline);
+
+    // lintr also checks code-shaped end-of-line comments. Ordinary prose
+    // annotations still fail `looks_like_code` and remain silent.
+    for comment in inline {
+        let line_text = lines.get(comment.line as usize).copied().unwrap_or("");
+        let comment_text = line_text.get(comment.start_byte_on_line..).unwrap_or("");
+        if is_skip_line(comment_text, comment.line == 0)
+            || suppressions.is_suppressed_code(comment.line, rule_ids::COMMENTED_CODE)
+        {
+            continue;
+        }
+        let stripped = strip_and_join(&[comment_text]);
+        if !looks_like_code(&stripped) {
+            continue;
+        }
+        let start_col = byte_offset_to_utf16_column(line_text, comment.start_byte_on_line);
+        let end_col = byte_offset_to_utf16_column(line_text, line_text.len());
+        out.push(Diagnostic {
+            range: Range {
+                start: Position::new(comment.line, start_col),
+                end: Position::new(comment.line, end_col),
+            },
+            severity: Some(severity),
+            source: Some(LINT_SOURCE.to_string()),
+            code: Some(NumberOrString::String(rule_ids::COMMENTED_CODE.to_string())),
+            message: "Commented code should be removed.".to_string(),
+            ..Default::default()
+        });
+    }
 
     // Group consecutive standalone comments (adjacent lines, nothing else in
     // between), then *split* each group on any line that is itself a skip
@@ -144,7 +171,18 @@ struct StandaloneComment {
     start_byte_on_line: usize,
 }
 
-fn collect_standalone<'a>(node: Node<'a>, lines: &[&str], out: &mut Vec<StandaloneComment>) {
+#[derive(Debug, Clone, Copy)]
+struct InlineComment {
+    line: u32,
+    start_byte_on_line: usize,
+}
+
+fn collect_comments<'a>(
+    node: Node<'a>,
+    lines: &[&str],
+    standalone: &mut Vec<StandaloneComment>,
+    inline: &mut Vec<InlineComment>,
+) {
     if node.kind() == "comment" {
         let start = node.start_position();
         let line_idx = start.row;
@@ -162,7 +200,12 @@ fn collect_standalone<'a>(node: Node<'a>, lines: &[&str], out: &mut Vec<Standalo
                     .bytes()
                     .all(|b| b == b' ' || b == b'\t')
             {
-                out.push(StandaloneComment {
+                standalone.push(StandaloneComment {
+                    line: line_idx as u32,
+                    start_byte_on_line: col_bytes,
+                });
+            } else if col_bytes <= line.len() {
+                inline.push(InlineComment {
                     line: line_idx as u32,
                     start_byte_on_line: col_bytes,
                 });
@@ -172,7 +215,7 @@ fn collect_standalone<'a>(node: Node<'a>, lines: &[&str], out: &mut Vec<Standalo
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_standalone(child, lines, out);
+        collect_comments(child, lines, standalone, inline);
     }
 }
 

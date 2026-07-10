@@ -163,7 +163,7 @@ pub(crate) fn collect_declared_s3_generics(root: Node<'_>, text: &str) -> HashSe
 /// Descend a `$`/`@` extract chain to its leftmost object. Any other shape
 /// (subscripts, calls) is returned as-is and skipped by the caller's kind
 /// check.
-fn leftmost_extract_object<'t>(node: Node<'t>) -> Node<'t> {
+pub(crate) fn leftmost_extract_object<'t>(node: Node<'t>) -> Node<'t> {
     let mut current = node;
     while current.kind() == "extract_operator" {
         match current.child_by_field_name("lhs") {
@@ -296,35 +296,9 @@ fn check_binding_call(
         SymbolKind::Variable => "x",
         _ => "name",
     };
-    let Some(args) = node.child_by_field_name("arguments") else {
+    let Some(name_node) = binding_call_literal_name(node, named, text) else {
         return;
     };
-    // The name is the first positional argument, or the one named `x` /
-    // `name` (lintr accepts either spelling).
-    let mut cursor = args.walk();
-    let mut name_node = None;
-    for child in args.children(&mut cursor) {
-        if child.kind() != "argument" {
-            continue;
-        }
-        match child.child_by_field_name("name") {
-            Some(arg_name) if node_text(arg_name, text) == named => {
-                name_node = child.child_by_field_name("value");
-                break;
-            }
-            Some(_) => {}
-            None => {
-                name_node = child.child_by_field_name("value");
-                break;
-            }
-        }
-    }
-    let Some(name_node) = name_node else {
-        return;
-    };
-    if name_node.kind() != "string" {
-        return;
-    }
     let patterns = patterns_for(kind, cx.styles);
     if patterns.is_disabled() {
         return;
@@ -338,6 +312,36 @@ fn check_binding_call(
         cx,
         out,
     );
+}
+
+/// The literal string node holding a binding call's name: the first
+/// positional argument, or the one named `formal` (lintr accepts either
+/// spelling). Returns `None` for non-literal names.
+pub(crate) fn binding_call_literal_name<'t>(
+    call: Node<'t>,
+    formal: &str,
+    text: &str,
+) -> Option<Node<'t>> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let mut name_node = None;
+    for child in args.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        match child.child_by_field_name("name") {
+            Some(arg_name) if node_text(arg_name, text) == formal => {
+                name_node = child.child_by_field_name("value");
+                break;
+            }
+            Some(_) => {}
+            None => {
+                name_node = child.child_by_field_name("value");
+                break;
+            }
+        }
+    }
+    name_node.filter(|n| n.kind() == "string")
 }
 
 /// Check formal arguments of a `function_definition` node.
