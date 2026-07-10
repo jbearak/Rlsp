@@ -72,6 +72,14 @@ fn callee_checks(function: Node<'_>, text: &str) -> CalleeChecks {
             _ => CalleeChecks::None,
         },
         "extract_operator" => {
+            // A string member callee (`obj$"foo"(1)`) is exempt like any
+            // other string callee.
+            if function
+                .child_by_field_name("rhs")
+                .is_none_or(|rhs| rhs.kind() != "identifier")
+            {
+                return CalleeChecks::None;
+            }
             match function
                 .child_by_field_name("operator")
                 .and_then(|op| text.get(op.start_byte()..op.end_byte()))

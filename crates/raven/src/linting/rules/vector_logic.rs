@@ -56,9 +56,18 @@ fn visit(
     if node.kind() == "call" {
         match callee_name(node, text) {
             // testthat conditions behave like `if`/`while` conditions.
+            // lintr scans every direct argument expression, not just the
+            // resolved `object` (`expect_true(info = x & y, ...)` flags too).
             Some("expect_true") | Some("expect_false") => {
-                if let Some(object) = object_argument_value(node, text) {
-                    scan_condition(object, text, severity, suppressions, out);
+                if let Some(args) = node.child_by_field_name("arguments") {
+                    let mut cursor = args.walk();
+                    for child in args.children(&mut cursor) {
+                        if child.kind() == "argument"
+                            && let Some(value) = child.child_by_field_name("value")
+                        {
+                            scan_condition(value, text, severity, suppressions, out);
+                        }
+                    }
                 }
             }
             // Subsetting contexts: scalar `&&`/`||` are wrong. `stats::filter`
@@ -101,38 +110,6 @@ fn is_stats_qualified(call: Node<'_>, text: &str) -> bool {
         .and_then(|f| f.child_by_field_name("lhs"))
         .and_then(|lhs| text.get(lhs.start_byte()..lhs.end_byte()))
         == Some("stats")
-}
-
-/// The tested expression of an `expect_true()`/`expect_false()` call: the
-/// argument named `object` when present, otherwise the first *positional*
-/// argument — `expect_true(info = "x", object = x & y)` tests `x & y`.
-fn object_argument_value<'t>(call: Node<'t>, text: &str) -> Option<Node<'t>> {
-    let args = call.child_by_field_name("arguments")?;
-    let mut cursor = args.walk();
-    let mut first_positional = None;
-    for child in args.children(&mut cursor) {
-        if child.kind() != "argument" {
-            continue;
-        }
-        match child.child_by_field_name("name") {
-            // R partially matches formals: `obj =` binds to `object`
-            // (expect_true's other formals start with different letters).
-            Some(name)
-                if text
-                    .get(name.start_byte()..name.end_byte())
-                    .is_some_and(|n| !n.is_empty() && "object".starts_with(n)) =>
-            {
-                return child.child_by_field_name("value");
-            }
-            Some(_) => {}
-            None => {
-                if first_positional.is_none() {
-                    first_positional = child.child_by_field_name("value");
-                }
-            }
-        }
-    }
-    first_positional
 }
 
 /// Flag scalar `&&` / `||` inside `subset()` / `filter()` arguments. Recurses

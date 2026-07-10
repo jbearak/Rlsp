@@ -106,6 +106,8 @@ fn is_excluded_position(ident: Node<'_>) -> bool {
         return true;
     }
     match parent.kind() {
+        // `pkg::T` names the package's export, not the boolean shorthand.
+        "namespace_operator" => true,
         "extract_operator" => {
             // `$` / `@`: skip the RHS field name; LHS is a real reference.
             // Centralized in `crate::extract_op` so this predicate,

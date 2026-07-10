@@ -135,14 +135,13 @@ pub(crate) fn collect_declared_s3_generics(root: Node<'_>, text: &str) -> HashSe
         let Some(op) = child.child_by_field_name("operator") else {
             continue;
         };
+        // lintr's declared_s3_generics only matches LEFT_ASSIGN / EQ_ASSIGN
+        // declarations; a right-assigned `function(x) UseMethod(...) -> g`
+        // does not register the generic there.
         let (target, value) = match node_text(op, text) {
             "<-" | "<<-" | "=" => (
                 child.child_by_field_name("lhs"),
                 child.child_by_field_name("rhs"),
-            ),
-            "->" | "->>" => (
-                child.child_by_field_name("rhs"),
-                child.child_by_field_name("lhs"),
             ),
             _ => continue,
         };
@@ -346,24 +345,34 @@ pub(crate) fn binding_call_literal_name<'t>(
 ) -> Option<Node<'t>> {
     let args = call.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
-    let mut name_node = None;
+    let mut first_positional = None;
     for child in args.children(&mut cursor) {
         if child.kind() != "argument" {
             continue;
         }
         match child.child_by_field_name("name") {
-            Some(arg_name) if node_text(arg_name, text) == formal => {
-                name_node = child.child_by_field_name("value");
-                break;
+            // A named binding anywhere in the call wins over positional
+            // matching (`assign(1, x = "name")` binds `x` by name); R
+            // partially matches formals, so any prefix of the formal binds.
+            Some(arg_name)
+                if {
+                    let name = node_text(arg_name, text);
+                    !name.is_empty() && formal.starts_with(name)
+                } =>
+            {
+                return child
+                    .child_by_field_name("value")
+                    .filter(|n| n.kind() == "string");
             }
             Some(_) => {}
             None => {
-                name_node = child.child_by_field_name("value");
-                break;
+                if first_positional.is_none() {
+                    first_positional = child.child_by_field_name("value");
+                }
             }
         }
     }
-    name_node.filter(|n| n.kind() == "string")
+    first_positional.filter(|n| n.kind() == "string")
 }
 
 /// Check formal arguments of a `function_definition` node.
