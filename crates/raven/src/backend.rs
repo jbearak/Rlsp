@@ -7733,6 +7733,16 @@ impl LanguageServer for Backend {
         self.check_and_warn_traversal_truncation().await;
     }
 
+    /// Close the live document and clear its editor diagnostics before any
+    /// asynchronous disk resync or dependent revalidation begins.
+    ///
+    /// Raven publishes diagnostics only for live documents. LSP push
+    /// diagnostics are server-owned, so removing the document from
+    /// [`WorldState::documents`] is not enough: the client may retain the last
+    /// published Problems entries indefinitely. Publishing an empty list after
+    /// the close commit prevents those stale entries from causing VS Code to
+    /// load the closed resources as hidden text documents, which would send a
+    /// new `didOpen` and repopulate the diagnostics.
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
         log::trace!("diagnostics lifecycle: didClose uri={}", uri);
@@ -8049,6 +8059,19 @@ impl LanguageServer for Backend {
             let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
             (sibling_fanout, debounce_ms)
         };
+
+        // Push diagnostics are owned by the server and survive document close
+        // unless explicitly replaced. Clear the raw client URI after the state
+        // commit (pending work is cancelled and the gate is cleared above) but
+        // before slower close-time rescans. With the LSP dispatcher serialized,
+        // a subsequent didOpen cannot overtake this empty publication.
+        log::trace!(
+            "diagnostics lifecycle: publish uri={} count=0 path=close-clear open=false",
+            uri
+        );
+        self.client
+            .publish_diagnostics(uri.clone(), Vec::new(), None)
+            .await;
 
         // Switch the prelude to a remaining live `.Rprofile` alias, or revert
         // it to on-disk `.Rprofile` after a close (off-lock).
@@ -11533,6 +11556,108 @@ async fn run_libpath_consumer(
 
 #[cfg(test)]
 mod tests {
+    mod diagnostic_lifecycle {
+        use futures_util::StreamExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+        use tower::{Service, ServiceExt};
+        use tower_lsp::jsonrpc::Request;
+        use tower_lsp::lsp_types::{
+            Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
+            PublishDiagnosticsParams, Range, TextDocumentIdentifier, TextDocumentItem, Url,
+        };
+        use tower_lsp::{LanguageServer, LspService};
+
+        /// Push diagnostics are server-owned. Closing Raven's last live buffer
+        /// for a URI must therefore replace its nonempty Problems entries with
+        /// an empty publication; removing the URI from `WorldState::documents`
+        /// alone does not clear the client collection.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn did_close_publishes_empty_diagnostics_for_closed_uri() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("close-me.R");
+            let text = "definitely_missing_close_clear\n";
+            std::fs::write(&path, text).unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                // Keep didOpen's own diagnostic task pending; didClose below
+                // must cancel it before it can race the explicit stale marker.
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+
+            // Model the nonempty push diagnostics already owned by the client.
+            // The close handler, not a fresh diagnostic computation, is what
+            // must replace this marker with an empty list.
+            backend
+                .client
+                .publish_diagnostics(
+                    uri.clone(),
+                    vec![Diagnostic::new_simple(
+                        Range::default(),
+                        "stale diagnostic".into(),
+                    )],
+                    None,
+                )
+                .await;
+            let initial = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("seed diagnostic must publish")
+                .expect("client socket must remain open");
+            assert_eq!(initial.method(), "textDocument/publishDiagnostics");
+            let initial: PublishDiagnosticsParams =
+                serde_json::from_value(initial.params().unwrap().clone()).unwrap();
+            assert_eq!(initial.uri, uri);
+            assert!(
+                !initial.diagnostics.is_empty(),
+                "precondition: the open document must own nonempty diagnostics"
+            );
+
+            backend
+                .did_close(DidCloseTextDocumentParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                })
+                .await;
+
+            let cleared = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("close must clear diagnostics")
+                .expect("client socket must remain open");
+            assert_eq!(cleared.method(), "textDocument/publishDiagnostics");
+            let cleared: PublishDiagnosticsParams =
+                serde_json::from_value(cleared.params().unwrap().clone()).unwrap();
+            assert_eq!(cleared.uri, uri);
+            assert!(
+                cleared.diagnostics.is_empty(),
+                "closed document diagnostics must be cleared, got {:?}",
+                cleared.diagnostics
+            );
+        }
+    }
+
     mod document_indent_units {
         #[test]
         fn normalizes_client_supplied_indent_units() {
