@@ -5065,14 +5065,47 @@ async fn run_debounced_diagnostics(
         // instants between the final pre-consume re-check and
         // try_consume_publish, in which case this publish consumed the force
         // marker meant for the successor and the successor would be gated out
-        // at the same version. Restoring a marker here lets the successor's
-        // fresh publish through; if the cancellation instead came from
-        // did_close, the surplus marker is either cleared by the close or
-        // admits at most one redundant fresh same-version republish.
+        // at the same version. Restore a marker AND respawn a fresh consumer:
+        // the marker alone can be stranded (the successor's unlocked advisory
+        // pre-check can observe the consumed gate and give up before this
+        // restore lands), while the respawn guarantees a consumer exists for
+        // the restored marker. The respawn's schedule() supersedes any pending
+        // successor, it blocks on the publish lock until this task releases
+        // it, and it only re-enters this branch if it loses the same race to
+        // yet another superseding edit — so it cannot loop absent new edits.
+        // If the cancellation instead came from did_close, the close's
+        // gate.clear (serialized behind the publish lock this task holds)
+        // removes the surplus marker and the respawn bails at its
+        // eligibility checks.
         if cancel.is_cancelled() {
             state.diagnostics_gate.mark_force_republish(&affected_uri);
+            tokio::spawn(respawn_publish_after_superseded(
+                Arc::clone(&state_arc),
+                client.clone(),
+                affected_uri.clone(),
+                traversal_truncation.clone(),
+            ));
         }
     }
+}
+
+/// Respawn helper for the cancel-vs-consume backstop in
+/// `run_debounced_diagnostics`: runs the normal debounced pipeline for the
+/// URI so the restored force marker has a guaranteed consumer.
+///
+/// Returned as a boxed trait object with an explicit signature because the
+/// respawn makes the future type recursive (`run_debounced_diagnostics` →
+/// `publish_diagnostics_via_arc` → `run_debounced_diagnostics`); without the
+/// named indirection the compiler cannot resolve the cyclic `Send` obligation.
+fn respawn_publish_after_superseded(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    uri: Url,
+    traversal_truncation: Option<Arc<TraversalTruncationState>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        Backend::publish_diagnostics_via_arc(state_arc, client, &uri, traversal_truncation).await;
+    })
 }
 
 pub(crate) enum RavenProjectConfigLoaded {}
