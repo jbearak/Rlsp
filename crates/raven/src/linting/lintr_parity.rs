@@ -119,11 +119,13 @@ const CASES: &[Case] = &[
         false,
     ),
     case(Rule::AssignmentOperator, "right arrow", "1 -> x\n", true),
+    // lintr 3.3.0.1's default is `operator = c("<-", "<<-")` — `<<-` is
+    // allowed (verified empirically; lintr dev narrows the default to "<-").
     case(
         Rule::AssignmentOperator,
         "superassignment",
         "x <<- 1\n",
-        true,
+        false,
     ),
     case(Rule::ObjectName, "snake case", "good_name <- 1\n", false),
     case(Rule::ObjectName, "camel case", "badName <- 1\n", true),
@@ -386,11 +388,14 @@ const CASES: &[Case] = &[
         "if (x) {\ny <- 1\n}\n",
         true,
     ),
+    // Real lintr 3.3.0.1 flags the second operand line here ("Indentation
+    // should be 8 spaces but is 4") — binary-operator continuations indent
+    // one more unit, and styler formats them that way (issue #589 discussion).
     case(
         Rule::Indentation,
         "aligned parenthesized Boolean clauses",
         "changed <- !(\n    (is.na(old) & is.na(new)) |\n    (!is.na(old) & !is.na(new))\n)\n",
-        false,
+        true,
     ),
 ];
 

@@ -47,6 +47,10 @@ pub enum ObjectNameStyle {
     UpperCase,
     /// `lowercase` — a single all-lowercase word with no separators.
     Lowercase,
+    /// `symbols` — a name containing *only* non-alphanumeric characters,
+    /// e.g. an operator overload like `%+%` or `!=`. Part of lintr's default
+    /// styles so operator definitions pass under the default configuration.
+    Symbols,
     /// `any` — disable the check for this kind of symbol.
     Any,
 }
@@ -60,6 +64,7 @@ const OBJECT_NAME_STYLE_NAMES: &[(&str, ObjectNameStyle)] = &[
     ("dotted.case", ObjectNameStyle::DottedCase),
     ("UPPER_CASE", ObjectNameStyle::UpperCase),
     ("lowercase", ObjectNameStyle::Lowercase),
+    ("symbols", ObjectNameStyle::Symbols),
     ("any", ObjectNameStyle::Any),
 ];
 
@@ -182,8 +187,8 @@ pub struct LintConfig {
     /// Master switch. When `false`, [`crate::linting::run_lints`] returns an
     /// empty vector regardless of per-rule severities.
     pub enabled: bool,
-    /// Maximum allowed line length, measured in UTF-16 code units to align
-    /// with how LSP positions are reported.
+    /// Maximum allowed line length, measured in characters (matching
+    /// lintr's `nchar()`).
     pub line_length: u32,
     /// Maximum allowed identifier length (object-length rule). Identifiers
     /// longer than this are flagged. Measured in characters of the name.
@@ -276,9 +281,12 @@ impl Default for LintConfig {
             indentation_unit: 2,
             assignment_operator_style: AssignmentOperatorStyle::default(),
             string_delimiter: StringDelimiter::default(),
-            object_name_style_function: vec![ObjectNameStyle::SnakeCase],
-            object_name_style_variable: vec![ObjectNameStyle::SnakeCase],
-            object_name_style_argument: vec![ObjectNameStyle::SnakeCase],
+            // lintr's default is `styles = c("snake_case", "symbols")`; the
+            // `symbols` member is what lets operator definitions like
+            // `` `%+%` <- ... `` pass under the default configuration.
+            object_name_style_function: vec![ObjectNameStyle::SnakeCase, ObjectNameStyle::Symbols],
+            object_name_style_variable: vec![ObjectNameStyle::SnakeCase, ObjectNameStyle::Symbols],
+            object_name_style_argument: vec![ObjectNameStyle::SnakeCase, ObjectNameStyle::Symbols],
             object_name_regexes_function: Vec::new(),
             object_name_regexes_variable: Vec::new(),
             object_name_regexes_argument: Vec::new(),

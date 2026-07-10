@@ -270,38 +270,38 @@ Native style diagnostics (18 of [`lintr`](https://lintr.r-lib.org/)'s default ru
 
 | Diagnostic | Default Severity | Trigger |
 |---|---|---|
-| Line length | information | Line exceeds `raven.linting.lineLength` (default 80 UTF-16 code units) |
-| Trailing whitespace | information | Spaces or tabs at end of line |
-| Tab character | information | Tab character anywhere in source |
+| Line length | information | Line exceeds `raven.linting.lineLength` (default 80 characters, matching `lintr`'s `nchar()`) |
+| Trailing whitespace | information | Spaces or tabs at end of line (whitespace inside a multi-line string is part of its value and exempt) |
+| Tab character | information | Tab used for indentation (tabs in comments, strings, or between tokens are exempt, matching `lintr::whitespace_linter`) |
 | Trailing blank lines | information | Blank lines at end of file, or missing final newline |
 | Assignment operator | information | Top-level assignment uses an operator other than the preferred one (`<-` by default; configurable via `raven.linting.assignmentOperator`) |
-| Object name | information | Function, variable, or argument name doesn't match the configured named styles or regexes (`snake_case` by default; configurable per kind via `raven.linting.objectNameStyle*` and `raven.linting.objectNameRegexes*`) |
-| Object length | information | Identifier name exceeds `raven.linting.objectLength` characters (default 30; leading `.` not counted) |
-| Infix spaces | information | Missing space around a binary operator (`a+b`, `x<-1`, `a%>%b`, `if (a<=b)`), or stray space around a tight-binding operator (`obj $ field`, `1 : 10`, unary `- x`) |
-| Commented code | information | A standalone comment whose body parses as R and contains a call, assignment, or operator (`# foo(bar)`, `# x <- 1 + 2`) |
-| Quotes | information | String literal not using the preferred delimiter (`raven.linting.stringDelimiter`; default `"`). Raw strings are exempt |
+| Object name | information | Function, variable, or argument name doesn't match the configured named styles or regexes (`snake_case` + `symbols` by default, matching `lintr`; configurable per kind via `raven.linting.objectNameStyle*` and `raven.linting.objectNameRegexes*`) |
+| Object length | information | Identifier name exceeds `raven.linting.objectLength` characters (default 30; S3 methods measure only the part after a known generic prefix) |
+| Infix spaces | information | Missing space around one of `lintr`'s low-precedence operators (`a+b`, `x<-1`, `a%>%b`, `f(x=1)`); high-precedence operators (`^`, `:`, `::`, `$`, `@`) and unary forms are never linted |
+| Commented code | information | A comment (standalone block or end-of-line) whose body parses as R and contains a call, assignment, or operator (`# foo(bar)`, `# x <- 1 + 2`) |
+| Quotes | information | String literal (raw strings included) not using the preferred delimiter (`raven.linting.stringDelimiter`; default `"`); literals containing the preferred quote character are exempt |
 | Commas | information | Whitespace before `,` (`a , b`) or missing whitespace after `,` (`c(1,2)`). Newline after comma is fine |
-| `T` / `F` symbol | information | Bare `T` / `F` used in reference position (use `TRUE` / `FALSE`). Skipped at assignment targets, named arguments, formal parameters, and `$`/`@` field names |
+| `T` / `F` symbol | information | Bare `T` / `F` used in reference position (use `TRUE` / `FALSE`), with a dedicated message at assignment targets. Skipped for named arguments, formal parameters, `$`/`@` field names, formula terms, subscripted uses, and callees |
 | Semicolon | information | `;` separator outside strings/comments (`a; b`, trailing `a;`) |
-| Equals NA | information | `x == NA`, `x != NA`, or any typed-`NA` variant on either side. Use `is.na(x)` |
-| Vector logic | information | `&` or `\|` in an `if` / `while` condition (use `&&` / `\|\|` for scalars). Scan stops at call boundaries |
-| Function left parentheses | information | Whitespace between `function` (or `\`) and `(` (`function (x) ...`, `\ (x) ...`) |
-| Spaces inside | information | Whitespace immediately inside `(`, `[`, or `[[` (`f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are exempt |
+| Equals NA | information | `x == NA`, `x != NA` (either side), any typed-`NA` variant, or `x %in% NA`. Use `is.na(x)` |
+| Vector logic | information | `&` or `\|` in an `if` / `while` / `expect_true()` condition, and `&&` / `\|\|` inside `subset()` / `filter()` arguments. Condition scan stops at call boundaries; bitwise-arithmetic operands are exempt |
+| Function left parentheses | information | Whitespace between `function` (or `\`) and `(`, or between a call's function name and its `(` (`blah (1)`) |
+| Spaces inside | information | Whitespace immediately inside `(`, `[`, or `[[` (`f( x )`, `df[ 1 ]`, `f( )`). Multi-line wrapping and comma/`= )` neighbors are exempt |
 | Indentation | information | Leading whitespace doesn't match the expected indent for the line's AST scope (braced blocks, multi-line argument lists, continuation lines). Configurable indent unit via `raven.linting.indentationUnit` (default `"auto"` in VS Code, tracking each file's resolved `editor.tabSize`) |
 
 Lint diagnostics carry the `source` field `raven (lint)` so they're easy to distinguish from cross-file or syntax diagnostics. Named-argument `=` inside function calls is never flagged.
 
-The infix-spaces lint flags two opposing cases. **Spaces required** on both sides: arithmetic (`+`, `-`, `*`, `/`, `^`), comparison (`<`, `<=`, `==`, `!=`, ...), logical (`&`, `&&`, `|`, `||`), assignment (`<-`, `<<-`, `->`, `->>`, `=`), pipe (`|>`, `%>%`, any `%...%`), and binary formula (`y ~ x`). **No spaces** on either side: sequence (`:`), namespace (`::`, `:::`), member access (`$`, `@`), and unary `-`, `+`, `!`, `?`. The rule is conservative — alignment whitespace (`x   <- 1`) is not flagged, and line-continuation cases (operator at end of line, RHS on the next line) are skipped since the line break supplies the separation.
+The infix-spaces lint requires at least one space on both sides of `lintr`'s low-precedence operator set: arithmetic (`+`, `-`, `*`, `/`), comparison (`<`, `<=`, `==`, `!=`, ...), logical (`&`, `&&`, `|`, `||`), assignment (`<-`, `<<-`, `:=`, `->`, `->>`, `=` — including named-argument and formal-default `=`), pipe (`|>`, `%>%`, any `%...%`), and binary formula (`y ~ x`). High-precedence operators (`^`/`**`, `:`, `::`, `:::`, `$`, `@`, `?`) and unary `-`, `+`, `!`, `~` are never linted, matching `lintr`. Alignment whitespace (`x   <- 1`) is not flagged, and line-continuation cases (operator at end of line, RHS on the next line) are skipped since the line break supplies the separation.
 
-The commented-code lint groups consecutive standalone comment lines and try-parses their bodies as R. A block is reported when it parses without errors **and** contains at least one call, assignment, binary/unary operator, function definition, or control-flow construct — bare identifiers and literals are treated as prose. End-of-line comments next to real code (`x <- 1 # explain`) are never flagged. Roxygen lines (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines (`# -*- ... -*-`), and `# nolint` / `# raven:` / `# @lsp-…` directives are skipped up front.
+The commented-code lint groups consecutive standalone comment lines (and checks end-of-line comments individually) and try-parses their bodies as R. A comment is reported when it parses without errors **and** contains at least one call, assignment, binary/unary operator, function definition, or control-flow construct — bare identifiers, literals, juxtaposed prose, and lone `-`/`?` operators are treated as prose. Roxygen lines (`#'`), shebangs, annotation comments (`# TODO:`, `# FIXME:`, `# NOTE:`, `# XXX:`, `# HACK:`, `# BUG:`, `# WARNING:`, `# OPTIMIZE:`), Emacs mode lines (`# -*- ... -*-`), and `# nolint` / `# raven:` / `# @lsp-…` directives are skipped up front.
 
-The object-name lint has independent settings for **functions** (`objectNameStyleFunction`, `objectNameRegexesFunction`), **variables** (`objectNameStyleVariable`, `objectNameRegexesVariable`), and **arguments** (`objectNameStyleArgument`, `objectNameRegexesArgument`). Each style key accepts one named style or an array of styles: `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, or `any`. Names pass when they match any named style or regex for that kind. Using `any` accepts all names for that kind; an empty style array with regexes is regex-only mode.
+The object-name lint has independent settings for **functions** (`objectNameStyleFunction`, `objectNameRegexesFunction`), **variables** (`objectNameStyleVariable`, `objectNameRegexesVariable`), and **arguments** (`objectNameStyleArgument`, `objectNameRegexesArgument`). Each style key accepts one named style or an array of styles: `snake_case`, `camelCase`, `dotted.case`, `UPPER_CASE`, `lowercase`, `symbols`, or `any`. Names pass when they match any named style or regex for that kind. Using `any` accepts all names for that kind; an empty style array with regexes is regex-only mode.
 
 > [!NOTE]
 > Some names are always accepted regardless of the configured style:
 > - Named styles treat an optional leading `.` as decorative; the rest of the name must still match (e.g. `.helper` under `snake_case` is fine, `.myHelper` is not). Custom regexes match the full identifier including the leading dot.
-> - Function definitions with the shape `<generic>.<class>` are exempt when `<generic>` is a known base R S3 generic (`print.MyClass`, `as.Date.character`, `print.data.frame`, etc.). For less-common generics, use `# nolint` or `# raven: ignore`.
-> - Backtick-quoted names (e.g. `` `with spaces` ``, `` `+.MyClass` ``) are skipped entirely. Non-ASCII identifiers are skipped only when no regexes are configured for the kind; with regexes configured they are checked against the regexes.
+> - Names with the shape `<generic>.<class>` are exempt when `<generic>` is a known base R S3 generic (`print.MyClass`, `as.Date.character`, `` `+.MyClass` ``) or a generic declared in the same file via `UseMethod`. For other generics, use `# nolint` or `# raven: ignore`.
+> - Backtick-quoted names are *stripped*, not skipped (`` `myBadName` <- 1 `` lints like `myBadName <- 1`); operator overloads like `` `%+%` `` pass via the default `symbols` style. Non-ASCII identifiers are skipped only when no regexes are configured for the kind; with regexes configured they are checked against the regexes.
 
 **Suppression:** lint diagnostics honor the `lintr` conventions in addition to Raven's own:
 

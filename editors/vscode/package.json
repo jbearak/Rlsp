@@ -1567,7 +1567,7 @@
           "default": 80,
           "minimum": 20,
           "maximum": 10000,
-          "description": "Maximum allowed line length for the line-length lint. Width is measured in UTF-16 code units. Set raven.linting.lineLengthSeverity to \"off\" to disable the rule without affecting other lints."
+          "description": "Maximum allowed line length for the line-length lint. Width is measured in characters, matching lintr. Set raven.linting.lineLengthSeverity to \"off\" to disable the rule without affecting other lints."
         },
         "raven.linting.assignmentOperator": {
           "type": "string",
@@ -1577,10 +1577,10 @@
             "="
           ],
           "enumDescriptions": [
-            "Require `<-` for assignment; flag top-level `=` assignments.",
-            "Require `=` for assignment; flag top-level `<-` assignments."
+            "Require `<-` for assignment; flag `=`, `->`, `->>`, and `%<>%` assignments.",
+            "Require `=` for assignment; flag `<-`, `<<-`, `->`, `->>`, and `%<>%` assignments."
           ],
-          "description": "Preferred assignment operator. The lint never flags `=` inside argument lists (named arguments)."
+          "description": "Preferred assignment operator. Named-argument `=` is never flagged, and assignments nested inside call arguments or if/while/for conditions are excluded, matching lintr's default."
         },
         "raven.linting.lineLengthSeverity": {
           "type": "string",
@@ -1637,7 +1637,7 @@
             "Disable the no-tab lint"
           ],
           "default": "information",
-          "description": "Severity for tab characters in source. Set to \"off\" to disable the rule."
+          "description": "Severity for tabs used in indentation (tabs in comments, strings, or between tokens are not flagged, matching lintr). Set to \"off\" to disable the rule."
         },
         "raven.linting.trailingBlankLinesSeverity": {
           "type": "string",
@@ -1687,6 +1687,7 @@
                 "dotted.case",
                 "UPPER_CASE",
                 "lowercase",
+                "symbols",
                 "any"
               ],
               "enumDescriptions": [
@@ -1695,6 +1696,7 @@
                 "Require lowercase words separated by dots (e.g. my.function)",
                 "Require uppercase words separated by underscores (e.g. MY_CONSTANT)",
                 "Require a single all-lowercase word (e.g. mything)",
+                "Accept names made up entirely of non-alphanumeric characters (operator overloads like %+%)",
                 "Disable the function-name check (variable and argument checks may still run)"
               ]
             },
@@ -1708,12 +1710,13 @@
                   "dotted.case",
                   "UPPER_CASE",
                   "lowercase",
+                  "symbols",
                   "any"
                 ]
               }
             }
           ],
-          "default": "snake_case",
+          "default": ["snake_case", "symbols"],
           "description": "Required naming scheme for functions (assignments whose value is a function definition). Accepts one named style or an array of named styles; a function name passes if it matches any listed style or any raven.linting.objectNameRegexesFunction regex. Include \"any\" to accept all function names. Set an explicit empty array to require regex matches only when raven.linting.objectNameRegexesFunction is non-empty; with both arrays empty, the function-name check is disabled. Names that look like S3 method dispatch (e.g. print.MyClass) are exempted automatically."
         },
         "raven.linting.objectNameStyleVariable": {
@@ -1726,6 +1729,7 @@
                 "dotted.case",
                 "UPPER_CASE",
                 "lowercase",
+                "symbols",
                 "any"
               ],
               "enumDescriptions": [
@@ -1734,6 +1738,7 @@
                 "Require lowercase words separated by dots (e.g. my.variable)",
                 "Require uppercase words separated by underscores (e.g. MY_CONSTANT)",
                 "Require a single all-lowercase word (e.g. myvar)",
+                "Accept names made up entirely of non-alphanumeric characters (operator overloads like %+%)",
                 "Disable the variable-name check (function and argument checks may still run)"
               ]
             },
@@ -1747,12 +1752,13 @@
                   "dotted.case",
                   "UPPER_CASE",
                   "lowercase",
+                  "symbols",
                   "any"
                 ]
               }
             }
           ],
-          "default": "snake_case",
+          "default": ["snake_case", "symbols"],
           "description": "Required naming scheme for variables (assignments whose value is not a function definition). Accepts one named style or an array of named styles; a variable name passes if it matches any listed style or any raven.linting.objectNameRegexesVariable regex. Include \"any\" to accept all variable names. Set an explicit empty array to require regex matches only when raven.linting.objectNameRegexesVariable is non-empty; with both arrays empty, the variable-name check is disabled."
         },
         "raven.linting.objectNameStyleArgument": {
@@ -1765,6 +1771,7 @@
                 "dotted.case",
                 "UPPER_CASE",
                 "lowercase",
+                "symbols",
                 "any"
               ],
               "enumDescriptions": [
@@ -1773,6 +1780,7 @@
                 "Require lowercase words separated by dots (e.g. my.arg)",
                 "Require uppercase words separated by underscores (e.g. MY_ARG)",
                 "Require a single all-lowercase word (e.g. arg)",
+                "Accept names made up entirely of non-alphanumeric characters (operator overloads like %+%)",
                 "Disable the argument-name check (function and variable checks may still run)"
               ]
             },
@@ -1786,12 +1794,13 @@
                   "dotted.case",
                   "UPPER_CASE",
                   "lowercase",
+                  "symbols",
                   "any"
                 ]
               }
             }
           ],
-          "default": "snake_case",
+          "default": ["snake_case", "symbols"],
           "description": "Required naming scheme for function formal arguments. Accepts one named style or an array of named styles; an argument name passes if it matches any listed style or any raven.linting.objectNameRegexesArgument regex. Include \"any\" to accept all argument names. Set an explicit empty array to require regex matches only when raven.linting.objectNameRegexesArgument is non-empty; with both arrays empty, the argument-name check is disabled."
         },
         "raven.linting.objectNameRegexesFunction": {
@@ -1888,7 +1897,7 @@
             "Disable the infix-spaces lint"
           ],
           "default": "information",
-          "description": "Severity for the infix-spaces lint. Flags missing spaces around binary operators (`+`, `==`, `<-`, `|>`, `%>%`, etc.) and stray whitespace around tight-binding operators (`::`, `$`, `:`, unary `-/+/!`). Alignment whitespace (multiple spaces) and line-continuations are not flagged."
+          "description": "Severity for the infix-spaces lint. Flags missing spaces around lintr's low-precedence operators (`+`, `==`, `<-`, `|>`, `%>%`, named-argument `=`, etc.). High-precedence operators (`^`, `:`, `::`, `$`, `@`) and unary forms are never linted. Alignment whitespace (multiple spaces) and line-continuations are not flagged."
         },
         "raven.linting.commentedCodeSeverity": {
           "type": "string",
@@ -1920,7 +1929,7 @@
             "Require double quotes (\"...\") for string literals.",
             "Require single quotes ('...') for string literals."
           ],
-          "description": "Preferred string-literal delimiter. Used by the quotes lint. Raw strings (r\"(...)\") are exempt."
+          "description": "Preferred string-literal delimiter. Used by the quotes lint. Literals containing the preferred quote character are exempt (switching would force escaping)."
         },
         "raven.linting.quotesSeverity": {
           "type": "string",
@@ -1939,7 +1948,7 @@
             "Disable the quotes lint"
           ],
           "default": "information",
-          "description": "Severity for the quotes lint. Flags string literals not using the configured `raven.linting.stringDelimiter`. Raw strings are exempt."
+          "description": "Severity for the quotes lint. Flags string literals (raw strings included) not using the configured `raven.linting.stringDelimiter`; literals containing the preferred quote character are exempt."
         },
         "raven.linting.commasSeverity": {
           "type": "string",
@@ -1977,7 +1986,7 @@
             "Disable the T/F symbol lint"
           ],
           "default": "information",
-          "description": "Severity for the T/F-symbol lint. Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`. Assignment targets, named arguments, formal parameters, and `$`/`@` field names are exempt."
+          "description": "Severity for the T/F-symbol lint. Flags bare `T` / `F` identifiers used as references to `TRUE` / `FALSE`; assignment targets get a dedicated variable-name message. Named arguments, formal parameters, `$`/`@` field names, formula terms, subscripted uses, and callees are exempt."
         },
         "raven.linting.semicolonSeverity": {
           "type": "string",
@@ -2022,7 +2031,7 @@
           "default": 30,
           "minimum": 5,
           "maximum": 1000,
-          "description": "Maximum allowed identifier length for the object-length lint. The leading `.` of hidden-identifier names is not counted; backtick-quoted and non-ASCII names are exempt."
+          "description": "Maximum allowed identifier length for the object-length lint. Names are measured after stripping backticks/quotes, and S3 methods measure only the part after a known generic prefix, matching lintr."
         },
         "raven.linting.objectLengthSeverity": {
           "type": "string",
@@ -2060,7 +2069,7 @@
             "Disable the vector-logic lint"
           ],
           "default": "information",
-          "description": "Severity for the vector-logic lint. Flags `&` or `|` in `if` / `while` conditions (where `&&` / `||` is the scalar form). Function-call boundaries stop the scan, so `if (any(x & y))` is left alone."
+          "description": "Severity for the vector-logic lint. Flags `&` or `|` in `if` / `while` / `expect_true()` conditions, and `&&` / `||` inside `subset()` / `filter()` arguments. Function-call boundaries stop the condition scan (`if (any(x & y))` is left alone) and bitwise-arithmetic operands are exempt."
         },
         "raven.linting.functionLeftParenthesesSeverity": {
           "type": "string",
@@ -2079,7 +2088,7 @@
             "Disable the function-left-parens lint"
           ],
           "default": "information",
-          "description": "Severity for the function-left-parentheses lint. Flags whitespace between `function` (or `\\`) and the parameter `(`."
+          "description": "Severity for the function-left-parentheses lint. Flags whitespace between `function` (or `\\`) and the parameter `(`, and between a call's function name and its argument `(` (e.g. `blah (1)`)."
         },
         "raven.linting.spacesInsideSeverity": {
           "type": "string",
@@ -2098,7 +2107,7 @@
             "Disable the spaces-inside lint"
           ],
           "default": "information",
-          "description": "Severity for the spaces-inside lint. Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`). Empty groupings and multi-line wrapping are left alone."
+          "description": "Severity for the spaces-inside lint. Flags whitespace immediately inside `(`, `[`, `[[` and their closing counterparts (e.g. `f( x )`, `df[ 1 ]`, `f( )`). Multi-line wrapping and comma/`= )` neighbors are left alone."
         },
         "raven.linting.indentationUnit": {
           "oneOf": [

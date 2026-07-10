@@ -1,10 +1,10 @@
 //! Flag trailing spaces/tabs at end of line.
 //!
-//! Matching `lintr::trailing_whitespace_linter()` defaults, whitespace at a
-//! line ending that is inside a multi-line string is allowed. Whitespace after
-//! the string's closing delimiter is still checked normally.
-
-use std::collections::HashSet;
+//! Mirrors `lintr::trailing_whitespace_linter` defaults
+//! (`allow_empty_lines = FALSE`, `allow_in_strings = TRUE`): whitespace-only
+//! lines are flagged, but trailing whitespace that lies *inside* a string
+//! literal (e.g. the interior lines of a multi-line string) is not — that
+//! whitespace is part of the string's value.
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -21,19 +21,28 @@ pub(crate) fn collect(
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    let mut string_continuation_lines = HashSet::new();
-    collect_string_continuation_lines(root, &mut string_continuation_lines);
-
+    let string_ranges = super::string_byte_ranges(root);
+    let mut line_start = 0usize;
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx as u32;
+        // `lines()` strips the terminator; step past `\n` (and a `\r` that
+        // `lines()` also strips) when computing the next line's offset.
+        let next_line_start =
+            line_start + line.len() + terminator_len(text, line_start + line.len());
         if suppressions.is_suppressed_code(line_no, rule_ids::TRAILING_WHITESPACE) {
+            line_start = next_line_start;
             continue;
         }
         let trimmed = line.trim_end_matches([' ', '\t']);
         if trimmed.len() == line.len() {
+            line_start = next_line_start;
             continue;
         }
-        if string_continuation_lines.contains(&line_no) {
+        // lintr's `allow_in_strings = TRUE` default: skip when the trailing
+        // run is inside a string literal.
+        let ws_start_byte = line_start + trimmed.len();
+        if super::inside_any_range(&string_ranges, ws_start_byte) {
+            line_start = next_line_start;
             continue;
         }
         let start_col = byte_offset_to_utf16_column(line, trimmed.len());
@@ -51,24 +60,15 @@ pub(crate) fn collect(
             message: "Trailing whitespace.".to_string(),
             ..Default::default()
         });
+        line_start = next_line_start;
     }
 }
 
-/// Record rows whose terminating newline occurs inside a multi-line string.
-/// For a string spanning rows `start..=end`, those are `start..end`; the end
-/// row is deliberately excluded because any whitespace after the closing
-/// delimiter belongs to source, not the string.
-fn collect_string_continuation_lines(node: Node<'_>, out: &mut HashSet<u32>) {
-    if node.kind() == "string" {
-        let start = node.start_position().row as u32;
-        let end = node.end_position().row as u32;
-        for line in start..end {
-            out.insert(line);
-        }
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_string_continuation_lines(child, out);
+/// Length of the line terminator at `pos` (`\r\n`, `\n`, or end of text).
+fn terminator_len(text: &str, pos: usize) -> usize {
+    match text.as_bytes().get(pos) {
+        Some(b'\r') if text.as_bytes().get(pos + 1) == Some(&b'\n') => 2,
+        Some(b'\n') => 1,
+        _ => 0,
     }
 }

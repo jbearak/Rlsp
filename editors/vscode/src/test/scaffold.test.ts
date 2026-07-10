@@ -532,7 +532,7 @@ suite('scaffold linting-settings merge', () => {
 `;
         const merged = mergeOrThrow(existing);
         assert.ok(
-            merged.includes('"raven.linting.objectNameStyleFunction": ["snake_case"]'),
+            merged.includes('"raven.linting.objectNameStyleFunction": ["snake_case","symbols"]'),
             `expected scaffold array defaults in merged output; got:\n${merged}`,
         );
         assert.ok(

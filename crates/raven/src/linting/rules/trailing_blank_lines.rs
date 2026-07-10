@@ -40,7 +40,8 @@ pub(crate) fn collect(
                 ..Default::default()
             });
         }
-        return;
+        // Fall through: a file can be missing its terminal newline AND have
+        // trailing blank lines (e.g. `x <- 1\n\n `) — lintr reports both.
     }
 
     // Count trailing blank lines.
@@ -61,10 +62,23 @@ pub(crate) fn collect(
     if suppressions.is_suppressed_code(line_no, rule_ids::TRAILING_BLANK_LINES) {
         return;
     }
+    // With a final newline, the position at the start of the line after the
+    // last is the document end and covers the blank region including its
+    // newline. Without one, that line doesn't exist — clamp to the last
+    // line's end so the range stays in bounds.
+    let end = if text.ends_with('\n') {
+        Position::new(lines.len() as u32, 0)
+    } else {
+        let last_line_utf16: u32 = lines[lines.len() - 1]
+            .chars()
+            .map(|c| c.len_utf16() as u32)
+            .sum();
+        Position::new((lines.len() - 1) as u32, last_line_utf16)
+    };
     out.push(Diagnostic {
         range: Range {
             start: Position::new(line_no, 0),
-            end: Position::new(lines.len() as u32, 0),
+            end,
         },
         severity: Some(severity),
         source: Some(LINT_SOURCE.to_string()),

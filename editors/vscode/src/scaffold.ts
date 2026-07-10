@@ -117,9 +117,9 @@ const LINTING_GROUPS: LintingGroup[] = [
     {
         comment: 'lintr: object_name_linter(styles = ..., regexes = ...)',
         entries: [
-            { key: 'raven.linting.objectNameStyleFunction', value: ['snake_case'] },
-            { key: 'raven.linting.objectNameStyleVariable', value: ['snake_case'] },
-            { key: 'raven.linting.objectNameStyleArgument', value: ['snake_case'] },
+            { key: 'raven.linting.objectNameStyleFunction', value: ['snake_case', 'symbols'] },
+            { key: 'raven.linting.objectNameStyleVariable', value: ['snake_case', 'symbols'] },
+            { key: 'raven.linting.objectNameStyleArgument', value: ['snake_case', 'symbols'] },
             { key: 'raven.linting.objectNameRegexesFunction', value: [] },
             { key: 'raven.linting.objectNameRegexesVariable', value: [] },
             { key: 'raven.linting.objectNameRegexesArgument', value: [] },
@@ -680,18 +680,18 @@ export function renderRavenToml(linting: Record<string, unknown> | undefined): s
     ];
     const entries: [string, unknown, string][] = [
         ['enabled', false, 'master switch'],
-        ['lineLength', 80, 'maximum line length (UTF-16 code units)'],
+        ['lineLength', 80, 'maximum line length (characters)'],
         ['objectLength', 30, 'maximum identifier length'],
         ['indentationUnit', 2, 'expected indent unit'],
         ['assignmentOperator', '<-', '"<-" or "="'],
         ['stringDelimiter', '"', '"\\"" or "\'"'],
         [
             'objectNameStyleFunction',
-            'snake_case',
-            'string or array: snake_case, camelCase, dotted.case, UPPER_CASE, lowercase, any',
+            ['snake_case', 'symbols'],
+            'string or array: snake_case, camelCase, dotted.case, UPPER_CASE, lowercase, symbols, any',
         ],
-        ['objectNameStyleVariable', 'snake_case', 'same string-or-array form'],
-        ['objectNameStyleArgument', 'snake_case', 'same string-or-array form'],
+        ['objectNameStyleVariable', ['snake_case', 'symbols'], 'same string-or-array form'],
+        ['objectNameStyleArgument', ['snake_case', 'symbols'], 'same string-or-array form'],
         ['objectNameRegexesFunction', [], 'array of Rust regexes; partial match'],
         ['objectNameRegexesVariable', [], 'array of Rust regexes; partial match'],
         ['objectNameRegexesArgument', [], 'array of Rust regexes; partial match'],

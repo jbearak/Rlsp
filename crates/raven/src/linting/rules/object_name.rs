@@ -1,45 +1,64 @@
 //! Enforce a naming scheme on user-defined symbols.
 //!
-//! Walks the tree-sitter AST and flags assignment targets, function
-//! parameters, and literal `assign()` / `setGeneric()` binding names that do
-//! not match the configured [`ObjectNameStyle`] or custom regexes. Mirrors `lintr::object_name_linter` with three per-kind
+//! Walks the tree-sitter AST and flags assignment targets and function
+//! parameters whose names don't match the configured [`ObjectNameStyle`] or
+//! custom regexes. Mirrors `lintr::object_name_linter` with three per-kind
 //! settings: `function`, `variable`, and `argument`. Each kind defaults to
-//! `snake_case` and can be independently disabled by including
-//! [`ObjectNameStyle::Any`] in its style list.
+//! `snake_case` + `symbols` (lintr's default `styles`) and can be
+//! independently disabled by including [`ObjectNameStyle::Any`] in its style
+//! list. Checked positions are direct symbol targets of assignments,
+//! quoted-string targets (`"foo" <- 1`), and formal parameters.
 //! A name passes when it matches any accepted named style or any accepted
 //! regex. Named styles keep lintr's decorative-leading-dot behavior; regexes
-//! are matched unanchored (partial match) against the full identifier text as
-//! written in source; anchor with `^...$` to require a whole-name match.
+//! are matched unanchored (partial match) against the [`strip_name`]-
+//! normalized identifier (leading dot included); anchor with `^...$` to
+//! require a whole-name match.
 //!
 //! Carve-outs:
 //!
-//! * **Quoted names** are checked after removing one matching pair of
-//!   backticks. This matches lintr's `strip_names()` behavior: quoting changes
-//!   what R accepts syntactically, not which naming policy applies.
-//! * **S3 method dispatch**: a function definition whose name has the shape
-//!   `<generic>.<class>` is exempt when `<generic>` is a known base R S3
-//!   generic (see [`is_known_s3_generic`]). Every dot is tried as a possible
-//!   split point so methods of generics that themselves contain dots
-//!   (`as.Date.character`, `is.numeric.foo`) match; class names that contain
-//!   dots (`print.data.frame`) also match because the leftmost generic wins.
+//! * **Backtick-quoted names** are *stripped*, not exempted (issue #599,
+//!   mirroring lintr's `strip_names`): one leading/trailing run of backticks,
+//!   quotes, and `%` is removed (plus a trailing `<-`, so replacement
+//!   functions like `` `height<-` `` check as `height`), and the remaining
+//!   name goes through the normal pattern matching. `` `myBadName` <- 1 `` is
+//!   therefore flagged exactly like `myBadName <- 1`, while `` `%+%` `` (an
+//!   operator overload) strips to `+` and passes via the `symbols` style. A
+//!   name that strips to nothing (e.g. `` `%%` ``) is skipped, as in lintr.
+//! * **S3 method dispatch**: a name of the shape `<generic>.<class>` is
+//!   exempt when `<generic>` is a known base R S3 generic (see
+//!   [`is_known_s3_generic`], ported from lintr's `.base_s3_generics`,
+//!   including operator generics like `+` so `` `+.foo` `` is exempt) or a
+//!   generic declared in the same file (a top-level assignment of a function
+//!   whose body calls `UseMethod`, mirroring lintr's
+//!   `declared_s3_generics`). Every dot is tried as a possible split point so
+//!   methods of generics that themselves contain dots (`as.Date.character`,
+//!   `is.numeric.foo`) match; class names that contain dots
+//!   (`print.data.frame`) also match because the leftmost generic wins.
 //!   A leading `.` (hidden identifier convention) is stripped before the
-//!   lookup so hidden methods like `.print.MyClass` are still recognized.
-//!   Names with no recognized generic in any prefix (e.g. `foo.Bar`,
-//!   `my.func`) are checked normally.
-//! * **Leading-dot "hidden" names** (`.foo`, `.my_helper`, `.onLoad`) are
-//!   accepted under every scheme — an optional leading dot is stripped before
-//!   scheme classification, mirroring lintr.
+//!   lookup so hidden methods like `.print.MyClass` are still recognized —
+//!   a deliberate leniency over lintr, which flags hidden methods.
+//! * **Special functions** (`.onLoad`, `.onAttach`, `.onUnload`,
+//!   `.onDetach`, `.Last.lib`, `.First`, `.Last`) and `...` are always
+//!   exempt, matching lintr's `is_special_function`.
+//! * **Leading-dot "hidden" names** (`.foo`, `.my_helper`) are accepted under
+//!   every scheme — an optional leading dot is stripped before scheme
+//!   classification, mirroring lintr.
 //! * **Non-ASCII identifiers** are skipped when no regexes are configured
 //!   for the kind — case is locale-dependent and the named styles' simple
 //!   ASCII schemes can't classify them. When regexes are configured
 //!   (regex-only or combined with styles), non-ASCII names are checked
-//!   against the regexes; the named styles never match them.
+//!   against the regexes; the named styles never match them. (Deliberate
+//!   divergence: lintr's ASCII-only style regexes flag non-ASCII names.)
 //! * **Named-argument `=`** (`f(name = value)`) is never an assignment target,
 //!   so it isn't checked. `=` elsewhere (top level, function bodies, braced
 //!   blocks) *is* treated as assignment and the LHS is checked.
-//! * **Compound LHS** (`obj$field <- ...`, `obj[[i]] <- ...`) checks only the
-//!   leftmost object (`obj`). Field names and index expressions are ignored,
-//!   matching lintr.
+//! * **Compound LHS**: a `$`/`@` chain checks its *leftmost* object (`a` in
+//!   `a$b$c <- 1` — the field names may be beyond the user's control), and
+//!   subscripted targets (`x[[i]] <- ...`) are skipped entirely, matching
+//!   lintr. Literal binding names in `assign("name", …)` and
+//!   `setGeneric("name", …)` calls are checked too.
+
+use std::collections::HashSet;
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
 use tree_sitter::Node;
@@ -80,7 +99,114 @@ pub(crate) fn collect(
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
-    visit(root, text, &styles, severity, suppressions, out);
+    let declared_generics = collect_declared_s3_generics(root, text);
+    let cx = CheckContext {
+        styles: &styles,
+        declared_generics: &declared_generics,
+        severity,
+        suppressions,
+    };
+    visit(root, text, &cx, out);
+}
+
+/// Immutable per-run inputs threaded through the AST walk.
+struct CheckContext<'a> {
+    styles: &'a ObjectNameStyles<'a>,
+    /// Names of S3 generics declared in this file (top-level assignments of
+    /// functions whose body calls `UseMethod`), mirroring lintr's
+    /// `declared_s3_generics`. Methods of these generics are exempt just like
+    /// methods of base generics.
+    declared_generics: &'a HashSet<String>,
+    severity: DiagnosticSeverity,
+    suppressions: &'a Suppressions,
+}
+
+/// Collect the names of S3 generics declared at the top level of the file: a
+/// direct `program` child of the form `name <- function(...) ...` (also `=`,
+/// `<<-`, right-assign, or a lambda) whose body contains a `UseMethod(...)`
+/// call. Mirrors lintr's `declared_s3_generics`.
+pub(crate) fn collect_declared_s3_generics(root: Node<'_>, text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "binary_operator" {
+            continue;
+        }
+        let Some(op) = child.child_by_field_name("operator") else {
+            continue;
+        };
+        // lintr's declared_s3_generics only matches LEFT_ASSIGN / EQ_ASSIGN
+        // declarations; a right-assigned `function(x) UseMethod(...) -> g`
+        // does not register the generic there.
+        let (target, value) = match node_text(op, text) {
+            "<-" | "<<-" | "=" => (
+                child.child_by_field_name("lhs"),
+                child.child_by_field_name("rhs"),
+            ),
+            _ => continue,
+        };
+        let (Some(target), Some(value)) = (target, value) else {
+            continue;
+        };
+        if target.kind() != "identifier"
+            || !is_function_definition_after_parens(value)
+            || !contains_use_method_call(value, text)
+        {
+            continue;
+        }
+        out.insert(strip_name(node_text(target, text)).to_string());
+    }
+    out
+}
+
+/// Descend a compound assignment target to its base object: through
+/// `$`/`@` chains (`a$b$c <- 1` checks `a`), subscripts `[`/`[[`
+/// (`a[[1]] <- 1` checks `a`), and replacement calls (`names(a) <- 1`,
+/// `attr(a, "x") <- 1` check the first argument) — all shapes real lintr
+/// flags. Anything else is returned as-is and skipped by the caller's kind
+/// check. (lintr can also flag a *non-first* symbol argument of a
+/// replacement call, e.g. `foo(1, badName) <- 1`; that shape is rare and
+/// not descended here.)
+pub(crate) fn leftmost_extract_object<'t>(node: Node<'t>) -> Node<'t> {
+    let mut current = node;
+    loop {
+        let next = match current.kind() {
+            "extract_operator" => current.child_by_field_name("lhs"),
+            "subset" | "subset2" => current.child_by_field_name("function"),
+            "call" => current.child_by_field_name("arguments").and_then(|args| {
+                let mut cursor = args.walk();
+                args.children(&mut cursor)
+                    .find(|child| child.kind() == "argument")
+                    .and_then(|arg| arg.child_by_field_name("value"))
+            }),
+            _ => return current,
+        };
+        match next {
+            Some(next) => current = next,
+            None => return current,
+        }
+    }
+}
+
+/// True when the subtree contains a call to `UseMethod` (bare or
+/// namespace-qualified — R's parser emits the same call token either way,
+/// and lintr recognizes both).
+fn contains_use_method_call(node: Node<'_>, text: &str) -> bool {
+    if node.kind() == "call"
+        && node.child_by_field_name("function").is_some_and(|f| {
+            let name = match f.kind() {
+                "identifier" => Some(f),
+                "namespace_operator" => f.child_by_field_name("rhs"),
+                _ => None,
+            };
+            name.is_some_and(|n| node_text(n, text) == "UseMethod")
+        })
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| contains_use_method_call(child, text))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,80 +216,22 @@ enum SymbolKind {
     Argument,
 }
 
-fn visit(
-    node: Node<'_>,
-    text: &str,
-    styles: &ObjectNameStyles<'_>,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
-    out: &mut Vec<Diagnostic>,
-) {
+fn visit(node: Node<'_>, text: &str, cx: &CheckContext<'_>, out: &mut Vec<Diagnostic>) {
     match node.kind() {
-        "binary_operator" => check_assignment(node, text, styles, severity, suppressions, out),
-        "function_definition" => check_parameters(node, text, styles, severity, suppressions, out),
-        "call" => check_binding_call(node, text, styles, severity, suppressions, out),
+        "binary_operator" => check_assignment(node, text, cx, out),
+        "function_definition" => check_parameters(node, text, cx, out),
+        "call" => check_binding_call(node, text, cx, out),
         _ => {}
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit(child, text, styles, severity, suppressions, out);
+        visit(child, text, cx, out);
     }
-}
-
-fn check_binding_call(
-    node: Node<'_>,
-    text: &str,
-    styles: &ObjectNameStyles<'_>,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
-    out: &mut Vec<Diagnostic>,
-) {
-    let Some(function) = node.child_by_field_name("function") else {
-        return;
-    };
-    let function_text = node_text(function, text);
-    let kind = if function_text == "assign" || function_text.ends_with("::assign") {
-        SymbolKind::Variable
-    } else if function_text == "setGeneric" || function_text.ends_with("::setGeneric") {
-        SymbolKind::Function
-    } else {
-        return;
-    };
-    let formal = if kind == SymbolKind::Variable {
-        "x"
-    } else {
-        "name"
-    };
-    let Some(name_node) = binding_name_argument(node, formal, text) else {
-        return;
-    };
-    let name = node_text(name_node, text);
-    let patterns = patterns_for(kind, styles);
-    if patterns.is_disabled() {
-        return;
-    }
-    report_if_bad(
-        name_node,
-        name,
-        kind,
-        patterns,
-        text,
-        severity,
-        suppressions,
-        out,
-    );
 }
 
 /// Check the assignment target of a `binary_operator` node.
-fn check_assignment(
-    node: Node<'_>,
-    text: &str,
-    styles: &ObjectNameStyles<'_>,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
-    out: &mut Vec<Diagnostic>,
-) {
+fn check_assignment(node: Node<'_>, text: &str, cx: &CheckContext<'_>, out: &mut Vec<Diagnostic>) {
     let op_node = match node.child_by_field_name("operator") {
         Some(n) => n,
         None => return,
@@ -194,9 +262,15 @@ fn check_assignment(
         return;
     }
 
-    let Some(target) = assignment_name_target(target) else {
+    // Direct symbol targets and quoted-string targets (`"foo" <- 1`) are
+    // checked — lintr lints STR_CONST assignment targets, stripping the
+    // quotes. For a `$`/`@` compound LHS, lintr checks the *leftmost* object
+    // (`a` in `a$b$c <- 1` — `b`/`c` may be beyond the user's control), but
+    // never anything subscripted (`x[[i]] <- 1`, `x[i]$a <- 1` are exempt).
+    let target = leftmost_extract_object(target);
+    if !matches!(target.kind(), "identifier" | "string") {
         return;
-    };
+    }
 
     let name = node_text(target, text);
     if name.is_empty() {
@@ -212,33 +286,98 @@ fn check_assignment(
         SymbolKind::Variable
     };
 
-    let patterns = patterns_for(kind, styles);
+    let patterns = patterns_for(kind, cx.styles);
     if patterns.is_disabled() {
         return;
     }
 
+    report_if_bad(target, name, kind, patterns, text, cx, out);
+}
+
+/// Check the literal binding name of `assign("name", …)` (a variable) and
+/// `setGeneric("name", …)` (a function) — lintr lints both.
+fn check_binding_call(
+    node: Node<'_>,
+    text: &str,
+    cx: &CheckContext<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(function) = node.child_by_field_name("function") else {
+        return;
+    };
+    let function_text = node_text(function, text);
+    let kind = match function_text {
+        "assign" => SymbolKind::Variable,
+        "setGeneric" => SymbolKind::Function,
+        _ if function_text.ends_with("::assign") => SymbolKind::Variable,
+        _ if function_text.ends_with("::setGeneric") => SymbolKind::Function,
+        _ => return,
+    };
+    let named = match kind {
+        SymbolKind::Variable => "x",
+        _ => "name",
+    };
+    let Some(name_node) = binding_call_literal_name(node, named, text) else {
+        return;
+    };
+    let patterns = patterns_for(kind, cx.styles);
+    if patterns.is_disabled() {
+        return;
+    }
     report_if_bad(
-        target,
-        name,
+        name_node,
+        node_text(name_node, text),
         kind,
         patterns,
         text,
-        severity,
-        suppressions,
+        cx,
         out,
     );
 }
 
-/// Check formal arguments of a `function_definition` node.
-fn check_parameters(
-    node: Node<'_>,
+/// The literal string node holding a binding call's name: the first
+/// positional argument, or the one named `formal` (lintr accepts either
+/// spelling). Returns `None` for non-literal names.
+pub(crate) fn binding_call_literal_name<'t>(
+    call: Node<'t>,
+    formal: &str,
     text: &str,
-    styles: &ObjectNameStyles<'_>,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
-    out: &mut Vec<Diagnostic>,
-) {
-    let patterns = patterns_for(SymbolKind::Argument, styles);
+) -> Option<Node<'t>> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let mut first_positional = None;
+    for child in args.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        match child.child_by_field_name("name") {
+            // A named binding anywhere in the call wins over positional
+            // matching (`assign(1, x = "name")` binds `x` by name); R
+            // partially matches formals, so any prefix of the formal binds.
+            Some(arg_name)
+                if {
+                    let name = node_text(arg_name, text);
+                    !name.is_empty() && formal.starts_with(name)
+                } =>
+            {
+                return child
+                    .child_by_field_name("value")
+                    .filter(|n| n.kind() == "string");
+            }
+            Some(_) => {}
+            None => {
+                if first_positional.is_none() {
+                    first_positional = child.child_by_field_name("value");
+                }
+            }
+        }
+    }
+    first_positional.filter(|n| n.kind() == "string")
+}
+
+/// Check formal arguments of a `function_definition` node.
+fn check_parameters(node: Node<'_>, text: &str, cx: &CheckContext<'_>, out: &mut Vec<Diagnostic>) {
+    let patterns = patterns_for(SymbolKind::Argument, cx.styles);
     if patterns.is_disabled() {
         return;
     }
@@ -274,71 +413,88 @@ fn check_parameters(
             if name.is_empty() {
                 continue;
             }
-            report_if_bad(
-                ident,
-                name,
-                SymbolKind::Argument,
-                patterns,
-                text,
-                severity,
-                suppressions,
-                out,
-            );
+            report_if_bad(ident, name, SymbolKind::Argument, patterns, text, cx, out);
         }
     }
 }
 
 /// Report a diagnostic for `name` when it does not match `patterns`.
 ///
+/// The raw token text is stripped first (backticks, quotes, `%`, trailing
+/// `<-`; see [`strip_name`]) and everything downstream — carve-outs, style
+/// and regex matching, the message — operates on the stripped name, matching
+/// lintr's `strip_names`.
+///
 /// Callers pre-check [`KindPatterns::is_disabled`] as a fast path, while this
 /// function also guards the invariant so future call sites cannot report every
 /// name for a disabled symbol kind.
-// The diagnostic construction inputs are clearer kept flat at this leaf helper.
-#[allow(clippy::too_many_arguments)]
 fn report_if_bad(
     name_node: Node<'_>,
     name: &str,
     kind: SymbolKind,
     patterns: KindPatterns<'_>,
     text: &str,
-    severity: DiagnosticSeverity,
-    suppressions: &Suppressions,
+    cx: &CheckContext<'_>,
     out: &mut Vec<Diagnostic>,
 ) {
     if patterns.is_disabled() {
         return;
     }
-    let policy_name = strip_name_delimiters(name);
-    if should_skip_name(policy_name, kind, patterns) {
+    let name = strip_name(name);
+    // A name that strips to nothing (e.g. `` `%%` ``) is conforming in lintr.
+    if name.is_empty() {
         return;
     }
-    if matches_patterns(policy_name, patterns) {
+    if should_skip_name(name, patterns, cx.declared_generics) {
+        return;
+    }
+    if matches_patterns(name, patterns) {
         return;
     }
     let line_no = name_node.start_position().row as u32;
-    if suppressions.is_suppressed_code(line_no, rule_ids::OBJECT_NAME) {
+    if cx
+        .suppressions
+        .is_suppressed_code(line_no, rule_ids::OBJECT_NAME)
+    {
         return;
     }
     let line_text = text.lines().nth(line_no as usize).unwrap_or("");
     let start_col = byte_offset_to_utf16_column(line_text, name_node.start_position().column);
-    let end_col = byte_offset_to_utf16_column(line_text, name_node.end_position().column);
+    // The node can span lines (a multi-line string target), so the end
+    // column must be converted against the *end* line's text.
+    let end_line_no = name_node.end_position().row as u32;
+    let end_line_text = if end_line_no == line_no {
+        line_text
+    } else {
+        text.lines().nth(end_line_no as usize).unwrap_or("")
+    };
+    let end_col = byte_offset_to_utf16_column(end_line_text, name_node.end_position().column);
     let kind_label = match kind {
         SymbolKind::Function => "Function",
         SymbolKind::Variable => "Variable",
         SymbolKind::Argument => "Argument",
     };
-    let message = object_name_message(kind_label, policy_name, patterns);
+    let message = object_name_message(kind_label, name, patterns);
     out.push(Diagnostic {
         range: Range {
             start: Position::new(line_no, start_col),
             end: Position::new(name_node.end_position().row as u32, end_col),
         },
-        severity: Some(severity),
+        severity: Some(cx.severity),
         source: Some(LINT_SOURCE.to_string()),
         code: Some(NumberOrString::String(rule_ids::OBJECT_NAME.to_string())),
         message,
         ..Default::default()
     });
+}
+
+/// Strip the token decorations lintr's `strip_names` removes before pattern
+/// matching: a leading run of backticks/quotes/`%` and a trailing run of
+/// backticks/quotes/`<`/`-`/`%`. The trailing `<-` case is what lets
+/// replacement functions (`` `height<-` ``) check as their base name.
+pub(crate) fn strip_name(name: &str) -> &str {
+    name.trim_start_matches(['`', '"', '\'', '%'])
+        .trim_end_matches(['`', '"', '\'', '<', '-', '%'])
 }
 
 /// Look up the configured patterns for a given symbol kind.
@@ -358,8 +514,17 @@ fn matches_patterns(name: &str, patterns: KindPatterns<'_>) -> bool {
         || patterns.regexes.iter().any(|regex| regex.is_match(name))
 }
 
-/// Names that should be skipped regardless of the configured scheme.
-fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) -> bool {
+/// Names that should be skipped regardless of the configured scheme. `name`
+/// is the [`strip_name`]-normalized token text.
+fn should_skip_name(
+    name: &str,
+    patterns: KindPatterns<'_>,
+    declared_generics: &HashSet<String>,
+) -> bool {
+    // lintr's `is_special_function` names and `...` are always conforming.
+    if is_special_function(name) || name == "..." {
+        return true;
+    }
     // Non-ASCII identifiers can't be classified by the named styles' simple
     // ASCII schemes, so configurations with no regexes skip them. When
     // regexes ARE configured — regex-only or combined with styles — the name
@@ -369,14 +534,16 @@ fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) ->
     if !name.is_ascii() {
         return patterns.regexes.is_empty();
     }
-    // S3 method dispatch: only relevant for function definitions. A name like
-    // `print.MyClass` is `<generic>.<ClassName>` — exempt when some prefix
-    // ending at a dot is a *known* base R S3 generic (see
-    // [`is_known_s3_generic`]). Names whose prefix isn't a recognized generic
+    // S3 method dispatch. A name like `print.MyClass` is
+    // `<generic>.<ClassName>` — exempt when some prefix ending at a dot is a
+    // known base R S3 generic (see [`is_known_s3_generic`]) or a generic
+    // declared in this file. Names whose prefix isn't a recognized generic
     // (e.g. `foo.Bar`) are still checked: there's no signal that they're
     // actually method dispatch rather than a quirky dotted name, and lintr
     // similarly requires evidence (a `UseMethod` call or a known generic)
-    // before exempting.
+    // before exempting. Like lintr, the exemption applies to every symbol
+    // kind, not just function definitions — lintr runs one generic check over
+    // all assignment targets and formals.
     //
     // We scan *every* dot position rather than just the first because both
     // generics and class names can themselves contain dots:
@@ -388,186 +555,271 @@ fn should_skip_name(name: &str, kind: SymbolKind, patterns: KindPatterns<'_>) ->
     //     The first dot gives `print` (match), so we exit early.
     //
     // We also strip an optional leading `.` so hidden S3 methods like
-    // `.print.MyClass` resolve through `print`.
-    if kind == SymbolKind::Function {
-        if matches!(
-            name,
-            ".onLoad" | ".onAttach" | ".onUnload" | ".onDetach" | ".Last.lib" | ".First" | ".Last"
-        ) {
+    // `.print.MyClass` resolve through `print` (a deliberate leniency over
+    // lintr, which only matches a generic at the very start of the name).
+    // The class part must be non-empty — `print.` is not method dispatch.
+    let body = name.strip_prefix('.').unwrap_or(name);
+    for (i, c) in body.char_indices() {
+        if c == '.'
+            && i + 1 < body.len()
+            && (is_known_s3_generic(&body[..i]) || declared_generics.contains(&body[..i]))
+        {
             return true;
-        }
-        let body = name.strip_prefix('.').unwrap_or(name);
-        for (i, c) in body.char_indices() {
-            if c == '.' && is_known_s3_generic(&body[..i]) {
-                return true;
-            }
         }
     }
     false
 }
 
-/// Remove one matching syntactic delimiter pair before applying name policy.
-/// Only complete pairs are removed; malformed parse-recovery fragments are
-/// left untouched rather than normalized into a different name.
-fn strip_name_delimiters(name: &str) -> &str {
-    for delimiter in ['`', '\'', '"'] {
-        if let Some(inner) = name
-            .strip_prefix(delimiter)
-            .and_then(|rest| rest.strip_suffix(delimiter))
-        {
-            return inner;
-        }
-    }
-    name
+/// Namespace hooks and session hooks lintr always exempts
+/// (`lintr:::special_funs`).
+fn is_special_function(name: &str) -> bool {
+    matches!(
+        name,
+        ".onLoad" | ".onAttach" | ".onUnload" | ".onDetach" | ".Last.lib" | ".First" | ".Last"
+    )
 }
 
-/// Find the leftmost object governed by a compound assignment target.
-fn assignment_name_target(mut target: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        match target.kind() {
-            "identifier" | "string" => return Some(target),
-            "extract_operator" => target = target.child_by_field_name("lhs")?,
-            "subset" | "subset2" => target = target.child_by_field_name("function")?,
-            "call" => {
-                let arguments = target.child_by_field_name("arguments")?;
-                target = first_positional_argument(arguments)?;
-            }
-            _ => return None,
-        }
-    }
-}
-
-fn binding_name_argument<'tree>(
-    call: Node<'tree>,
-    formal: &str,
-    text: &str,
-) -> Option<Node<'tree>> {
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut first_positional = None;
-    let mut cursor = arguments.walk();
-    for argument in arguments
-        .children(&mut cursor)
-        .filter(|child| child.kind() == "argument")
-    {
-        let name = argument.child_by_field_name("name");
-        let value = argument.child_by_field_name("value");
-        if name.and_then(|name| text.get(name.start_byte()..name.end_byte())) == Some(formal) {
-            return value.filter(|value| value.kind() == "string");
-        }
-        if name.is_none() && first_positional.is_none() {
-            first_positional = value;
-        }
-    }
-    first_positional.filter(|value| value.kind() == "string")
-}
-
-fn first_positional_argument(arguments: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = arguments.walk();
-    arguments
-        .children(&mut cursor)
-        .find(|child| child.kind() == "argument" && child.child_by_field_name("name").is_none())?
-        .child_by_field_name("value")
-}
-
-/// Base R S3 generics whose `<generic>.<class>` methods are conventionally
-/// exempt from naming-style enforcement. The list is intentionally finite — if
-/// users define their own generic and want methods exempt, they can suppress
-/// the line with `# nolint` or `# raven: ignore` (alias `# @lsp-ignore`).
-///
-/// Sourced from base R's documented generics across `methods("...")` output
-/// for typical interactive sessions: print/format/summary family,
-/// statistical model accessors, coercion (`as.*`)/predicate (`is.*`) families,
-/// the group generics (`Ops`, `Math`, `Summary`, `Complex`), and a handful of
-/// commonly-extended utilities.
-fn is_known_s3_generic(name: &str) -> bool {
-    // Sorted alphabetically so `binary_search` works.
+/// S3 generics whose `<generic>.<class>` methods are exempt from
+/// naming-style enforcement. Ported verbatim from lintr's
+/// `.base_s3_generics` (lintr 3.3.0): base R's `.knownS3Generics`, the group
+/// generics (`Ops`, `Math`, `Summary`, `Complex` and their members, including
+/// the operator generics like `+` that make `` `+.foo` `` exempt), and the
+/// S3 generics exported by the base and stats namespaces. If users define
+/// their own generic in another file and want methods exempt, they can
+/// suppress the line with `# nolint` or `# raven: ignore` (alias
+/// `# @lsp-ignore`); generics declared in the *same* file are recognized via
+/// `collect_declared_s3_generics`.
+pub(crate) fn is_known_s3_generic(name: &str) -> bool {
+    // Byte-sorted so `binary_search` works.
     const GENERICS: &[&str] = &[
+        "!",
+        "!=",
         "$",
+        "$<-",
+        "%%",
+        "%*%",
+        "%/%",
+        "&",
+        "*",
         "+",
         "-",
+        "/",
+        "<",
+        "<=",
+        "==",
+        ">",
+        ">=",
         "AIC",
-        "BIC",
+        "Arg",
         "Complex",
+        "Conj",
+        "Im",
         "Math",
+        "Mod",
         "Ops",
+        "Re",
         "Summary",
+        "[",
+        "[<-",
+        "[[",
+        "[[<-",
+        "^",
+        "abs",
+        "acos",
+        "acosh",
+        "add1",
+        "all",
         "all.equal",
         "anova",
+        "any",
+        "anyDuplicated",
+        "anyNA",
+        "aperm",
         "as.Date",
         "as.POSIXct",
         "as.POSIXlt",
+        "as.array",
+        "as.call",
         "as.character",
+        "as.complex",
         "as.data.frame",
         "as.double",
         "as.environment",
-        "as.factor",
+        "as.expression",
         "as.function",
         "as.integer",
         "as.list",
         "as.logical",
         "as.matrix",
+        "as.null",
         "as.numeric",
+        "as.raw",
+        "as.single",
+        "as.table",
         "as.vector",
+        "asin",
+        "asinh",
+        "atan",
+        "atanh",
+        "biplot",
+        "by",
         "c",
         "cbind",
+        "ceiling",
+        "chol",
+        "chooseOpsMethod",
+        "close",
         "coef",
-        "coefficients",
+        "conditionCall",
+        "conditionMessage",
         "confint",
+        "contour",
+        "cos",
+        "cosh",
+        "cospi",
+        "crossprod",
+        "cummax",
+        "cummin",
+        "cumprod",
+        "cumsum",
+        "cut",
+        "determinant",
         "deviance",
+        "df.residual",
+        "diff",
+        "digamma",
         "dim",
+        "dim<-",
         "dimnames",
+        "dimnames<-",
+        "drop1",
+        "droplevels",
+        "duplicated",
+        "edit",
+        "exp",
+        "expm1",
+        "extractAIC",
         "fitted",
-        "fitted.values",
+        "floor",
+        "flush",
         "format",
         "formula",
-        "head",
-        "is.character",
-        "is.data.frame",
-        "is.double",
-        "is.environment",
-        "is.factor",
-        "is.function",
-        "is.integer",
-        "is.list",
-        "is.logical",
+        "gamma",
+        "getDLLRegisteredRoutines",
+        "hist",
+        "identify",
+        "image",
+        "is.array",
+        "is.finite",
+        "is.infinite",
         "is.matrix",
+        "is.na",
+        "is.na<-",
+        "is.nan",
         "is.numeric",
-        "is.vector",
+        "isSymmetric",
+        "julian",
+        "kappa",
         "labels",
         "length",
+        "length<-",
         "levels",
+        "levels<-",
+        "lgamma",
+        "lines",
+        "log",
+        "log10",
+        "log1p",
+        "log2",
         "logLik",
+        "matrixOps",
+        "max",
         "mean",
         "merge",
+        "min",
+        "model.frame",
+        "model.matrix",
+        "months",
+        "mtfrm",
+        "nameOfClass",
         "names",
-        "nobs",
+        "names<-",
+        "open",
+        "pairs",
         "plot",
+        "points",
         "predict",
+        "pretty",
         "print",
+        "prod",
+        "profile",
+        "qqnorm",
+        "qr",
+        "quarters",
         "range",
         "rbind",
+        "rep",
         "residuals",
         "rev",
-        "simulate",
+        "round",
+        "row.names",
+        "row.names<-",
+        "rowsum",
+        "scale",
+        "se.contrast",
+        "seek",
+        "seq",
+        "seq.int",
+        "sequence",
+        "sign",
+        "signif",
+        "sin",
+        "sinh",
+        "sinpi",
+        "solve",
         "sort",
+        "sort_by",
         "split",
+        "split<-",
+        "sqrt",
         "str",
         "subset",
+        "sum",
         "summary",
         "t",
-        "tail",
+        "tan",
+        "tanh",
+        "tanpi",
+        "tcrossprod",
         "terms",
+        "text",
         "toString",
         "transform",
+        "trigamma",
+        "trunc",
+        "truncate",
         "unique",
+        "units",
+        "units<-",
+        "update",
         "vcov",
+        "weekdays",
         "with",
         "within",
+        "xtfrm",
+        "|",
     ];
     GENERICS.binary_search(&name).is_ok()
 }
 
 fn matches_scheme(name: &str, style: ObjectNameStyle) -> bool {
+    // `symbols` (lintr): a name made up entirely of non-alphanumeric
+    // characters, e.g. `+` or `%>%` stripped to `>`. Checked before the
+    // ASCII guard and the leading-dot handling — both would misjudge
+    // symbol-only names (`...` starts with a dot; `€` isn't ASCII).
+    if style == ObjectNameStyle::Symbols {
+        return !name.chars().any(char::is_alphanumeric);
+    }
     if !name.is_ascii() {
         // The ASCII schemes can never classify a non-ASCII name. Returning
         // false matters in combined style+regex configurations, where
@@ -594,6 +846,8 @@ fn matches_scheme(name: &str, style: ObjectNameStyle) -> bool {
         ObjectNameStyle::DottedCase => is_dotted_case(body),
         ObjectNameStyle::UpperCase => is_upper_case(body),
         ObjectNameStyle::Lowercase => is_lowercase(body),
+        // Handled before the leading-dot normalization above.
+        ObjectNameStyle::Symbols => unreachable!("symbols handled before dot-stripping"),
     }
 }
 
@@ -642,6 +896,7 @@ fn scheme_label(style: ObjectNameStyle) -> &'static str {
         ObjectNameStyle::DottedCase => "dotted.case",
         ObjectNameStyle::UpperCase => "UPPER_CASE",
         ObjectNameStyle::Lowercase => "lowercase",
+        ObjectNameStyle::Symbols => "symbols",
         ObjectNameStyle::Any => "any",
     }
 }
@@ -714,14 +969,14 @@ mod tests {
 
     /// [`should_skip_name`] under a typical style-based configuration —
     /// the carve-outs exercised by most tests don't depend on the patterns.
-    fn skip_default(name: &str, kind: SymbolKind) -> bool {
+    fn skip_default(name: &str) -> bool {
         should_skip_name(
             name,
-            kind,
             KindPatterns {
                 styles: &[ObjectNameStyle::SnakeCase],
                 regexes: &[],
             },
+            &HashSet::new(),
         )
     }
 
@@ -772,19 +1027,20 @@ mod tests {
     }
 
     #[test]
-    fn s3_method_detected_for_function_kind_only() {
-        // Prefix is a known base R generic — exempt.
-        assert!(skip_default("print.MyClass", SymbolKind::Function));
-        assert!(skip_default("format.Date", SymbolKind::Function));
-        assert!(skip_default("summary.lm", SymbolKind::Function));
-        // For variables, dotted names are checked normally — `print.MyClass`
-        // isn't a method definition when bound to a non-function value.
-        assert!(!skip_default("print.MyClass", SymbolKind::Variable));
+    fn s3_method_detected_for_every_symbol_kind() {
+        // Prefix is a known base R generic — exempt. Like lintr, the
+        // exemption is kind-independent (lintr runs one generic check over
+        // all assignment targets and formals).
+        assert!(skip_default("print.MyClass"));
+        assert!(skip_default("format.Date"));
+        assert!(skip_default("summary.lm"));
         // All-lowercase dotted name with unknown prefix is still checked.
-        assert!(!skip_default("my.func", SymbolKind::Function));
+        assert!(!skip_default("my.func"));
         // Unknown prefix + capitalized suffix (regression for over-broad
         // exemption): `foo` is not a known generic, so `foo.Bar` is checked.
-        assert!(!skip_default("foo.Bar", SymbolKind::Function));
+        assert!(!skip_default("foo.Bar"));
+        // The class part must be non-empty — `print.` is not dispatch.
+        assert!(!skip_default("print."));
     }
 
     #[test]
@@ -794,17 +1050,31 @@ mod tests {
         // lookup gave `"as"` (not in the list), so the method was wrongly
         // flagged. The progressive-prefix scan tries `as`, then `as.Date`,
         // and exempts on the second.
-        assert!(skip_default("as.Date.character", SymbolKind::Function));
-        assert!(skip_default("as.numeric.foo", SymbolKind::Function));
-        assert!(skip_default("is.character.MyClass", SymbolKind::Function));
-        assert!(skip_default("all.equal.default", SymbolKind::Function));
-        assert!(skip_default("fitted.values.MyModel", SymbolKind::Function));
+        assert!(skip_default("as.Date.character"));
+        assert!(skip_default("as.numeric.foo"));
+        assert!(skip_default("is.numeric.MyClass"));
+        assert!(skip_default("all.equal.default"));
+        // `is.character` is a primitive, not an S3 generic — lintr's
+        // `.base_s3_generics` omits it and real lintr flags this name.
+        assert!(!skip_default("is.character.MyClass"));
         // Class names containing dots also work because the leftmost matching
         // generic wins.
-        assert!(skip_default("print.data.frame", SymbolKind::Function));
+        assert!(skip_default("print.data.frame"));
         // Generic name itself (no class suffix) still requires at least one
         // dot to be considered S3 — bare `as.Date` defining the generic is
         // checked by the scheme (and would pass `dotted.case`).
+    }
+
+    #[test]
+    fn s3_method_detection_handles_operator_generics() {
+        // lintr's `.base_s3_generics` includes the operator generics, so
+        // stripped operator-overload methods like `+.foo` (written
+        // `` `+.foo` `` in source) are exempt.
+        assert!(skip_default("+.foo"));
+        assert!(skip_default("==.myclass"));
+        assert!(skip_default("[.myclass"));
+        assert!(skip_default("%%.myclass"));
+        assert!(skip_default("$<-.myclass"));
     }
 
     #[test]
@@ -812,10 +1082,35 @@ mod tests {
         // Hidden S3 methods (`.print.MyClass`) — a leading `.` is stripped
         // before the generic lookup, so `.print.MyClass` still resolves
         // through `print`.
-        assert!(skip_default(".print.MyClass", SymbolKind::Function));
-        assert!(skip_default(".as.Date.character", SymbolKind::Function));
+        assert!(skip_default(".print.MyClass"));
+        assert!(skip_default(".as.Date.character"));
         // `.foo.Bar` — `foo` is not a generic, so still flagged.
-        assert!(!skip_default(".foo.Bar", SymbolKind::Function));
+        assert!(!skip_default(".foo.Bar"));
+    }
+
+    #[test]
+    fn special_functions_always_exempt() {
+        // lintr's `special_funs`: namespace and session hooks.
+        assert!(skip_default(".onLoad"));
+        assert!(skip_default(".onAttach"));
+        assert!(skip_default(".Last.lib"));
+        assert!(skip_default(".First"));
+        assert!(skip_default("..."));
+        // Near-misses are still checked.
+        assert!(!skip_default(".onload"));
+        assert!(!skip_default("onLoad"));
+    }
+
+    #[test]
+    fn strip_name_mirrors_lintr() {
+        assert_eq!(strip_name("`myBadName`"), "myBadName");
+        assert_eq!(strip_name("`with spaces`"), "with spaces");
+        assert_eq!(strip_name("`+.foo`"), "+.foo");
+        assert_eq!(strip_name("`%+%`"), "+");
+        assert_eq!(strip_name("`%%`"), "");
+        assert_eq!(strip_name("`height<-`"), "height");
+        assert_eq!(strip_name("\"quoted\""), "quoted");
+        assert_eq!(strip_name("plain"), "plain");
     }
 
     #[test]
@@ -986,18 +1281,10 @@ mod tests {
     }
 
     #[test]
-    fn backtick_quoted_names_are_checked_after_stripping_quotes() {
-        assert_eq!(strip_name_delimiters("`badName`"), "badName");
-        assert_eq!(strip_name_delimiters("\"badName\""), "badName");
-        assert_eq!(strip_name_delimiters("plain_name"), "plain_name");
-        assert!(!skip_default("badName", SymbolKind::Variable));
-    }
-
-    #[test]
     fn non_ascii_names_are_skipped_for_style_configs_only() {
         // Style-based configurations skip non-ASCII names (the ASCII schemes
         // can't classify them)...
-        assert!(skip_default("\u{03b1}", SymbolKind::Variable));
+        assert!(skip_default("\u{03b1}"));
         // ...but regex-only configurations check them against the regexes:
         // the user's patterns are the entire policy.
         let regexes = [CompiledRegex::new("^[a-z]+$").unwrap()];
@@ -1005,11 +1292,7 @@ mod tests {
             styles: &[],
             regexes: &regexes,
         };
-        assert!(!should_skip_name(
-            "\u{03b1}",
-            SymbolKind::Variable,
-            regex_only
-        ));
+        assert!(!should_skip_name("\u{03b1}", regex_only, &HashSet::new()));
         assert!(!matches_patterns("\u{e9}Bad", regex_only));
         // Combined style+regex configurations also check non-ASCII names —
         // the regexes may exist precisely to govern Unicode identifiers, and
@@ -1019,11 +1302,145 @@ mod tests {
             styles: &styles,
             regexes: &regexes,
         };
-        assert!(!should_skip_name(
-            "\u{e9}Bad",
-            SymbolKind::Variable,
-            combined
-        ));
+        assert!(!should_skip_name("\u{e9}Bad", combined, &HashSet::new()));
         assert!(!matches_patterns("\u{e9}Bad", combined));
+    }
+
+    #[test]
+    fn symbols_style_matches_operator_names() {
+        // lintr: names made up entirely of non-alphanumeric characters.
+        assert!(matches_scheme("+", ObjectNameStyle::Symbols));
+        assert!(matches_scheme("<=>", ObjectNameStyle::Symbols));
+        assert!(matches_scheme("...", ObjectNameStyle::Symbols));
+        assert!(!matches_scheme("m+", ObjectNameStyle::Symbols));
+        assert!(!matches_scheme("foo", ObjectNameStyle::Symbols));
+    }
+
+    /// Run the full rule with the default (lintr-parity) configuration:
+    /// snake_case + symbols for every kind.
+    fn lint_default(text: &str) -> Vec<Diagnostic> {
+        let tree = with_parser(|p| p.parse(text, None)).expect("parse must succeed");
+        let styles = [ObjectNameStyle::SnakeCase, ObjectNameStyle::Symbols];
+        let kind = KindPatterns {
+            styles: &styles,
+            regexes: &[],
+        };
+        let styles = ObjectNameStyles {
+            function: kind,
+            variable: kind,
+            argument: kind,
+        };
+        let mut diags = Vec::new();
+        collect(
+            text,
+            tree.root_node(),
+            styles,
+            DiagnosticSeverity::INFORMATION,
+            &Suppressions::default(),
+            &mut diags,
+        );
+        diags
+    }
+
+    #[test]
+    fn backtick_quoted_names_are_stripped_and_checked() {
+        // Issue #599: lintr strips backticks and applies the styles — a
+        // backticked bad name lints exactly like the unquoted spelling.
+        let diags = lint_default("`myBadName` <- 1\n");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert!(diags[0].message.contains("`myBadName`"), "{diags:?}");
+
+        let diags = lint_default("`my bad name` <- 1\n");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+
+        // Conforming backticked names pass.
+        assert!(lint_default("`my_var` <- 1\n").is_empty());
+    }
+
+    #[test]
+    fn operator_overloads_pass_under_default_styles() {
+        // `%+%` strips to `+`, which the default `symbols` style accepts.
+        assert!(lint_default("`%+%` <- function(a, b) a\n").is_empty());
+        // S3 operator methods are exempt via the operator generics.
+        assert!(lint_default("`+.foo` <- function(e1, e2) e1\n").is_empty());
+        // ...but alphanumeric-containing operators lint (lintr's own doc
+        // example: `%m+%` is flagged).
+        let diags = lint_default("`%m+%` <- function(a, b) a\n");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
+    #[test]
+    fn replacement_functions_check_base_name() {
+        // `height<-` strips the trailing `<-` and checks `height`.
+        assert!(lint_default("`height<-` <- function(x, value) x\n").is_empty());
+        let diags = lint_default("`badHeight<-` <- function(x, value) x\n");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+    }
+
+    #[test]
+    fn name_stripping_to_empty_is_skipped() {
+        assert!(lint_default("`%%` <- function(a, b) a\n").is_empty());
+    }
+
+    #[test]
+    fn compound_lhs_checks_leftmost_object() {
+        // lintr lints `a` in `a$b$c <- 1`; subscripted targets stay exempt.
+        assert_eq!(lint_default("myBadObj$field <- 1\n").len(), 1);
+        assert!(lint_default("good_obj$Field <- 1\n").is_empty());
+        assert!(lint_default("x[[i]] <- 1\n").is_empty());
+        assert!(lint_default("x[i]$BadName <- 1\n").is_empty());
+    }
+
+    #[test]
+    fn binding_calls_check_their_literal_names() {
+        assert_eq!(lint_default("assign(\"myBadName\", 2)\n").len(), 1);
+        assert_eq!(
+            lint_default("setGeneric(\"fooBar\", function(x) standardGeneric(\"fooBar\"))\n").len(),
+            1
+        );
+        assert!(lint_default("assign(\"good_name\", 2)\n").is_empty());
+        assert!(lint_default("base::assign(\"good_name\", 2)\n").is_empty());
+        // Non-literal names are not checked.
+        assert!(lint_default("assign(name_var, 2)\n").is_empty());
+    }
+
+    #[test]
+    fn quoted_string_targets_are_checked() {
+        // lintr lints STR_CONST assignment targets after stripping quotes.
+        let diags = lint_default("\"myBadString\" <- 1\n");
+        assert_eq!(diags.len(), 1, "got {diags:?}");
+        assert!(lint_default("\"good_name\" <- 1\n").is_empty());
+        // Idiomatic quoted S3 operator methods stay exempt via the operator
+        // generics table.
+        assert!(lint_default("\"[.Surv\" <- function(x, i) x\n").is_empty());
+        // Replacement-function methods (`coef<-.varPower`) are flagged —
+        // matching real lintr, whose generics table has `coef` but not
+        // `coef<-`, and whose styles reject the `<` and `-` characters.
+        assert_eq!(
+            lint_default("\"coef<-.varPower\" <- function(x, value) x\n").len(),
+            1
+        );
+        // Compound string LHS (`a$"b" <- 1`) is still exempt: the binop LHS
+        // is the `$`-extract node, not the string.
+        assert!(lint_default("a$\"myBadString\" <- 1\n").is_empty());
+    }
+
+    #[test]
+    fn declared_generic_methods_are_exempt() {
+        // `myGeneric` doesn't match snake_case but is a declared generic;
+        // lintr exempts methods of same-file `UseMethod` generics. The
+        // generic's own definition still lints.
+        let text = "\
+my_generic <- function(x) UseMethod(\"my_generic\")\n\
+my_generic.myClass <- function(x) 1\n";
+        assert!(
+            lint_default(text).is_empty(),
+            "got {:?}",
+            lint_default(text)
+        );
+
+        // Without the UseMethod declaration, the dotted method name lints.
+        let undeclared = "my_generic.myClass <- function(x) 1\n";
+        assert_eq!(lint_default(undeclared).len(), 1);
     }
 }

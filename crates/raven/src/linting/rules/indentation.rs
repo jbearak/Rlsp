@@ -1,43 +1,20 @@
 //! Flag lines whose leading whitespace doesn't match the expected indent.
 //!
 //! Mirrors `lintr::indentation_linter()` with the default "tidy" hanging-indent
-//! style. The rule walks the parse tree once, builds a per-line expected indent
-//! from the AST scopes it crosses (braced blocks, multi-line argument lists,
-//! continuation lines under a binary operator), and reports any line whose
-//! actual leading-space count doesn't satisfy that expectation.
+//! style, using lintr's accumulated "indent change" model: indent-inducing
+//! tokens (bracket openers, end-of-line infix operators, `else`/`repeat`,
+//! unbraced bodies) are collected in document order and each rewrites its
+//! covered lines' expectation relative to the *current* accumulated value.
+//! The full semantics live on [`set_expectations`]. Verified against a
+//! 112-case differential corpus vs real lintr; the deliberate differences
+//! are all lenient (Raven additionally accepts the aligned-argument style,
+//! the block form where lintr demands hanging/double indents, and the
+//! chain-start column the on-type formatter produces — so Raven never flags
+//! code those styles produce, while every primary expectation matches
+//! lintr's).
 //!
-//! Scopes and their expected indents:
-//! * `braced_expression` — inner lines indent one `indent_unit` beyond the
-//!   line of the opening `{`. A `}` that starts its own line aligns with the
-//!   opening `{`'s line; a `}` trailing other code is left to the inner-line
-//!   rule. This standalone closer alignment takes precedence over any binary
-//!   operator continuation expectation that also reaches the closer's line
-//!   (see the "closer wins" note on `set_expectations` for why).
-//! * Bracketed groups (`call` / `subset` / `subset2` arguments,
-//!   `parenthesized_expression`, and `function_definition` parameter lists)
-//!   — when the opener is followed by code on the same line (e.g. `foo(a,`),
-//!   continuation lines may either align with the column after the opener
-//!   (`opener_col + 1`) or hang one `indent_unit` below the opener's line;
-//!   both are accepted to match the community-common aligned style. A
-//!   trailing `#` comment after the opener doesn't count as content (so
-//!   `foo( # note` is treated like `foo(`, hanging-only). When the opener
-//!   stands alone at end of line, only the hanging form is accepted. A closing
-//!   delimiter that starts its own line aligns with its opener's line.
-//! * `binary_operator` — when the operator's RHS lives on a later line than
-//!   the LHS, those continuation lines indent one `indent_unit` beyond the
-//!   line where the LHS starts. The on-type formatter additionally aligns
-//!   such lines with the binop's own start column (the column of its
-//!   leftmost token); when that column is to the right of the hanging indent,
-//!   the linter accepts it as an alternative so its verdict doesn't disagree
-//!   with the formatter's output. (The smart-indent provider may walk to a
-//!   sub-chain root for some mixed pipe/arithmetic chains via
-//!   `find_chain_start_from_ast`; the linter currently approximates this
-//!   with `node.start_position().column`, which agrees in the common cases
-//!   exercised by the test suite.) Nested binary operators may push the
-//!   expectation deeper (lintr's "tidy" default). One common Boolean layout
-//!   is also accepted: when both sides of a binary operator are parenthesized
-//!   clauses inside an outer parenthesized expression, the clauses may align
-//!   with each other instead of indenting the RHS by another unit.
+//! Like lintr, a run of consecutive lines mis-indented by the same amount
+//! produces a single diagnostic (on the run's first line).
 //!
 //! Lines skipped without checks:
 //! * Suppressed lines (`# nolint`, `# nolint start/end`, `# raven: ignore`,
@@ -107,6 +84,10 @@ pub(crate) fn collect(
     let aligned_comment_exemptions =
         collect_aligned_comment_exemptions(&lines, &expectations, &comments, &line_states);
 
+    // lintr suppresses consecutive lints with the same indentation
+    // difference — one diagnostic per run of equally mis-indented lines.
+    let mut last_bad: Option<(u32, i64)> = None;
+
     for (idx, line_text) in lines.iter().enumerate() {
         let line_no = idx as u32;
         if line_states[idx].skips_indentation_check() {
@@ -124,6 +105,14 @@ pub(crate) fn collect(
         }
 
         if aligned_comment_exemptions.contains(&line_no) && is_standalone_comment_line(line_text) {
+            continue;
+        }
+
+        let diff = i64::from(expected.primary) - i64::from(actual);
+        let consecutive_same_diff = last_bad
+            .is_some_and(|(prev_line, prev_diff)| line_no == prev_line + 1 && diff == prev_diff);
+        last_bad = Some((line_no, diff));
+        if consecutive_same_diff {
             continue;
         }
 
@@ -200,17 +189,6 @@ impl Expected {
 
     fn top_level() -> Self {
         Self::single(0)
-    }
-
-    fn with_alternative(primary: u32, alternative: u32) -> Self {
-        if primary == alternative {
-            Self::single(primary)
-        } else {
-            Self {
-                primary,
-                alternatives: vec![alternative],
-            }
-        }
     }
 
     fn is_acceptable(&self, actual: u32) -> bool {
@@ -431,184 +409,507 @@ fn comment_run_member(
     Some((comment, expected))
 }
 
-/// Walk the tree once, recording an expected indent for each line covered by a
-/// multi-line scope. We visit the parent before its children so that nested
-/// (innermost) scopes overwrite their ancestor's expectation — the inner scope
-/// is what the line actually sits in.
+/// Build per-line expected indents with lintr's accumulated "indent change"
+/// model. Indent-inducing tokens are collected in document order; each change
+/// covers a line range and rewrites those lines' expectation as a function of
+/// the *current* expected value — `Block` adds one unit, `Double` two,
+/// `Hanging` pins an absolute column. This mirrors
+/// `lintr::indentation_linter()`'s algorithm (tidy style), so nested scopes
+/// accumulate exactly like lintr instead of anchoring to a line's physical
+/// indentation.
 ///
-/// **Closer wins, by construction.** A standalone closing delimiter's line
-/// (`)`, `]`, `]]`, or `}` that begins its own line) must always keep the
-/// opener-aligned expectation set by `set_braced`/`set_bracketed`, never a
-/// binary-operator continuation expectation from `set_binary_operator`. This
-/// holds without any extra bookkeeping because of two structural facts about
-/// the grammar and this traversal:
-/// * If a `binary_operator` node's continuation write (`(start_line +
-///   1)..=end_line` in `set_binary_operator`) reaches the closer's row, that
-///   operator must be an *ancestor* of the bracket/brace (a descendant's rows
-///   can never extend past its own bracket's closer token; a same-row
-///   *sibling* operator elsewhere on the closer's line, e.g. after a `;`,
-///   only starts there and so never writes to it). Ancestors are visited —
-///   and so write their expectation — strictly before descendants in this
-///   pre-order walk, so the bracket/brace's own write to the closer row
-///   always happens last and wins.
-/// * A binary operator that is a *descendant* of the bracket/brace can never
-///   reach the closer's row at all, because that row's leading token is the
-///   closer itself (that's what "begins its own line" means), leaving no room
-///   for a nested operator's span to extend onto it.
+/// The changes:
+/// * A bracket opener (`{`, `(`, `[`, `[[` — from braces, call/subset
+///   arguments, parameter lists, parenthesized expressions, and
+///   `if`/`while`/`for` statement parens) covers the lines from the opener's
+///   next line through the last content line before the closer. A closer that
+///   starts its own line is therefore *outside* the range and keeps the
+///   surrounding expectation — closer alignment falls out of the model. The
+///   change is `Block` when the closer starts its own line and
+///   `Hanging(column after the opener)` when the closer trails content
+///   (lintr's tidy exclusivity). A function/lambda parameter list whose
+///   first parameter sits on a later line than `function` *and* whose closer
+///   trails the last parameter is `Double` (tidyverse double-indent
+///   definitions). An opener is skipped entirely when a same-line following
+///   sibling spans multiple lines and itself contains an end-of-line opener
+///   (`foo(bar(`, trailing lambdas `map(x, function(y) {` — only the inner
+///   bracket indents, lintr's double-indent avoidance).
+/// * An infix operator token at end of line (binary operators including
+///   `%…%`, plus `$`/`@`/`::` chains and the `=` of named arguments and
+///   formal defaults) covers its right-hand operand's lines as `Block` —
+///   unless suppressed by lintr's `assignment_as_infix` default: an operator
+///   nested under an assignment whose own operator ends its line (walking up
+///   until a call argument or braced block resets the context) adds no
+///   second level, so `x <-\n  a +\n  b` is flat.
+/// * `else` / `repeat` at end of line and an unbraced control-flow or
+///   function body (`)` at end of line with no `{` following) cover the body
+///   lines as `Block`.
 ///
-/// So the ordinary parent-before-child overwrite rule already guarantees
-/// closer alignment takes precedence, independent of how deeply the
-/// binary-operator continuation nests inside the bracket.
+/// Raven layers documented tolerances on top as alternative accepted values:
+/// aligned-with-opener style for argument lists whose opener carries content
+/// (`foo(a,\n    b\n)`), the block form where lintr demands hanging (and one
+/// unit where lintr demands two), and the chain-start column for operator
+/// continuations so the linter never disagrees with the on-type formatter.
+/// These only ever *add* accepted values, so Raven flags a subset of what
+/// lintr flags on these shapes; primaries match lintr.
 fn set_expectations(
-    node: Node<'_>,
+    root: Node<'_>,
     lines: &[&str],
     indent_unit: u32,
     out: &mut HashMap<u32, Expected>,
 ) {
+    let mut changes: Vec<Change> = Vec::new();
+    collect_changes(root, lines, &mut changes);
+    changes.sort_by_key(|c| c.token_byte);
+
+    let line_count = lines.len();
+    let mut primary = vec![0u32; line_count];
+    let mut alternatives: Vec<Vec<u32>> = vec![Vec::new(); line_count];
+
+    for change in &changes {
+        let begin = change.begin as usize;
+        let end = (change.end as usize).min(line_count.saturating_sub(1));
+        if begin > end {
+            continue;
+        }
+        for line in begin..=end {
+            let current = primary[line];
+            match change.ty {
+                ChangeType::Block => {
+                    primary[line] = current + indent_unit;
+                    for alt in &mut alternatives[line] {
+                        *alt += indent_unit;
+                    }
+                }
+                ChangeType::Double => {
+                    primary[line] = current + 2 * indent_unit;
+                    for alt in &mut alternatives[line] {
+                        *alt += 2 * indent_unit;
+                    }
+                }
+                ChangeType::Hanging(col) => {
+                    primary[line] = col;
+                    alternatives[line].clear();
+                }
+            }
+            match change.alt {
+                AltRule::None => {}
+                // Only accept an absolute-column tolerance that sits to the
+                // *right* of the primary — the aligned/chain-start styles are
+                // deeper than the block/hanging primary. A column at or left
+                // of the primary would legalize under-indented continuations
+                // (`x <- (\n  a +\n  b\n)` must still flag `b`).
+                AltRule::AlsoCol(col) if col > primary[line] => alternatives[line].push(col),
+                AltRule::AlsoCol(_) => {}
+                AltRule::AlsoBlock => alternatives[line].push(current + indent_unit),
+            }
+        }
+    }
+
+    for line in 0..line_count {
+        if primary[line] != 0 || !alternatives[line].is_empty() {
+            let mut expected = Expected::single(primary[line]);
+            for &alt in &alternatives[line] {
+                if alt != expected.primary && !expected.alternatives.contains(&alt) {
+                    expected.alternatives.push(alt);
+                }
+            }
+            out.insert(line as u32, expected);
+        }
+    }
+}
+
+/// How an indent change rewrites the covered lines' expectation.
+#[derive(Clone, Copy)]
+enum ChangeType {
+    /// One `indent_unit` beyond the current expectation.
+    Block,
+    /// Two units (tidyverse double-indent function definitions).
+    Double,
+    /// An absolute column (content trails the opener; closer trails content).
+    Hanging(u32),
+}
+
+/// Raven's extra accepted values, layered over the lintr primary.
+#[derive(Clone, Copy)]
+enum AltRule {
+    None,
+    /// Accept this absolute column too (aligned-argument style, operator
+    /// chain-start alignment).
+    AlsoCol(u32),
+    /// Accept one `indent_unit` over the pre-change expectation too (the
+    /// block form where lintr demands hanging/double).
+    AlsoBlock,
+}
+
+/// One indent-inducing token and the line range it governs.
+struct Change {
+    /// Byte offset of the inducing token — changes apply in document order.
+    token_byte: usize,
+    /// First covered line (inclusive).
+    begin: u32,
+    /// Last covered line (inclusive).
+    end: u32,
+    ty: ChangeType,
+    alt: AltRule,
+}
+
+fn collect_changes(node: Node<'_>, lines: &[&str], out: &mut Vec<Change>) {
     match node.kind() {
-        "braced_expression" => set_braced(node, lines, indent_unit, out),
+        "braced_expression" => bracket_change(node, node, lines, false, out),
         "call" | "subset" | "subset2" => {
             if let Some(args) = node.child_by_field_name("arguments") {
-                set_bracketed(args, lines, indent_unit, out);
+                bracket_change(node, args, lines, false, out);
             }
         }
         "function_definition" => {
             if let Some(params) = node.child_by_field_name("parameters") {
-                set_bracketed(params, lines, indent_unit, out);
+                bracket_change(node, params, lines, true, out);
+            }
+            unbraced_body_change(node, "body", lines, out);
+        }
+        "parenthesized_expression" => bracket_change(node, node, lines, false, out),
+        "if_statement" | "while_statement" | "for_statement" => {
+            bracket_change(node, node, lines, false, out);
+            let body_field = if node.kind() == "if_statement" {
+                "consequence"
+            } else {
+                "body"
+            };
+            unbraced_body_change(node, body_field, lines, out);
+            else_change(node, out);
+        }
+        "repeat_statement" => {
+            if let (Some(keyword), Some(body)) = (node.child(0), node.child_by_field_name("body"))
+                && body.start_position().row > keyword.start_position().row
+                && body.kind() != "braced_expression"
+            {
+                out.push(Change {
+                    token_byte: keyword.start_byte(),
+                    begin: keyword.start_position().row as u32 + 1,
+                    end: body.end_position().row as u32,
+                    ty: ChangeType::Block,
+                    alt: AltRule::None,
+                });
             }
         }
-        "parenthesized_expression" => set_bracketed(node, lines, indent_unit, out),
-        "binary_operator" => set_binary_operator(node, lines, indent_unit, out),
+        "binary_operator" | "extract_operator" | "namespace_operator" => {
+            operator_change(node, lines, out);
+        }
+        "argument" | "parameter" => named_eq_change(node, out),
         _ => {}
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        set_expectations(child, lines, indent_unit, out);
+        collect_changes(child, lines, out);
     }
 }
 
-fn set_braced(node: Node<'_>, lines: &[&str], indent_unit: u32, out: &mut HashMap<u32, Expected>) {
-    let Some(opener) = node.child_by_field_name("open") else {
-        return;
-    };
-    let Some(closer) = node.child_by_field_name("close") else {
-        return;
-    };
-
-    let opener_line = opener.start_position().row as u32;
-    let closer_line = closer.start_position().row as u32;
-    if opener_line >= closer_line {
-        return;
-    }
-
-    let opener_indent = leading_whitespace_count(line_text(lines, opener_line));
-    let inner_indent = opener_indent.saturating_add(indent_unit);
-    let closer_col = closer.start_position().column as u32;
-
-    for line in (opener_line + 1)..=closer_line {
-        let text = line_text(lines, line);
-        let leading_ws = leading_whitespace_count(text);
-        let expected = if line == closer_line && closer_col == leading_ws {
-            Expected::single(opener_indent)
-        } else {
-            Expected::single(inner_indent)
-        };
-        out.insert(line, expected);
-    }
-}
-
-fn set_bracketed(
-    node: Node<'_>,
+/// Emit the indent change for a bracketed group. `owner` is the syntactic
+/// construct (used for the double-indent test); `bracket` is the node holding
+/// the `open`/`close` fields.
+fn bracket_change(
+    owner: Node<'_>,
+    bracket: Node<'_>,
     lines: &[&str],
-    indent_unit: u32,
-    out: &mut HashMap<u32, Expected>,
+    is_parameters: bool,
+    out: &mut Vec<Change>,
 ) {
-    let Some(opener) = node.child_by_field_name("open") else {
+    let Some(open) = bracket.child_by_field_name("open") else {
         return;
     };
-    let Some(closer) = node.child_by_field_name("close") else {
+    let Some(close) = bracket.child_by_field_name("close") else {
         return;
     };
-
-    let opener_line = opener.start_position().row as u32;
-    let closer_line = closer.start_position().row as u32;
-    if opener_line >= closer_line {
+    let open_row = open.start_position().row as u32;
+    let close_row = close.start_position().row as u32;
+    if open_row >= close_row {
+        return;
+    }
+    // lintr's double-indent avoidance: when a same-line sibling expression
+    // spans multiple lines and itself contains an end-of-line opener
+    // (`foo(bar(`, `map(x, function(y) {`), only the inner bracket indents.
+    if sibling_content_has_eol_opener(bracket, open, lines) {
         return;
     }
 
-    let opener_line_text = line_text(lines, opener_line);
-    let opener_indent = leading_whitespace_count(opener_line_text);
-    let opener_end_col = opener.end_position().column as u32;
+    let Some(prev) = close.prev_sibling() else {
+        return;
+    };
+    if prev.id() == open.id() {
+        // Empty group (`(\n)`) — nothing to indent.
+        return;
+    }
+    let begin = open_row + 1;
+    let end = prev.end_position().row as u32;
+    if begin > end {
+        return;
+    }
+
+    let closer_on_own_line = {
+        let text = line_text(lines, close_row);
+        let col = close.start_position().column;
+        text.get(..col)
+            .is_some_and(|prefix| prefix.chars().all(char::is_whitespace))
+    };
+    let opener_line_text = line_text(lines, open_row);
     let after_opener = opener_line_text
-        .get(opener_end_col as usize..)
+        .get(open.end_position().column..)
         .unwrap_or("");
-    // A trailing `# comment` after the opener doesn't count as "content on
-    // the same line" — `foo( # note` is morally the same as `foo(`, so only
-    // the hanging form should be accepted. The smart-indent provider strips
-    // comments before making the same decision; do likewise here so we don't
-    // silently accept aligned-style indent in code where the opener carries
-    // no code argument.
+    // A trailing `#` comment after the opener doesn't count as content — the
+    // aligned-style tolerance needs a real code argument to align to.
     let has_content_after_opener = first_non_whitespace_is_code(after_opener);
+    let opener_end_col = char_col(lines, open_row, open.end_position().column);
 
-    let primary = opener_indent.saturating_add(indent_unit);
-    let aligned = opener_end_col;
-    let closer_col = closer.start_position().column as u32;
+    // Tidyverse double-indent definitions: `function(` with no parameter on
+    // the `function` line and the closer trailing the last parameter.
+    let double = is_parameters
+        && !has_content_after_opener
+        && !closer_on_own_line
+        && owner.start_position().row as u32 == open_row;
 
-    for line in (opener_line + 1)..=closer_line {
-        let text = line_text(lines, line);
-        let leading_ws = leading_whitespace_count(text);
-        let expected = if line == closer_line && closer_col == leading_ws {
-            Expected::single(opener_indent)
-        } else if has_content_after_opener {
-            Expected::with_alternative(primary, aligned)
-        } else {
-            Expected::single(primary)
-        };
-        out.insert(line, expected);
-    }
-}
-
-fn set_binary_operator(
-    node: Node<'_>,
-    lines: &[&str],
-    indent_unit: u32,
-    out: &mut HashMap<u32, Expected>,
-) {
-    let start_line = node.start_position().row as u32;
-    let end_line = node.end_position().row as u32;
-    if start_line >= end_line {
+    // lintr's "suppress" case: an outer call that merely wraps an inner call
+    // starting on the same line and running to the closer adds no indent
+    // level of its own (`outer_fun(inner_fun(x,\n  arg\n))` — only the inner
+    // call indents).
+    let prev_content = if prev.kind() == "argument" {
+        prev.child_by_field_name("value").unwrap_or(prev)
+    } else {
+        prev
+    };
+    if !closer_on_own_line
+        && prev_content.kind() == "call"
+        && prev_content.start_position().row as u32 == open_row
+        && prev_content.end_position().row as u32 == close_row
+        && close_row > open_row
+    {
         return;
     }
 
-    let opener_indent = leading_whitespace_count(line_text(lines, start_line));
-    let hanging = opener_indent.saturating_add(indent_unit);
-    // The on-type formatter (see `calculate_indentation` for
-    // `AfterContinuationOperator`) places continuation lines at
-    // `max(chain_start_col, line_indent + tab_size)`. When the chain start
-    // column (the leftmost column of the binop's LHS) sits to the right of
-    // the hanging indent — typically because the chain is the RHS of a
-    // wider assignment such as `result <- foo() +` — we accept both forms
-    // so the linter doesn't disagree with the formatter's output.
-    let chain_start_col = node.start_position().column as u32;
-    let aligned_parenthesized_clauses = node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "parenthesized_expression")
-        && node
-            .child_by_field_name("lhs")
-            .is_some_and(|lhs| lhs.kind() == "parenthesized_expression")
-        && node
-            .child_by_field_name("rhs")
-            .is_some_and(|rhs| rhs.kind() == "parenthesized_expression");
-    let expected = if chain_start_col > hanging || aligned_parenthesized_clauses {
-        Expected::with_alternative(hanging, chain_start_col)
+    let (ty, alt) = if double {
+        (ChangeType::Double, AltRule::AlsoBlock)
+    } else if closer_on_own_line {
+        let alt = if has_content_after_opener {
+            AltRule::AlsoCol(opener_end_col)
+        } else {
+            AltRule::None
+        };
+        (ChangeType::Block, alt)
     } else {
-        Expected::single(hanging)
+        (ChangeType::Hanging(opener_end_col), AltRule::AlsoBlock)
     };
 
-    for line in (start_line + 1)..=end_line {
-        out.insert(line, expected.clone());
+    out.push(Change {
+        token_byte: open.start_byte(),
+        begin,
+        end,
+        ty,
+        alt,
+    });
+}
+
+/// True when a sibling content node starting on the opener's row spans
+/// multiple rows and contains a bracket opener token at end of line.
+fn sibling_content_has_eol_opener(bracket: Node<'_>, open: Node<'_>, lines: &[&str]) -> bool {
+    let open_row = open.start_position().row;
+    let mut cursor = bracket.walk();
+    bracket.children(&mut cursor).any(|child| {
+        child.start_byte() > open.start_byte()
+            && child.start_position().row == open_row
+            && child.end_position().row > open_row
+            && subtree_has_eol_opener(child, lines)
+    })
+}
+
+fn subtree_has_eol_opener(node: Node<'_>, lines: &[&str]) -> bool {
+    if matches!(node.kind(), "(" | "[" | "[[" | "{") {
+        let row = node.start_position().row;
+        let rest = line_text(lines, row as u32)
+            .get(node.end_position().column..)
+            .unwrap_or("");
+        if !first_non_whitespace_is_code(rest) {
+            return true;
+        }
     }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| subtree_has_eol_opener(child, lines))
+}
+
+/// Emit the continuation change for an infix operator whose right-hand side
+/// starts on a later line, subject to the `assignment_as_infix` suppression.
+fn operator_change(node: Node<'_>, lines: &[&str], out: &mut Vec<Change>) {
+    let Some(op) = node.child_by_field_name("operator") else {
+        return;
+    };
+    let Some(rhs) = node.child_by_field_name("rhs") else {
+        return;
+    };
+    if rhs.start_position().row <= op.end_position().row {
+        return;
+    }
+    if suppressed_as_assignment_rhs(node) {
+        return;
+    }
+    // When the operator's RHS is immediately called (`http_head(url)$\n
+    // then(...)`), the continuation level covers the whole call, not just
+    // the callee name — lintr extends the range the same way.
+    let mut end = rhs.end_position().row as u32;
+    if let Some(parent) = node.parent()
+        && parent.kind() == "call"
+        && parent
+            .child_by_field_name("function")
+            .is_some_and(|f| f.id() == node.id())
+    {
+        end = parent.end_position().row as u32;
+    }
+    out.push(Change {
+        token_byte: op.start_byte(),
+        begin: op.end_position().row as u32 + 1,
+        end,
+        ty: ChangeType::Block,
+        // The on-type formatter may align continuations with the chain's
+        // start column; accept that too so the linter never disagrees with
+        // the formatter's output.
+        alt: AltRule::AlsoCol(char_col(
+            lines,
+            node.start_position().row as u32,
+            node.start_position().column,
+        )),
+    });
+}
+
+/// Emit the continuation change for a named argument / formal default whose
+/// `=` ends its line (lintr's EQ_SUB / EQ_FORMALS infix changes).
+fn named_eq_change(node: Node<'_>, out: &mut Vec<Change>) {
+    let mut cursor = node.walk();
+    let Some(eq) = node.children(&mut cursor).find(|child| child.kind() == "=") else {
+        return;
+    };
+    let Some(value) = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("default"))
+    else {
+        return;
+    };
+    if value.start_position().row <= eq.end_position().row {
+        return;
+    }
+    if suppressed_as_assignment_rhs(node) {
+        return;
+    }
+    out.push(Change {
+        token_byte: eq.start_byte(),
+        begin: eq.end_position().row as u32 + 1,
+        end: value.end_position().row as u32,
+        ty: ChangeType::Block,
+        alt: AltRule::None,
+    });
+}
+
+/// lintr's `assignment_as_infix = TRUE` suppression: an infix continuation
+/// adds no second indent level when it sits on the right-hand side of an
+/// assignment whose operator ends its line. Walking up, a call argument or a
+/// braced block "restores" the context (stops the search); a parenthesized
+/// expression does not.
+fn suppressed_as_assignment_rhs(node: Node<'_>) -> bool {
+    let mut child = node;
+    while let Some(parent) = child.parent() {
+        match parent.kind() {
+            "binary_operator" => {
+                let is_rhs = parent
+                    .child_by_field_name("rhs")
+                    .is_some_and(|rhs| rhs.id() == child.id());
+                if is_rhs
+                    && let Some(op) = parent.child_by_field_name("operator")
+                    && matches!(op.kind(), "<-" | "<<-" | "=" | ":=")
+                    && parent
+                        .child_by_field_name("rhs")
+                        .is_some_and(|rhs| rhs.start_position().row > op.end_position().row)
+                {
+                    return true;
+                }
+                // An assignment operator not at end of line is neither a
+                // suppressor nor a restorer — keep walking.
+            }
+            "argument" | "parameter" => {
+                // A named argument whose `=` ends its line suppresses; any
+                // other argument is a call boundary that restores.
+                let mut cursor = parent.walk();
+                let eq = parent.children(&mut cursor).find(|c| c.kind() == "=");
+                let value = parent
+                    .child_by_field_name("value")
+                    .or_else(|| parent.child_by_field_name("default"));
+                return match (eq, value) {
+                    (Some(eq), Some(value)) if value.id() == child.id() => {
+                        value.start_position().row > eq.end_position().row
+                    }
+                    _ => false,
+                };
+            }
+            "braced_expression" => return false,
+            _ => {}
+        }
+        child = parent;
+    }
+    false
+}
+
+/// Emit the change for an unbraced control-flow or function body: the `)` (or
+/// parameter-list `)`) ends its line and the body is not a braced block.
+fn unbraced_body_change(node: Node<'_>, body_field: &str, lines: &[&str], out: &mut Vec<Change>) {
+    let close = node.child_by_field_name("close").or_else(|| {
+        node.child_by_field_name("parameters")
+            .and_then(|params| params.child_by_field_name("close"))
+    });
+    let Some(close) = close else {
+        return;
+    };
+    let Some(body) = node.child_by_field_name(body_field) else {
+        return;
+    };
+    if body.kind() == "braced_expression" {
+        return;
+    }
+    let close_row = close.start_position().row;
+    if body.start_position().row <= close_row {
+        return;
+    }
+    let _ = lines;
+    out.push(Change {
+        token_byte: close.start_byte(),
+        begin: close_row as u32 + 1,
+        end: body.end_position().row as u32,
+        ty: ChangeType::Block,
+        alt: AltRule::None,
+    });
+}
+
+/// Emit the change for an `else` keyword that ends its line.
+fn else_change(node: Node<'_>, out: &mut Vec<Change>) {
+    if node.kind() != "if_statement" {
+        return;
+    }
+    let Some(alternative) = node.child_by_field_name("alternative") else {
+        return;
+    };
+    let mut cursor = node.walk();
+    let Some(else_kw) = node.children(&mut cursor).find(|c| c.kind() == "else") else {
+        return;
+    };
+    if alternative.kind() == "braced_expression"
+        || alternative.start_position().row <= else_kw.start_position().row
+    {
+        return;
+    }
+    out.push(Change {
+        token_byte: else_kw.start_byte(),
+        begin: else_kw.start_position().row as u32 + 1,
+        end: alternative.end_position().row as u32,
+        ty: ChangeType::Block,
+        alt: AltRule::None,
+    });
 }
 
 /// Collect line numbers that start strictly inside a multi-line string. For a
@@ -630,16 +931,26 @@ fn collect_string_interior_lines(node: Node<'_>, set: &mut HashSet<u32>) {
     }
 }
 
+/// Character column for a tree-sitter *byte* column on `line`. Expected
+/// indents are measured in characters (`leading_space_count`), so absolute
+/// columns fed into `Hanging`/`AlsoCol` must be converted — a non-ASCII
+/// character before the opener would otherwise shift the expectation.
+fn char_col(lines: &[&str], line: u32, byte_col: usize) -> u32 {
+    let text = line_text(lines, line);
+    match text.get(..byte_col) {
+        // A leading BOM (line 0 only) is invisible and must not count —
+        // `leading_space_count` never sees it either.
+        Some(prefix) => strip_leading_bom_for_scan(prefix).chars().count() as u32,
+        None => byte_col as u32,
+    }
+}
+
 fn line_text<'a>(lines: &'a [&'a str], line: u32) -> &'a str {
     lines.get(line as usize).copied().unwrap_or("")
 }
 
 fn leading_space_count(line: &str) -> u32 {
     line.chars().take_while(|c| *c == ' ').count() as u32
-}
-
-fn leading_whitespace_count(line: &str) -> u32 {
-    line.chars().take_while(|c| c.is_whitespace()).count() as u32
 }
 
 fn has_tab_in_leading(line: &str) -> bool {
@@ -1129,10 +1440,12 @@ mod tests {
             "expected no diagnostic on closing paren line; got {:?}",
             diags
         );
+        let operand_diag = diagnostic_on_line(&diags, 2)
+            .expect("expected continuation diagnostic on second operand line");
         assert!(
-            diagnostic_on_line(&diags, 2).is_none(),
-            "aligned parenthesized clauses should be accepted; got {:?}",
-            diags
+            operand_diag.message.contains("8"),
+            "expected message to mention 8 spaces; got {:?}",
+            operand_diag
         );
     }
 
@@ -1146,10 +1459,12 @@ mod tests {
             "expected no diagnostic on closing paren line; got {:?}",
             diags
         );
+        let operand_diag = diagnostic_on_line(&diags, 4)
+            .expect("expected continuation diagnostic on second operand line");
         assert!(
-            diagnostic_on_line(&diags, 4).is_none(),
-            "aligned parenthesized clauses should be accepted; got {:?}",
-            diags
+            operand_diag.message.contains("16"),
+            "expected message to mention 16 spaces; got {:?}",
+            operand_diag
         );
     }
 
@@ -1181,5 +1496,52 @@ mod tests {
             "expected diagnostic on line 2 (the misindented `)`); got {:?}",
             diags
         );
+    }
+
+    #[test]
+    fn multi_line_if_condition_hangs_like_a_bracketed_group() {
+        // `if (` / `while (` conditions indent like any other bracketed
+        // group (issue #600); real lintr accepts these shapes.
+        let if_ok = "if (\n  a &&\n    b\n) {\n  x <- 1\n}\n";
+        assert!(lint(if_ok, 2).is_empty(), "got {:?}", lint(if_ok, 2));
+
+        let while_ok = "while (\n  a &&\n    b\n) {\n  y <- 2\n}\n";
+        assert!(lint(while_ok, 2).is_empty(), "got {:?}", lint(while_ok, 2));
+
+        // Under-indented condition lines are still flagged.
+        let bad = "if (\na\n) {\n  x <- 1\n}\n";
+        let diags = lint(bad, 2);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.line, 1);
+        assert!(diags[0].message.contains("should be 2 spaces"));
+    }
+
+    #[test]
+    fn multi_line_if_condition_closer_aligns_with_if_line() {
+        // The `)` closing a multi-line condition aligns with the `if` line.
+        let misaligned = "if (\n  a\n  ) {\n  x <- 1\n}\n";
+        let diags = lint(misaligned, 2);
+        assert!(
+            diags.iter().any(|d| d.range.start.line == 2),
+            "expected diagnostic on the misindented `)`; got {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn hanging_columns_measure_characters_not_bytes() {
+        // `é` is 2 bytes, 1 char. The hanging column after `foo(` is the
+        // 9th *character*; real lintr accepts this layout (verified).
+        let text = "\u{e9} <- foo(a,\n         b)\n";
+        assert!(lint(text, 2).is_empty(), "got {:?}", lint(text, 2));
+    }
+
+    #[test]
+    fn multi_line_for_clause_indents_like_a_bracketed_group() {
+        // A `for` clause spanning lines: the nested call's closer at column 0
+        // must win over the for-clause's inner-line expectation (descendant
+        // writes overwrite ancestors in the pre-order walk).
+        let text = "for (i in seq_len(\n  n\n)) {\n  z <- 3\n}\n";
+        assert!(lint(text, 2).is_empty(), "got {:?}", lint(text, 2));
     }
 }
