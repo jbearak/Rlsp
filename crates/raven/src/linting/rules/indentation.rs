@@ -1276,6 +1276,51 @@ mod tests {
     }
 
     #[test]
+    fn issue611_same_line_condition_chain_keeps_hanging_level() {
+        // A chain inside `if (`/`while (` condition parens under a broken
+        // assignment: the condition's bracket level survives the
+        // assignment suppression — the indenter's formula output (6 for
+        // `if`, 9 for `while`) is accepted; the bare line indent (2) is
+        // flagged in every mode.
+        for style in ALL_STYLES {
+            for clean in [
+                "a <-\n  if (data %>%\n      g()) 1\n",
+                "a <-\n  while (data %>%\n         g()) 1\n",
+            ] {
+                assert!(
+                    lint_with_style(clean, 2, style).is_empty(),
+                    "{clean:?} must be clean under {style:?}"
+                );
+            }
+            for flagged in [
+                "a <-\n  if (data %>%\n  g()) 1\n",
+                "a <-\n  while (data %>%\n  g()) 1\n",
+            ] {
+                assert!(
+                    !lint_with_style(flagged, 2, style).is_empty(),
+                    "bare line indent {flagged:?} must be flagged under {style:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue611_same_line_statement_body_chain_is_flattened() {
+        // A chain in a same-row `if` BODY has no bracket level: the
+        // flattened column (2) is the only accepted shape.
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("a <-\n  if (x) data %>%\n  g()\n", 2, style).is_empty(),
+                "flattened if-body chain must be clean under {style:?}"
+            );
+            assert!(
+                !lint_with_style("a <-\n  if (x) data %>%\n    g()\n", 2, style).is_empty(),
+                "indented if-body chain must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
     fn issue611_same_line_paren_chain_keeps_hanging_level() {
         // `a <-` ⏎ `  (data %>%` ⏎: the paren opened on the chain's own
         // line contributes a hanging level the assignment suppression does

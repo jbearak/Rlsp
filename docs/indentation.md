@@ -112,7 +112,7 @@ result <-
   select(y)
 ```
 
-The same flattening applies to chained broken assignments (`a <-` ⏎ `b <-` ⏎ puts the final right-hand side at one level, not two).
+The same flattening applies to chained broken assignments (`a <-` ⏎ `b <-` ⏎ puts the final right-hand side at one level, not two). It does **not** apply when the chain hangs in a bracket opened on its own line — in `a <-` ⏎ `(data %>%` ⏎ (or a chain inside `if (…)` condition parens) the bracket's hanging level survives, and continuations align under the chain start as usual.
 
 An assignment operator ending a line *inside* call arguments — including a named argument's or formal default's `=` — keeps the argument alignment of the enclosing call instead ([see above](#styles)); `:=` inside `dt[...]` likewise keeps bracket-content alignment.
 

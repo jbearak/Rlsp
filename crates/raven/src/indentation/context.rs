@@ -1123,39 +1123,62 @@ fn find_subchain_start(
     }
 }
 
-/// Whether a chain hangs in a paren opened on the chain's own start line
-/// (`a <-` ⏎ `  (data %>%` ⏎): the parenthesized expression does not
-/// restore the `assignment_as_infix` suppression, but its hanging level
-/// still applies — the lint expects continuations at the paren-content
-/// column (3) or the block bump (4), never the bare line indent (2). Such
-/// chains are exempt from flattening so the existing
-/// `max(chain_start_col, line_indent + tab)` formula (lint-accepted)
-/// applies. A paren opened on an *earlier* line contributes a block level
-/// the chain line's own indent already reflects, so flattening stands.
+/// Whether a chain hangs in a bracket opened on the chain's own start line
+/// (`a <-` ⏎ `  (data %>%` ⏎, or a chain inside `if (`/`while (`/`for (`
+/// condition parens): these constructs do not restore the
+/// `assignment_as_infix` suppression, but their hanging level still
+/// applies — the lint expects continuations at the bracket-content or
+/// block-bump column, never the bare line indent. Such chains are exempt
+/// from flattening so the existing `max(chain_start_col, line_indent +
+/// tab)` formula (lint-accepted) applies. A bracket opened on an *earlier*
+/// line contributes a block level the chain line's own indent already
+/// reflects, so flattening stands.
 ///
-/// The walk passes through any ancestor that still begins on the chain's
-/// row (mixed-chain `binary_operator`s, `unary_operator` as in
-/// `(!data %>%`, nested parens, …) and ends as soon as an ancestor begins
-/// on an earlier row — by containment, everything above it also begins on
-/// or before that row, so no same-row paren can appear higher up. Restorer
-/// boundaries (call arguments, braces) need no special-casing here: they
-/// make the suppression predicate false before this function matters.
+/// Control-flow statements are field-sensitive, mirroring
+/// [`assignment_in_paren_context`]: only the `condition` (`if`/`while`) or
+/// `sequence` (`for`) field hangs — a chain in a same-row *body*
+/// (`a <-` ⏎ `  if (x) data %>%` ⏎) has no bracket level and the lint
+/// expects the flattened column there.
 ///
-/// The fallback path needs no counterpart: at Enter time such a paren is
+/// The walk passes through any other ancestor that still begins on the
+/// chain's row (mixed-chain `binary_operator`s, `unary_operator` as in
+/// `(!data %>%`, statement bodies, …) and ends as soon as an ancestor
+/// begins on an earlier row — by containment, everything above it also
+/// begins on or before that row, so no same-row bracket can appear higher
+/// up. Restorer boundaries (call/subset arguments, braces) need no arms
+/// here: they make the suppression predicate false before this function
+/// matters.
+///
+/// The fallback path needs no counterpart: at Enter time such a bracket is
 /// unclosed on the chain-start line, and the fallback's
 /// unclosed-delimiter-at-or-after-chain-start guard already rejects
 /// flattening there.
-fn chain_hangs_in_same_line_paren(outermost: Node) -> bool {
+fn chain_hangs_in_same_line_bracket(outermost: Node) -> bool {
     let row = outermost.start_position().row;
-    let mut current = outermost;
-    while let Some(parent) = current.parent() {
+    let mut child = outermost;
+    while let Some(parent) = child.parent() {
         if parent.start_position().row < row {
             return false;
         }
-        if parent.kind() == "parenthesized_expression" {
-            return true;
+        match parent.kind() {
+            "parenthesized_expression" => return true,
+            "if_statement" | "while_statement"
+                if parent
+                    .child_by_field_name("condition")
+                    .is_some_and(|c| c.id() == child.id()) =>
+            {
+                return true;
+            }
+            "for_statement"
+                if parent
+                    .child_by_field_name("sequence")
+                    .is_some_and(|c| c.id() == child.id()) =>
+            {
+                return true;
+            }
+            _ => {}
         }
-        current = parent;
+        child = parent;
     }
     false
 }
@@ -1174,7 +1197,7 @@ fn chain_hangs_in_same_line_paren(outermost: Node) -> bool {
 /// the caller can drop the one-level indent floor (#611). Computed here
 /// because only this function holds the outermost chain node. A chain that
 /// hangs in a same-line paren is exempt from flattening (see
-/// [`chain_hangs_in_same_line_paren`]): there the paren's hanging level
+/// [`chain_hangs_in_same_line_bracket`]): there the paren's hanging level
 /// still applies, and the lint rejects the bare line indent.
 fn find_chain_start_from_ast(
     tree: &Tree,
@@ -1242,7 +1265,7 @@ fn find_chain_start_from_ast(
     // root's indent level) so the calculator formula produces correct results.
     // For single-class chains, use outermost's start position directly.
     let flattened = crate::linting::suppressed_as_assignment_rhs(outermost)
-        && !chain_hangs_in_same_line_paren(outermost);
+        && !chain_hangs_in_same_line_bracket(outermost);
     let start = outermost.start_position();
     match find_subchain_start(outermost, our_class, source) {
         Some(sub_col) => Some((start.row as u32, sub_col, flattened)),
@@ -6137,6 +6160,50 @@ mod assignment_context_tests {
             );
             assert_eq!(indent_at(code, 2), 4, "for {code:?}");
         }
+    }
+
+    #[test]
+    fn chain_in_same_line_condition_is_not_flattened() {
+        // A chain inside `if (`/`while (` condition parens under a broken
+        // assignment keeps the condition's hanging level (the lint accepts
+        // the hanging or block columns, never the bare line indent). These
+        // states parse cleanly because the rest of the statement already
+        // exists below the cursor.
+        let code = "a <-\n  if (data %>%\n  g()) 1\n";
+        let ctx = detect(code, 2);
+        assert!(
+            matches!(
+                ctx,
+                IndentContext::AfterContinuationOperator {
+                    flattened_rhs: false,
+                    ..
+                }
+            ),
+            "if-condition chain must not be flattened, got {ctx:?}"
+        );
+        assert_eq!(indent_at(code, 2), 6);
+
+        let code = "a <-\n  while (data %>%\n  g()) 1\n";
+        assert_eq!(indent_at(code, 2), 9);
+    }
+
+    #[test]
+    fn chain_in_same_line_statement_body_is_flattened() {
+        // A chain in a same-row `if` BODY has no bracket level: the lint
+        // expects exactly the flattened column (2) in every mode.
+        let code = "a <-\n  if (x) data %>%\n  g()\n";
+        let ctx = detect(code, 2);
+        assert!(
+            matches!(
+                ctx,
+                IndentContext::AfterContinuationOperator {
+                    flattened_rhs: true,
+                    ..
+                }
+            ),
+            "if-body chain must be flattened, got {ctx:?}"
+        );
+        assert_eq!(indent_at(code, 2), 2);
     }
 
     #[test]
