@@ -249,25 +249,38 @@ fn ends_with_flattening_assignment(trimmed: &str) -> bool {
     )
 }
 
-/// Text-heuristic `assignment_as_infix` check for the fallback path: does
-/// the nearest code line above `line` end with a suppressing assignment
-/// operator? The walk skips lines the lint's AST predicate is insensitive
-/// to: blank lines, comment-only lines, and lines consisting solely of
-/// `(` — a parenthesized expression does not restore the context in
+/// Finds the topmost line of the consecutive run of suppressing
+/// assignment lines above `line` (the text-heuristic `assignment_as_infix`
+/// walk): `Some(row)` when the nearest code line above ends with a
+/// suppressing assignment operator, continuing upward through further
+/// suppressor lines so chained broken assignments (`a <-` ⏎ `  b <-` ⏎)
+/// report the outermost one. `None` when the nearest code line is not a
+/// suppressor (no flattening).
+///
+/// Serves two callers: detection uses `is_some()` to decide flattening on
+/// the fallback path, and the calculator derives the flattened *floor*
+/// from the returned row (`its indent + tab`), so malformed input — a
+/// chain line that is itself under-indented — still produces the level
+/// the lint requires instead of mirroring the bad indent.
+///
+/// The walk skips lines the lint's AST predicate is insensitive to: blank
+/// lines, comment-only lines, and lines consisting solely of `(` — a
+/// parenthesized expression does not restore the context in
 /// [`crate::linting::suppressed_as_assignment_rhs`], so an RHS wrapped as
 /// `a <-` ⏎ `  (` ⏎ `    data %>%` still flattens. A `{`-only line stops
 /// the walk (braces DO restore), as does any line with other content.
 ///
 /// Documented approximation: this cannot see restorer boundaries at all;
-/// callers guard the common restorer shape by rejecting flattening when an
-/// unclosed delimiter opens at or after the chain-start line. The residual
-/// gaps require an ERROR tree *and* an exotic shape simultaneously; the AST
-/// path handles them exactly.
-fn text_flattened_under_assignment(source: &str, line: u32) -> bool {
+/// detection callers guard the common restorer shape by rejecting
+/// flattening when an unclosed delimiter opens at or after the chain-start
+/// line. The residual gaps require an ERROR tree *and* an exotic shape
+/// simultaneously; the AST path handles detection exactly.
+pub(super) fn flattening_suppressor_line(source: &str, line: u32) -> Option<u32> {
     let lines: Vec<&str> = source.lines().collect();
+    let mut topmost = None;
     for idx in (0..line as usize).rev() {
         let Some(text) = lines.get(idx) else {
-            return false;
+            break;
         };
         let trimmed = strip_trailing_comment(text).trim_end();
         let content = trimmed.trim_start();
@@ -277,9 +290,13 @@ fn text_flattened_under_assignment(source: &str, line: u32) -> bool {
         if content.chars().all(|c| c == '(' || c.is_whitespace()) {
             continue; // parens don't restore the assignment context
         }
-        return ends_with_flattening_assignment(trimmed);
+        if ends_with_flattening_assignment(trimmed) {
+            topmost = Some(idx as u32);
+            continue; // keep climbing through chained assignments
+        }
+        break;
     }
-    false
+    topmost
 }
 
 /// Detects the syntactic context at the given position for indentation.
@@ -620,7 +637,7 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
             // assignment above the chain start suppresses the level, unless
             // a delimiter opened at/after the chain start (restorer shape:
             // the chain sits inside a call/parens, not directly on the RHS).
-            let flattened_rhs = text_flattened_under_assignment(source, chain_start_line)
+            let flattened_rhs = flattening_suppressor_line(source, chain_start_line).is_some()
                 && !matches!(unclosed, Some((row, _, _)) if row >= chain_start_line);
             return IndentContext::AfterContinuationOperator {
                 chain_start_line,
@@ -644,7 +661,7 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
             // does not extend it.
             let assign_line = position.line - 1;
             let (base_line, _) = ChainWalker::new(source, tab_size).find_chain_start(assign_line);
-            let flattened = text_flattened_under_assignment(source, base_line)
+            let flattened = flattening_suppressor_line(source, base_line).is_some()
                 && !matches!(unclosed, Some((row, _, _)) if row >= base_line);
             return IndentContext::AfterAssignmentOperator {
                 base_line,
@@ -1419,12 +1436,12 @@ fn detect_continuation_operator(
     // heuristic. The AST path evaluates the assignment_as_infix flattening
     // exactly (via the lint's predicate); the text path approximates it and
     // guards the restorer shape (chain inside a call opened at or after the
-    // chain start — see `text_flattened_under_assignment`).
+    // chain start — see `flattening_suppressor_line`).
     let (chain_start_line, chain_start_col, flattened_rhs) =
         find_chain_start_from_ast(tree, source, prev_line).unwrap_or_else(|| {
             let walker = ChainWalker::new(source, tab_size);
             let (line, col) = walker.find_chain_start(position.line);
-            let flattened = text_flattened_under_assignment(source, line)
+            let flattened = flattening_suppressor_line(source, line).is_some()
                 && !matches!(
                     find_unclosed_delimiter_heuristic(source, position.line),
                     Some((row, _, _)) if row >= line
@@ -6160,6 +6177,24 @@ mod assignment_context_tests {
             );
             assert_eq!(indent_at(code, 2), 4, "for {code:?}");
         }
+    }
+
+    #[test]
+    fn flattening_does_not_mirror_malformed_chain_indent() {
+        // When the chain-start line is itself under-indented (malformed
+        // input the auto-indenter never produced), the flattened output is
+        // floored at the suppressing assignment's level + one tab instead
+        // of mirroring the bad indent.
+        let code = "result <-\ndata %>%\n";
+        assert_eq!(indent_at(code, 2), 2);
+
+        // Same inside a function body via the fallback route.
+        let code = "f <- function() {\n  result <-\ndata %>%\n";
+        assert_eq!(indent_at(code, 3), 4);
+
+        // And for a chained assignment whose inner line is at column 0.
+        let code = "a <-\nb <-\n";
+        assert_eq!(indent_at(code, 2), 2);
     }
 
     #[test]

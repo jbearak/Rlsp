@@ -75,7 +75,14 @@ pub fn calculate_indentation(
                 // chain-start line's indent (not chain_start_col, which can
                 // sit mid-line in mixed chains) — every lint mode flags a
                 // second level here (lintr's assignment_as_infix, #611).
-                line_indent
+                // The suppressor-derived floor keeps malformed input (a
+                // chain line itself under-indented) at the level the lint
+                // requires instead of mirroring the bad indent; for
+                // well-formed input the two are equal.
+                std::cmp::max(
+                    line_indent,
+                    flattened_floor(source, chain_start_line, &config),
+                )
             } else {
                 // Align to chain start column (RHS of assignment if present)
                 // but ensure at least one tab_size indent from the line start.
@@ -89,10 +96,11 @@ pub fn calculate_indentation(
             // One level from the assignment statement's start line, in every
             // style — an assignment RHS has nothing to align against (#611).
             // A flattened assignment (itself the RHS of an enclosing broken
-            // assignment) adds no level of its own.
+            // assignment) adds no level of its own, but the enclosing
+            // suppressor still floors it (see the flattened chain arm).
             let base = get_line_indent(source, base_line, config.tab_size);
             if flattened {
-                base
+                std::cmp::max(base, flattened_floor(source, base_line, &config))
             } else {
                 base.saturating_add(config.tab_size)
             }
@@ -141,6 +149,16 @@ pub fn calculate_indentation(
             enclosing_block_indent
         }
     }
+}
+
+/// The minimum column for a flattened construct: one level below the
+/// topmost line of the suppressing-assignment run above `line` (see
+/// [`super::context::flattening_suppressor_line`]), or 0 when the text walk
+/// finds none (then the observed line indent stands unchallenged).
+fn flattened_floor(source: &str, line: u32, config: &IndentationConfig) -> u32 {
+    super::context::flattening_suppressor_line(source, line)
+        .map(|l| get_line_indent(source, l, config.tab_size).saturating_add(config.tab_size))
+        .unwrap_or(0)
 }
 
 /// Gets the indentation (leading whitespace column) of a specific line.
