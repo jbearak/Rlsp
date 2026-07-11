@@ -788,6 +788,8 @@ fn find_unclosed_delimiter_heuristic(source: &str, current_line: u32) -> Option<
                 escape_next = false;
                 continue;
             }
+            // No escape handling inside backticks — same rule and rationale
+            // as `strip_trailing_comment`.
             if ch == '\\' && in_string && string_char != '`' {
                 escape_next = true;
                 continue;
@@ -1764,6 +1766,11 @@ fn strip_trailing_comment(line: &str) -> &str {
             continue;
         }
 
+        // No escape handling inside backticks: R's parser rejects `a\`b`
+        // ("unexpected symbol", verified on R 4.6.1) — a backquoted name
+        // cannot contain a backtick, so the first unescaped backtick always
+        // closes it. `#` inside backticks needs no escape and is handled by
+        // the in_string state alone.
         if c == '\\' && in_string && string_char != '`' {
             escape_next = true;
             continue;
@@ -5631,6 +5638,22 @@ mod assignment_context_tests {
         assert!(
             !matches!(ctx, IndentContext::AfterAssignmentOperator { .. }),
             "%<-% must not classify as assignment, got {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn backtick_name_with_hash_fires() {
+        // `#` inside a backquoted name is not a comment (and needs no
+        // escape — R's parser rejects `\`` inside backticks, so the first
+        // backtick always closes the name).
+        let code = "`a#b` <-\n";
+        let ctx = detect(code, 1);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 0,
+                flattened: false,
+            }
         );
     }
 
