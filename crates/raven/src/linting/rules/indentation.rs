@@ -1276,6 +1276,30 @@ mod tests {
     }
 
     #[test]
+    fn issue611_same_line_paren_chain_keeps_hanging_level() {
+        // `a <-` ⏎ `  (data %>%` ⏎: the paren opened on the chain's own
+        // line contributes a hanging level the assignment suppression does
+        // not remove — the indenter's formula output (4) and the hanging
+        // column (3) are accepted; the bare line indent (2, what naive
+        // flattening would produce) is flagged in every mode.
+        for style in ALL_STYLES {
+            for clean in [
+                "a <-\n  (data %>%\n    g())\n",
+                "a <-\n  (data %>%\n   g())\n",
+            ] {
+                assert!(
+                    lint_with_style(clean, 2, style).is_empty(),
+                    "{clean:?} must be clean under {style:?}"
+                );
+            }
+            assert!(
+                !lint_with_style("a <-\n  (data %>%\n  g())\n", 2, style).is_empty(),
+                "bare line indent must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
     fn issue611_right_assignment_target_at_statement_level() {
         // `data %>%` ⏎ `  f() ->` ⏎: the target belongs one level from the
         // statement start (column 2), not two. Under `Aligned` the chain

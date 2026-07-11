@@ -88,4 +88,14 @@ describe('assignment onEnterRule (#611)', () => {
             expect(() => new RegExp(rule.beforeText)).not.toThrow();
         }
     });
+
+    test('known limitation: multiline-string interiors match', () => {
+        // `beforeText` sees one line with no cross-line state, so a line
+        // ending in `<-` inside an unterminated multiline string matches.
+        // Every existing operator rule (`%>%`, `+`, `~`, `%infix%`) shares
+        // this class of false positive; Tier 2 corrects it when active.
+        // Pinned so a future fix is deliberate rather than accidental.
+        const re = assignmentRule();
+        expect(re.test('looks like <-')).toBe(true);
+    });
 });

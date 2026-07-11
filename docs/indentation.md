@@ -116,7 +116,7 @@ The same flattening applies to chained broken assignments (`a <-` ⏎ `b <-` ⏎
 
 An assignment operator ending a line *inside* call arguments — including a named argument's or formal default's `=` — keeps the argument alignment of the enclosing call instead ([see above](#styles)); `:=` inside `dt[...]` likewise keeps bracket-content alignment.
 
-Tier 1 has a matching declarative rule for `<-` / `<<-` only, so those two indent even with Tier 2 off; `=`, `:=`, `->`, `->>` need the AST to classify correctly and are Tier 2-only.
+Tier 1 has a matching declarative rule for `<-` / `<<-` only, so those two indent even with Tier 2 off; `=`, `:=`, `->`, `->>` need the AST to classify correctly and are Tier 2-only. Like every Tier 1 rule, the regex sees a single line: it cannot recognize an operator inside an unterminated multiline string, and on its own it cannot flatten (Tier 2 handles both when active).
 
 ### Pipe Chains
 

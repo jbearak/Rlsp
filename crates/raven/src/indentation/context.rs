@@ -1081,6 +1081,37 @@ fn find_subchain_start(
     }
 }
 
+/// Whether a chain hangs in a paren opened on the chain's own start line
+/// (`a <-` ⏎ `  (data %>%` ⏎): the parenthesized expression does not
+/// restore the `assignment_as_infix` suppression, but its hanging level
+/// still applies — the lint expects continuations at the paren-content
+/// column (3) or the block bump (4), never the bare line indent (2). Such
+/// chains are exempt from flattening so the existing
+/// `max(chain_start_col, line_indent + tab)` formula (lint-accepted)
+/// applies. A paren opened on an *earlier* line contributes a block level
+/// the chain line's own indent already reflects, so flattening stands.
+///
+/// The walk passes through `binary_operator` nodes (a mixed chain inside a
+/// paren still hangs) and nested parens; anything else stops it — restorer
+/// boundaries make the suppression predicate false before this matters.
+///
+/// The fallback path needs no counterpart: at Enter time such a paren is
+/// unclosed on the chain-start line, and the fallback's
+/// unclosed-delimiter-at-or-after-chain-start guard already rejects
+/// flattening there.
+fn chain_hangs_in_same_line_paren(outermost: Node) -> bool {
+    let row = outermost.start_position().row;
+    let mut current = outermost;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "parenthesized_expression" if parent.start_position().row == row => return true,
+            "parenthesized_expression" | "binary_operator" => current = parent,
+            _ => break,
+        }
+    }
+    false
+}
+
 /// Finds the continuation chain start position using AST analysis.
 ///
 /// For continuation operators (`|>`, `%>%`, `+`, `~`, `%word%`), walks up
@@ -1093,7 +1124,10 @@ fn find_subchain_start(
 /// it sits on the RHS of an assignment whose operator ends its line, per the
 /// lint's [`crate::linting::suppressed_as_assignment_rhs`] predicate — so
 /// the caller can drop the one-level indent floor (#611). Computed here
-/// because only this function holds the outermost chain node.
+/// because only this function holds the outermost chain node. A chain that
+/// hangs in a same-line paren is exempt from flattening (see
+/// [`chain_hangs_in_same_line_paren`]): there the paren's hanging level
+/// still applies, and the lint rejects the bare line indent.
 fn find_chain_start_from_ast(
     tree: &Tree,
     source: &str,
@@ -1159,7 +1193,8 @@ fn find_chain_start_from_ast(
     // operand column. Use outermost's start line (which has the expression
     // root's indent level) so the calculator formula produces correct results.
     // For single-class chains, use outermost's start position directly.
-    let flattened = crate::linting::suppressed_as_assignment_rhs(outermost);
+    let flattened = crate::linting::suppressed_as_assignment_rhs(outermost)
+        && !chain_hangs_in_same_line_paren(outermost);
     let start = outermost.start_position();
     match find_subchain_start(outermost, our_class, source) {
         Some(sub_col) => Some((start.row as u32, sub_col, flattened)),
@@ -5929,6 +5964,27 @@ mod assignment_context_tests {
             "`(`-only separator must not defeat fallback flattening, got {ctx:?}"
         );
         assert_eq!(indent_at(code, 4), 6);
+    }
+
+    #[test]
+    fn chain_hanging_in_same_line_paren_is_not_flattened() {
+        // `a <-` ⏎ `  (data %>%` ⏎: the paren's hanging level still applies
+        // even though the assignment suppression covers the chain — the
+        // lint accepts columns 3 (hanging) or 4 (block), never 2. The
+        // pre-#611 formula output (4) stands.
+        let code = "a <-\n  (data %>%\n";
+        let ctx = detect(code, 2);
+        assert!(
+            matches!(
+                ctx,
+                IndentContext::AfterContinuationOperator {
+                    flattened_rhs: false,
+                    ..
+                }
+            ),
+            "same-line paren must exempt the chain from flattening, got {ctx:?}"
+        );
+        assert_eq!(indent_at(code, 2), 4);
     }
 
     #[test]
