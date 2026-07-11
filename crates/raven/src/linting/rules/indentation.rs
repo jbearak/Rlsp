@@ -1306,6 +1306,32 @@ mod tests {
     }
 
     #[test]
+    fn issue611_comment_interrupted_chain_target_at_statement_level() {
+        // A comment-only line inside the chain does not move the statement
+        // start: the `->` target belongs at the chain's block level (4),
+        // matching the indenter's comment-transparent ChainWalker output.
+        // Under `Aligned` the chain lines themselves are flagged (aligned
+        // chains sit at the chain-start column — #610 semantics, unrelated
+        // to the target), so assert on the target line only there.
+        let text = "f <- function() {\n  data %>%\n    # explanation\n    g() ->\n    target\n}\n";
+        for style in [
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Either,
+        ] {
+            assert!(
+                lint_with_style(text, 2, style).is_empty(),
+                "comment-interrupted chain target must be clean under {style:?}; got {:?}",
+                lint_with_style(text, 2, style)
+            );
+        }
+        let aligned = lint_with_style(text, 2, InfixContinuationStyle::Aligned);
+        assert!(
+            diagnostic_on_line(&aligned, 4).is_none(),
+            "target line must not be flagged under Aligned; got {aligned:?}"
+        );
+    }
+
+    #[test]
     fn issue611_right_assignment_target_at_statement_level() {
         // `data %>%` ⏎ `  f() ->` ⏎: the target belongs one level from the
         // statement start (column 2), not two. Under `Aligned` the chain

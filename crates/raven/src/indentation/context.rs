@@ -785,10 +785,31 @@ fn find_unclosed_delimiter_heuristic(source: &str, current_line: u32) -> Option<
         let mut in_string = false;
         let mut string_char = '"';
         let mut escape_next = false;
+        let mut in_raw_string = false;
+        let mut raw_close_delim = ')';
+        let mut skip_raw_close_quote = false;
+        let bytes = stripped.as_bytes();
 
         for (col, ch) in stripped.char_indices() {
             if escape_next {
                 escape_next = false;
+                continue;
+            }
+            // Raw-string handling mirrors `strip_trailing_comment`: the
+            // delimiters inside `r"(...)"` are string content, not brackets
+            // (otherwise `x[r"(a"#b)"] <-` hallucinates an unclosed `[`).
+            if skip_raw_close_quote {
+                skip_raw_close_quote = false;
+                continue;
+            }
+            if in_raw_string {
+                if ch == raw_close_delim {
+                    let next_byte = col + ch.len_utf8();
+                    if next_byte < bytes.len() && bytes[next_byte] == b'"' {
+                        in_raw_string = false;
+                        skip_raw_close_quote = true;
+                    }
+                }
                 continue;
             }
             // No escape handling inside backticks — same rule and rationale
@@ -796,6 +817,22 @@ fn find_unclosed_delimiter_heuristic(source: &str, current_line: u32) -> Option<
             if ch == '\\' && in_string && string_char != '`' {
                 escape_next = true;
                 continue;
+            }
+            if !in_string && (ch == 'r' || ch == 'R') {
+                let next_byte = col + 1;
+                if next_byte + 1 < bytes.len() && bytes[next_byte] == b'"' {
+                    let close = match bytes[next_byte + 1] {
+                        b'(' => Some(')'),
+                        b'[' => Some(']'),
+                        b'{' => Some('}'),
+                        _ => None,
+                    };
+                    if let Some(cd) = close {
+                        in_raw_string = true;
+                        raw_close_delim = cd;
+                        continue;
+                    }
+                }
             }
             if !in_string && (ch == '"' || ch == '\'' || ch == '`') {
                 in_string = true;
@@ -1643,7 +1680,11 @@ impl<'a> ChainWalker<'a> {
     ///
     /// Starting from `cursor_line`, walks backward through lines that end with
     /// continuation operators (`|>`, `%>%`, `+`, `~`, `%word%`) until finding a line
-    /// that does NOT end with such an operator.
+    /// that does NOT end with such an operator. Comment-only lines are
+    /// transparent — a `# note` between chain members does not break the
+    /// chain syntactically, so the walk skips them (without ever selecting
+    /// one as the chain start). Blank lines DO break the chain, preserving
+    /// the documented troubleshooting behavior.
     ///
     /// # Arguments
     ///
@@ -1662,10 +1703,16 @@ impl<'a> ChainWalker<'a> {
         let mut iterations = 0;
 
         while current_line > 0 && iterations < max_iterations {
-            if !self.line_ends_with_operator(current_line - 1) {
+            // Walk upward past comment-only lines to the nearest code line.
+            let mut probe = current_line - 1;
+            while probe > 0 && self.is_comment_only_line(probe) {
+                probe -= 1;
+                iterations += 1;
+            }
+            if self.is_comment_only_line(probe) || !self.line_ends_with_operator(probe) {
                 break;
             }
-            current_line -= 1;
+            current_line = probe;
             iterations += 1;
         }
 
@@ -1674,6 +1721,15 @@ impl<'a> ChainWalker<'a> {
         }
 
         (current_line, self.get_line_start_column(current_line))
+    }
+
+    /// Whether a line contains only a comment (after stripping the comment
+    /// nothing but whitespace remains, though the line itself is not blank).
+    fn is_comment_only_line(&self, line: u32) -> bool {
+        let Some(line_text) = self.get_line_text(line) else {
+            return false;
+        };
+        strip_trailing_comment(line_text).trim().is_empty() && !line_text.trim().is_empty()
     }
 
     /// Checks if a line ends with a continuation operator.
@@ -5934,6 +5990,48 @@ mod assignment_context_tests {
         // Enter. The fallback's closers-only exemption lets detection fall
         // through to the assignment context instead of aligning the closer.
         let code = "f(function() {\n  x <-\n})";
+        let ctx = detect(code, 2);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 1,
+                flattened: false,
+            }
+        );
+        assert_eq!(indent_at(code, 2), 4);
+    }
+
+    #[test]
+    fn comment_in_chain_does_not_shift_right_assignment_base() {
+        // Comment-only lines are syntactically transparent inside a chain:
+        // the statement start for the `->` target is still the `data` line
+        // (ERROR tree → ChainWalker route).
+        let code = "f <- function() {\n  data %>%\n    # explanation\n    g() ->\n";
+        let ctx = detect(code, 4);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 1,
+                flattened: false,
+            }
+        );
+        assert_eq!(indent_at(code, 4), 4);
+    }
+
+    #[test]
+    fn comment_in_chain_keeps_continuation_at_chain_level_via_fallback() {
+        // Same transparency for a plain continuation Enter: the chain start
+        // stays at the `data` line, not the line after the comment.
+        let code = "f <- function() {\n  data %>%\n    # explanation\n    g() %>%\n";
+        assert_eq!(indent_at(code, 4), 4);
+    }
+
+    #[test]
+    fn raw_string_delimiters_do_not_poison_fallback_gate() {
+        // The `(` and `"` inside a raw string are content, not delimiters:
+        // the fallback's unclosed-delimiter scan must not hallucinate an
+        // unclosed `[` from `r"(a"#b)"` and defer the assignment.
+        let code = "f <- function() {\n  long_name[r\"(a\"#b)\"] <-\n";
         let ctx = detect(code, 2);
         assert_eq!(
             ctx,
