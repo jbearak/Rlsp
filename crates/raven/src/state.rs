@@ -862,6 +862,40 @@ impl WorldState {
         self.package_state.workspace()
     }
 
+    /// The effective per-document `LintConfig`: the workspace-wide base,
+    /// patched with the auto-detected per-document indentation unit, then any
+    /// matching `[[linting.overrides]]` entries layered on top. Passing the
+    /// patched config as the *base* to `resolve_lint_for_document` keeps an
+    /// override's `indentationUnit` winning over the per-document value, not
+    /// the other way around.
+    ///
+    /// This is the single implementation shared by diagnostics
+    /// (`DiagnosticsSnapshot::build`) and on-type formatting (the judge tier),
+    /// so the two can never drift and disagree about a document's accepted
+    /// columns. Fast path: with no overrides configured (the common case),
+    /// the merge + section-clone work is skipped entirely.
+    pub fn effective_lint_config_for_document(
+        &self,
+        uri: &tower_lsp::lsp_types::Url,
+    ) -> crate::linting::LintConfig {
+        let mut base = self.lint_config.clone();
+        if let Some(&unit) = self.per_document_indent_unit.get(uri.as_str()) {
+            base.indentation_unit = unit;
+        }
+        if self.lint_overrides.is_empty() {
+            return base;
+        }
+        let merged = crate::config_file::merge_settings(
+            &self.raw_client_settings,
+            self.raw_project_settings.as_ref(),
+        );
+        let section = merged
+            .get("linting")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        crate::config_file::resolve_lint_for_document(&base, &section, &self.lint_overrides, uri)
+    }
+
     /// Bump the package/config generation (issue #483) so the persistent
     /// `StandaloneScopeCache` treats entries computed before a package-library
     /// re-init as belonging to a different key. Defensive: the depth-≥1 isolated

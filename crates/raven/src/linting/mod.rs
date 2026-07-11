@@ -111,8 +111,12 @@ mod rules;
 /// which must apply the same `assignment_as_infix` suppression the
 /// indentation lint judges by (#611). See the function's own doc comment.
 pub(crate) use rules::indentation::{
-    IndentKind, LineIndentExpectation, accepted_indents_for_line, suppressed_as_assignment_rhs,
+    IndentKind, LineIndentExpectation, accepted_indents_for_lines, leading_space_count,
+    suppressed_as_assignment_rhs,
 };
+
+#[cfg(test)]
+pub(crate) use rules::indentation::{IndentKindSet, accepted_indents_for_line};
 
 #[cfg(test)]
 pub(crate) use rules::indentation::lint_for_judge_test;

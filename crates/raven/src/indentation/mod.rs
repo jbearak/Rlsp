@@ -135,4 +135,28 @@ mod tests {
             "judge bail must preserve the legacy multiline-string column"
         );
     }
+
+    #[test]
+    fn offset_context_uses_legacy_physical_anchor() {
+        let source = "    {\n";
+        let tree = with_parser(|parser| parser.parse(source, None)).expect("parse must succeed");
+        let config = IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+
+        let column = on_type_indentation(
+            &tree,
+            source,
+            Position::new(1, 0),
+            &config,
+            InfixContinuationStyle::Indented,
+        );
+
+        assert_eq!(
+            column, 6,
+            "an offset opener must keep the legacy physical-indent anchor"
+        );
+    }
 }

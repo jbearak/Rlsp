@@ -9223,6 +9223,7 @@ impl LanguageServer for Backend {
 
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+        let is_newline = params.ch == "\n";
         let (tree, source, style, lint_config) = {
             let state = self.state.read().await;
             let doc = match state.get_document(uri) {
@@ -9257,34 +9258,13 @@ impl LanguageServer for Backend {
             let source = doc.analysis_text();
             let style = state.indentation_config.style;
 
-            // Mirror DiagnosticsSnapshot::build exactly: auto-detected
-            // per-document units patch the base, then matching lint overrides
-            // take precedence over that patched base.
-            let mut base_lint_config = state.lint_config.clone();
-            if let Some(&unit) = state.per_document_indent_unit.get(uri.as_str()) {
-                base_lint_config.indentation_unit = unit;
-            }
-            let lint_config = if state.lint_overrides.is_empty() {
-                base_lint_config
-            } else {
-                let merged = crate::config_file::merge_settings(
-                    &state.raw_client_settings,
-                    state.raw_project_settings.as_ref(),
-                );
-                let section = merged
-                    .get("linting")
-                    .cloned()
-                    .unwrap_or(serde_json::json!({}));
-                crate::config_file::resolve_lint_for_document(
-                    &base_lint_config,
-                    &section,
-                    &state.lint_overrides,
-                    uri,
-                )
-            };
+            // Only the Enter path (the judge tier) reads lint settings; the
+            // closing-delimiter triggers and the Off fast path below must not
+            // pay for override glob resolution while holding the read lock.
+            let lint_config = (is_newline && style != indentation::IndentationStyle::Off)
+                .then(|| state.effective_lint_config_for_document(uri));
             (tree, source, style, lint_config)
         };
-        let infix_style = lint_config.infix_continuation_style;
 
         // If style is Off, disable all formatting — return no edits
         // so only Tier 1 declarative rules apply
@@ -9344,6 +9324,14 @@ impl LanguageServer for Backend {
             // No duplicate detected — no edits needed for delimiter triggers
             return Ok(None);
         }
+
+        // Only the newline trigger reaches this point (the entry guard admits
+        // `\n` and closers; closers returned above), so the Enter-path lint
+        // config was resolved under the lock.
+        let Some(lint_config) = lint_config else {
+            return Ok(None);
+        };
+        let infix_style = lint_config.infix_continuation_style;
 
         // Extract FormattingOptions (Requirements 6.1, 6.2)
         let raw_tab_size = params.options.tab_size;

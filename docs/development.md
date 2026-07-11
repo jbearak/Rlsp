@@ -623,13 +623,30 @@ The judge queries the same expectation engine as the indentation lint; see
 Maintain these boundaries:
 
 - Repair-and-ask builds a virtual buffer with a sentinel identifier on an empty
-  or closer-only cursor line. Pushed-down closers are re-appended after the
-  synthesized closers. The full-stack delimiter scan is shared with the legacy
-  fallback in `indentation/context.rs`; every unclosed delimiter gets a
-  synthesized closer on its own line so bracket changes retain the lint's
-  closer-on-own-line classification.
-- Multiline-string interiors, unanswerable positions, and a failed virtual
-  parse bail out to the legacy fallback.
+  or closer-only cursor line, splicing exactly one region so the document's
+  tree can be reparsed incrementally (`InputEdit` in `VirtualBuffer`). The
+  probe line's own leading closers consume their openers from the scanned
+  stack; pushed-down closers reappear once, below the sentinel and before the
+  closers synthesized for the still-open outer delimiters, each on its own
+  line so bracket changes retain the lint's closer-on-own-line classification.
+  The judge's delimiter scan (`unclosed_delimiters_for_judge`) is its own
+  tree-coverage-masked implementation — it is NOT shared with the legacy
+  fallback's `unclosed_delimiters_heuristic` in `indentation/context.rs`, so
+  string/comment/backtick handling changes must be applied to whichever
+  scanner the affected tier uses.
+- The judge bails out to the legacy fallback for: multiline string and
+  backtick-identifier interiors; unanswerable positions; tab-indented context
+  or a tabs-mode editor (`insertSpaces: false`) — the expectation engine
+  measures character columns while the editor renders tab stops; a repaired
+  buffer whose parse still holds an error at or above the probe line; and a
+  nearest checkable line above the probe that does not sit at a lint-accepted
+  column — the expectation model accumulates from column 0, so only
+  lint-conforming context can be answered without collapsing a user's offset
+  indentation (the legacy path anchors to physical indentation instead).
+- On-type queries use the per-line expectation fold
+  (`accepted_indents_for_lines`), which collects and sorts the change list
+  once and folds only the requested lines — never the whole-document maps the
+  diagnostic pass builds.
 - Selection is bounded by the judge's accepted set (whose primary column is
   always accepted) and has separate internal argument and infix preference
   axes. `SelectionPrefs::from_config` is the sole projection from

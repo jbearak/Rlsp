@@ -1,11 +1,12 @@
 //! Judge-backed smart indentation over a repaired virtual buffer.
 
 use tower_lsp::lsp_types::Position;
-use tree_sitter::{Node, Point, Tree};
+use tree_sitter::{InputEdit, Node, Point, Tree};
 
 use super::calculator::{IndentationConfig, IndentationStyle};
 use crate::linting::{
-    IndentKind, InfixContinuationStyle, LineIndentExpectation, accepted_indents_for_line,
+    IndentKind, InfixContinuationStyle, LineIndentExpectation, accepted_indents_for_lines,
+    leading_space_count,
 };
 use crate::parser_pool::with_parser;
 use crate::utf16::utf16_column_to_byte_offset;
@@ -16,6 +17,10 @@ const SENTINEL: &str = "raven_sentinel_";
 struct VirtualBuffer {
     text: String,
     probe_line: u32,
+    /// The single splice that turned the source into `text`, so the caller
+    /// can reparse incrementally from the document's existing tree instead of
+    /// paying a full parse on every Enter press.
+    edit: InputEdit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +80,20 @@ impl SelectionPrefs {
 ///
 /// Returns `None` when the repair-and-ask path cannot answer, so the caller can
 /// fall back to the legacy `detect_context` / `calculate_indentation` path.
+/// Beyond unanswerable repairs, the judge deliberately declines in three
+/// situations where its character-column model would misfire:
+///
+/// * The editor inserts tabs, or a scanned line's whitespace holds a real
+///   (non-string) tab — the expectation engine counts characters while the
+///   editor renders tab stops, so tab contexts keep the legacy visual-column
+///   path.
+/// * The repaired buffer still fails to parse — the expectation engine would
+///   answer top-level (column 0) for a probe it cannot model, deindenting the
+///   new line, where the legacy path degrades gracefully.
+/// * The nearest checkable line above the probe does not sit at a column the
+///   lint accepts — the expectation model accumulates from column 0 and would
+///   collapse a user's deliberately offset context (e.g. a top-level `    {`),
+///   while the legacy path anchors to physical indentation.
 pub fn judge_backed_indentation(
     tree: &Tree,
     source: &str,
@@ -86,6 +105,10 @@ pub fn judge_backed_indentation(
         log::trace!("judge_backed_indentation: bail: indentation style is Off");
         return None;
     };
+    if !config.insert_spaces {
+        log::trace!("judge_backed_indentation: bail: editor inserts tabs, not spaces");
+        return None;
+    }
 
     let Some(probe) = logical_line(source, position.line) else {
         log::trace!(
@@ -104,7 +127,7 @@ pub fn judge_backed_indentation(
         return None;
     }
 
-    if cursor_is_inside_multiline_string(tree, source, position) {
+    if cursor_is_inside_multiline_string_like(tree, source, position) {
         log::trace!(
             "judge_backed_indentation: bail: cursor on line {} is inside a multiline string",
             position.line
@@ -116,17 +139,43 @@ pub fn judge_backed_indentation(
         log::trace!("judge_backed_indentation: bail: virtual repair was ambiguous");
         return None;
     };
-    let Some(tree) = with_parser(|parser| parser.parse(&virtual_buffer.text, None)) else {
+    let mut edited_tree = tree.clone();
+    edited_tree.edit(&virtual_buffer.edit);
+    let Some(virtual_tree) =
+        with_parser(|parser| parser.parse(&virtual_buffer.text, Some(&edited_tree)))
+    else {
         log::trace!("judge_backed_indentation: bail: virtual parse failed");
         return None;
     };
-    let expected = accepted_indents_for_line(
+    if error_at_or_above(virtual_tree.root_node(), position.line as usize) {
+        log::trace!("judge_backed_indentation: bail: repaired buffer still has syntax errors");
+        return None;
+    }
+
+    let reference = reference_row(&virtual_tree, source, position.line);
+    let targets: Vec<u32> = reference
+        .into_iter()
+        .chain([virtual_buffer.probe_line])
+        .collect();
+    let mut expectations = accepted_indents_for_lines(
         &virtual_buffer.text,
-        tree.root_node(),
+        virtual_tree.root_node(),
         config.tab_size,
         infix_style,
-        virtual_buffer.probe_line,
+        &targets,
     );
+    let expected = expectations.pop()?;
+    if let (Some(reference), Some(reference_expected)) = (reference, expectations.pop()) {
+        let actual = leading_space_count(logical_line(source, reference)?);
+        if !reference_expected.accepts(actual) {
+            log::trace!(
+                "judge_backed_indentation: bail: reference line {reference} sits at column \
+                 {actual}, outside its accepted set (primary {})",
+                reference_expected.primary
+            );
+            return None;
+        }
+    }
     log::trace!(
         "judge_backed_indentation: accepted primary={}, alternatives={:?}",
         expected.primary,
@@ -140,6 +189,47 @@ pub fn judge_backed_indentation(
         prefs
     );
     Some(selected)
+}
+
+/// True when the repaired buffer holds a syntax error whose extent begins at
+/// or above the probe line. Such an error means the context the probe's
+/// expectation folds over is malformed beyond the sentinel repair, and the
+/// engine's answer would be a meaningless top level (e.g. after `x %+`).
+/// Errors that begin strictly below the probe are expected mid-typing — a
+/// virtual `if (x <- raven_sentinel_)` is still waiting for its consequence —
+/// and cannot influence the probe's covering changes.
+fn error_at_or_above(node: Node<'_>, probe_line: usize) -> bool {
+    if !node.has_error() || node.start_position().row > probe_line {
+        return false;
+    }
+    if node.is_error() || node.is_missing() {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| error_at_or_above(child, probe_line))
+}
+
+/// The nearest line above the probe whose physical indent the lint's
+/// expectation model actually constrains: skips blank lines, comment-only
+/// lines (aligned comment runs may sit at exempted columns), and lines that
+/// start inside a multiline string or backtick-quoted identifier. `None` when
+/// no such line exists (the probe is the first content line).
+///
+/// The lines above the probe are identical in the source and the virtual
+/// buffer — the repair splices only the probe line — so callers may measure
+/// the reference line's actual indent on either text.
+fn reference_row(virtual_tree: &Tree, source: &str, probe_line: u32) -> Option<u32> {
+    (0..probe_line).rev().find(|&row| {
+        let Some(line) = logical_line(source, row) else {
+            return false;
+        };
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        !line_starts_inside_multiline_node(virtual_tree, row as usize)
+    })
 }
 
 fn build_virtual_buffer(
@@ -166,12 +256,26 @@ fn build_virtual_buffer(
     );
 
     let mut openers = unclosed_delimiters_for_judge(tree, source, position.line)?;
-    if kind == ProbeKind::MixedClosers {
-        for closer in leading_closers {
-            let (_, _, opener) = openers.pop()?;
-            if matching_closer(opener) != Some(closer) {
-                return None;
+    // Consume the probe's own leading closers from the opener stack. Mixed
+    // content keeps them verbatim inside `trimmed`; pure closers are pushed
+    // below the sentinel so each real closer appears exactly once in the
+    // repair (re-appending them after synthesized copies would guarantee an
+    // unmatched duplicate and an ERROR tree). A closer left over once the
+    // stack empties is an unmatched stray (an auto-close artifact): a
+    // pure-closer line simply drops it from the repair, while mixed content
+    // must bail because its text cannot be edited piecemeal.
+    let mut pushed_closers = String::new();
+    for closer in leading_closers {
+        match openers.pop() {
+            Some((_, _, opener)) if matching_closer(opener) == Some(closer) => {
+                if kind == ProbeKind::PureClosers {
+                    pushed_closers.push(closer);
+                }
             }
+            // Mismatched nesting — the repair is ambiguous.
+            Some(_) => return None,
+            None if kind == ProbeKind::PureClosers => break,
+            None => return None,
         }
     }
     let closers: Vec<char> = openers
@@ -183,17 +287,21 @@ fn build_virtual_buffer(
         .collect();
     log::trace!("judge_backed_indentation: synthesized closers={closers:?}");
 
-    let pushed_closers = (kind == ProbeKind::PureClosers).then_some(trimmed);
     let replacement_content = match kind {
         ProbeKind::Blank | ProbeKind::PureClosers => SENTINEL,
         ProbeKind::MixedClosers | ProbeKind::ExistingContent => trimmed,
     };
     let replacement_indent_len = probe_indent.map_or(content_start, |column| column as usize);
-    let inserted_lines = closers.len() + usize::from(pushed_closers.is_some());
-    let extra_capacity = replacement_indent_len
+    let pushed_len = if pushed_closers.is_empty() {
+        0
+    } else {
+        1 + pushed_closers.len()
+    };
+    let inserted_len = replacement_indent_len
         .saturating_add(replacement_content.len())
-        .saturating_add(inserted_lines.saturating_mul(2));
-    let mut text = String::with_capacity(source.len().saturating_add(extra_capacity));
+        .saturating_add(pushed_len)
+        .saturating_add(closers.len().saturating_mul(2));
+    let mut text = String::with_capacity(source.len().saturating_add(inserted_len));
     text.push_str(&source[..line_start]);
     if let Some(column) = probe_indent {
         text.push_str(&" ".repeat(column as usize));
@@ -201,19 +309,39 @@ fn build_virtual_buffer(
         text.push_str(&probe[..content_start]);
     }
     text.push_str(replacement_content);
+    let mut inserted_rows = 0usize;
+    let mut last_line_len = replacement_indent_len + replacement_content.len();
+    // Pushed-down real closers close the innermost popped openers, so they
+    // precede the synthesized closers for the still-open outer ones. Each
+    // sits on its own line to retain the lint's closer-on-own-line
+    // classification.
+    if !pushed_closers.is_empty() {
+        text.push('\n');
+        text.push_str(&pushed_closers);
+        inserted_rows += 1;
+        last_line_len = pushed_closers.len();
+    }
     for closer in closers {
         text.push('\n');
         text.push(closer);
-    }
-    if let Some(pushed) = pushed_closers {
-        text.push('\n');
-        text.push_str(pushed);
+        inserted_rows += 1;
+        last_line_len = 1;
     }
     text.push_str(&source[line_end..]);
+
+    let edit = InputEdit {
+        start_byte: line_start,
+        old_end_byte: line_end,
+        new_end_byte: line_start + inserted_len,
+        start_position: Point::new(position.line as usize, 0),
+        old_end_position: Point::new(position.line as usize, probe.len()),
+        new_end_position: Point::new(position.line as usize + inserted_rows, last_line_len),
+    };
 
     Some(VirtualBuffer {
         text,
         probe_line: position.line,
+        edit,
     })
 }
 
@@ -245,12 +373,41 @@ fn matching_closer(opener: char) -> Option<char> {
     }
 }
 
-fn cursor_is_inside_multiline_string(tree: &Tree, source: &str, position: Position) -> bool {
+fn cursor_is_inside_multiline_string_like(tree: &Tree, source: &str, position: Position) -> bool {
     let Some(line) = logical_line(source, position.line) else {
         return false;
     };
     let byte_col = utf16_column_to_byte_offset(line, position.character);
-    multiline_string_contains(tree, source, position.line as usize, byte_col)
+    multiline_string_like_contains(tree, source, position.line as usize, byte_col)
+}
+
+/// Strings and backtick-quoted identifiers both carry literal text across
+/// lines, so the judge must treat their interiors as opaque — indenting
+/// inside one would rewrite the literal (for an identifier, the symbol's
+/// name). A plain identifier can never span rows, so any multiline
+/// `identifier` node is backtick-quoted.
+fn is_multiline_string_like(node: Node<'_>) -> bool {
+    matches!(node.kind(), "string" | "identifier")
+        && node.start_position().row < node.end_position().row
+}
+
+/// True when `row` starts strictly inside a multiline string or
+/// backtick-quoted identifier — the same lines the indentation lint skips as
+/// string interiors, whose leading whitespace is literal content rather than
+/// indentation.
+fn line_starts_inside_multiline_node(tree: &Tree, row: usize) -> bool {
+    let point = Point::new(row, 0);
+    let mut node = tree.root_node().descendant_for_point_range(point, point);
+    while let Some(current) = node {
+        if is_multiline_string_like(current)
+            && current.start_position().row < row
+            && point_in_node(current, row, 0)
+        {
+            return true;
+        }
+        node = current.parent();
+    }
+    false
 }
 
 fn logical_line(source: &str, line: u32) -> Option<&str> {
@@ -259,14 +416,11 @@ fn logical_line(source: &str, line: u32) -> Option<&str> {
     })
 }
 
-fn multiline_string_contains(tree: &Tree, source: &str, row: usize, column: usize) -> bool {
+fn multiline_string_like_contains(tree: &Tree, source: &str, row: usize, column: usize) -> bool {
     let point = Point::new(row, column);
     let mut node = tree.root_node().descendant_for_point_range(point, point);
     while let Some(current) = node {
-        if current.kind() == "string"
-            && current.start_position().row < current.end_position().row
-            && point_in_node(current, row, column)
-        {
+        if is_multiline_string_like(current) && point_in_node(current, row, column) {
             return true;
         }
         node = current.parent();
@@ -286,10 +440,7 @@ fn multiline_string_contains(tree: &Tree, source: &str, row: usize, column: usiz
             .root_node()
             .descendant_for_point_range(preceding, preceding);
         while let Some(current) = node {
-            if current.kind() == "string"
-                && current.start_position().row < current.end_position().row
-                && current.end_position() == point
-            {
+            if is_multiline_string_like(current) && current.end_position() == point {
                 return true;
             }
             node = current.parent();
@@ -298,22 +449,42 @@ fn multiline_string_contains(tree: &Tree, source: &str, row: usize, column: usiz
     false
 }
 
+/// One pass over the lines above `current_line`, keeping a stack of unclosed
+/// bracket openers. Bracket and quote characters inside strings, comments,
+/// and backtick-quoted identifiers are masked via the parse tree; a quote
+/// character the tree cannot explain aborts the scan (`None`), and so does a
+/// real (non-masked) tab anywhere on a scanned line — the expectation engine
+/// measures character columns and the judge emits spaces, so tab-shaped
+/// context must use the legacy visual-column fallback.
 fn unclosed_delimiters_for_judge(
     tree: &Tree,
     source: &str,
     current_line: u32,
 ) -> Option<Vec<(u32, u32, char)>> {
     let mut stack = Vec::new();
-    for row in 0..current_line as usize {
-        let line = logical_line(source, row as u32)?;
-        let byte_start = line_start_byte(source, row as u32)?;
+    let mut rows_seen = 0usize;
+    let mut byte_start = 0usize;
+    for (row, raw) in source
+        .split_inclusive('\n')
+        .take(current_line as usize)
+        .enumerate()
+    {
+        rows_seen = row + 1;
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         for (column, ch) in line.char_indices() {
-            if !matches!(ch, '(' | '[' | '{' | ')' | ']' | '}' | '\"' | '\'' | '`') {
+            if !matches!(
+                ch,
+                '(' | '[' | '{' | ')' | ']' | '}' | '\"' | '\'' | '`' | '\t'
+            ) {
                 continue;
             }
             let coverage = tree_coverage(tree, row, column, byte_start + column);
             if coverage == TreeCoverage::Masked {
                 continue;
+            }
+            if ch == '\t' {
+                return None;
             }
             if matches!(ch, '\"' | '\'' | '`') {
                 if coverage == TreeCoverage::Unexplained {
@@ -335,6 +506,10 @@ fn unclosed_delimiters_for_judge(
                 _ => {}
             }
         }
+        byte_start += raw.len();
+    }
+    if rows_seen < current_line as usize {
+        return None;
     }
     Some(stack)
 }
@@ -349,7 +524,9 @@ fn tree_coverage(tree: &Tree, row: usize, column: usize, byte: usize) -> TreeCov
     while let Some(current) = node {
         if current.start_byte() <= byte && byte < current.end_byte() {
             deepest_covering.get_or_insert(current);
-            if matches!(current.kind(), "string" | "comment") {
+            // An `identifier` covering a bracket, quote, or tab byte can only
+            // be backtick-quoted — its content is literal, like a string's.
+            if matches!(current.kind(), "string" | "comment" | "identifier") {
                 return TreeCoverage::Masked;
             }
         }
@@ -391,13 +568,13 @@ fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> u32
         expected
             .alternatives
             .iter()
-            .any(|(_, kinds)| kinds.contains(&kind))
+            .any(|(_, kinds)| kinds.contains(kind))
     };
-    let candidate = |kind| {
+    let candidate = |kind: IndentKind| {
         expected
             .alternatives
             .iter()
-            .find_map(|(column, kinds)| kinds.contains(&kind).then_some(*column))
+            .find_map(|(column, kinds)| kinds.contains(kind).then_some(*column))
     };
 
     if has_kind(IndentKind::ChainStart) {
@@ -406,7 +583,7 @@ fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> u32
                 .alternatives
                 .iter()
                 .filter_map(|(column, kinds)| {
-                    (kinds.contains(&IndentKind::ChainStart) && *column > expected.primary)
+                    (kinds.contains(IndentKind::ChainStart) && *column > expected.primary)
                         .then_some(*column)
                 })
                 .max()
@@ -428,7 +605,7 @@ fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> u32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linting::lint_for_judge_test;
+    use crate::linting::{IndentKindSet, accepted_indents_for_line, lint_for_judge_test};
 
     #[derive(Clone, Copy)]
     struct Case {
@@ -571,6 +748,30 @@ mod tests {
             line: 1,
             expected: 19,
         },
+        Case {
+            name: "backtick name closer does not pop real opener",
+            source: "f(`a)b`,\n",
+            line: 1,
+            expected: 2,
+        },
+        Case {
+            name: "backtick name opener is not synthesized",
+            source: "list(\n  `a(b` = 1,\n",
+            line: 2,
+            expected: 2,
+        },
+        Case {
+            name: "pushed inner closer precedes synthesized outer closer",
+            source: "f(g(\n)",
+            line: 1,
+            expected: 2,
+        },
+        Case {
+            name: "tab inside string content does not poison the scan",
+            source: "x <- c(\"a\n\tb\",\n  f(\n",
+            line: 3,
+            expected: 9,
+        },
     ];
 
     fn config(style: IndentationStyle) -> IndentationConfig {
@@ -618,7 +819,10 @@ mod tests {
         assert_eq!(walrus.primary, 4);
         assert_eq!(
             walrus.alternatives,
-            vec![(5, vec![IndentKind::OpenerAligned, IndentKind::ChainStart])]
+            vec![(
+                5,
+                IndentKindSet::of(&[IndentKind::OpenerAligned, IndentKind::ChainStart])
+            )]
         );
 
         let same_line_call = repaired_expectation("long_function_name(x <-\n", 1);
@@ -626,8 +830,8 @@ mod tests {
         assert_eq!(
             same_line_call.alternatives,
             vec![
-                (21, vec![IndentKind::OpenerAligned]),
-                (19, vec![IndentKind::ChainStart]),
+                (21, IndentKindSet::single(IndentKind::OpenerAligned)),
+                (19, IndentKindSet::single(IndentKind::ChainStart)),
             ]
         );
     }
@@ -729,10 +933,147 @@ mod tests {
     }
 
     #[test]
+    fn bails_inside_multiline_backtick_identifiers() {
+        let cfg = config(IndentationStyle::RStudio);
+        assert_eq!(
+            judge(
+                "f(`a\nb`)\n",
+                Position::new(1, 0),
+                &cfg,
+                InfixContinuationStyle::Indented,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn bails_when_context_does_not_conform_to_the_accepted_set() {
+        let cfg = config(IndentationStyle::RStudio);
+        for source in ["    {\n", "    result <-\n"] {
+            assert_eq!(
+                judge(
+                    source,
+                    Position::new(1, 0),
+                    &cfg,
+                    InfixContinuationStyle::Indented,
+                ),
+                None,
+                "offset context {source:?} must fall back to the legacy anchor"
+            );
+        }
+        assert_eq!(
+            judge(
+                "f <- function() {\n      x <- 1\n",
+                Position::new(2, 0),
+                &cfg,
+                InfixContinuationStyle::Indented,
+            ),
+            None,
+            "over-indented sibling must fall back to the legacy anchor"
+        );
+    }
+
+    #[test]
+    fn conformity_reference_skips_blank_and_comment_lines() {
+        let cfg = config(IndentationStyle::RStudio);
+        assert_eq!(
+            judge(
+                "f(\n\n      # odd comment\n",
+                Position::new(3, 0),
+                &cfg,
+                InfixContinuationStyle::Indented,
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn bails_for_tab_contexts_and_tab_editors() {
+        let cfg = config(IndentationStyle::RStudio);
+        assert_eq!(
+            judge(
+                "\tf(a,\n",
+                Position::new(1, 0),
+                &cfg,
+                InfixContinuationStyle::Indented,
+            ),
+            None,
+            "tab-indented context must use the legacy visual-column path"
+        );
+
+        let tabs = IndentationConfig {
+            insert_spaces: false,
+            ..config(IndentationStyle::RStudio)
+        };
+        assert_eq!(
+            judge(
+                "f(a,\n",
+                Position::new(1, 0),
+                &tabs,
+                InfixContinuationStyle::Indented,
+            ),
+            None,
+            "a tabs-mode editor must use the legacy visual-column path"
+        );
+    }
+
+    #[test]
+    fn bails_when_the_repaired_buffer_still_has_errors() {
+        let cfg = config(IndentationStyle::RStudio);
+        assert_eq!(
+            judge(
+                "x %+\n",
+                Position::new(1, 0),
+                &cfg,
+                InfixContinuationStyle::Indented,
+            ),
+            None,
+            "an unrepairable operator tail must not deindent to top level"
+        );
+    }
+
+    #[test]
+    fn pure_closer_repairs_parse_cleanly() {
+        for (source, line) in [("f(\n)", 1), ("f <- function() {\n})", 1), ("f(g(\n)", 1)] {
+            let virtual_text = text_with_probe(source, line, 0);
+            let tree = with_parser(|parser| parser.parse(&virtual_text, None))
+                .expect("repaired buffer must parse");
+            assert!(
+                !tree.root_node().has_error(),
+                "{source:?} repaired to {virtual_text:?} must parse without errors"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_matches_a_fresh_parse() {
+        for case in CASES {
+            let tree = with_parser(|parser| parser.parse(case.source, None))
+                .expect("real test input must parse");
+            let virtual_buffer =
+                build_virtual_buffer(&tree, case.source, Position::new(case.line, 0), None)
+                    .unwrap_or_else(|| panic!("{} must be repairable", case.name));
+            let mut edited = tree.clone();
+            edited.edit(&virtual_buffer.edit);
+            let incremental =
+                with_parser(|parser| parser.parse(&virtual_buffer.text, Some(&edited)))
+                    .expect("incremental parse must succeed");
+            let fresh = with_parser(|parser| parser.parse(&virtual_buffer.text, None))
+                .expect("fresh parse must succeed");
+            assert_eq!(
+                incremental.root_node().to_sexp(),
+                fresh.root_node().to_sexp(),
+                "{}: incremental reparse diverged from a fresh parse",
+                case.name
+            );
+        }
+    }
+
+    #[test]
     fn selection_never_targets_top_level_alternative() {
         let expected = LineIndentExpectation {
             primary: 4,
-            alternatives: vec![(0, vec![IndentKind::TopLevel])],
+            alternatives: vec![(0, IndentKindSet::single(IndentKind::TopLevel))],
         };
         assert_eq!(
             select_column(
