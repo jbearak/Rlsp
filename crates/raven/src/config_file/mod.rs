@@ -170,6 +170,18 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         // since-removed root.
         state.lint_overrides = Vec::new();
     }
+    // Cache the merged `linting` section next to the compiled overrides so
+    // per-document resolution (`effective_lint_config_for_document`) never
+    // re-merges the raw settings trees on the typing hot path. Deliberately
+    // merged from the RAW project layer (not `normalized_project`), exactly
+    // as the per-document resolvers always did before the cache existed.
+    state.merged_linting_section = merge_settings(
+        &state.raw_client_settings,
+        state.raw_project_settings.as_ref(),
+    )
+    .get("linting")
+    .cloned()
+    .unwrap_or(serde_json::json!({}));
     state.workspace_exclusions = compile_workspace_exclusions(&merged, workspace_roots);
 }
 

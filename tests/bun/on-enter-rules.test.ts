@@ -109,3 +109,62 @@ describe('assignment onEnterRule (#611)', () => {
         expect(re.test('x[r"(a"#b)"] <-')).toBe(false);
     });
 });
+
+/**
+ * `rmd`/`quarto` use `rmd-language-configuration.json`, a copy of the R
+ * configuration WITHOUT the assignment onEnterRule: `beforeText` regexes
+ * apply to the whole document, and a prose paragraph ending in `<-` (e.g.
+ * documentation about the operator) must not indent the next Markdown line —
+ * the LSP deliberately declines to format prose positions, so a Tier 1
+ * misfire there would never be corrected. (The pre-existing operator rules
+ * are kept for chunk-editing parity; their prose leak predates the
+ * assignment rule.)
+ *
+ * The parity tests gate drift between the two files on CI: everything except
+ * the assignment rule must stay identical.
+ */
+const RMD_LANGUAGE_CONFIG = path.resolve(
+    __dirname,
+    '..',
+    '..',
+    'editors',
+    'vscode',
+    'rmd-language-configuration.json',
+);
+
+describe('rmd/quarto language configuration (assignment rule excluded)', () => {
+    const rConfig = () => JSON.parse(fs.readFileSync(LANGUAGE_CONFIG, 'utf8'));
+    const rmdConfig = () => JSON.parse(fs.readFileSync(RMD_LANGUAGE_CONFIG, 'utf8'));
+
+    test('matches the R configuration outside onEnterRules', () => {
+        const r = rConfig();
+        const rmd = rmdConfig();
+        delete r.onEnterRules;
+        delete rmd.onEnterRules;
+        expect(rmd).toEqual(r);
+    });
+
+    test('onEnterRules are exactly the R rules minus the assignment rule', () => {
+        const rRules = rConfig().onEnterRules as OnEnterRule[];
+        const expected = rRules.filter((rule) => !rule.beforeText.includes('<<-'));
+        expect(expected.length).toBe(rRules.length - 1);
+        expect(rmdConfig().onEnterRules).toEqual(expected);
+    });
+
+    test('package.json points r at the R config and rmd/quarto at the rmd config', () => {
+        const pkg = JSON.parse(
+            fs.readFileSync(
+                path.resolve(__dirname, '..', '..', 'editors', 'vscode', 'package.json'),
+                'utf8',
+            ),
+        );
+        const byId = new Map(
+            (pkg.contributes.languages as { id: string; configuration?: string }[]).map(
+                (lang) => [lang.id, lang.configuration],
+            ),
+        );
+        expect(byId.get('r')).toBe('./language-configuration.json');
+        expect(byId.get('rmd')).toBe('./rmd-language-configuration.json');
+        expect(byId.get('quarto')).toBe('./rmd-language-configuration.json');
+    });
+});

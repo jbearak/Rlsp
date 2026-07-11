@@ -85,10 +85,11 @@ const WORD_SEPARATORS = "`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?";
  * a word — affecting double-click selection and word-wise cursor motion over
  * dotted names like `my.variable`.
  *
- * `rmd` and `quarto` are deliberately EXCLUDED, even though they reuse R's
- * `language-configuration.json` and therefore already get the *other* half of
- * this feature (the `wordPattern`, which drives Cmd+click / `getWordRangeAtPosition`
- * across dotted names — see the wordPattern tests in `lsp.test.ts`).
+ * `rmd` and `quarto` are deliberately EXCLUDED, even though their
+ * `rmd-language-configuration.json` shares R's `wordPattern` and therefore
+ * already gets the *other* half of this feature (the pattern drives
+ * Cmd+click / `getWordRangeAtPosition` across dotted names — see the
+ * wordPattern tests in `lsp.test.ts`).
  *
  * The asymmetry is intentional: `editor.wordSeparators` resolves per *document*
  * language, not per embedded code chunk. An `.Rmd` / `.Rmarkdown` / `.qmd`

@@ -304,28 +304,29 @@ pub(crate) fn accepted_indents_for_lines(
         InfixContinuationStyle::Indented => &[InfixContinuationStyle::Indented],
         InfixContinuationStyle::Aligned => &[InfixContinuationStyle::Aligned],
     };
-    let passes: Vec<Vec<Change>> = pass_styles
-        .iter()
-        .map(|&style| {
-            let mut changes = Vec::new();
-            collect_changes(root, &lines, style, &mut changes);
-            changes.sort_by_key(|c| c.token_byte);
-            changes
-        })
-        .collect();
-
-    targets
-        .iter()
-        .map(|&line| {
-            let (first, rest) = passes.split_first().expect("at least one style pass");
-            let mut expected = expectation_for_line(first, lines.len(), indent_unit, line);
-            for changes in rest {
-                let other = expectation_for_line(changes, lines.len(), indent_unit, line);
-                expected.add_alternative(other.primary, other.primary_kinds);
-                for (column, kinds) in other.alternatives {
-                    expected.add_alternative(column, kinds);
+    let mut merged: Vec<Option<Expected>> = vec![None; targets.len()];
+    for &style in pass_styles {
+        let mut changes = Vec::new();
+        collect_changes(root, &lines, style, &mut changes);
+        changes.sort_by_key(|c| c.token_byte);
+        let pass = expectations_for_targets(&changes, lines.len(), indent_unit, targets);
+        for (slot, expected) in pass.into_iter().enumerate() {
+            match &mut merged[slot] {
+                None => merged[slot] = Some(expected),
+                Some(existing) => {
+                    existing.add_alternative(expected.primary, expected.primary_kinds);
+                    for (column, kinds) in expected.alternatives {
+                        existing.add_alternative(column, kinds);
+                    }
                 }
             }
+        }
+    }
+
+    merged
+        .into_iter()
+        .map(|expected| {
+            let expected = expected.expect("every style pass fills every target slot");
             LineIndentExpectation {
                 primary: expected.primary,
                 alternatives: expected.alternatives,
@@ -334,44 +335,61 @@ pub(crate) fn accepted_indents_for_lines(
         .collect()
 }
 
-/// Fold the sorted change list for a single line: the exact per-line body of
-/// [`set_expectations`], applied only to changes whose range covers `line`.
-fn expectation_for_line(
+/// Fold the sorted change list ONCE, applying each change to every covered
+/// target's accumulator — the exact per-line body of [`set_expectations`],
+/// restricted to the requested lines (the judge asks for two per Enter).
+fn expectations_for_targets(
     changes: &[Change],
     line_count: usize,
     indent_unit: u32,
-    line: u32,
-) -> Expected {
-    let line_idx = line as usize;
-    let mut primary = 0u32;
-    let mut primary_kinds = IndentKindSet::single(IndentKind::TopLevel);
-    let mut alternatives: Vec<(u32, IndentKindSet)> = Vec::new();
+    targets: &[u32],
+) -> Vec<Expected> {
+    /// One target line's in-progress fold: the same (primary, kinds,
+    /// alternatives) triple `set_expectations` keeps per document line.
+    type Accum = (u32, IndentKindSet, Vec<(u32, IndentKindSet)>);
+    let mut accums: Vec<Accum> = targets
+        .iter()
+        .map(|_| {
+            (
+                0u32,
+                IndentKindSet::single(IndentKind::TopLevel),
+                Vec::new(),
+            )
+        })
+        .collect();
     for change in changes {
         let begin = change.begin as usize;
         let end = (change.end as usize).min(line_count.saturating_sub(1));
-        if begin > end || line_idx < begin || line_idx > end {
+        if begin > end {
             continue;
         }
-        apply_change_to_line(
-            change,
-            indent_unit,
-            &mut primary,
-            &mut primary_kinds,
-            &mut alternatives,
-        );
+        for (slot, &line) in targets.iter().enumerate() {
+            let line = line as usize;
+            if line < begin || line > end {
+                continue;
+            }
+            let (primary, kinds, alternatives) = &mut accums[slot];
+            apply_change_to_line(change, indent_unit, primary, kinds, alternatives);
+        }
     }
-    // Mirror the whole-document fold exactly: it only records lines whose
-    // primary or alternatives are non-trivial, and an absent line reads back
-    // as `top_level()` — so a fold that lands on a bare column 0 (e.g. an
-    // `Aligned` pin at the line start) canonicalizes its kind to `TopLevel`.
-    if primary == 0 && alternatives.is_empty() {
-        return Expected::top_level();
-    }
-    let mut expected = Expected::single(primary, primary_kinds);
-    for (column, kinds) in alternatives {
-        expected.add_alternative(column, kinds);
-    }
-    expected
+    accums
+        .into_iter()
+        .map(|(primary, kinds, alternatives)| {
+            // Mirror the whole-document fold exactly: it only records lines
+            // whose primary or alternatives are non-trivial, and an absent
+            // line reads back as `top_level()` — so a fold landing on a bare
+            // column 0 (e.g. an `Aligned` pin at the line start)
+            // canonicalizes its kind to `TopLevel`.
+            if primary == 0 && alternatives.is_empty() {
+                return Expected::top_level();
+            }
+            let mut expected = Expected::single(primary, kinds);
+            for (column, kinds) in alternatives {
+                expected.add_alternative(column, kinds);
+            }
+            expected
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -861,7 +879,7 @@ fn set_expectations(
 
 /// Apply one indent change to one covered line's accumulated expectation —
 /// the shared body of the whole-document fold ([`set_expectations`]) and the
-/// per-line fold ([`expectation_for_line`]), so the two cannot drift.
+/// per-target fold ([`expectations_for_targets`]), so the two cannot drift.
 fn apply_change_to_line(
     change: &Change,
     indent_unit: u32,

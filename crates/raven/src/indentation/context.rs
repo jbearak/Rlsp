@@ -280,7 +280,10 @@ fn ends_with_flattening_assignment(trimmed: &str) -> bool {
 /// line. The residual gaps require an ERROR tree *and* an exotic shape
 /// simultaneously; the AST path handles detection exactly.
 pub(super) fn flattening_suppressor_line(source: &str, line: u32) -> Option<u32> {
-    let lines: Vec<&str> = source.lines().collect();
+    // Collect only the prefix the backward walk can visit — the walk usually
+    // stops within a few lines, so per-line work stays proportional to the
+    // visited run, and the suffix is never materialized.
+    let lines: Vec<&str> = source.lines().take(line as usize).collect();
     let mut topmost = None;
     for idx in (0..line as usize).rev() {
         let Some(text) = lines.get(idx) else {
@@ -812,24 +815,28 @@ pub(super) fn unclosed_delimiters_heuristic(
     source: &str,
     current_line: u32,
 ) -> Option<Vec<(u32, u32, char)>> {
-    let lines: Vec<&str> = source.lines().collect();
+    let lines: Vec<&str> = source.lines().take(current_line as usize).collect();
 
     // Track unclosed delimiters with their positions
     let mut stack: Vec<(u32, u32, char)> = Vec::new();
 
     // Process lines up to (but not including) current line. String masking
-    // is shared with `strip_trailing_comment` via `StringScanState`: the
-    // delimiters inside `r"(...)"` are string content, not brackets
-    // (otherwise `x[r"(a"#b)"] <-` hallucinates an unclosed `[`).
+    // is shared with `strip_trailing_comment` via `StringScanState`, and the
+    // state carries ACROSS lines: brackets inside a multiline string (or a
+    // raw string like `r"(...)"`) are string content, not delimiters —
+    // per-line resets would push phantom openers from string interiors and
+    // divert the fallback's assignment/paren gates. A `#` outside any string
+    // ends the line's code, replacing the per-line comment strip.
+    let mut state = StringScanState::default();
     for line_idx in 0..current_line as usize {
         let line_text = lines.get(line_idx)?;
-        let stripped = strip_trailing_comment(line_text);
-
-        let mut state = StringScanState::default();
-        let bytes = stripped.as_bytes();
-        for (col, ch) in stripped.char_indices() {
+        let bytes = line_text.as_bytes();
+        for (col, ch) in line_text.char_indices() {
             if !state.step(bytes, col, ch) {
                 continue;
+            }
+            if ch == '#' {
+                break;
             }
             match ch {
                 '(' | '[' | '{' => {
@@ -853,14 +860,16 @@ pub(super) fn unclosed_delimiters_heuristic(
                 _ => {}
             }
         }
+        state.end_line();
     }
 
     Some(stack)
 }
 
 fn find_unclosed_delimiter_heuristic(source: &str, current_line: u32) -> Option<(u32, u32, char)> {
-    // Preserve the legacy fallback's innermost-opener behavior while sharing
-    // the scan with the judge-backed repair path, which needs every opener.
+    // The legacy fallback only needs the innermost opener; the full-stack
+    // form exists for callers and tests that assert on every opener. (The
+    // judge tier has its own tree-coverage-masked scanner in `judge.rs`.)
     unclosed_delimiters_heuristic(source, current_line)?.pop()
 }
 
@@ -1310,8 +1319,7 @@ fn find_chain_start_from_ast(
 /// them via a body field keeps walking.
 ///
 /// This is an O(tree-depth) ancestor walk — deliberately not a text scan,
-/// which a distant unclosed `(` hundreds of lines up (or parens inside a
-/// multiline string) would poison.
+/// which a distant unclosed `(` hundreds of lines up would poison.
 fn assignment_in_paren_context(assign_binop: Node) -> bool {
     let mut child = assign_binop;
     while let Some(parent) = child.parent() {
@@ -1884,9 +1892,10 @@ fn raw_string_closes_at(bytes: &[u8], at: usize, close: RawStringClose) -> bool 
 /// String-masking scanner shared by the text-based fallback helpers: tracks
 /// ordinary strings (with backslash escapes), backquoted names, and raw
 /// strings including dashed delimiters (`r"---(...)---"`, single or double
-/// quoted). `strip_trailing_comment` and `unclosed_delimiters_heuristic` run
-/// one instance per line; `line_starts_inside_string_heuristic` carries one
-/// across lines to detect multiline-string interiors.
+/// quoted). `strip_trailing_comment` runs one instance per line (its
+/// contract is single-line); `unclosed_delimiters_heuristic` and
+/// `line_starts_inside_string_heuristic` carry one across lines so brackets
+/// and quotes inside multiline strings stay masked.
 #[derive(Default)]
 struct StringScanState {
     in_string: bool,
@@ -3206,6 +3215,41 @@ mod tests {
         assert_eq!(
             unclosed_delimiters_heuristic("x[r\"---(a\"#b)---\"] <-\n", 1),
             Some(vec![])
+        );
+    }
+
+    #[test]
+    fn test_unclosed_heuristic_masks_brackets_across_multiline_strings() {
+        // The scanner carries string state across lines: brackets (and `#`)
+        // inside a multiline string span are content, not delimiters, so
+        // only the real `f(` on the line after the string closes survives.
+        let source = "s <- \"a (\nb [ # not a comment\n\"\nf(\n";
+        assert_eq!(
+            unclosed_delimiters_heuristic(source, 4),
+            Some(vec![(3, 1, '(')])
+        );
+    }
+
+    #[test]
+    fn fallback_assignment_gate_ignores_string_parens() {
+        // A `(` inside a closed multiline string above must not divert the
+        // fallback's assignment arm into paren alignment (the pre-fix scan
+        // reset its string state per line and saw a phantom opener).
+        let source = "s <- \"a (\nb\"\nresult <-\n";
+        let ctx = fallback_detect_context(
+            source,
+            Position {
+                line: 3,
+                character: 0,
+            },
+            2,
+        );
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 2,
+                flattened_floor: None,
+            }
         );
     }
 

@@ -154,7 +154,8 @@ pub fn judge_backed_indentation(
 
     let reference = reference_row(&virtual_tree, source, position.line);
     let targets: Vec<u32> = reference
-        .into_iter()
+        .iter()
+        .map(|&(row, _)| row)
         .chain([virtual_buffer.probe_line])
         .collect();
     let mut expectations = accepted_indents_for_lines(
@@ -165,16 +166,15 @@ pub fn judge_backed_indentation(
         &targets,
     );
     let expected = expectations.pop()?;
-    if let (Some(reference), Some(reference_expected)) = (reference, expectations.pop()) {
-        let actual = leading_space_count(logical_line(source, reference)?);
-        if !reference_expected.accepts(actual) {
-            log::trace!(
-                "judge_backed_indentation: bail: reference line {reference} sits at column \
-                 {actual}, outside its accepted set (primary {})",
-                reference_expected.primary
-            );
-            return None;
-        }
+    if let (Some((reference, actual)), Some(reference_expected)) = (reference, expectations.pop())
+        && !reference_expected.accepts(actual)
+    {
+        log::trace!(
+            "judge_backed_indentation: bail: reference line {reference} sits at column \
+             {actual}, outside its accepted set (primary {})",
+            reference_expected.primary
+        );
+        return None;
     }
     log::trace!(
         "judge_backed_indentation: accepted primary={}, alternatives={:?}",
@@ -213,23 +213,30 @@ fn error_at_or_above(node: Node<'_>, probe_line: usize) -> bool {
 /// The nearest line above the probe whose physical indent the lint's
 /// expectation model actually constrains: skips blank lines, comment-only
 /// lines (aligned comment runs may sit at exempted columns), and lines that
-/// start inside a multiline string or backtick-quoted identifier. `None` when
-/// no such line exists (the probe is the first content line).
+/// start inside a multiline string or backtick-quoted identifier. Returns the
+/// row together with its measured indent; `None` when no such line exists
+/// (the probe is the first content line).
 ///
 /// The lines above the probe are identical in the source and the virtual
-/// buffer — the repair splices only the probe line — so callers may measure
-/// the reference line's actual indent on either text.
-fn reference_row(virtual_tree: &Tree, source: &str, probe_line: u32) -> Option<u32> {
-    (0..probe_line).rev().find(|&row| {
-        let Some(line) = logical_line(source, row) else {
-            return false;
-        };
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            return false;
-        }
-        !line_starts_inside_multiline_node(virtual_tree, row as usize)
-    })
+/// buffer — the repair splices only the probe line — so measuring the
+/// reference line's actual indent on the source is exact. The prefix is
+/// collected once so the reverse walk never rescans it per skipped row
+/// (masked Rmd/Quarto prose produces long blank runs above a chunk).
+fn reference_row(virtual_tree: &Tree, source: &str, probe_line: u32) -> Option<(u32, u32)> {
+    let lines: Vec<&str> = source.lines().take(probe_line as usize).collect();
+    lines
+        .iter()
+        .copied()
+        .enumerate()
+        .rev()
+        .find_map(|(row, line)| {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            (!line_starts_inside_multiline_node(virtual_tree, row))
+                .then(|| (row as u32, leading_space_count(line)))
+        })
 }
 
 fn build_virtual_buffer(

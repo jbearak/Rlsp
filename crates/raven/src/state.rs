@@ -696,6 +696,14 @@ pub struct WorldState {
     /// are configured. Per-document resolution scans this list.
     pub lint_overrides: Vec<crate::config_file::CompiledLintOverride>,
 
+    /// The merged (client + raw project) `linting` settings section, cached
+    /// by `recompute_parsed_configs` alongside `lint_overrides` so
+    /// per-document override resolution never re-merges and re-clones the
+    /// raw settings trees on the typing hot path. `{}` when the merged
+    /// settings carry no `linting` section. Only meaningful together with
+    /// `lint_overrides` — both are written by the same single writer.
+    pub merged_linting_section: serde_json::Value,
+
     /// Compiled `[workspace].exclude` entries. Empty when no project-level
     /// exclusions are configured. These apply to workspace/default discovery,
     /// indexing, watcher resync, on-demand indexing, and LSP diagnostics.
@@ -872,8 +880,10 @@ impl WorldState {
     /// This is the single implementation shared by diagnostics
     /// (`DiagnosticsSnapshot::build`) and on-type formatting (the judge tier),
     /// so the two can never drift and disagree about a document's accepted
-    /// columns. Fast path: with no overrides configured (the common case),
-    /// the merge + section-clone work is skipped entirely.
+    /// columns. With no overrides configured (the common case) this is a
+    /// plain config clone; with overrides it resolves against the
+    /// `merged_linting_section` cached by `recompute_parsed_configs`, so no
+    /// caller ever re-merges the raw settings trees on the typing hot path.
     pub fn effective_lint_config_for_document(
         &self,
         uri: &tower_lsp::lsp_types::Url,
@@ -885,15 +895,12 @@ impl WorldState {
         if self.lint_overrides.is_empty() {
             return base;
         }
-        let merged = crate::config_file::merge_settings(
-            &self.raw_client_settings,
-            self.raw_project_settings.as_ref(),
-        );
-        let section = merged
-            .get("linting")
-            .cloned()
-            .unwrap_or(serde_json::json!({}));
-        crate::config_file::resolve_lint_for_document(&base, &section, &self.lint_overrides, uri)
+        crate::config_file::resolve_lint_for_document(
+            &base,
+            &self.merged_linting_section,
+            &self.lint_overrides,
+            uri,
+        )
     }
 
     /// Bump the package/config generation (issue #483) so the persistent
@@ -1168,6 +1175,7 @@ impl WorldState {
             raw_project_settings: None,
             project_config_path: None,
             lint_overrides: Vec::new(),
+            merged_linting_section: serde_json::json!({}),
             workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions::default(),
             per_document_indent_unit: std::collections::HashMap::new(),
             cross_file_meta: MetadataCache::new(),
