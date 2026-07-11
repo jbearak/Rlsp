@@ -39,6 +39,8 @@ When you press Enter, Tier 1 applies first (regex-based), then Tier 2 replaces t
 
 Style names follow the [ESS (Emacs Speaks Statistics)](https://ess.r-project.org/) conventions: `rstudio` matches the RStudio IDE's default alignment; `rstudio-minus` (`RStudio-` in ESS) drops same-line paren alignment.
 
+The style choice governs **paren-argument alignment only**. Operator-chain continuation alignment (see [Pipe Chains](#pipe-chains) below) is not part of the style: it applies under both `rstudio` and `rstudio-minus` whenever Tier 2 is active, and it deliberately goes beyond what the real RStudio IDE does (RStudio indents statement-level operator continuations by one level; it never aligns them under the chain start).
+
 ### Disabling Tier 2
 
 Two ways to disable AST-aware indentation:
@@ -86,12 +88,20 @@ result <- function_call(first_arg,
 
 ### Pipe Chains
 
-Continuation lines in a pipe chain align relative to the chain start:
+Continuation lines in a pipe chain align under the chain start — for a chain on the right-hand side of an assignment, that is the first operand after the assignment operator:
 
 ```r
 result <- data %>%
-  filter(x > 0) %>%
-  mutate(y = x * 2) %>%
+          filter(x > 0) %>%
+          mutate(y = x * 2) %>%
+          select(y)
+```
+
+A continuation always gets at least one indent level from the chain-start line, so a chain whose first operand sits at the line's first column indents instead of aligning:
+
+```r
+data |>
+  filter(x > 0) |>
   select(y)
 ```
 
@@ -110,10 +120,10 @@ output <- some_function(
 
 ```r
 result <- data %>%
-  mutate(new_col = complex_function(arg1,
-                                    arg2,
-                                    arg3)) %>%
-  filter(new_col > 0)
+          mutate(new_col = complex_function(arg1,
+                                            arg2,
+                                            arg3)) %>%
+          filter(new_col > 0)
 ```
 
 ### Brace Blocks
