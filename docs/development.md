@@ -611,6 +611,37 @@ datasets come via the embedded base table, above.)
 
 Brief orientation for modules outside the cross-file and package-library subsystems.
 
+### Judge-backed Tier 2 indentation (#611)
+
+Tier 2 enters through `indentation::on_type_indentation`: it first uses the
+judge-backed path in [`indentation/judge.rs`](../crates/raven/src/indentation/judge.rs)
+and falls back to the legacy `detect_context` / `calculate_indentation` path.
+The judge queries the same expectation engine as the indentation lint; see
+`accepted_indents_for_line`, `LineIndentExpectation`, and `IndentKind` in
+[`linting/rules/indentation.rs`](../crates/raven/src/linting/rules/indentation.rs).
+
+Maintain these boundaries:
+
+- Repair-and-ask builds a virtual buffer with a sentinel identifier on an empty
+  or closer-only cursor line. Pushed-down closers are re-appended after the
+  synthesized closers. The full-stack delimiter scan is shared with the legacy
+  fallback in `indentation/context.rs`; every unclosed delimiter gets a
+  synthesized closer on its own line so bracket changes retain the lint's
+  closer-on-own-line classification.
+- Multiline-string interiors, unanswerable positions, and a failed virtual
+  parse bail out to the legacy fallback.
+- Selection is bounded by the judge's accepted set (whose primary column is
+  always accepted) and has separate internal argument and infix preference
+  axes. `SelectionPrefs::from_config` is the sole projection from
+  `IndentationStyle` onto those axes until #610 adds per-axis settings.
+- The lint infix style defines the accepted set; the indentation style defines
+  the emit preference. The producer queries the configured lint style. From the
+  producer's perspective, lint acceptance is frozen: changing the producer must
+  never reshape the accepted sets, which is lint-policy work such as #610.
+- `IndentKind` tags preserve each accepted column's provenance. `TopLevel`
+  contributions created by expectation merging are never preference targets;
+  selecting them recreates the accepted-0 trap.
+
 - **`package_state/`** — Derived state for R package mode. Owns workspace detection result, namespace model, per-file facts (exported symbols, roxygen tags), and the aggregate scope contribution. Fully derive-based: `derive_package_state()` recomputes the entire `PackageState` from inputs.
 
   **Local-dev overlay for `load_all()`.** `PackageLibrary` maintains a local-dev overlay that surfaces the workspace package's internal symbols (non-exported `R/` definitions, sysdata, `.onLoad` names, NAMESPACE imports). The overlay is keyed on a fixed sentinel package name (the `LOAD_ALL_SENTINEL` constant, `__raven_load_all__`), **not** on a name derived from `DESCRIPTION` — the workspace `DESCRIPTION` `Package:` name feeds only the user-facing display label (`load_all_owner_display`), never the overlay key. When Raven detects a `load_all()` call in a file, it resolves the internals through this overlay exactly as it would resolve an installed package via `library()`. `apply_package_event` refreshes the overlay on `R/` filesystem events so adding, editing, or deleting a file under `R/` keeps the overlay in sync without restarting the LSP; every other code path that *replaces* `package_library` (LSP libpath rebuild/init, and `raven check`'s `maybe_init_r`) must call `refresh_local_dev_overlay` afterward, since a fresh library starts with a `None` overlay. The overlay integrates with the three-tier export resolution model (Tier 1 always wins for an actually-installed package).

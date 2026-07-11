@@ -270,7 +270,7 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
     )
     ```
 
-    This is a strict requirement, not an auto-indent-parity mode: [smart indentation](indentation.md) indents a continuation to at least one unit, so for a chain starting at a line's first column (e.g. a top-level `data |>` pipeline) auto-indent suggests one unit while `"aligned"` demands column 0. It also disables the aligned-argument/block-form tolerances on the specific lines an operator continuation covers.
+    This is a strict requirement. [Smart indentation](indentation.md) queries the configured lint style before choosing a column, so with `"aligned"` a top-level `data |>` pipeline continues at column 0 as required; auto-indent does not emit the otherwise-preferred one-unit form and then get flagged. This mode also disables the aligned-argument/block-form tolerances on the specific lines an operator continuation covers.
   - `"either"` — accept both forms; anything clean under `"indented"` or `"aligned"` is clean under `"either"`. Genuinely under-indented code stays flagged because the chain-start line itself is still checked against its own expectation.
 
   In every mode, assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) and named-argument `=` continuations are unaffected — `"aligned"` never demands the right-hand side of `x <-` line up under `x`.
