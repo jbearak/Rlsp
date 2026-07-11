@@ -694,8 +694,7 @@ pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
 ///   indentation lint; clamped to `[1, 8]`.
 /// * `infixContinuationStyle` (`"indented"` / `"aligned"` / `"either"`) —
 ///   continuation style for end-of-line infix operators in the indentation
-///   lint; any other value (including non-strings) warns and falls back to
-///   `"indented"`.
+///   lint; any other string warns and falls back to `"indented"`.
 /// * `assignmentOperator` (`"<-"` or `"="`) — preferred operator.
 /// * `stringDelimiter` (`"\""` or `"'"`) — preferred string delimiter.
 /// * `objectNameStyleFunction`, `objectNameStyleVariable`,
@@ -788,17 +787,17 @@ pub(crate) fn parse_lint_config(
         // bound used by the on-type indentation provider.
         config.indentation_unit = v.clamp(1, 8) as u32;
     }
-    if let Some(v) = linting.get("infixContinuationStyle") {
-        // Unlike the sibling string settings, a mistyped non-string value also
-        // warns instead of being silently skipped — the key is in
-        // KNOWN_LINTING_KEYS, so the TOML unknown-key warning can't catch it.
-        config.infix_continuation_style = match v.as_str() {
-            Some("indented") => crate::linting::InfixContinuationStyle::Indented,
-            Some("aligned") => crate::linting::InfixContinuationStyle::Aligned,
-            Some("either") => crate::linting::InfixContinuationStyle::Either,
-            _ => {
+    if let Some(v) = linting
+        .get("infixContinuationStyle")
+        .and_then(|v| v.as_str())
+    {
+        config.infix_continuation_style = match v {
+            "indented" => crate::linting::InfixContinuationStyle::Indented,
+            "aligned" => crate::linting::InfixContinuationStyle::Aligned,
+            "either" => crate::linting::InfixContinuationStyle::Either,
+            other => {
                 log::warn!(
-                    "Unrecognised linting.infixContinuationStyle {v}, defaulting to 'indented'."
+                    "Unrecognised linting.infixContinuationStyle '{other}', defaulting to 'indented'."
                 );
                 crate::linting::InfixContinuationStyle::Indented
             }
@@ -14470,8 +14469,9 @@ mod tests {
         #[test]
         fn parse_lint_config_invalid_infix_continuation_style_falls_back_to_indented() {
             use crate::linting::InfixContinuationStyle;
-            // Unrecognized strings and mistyped non-string values both fall
-            // back to the default (each also logs a warning).
+            // Unrecognized strings warn and fall back; mistyped non-string
+            // values are skipped like every sibling string setting — either
+            // way the default survives.
             for value in [
                 json!("alignedd"),
                 json!(42),
