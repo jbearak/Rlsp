@@ -84,9 +84,6 @@ pub(crate) fn collect(
     let mut string_interior: HashSet<u32> = HashSet::new();
     collect_string_interior_lines(root, &mut string_interior);
 
-    let mut expectations: HashMap<u32, Expected> = HashMap::new();
-    set_expectations(root, &lines, indent_unit, infix_style, &mut expectations);
-
     let line_states: Vec<LineState> = lines
         .iter()
         .enumerate()
@@ -98,8 +95,35 @@ pub(crate) fn collect(
     let mut comments: HashMap<u32, CommentCol> = HashMap::new();
     collect_comment_cols(root, &lines, &mut comments);
 
-    let aligned_comment_exemptions =
-        collect_aligned_comment_exemptions(&lines, &expectations, &comments, &line_states);
+    // One full pass (expectations + aligned-comment exemptions) per style.
+    // `Either` runs the `Indented` and `Aligned` passes and accepts a line
+    // that ANY pass accepts or exempts — the exemptions must be per-pass
+    // because comment-run grouping compares each pass's own `Expected`
+    // values, which a merged map cannot reproduce (a run that groups under
+    // `Aligned`'s uniform pins breaks against merged multi-value entries).
+    let pass_styles: &[InfixContinuationStyle] = match infix_style {
+        InfixContinuationStyle::Either => &[
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Aligned,
+        ],
+        InfixContinuationStyle::Indented => &[InfixContinuationStyle::Indented],
+        InfixContinuationStyle::Aligned => &[InfixContinuationStyle::Aligned],
+    };
+    let passes: Vec<(HashMap<u32, Expected>, HashSet<u32>)> = pass_styles
+        .iter()
+        .map(|&style| {
+            let mut expectations: HashMap<u32, Expected> = HashMap::new();
+            set_expectations(root, &lines, indent_unit, style, &mut expectations);
+            let exemptions =
+                collect_aligned_comment_exemptions(&lines, &expectations, &comments, &line_states);
+            (expectations, exemptions)
+        })
+        .collect();
+
+    // Merged per-line accepted values, used only for diagnostic messages and
+    // the run-coalescing diff (the primary comes from the first pass, which
+    // is the lintr-compatible `Indented` fold when `Either` runs both).
+    let merged: HashMap<u32, Expected> = merge_pass_expectations(&passes);
 
     // lintr suppresses consecutive lints with the same indentation
     // difference — one diagnostic per run of equally mis-indented lines.
@@ -112,18 +136,22 @@ pub(crate) fn collect(
         }
 
         let actual = leading_space_count(line_text);
-        let expected = expectations
+        let standalone_comment = is_standalone_comment_line(line_text);
+        let acceptable = passes.iter().any(|(expectations, exemptions)| {
+            let expected = expectations
+                .get(&line_no)
+                .cloned()
+                .unwrap_or_else(Expected::top_level);
+            expected.is_acceptable(actual) || (exemptions.contains(&line_no) && standalone_comment)
+        });
+        if acceptable {
+            continue;
+        }
+
+        let expected = merged
             .get(&line_no)
             .cloned()
             .unwrap_or_else(Expected::top_level);
-
-        if expected.is_acceptable(actual) {
-            continue;
-        }
-
-        if aligned_comment_exemptions.contains(&line_no) && is_standalone_comment_line(line_text) {
-            continue;
-        }
 
         let diff = i64::from(expected.primary) - i64::from(actual);
         let consecutive_same_diff = last_bad
@@ -474,15 +502,55 @@ fn comment_run_member(
 /// so Raven flags a subset of what lintr flags on these shapes and primaries
 /// match lintr. The non-default styles change that for infix-operator
 /// continuations only: `Aligned` replaces the block primary with the
-/// chain-start column, and `Either` accepts exactly the union of what
-/// `Indented` and `Aligned` accept — computed literally as two single-style
-/// folds whose per-line accepted sets are merged, so the superset property
-/// holds by construction (a per-alternative encoding cannot: downstream
-/// bracket tolerances are functions of the mode-dependent primary, so an
-/// operator continuation containing a multi-line call accepts different
-/// bracket tolerances under the two folds). Genuine under-indentation stays
-/// flagged in every style because the chain-start line itself carries no
-/// aligned alternative and is checked against its own expectation.
+/// chain-start column. `Either` never reaches this function — `collect` runs
+/// one full pass (this fold plus the aligned-comment exemptions) per style
+/// and accepts a line that any pass accepts, so `Either` is the union of
+/// `Indented` and `Aligned` by construction. A per-alternative encoding in a
+/// single fold cannot deliver that: downstream bracket tolerances and the
+/// comment-run grouping are functions of the fold's own primaries, which
+/// differ between the block path and the aligned pins. Genuine
+/// under-indentation stays flagged in every style because the chain-start
+/// line itself carries no aligned alternative and is checked against its own
+/// expectation.
+/// Union the per-line accepted sets of the style passes: the primary comes
+/// from the first pass (the lintr-compatible `Indented` fold when `Either`
+/// runs both), every other pass contributes its primary and alternatives as
+/// alternatives. A line absent from a pass's map expects indent 0 there
+/// (`Expected::top_level`), so absence contributes 0 to the union — e.g. an
+/// `Aligned` pin at column 0 produces no map entry yet still accepts 0. Used
+/// only for diagnostic messages and the run-coalescing diff; acceptance is
+/// decided per pass in `collect`.
+fn merge_pass_expectations(
+    passes: &[(HashMap<u32, Expected>, HashSet<u32>)],
+) -> HashMap<u32, Expected> {
+    let (first, rest) = passes.split_first().expect("at least one style pass");
+    let mut merged = first.0.clone();
+    for (expectations, _) in rest {
+        let mut merge_lines: Vec<u32> = merged
+            .keys()
+            .copied()
+            .chain(expectations.keys().copied())
+            .collect();
+        merge_lines.sort_unstable();
+        merge_lines.dedup();
+        for line in merge_lines {
+            let accepts: Vec<u32> = match expectations.get(&line) {
+                Some(e) => std::iter::once(e.primary)
+                    .chain(e.alternatives.iter().copied())
+                    .collect(),
+                None => vec![0],
+            };
+            let entry = merged.entry(line).or_insert_with(Expected::top_level);
+            for col in accepts {
+                if col != entry.primary && !entry.alternatives.contains(&col) {
+                    entry.alternatives.push(col);
+                }
+            }
+        }
+    }
+    merged
+}
+
 fn set_expectations(
     root: Node<'_>,
     lines: &[&str],
@@ -490,45 +558,6 @@ fn set_expectations(
     infix_style: InfixContinuationStyle,
     out: &mut HashMap<u32, Expected>,
 ) {
-    if infix_style == InfixContinuationStyle::Either {
-        set_expectations(
-            root,
-            lines,
-            indent_unit,
-            InfixContinuationStyle::Indented,
-            out,
-        );
-        let mut aligned: HashMap<u32, Expected> = HashMap::new();
-        set_expectations(
-            root,
-            lines,
-            indent_unit,
-            InfixContinuationStyle::Aligned,
-            &mut aligned,
-        );
-        // Union per line. A line absent from a fold's map expects indent 0
-        // there (`Expected::top_level`), so absence contributes 0 to the
-        // union — e.g. an `Aligned` pin at column 0 produces no entry yet
-        // still accepts 0.
-        let mut merge_lines: Vec<u32> =
-            out.keys().copied().chain(aligned.keys().copied()).collect();
-        merge_lines.sort_unstable();
-        merge_lines.dedup();
-        for line in merge_lines {
-            let aligned_accepts: Vec<u32> = match aligned.remove(&line) {
-                Some(a) => std::iter::once(a.primary).chain(a.alternatives).collect(),
-                None => vec![0],
-            };
-            let entry = out.entry(line).or_insert_with(Expected::top_level);
-            for col in aligned_accepts {
-                if col != entry.primary && !entry.alternatives.contains(&col) {
-                    entry.alternatives.push(col);
-                }
-            }
-        }
-        return;
-    }
-
     let mut changes: Vec<Change> = Vec::new();
     collect_changes(root, lines, infix_style, &mut changes);
     changes.sort_by_key(|c| c.token_byte);
@@ -1839,8 +1868,8 @@ mod tests {
     #[test]
     fn either_style_accepts_operand_at_paren_indent() {
         // Flagged under Indented (see
-        // `parenthesized_expression_inner_misindented_flagged`); the floor
-        // accepts the chain-start column at the paren's own indent.
+        // `parenthesized_expression_inner_misindented_flagged`); the Aligned
+        // pass accepts the chain-start column at the paren's own indent.
         let text = "x <- (\n  a +\n  b\n)\n";
         assert!(
             lint_with_style(text, 2, InfixContinuationStyle::Either).is_empty(),
@@ -1899,6 +1928,28 @@ mod tests {
     }
 
     #[test]
+    fn either_style_honors_aligned_comment_exemptions_per_pass() {
+        // The aligned-comment exemption groups runs by comparing each line's
+        // `Expected` value. Under Aligned the operand and comment lines all
+        // expect exactly {2}, so the standalone comment aligned with the
+        // anchor's trailing-comment column is exempt and the snippet is
+        // clean. A merged Either map has structurally different per-line
+        // values, breaking the run — so exemptions must be computed per
+        // pass, with a line accepted when any pass accepts or exempts it.
+        let text = "x <- (\n  a +\n  b +   # anchor\n        # standalone\n  c\n)\n";
+        for style in [
+            InfixContinuationStyle::Aligned,
+            InfixContinuationStyle::Either,
+        ] {
+            assert!(
+                lint_with_style(text, 2, style).is_empty(),
+                "got {:?} under {style:?}",
+                lint_with_style(text, 2, style)
+            );
+        }
+    }
+
+    #[test]
     fn either_style_accepts_bracket_tolerances_inside_aligned_continuations() {
         // A bracket group nested inside an operator continuation: its
         // tolerances (aligned-argument `AlsoCol`, hanging-with-`AlsoBlock`)
@@ -1945,6 +1996,7 @@ mod tests {
             "changed <- !(\nfirst_condition |\nsecond_condition\n)\n",
             "x <- (\n  a +\n  fo(k,\n     q\n  )\n)\n",
             "x <- foo() +\n     bar(a,\n       b)\n",
+            "x <- (\n  a +\n  b +   # anchor\n        # standalone\n  c\n)\n",
             "x <- f() |>\n     g() + y +\n     z\n",
             "x <- f() |>\n  g() + y +\n  z\n",
         ];
