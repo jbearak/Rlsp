@@ -66,10 +66,10 @@ pub fn calculate_indentation(
             chain_start_line,
             chain_start_col,
             operator_type: _,
-            flattened_rhs,
+            flattened_floor,
         } => {
             let line_indent = get_line_indent(source, chain_start_line, config.tab_size);
-            if flattened_rhs {
+            if let Some(flattened_floor) = flattened_floor {
                 // Chain on the RHS of a broken assignment: the assignment
                 // already added the level, so continuations stay at the
                 // chain-start line's indent (not chain_start_col, which can
@@ -79,10 +79,7 @@ pub fn calculate_indentation(
                 // chain line itself under-indented) at the level the lint
                 // requires instead of mirroring the bad indent; for
                 // well-formed input the two are equal.
-                std::cmp::max(
-                    line_indent,
-                    flattened_floor(source, chain_start_line, &config),
-                )
+                std::cmp::max(line_indent, flattened_floor)
             } else {
                 // Align to chain start column (RHS of assignment if present)
                 // but ensure at least one tab_size indent from the line start.
@@ -91,7 +88,7 @@ pub fn calculate_indentation(
         }
         IndentContext::AfterAssignmentOperator {
             base_line,
-            flattened,
+            flattened_floor,
         } => {
             // One level from the assignment statement's start line, in every
             // style — an assignment RHS has nothing to align against (#611).
@@ -99,8 +96,8 @@ pub fn calculate_indentation(
             // assignment) adds no level of its own, but the enclosing
             // suppressor still floors it (see the flattened chain arm).
             let base = get_line_indent(source, base_line, config.tab_size);
-            if flattened {
-                std::cmp::max(base, flattened_floor(source, base_line, &config))
+            if let Some(flattened_floor) = flattened_floor {
+                std::cmp::max(base, flattened_floor)
             } else {
                 base.saturating_add(config.tab_size)
             }
@@ -149,16 +146,6 @@ pub fn calculate_indentation(
             enclosing_block_indent
         }
     }
-}
-
-/// The minimum column for a flattened construct: one level below the
-/// topmost line of the suppressing-assignment run above `line` (see
-/// [`super::context::flattening_suppressor_line`]), or 0 when the text walk
-/// finds none (then the observed line indent stands unchallenged).
-fn flattened_floor(source: &str, line: u32, config: &IndentationConfig) -> u32 {
-    super::context::flattening_suppressor_line(source, line)
-        .map(|l| get_line_indent(source, l, config.tab_size).saturating_add(config.tab_size))
-        .unwrap_or(0)
 }
 
 /// Gets the indentation (leading whitespace column) of a specific line.
@@ -296,7 +283,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -319,7 +306,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 4,
             operator_type: OperatorType::MagrittrPipe,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -341,7 +328,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 4,
             operator_type: OperatorType::Plus,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -375,7 +362,7 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col: 0,
                 operator_type: op,
-                flattened_rhs: false,
+                flattened_floor: None,
             };
 
             let indent = calculate_indentation(context.clone(), config.clone(), "");
@@ -409,7 +396,7 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col: 5,
                 operator_type: op,
-                flattened_rhs: false,
+                flattened_floor: None,
             };
             assert_eq!(
                 calculate_indentation(ctx, config.clone(), ""),
@@ -438,7 +425,7 @@ mod tests {
             chain_start_line: 1,
             chain_start_col: 6,
             operator_type: OperatorType::MagrittrPipe,
-            flattened_rhs: true,
+            flattened_floor: Some(2),
         };
         assert_eq!(calculate_indentation(ctx, config, source), 2);
     }
@@ -453,7 +440,7 @@ mod tests {
         let source = "f <- function() {\n  x <-\n";
         let ctx = IndentContext::AfterAssignmentOperator {
             base_line: 1,
-            flattened: false,
+            flattened_floor: None,
         };
         assert_eq!(calculate_indentation(ctx, config, source), 4);
     }
@@ -468,7 +455,7 @@ mod tests {
         let source = "a <-\n  b <-\n";
         let ctx = IndentContext::AfterAssignmentOperator {
             base_line: 1,
-            flattened: true,
+            flattened_floor: Some(2),
         };
         assert_eq!(calculate_indentation(ctx, config, source), 2);
     }
@@ -485,7 +472,7 @@ mod tests {
             };
             let ctx = IndentContext::AfterAssignmentOperator {
                 base_line: 0,
-                flattened: false,
+                flattened_floor: None,
             };
             assert_eq!(
                 calculate_indentation(ctx, config, source),
@@ -515,7 +502,7 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col,
                 operator_type: OperatorType::Pipe,
-                flattened_rhs: false,
+                flattened_floor: None,
             };
 
             let indent = calculate_indentation(context, config.clone(), "");
@@ -544,7 +531,7 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col,
                 operator_type: OperatorType::Pipe,
-                flattened_rhs: false,
+                flattened_floor: None,
             };
 
             let indent = calculate_indentation(context, config, "");
@@ -580,7 +567,7 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col,
                 operator_type: OperatorType::Pipe,
-                flattened_rhs: false,
+                flattened_floor: None,
             };
 
             let indent = calculate_indentation(context, config, "");
@@ -1011,7 +998,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1122,7 +1109,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 100,
             operator_type: OperatorType::Pipe,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1144,7 +1131,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 100,
             operator_type: OperatorType::Plus,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1185,7 +1172,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1345,7 +1332,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1427,7 +1414,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1449,7 +1436,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1522,7 +1509,7 @@ mod tests {
                     chain_start_line: 0,
                     chain_start_col,
                     operator_type,
-                    flattened_rhs: false,
+                    flattened_floor: None,
                 };
 
                 let indent = calculate_indentation(context, config, "");
@@ -1578,7 +1565,7 @@ mod tests {
                     chain_start_line: 0,
                     chain_start_col,
                     operator_type,
-                    flattened_rhs: false,
+                    flattened_floor: None,
                 };
 
                 let indent = calculate_indentation(context, config, "");
@@ -1632,7 +1619,7 @@ mod tests {
                         chain_start_line,
                         chain_start_col,
                         operator_type,
-                        flattened_rhs: false,
+                        flattened_floor: None,
                     };
 
                     let indent = calculate_indentation(context, config.clone(), "");
@@ -1686,7 +1673,7 @@ mod tests {
                         chain_start_line,
                         chain_start_col,
                         operator_type: map_operator(op_idx),
-                        flattened_rhs: false,
+                        flattened_floor: None,
                     };
 
                     let indent = calculate_indentation(context, config.clone(), "");

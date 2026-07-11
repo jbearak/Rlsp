@@ -116,7 +116,9 @@ pub enum IndentContext {
         /// Continuations then stay at the chain-start line's indent instead
         /// of gaining the one-level floor — the assignment already paid for
         /// the level, and every lint mode flags a second one.
-        flattened_rhs: bool,
+        /// `Some(column)` is the suppressing assignment run's precomputed
+        /// indentation floor; `None` means the chain is not flattened.
+        flattened_floor: Option<u32>,
     },
 
     /// After a line ending in an assignment operator
@@ -134,7 +136,9 @@ pub enum IndentContext {
         /// assignment (`a <-` ⏎ `  b <-` ⏎): the outer assignment already
         /// added the level, so this one adds none (mirrors the lint's
         /// `assignment_as_infix` suppression).
-        flattened: bool,
+        /// `Some(column)` is the suppressing assignment run's precomputed
+        /// indentation floor; `None` means this assignment is not flattened.
+        flattened_floor: Option<u32>,
     },
 
     /// After a complete expression (no trailing operator, no unclosed delimiters).
@@ -299,6 +303,10 @@ pub(super) fn flattening_suppressor_line(source: &str, line: u32) -> Option<u32>
     topmost
 }
 
+fn flattening_floor_from_suppressor(source: &str, line: u32, tab_size: u32) -> u32 {
+    get_line_indent(source, line, tab_size).saturating_add(tab_size)
+}
+
 /// Detects the syntactic context at the given position for indentation.
 ///
 /// This function analyzes the tree-sitter AST to determine what kind of
@@ -385,7 +393,7 @@ pub fn detect_context(
     // Must precede the parens/braces detection: the assignment context
     // preempts InsideBraces, while paren/bracket context is deferred to
     // inside detect_assignment_continuation itself.
-    if let Some(ctx) = detect_assignment_continuation(tree, source, position) {
+    if let Some(ctx) = detect_assignment_continuation(tree, source, position, tab_size) {
         return ctx;
     }
 
@@ -637,13 +645,14 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
             // assignment above the chain start suppresses the level, unless
             // a delimiter opened at/after the chain start (restorer shape:
             // the chain sits inside a call/parens, not directly on the RHS).
-            let flattened_rhs = flattening_suppressor_line(source, chain_start_line).is_some()
-                && !matches!(unclosed, Some((row, _, _)) if row >= chain_start_line);
+            let flattened_floor = flattening_suppressor_line(source, chain_start_line)
+                .filter(|_| !matches!(unclosed, Some((row, _, _)) if row >= chain_start_line))
+                .map(|row| flattening_floor_from_suppressor(source, row, tab_size));
             return IndentContext::AfterContinuationOperator {
                 chain_start_line,
                 chain_start_col,
                 operator_type: op_type,
-                flattened_rhs,
+                flattened_floor,
             };
         }
 
@@ -661,11 +670,12 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
             // does not extend it.
             let assign_line = position.line - 1;
             let (base_line, _) = ChainWalker::new(source, tab_size).find_chain_start(assign_line);
-            let flattened = flattening_suppressor_line(source, base_line).is_some()
-                && !matches!(unclosed, Some((row, _, _)) if row >= base_line);
+            let flattened_floor = flattening_suppressor_line(source, base_line)
+                .filter(|_| !matches!(unclosed, Some((row, _, _)) if row >= base_line))
+                .map(|row| flattening_floor_from_suppressor(source, row, tab_size));
             return IndentContext::AfterAssignmentOperator {
                 base_line,
-                flattened,
+                flattened_floor,
             };
         }
     }
@@ -1183,17 +1193,8 @@ fn chain_hangs_in_same_line_bracket(outermost: Node) -> bool {
         }
         match parent.kind() {
             "parenthesized_expression" => return true,
-            "if_statement" | "while_statement"
-                if parent
-                    .child_by_field_name("condition")
-                    .is_some_and(|c| c.id() == child.id()) =>
-            {
-                return true;
-            }
-            "for_statement"
-                if parent
-                    .child_by_field_name("sequence")
-                    .is_some_and(|c| c.id() == child.id()) =>
+            "if_statement" | "while_statement" | "for_statement"
+                if is_control_flow_header_child(parent, child) =>
             {
                 return true;
             }
@@ -1202,6 +1203,23 @@ fn chain_hangs_in_same_line_bracket(outermost: Node) -> bool {
         child = parent;
     }
     false
+}
+
+fn is_control_flow_header_child(parent: Node<'_>, child: Node<'_>) -> bool {
+    let field = match parent.kind() {
+        "if_statement" | "while_statement" => "condition",
+        "for_statement" => "sequence",
+        _ => return false,
+    };
+    parent
+        .child_by_field_name(field)
+        .is_some_and(|node| node.id() == child.id())
+}
+
+fn trimmed_end_point(row: u32, line_text: &str, trimmed: &str) -> tree_sitter::Point {
+    let leading_ws = line_text.len() - line_text.trim_start().len();
+    let content_len = trimmed.trim_start().len();
+    tree_sitter::Point::new(row as usize, leading_ws + content_len.saturating_sub(1))
 }
 
 /// Finds the continuation chain start position using AST analysis.
@@ -1236,10 +1254,7 @@ fn find_chain_start_from_ast(
     }
 
     // Account for leading whitespace when computing the column
-    let leading_ws = line_text.len() - line_text.trim_start().len();
-    let content_len = trimmed.trim_start().len();
-    let trimmed_end_col = leading_ws + content_len.saturating_sub(1);
-    let point = tree_sitter::Point::new(prev_line as usize, trimmed_end_col);
+    let point = trimmed_end_point(prev_line, line_text, trimmed);
 
     // Get the node at the operator position
     let node = root.descendant_for_point_range(point, point)?;
@@ -1323,17 +1338,8 @@ fn assignment_in_paren_context(assign_binop: Node) -> bool {
             | "parameter"
             | "parenthesized_expression" => return true,
             "braced_expression" => return false,
-            "if_statement" | "while_statement"
-                if parent
-                    .child_by_field_name("condition")
-                    .is_some_and(|c| c.id() == child.id()) =>
-            {
-                return true;
-            }
-            "for_statement"
-                if parent
-                    .child_by_field_name("sequence")
-                    .is_some_and(|c| c.id() == child.id()) =>
+            "if_statement" | "while_statement" | "for_statement"
+                if is_control_flow_header_child(parent, child) =>
             {
                 return true;
             }
@@ -1363,6 +1369,7 @@ fn detect_assignment_continuation(
     tree: &Tree,
     source: &str,
     position: Position,
+    tab_size: u32,
 ) -> Option<IndentContext> {
     if position.line == 0 {
         return None;
@@ -1376,10 +1383,7 @@ fn detect_assignment_continuation(
 
     // Locate the operator token's last byte (same arithmetic as
     // `find_chain_start_from_ast`).
-    let leading_ws = line_text.len() - line_text.trim_start().len();
-    let content_len = trimmed.trim_start().len();
-    let end_col = leading_ws + content_len.saturating_sub(1);
-    let point = tree_sitter::Point::new(prev_line as usize, end_col);
+    let point = trimmed_end_point(prev_line, line_text, trimmed);
 
     let node = tree.root_node().descendant_for_point_range(point, point)?;
     if node.kind() != op {
@@ -1391,12 +1395,18 @@ fn detect_assignment_continuation(
         return None;
     }
 
+    let base_line = binop.start_position().row as u32;
+    let flattened_floor = crate::linting::suppressed_as_assignment_rhs(binop).then(|| {
+        flattening_suppressor_line(source, base_line)
+            .map(|row| flattening_floor_from_suppressor(source, row, tab_size))
+            .unwrap_or(0)
+    });
     Some(IndentContext::AfterAssignmentOperator {
         // The binop starts where the assignment statement starts — for
         // `data %>%` ⏎ `  f() ->` the `->` binop's LHS is the whole chain,
         // so the base is the `data` line, matching the lint's block level.
-        base_line: binop.start_position().row as u32,
-        flattened: crate::linting::suppressed_as_assignment_rhs(binop),
+        base_line,
+        flattened_floor,
     })
 }
 
@@ -1441,23 +1451,32 @@ fn detect_continuation_operator(
     // exactly (via the lint's predicate); the text path approximates it and
     // guards the restorer shape (chain inside a call opened at or after the
     // chain start — see `flattening_suppressor_line`).
-    let (chain_start_line, chain_start_col, flattened_rhs) =
-        find_chain_start_from_ast(tree, source, prev_line).unwrap_or_else(|| {
+    let (chain_start_line, chain_start_col, flattened_floor) =
+        if let Some((line, col, flattened)) = find_chain_start_from_ast(tree, source, prev_line) {
+            let floor = flattened.then(|| {
+                flattening_suppressor_line(source, line)
+                    .map(|row| flattening_floor_from_suppressor(source, row, tab_size))
+                    .unwrap_or(0)
+            });
+            (line, col, floor)
+        } else {
             let walker = ChainWalker::new(source, tab_size);
             let (line, col) = walker.find_chain_start(position.line);
-            let flattened = flattening_suppressor_line(source, line).is_some()
-                && !matches!(
-                    find_unclosed_delimiter_heuristic(source, position.line),
-                    Some((row, _, _)) if row >= line
-                );
-            (line, col, flattened)
-        });
-
+            let floor = flattening_suppressor_line(source, line)
+                .filter(|_| {
+                    !matches!(
+                        find_unclosed_delimiter_heuristic(source, position.line),
+                        Some((row, _, _)) if row >= line
+                    )
+                })
+                .map(|row| flattening_floor_from_suppressor(source, row, tab_size));
+            (line, col, floor)
+        };
     Some(IndentContext::AfterContinuationOperator {
         chain_start_line,
         chain_start_col,
         operator_type,
-        flattened_rhs,
+        flattened_floor,
     })
 }
 
@@ -2725,7 +2744,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
-            flattened_rhs: false,
+            flattened_floor: None,
         };
         assert!(matches!(
             continuation,
@@ -5687,7 +5706,7 @@ mod assignment_context_tests {
                 ctx,
                 IndentContext::AfterAssignmentOperator {
                     base_line: base,
-                    flattened: false,
+                    flattened_floor: None,
                 },
                 "for {code:?}"
             );
@@ -5705,7 +5724,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 0,
-                flattened: false,
+                flattened_floor: None,
             }
         );
         assert_eq!(indent_at(code, 2), 2);
@@ -5777,7 +5796,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 0,
-                flattened: false,
+                flattened_floor: None,
             }
         );
     }
@@ -5793,7 +5812,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 0,
-                flattened: false,
+                flattened_floor: None,
             }
         );
     }
@@ -5808,7 +5827,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 0,
-                flattened: false,
+                flattened_floor: None,
             }
         );
     }
@@ -5865,7 +5884,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 1,
-                flattened: false,
+                flattened_floor: None,
             }
         );
         assert_eq!(indent_at(code, 2), 4);
@@ -5882,7 +5901,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 3,
-                flattened: false,
+                flattened_floor: None,
             }
         );
     }
@@ -5901,7 +5920,7 @@ mod assignment_context_tests {
                 chain_start_line: 1,
                 chain_start_col: 2,
                 operator_type: OperatorType::MagrittrPipe,
-                flattened_rhs: true,
+                flattened_floor: Some(2),
             }
         );
         assert_eq!(indent_at(code, 2), 2);
@@ -5933,7 +5952,7 @@ mod assignment_context_tests {
                 chain_start_line: 0,
                 chain_start_col: 0,
                 operator_type: OperatorType::MagrittrPipe,
-                flattened_rhs: false,
+                flattened_floor: None,
             }
         );
         assert_eq!(indent_at(code, 1), 2);
@@ -5958,7 +5977,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 1,
-                flattened: true,
+                flattened_floor: Some(2),
             }
         );
         assert_eq!(indent_at(code, 2), 2);
@@ -5972,7 +5991,7 @@ mod assignment_context_tests {
             matches!(
                 ctx,
                 IndentContext::AfterContinuationOperator {
-                    flattened_rhs: true,
+                    flattened_floor: Some(2),
                     ..
                 }
             ),
@@ -5994,7 +6013,7 @@ mod assignment_context_tests {
             matches!(
                 ctx,
                 IndentContext::AfterContinuationOperator {
-                    flattened_rhs: false,
+                    flattened_floor: None,
                     ..
                 }
             ),
@@ -6018,7 +6037,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 1,
-                flattened: false,
+                flattened_floor: None,
             }
         );
         assert_eq!(legacy_tier_indent_at(code, 2), 4);
@@ -6053,7 +6072,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 1,
-                flattened: false,
+                flattened_floor: None,
             }
         );
         assert_eq!(legacy_tier_indent_at(code, 2), 4);
@@ -6070,7 +6089,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 1,
-                flattened: false,
+                flattened_floor: None,
             }
         );
         assert_eq!(legacy_tier_indent_at(code, 4), 4);
@@ -6095,7 +6114,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 1,
-                flattened: false,
+                flattened_floor: None,
             }
         );
         assert_eq!(legacy_tier_indent_at(code, 2), 4);
@@ -6118,7 +6137,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 0,
-                flattened: false,
+                flattened_floor: None,
             }
         );
     }
@@ -6138,7 +6157,7 @@ mod assignment_context_tests {
             matches!(
                 ctx,
                 IndentContext::AfterContinuationOperator {
-                    flattened_rhs: true,
+                    flattened_floor: Some(2),
                     ..
                 }
             ),
@@ -6163,7 +6182,7 @@ mod assignment_context_tests {
             matches!(
                 ctx,
                 IndentContext::AfterContinuationOperator {
-                    flattened_rhs: true,
+                    flattened_floor: Some(4),
                     ..
                 }
             ),
@@ -6187,7 +6206,7 @@ mod assignment_context_tests {
                 matches!(
                     ctx,
                     IndentContext::AfterContinuationOperator {
-                        flattened_rhs: false,
+                        flattened_floor: None,
                         ..
                     }
                 ),
@@ -6228,7 +6247,7 @@ mod assignment_context_tests {
             matches!(
                 ctx,
                 IndentContext::AfterContinuationOperator {
-                    flattened_rhs: false,
+                    flattened_floor: None,
                     ..
                 }
             ),
@@ -6250,7 +6269,7 @@ mod assignment_context_tests {
             matches!(
                 ctx,
                 IndentContext::AfterContinuationOperator {
-                    flattened_rhs: true,
+                    flattened_floor: Some(2),
                     ..
                 }
             ),
@@ -6269,7 +6288,7 @@ mod assignment_context_tests {
             matches!(
                 ctx,
                 IndentContext::AfterContinuationOperator {
-                    flattened_rhs: false,
+                    flattened_floor: None,
                     ..
                 }
             ),
@@ -6329,7 +6348,7 @@ mod assignment_context_tests {
             ctx,
             IndentContext::AfterAssignmentOperator {
                 base_line: 0,
-                flattened: false,
+                flattened_floor: None,
             }
         );
         let cfg = config(IndentationStyle::RStudio);

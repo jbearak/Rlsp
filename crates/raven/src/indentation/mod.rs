@@ -25,7 +25,6 @@ mod judge;
 pub use calculator::{IndentationConfig, IndentationStyle, calculate_indentation};
 pub use context::{IndentContext, OperatorType, detect_context};
 pub use formatter::format_indentation;
-pub use judge::judge_backed_indentation;
 
 /// Tier 2 on-type indent for an Enter press: repair-and-ask against the
 /// lint's expectation engine, falling back to the legacy
@@ -37,7 +36,33 @@ pub fn on_type_indentation(
     config: &IndentationConfig,
     infix_style: InfixContinuationStyle,
 ) -> u32 {
-    if let Some(column) = judge_backed_indentation(tree, source, position, config, infix_style) {
+    on_type_indentation_with_judge_unit(
+        tree,
+        source,
+        position,
+        config,
+        config.tab_size,
+        infix_style,
+    )
+}
+
+/// Backend entry that lets the judge use the lint's resolved indentation
+/// unit while preserving the editor unit for the frozen legacy fallback.
+pub(crate) fn on_type_indentation_with_judge_unit(
+    tree: &Tree,
+    source: &str,
+    position: Position,
+    config: &IndentationConfig,
+    judge_indent_unit: u32,
+    infix_style: InfixContinuationStyle,
+) -> u32 {
+    let judge_config = IndentationConfig {
+        tab_size: judge_indent_unit,
+        ..config.clone()
+    };
+    if let Some(column) =
+        judge::judge_backed_indentation(tree, source, position, &judge_config, infix_style)
+    {
         log::trace!("on_type_indentation: judge-backed tier selected column {column}");
         return column;
     }

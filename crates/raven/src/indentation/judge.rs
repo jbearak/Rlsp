@@ -1,10 +1,9 @@
 //! Judge-backed smart indentation over a repaired virtual buffer.
 
 use tower_lsp::lsp_types::Position;
-use tree_sitter::{Node, Tree};
+use tree_sitter::{Node, Point, Tree};
 
 use super::calculator::{IndentationConfig, IndentationStyle};
-use super::context::unclosed_delimiters_heuristic;
 use crate::linting::{
     IndentKind, InfixContinuationStyle, LineIndentExpectation, accepted_indents_for_line,
 };
@@ -12,6 +11,27 @@ use crate::parser_pool::with_parser;
 use crate::utf16::utf16_column_to_byte_offset;
 
 const SENTINEL: &str = "raven_sentinel_";
+
+#[derive(Debug)]
+struct VirtualBuffer {
+    text: String,
+    probe_line: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeKind {
+    Blank,
+    PureClosers,
+    MixedClosers,
+    ExistingContent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeCoverage {
+    Masked,
+    Explained,
+    Unexplained,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FormPref {
@@ -67,17 +87,11 @@ pub fn judge_backed_indentation(
         return None;
     };
 
-    let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
-    if source.is_empty() || source.ends_with('\n') {
-        lines.push(String::new());
-    }
-
-    let probe_line = position.line as usize;
-    let Some(probe) = lines.get(probe_line) else {
+    let Some(probe) = logical_line(source, position.line) else {
         log::trace!(
             "judge_backed_indentation: bail: line {} is out of bounds ({} lines)",
             position.line,
-            lines.len()
+            source.lines().count() + usize::from(source.is_empty() || source.ends_with('\n'))
         );
         return None;
     };
@@ -90,9 +104,7 @@ pub fn judge_backed_indentation(
         return None;
     }
 
-    if cursor_is_inside_multiline_string(tree, source, position)
-        || lexically_inside_multiline_string(source, position)
-    {
+    if cursor_is_inside_multiline_string(tree, source, position) {
         log::trace!(
             "judge_backed_indentation: bail: cursor on line {} is inside a multiline string",
             position.line
@@ -100,77 +112,20 @@ pub fn judge_backed_indentation(
         return None;
     }
 
-    let add_sentinel = needs_sentinel(probe);
-    let pushed_closers_only = {
-        let trimmed = probe.trim_start();
-        !trimmed.is_empty() && trimmed.chars().all(|ch| matches!(ch, ')' | ']' | '}'))
-    };
-    log::trace!(
-        "judge_backed_indentation: probe line={}, kind={}",
-        position.line,
-        if pushed_closers_only {
-            "sentinel-replacing-pushed-closers"
-        } else if add_sentinel {
-            "sentinel"
-        } else {
-            "existing-content"
-        }
-    );
-    let pushed_closer_line = if add_sentinel {
-        let content_start = probe
-            .char_indices()
-            .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
-            .unwrap_or(probe.len());
-        if pushed_closers_only {
-            let pushed = lines[probe_line][content_start..].to_owned();
-            lines[probe_line].truncate(content_start);
-            lines[probe_line].push_str(SENTINEL);
-            Some(pushed)
-        } else {
-            lines[probe_line].insert_str(content_start, SENTINEL);
-            None
-        }
-    } else {
-        None
-    };
-
-    let Some(openers) = unclosed_delimiters_heuristic(source, position.line) else {
-        log::trace!(
-            "judge_backed_indentation: bail: delimiter scan could not reach line {}",
-            position.line
-        );
+    let Some(virtual_buffer) = build_virtual_buffer(tree, source, position, None) else {
+        log::trace!("judge_backed_indentation: bail: virtual repair was ambiguous");
         return None;
     };
-    let closers: Vec<String> = openers
-        .iter()
-        .rev()
-        .map(|(_, _, opener)| {
-            matching_closer(*opener)
-                .expect("delimiter scan only stores supported openers")
-                .to_string()
-        })
-        .collect();
-    log::trace!(
-        "judge_backed_indentation: synthesized closers={:?}",
-        closers
-    );
-    let synthesized_count = closers.len();
-    lines.splice(probe_line + 1..probe_line + 1, closers);
-    if let Some(pushed) = pushed_closer_line {
-        lines.insert(probe_line + 1 + synthesized_count, pushed);
-    }
-
-    let virtual_text = lines.join("\n");
-    let Some(tree) = with_parser(|parser| parser.parse(&virtual_text, None)) else {
+    let Some(tree) = with_parser(|parser| parser.parse(&virtual_buffer.text, None)) else {
         log::trace!("judge_backed_indentation: bail: virtual parse failed");
         return None;
     };
     let expected = accepted_indents_for_line(
-        &virtual_text,
+        &virtual_buffer.text,
         tree.root_node(),
         config.tab_size,
         infix_style,
-        position.line,
+        virtual_buffer.probe_line,
     );
     log::trace!(
         "judge_backed_indentation: accepted primary={}, alternatives={:?}",
@@ -187,16 +142,98 @@ pub fn judge_backed_indentation(
     Some(selected)
 }
 
-fn needs_sentinel(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() {
-        return true;
+fn build_virtual_buffer(
+    tree: &Tree,
+    source: &str,
+    position: Position,
+    probe_indent: Option<u32>,
+) -> Option<VirtualBuffer> {
+    let probe = logical_line(source, position.line)?;
+    if position.character as usize > probe.encode_utf16().count() {
+        return None;
     }
+    let line_start = line_start_byte(source, position.line)?;
+    let line_end = line_start.checked_add(probe.len())?;
+    let content_start = probe
+        .char_indices()
+        .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
+        .unwrap_or(probe.len());
+    let trimmed = &probe[content_start..];
+    let (kind, leading_closers) = classify_probe(trimmed);
+    log::trace!(
+        "judge_backed_indentation: probe line={}, kind={kind:?}",
+        position.line
+    );
 
-    trimmed
-        .split_whitespace()
-        .next()
-        .is_some_and(|run| run.chars().all(|ch| matches!(ch, ')' | ']' | '}')))
+    let mut openers = unclosed_delimiters_for_judge(tree, source, position.line)?;
+    if kind == ProbeKind::MixedClosers {
+        for closer in leading_closers {
+            let (_, _, opener) = openers.pop()?;
+            if matching_closer(opener) != Some(closer) {
+                return None;
+            }
+        }
+    }
+    let closers: Vec<char> = openers
+        .iter()
+        .rev()
+        .map(|(_, _, opener)| {
+            matching_closer(*opener).expect("judge delimiter scan only stores supported openers")
+        })
+        .collect();
+    log::trace!("judge_backed_indentation: synthesized closers={closers:?}");
+
+    let pushed_closers = (kind == ProbeKind::PureClosers).then_some(trimmed);
+    let replacement_content = match kind {
+        ProbeKind::Blank | ProbeKind::PureClosers => SENTINEL,
+        ProbeKind::MixedClosers | ProbeKind::ExistingContent => trimmed,
+    };
+    let replacement_indent_len = probe_indent.map_or(content_start, |column| column as usize);
+    let inserted_lines = closers.len() + usize::from(pushed_closers.is_some());
+    let extra_capacity = replacement_indent_len
+        .saturating_add(replacement_content.len())
+        .saturating_add(inserted_lines.saturating_mul(2));
+    let mut text = String::with_capacity(source.len().saturating_add(extra_capacity));
+    text.push_str(&source[..line_start]);
+    if let Some(column) = probe_indent {
+        text.push_str(&" ".repeat(column as usize));
+    } else {
+        text.push_str(&probe[..content_start]);
+    }
+    text.push_str(replacement_content);
+    for closer in closers {
+        text.push('\n');
+        text.push(closer);
+    }
+    if let Some(pushed) = pushed_closers {
+        text.push('\n');
+        text.push_str(pushed);
+    }
+    text.push_str(&source[line_end..]);
+
+    Some(VirtualBuffer {
+        text,
+        probe_line: position.line,
+    })
+}
+
+fn classify_probe(trimmed: &str) -> (ProbeKind, Vec<char>) {
+    if trimmed.is_empty() {
+        return (ProbeKind::Blank, Vec::new());
+    }
+    let mut closers = Vec::new();
+    for ch in trimmed.chars() {
+        if matches!(ch, ')' | ']' | '}') {
+            closers.push(ch);
+        } else if !ch.is_whitespace() {
+            return if closers.is_empty() {
+                (ProbeKind::ExistingContent, closers)
+            } else {
+                (ProbeKind::MixedClosers, closers)
+            };
+        }
+    }
+    (ProbeKind::PureClosers, closers)
 }
 
 fn matching_closer(opener: char) -> Option<char> {
@@ -213,58 +250,7 @@ fn cursor_is_inside_multiline_string(tree: &Tree, source: &str, position: Positi
         return false;
     };
     let byte_col = utf16_column_to_byte_offset(line, position.character);
-    multiline_string_contains(tree.root_node(), position.line as usize, byte_col)
-}
-
-fn lexically_inside_multiline_string(source: &str, position: Position) -> bool {
-    let mut quote = None;
-    let mut quote_start_row = 0usize;
-    let mut escaped = false;
-
-    for (row, line) in source.lines().enumerate() {
-        if row > position.line as usize {
-            break;
-        }
-        let limit = if row == position.line as usize {
-            utf16_column_to_byte_offset(line, position.character)
-        } else {
-            line.len()
-        };
-        let Some(prefix) = line.get(..limit) else {
-            return false;
-        };
-
-        for ch in prefix.chars() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if quote.is_some() && ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if let Some(delimiter) = quote {
-                if ch == delimiter {
-                    quote = None;
-                }
-                continue;
-            }
-            if ch == '#' {
-                break;
-            }
-            if matches!(ch, '\"' | '\'' | '`') {
-                quote = Some(ch);
-                quote_start_row = row;
-            }
-        }
-        escaped = false;
-
-        if row == position.line as usize {
-            break;
-        }
-    }
-
-    quote.is_some() && quote_start_row < position.line as usize
+    multiline_string_contains(tree, source, position.line as usize, byte_col)
 }
 
 fn logical_line(source: &str, line: u32) -> Option<&str> {
@@ -273,20 +259,131 @@ fn logical_line(source: &str, line: u32) -> Option<&str> {
     })
 }
 
-fn multiline_string_contains(node: Node<'_>, row: usize, column: usize) -> bool {
-    if node.kind() == "string" && node.start_position().row < node.end_position().row {
-        let start = node.start_position();
-        let end = node.end_position();
-        let after_start = row > start.row || (row == start.row && column >= start.column);
-        let before_end = row < end.row || (row == end.row && column < end.column);
-        if after_start && before_end {
+fn multiline_string_contains(tree: &Tree, source: &str, row: usize, column: usize) -> bool {
+    let point = Point::new(row, column);
+    let mut node = tree.root_node().descendant_for_point_range(point, point);
+    while let Some(current) = node {
+        if current.kind() == "string"
+            && current.start_position().row < current.end_position().row
+            && point_in_node(current, row, column)
+        {
             return true;
         }
+        node = current.parent();
     }
 
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| multiline_string_contains(child, row, column))
+    // At an empty EOF line, tree-sitter may resolve the exact boundary point
+    // to the program rather than to an unterminated string ending there.
+    // Probe the preceding byte and accept only a multiline string whose end
+    // is exactly the cursor boundary.
+    if column == 0
+        && row > 0
+        && let Some(previous) = logical_line(source, row as u32 - 1)
+        && !previous.is_empty()
+    {
+        let preceding = Point::new(row - 1, previous.len() - 1);
+        let mut node = tree
+            .root_node()
+            .descendant_for_point_range(preceding, preceding);
+        while let Some(current) = node {
+            if current.kind() == "string"
+                && current.start_position().row < current.end_position().row
+                && current.end_position() == point
+            {
+                return true;
+            }
+            node = current.parent();
+        }
+    }
+    false
+}
+
+fn unclosed_delimiters_for_judge(
+    tree: &Tree,
+    source: &str,
+    current_line: u32,
+) -> Option<Vec<(u32, u32, char)>> {
+    let mut stack = Vec::new();
+    for row in 0..current_line as usize {
+        let line = logical_line(source, row as u32)?;
+        let byte_start = line_start_byte(source, row as u32)?;
+        for (column, ch) in line.char_indices() {
+            if !matches!(ch, '(' | '[' | '{' | ')' | ']' | '}' | '\"' | '\'' | '`') {
+                continue;
+            }
+            let coverage = tree_coverage(tree, row, column, byte_start + column);
+            if coverage == TreeCoverage::Masked {
+                continue;
+            }
+            if matches!(ch, '\"' | '\'' | '`') {
+                if coverage == TreeCoverage::Unexplained {
+                    return None;
+                }
+                continue;
+            }
+            match ch {
+                '(' | '[' | '{' => stack.push((row as u32, column as u32, ch)),
+                ')' if stack.last().is_some_and(|(_, _, opener)| *opener == '(') => {
+                    stack.pop();
+                }
+                ']' if stack.last().is_some_and(|(_, _, opener)| *opener == '[') => {
+                    stack.pop();
+                }
+                '}' if stack.last().is_some_and(|(_, _, opener)| *opener == '{') => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(stack)
+}
+
+fn tree_coverage(tree: &Tree, row: usize, column: usize, byte: usize) -> TreeCoverage {
+    let point = Point::new(row, column);
+    let Some(deepest) = tree.root_node().descendant_for_point_range(point, point) else {
+        return TreeCoverage::Unexplained;
+    };
+    let mut deepest_covering = None;
+    let mut node = Some(deepest);
+    while let Some(current) = node {
+        if current.start_byte() <= byte && byte < current.end_byte() {
+            deepest_covering.get_or_insert(current);
+            if matches!(current.kind(), "string" | "comment") {
+                return TreeCoverage::Masked;
+            }
+        }
+        node = current.parent();
+    }
+    match deepest_covering {
+        Some(node) if node.child_count() == 0 && !node.is_error() && !node.is_missing() => {
+            TreeCoverage::Explained
+        }
+        _ => TreeCoverage::Unexplained,
+    }
+}
+
+fn point_in_node(node: Node<'_>, row: usize, column: usize) -> bool {
+    let start = node.start_position();
+    let end = node.end_position();
+    (row > start.row || (row == start.row && column >= start.column))
+        && (row < end.row || (row == end.row && column < end.column))
+}
+
+fn line_start_byte(source: &str, line: u32) -> Option<usize> {
+    if line == 0 {
+        return Some(0);
+    }
+    let mut seen = 0u32;
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            seen += 1;
+            if seen == line {
+                return Some(index + 1);
+            }
+        }
+    }
+    None
 }
 
 fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> u32 {
@@ -391,6 +488,60 @@ mod tests {
             expected: 2,
         },
         Case {
+            name: "mixed brace closer and else body",
+            source: "if (x) {\n} else y",
+            line: 1,
+            expected: 0,
+        },
+        Case {
+            name: "mixed paren closer and infix rhs",
+            source: "f(a\n) + x",
+            line: 1,
+            expected: 0,
+        },
+        Case {
+            name: "nested mixed closer",
+            source: "f(\n  g(b\n  ) + 1",
+            line: 2,
+            expected: 2,
+        },
+        Case {
+            name: "multiline string closes before function opener",
+            source: "x <- c(\"a\nb\", function() {\n",
+            line: 2,
+            expected: 9,
+        },
+        Case {
+            name: "multiline string closes before nested calls",
+            source: "x <- paste(\"a\nb\", f(g(\n",
+            line: 2,
+            expected: 13,
+        },
+        Case {
+            name: "raw string quote does not poison later scan",
+            source: "x <- r\"(don\"t)\"\nf(\n",
+            line: 2,
+            expected: 2,
+        },
+        Case {
+            name: "string closer does not pop real opener",
+            source: "f(\"a)b\",\n",
+            line: 1,
+            expected: 2,
+        },
+        Case {
+            name: "string bracket opener is not synthesized",
+            source: "g(\"[\",\n",
+            line: 1,
+            expected: 2,
+        },
+        Case {
+            name: "string paren opener is not synthesized",
+            source: "f(\"(\", \n",
+            line: 1,
+            expected: 2,
+        },
+        Case {
             name: "earlier call opener",
             source: "f(\n  b <-\n",
             line: 2,
@@ -441,32 +592,11 @@ mod tests {
     }
 
     fn text_with_probe(source: &str, line: u32, column: u32) -> String {
-        let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
-        if source.is_empty() || source.ends_with('\n') {
-            lines.push(String::new());
-        }
-        let original = lines[line as usize].trim_start();
-        let pushed_closers = (!original.is_empty()
-            && original.chars().all(|ch| matches!(ch, ')' | ']' | '}')))
-        .then(|| original.to_owned());
-        let retained = pushed_closers.as_deref().map_or(original, |_| "");
-        lines[line as usize] = format!("{}{}{}", " ".repeat(column as usize), SENTINEL, retained);
-        let closers: Vec<String> = unclosed_delimiters_heuristic(source, line)
-            .expect("test cursor line must be reachable")
-            .into_iter()
-            .rev()
-            .map(|(_, _, opener)| {
-                matching_closer(opener)
-                    .expect("scan only records delimiters")
-                    .to_string()
-            })
-            .collect();
-        let synthesized_count = closers.len();
-        lines.splice(line as usize + 1..line as usize + 1, closers);
-        if let Some(pushed) = pushed_closers {
-            lines.insert(line as usize + 1 + synthesized_count, pushed);
-        }
-        lines.join("\n")
+        let tree =
+            with_parser(|parser| parser.parse(source, None)).expect("real test input must parse");
+        build_virtual_buffer(&tree, source, Position::new(line, 0), Some(column))
+            .expect("test virtual repair must be answerable")
+            .text
     }
 
     fn repaired_expectation(source: &str, line: u32) -> LineIndentExpectation {
@@ -499,6 +629,17 @@ mod tests {
                 (21, vec![IndentKind::OpenerAligned]),
                 (19, vec![IndentKind::ChainStart]),
             ]
+        );
+    }
+
+    #[test]
+    fn string_content_brackets_do_not_change_the_real_opener_stack() {
+        let source = "f(\"a)b\",\n";
+        let tree =
+            with_parser(|parser| parser.parse(source, None)).expect("real test input must parse");
+        assert_eq!(
+            unclosed_delimiters_for_judge(&tree, source, 1),
+            Some(vec![(0, 1, '(')])
         );
     }
 
@@ -571,6 +712,15 @@ mod tests {
             judge(
                 "x <- \"open\nstill open\n",
                 Position::new(2, 0),
+                &cfg,
+                InfixContinuationStyle::Indented,
+            ),
+            None
+        );
+        assert_eq!(
+            judge(
+                "f(\n] + x",
+                Position::new(1, 0),
                 &cfg,
                 InfixContinuationStyle::Indented,
             ),

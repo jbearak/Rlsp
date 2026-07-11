@@ -9221,53 +9221,70 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        let state = self.state.read().await;
-
-        // Get document from state
         let uri = &params.text_document_position.text_document.uri;
-        let doc = match state.get_document(uri) {
-            Some(d) => d,
-            None => {
-                log::trace!("on_type_formatting: document not found: {}", uri);
-                return Ok(None);
-            }
-        };
-
         let position = params.text_document_position.position;
+        let (tree, source, style, lint_config) = {
+            let state = self.state.read().await;
+            let doc = match state.get_document(uri) {
+                Some(d) => d,
+                None => {
+                    log::trace!("on_type_formatting: document not found: {}", uri);
+                    return Ok(None);
+                }
+            };
 
-        // Rmd/Quarto: indentation is first-class inside R chunk bodies, but a
-        // prose/YAML line maps to a blank masked line that the R indentation
-        // engine would treat as top-level R — applying R rules to markdown.
-        // Short-circuit unless the position is inside an R chunk body. The
-        // chunk-position check uses the RAW text (fences are blanked in the
-        // masked analysis text).
-        if doc.is_rmd_document()
-            && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
-        {
-            log::trace!(
-                "on_type_formatting: skipping prose position in Rmd/Quarto document {}",
-                uri
-            );
-            return Ok(None);
-        }
-
-        // Get tree-sitter AST
-        let tree = match doc.tree.as_ref() {
-            Some(t) => t,
-            None => {
-                log::trace!("on_type_formatting: no parse tree for: {}", uri);
+            // Rmd/Quarto: indentation is first-class inside R chunk bodies,
+            // but prose/YAML maps to blank masked lines. Keep the guard on raw
+            // text, then snapshot owned analysis inputs before dropping the
+            // WorldState read lock.
+            if doc.is_rmd_document()
+                && !crate::chunks::position_in_r_chunk_body(&doc.text(), position.line)
+            {
+                log::trace!(
+                    "on_type_formatting: skipping prose position in Rmd/Quarto document {}",
+                    uri
+                );
                 return Ok(None);
             }
+
+            let tree = match doc.tree.as_ref() {
+                Some(tree) => tree.clone(),
+                None => {
+                    log::trace!("on_type_formatting: no parse tree for: {}", uri);
+                    return Ok(None);
+                }
+            };
+            let source = doc.analysis_text();
+            let style = state.indentation_config.style;
+
+            // Mirror DiagnosticsSnapshot::build exactly: auto-detected
+            // per-document units patch the base, then matching lint overrides
+            // take precedence over that patched base.
+            let mut base_lint_config = state.lint_config.clone();
+            if let Some(&unit) = state.per_document_indent_unit.get(uri.as_str()) {
+                base_lint_config.indentation_unit = unit;
+            }
+            let lint_config = if state.lint_overrides.is_empty() {
+                base_lint_config
+            } else {
+                let merged = crate::config_file::merge_settings(
+                    &state.raw_client_settings,
+                    state.raw_project_settings.as_ref(),
+                );
+                let section = merged
+                    .get("linting")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                crate::config_file::resolve_lint_for_document(
+                    &base_lint_config,
+                    &section,
+                    &state.lint_overrides,
+                    uri,
+                )
+            };
+            (tree, source, style, lint_config)
         };
-
-        // The tree is parsed from the analysis text (masked for Rmd); the
-        // indentation engine must receive the same text so its byte offsets
-        // and tree-sitter points line up. Behavior-neutral for plain R.
-        let source = doc.analysis_text();
-
-        // Get indentation style from server configuration
-        let style = state.indentation_config.style;
-        let infix_style = state.lint_config.infix_continuation_style;
+        let infix_style = lint_config.infix_continuation_style;
 
         // If style is Off, disable all formatting — return no edits
         // so only Tier 1 declarative rules apply
@@ -9347,6 +9364,12 @@ impl LanguageServer for Backend {
             insert_spaces,
             style,
         };
+        let judge_indent_unit = if lint_config.enabled && lint_config.indentation_severity.is_some()
+        {
+            lint_config.indentation_unit
+        } else {
+            tab_size
+        };
 
         if log::log_enabled!(log::Level::Trace) {
             let source_lines = source.lines().count();
@@ -9362,8 +9385,14 @@ impl LanguageServer for Backend {
         }
 
         // Calculate target indentation
-        let target_column =
-            indentation::on_type_indentation(tree, &source, position, &config, infix_style);
+        let target_column = indentation::on_type_indentation_with_judge_unit(
+            &tree,
+            &source,
+            position,
+            &config,
+            judge_indent_unit,
+            infix_style,
+        );
 
         // Generate TextEdit (Requirement 8.4)
         let edit = indentation::format_indentation(position.line, target_column, config, &source);
@@ -25334,6 +25363,15 @@ lineLength = 200
         line: u32,
         character: u32,
     ) -> tower_lsp::lsp_types::DocumentOnTypeFormattingParams {
+        on_type_params_with_tab_size(uri, line, character, 2)
+    }
+
+    fn on_type_params_with_tab_size(
+        uri: &Url,
+        line: u32,
+        character: u32,
+        tab_size: u32,
+    ) -> tower_lsp::lsp_types::DocumentOnTypeFormattingParams {
         use tower_lsp::lsp_types::{
             DocumentOnTypeFormattingParams, FormattingOptions, Position, TextDocumentPositionParams,
         };
@@ -25344,7 +25382,7 @@ lineLength = 200
             },
             ch: "\n".into(),
             options: FormattingOptions {
-                tab_size: 2,
+                tab_size,
                 insert_spaces: true,
                 ..Default::default()
             },
@@ -25371,6 +25409,83 @@ lineLength = 200
         assert_eq!(edits[0].range.start.line, 1);
         assert_eq!(edits[0].range.start.character, 0);
         assert_eq!(edits[0].range.end.character, 0);
+    }
+
+    #[tokio::test]
+    async fn on_type_formatting_uses_lint_unit_only_when_indentation_rule_is_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let content = "result <-\n";
+        fs::write(tmp.path().join("script.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "script.R", "r", content).await;
+        let backend = svc.inner();
+
+        {
+            let mut state = backend.state.write().await;
+            state.lint_config.enabled = true;
+            state.lint_config.indentation_severity = Some(DiagnosticSeverity::INFORMATION);
+            state.lint_config.indentation_unit = 2;
+        }
+        let enabled = backend
+            .on_type_formatting(on_type_params_with_tab_size(&uri, 1, 0, 4))
+            .await
+            .expect("on_type_formatting must not error")
+            .expect("enabled indentation lint must produce an edit");
+        assert_eq!(enabled[0].new_text, "  ");
+
+        {
+            let mut state = backend.state.write().await;
+            state.lint_config.indentation_severity = None;
+        }
+        let disabled = backend
+            .on_type_formatting(on_type_params_with_tab_size(&uri, 1, 0, 4))
+            .await
+            .expect("on_type_formatting must not error")
+            .expect("disabled indentation lint must still use editor indentation");
+        assert_eq!(disabled[0].new_text, "    ");
+    }
+
+    #[tokio::test]
+    async fn on_type_formatting_uses_per_file_infix_style_override() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("raven.toml"),
+            r#"
+[linting]
+enabled = true
+indentationUnit = 2
+indentationSeverity = "information"
+infixContinuationStyle = "indented"
+
+[[linting.overrides]]
+files = ["R/**/*.R"]
+infixContinuationStyle = "aligned"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("R")).unwrap();
+        let content = "data %>%\n";
+        let override_path = tmp.path().join("R/script.R");
+        let base_path = tmp.path().join("script.R");
+        fs::write(&override_path, content).unwrap();
+        fs::write(&base_path, content).unwrap();
+        let (svc, override_uri) = open_in_workspace(&tmp, "R/script.R", "r", content).await;
+        let backend = svc.inner();
+        let base_uri = Url::from_file_path(base_path).unwrap();
+        open_doc(backend, &base_uri, "r", 1, content).await;
+
+        let overridden = backend
+            .on_type_formatting(on_type_params_with_tab_size(&override_uri, 1, 0, 4))
+            .await
+            .expect("on_type_formatting must not error")
+            .expect("matching infix-style override must produce an edit");
+        assert_eq!(overridden[0].new_text, "");
+
+        let base = backend
+            .on_type_formatting(on_type_params_with_tab_size(&base_uri, 1, 0, 4))
+            .await
+            .expect("on_type_formatting must not error")
+            .expect("base infix style must produce an edit");
+        assert_eq!(base[0].new_text, "  ");
     }
 
     /// Issue #343 Task 4: on-type-formatting indents inside an R chunk body.

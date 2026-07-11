@@ -218,13 +218,17 @@ pub(crate) fn accepted_indents_for_line(
                 .unwrap_or_else(Expected::top_level)
         }
         InfixContinuationStyle::Either => {
-            let indented =
+            let mut indented =
                 expectations_for_style(root, &lines, indent_unit, InfixContinuationStyle::Indented);
-            let aligned =
+            let mut aligned =
                 expectations_for_style(root, &lines, indent_unit, InfixContinuationStyle::Aligned);
-            merge_expectation_maps(&[&indented, &aligned])
-                .remove(&line)
-                .unwrap_or_else(Expected::top_level)
+            let mut expected = indented.remove(&line).unwrap_or_else(Expected::top_level);
+            let aligned = aligned.remove(&line).unwrap_or_else(Expected::top_level);
+            expected.add_alternative(aligned.primary, &aligned.primary_kinds);
+            for (column, kinds) in aligned.alternatives {
+                expected.add_alternative(column, &kinds);
+            }
+            expected
         }
     };
 
