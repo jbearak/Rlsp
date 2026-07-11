@@ -1420,11 +1420,13 @@ fn else_change(node: Node<'_>, out: &mut Vec<Change>) {
     });
 }
 
-/// Collect line numbers that start strictly inside a multi-line string. For a
-/// string spanning rows `[r1, r2]` with `r2 > r1`, lines `r1 + 1 ..= r2` start
-/// inside the string and are skipped by the linter.
+/// Collect line numbers that start strictly inside a multi-line string or
+/// backtick-quoted identifier. For a node spanning rows `[r1, r2]` with
+/// `r2 > r1`, lines `r1 + 1 ..= r2` start inside literal content and are
+/// skipped by the linter. Plain identifiers cannot span rows, so every
+/// multiline `identifier` node is backtick-quoted.
 fn collect_string_interior_lines(node: Node<'_>, set: &mut HashSet<u32>) {
-    if node.kind() == "string" {
+    if matches!(node.kind(), "string" | "identifier") {
         let start = node.start_position().row as u32;
         let end = node.end_position().row as u32;
         if end > start {
@@ -1520,6 +1522,15 @@ mod tests {
 
     fn diagnostic_on_line(diags: &[Diagnostic], line: u32) -> Option<&Diagnostic> {
         diags.iter().find(|diag| diag.range.start.line == line)
+    }
+
+    #[test]
+    fn multiline_backtick_identifier_interior_is_not_indentation() {
+        let diagnostics = lint("x <- `a\n  b`\n", 2);
+        assert!(
+            diagnostic_on_line(&diagnostics, 1).is_none(),
+            "backtick identifier content must not be linted as indentation: {diagnostics:?}"
+        );
     }
 
     fn line_expectation(

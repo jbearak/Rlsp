@@ -11048,22 +11048,18 @@ impl Backend {
         let affected_uris: Vec<Url> = {
             let mut state = self.state.write().await;
 
-            // Collect URIs whose effective indent unit changed.
-            let open_uris: Vec<Url> = state.documents.keys().cloned().collect();
-            let affected: Vec<Url> = open_uris
-                .into_iter()
-                .filter(|uri| {
-                    let key = uri.as_str();
-                    let old = state
-                        .per_document_indent_unit
-                        .get(key)
-                        .copied()
-                        .unwrap_or(state.lint_config.indentation_unit);
-                    let new = new_map
-                        .get(key)
-                        .copied()
-                        .unwrap_or(state.lint_config.indentation_unit);
-                    old != new
+            // Resolve before and after the map swap so matching lint overrides
+            // can keep their indentationUnit authoritative without triggering
+            // a republish for an unchanged effective value.
+            let old_units: Vec<(Url, u32)> = state
+                .documents
+                .keys()
+                .cloned()
+                .map(|uri| {
+                    let unit = state
+                        .effective_lint_config_for_document(&uri)
+                        .indentation_unit;
+                    (uri, unit)
                 })
                 .collect();
 
@@ -11073,6 +11069,17 @@ impl Backend {
             if let Ok(mut cache) = state.effective_lint_config_cache.lock() {
                 cache.clear();
             }
+
+            let affected: Vec<Url> = old_units
+                .into_iter()
+                .filter_map(|(uri, old)| {
+                    (state
+                        .effective_lint_config_for_document(&uri)
+                        .indentation_unit
+                        != old)
+                        .then_some(uri)
+                })
+                .collect();
 
             if !affected.is_empty() {
                 state

@@ -154,20 +154,26 @@ pub fn calculate_indentation(
 ///
 /// * `source` - The source code text
 /// * `line` - The line number (0-indexed)
-/// * `tab_size` - The number of columns a tab character represents
+/// * `tab_size` - The width of the tab-stop grid (clamped to at least 1)
 ///
 /// # Returns
 ///
 /// The column of the first non-whitespace character on the line.
 pub fn get_line_indent(source: &str, line: u32, tab_size: u32) -> u32 {
+    let tab_size = tab_size.max(1);
     source
         .lines()
         .nth(line as usize)
-        .map(|l| {
-            l.chars()
+        .map(|line| {
+            line.chars()
                 .take_while(|c| c.is_whitespace())
-                .map(|c| if c == '\t' { tab_size } else { 1 })
-                .sum()
+                .fold(0u32, |column, c| {
+                    if c == '\t' {
+                        (column / tab_size + 1) * tab_size
+                    } else {
+                        column + 1
+                    }
+                })
         })
         .unwrap_or(0)
 }
@@ -228,11 +234,11 @@ mod tests {
 
     #[test]
     fn test_get_line_indent_with_tabs_tab_size_4() {
-        // Tab characters expand to tab_size columns each
+        // Tabs advance to the next tab stop.
         let source = "\tx\n\t\tx\n\t  x\n";
         assert_eq!(get_line_indent(source, 0, 4), 4); // 1 tab * 4
         assert_eq!(get_line_indent(source, 1, 4), 8); // 2 tabs * 4
-        assert_eq!(get_line_indent(source, 2, 4), 6); // 1 tab * 4 + 2 spaces
+        assert_eq!(get_line_indent(source, 2, 4), 6); // tab to 4 + 2 spaces
     }
 
     #[test]
@@ -246,7 +252,8 @@ mod tests {
     fn test_get_line_indent_mixed_whitespace_tab_size_4() {
         // Mixed tabs and spaces with tab_size=4
         let source = "  \t  code";
-        assert_eq!(get_line_indent(source, 0, 4), 8); // 2 spaces + 1 tab(=4) + 2 spaces
+        assert_eq!(get_line_indent(source, 0, 4), 6); // 2 spaces + tab to 4 + 2 spaces
+        assert_eq!(get_line_indent(" \tx", 0, 4), 4); // 1 space + tab to 4
     }
 
     #[test]

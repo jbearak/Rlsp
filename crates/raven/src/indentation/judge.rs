@@ -116,11 +116,12 @@ pub fn judge_backed_indentation(
         return None;
     }
 
-    let Some(probe) = logical_line(source, position.line) else {
+    let line_index = indexed_lines(source);
+    let Some((_, probe)) = line_index.get(position.line as usize).copied() else {
         log::trace!(
             "judge_backed_indentation: bail: line {} is out of bounds ({} lines)",
             position.line,
-            source.lines().count() + usize::from(source.is_empty() || source.ends_with('\n'))
+            line_index.len()
         );
         return None;
     };
@@ -133,7 +134,7 @@ pub fn judge_backed_indentation(
         return None;
     }
 
-    if cursor_is_inside_multiline_string_like(tree, source, position) {
+    if cursor_is_inside_multiline_string_like(tree, &line_index, position) {
         log::trace!(
             "judge_backed_indentation: bail: cursor on line {} is inside a multiline string",
             position.line
@@ -141,7 +142,8 @@ pub fn judge_backed_indentation(
         return None;
     }
 
-    let Some(virtual_buffer) = build_virtual_buffer(tree, source, position, None) else {
+    let Some(virtual_buffer) = build_virtual_buffer(tree, source, &line_index, position, None)
+    else {
         log::trace!("judge_backed_indentation: bail: virtual repair was ambiguous");
         return None;
     };
@@ -154,7 +156,7 @@ pub fn judge_backed_indentation(
         return None;
     };
 
-    let reference = reference_row(&virtual_tree, source, position.line);
+    let reference = reference_row(&virtual_tree, &line_index, position.line);
 
     // A residual syntax error is disqualifying only when it touches the rows
     // the answer actually reads — the reference-to-probe window. An error on
@@ -262,17 +264,20 @@ fn error_intersects_rows(node: Node<'_>, start_row: usize, end_row: usize) -> bo
 ///
 /// The lines above the probe are identical in the source and the virtual
 /// buffer — the repair splices only the probe line — so measuring the
-/// reference line's actual indent on the source is exact. The prefix is
-/// collected once so the reverse walk never rescans it per skipped row
-/// (masked Rmd/Quarto prose produces long blank runs above a chunk).
-fn reference_row(virtual_tree: &Tree, source: &str, probe_line: u32) -> Option<(u32, u32)> {
-    let lines: Vec<&str> = source.lines().take(probe_line as usize).collect();
-    lines
+/// reference line's actual indent on the source is exact. The shared line
+/// index makes the reverse walk constant-time per skipped row (masked
+/// Rmd/Quarto prose produces long blank runs above a chunk).
+fn reference_row(
+    virtual_tree: &Tree,
+    line_index: &[(usize, &str)],
+    probe_line: u32,
+) -> Option<(u32, u32)> {
+    line_index
         .iter()
-        .copied()
+        .take(probe_line as usize)
         .enumerate()
         .rev()
-        .find_map(|(row, line)| {
+        .find_map(|(row, &(_, line))| {
             let trimmed = line.trim_start();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 return None;
@@ -285,14 +290,14 @@ fn reference_row(virtual_tree: &Tree, source: &str, probe_line: u32) -> Option<(
 fn build_virtual_buffer(
     tree: &Tree,
     source: &str,
+    line_index: &[(usize, &str)],
     position: Position,
     probe_indent: Option<u32>,
 ) -> Option<VirtualBuffer> {
-    let probe = logical_line(source, position.line)?;
+    let &(line_start, probe) = line_index.get(position.line as usize)?;
     if position.character as usize > probe.encode_utf16().count() {
         return None;
     }
-    let line_start = line_start_byte(source, position.line)?;
     let line_end = line_start.checked_add(probe.len())?;
     let content_start = probe
         .char_indices()
@@ -305,7 +310,7 @@ fn build_virtual_buffer(
         position.line
     );
 
-    let scan = unclosed_delimiters_for_judge(tree, source, position.line)?;
+    let scan = unclosed_delimiters_for_judge(tree, source, line_index, position.line)?;
     let outer_opener_row = scan.openers.first().map(|&(row, _, _)| row);
     let tab_rows = scan.tab_rows;
     let mut openers = scan.openers;
@@ -317,7 +322,7 @@ fn build_virtual_buffer(
     // stack empties is an unmatched stray (an auto-close artifact): a
     // pure-closer line simply drops it from the repair, while mixed content
     // must bail because its text cannot be edited piecemeal.
-    let mut pushed_closers = String::new();
+    let mut pushed_closers = Vec::new();
     for closer in leading_closers {
         match openers.pop() {
             Some((_, _, opener)) if matching_closer(opener) == Some(closer) => {
@@ -345,11 +350,7 @@ fn build_virtual_buffer(
         ProbeKind::MixedClosers | ProbeKind::ExistingContent => trimmed,
     };
     let replacement_indent_len = probe_indent.map_or(content_start, |column| column as usize);
-    let pushed_len = if pushed_closers.is_empty() {
-        0
-    } else {
-        1 + pushed_closers.len()
-    };
+    let pushed_len = pushed_closers.len().saturating_mul(2);
     let inserted_len = replacement_indent_len
         .saturating_add(replacement_content.len())
         .saturating_add(pushed_len)
@@ -368,11 +369,11 @@ fn build_virtual_buffer(
     // precede the synthesized closers for the still-open outer ones. Each
     // sits on its own line to retain the lint's closer-on-own-line
     // classification.
-    if !pushed_closers.is_empty() {
+    for closer in pushed_closers {
         text.push('\n');
-        text.push_str(&pushed_closers);
+        text.push(closer);
         inserted_rows += 1;
-        last_line_len = pushed_closers.len();
+        last_line_len = 1;
     }
     for closer in closers {
         text.push('\n');
@@ -428,12 +429,16 @@ fn matching_closer(opener: char) -> Option<char> {
     }
 }
 
-fn cursor_is_inside_multiline_string_like(tree: &Tree, source: &str, position: Position) -> bool {
-    let Some(line) = logical_line(source, position.line) else {
+fn cursor_is_inside_multiline_string_like(
+    tree: &Tree,
+    line_index: &[(usize, &str)],
+    position: Position,
+) -> bool {
+    let Some((_, line)) = line_index.get(position.line as usize).copied() else {
         return false;
     };
     let byte_col = utf16_column_to_byte_offset(line, position.character);
-    multiline_string_like_contains(tree, source, position.line as usize, byte_col)
+    multiline_string_like_contains(tree, line_index, position.line as usize, byte_col)
 }
 
 /// Strings and backtick-quoted identifiers both carry literal text across
@@ -465,13 +470,12 @@ fn line_starts_inside_multiline_node(tree: &Tree, row: usize) -> bool {
     false
 }
 
-fn logical_line(source: &str, line: u32) -> Option<&str> {
-    source.lines().nth(line as usize).or_else(|| {
-        (source.ends_with('\n') && line as usize == source.lines().count()).then_some("")
-    })
-}
-
-fn multiline_string_like_contains(tree: &Tree, source: &str, row: usize, column: usize) -> bool {
+fn multiline_string_like_contains(
+    tree: &Tree,
+    line_index: &[(usize, &str)],
+    row: usize,
+    column: usize,
+) -> bool {
     let point = Point::new(row, column);
     let mut node = tree.root_node().descendant_for_point_range(point, point);
     while let Some(current) = node {
@@ -487,7 +491,7 @@ fn multiline_string_like_contains(tree: &Tree, source: &str, row: usize, column:
     // is exactly the cursor boundary.
     if column == 0
         && row > 0
-        && let Some(previous) = logical_line(source, row as u32 - 1)
+        && let Some((_, previous)) = line_index.get(row - 1).copied()
         && !previous.is_empty()
     {
         let preceding = Point::new(row - 1, previous.len() - 1);
@@ -524,21 +528,15 @@ struct PrefixScan {
 fn unclosed_delimiters_for_judge(
     tree: &Tree,
     source: &str,
+    line_index: &[(usize, &str)],
     current_line: u32,
 ) -> Option<PrefixScan> {
-    let prefix_end = line_start_byte(source, current_line)?;
+    let prefix_end = line_index.get(current_line as usize)?.0;
     let masked = masked_intervals(tree, source, prefix_end);
     let mut mask_idx = 0usize;
     let mut openers = Vec::new();
     let mut tab_rows: Vec<u32> = Vec::new();
-    let mut byte_start = 0usize;
-    for (row, raw) in source
-        .split_inclusive('\n')
-        .take(current_line as usize)
-        .enumerate()
-    {
-        let line = raw.strip_suffix('\n').unwrap_or(raw);
-        let line = line.strip_suffix('\r').unwrap_or(line);
+    for (row, &(byte_start, line)) in line_index.iter().take(current_line as usize).enumerate() {
         for (column, ch) in line.char_indices() {
             if !matches!(
                 ch,
@@ -573,7 +571,6 @@ fn unclosed_delimiters_for_judge(
                 _ => {}
             }
         }
-        byte_start += raw.len();
     }
     Some(PrefixScan { openers, tab_rows })
 }
@@ -620,20 +617,28 @@ fn point_in_node(node: Node<'_>, row: usize, column: usize) -> bool {
         && (row < end.row || (row == end.row && column < end.column))
 }
 
-fn line_start_byte(source: &str, line: u32) -> Option<usize> {
-    if line == 0 {
-        return Some(0);
+/// Logical lines paired with their source byte offsets. Newline terminators
+/// are excluded, CRLF loses both bytes, and a final newline contributes one
+/// trailing empty line. Empty source has no logical lines.
+fn indexed_lines(source: &str) -> Vec<(usize, &str)> {
+    if source.is_empty() {
+        return Vec::new();
     }
-    let mut seen = 0u32;
-    for (index, byte) in source.bytes().enumerate() {
-        if byte == b'\n' {
-            seen += 1;
-            if seen == line {
-                return Some(index + 1);
-            }
-        }
+
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for raw in source.split_inclusive('\n') {
+        let text = match raw.strip_suffix('\n') {
+            Some(text) => text.strip_suffix('\r').unwrap_or(text),
+            None => raw,
+        };
+        lines.push((start, text));
+        start += raw.len();
     }
-    None
+    if source.ends_with('\n') {
+        lines.push((source.len(), ""));
+    }
+    lines
 }
 
 fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> u32 {
@@ -840,6 +845,12 @@ mod tests {
             expected: 2,
         },
         Case {
+            name: "pushed nested closers land on own lines",
+            source: "long_function_name(\n  g(\n))",
+            line: 2,
+            expected: 4,
+        },
+        Case {
             name: "tab inside string content does not poison the scan",
             source: "x <- c(\"a\n\tb\",\n  f(\n",
             line: 3,
@@ -868,9 +879,16 @@ mod tests {
     fn text_with_probe(source: &str, line: u32, column: u32) -> String {
         let tree =
             with_parser(|parser| parser.parse(source, None)).expect("real test input must parse");
-        build_virtual_buffer(&tree, source, Position::new(line, 0), Some(column))
-            .expect("test virtual repair must be answerable")
-            .text
+        let line_index = indexed_lines(source);
+        build_virtual_buffer(
+            &tree,
+            source,
+            &line_index,
+            Position::new(line, 0),
+            Some(column),
+        )
+        .expect("test virtual repair must be answerable")
+        .text
     }
 
     fn repaired_expectation(source: &str, line: u32) -> LineIndentExpectation {
@@ -915,7 +933,8 @@ mod tests {
         let tree =
             with_parser(|parser| parser.parse(source, None)).expect("real test input must parse");
         assert_eq!(
-            unclosed_delimiters_for_judge(&tree, source, 1).map(|scan| scan.openers),
+            unclosed_delimiters_for_judge(&tree, source, &indexed_lines(source), 1)
+                .map(|scan| scan.openers),
             Some(vec![(0, 1, '(')])
         );
     }
@@ -1157,9 +1176,15 @@ mod tests {
         for case in CASES {
             let tree = with_parser(|parser| parser.parse(case.source, None))
                 .expect("real test input must parse");
-            let virtual_buffer =
-                build_virtual_buffer(&tree, case.source, Position::new(case.line, 0), None)
-                    .unwrap_or_else(|| panic!("{} must be repairable", case.name));
+            let line_index = indexed_lines(case.source);
+            let virtual_buffer = build_virtual_buffer(
+                &tree,
+                case.source,
+                &line_index,
+                Position::new(case.line, 0),
+                None,
+            )
+            .unwrap_or_else(|| panic!("{} must be repairable", case.name));
             let mut edited = tree.clone();
             edited.edit(&virtual_buffer.edit);
             let incremental =

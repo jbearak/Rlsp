@@ -209,9 +209,9 @@ mod tests {
         state
     }
 
-    /// The per-URI resolved-config cache serves repeated lookups and is
-    /// cleared by `recompute_parsed_configs`, so an override edit is visible
-    /// on the very next resolution instead of returning the cached value.
+    /// The per-URI resolved-config cache serves repeated lookups, evicts a
+    /// closed document, and is cleared by `recompute_parsed_configs`, so no
+    /// stale value survives either lifecycle transition.
     #[test]
     fn effective_lint_config_cache_is_cleared_by_recompute() {
         let root = if cfg!(windows) { "C:\\proj" } else { "/proj" };
@@ -233,6 +233,7 @@ mod tests {
             std::path::Path::new(root).join("R").join("a.R"),
         )
         .unwrap();
+        state.open_document(uri.clone(), "", Some(1));
         assert_eq!(
             state
                 .effective_lint_config_for_document(&uri)
@@ -240,6 +241,30 @@ mod tests {
             8
         );
         // Second lookup is the cache hit; it must return the same answer.
+        assert_eq!(
+            state
+                .effective_lint_config_for_document(&uri)
+                .indentation_unit,
+            8
+        );
+        assert!(
+            state
+                .effective_lint_config_cache
+                .lock()
+                .unwrap()
+                .contains_key(uri.as_str())
+        );
+
+        state.close_document(&uri);
+        assert!(
+            !state
+                .effective_lint_config_cache
+                .lock()
+                .unwrap()
+                .contains_key(uri.as_str()),
+            "close_document must evict the closed URI's resolved config"
+        );
+        // Repopulate so the remainder still pins recompute invalidation.
         assert_eq!(
             state
                 .effective_lint_config_for_document(&uri)

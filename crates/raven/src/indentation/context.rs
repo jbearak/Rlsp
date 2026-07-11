@@ -1128,19 +1128,23 @@ fn find_subchain_start(
 }
 
 /// Convert a tree-sitter byte column on `row` to the visual measure the
-/// calculator's formulas consume (`get_line_indent`'s unit: tabs expand to
-/// `tab_size`, every other character counts one). Tree-sitter `Point`
-/// columns are byte offsets, so a multibyte character before the column
-/// would otherwise overshoot the alignment target.
+/// calculator's formulas consume (`get_line_indent`'s unit: tabs advance to
+/// the next stop on a `tab_size` grid, every other character counts one).
+/// Tree-sitter `Point` columns are byte offsets, so a multibyte character
+/// before the column would otherwise overshoot the alignment target.
 fn visual_col_at(source: &str, row: u32, byte_col: usize, tab_size: u32) -> u32 {
     let Some(line) = source.lines().nth(row as usize) else {
         return byte_col as u32;
     };
+    let tab_size = tab_size.max(1);
     match line.get(..byte_col) {
-        Some(prefix) => prefix
-            .chars()
-            .map(|c| if c == '\t' { tab_size } else { 1 })
-            .sum(),
+        Some(prefix) => prefix.chars().fold(0u32, |column, c| {
+            if c == '\t' {
+                (column / tab_size + 1) * tab_size
+            } else {
+                column + 1
+            }
+        }),
         None => byte_col as u32,
     }
 }

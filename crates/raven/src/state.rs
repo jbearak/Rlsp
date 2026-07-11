@@ -1729,6 +1729,9 @@ impl WorldState {
     pub fn close_document(&mut self, uri: &Url) -> Vec<Url> {
         let aliases = self.open_document_aliases.close(uri);
         self.documents.remove(uri);
+        if let Ok(mut cache) = self.effective_lint_config_cache.lock() {
+            cache.remove(uri.as_str());
+        }
         aliases
     }
 

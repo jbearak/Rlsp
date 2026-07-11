@@ -17,6 +17,7 @@ import {
     clearIneligibleDiagnostics,
     diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
+    isIndentUnitDocument,
     isRDocument,
     planDotInWordMigration,
     resolveTabSizeForDocument,
@@ -145,7 +146,7 @@ function sendDocumentIndentUnitsNotification() {
     }
 
     const units = vscode.workspace.textDocuments
-        .filter(isRDocument)
+        .filter(isIndentUnitDocument)
         .map(doc => ({
             uri: doc.uri.toString(),
             indentUnit: resolveTabSizeForDocument(doc),
@@ -687,7 +688,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     context.subscriptions.push(
         vscode.workspace.onDidOpenTextDocument((doc) => {
-            if (isRDocument(doc)) {
+            if (isIndentUnitDocument(doc)) {
                 sendDocumentIndentUnitsNotification();
             }
         })
@@ -695,7 +696,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     context.subscriptions.push(
         vscode.workspace.onDidCloseTextDocument((doc) => {
-            if (isRDocument(doc)) {
+            if (isIndentUnitDocument(doc)) {
                 sendDocumentIndentUnitsNotification();
             }
         })
@@ -703,7 +704,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
 
     context.subscriptions.push(
         vscode.window.onDidChangeTextEditorOptions((event) => {
-            if (isRDocument(event.textEditor.document)) {
+            if (isIndentUnitDocument(event.textEditor.document)) {
                 sendDocumentIndentUnitsNotification();
             }
         })

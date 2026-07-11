@@ -15,6 +15,23 @@ const R_DOCUMENT_EXTENSIONS = new Set([
     '.stan',
 ]);
 
+const INDENT_UNIT_DOCUMENT_LANGUAGE_IDS = new Set([
+    'r',
+    'jags',
+    'stan',
+    'rmd',
+    'quarto',
+]);
+const INDENT_UNIT_DOCUMENT_EXTENSIONS = new Set([
+    '.r',
+    '.jags',
+    '.bugs',
+    '.stan',
+    '.rmd',
+    '.rmarkdown',
+    '.qmd',
+]);
+
 type LanguageConfigurationInspection = {
     globalValue?: unknown;
     workspaceValue?: unknown;
@@ -29,6 +46,25 @@ export function isRDocument(
     }
 
     return R_DOCUMENT_EXTENSIONS.has(path.extname(document.uri.fsPath).toLowerCase());
+}
+
+/**
+ * Documents whose effective editor tab size must be synchronized with the
+ * server. Rmd/Quarto are included because Enter inside an R chunk resolves
+ * the judge's indent unit from this per-document map (see
+ * `backend.rs::on_type_formatting`'s `judge_indent_unit`). They remain
+ * excluded from `isRDocument`, whose activity/diagnostics role is narrower.
+ */
+export function isIndentUnitDocument(
+    document: Pick<vscode.TextDocument, 'isUntitled' | 'languageId' | 'uri'>,
+): boolean {
+    if (document.isUntitled) {
+        return INDENT_UNIT_DOCUMENT_LANGUAGE_IDS.has(document.languageId);
+    }
+
+    return INDENT_UNIT_DOCUMENT_EXTENSIONS.has(
+        path.extname(document.uri.fsPath).toLowerCase(),
+    );
 }
 
 type TabLike = { input: unknown; isActive?: boolean };
