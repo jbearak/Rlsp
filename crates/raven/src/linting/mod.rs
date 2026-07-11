@@ -110,14 +110,12 @@ mod rules;
 /// Re-exported for the on-type indenter (`crate::indentation::context`),
 /// which must apply the same `assignment_as_infix` suppression the
 /// indentation lint judges by (#611). See the function's own doc comment.
-#[allow(
-    unused_imports,
-    reason = "the producer starts consuming the expectation API in Tier 2 step 2"
-)]
 pub(crate) use rules::indentation::{
     IndentKind, LineIndentExpectation, accepted_indents_for_line, suppressed_as_assignment_rhs,
 };
 
+#[cfg(test)]
+pub(crate) use rules::indentation::lint_for_judge_test;
 use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter::Node;
 

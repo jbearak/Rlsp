@@ -192,10 +192,6 @@ pub(crate) enum IndentKind {
 
 /// Accepted indentation columns for one line, computed by the lint's own
 /// expectation engine.
-#[allow(
-    dead_code,
-    reason = "the producer starts consuming this API in Tier 2 step 2"
-)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct LineIndentExpectation {
     pub(crate) primary: u32,
@@ -207,10 +203,6 @@ pub(crate) struct LineIndentExpectation {
 /// them, minus suppression/blank/string-interior/tab skips and comment
 /// exemptions. The on-type indentation producer probes with a plain
 /// identifier line, so none of those exemptions apply.
-#[allow(
-    dead_code,
-    reason = "the producer starts consuming this API in Tier 2 step 2"
-)]
 pub(crate) fn accepted_indents_for_line(
     text: &str,
     root: Node<'_>,
@@ -242,6 +234,27 @@ pub(crate) fn accepted_indents_for_line(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn lint_for_judge_test(
+    text: &str,
+    indent_unit: u32,
+    infix_style: InfixContinuationStyle,
+) -> Vec<Diagnostic> {
+    let tree = crate::parser_pool::with_parser(|parser| parser.parse(text, None))
+        .expect("test input must parse");
+    let suppressions = crate::linting::nolint::Suppressions::from_text(text);
+    let mut out = Vec::new();
+    collect(
+        text,
+        tree.root_node(),
+        indent_unit,
+        infix_style,
+        DiagnosticSeverity::HINT,
+        &suppressions,
+        &mut out,
+    );
+    out
+}
 #[derive(Clone, Copy)]
 struct LineState {
     is_suppressed: bool,

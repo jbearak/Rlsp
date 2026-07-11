@@ -778,17 +778,16 @@ fn find_matching_opener_heuristic(
     None
 }
 
-/// Finds an unclosed delimiter using bracket counting.
+/// Finds every unclosed delimiter before `current_line` using bracket
+/// counting.
 ///
-/// # Arguments
-///
-/// * `source` - The source code text
-/// * `current_line` - The current line number
-///
-/// # Returns
-///
-/// `Some((line, col, delimiter))` of the innermost unclosed opener, or `None`.
-fn find_unclosed_delimiter_heuristic(source: &str, current_line: u32) -> Option<(u32, u32, char)> {
+/// Returns the opener stack in outermost-to-innermost order. `None` means
+/// `current_line` is beyond the lines available to the scan; an empty vector
+/// means the scan succeeded and found no unclosed delimiters.
+pub(super) fn unclosed_delimiters_heuristic(
+    source: &str,
+    current_line: u32,
+) -> Option<Vec<(u32, u32, char)>> {
     let lines: Vec<&str> = source.lines().collect();
 
     // Track unclosed delimiters with their positions
@@ -882,8 +881,13 @@ fn find_unclosed_delimiter_heuristic(source: &str, current_line: u32) -> Option<
         }
     }
 
-    // Return the innermost (last) unclosed delimiter
-    stack.pop()
+    Some(stack)
+}
+
+fn find_unclosed_delimiter_heuristic(source: &str, current_line: u32) -> Option<(u32, u32, char)> {
+    // Preserve the legacy fallback's innermost-opener behavior while sharing
+    // the scan with the judge-backed repair path, which needs every opener.
+    unclosed_delimiters_heuristic(source, current_line)?.pop()
 }
 
 /// Detects if the current line starts with a closing delimiter.
