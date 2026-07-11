@@ -1093,9 +1093,13 @@ fn find_subchain_start(
 /// applies. A paren opened on an *earlier* line contributes a block level
 /// the chain line's own indent already reflects, so flattening stands.
 ///
-/// The walk passes through `binary_operator` nodes (a mixed chain inside a
-/// paren still hangs) and nested parens; anything else stops it — restorer
-/// boundaries make the suppression predicate false before this matters.
+/// The walk passes through any ancestor that still begins on the chain's
+/// row (mixed-chain `binary_operator`s, `unary_operator` as in
+/// `(!data %>%`, nested parens, …) and ends as soon as an ancestor begins
+/// on an earlier row — by containment, everything above it also begins on
+/// or before that row, so no same-row paren can appear higher up. Restorer
+/// boundaries (call arguments, braces) need no special-casing here: they
+/// make the suppression predicate false before this function matters.
 ///
 /// The fallback path needs no counterpart: at Enter time such a paren is
 /// unclosed on the chain-start line, and the fallback's
@@ -1105,11 +1109,13 @@ fn chain_hangs_in_same_line_paren(outermost: Node) -> bool {
     let row = outermost.start_position().row;
     let mut current = outermost;
     while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "parenthesized_expression" if parent.start_position().row == row => return true,
-            "parenthesized_expression" | "binary_operator" => current = parent,
-            _ => break,
+        if parent.start_position().row < row {
+            return false;
         }
+        if parent.kind() == "parenthesized_expression" {
+            return true;
+        }
+        current = parent;
     }
     false
 }
@@ -5995,19 +6001,23 @@ mod assignment_context_tests {
         // even though the assignment suppression covers the chain — the
         // lint accepts columns 3 (hanging) or 4 (block), never 2. The
         // pre-#611 formula output (4) stands.
-        let code = "a <-\n  (data %>%\n";
-        let ctx = detect(code, 2);
-        assert!(
-            matches!(
-                ctx,
-                IndentContext::AfterContinuationOperator {
-                    flattened_rhs: false,
-                    ..
-                }
-            ),
-            "same-line paren must exempt the chain from flattening, got {ctx:?}"
-        );
-        assert_eq!(indent_at(code, 2), 4);
+        // The unary-operator variant pins that the ancestor walk passes
+        // through same-row nodes between the chain and the paren
+        // (`(!data %>%`: parenthesized_expression → unary_operator → chain).
+        for code in ["a <-\n  (data %>%\n", "a <-\n  (!data %>%\n"] {
+            let ctx = detect(code, 2);
+            assert!(
+                matches!(
+                    ctx,
+                    IndentContext::AfterContinuationOperator {
+                        flattened_rhs: false,
+                        ..
+                    }
+                ),
+                "same-line paren must exempt {code:?} from flattening, got {ctx:?}"
+            );
+            assert_eq!(indent_at(code, 2), 4, "for {code:?}");
+        }
     }
 
     #[test]

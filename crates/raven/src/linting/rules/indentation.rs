@@ -1286,16 +1286,22 @@ mod tests {
             for clean in [
                 "a <-\n  (data %>%\n    g())\n",
                 "a <-\n  (data %>%\n   g())\n",
+                "a <-\n  (!data %>%\n    g())\n",
             ] {
                 assert!(
                     lint_with_style(clean, 2, style).is_empty(),
                     "{clean:?} must be clean under {style:?}"
                 );
             }
-            assert!(
-                !lint_with_style("a <-\n  (data %>%\n  g())\n", 2, style).is_empty(),
-                "bare line indent must be flagged under {style:?}"
-            );
+            for flagged in [
+                "a <-\n  (data %>%\n  g())\n",
+                "a <-\n  (!data %>%\n  g())\n",
+            ] {
+                assert!(
+                    !lint_with_style(flagged, 2, style).is_empty(),
+                    "bare line indent {flagged:?} must be flagged under {style:?}"
+                );
+            }
         }
     }
 
