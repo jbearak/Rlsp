@@ -29,6 +29,31 @@ pub enum StringDelimiter {
     Single,
 }
 
+/// Continuation style for an infix-operator chain whose operator ends its
+/// line, used by the indentation rule (`rules::indentation`). Raven-specific —
+/// no `lintr` or `.lintr` equivalent: a `.lintr` can neither configure nor
+/// override it, so it stays [`Self::Indented`] unless another settings layer
+/// (`raven.toml` or the LSP client) supplies it. Assignment operators (`<-`,
+/// `<<-`, `=`, `:=`, `->`, `->>`) are exempt: their continuations behave as
+/// [`Self::Indented`] in every mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InfixContinuationStyle {
+    /// Block-indent the continuation one unit beyond the enclosing
+    /// expectation, also accepting the chain-start column when it sits
+    /// strictly deeper than that block indent. Matches `lintr`'s tidy style;
+    /// this is today's behavior and the default.
+    #[default]
+    Indented,
+    /// Require the continuation exactly at the operator chain's starting
+    /// column, replacing the block-indent primary.
+    Aligned,
+    /// Accept both the block-indent form and the chain-start column,
+    /// including when the chain-start column sits at or left of the block
+    /// primary — a strict superset of the other two styles. Genuinely
+    /// under-indented code stays flagged on the chain-start line itself.
+    Either,
+}
+
 /// Naming scheme used by the `object_name` lint.
 ///
 /// Mirrors `lintr::object_name_linter` named styles. `Any` disables the check
@@ -196,6 +221,9 @@ pub struct LintConfig {
     /// Number of spaces per indentation level used by the indentation rule
     /// (`lintr::indentation_linter`). Defaults to 2 to match `lintr`.
     pub indentation_unit: u32,
+    /// Continuation style for end-of-line infix operators in the indentation
+    /// rule. See [`InfixContinuationStyle`].
+    pub infix_continuation_style: InfixContinuationStyle,
     /// Preferred assignment operator style.
     pub assignment_operator_style: AssignmentOperatorStyle,
     /// Preferred string-literal delimiter (used by the `quotes` rule).
@@ -279,6 +307,7 @@ impl Default for LintConfig {
             line_length: 80,
             object_length: 30,
             indentation_unit: 2,
+            infix_continuation_style: InfixContinuationStyle::default(),
             assignment_operator_style: AssignmentOperatorStyle::default(),
             string_delimiter: StringDelimiter::default(),
             // lintr's default is `styles = c("snake_case", "symbols")`; the

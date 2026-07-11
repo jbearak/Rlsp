@@ -249,6 +249,7 @@ const KNOWN_LINTING_KEYS: &[&str] = &[
     "lineLength",
     "objectLength",
     "indentationUnit",
+    "infixContinuationStyle",
     "assignmentOperator",
     "stringDelimiter",
     "objectNameStyleFunction",

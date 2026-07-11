@@ -692,6 +692,9 @@ pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
 /// * `objectLength` (number) — max identifier length; clamped to `[5, 1_000]`.
 /// * `indentationUnit` (number) — spaces per indent level for the
 ///   indentation lint; clamped to `[1, 8]`.
+/// * `infixContinuationStyle` (`"indented"` / `"aligned"` / `"either"`) —
+///   continuation style for end-of-line infix operators in the indentation
+///   lint; any other string warns and falls back to `"indented"`.
 /// * `assignmentOperator` (`"<-"` or `"="`) — preferred operator.
 /// * `stringDelimiter` (`"\""` or `"'"`) — preferred string delimiter.
 /// * `objectNameStyleFunction`, `objectNameStyleVariable`,
@@ -783,6 +786,22 @@ pub(crate) fn parse_lint_config(
         // wouldn't be visually distinguishable; ceiling matches the `tab_size`
         // bound used by the on-type indentation provider.
         config.indentation_unit = v.clamp(1, 8) as u32;
+    }
+    if let Some(v) = linting
+        .get("infixContinuationStyle")
+        .and_then(|v| v.as_str())
+    {
+        config.infix_continuation_style = match v {
+            "indented" => crate::linting::InfixContinuationStyle::Indented,
+            "aligned" => crate::linting::InfixContinuationStyle::Aligned,
+            "either" => crate::linting::InfixContinuationStyle::Either,
+            other => {
+                log::warn!(
+                    "Unrecognised linting.infixContinuationStyle '{other}', defaulting to 'indented'."
+                );
+                crate::linting::InfixContinuationStyle::Indented
+            }
+        };
     }
     if let Some(op) = linting.get("assignmentOperator").and_then(|v| v.as_str()) {
         config.assignment_operator_style = match op {
@@ -928,6 +947,10 @@ pub(crate) fn parse_lint_config(
         config.indentation_severity,
     );
     log::info!("  indentation_unit: {}", config.indentation_unit);
+    log::info!(
+        "  infix_continuation_style: {:?}",
+        config.infix_continuation_style
+    );
     log::info!(
         "  object_name patterns: fn styles={:?} regexes={:?}; var styles={:?} regexes={:?}; arg styles={:?} regexes={:?}",
         config.object_name_style_function,
@@ -14419,6 +14442,50 @@ mod tests {
                 cfg.assignment_operator_style,
                 crate::linting::AssignmentOperatorStyle::LeftArrow
             );
+        }
+
+        #[test]
+        fn parse_lint_config_reads_infix_continuation_styles() {
+            use crate::linting::InfixContinuationStyle;
+            for (value, expected) in [
+                ("indented", InfixContinuationStyle::Indented),
+                ("aligned", InfixContinuationStyle::Aligned),
+                ("either", InfixContinuationStyle::Either),
+            ] {
+                let settings = json!({ "linting": { "infixContinuationStyle": value } });
+                let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+                assert_eq!(cfg.infix_continuation_style, expected, "value {value:?}");
+            }
+
+            // Absent key keeps the default.
+            let settings = json!({ "linting": { "lineLength": 100 } });
+            let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+            assert_eq!(
+                cfg.infix_continuation_style,
+                InfixContinuationStyle::Indented
+            );
+        }
+
+        #[test]
+        fn parse_lint_config_invalid_infix_continuation_style_falls_back_to_indented() {
+            use crate::linting::InfixContinuationStyle;
+            // Unrecognized strings warn and fall back; mistyped non-string
+            // values are skipped like every sibling string setting — either
+            // way the default survives.
+            for value in [
+                json!("alignedd"),
+                json!(42),
+                json!(["aligned"]),
+                json!(null),
+            ] {
+                let settings = json!({ "linting": { "infixContinuationStyle": value } });
+                let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
+                assert_eq!(
+                    cfg.infix_continuation_style,
+                    InfixContinuationStyle::Indented,
+                    "value {value:?}"
+                );
+            }
         }
 
         #[test]

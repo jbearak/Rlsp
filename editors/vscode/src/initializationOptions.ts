@@ -121,6 +121,7 @@ export interface RavenInitializationOptions {
         lineLength?: number;
         objectLength?: number;
         indentationUnit?: number | "auto";
+        infixContinuationStyle?: "indented" | "aligned" | "either";
         assignmentOperator?: "<-" | "=";
         stringDelimiter?: "\"" | "'";
         objectNameStyleFunction?: ObjectNameStyleSetting;
@@ -425,6 +426,7 @@ export function getInitializationOptions(
             // first notification arrives.
             return v === 'auto' ? 2 : v;
         })(),
+        infixContinuationStyle: config.get<"indented" | "aligned" | "either">('linting.infixContinuationStyle', 'indented'),
         assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
         stringDelimiter: config.get<"\"" | "'">('linting.stringDelimiter', '"'),
         objectNameStyleFunction: config.get<ObjectNameStyleSetting>('linting.objectNameStyleFunction', ['snake_case', 'symbols']),

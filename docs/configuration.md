@@ -227,6 +227,7 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 | `raven.linting.lineLength` | `80` | Maximum line length (characters) |
 | `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
 | `raven.linting.indentationUnit` | `"auto"` | Spaces per indent level used by the indentation lint. In VS Code, `"auto"` tracks each file's resolved `editor.tabSize`; set an integer `1..=8` for a fixed unit. |
+| `raven.linting.infixContinuationStyle` | `"indented"` | How the indentation lint treats a line continuing an end-of-line infix operator: `"indented"` (one extra level, `lintr`-compatible), `"aligned"` (at the operator chain's starting column), or `"either"`. Raven-only; see [Indentation](linting.md#indentation). |
 | `raven.linting.assignmentOperator` | `"<-"` | Preferred assignment operator (`"<-"` or `"="`) |
 | `raven.linting.stringDelimiter` | `"\""` | Preferred string-literal delimiter (`"\""` or `"'"`); used by the quotes lint |
 | `raven.linting.lineLengthSeverity` | `"information"` | Severity for over-long lines (or `"off"`) |

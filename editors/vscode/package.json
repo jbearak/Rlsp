@@ -2124,6 +2124,21 @@
           "default": "auto",
           "markdownDescription": "Number of spaces per indent level used by the indentation lint. Set to `\"auto\"` (default) to track each file's `editor.tabSize`; set to a fixed integer (e.g. `2` or `4`) to use the same unit for all R files. Mirrors `lintr::indentation_linter()`'s `indent` parameter."
         },
+        "raven.linting.infixContinuationStyle": {
+          "type": "string",
+          "enum": [
+            "indented",
+            "aligned",
+            "either"
+          ],
+          "enumDescriptions": [
+            "Continuation lines indent one unit beyond the enclosing expectation (lintr-compatible); the chain-start column is also accepted when it sits deeper than that",
+            "Continuation lines must sit exactly at the operator chain's starting column; the indented form is flagged",
+            "Continuation lines may use either the indented form or the chain-start column"
+          ],
+          "default": "indented",
+          "markdownDescription": "How the indentation lint treats a line that continues an end-of-line infix operator (`|`, `+`, pipes, `$`/`@` chains). Assignment operators and named-argument `=` continuations are unaffected. Raven-specific; no `lintr` equivalent."
+        },
         "raven.linting.indentationSeverity": {
           "type": "string",
           "enum": [

@@ -131,6 +131,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.lineLength', jsonPath: ['linting', 'lineLength'], type: 'number', defaultWhenUnconfigured: 80 },
     { vsCodeKey: 'linting.objectLength', jsonPath: ['linting', 'objectLength'], type: 'number', defaultWhenUnconfigured: 30 },
     { vsCodeKey: 'linting.indentationUnit', jsonPath: ['linting', 'indentationUnit'], type: 'number', defaultWhenUnconfigured: 2 },
+    { vsCodeKey: 'linting.infixContinuationStyle', jsonPath: ['linting', 'infixContinuationStyle'], type: 'enum', enumValues: ['indented', 'aligned', 'either'] as const, defaultWhenUnconfigured: 'indented' },
     { vsCodeKey: 'linting.assignmentOperator', jsonPath: ['linting', 'assignmentOperator'], type: 'enum', enumValues: ['<-', '='] as const, defaultWhenUnconfigured: '<-' },
     { vsCodeKey: 'linting.stringDelimiter', jsonPath: ['linting', 'stringDelimiter'], type: 'enum', enumValues: ['"', "'"] as const, defaultWhenUnconfigured: '"' },
     { vsCodeKey: 'linting.lineLengthSeverity', jsonPath: ['linting', 'lineLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
@@ -390,6 +391,7 @@ suite('Settings Transmission Property Tests', () => {
                 lineLength: 80,
                 objectLength: 30,
                 indentationUnit: 2,
+                infixContinuationStyle: 'indented',
                 assignmentOperator: '<-',
                 stringDelimiter: '"',
                 objectNameStyleFunction: ['snake_case', 'symbols'],
@@ -584,6 +586,7 @@ suite('Settings Transmission Unit Tests', () => {
             lineLength: 80,
             objectLength: 30,
             indentationUnit: 2,
+            infixContinuationStyle: 'indented',
             assignmentOperator: '<-',
             stringDelimiter: '"',
             objectNameStyleFunction: ['snake_case', 'symbols'],
@@ -619,6 +622,7 @@ suite('Settings Transmission Unit Tests', () => {
             ['linting.readHomeLintr', true],
             ['linting.lineLength', 120],
             ['linting.assignmentOperator', '='],
+            ['linting.infixContinuationStyle', 'either'],
             ['linting.lineLengthSeverity', 'warning'],
             ['linting.assignmentOperatorSeverity', 'off'],
             ['linting.objectNameStyleFunction', 'camelCase'],
@@ -634,6 +638,7 @@ suite('Settings Transmission Unit Tests', () => {
         assert.strictEqual(options.linting?.readHomeLintr, true);
         assert.strictEqual(options.linting?.lineLength, 120);
         assert.strictEqual(options.linting?.assignmentOperator, '=');
+        assert.strictEqual(options.linting?.infixContinuationStyle, 'either');
         assert.strictEqual(options.linting?.lineLengthSeverity, 'warning');
         assert.strictEqual(options.linting?.assignmentOperatorSeverity, 'off');
         assert.strictEqual(options.linting?.objectNameStyleFunction, 'camelCase');
