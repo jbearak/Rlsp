@@ -12,6 +12,10 @@
 //! - `formatter`: Generates LSP TextEdit for indentation replacement
 
 use tower_lsp::lsp_types::DocumentOnTypeFormattingOptions;
+use tower_lsp::lsp_types::Position;
+use tree_sitter::Tree;
+
+use crate::linting::InfixContinuationStyle;
 
 mod calculator;
 mod context;
@@ -22,6 +26,28 @@ pub use calculator::{IndentationConfig, IndentationStyle, calculate_indentation}
 pub use context::{IndentContext, OperatorType, detect_context};
 pub use formatter::format_indentation;
 pub use judge::judge_backed_indentation;
+
+/// Tier 2 on-type indent for an Enter press: repair-and-ask against the
+/// lint's expectation engine, falling back to the legacy
+/// `detect_context`/`calculate_indentation` path when the judge cannot answer.
+pub fn on_type_indentation(
+    tree: &Tree,
+    source: &str,
+    position: Position,
+    config: &IndentationConfig,
+    infix_style: InfixContinuationStyle,
+) -> u32 {
+    if let Some(column) = judge_backed_indentation(tree, source, position, config, infix_style) {
+        log::trace!("on_type_indentation: judge-backed tier selected column {column}");
+        return column;
+    }
+
+    log::trace!("on_type_indentation: falling back to legacy context detection");
+    let context = detect_context(tree, source, position, config.tab_size);
+    let column = calculate_indentation(context, config.clone(), source);
+    log::trace!("on_type_indentation: legacy fallback tier selected column {column}");
+    column
+}
 
 /// Returns the LSP capability options for on-type formatting.
 ///
@@ -37,7 +63,12 @@ pub fn on_type_formatting_capability() -> DocumentOnTypeFormattingOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::on_type_formatting_capability;
+    use super::{
+        IndentationConfig, IndentationStyle, on_type_formatting_capability, on_type_indentation,
+    };
+    use crate::linting::InfixContinuationStyle;
+    use crate::parser_pool::with_parser;
+    use tower_lsp::lsp_types::Position;
 
     #[test]
     fn test_on_type_formatting_capability_registration() {
@@ -54,5 +85,29 @@ mod tests {
         assert!(more.contains(&")".to_string()), "should trigger on )");
         assert!(more.contains(&"]".to_string()), "should trigger on ]");
         assert!(more.contains(&"}".to_string()), "should trigger on }}");
+    }
+
+    #[test]
+    fn multiline_string_interior_uses_legacy_fallback_column() {
+        let source = "text <- \"first\nstill open\n";
+        let tree = with_parser(|parser| parser.parse(source, None)).expect("parse must succeed");
+        let config = IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+
+        let column = on_type_indentation(
+            &tree,
+            source,
+            Position::new(1, 0),
+            &config,
+            InfixContinuationStyle::Indented,
+        );
+
+        assert_eq!(
+            column, 0,
+            "judge bail must preserve the legacy multiline-string column"
+        );
     }
 }

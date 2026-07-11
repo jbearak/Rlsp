@@ -5616,14 +5616,16 @@ mod auto_close_tests {
 /// on the RHS of a broken assignment loses the one-level floor
 /// (`assignment_as_infix` flattening). Detection is pinned on both the AST
 /// path (`detect_context`) and the regex fallback (`fallback_detect_context`),
-/// and columns are pinned through the real `detect_context` →
-/// `calculate_indentation` pipeline.
+/// and columns are pinned through the judge-first on-type pipeline, with an
+/// explicitly named subset retaining direct legacy-tier coverage.
 #[cfg(test)]
 mod assignment_context_tests {
     use super::*;
     use crate::indentation::calculator::{
         IndentationConfig, IndentationStyle, calculate_indentation,
     };
+    use crate::indentation::on_type_indentation;
+    use crate::linting::InfixContinuationStyle;
     use tower_lsp::lsp_types::Position;
 
     fn parse_r(code: &str) -> Tree {
@@ -5648,8 +5650,20 @@ mod assignment_context_tests {
         detect_context(&tree, code, Position { line, character: 0 }, 2)
     }
 
-    /// Full pipeline: detected context → calculated column, RStudio style.
+    /// Full shipped pipeline: judge first, then the legacy fallback.
     fn indent_at(code: &str, line: u32) -> u32 {
+        let tree = parse_r(code);
+        on_type_indentation(
+            &tree,
+            code,
+            Position { line, character: 0 },
+            &config(IndentationStyle::RStudio),
+            InfixContinuationStyle::Indented,
+        )
+    }
+
+    /// Directly pins the legacy tier for ERROR-tree fallback cases.
+    fn legacy_tier_indent_at(code: &str, line: u32) -> u32 {
         let ctx = detect(code, line);
         calculate_indentation(ctx, config(IndentationStyle::RStudio), code)
     }
@@ -5986,8 +6000,8 @@ mod assignment_context_tests {
             ),
             "call boundary must restore (no flattening), got {ctx:?}"
         );
-        // Behavior unchanged from before #611: one level from the chain line.
-        assert_eq!(indent_at(code, 2), 4);
+        // The judge selects the lint's opener-aligned continuation column.
+        assert_eq!(indent_at(code, 2), 6);
     }
 
     // ------------------------------------------------------------------
@@ -6007,13 +6021,13 @@ mod assignment_context_tests {
                 flattened: false,
             }
         );
-        assert_eq!(indent_at(code, 2), 4);
+        assert_eq!(legacy_tier_indent_at(code, 2), 4);
     }
 
     #[test]
     fn walrus_in_braces_fires_via_fallback() {
         let code = "{\n  x :=\n";
-        assert_eq!(indent_at(code, 2), 4);
+        assert_eq!(legacy_tier_indent_at(code, 2), 4);
     }
 
     #[test]
@@ -6042,7 +6056,7 @@ mod assignment_context_tests {
                 flattened: false,
             }
         );
-        assert_eq!(indent_at(code, 2), 4);
+        assert_eq!(legacy_tier_indent_at(code, 2), 4);
     }
 
     #[test]
@@ -6059,7 +6073,7 @@ mod assignment_context_tests {
                 flattened: false,
             }
         );
-        assert_eq!(indent_at(code, 4), 4);
+        assert_eq!(legacy_tier_indent_at(code, 4), 4);
     }
 
     #[test]
@@ -6067,7 +6081,7 @@ mod assignment_context_tests {
         // Same transparency for a plain continuation Enter: the chain start
         // stays at the `data` line, not the line after the comment.
         let code = "f <- function() {\n  data %>%\n    # explanation\n    g() %>%\n";
-        assert_eq!(indent_at(code, 4), 4);
+        assert_eq!(legacy_tier_indent_at(code, 4), 4);
     }
 
     #[test]
@@ -6084,7 +6098,7 @@ mod assignment_context_tests {
                 flattened: false,
             }
         );
-        assert_eq!(indent_at(code, 2), 4);
+        assert_eq!(legacy_tier_indent_at(code, 2), 4);
     }
 
     #[test]
@@ -6155,7 +6169,7 @@ mod assignment_context_tests {
             ),
             "`(`-only separator must not defeat fallback flattening, got {ctx:?}"
         );
-        assert_eq!(indent_at(code, 4), 6);
+        assert_eq!(legacy_tier_indent_at(code, 4), 6);
     }
 
     #[test]

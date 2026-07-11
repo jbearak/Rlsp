@@ -9267,6 +9267,7 @@ impl LanguageServer for Backend {
 
         // Get indentation style from server configuration
         let style = state.indentation_config.style;
+        let infix_style = state.lint_config.infix_continuation_style;
 
         // If style is Off, disable all formatting — return no edits
         // so only Tier 1 declarative rules apply
@@ -9347,25 +9348,22 @@ impl LanguageServer for Backend {
             style,
         };
 
-        // Detect syntactic context using AST (Requirement 8.3)
-        // This handles invalid AST states with fallback to regex-based detection
-        let context = indentation::detect_context(tree, &source, position, tab_size);
-
         if log::log_enabled!(log::Level::Trace) {
             let source_lines = source.lines().count();
             log::trace!(
-                "on_type_formatting: pos=({},{}), context={:?}, style={:?}, tab_size={}, source_lines={}",
+                "on_type_formatting: pos=({},{}), style={:?}, infix_style={:?}, tab_size={}, source_lines={}",
                 position.line,
                 position.character,
-                context,
                 style,
+                infix_style,
                 tab_size,
                 source_lines
             );
         }
 
         // Calculate target indentation
-        let target_column = indentation::calculate_indentation(context, config.clone(), &source);
+        let target_column =
+            indentation::on_type_indentation(tree, &source, position, &config, infix_style);
 
         // Generate TextEdit (Requirement 8.4)
         let edit = indentation::format_indentation(position.line, target_column, config, &source);
@@ -25351,6 +25349,28 @@ lineLength = 200
                 ..Default::default()
             },
         }
+    }
+
+    /// Issue #611: the full LSP path indents a broken assignment RHS.
+    #[tokio::test]
+    async fn on_type_formatting_indents_plain_r_assignment_rhs() {
+        let tmp = TempDir::new().unwrap();
+        let content = "result <-\n";
+        fs::write(tmp.path().join("script.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "script.R", "r", content).await;
+
+        let edits = svc
+            .inner()
+            .on_type_formatting(on_type_params(&uri, 1, 0))
+            .await
+            .expect("on_type_formatting must not error")
+            .expect("on_type_formatting must return an assignment RHS edit");
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "  ");
+        assert_eq!(edits[0].range.start.line, 1);
+        assert_eq!(edits[0].range.start.character, 0);
+        assert_eq!(edits[0].range.end.character, 0);
     }
 
     /// Issue #343 Task 4: on-type-formatting indents inside an R chunk body.

@@ -1468,13 +1468,19 @@ mod tests {
 
     /// Builds a snippet the way the on-type indenter would: starting from
     /// the first line, each subsequent content line is placed at the column
-    /// the real `detect_context` → `calculate_indentation` pipeline computes
-    /// for an Enter press at that point. Used to pin the producer→judge
-    /// invariant for #611: the linter never flags what auto-indent produced.
+    /// the real judge-first on-type pipeline computes for an Enter press at
+    /// that point. Used to pin the producer→judge invariant for #611: the
+    /// linter never flags what auto-indent produced.
     fn build_with_auto_indent(first: &str, rest: &[&str]) -> String {
-        use crate::indentation::{
-            IndentationConfig, IndentationStyle, calculate_indentation, detect_context,
-        };
+        build_with_auto_indent_for_style(first, rest, InfixContinuationStyle::Indented)
+    }
+
+    fn build_with_auto_indent_for_style(
+        first: &str,
+        rest: &[&str],
+        infix_style: InfixContinuationStyle,
+    ) -> String {
+        use crate::indentation::{IndentationConfig, IndentationStyle, on_type_indentation};
         use tower_lsp::lsp_types::Position;
 
         let config = IndentationConfig {
@@ -1486,18 +1492,42 @@ mod tests {
         for content in rest {
             let line = text.lines().count() as u32;
             let tree = with_parser(|p| p.parse(&text, None)).expect("parse must succeed");
-            let ctx = detect_context(
+            let col = on_type_indentation(
                 &tree,
                 &text,
                 Position { line, character: 0 },
-                config.tab_size,
+                &config,
+                infix_style,
             );
-            let col = calculate_indentation(ctx, config.clone(), &text);
             text.push_str(&" ".repeat(col as usize));
             text.push_str(content);
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn pass9_earlier_openers_use_judge_column_and_round_trip_clean() {
+        for style in ALL_STYLES {
+            for (first, assignment) in [
+                ("f(", "b <-"),
+                ("(", "x <-"),
+                ("x[", "a <-"),
+                ("f(a,", "b <-"),
+            ] {
+                let text = build_with_auto_indent_for_style(first, &[assignment, "value"], style);
+                let value_line = text.lines().nth(2).expect("value line must exist");
+                assert_eq!(
+                    value_line, "    value",
+                    "earlier opener shape {first:?} must indent the assignment RHS to column 4 under {style:?}"
+                );
+                assert!(
+                    lint_with_style(&text, 2, style).is_empty(),
+                    "facade output for earlier opener shape {first:?} must round-trip clean under {style:?}; got {:?}",
+                    lint_with_style(&text, 2, style)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1740,25 +1770,33 @@ mod tests {
     fn issue611_auto_indent_output_is_never_flagged() {
         // Producer→judge round trip: build each snippet through the real
         // indentation pipeline, then assert the linter accepts the result.
-        let built_cases: [(String, &str); 3] = [
-            (
-                build_with_auto_indent("result <-", &["f(x)"]),
-                "plain assignment",
-            ),
-            (
-                build_with_auto_indent("result <-", &["data %>%", "filter(x)"]),
-                "broken-assignment pipe chain",
-            ),
-            (
-                format!(
-                    "{}}}\n",
-                    build_with_auto_indent("f <- function() {", &["x <-", "value"])
+        for style in ALL_STYLES {
+            let built_cases: [(String, &str); 3] = [
+                (
+                    build_with_auto_indent_for_style("result <-", &["f(x)"], style),
+                    "plain assignment",
                 ),
-                "assignment in function body",
-            ),
-        ];
-        for (text, name) in &built_cases {
-            for style in ALL_STYLES {
+                (
+                    build_with_auto_indent_for_style(
+                        "result <-",
+                        &["data %>%", "filter(x)"],
+                        style,
+                    ),
+                    "broken-assignment pipe chain",
+                ),
+                (
+                    format!(
+                        "{}}}\n",
+                        build_with_auto_indent_for_style(
+                            "f <- function() {",
+                            &["x <-", "value"],
+                            style,
+                        )
+                    ),
+                    "assignment in function body",
+                ),
+            ];
+            for (text, name) in &built_cases {
                 assert!(
                     lint_with_style(text, 2, style).is_empty(),
                     "auto-indent output for {name} must be clean under {style:?}; \

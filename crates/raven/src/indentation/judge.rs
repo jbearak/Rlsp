@@ -1,7 +1,7 @@
 //! Judge-backed smart indentation over a repaired virtual buffer.
 
 use tower_lsp::lsp_types::Position;
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 use super::calculator::{IndentationConfig, IndentationStyle};
 use super::context::unclosed_delimiters_heuristic;
@@ -56,6 +56,7 @@ impl SelectionPrefs {
 /// Returns `None` when the repair-and-ask path cannot answer, so the caller can
 /// fall back to the legacy `detect_context` / `calculate_indentation` path.
 pub fn judge_backed_indentation(
+    tree: &Tree,
     source: &str,
     position: Position,
     config: &IndentationConfig,
@@ -89,7 +90,7 @@ pub fn judge_backed_indentation(
         return None;
     }
 
-    if cursor_is_inside_multiline_string(source, position)
+    if cursor_is_inside_multiline_string(tree, source, position)
         || lexically_inside_multiline_string(source, position)
     {
         log::trace!(
@@ -207,14 +208,11 @@ fn matching_closer(opener: char) -> Option<char> {
     }
 }
 
-fn cursor_is_inside_multiline_string(source: &str, position: Position) -> bool {
+fn cursor_is_inside_multiline_string(tree: &Tree, source: &str, position: Position) -> bool {
     let Some(line) = logical_line(source, position.line) else {
         return false;
     };
     let byte_col = utf16_column_to_byte_offset(line, position.character);
-    let Some(tree) = with_parser(|parser| parser.parse(source, None)) else {
-        return false;
-    };
     multiline_string_contains(tree.root_node(), position.line as usize, byte_col)
 }
 
@@ -431,6 +429,16 @@ mod tests {
             style,
         }
     }
+    fn judge(
+        source: &str,
+        position: Position,
+        config: &IndentationConfig,
+        infix_style: InfixContinuationStyle,
+    ) -> Option<u32> {
+        let tree =
+            with_parser(|parser| parser.parse(source, None)).expect("real test input must parse");
+        judge_backed_indentation(&tree, source, position, config, infix_style)
+    }
 
     fn text_with_probe(source: &str, line: u32, column: u32) -> String {
         let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
@@ -503,7 +511,7 @@ mod tests {
                 InfixContinuationStyle::Either,
             ] {
                 let source_before = case.source.to_owned();
-                let column = judge_backed_indentation(
+                let column = judge(
                     case.source,
                     Position::new(case.line, 0),
                     &config(IndentationStyle::RStudio),
@@ -538,7 +546,7 @@ mod tests {
     #[test]
     fn rstudio_minus_prefers_legal_block_forms() {
         let source = "long_function_name(a,\n";
-        let column = judge_backed_indentation(
+        let column = judge(
             source,
             Position::new(1, 0),
             &config(IndentationStyle::RStudioMinus),
@@ -551,7 +559,7 @@ mod tests {
     fn bails_for_invalid_positions_and_multiline_strings() {
         let cfg = config(IndentationStyle::RStudio);
         assert_eq!(
-            judge_backed_indentation(
+            judge(
                 "x\n",
                 Position::new(3, 0),
                 &cfg,
@@ -560,7 +568,7 @@ mod tests {
             None
         );
         assert_eq!(
-            judge_backed_indentation(
+            judge(
                 "x <- \"open\nstill open\n",
                 Position::new(2, 0),
                 &cfg,
