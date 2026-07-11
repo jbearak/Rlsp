@@ -111,7 +111,8 @@ fn scan(
             severity: Some(severity),
             source: Some(LINT_SOURCE.to_string()),
             code: Some(NumberOrString::String(rule_ids::SEMICOLON.to_string())),
-            message: "Avoid `;`; put each statement on its own line.".to_string(),
+            message: "Put each statement on its own line instead of separating them with `;`."
+                .to_string(),
             ..Default::default()
         });
     }

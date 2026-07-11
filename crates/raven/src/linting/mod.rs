@@ -1953,6 +1953,10 @@ print.data.frame <- function(x, ...) NULL
         let diags = lint("a; b\n", &config);
         assert_eq!(diags.len(), 1, "got {:?}", diags);
         assert_eq!(diags[0].range.start.character, 1);
+        assert_eq!(
+            diags[0].message,
+            "Put each statement on its own line instead of separating them with `;`."
+        );
     }
 
     #[test]
