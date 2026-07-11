@@ -635,14 +635,18 @@ Maintain these boundaries:
   string/comment/backtick handling changes must be applied to whichever
   scanner the affected tier uses.
 - The judge bails out to the legacy fallback for: multiline string and
-  backtick-identifier interiors; unanswerable positions; tab-indented context
-  or a tabs-mode editor (`insertSpaces: false`) — the expectation engine
-  measures character columns while the editor renders tab stops; a repaired
-  buffer whose parse still holds an error at or above the probe line; and a
-  nearest checkable line above the probe that does not sit at a lint-accepted
-  column — the expectation model accumulates from column 0, so only
-  lint-conforming context can be answered without collapsing a user's offset
-  indentation (the legacy path anchors to physical indentation instead).
+  backtick-identifier interiors; unanswerable positions; a tabs-mode editor
+  (`insertSpaces: false`) or a real (non-string) tab inside the active
+  context — the rows from the outermost unclosed opener or the reference
+  line down to the probe — because the expectation engine measures character
+  columns while the editor renders tab stops; a repaired buffer whose parse
+  still holds an error intersecting the reference-to-probe row window; and a
+  nearest checkable line above the probe (the reference line) that does not
+  sit at a lint-accepted column — the expectation model accumulates from
+  column 0, so only lint-conforming context can be answered without
+  collapsing a user's offset indentation (the legacy path anchors to
+  physical indentation instead). Tabs and syntax errors on unrelated earlier
+  statements do not disable the judge — the lint's own fold tolerates both.
 - On-type queries use the per-line expectation fold
   (`accepted_indents_for_lines`), which collects and sorts the change list
   once and folds only the requested lines — never the whole-document maps the

@@ -9331,7 +9331,6 @@ impl LanguageServer for Backend {
         let Some(lint_config) = lint_config else {
             return Ok(None);
         };
-        let infix_style = lint_config.infix_continuation_style;
 
         // Extract FormattingOptions (Requirements 6.1, 6.2)
         let raw_tab_size = params.options.tab_size;
@@ -9352,11 +9351,24 @@ impl LanguageServer for Backend {
             insert_spaces,
             style,
         };
-        let judge_indent_unit = if lint_config.enabled && lint_config.indentation_severity.is_some()
-        {
+        // The judge consults the lint's expectation engine as an oracle, but
+        // the lint's knobs steer it only while the indentation rule is
+        // actually enabled: a disabled rule must not change on-type
+        // formatting, so both the indent unit AND the infix continuation
+        // style revert to the editor unit and the default style (a leftover
+        // `infixContinuationStyle = "aligned"` would otherwise pin top-level
+        // chains to column 0 with no lint active to justify it).
+        let indentation_rule_active =
+            lint_config.enabled && lint_config.indentation_severity.is_some();
+        let judge_indent_unit = if indentation_rule_active {
             lint_config.indentation_unit
         } else {
             tab_size
+        };
+        let infix_style = if indentation_rule_active {
+            lint_config.infix_continuation_style
+        } else {
+            crate::linting::InfixContinuationStyle::default()
         };
 
         if log::log_enabled!(log::Level::Trace) {
@@ -11056,6 +11068,11 @@ impl Backend {
                 .collect();
 
             state.per_document_indent_unit = new_map;
+            // The per-document unit patches the base that override
+            // resolution builds on; drop the resolved-config cache with it.
+            if let Ok(mut cache) = state.effective_lint_config_cache.lock() {
+                cache.clear();
+            }
 
             if !affected.is_empty() {
                 state
@@ -25430,6 +25447,48 @@ lineLength = 200
             .expect("on_type_formatting must not error")
             .expect("disabled indentation lint must still use editor indentation");
         assert_eq!(disabled[0].new_text, "    ");
+    }
+
+    #[tokio::test]
+    async fn on_type_formatting_ignores_infix_style_when_indentation_rule_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let content = "data %>%\n";
+        fs::write(tmp.path().join("script.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "script.R", "r", content).await;
+        let backend = svc.inner();
+
+        {
+            let mut state = backend.state.write().await;
+            state.lint_config.enabled = true;
+            state.lint_config.indentation_severity = Some(DiagnosticSeverity::INFORMATION);
+            state.lint_config.indentation_unit = 2;
+            state.lint_config.infix_continuation_style =
+                crate::linting::InfixContinuationStyle::Aligned;
+        }
+        let enabled = backend
+            .on_type_formatting(on_type_params_with_tab_size(&uri, 1, 0, 4))
+            .await
+            .expect("on_type_formatting must not error")
+            .expect("enabled aligned style must produce an edit");
+        assert_eq!(
+            enabled[0].new_text, "",
+            "with the rule enabled, aligned style pins the top-level chain to column 0"
+        );
+
+        {
+            let mut state = backend.state.write().await;
+            state.lint_config.indentation_severity = None;
+        }
+        let disabled = backend
+            .on_type_formatting(on_type_params_with_tab_size(&uri, 1, 0, 4))
+            .await
+            .expect("on_type_formatting must not error")
+            .expect("disabled indentation rule must still produce an edit");
+        assert_eq!(
+            disabled[0].new_text, "    ",
+            "a disabled indentation rule must not let infixContinuationStyle change \
+             on-type formatting: default style at the editor unit applies"
+        );
     }
 
     #[tokio::test]

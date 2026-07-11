@@ -304,10 +304,16 @@ pub(crate) fn accepted_indents_for_lines(
         InfixContinuationStyle::Indented => &[InfixContinuationStyle::Indented],
         InfixContinuationStyle::Aligned => &[InfixContinuationStyle::Aligned],
     };
+    let bounds = targets
+        .iter()
+        .copied()
+        .min()
+        .zip(targets.iter().copied().max())
+        .map(|(min, max)| (min as usize, max as usize));
     let mut merged: Vec<Option<Expected>> = vec![None; targets.len()];
     for &style in pass_styles {
         let mut changes = Vec::new();
-        collect_changes(root, &lines, style, &mut changes);
+        collect_changes_bounded(root, &lines, style, bounds, &mut changes);
         changes.sort_by_key(|c| c.token_byte);
         let pass = expectations_for_targets(&changes, lines.len(), indent_unit, targets);
         for (slot, expected) in pass.into_iter().enumerate() {
@@ -976,6 +982,31 @@ fn collect_changes(
     infix_style: InfixContinuationStyle,
     out: &mut Vec<Change>,
 ) {
+    collect_changes_bounded(node, lines, infix_style, None, out);
+}
+
+/// [`collect_changes`] with optional row bounds: `Some((min_row, max_row))`
+/// prunes the traversal to subtrees that can still emit a change covering one
+/// of those rows, so the per-line query (`accepted_indents_for_lines`) does
+/// not walk the whole document AST on every Enter press. A subtree starting
+/// below `max_row` never can — every change begins at its inducing token's
+/// row plus one at the earliest. One ending above `min_row` can only reach
+/// down via `operator_change`'s call-function extension (the change runs to
+/// the *parent call's* end), so a child ending above `min_row` is skipped
+/// unless it is that call's `function` field; everything deeper extends at
+/// most to an ancestor within the skipped subtree.
+fn collect_changes_bounded(
+    node: Node<'_>,
+    lines: &[&str],
+    infix_style: InfixContinuationStyle,
+    bounds: Option<(usize, usize)>,
+    out: &mut Vec<Change>,
+) {
+    if let Some((_, max_row)) = bounds
+        && node.start_position().row > max_row
+    {
+        return;
+    }
     match node.kind() {
         "braced_expression" => bracket_change(node, node, lines, false, out),
         "call" | "subset" | "subset2" => {
@@ -1023,7 +1054,16 @@ fn collect_changes(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_changes(child, lines, infix_style, out);
+        if let Some((min_row, _)) = bounds
+            && child.end_position().row < min_row
+            && !(node.kind() == "call"
+                && node
+                    .child_by_field_name("function")
+                    .is_some_and(|function| function.id() == child.id()))
+        {
+            continue;
+        }
+        collect_changes_bounded(child, lines, infix_style, bounds, out);
     }
 }
 
@@ -1501,6 +1541,80 @@ mod tests {
             .alternatives
             .iter()
             .any(|(candidate, kinds)| *candidate == column && kinds.contains(kind))
+    }
+
+    /// The old unpruned per-line semantics, reconstructed from the
+    /// whole-document diagnostic fold: what `accepted_indents_for_lines`
+    /// must keep matching after traversal pruning.
+    fn whole_document_expectation(
+        root: Node<'_>,
+        lines: &[&str],
+        indent_unit: u32,
+        infix_style: InfixContinuationStyle,
+        line: u32,
+    ) -> LineIndentExpectation {
+        let styles: &[InfixContinuationStyle] = match infix_style {
+            InfixContinuationStyle::Either => &[
+                InfixContinuationStyle::Indented,
+                InfixContinuationStyle::Aligned,
+            ],
+            InfixContinuationStyle::Indented => &[InfixContinuationStyle::Indented],
+            InfixContinuationStyle::Aligned => &[InfixContinuationStyle::Aligned],
+        };
+        let mut merged: Option<Expected> = None;
+        for &style in styles {
+            let mut map = expectations_for_style(root, lines, indent_unit, style);
+            let expected = map.remove(&line).unwrap_or_else(Expected::top_level);
+            match &mut merged {
+                None => merged = Some(expected),
+                Some(existing) => {
+                    existing.add_alternative(expected.primary, expected.primary_kinds);
+                    for (column, kinds) in expected.alternatives {
+                        existing.add_alternative(column, kinds);
+                    }
+                }
+            }
+        }
+        let merged = merged.expect("at least one style pass");
+        LineIndentExpectation {
+            primary: merged.primary,
+            alternatives: merged.alternatives,
+        }
+    }
+
+    #[test]
+    fn per_line_query_matches_whole_document_fold_on_every_line() {
+        // Structurally rich shapes: nested calls, double-indent definitions,
+        // operator chains (including the call-function extension that lets a
+        // change reach its parent call's end), unbraced bodies, `else`,
+        // `repeat`, walrus subsets, and named arguments.
+        let sources = [
+            "f <- function(\n    x,\n    y) {\n  a <- x %>%\n    g() %>%\n    h(1,\n      2)\n  \
+             if (a)\n    b <- 2\n  else\n    c(3,\n      4)\n}\n",
+            "res <- http_head(url)$\n  then(function(x) {\n    x + 1\n  })\n",
+            "dt[, y :=\n     z]\nrepeat\n  f(\n    1)\nresult <- a +\n  b\n",
+        ];
+        for source in sources {
+            let tree = with_parser(|p| p.parse(source, None)).expect("test source must parse");
+            let lines: Vec<&str> = source.lines().collect();
+            for style in [
+                InfixContinuationStyle::Indented,
+                InfixContinuationStyle::Aligned,
+                InfixContinuationStyle::Either,
+            ] {
+                for line in 0..lines.len() as u32 {
+                    let queried =
+                        accepted_indents_for_line(source, tree.root_node(), 2, style, line);
+                    let reference =
+                        whole_document_expectation(tree.root_node(), &lines, 2, style, line);
+                    assert_eq!(
+                        queried, reference,
+                        "pruned per-line query diverged on line {line} ({style:?}) of \
+                         {source:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

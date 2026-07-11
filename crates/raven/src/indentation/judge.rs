@@ -21,6 +21,14 @@ struct VirtualBuffer {
     /// can reparse incrementally from the document's existing tree instead of
     /// paying a full parse on every Enter press.
     edit: InputEdit,
+    /// Rows above the probe carrying a real (non-string) tab, surfaced from
+    /// the delimiter scan so the caller can bail only when one sits inside
+    /// the active indentation context.
+    tab_rows: Vec<u32>,
+    /// Row of the outermost still-unclosed opener before the probe (before
+    /// the probe's own closers consumed any) — the top of the active context
+    /// for the tab gate.
+    outer_opener_row: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,13 +37,6 @@ enum ProbeKind {
     PureClosers,
     MixedClosers,
     ExistingContent,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TreeCoverage {
-    Masked,
-    Explained,
-    Unexplained,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,13 +84,18 @@ impl SelectionPrefs {
 /// Beyond unanswerable repairs, the judge deliberately declines in three
 /// situations where its character-column model would misfire:
 ///
-/// * The editor inserts tabs, or a scanned line's whitespace holds a real
-///   (non-string) tab — the expectation engine counts characters while the
-///   editor renders tab stops, so tab contexts keep the legacy visual-column
-///   path.
-/// * The repaired buffer still fails to parse — the expectation engine would
-///   answer top-level (column 0) for a probe it cannot model, deindenting the
-///   new line, where the legacy path degrades gracefully.
+/// * The editor inserts tabs, or a real (non-string) tab sits inside the
+///   active context (from the outermost unclosed opener or the reference
+///   line down to the probe) — the expectation engine counts characters
+///   while the editor renders tab stops, so tab-shaped context keeps the
+///   legacy visual-column path. Tabs on earlier completed statements are
+///   irrelevant and do not disable the judge.
+/// * The repaired buffer still has a syntax error intersecting the
+///   reference-to-probe row window — the expectation engine would answer
+///   top-level (column 0) for a probe it cannot model, deindenting the new
+///   line, where the legacy path degrades gracefully. Errors on unrelated
+///   earlier statements (which the lint's own fold tolerates too) do not
+///   disable the judge.
 /// * The nearest checkable line above the probe does not sit at a column the
 ///   lint accepts — the expectation model accumulates from column 0 and would
 ///   collapse a user's deliberately offset context (e.g. a top-level `    {`),
@@ -147,12 +153,45 @@ pub fn judge_backed_indentation(
         log::trace!("judge_backed_indentation: bail: virtual parse failed");
         return None;
     };
-    if error_at_or_above(virtual_tree.root_node(), position.line as usize) {
-        log::trace!("judge_backed_indentation: bail: repaired buffer still has syntax errors");
+
+    let reference = reference_row(&virtual_tree, source, position.line);
+
+    // A residual syntax error is disqualifying only when it touches the rows
+    // the answer actually reads — the reference-to-probe window. An error on
+    // an unrelated earlier statement leaves the probe's covering changes (and
+    // the lint's own fold, which never bails on error trees) intact.
+    let error_window_start = reference.map_or(position.line, |(row, _)| row) as usize;
+    if error_intersects_rows(
+        virtual_tree.root_node(),
+        error_window_start,
+        position.line as usize,
+    ) {
+        log::trace!(
+            "judge_backed_indentation: bail: repaired buffer has syntax errors in the \
+             reference-to-probe window"
+        );
         return None;
     }
 
-    let reference = reference_row(&virtual_tree, source, position.line);
+    // A real tab distorts the emitted columns only when it sits inside the
+    // active context: the rows from the outermost unclosed opener (whose
+    // aligned columns feed the expectation) or the reference line down to the
+    // probe. Tabs on earlier completed statements are irrelevant.
+    let tab_window_start = virtual_buffer
+        .outer_opener_row
+        .into_iter()
+        .chain(reference.map(|(row, _)| row))
+        .min();
+    if let Some(start) = tab_window_start
+        && virtual_buffer.tab_rows.iter().any(|&row| row >= start)
+    {
+        log::trace!(
+            "judge_backed_indentation: bail: a real tab inside the active context needs the \
+             legacy visual-column path"
+        );
+        return None;
+    }
+
     let targets: Vec<u32> = reference
         .iter()
         .map(|&(row, _)| row)
@@ -191,15 +230,19 @@ pub fn judge_backed_indentation(
     Some(selected)
 }
 
-/// True when the repaired buffer holds a syntax error whose extent begins at
-/// or above the probe line. Such an error means the context the probe's
-/// expectation folds over is malformed beyond the sentinel repair, and the
-/// engine's answer would be a meaningless top level (e.g. after `x %+`).
-/// Errors that begin strictly below the probe are expected mid-typing — a
-/// virtual `if (x <- raven_sentinel_)` is still waiting for its consequence —
-/// and cannot influence the probe's covering changes.
-fn error_at_or_above(node: Node<'_>, probe_line: usize) -> bool {
-    if !node.has_error() || node.start_position().row > probe_line {
+/// True when the repaired buffer holds a syntax error whose row extent
+/// intersects `[start_row, end_row]` — the reference-to-probe window. Such an
+/// error means the context the probe's expectation folds over is malformed
+/// beyond the sentinel repair, and the engine's answer would be a meaningless
+/// top level (e.g. after `x %+`). Errors outside the window are expected
+/// mid-typing — a virtual `if (x <- raven_sentinel_)` is still waiting for
+/// its consequence below the probe, and a malformed statement several lines
+/// up does not feed the probe's covering changes.
+fn error_intersects_rows(node: Node<'_>, start_row: usize, end_row: usize) -> bool {
+    if !node.has_error()
+        || node.start_position().row > end_row
+        || node.end_position().row < start_row
+    {
         return false;
     }
     if node.is_error() || node.is_missing() {
@@ -207,7 +250,7 @@ fn error_at_or_above(node: Node<'_>, probe_line: usize) -> bool {
     }
     let mut cursor = node.walk();
     node.children(&mut cursor)
-        .any(|child| error_at_or_above(child, probe_line))
+        .any(|child| error_intersects_rows(child, start_row, end_row))
 }
 
 /// The nearest line above the probe whose physical indent the lint's
@@ -262,7 +305,10 @@ fn build_virtual_buffer(
         position.line
     );
 
-    let mut openers = unclosed_delimiters_for_judge(tree, source, position.line)?;
+    let scan = unclosed_delimiters_for_judge(tree, source, position.line)?;
+    let outer_opener_row = scan.openers.first().map(|&(row, _, _)| row);
+    let tab_rows = scan.tab_rows;
+    let mut openers = scan.openers;
     // Consume the probe's own leading closers from the opener stack. Mixed
     // content keeps them verbatim inside `trimmed`; pure closers are pushed
     // below the sentinel so each real closer appears exactly once in the
@@ -349,6 +395,8 @@ fn build_virtual_buffer(
         text,
         probe_line: position.line,
         edit,
+        tab_rows,
+        outer_opener_row,
     })
 }
 
@@ -456,27 +504,39 @@ fn multiline_string_like_contains(tree: &Tree, source: &str, row: usize, column:
     false
 }
 
+/// The delimiter scan's findings for the prefix above the probe line.
+struct PrefixScan {
+    /// Still-unclosed bracket openers, outermost first.
+    openers: Vec<(u32, u32, char)>,
+    /// Rows carrying a real (non-string) tab, ascending and deduplicated.
+    tab_rows: Vec<u32>,
+}
+
 /// One pass over the lines above `current_line`, keeping a stack of unclosed
-/// bracket openers. Bracket and quote characters inside strings, comments,
-/// and backtick-quoted identifiers are masked via the parse tree; a quote
-/// character the tree cannot explain aborts the scan (`None`), and so does a
-/// real (non-masked) tab anywhere on a scanned line — the expectation engine
-/// measures character columns and the judge emits spaces, so tab-shaped
-/// context must use the legacy visual-column fallback.
+/// bracket openers. Bracket, quote, and tab characters inside strings,
+/// comments, and backtick-quoted identifiers are masked via byte intervals
+/// collected from the parse tree in a single pruned pre-order pass (no
+/// per-character tree lookups). A quote character outside every masked
+/// interval is one the tree cannot explain as string-like content — the
+/// prefix's string layout is not understood, so the scan aborts (`None`).
+/// Real tabs are reported per row rather than aborting; the caller decides
+/// whether one sits inside the active indentation context.
 fn unclosed_delimiters_for_judge(
     tree: &Tree,
     source: &str,
     current_line: u32,
-) -> Option<Vec<(u32, u32, char)>> {
-    let mut stack = Vec::new();
-    let mut rows_seen = 0usize;
+) -> Option<PrefixScan> {
+    let prefix_end = line_start_byte(source, current_line)?;
+    let masked = masked_intervals(tree, source, prefix_end);
+    let mut mask_idx = 0usize;
+    let mut openers = Vec::new();
+    let mut tab_rows: Vec<u32> = Vec::new();
     let mut byte_start = 0usize;
     for (row, raw) in source
         .split_inclusive('\n')
         .take(current_line as usize)
         .enumerate()
     {
-        rows_seen = row + 1;
         let line = raw.strip_suffix('\n').unwrap_or(raw);
         let line = line.strip_suffix('\r').unwrap_or(line);
         for (column, ch) in line.char_indices() {
@@ -486,65 +546,71 @@ fn unclosed_delimiters_for_judge(
             ) {
                 continue;
             }
-            let coverage = tree_coverage(tree, row, column, byte_start + column);
-            if coverage == TreeCoverage::Masked {
-                continue;
+            let byte = byte_start + column;
+            while mask_idx < masked.len() && masked[mask_idx].1 <= byte {
+                mask_idx += 1;
             }
-            if ch == '\t' {
-                return None;
-            }
-            if matches!(ch, '\"' | '\'' | '`') {
-                if coverage == TreeCoverage::Unexplained {
-                    return None;
-                }
+            if mask_idx < masked.len() && masked[mask_idx].0 <= byte {
                 continue;
             }
             match ch {
-                '(' | '[' | '{' => stack.push((row as u32, column as u32, ch)),
-                ')' if stack.last().is_some_and(|(_, _, opener)| *opener == '(') => {
-                    stack.pop();
+                '\t' => {
+                    if tab_rows.last() != Some(&(row as u32)) {
+                        tab_rows.push(row as u32);
+                    }
                 }
-                ']' if stack.last().is_some_and(|(_, _, opener)| *opener == '[') => {
-                    stack.pop();
+                '\"' | '\'' | '`' => return None,
+                '(' | '[' | '{' => openers.push((row as u32, column as u32, ch)),
+                ')' if openers.last().is_some_and(|(_, _, opener)| *opener == '(') => {
+                    openers.pop();
                 }
-                '}' if stack.last().is_some_and(|(_, _, opener)| *opener == '{') => {
-                    stack.pop();
+                ']' if openers.last().is_some_and(|(_, _, opener)| *opener == '[') => {
+                    openers.pop();
+                }
+                '}' if openers.last().is_some_and(|(_, _, opener)| *opener == '{') => {
+                    openers.pop();
                 }
                 _ => {}
             }
         }
         byte_start += raw.len();
     }
-    if rows_seen < current_line as usize {
-        return None;
-    }
-    Some(stack)
+    Some(PrefixScan { openers, tab_rows })
 }
 
-fn tree_coverage(tree: &Tree, row: usize, column: usize, byte: usize) -> TreeCoverage {
-    let point = Point::new(row, column);
-    let Some(deepest) = tree.root_node().descendant_for_point_range(point, point) else {
-        return TreeCoverage::Unexplained;
-    };
-    let mut deepest_covering = None;
-    let mut node = Some(deepest);
-    while let Some(current) = node {
-        if current.start_byte() <= byte && byte < current.end_byte() {
-            deepest_covering.get_or_insert(current);
-            // An `identifier` covering a bracket, quote, or tab byte can only
-            // be backtick-quoted — its content is literal, like a string's.
-            if matches!(current.kind(), "string" | "comment" | "identifier") {
-                return TreeCoverage::Masked;
+/// Byte intervals of literal content — strings, comments, and
+/// backtick-quoted identifiers — in `[0, prefix_end)`, sorted and
+/// non-overlapping (pre-order without descending into masked nodes). One
+/// pruned pass over the tree replaces a root-to-leaf `tree_coverage` query
+/// per scanned character.
+fn masked_intervals(tree: &Tree, source: &str, prefix_end: usize) -> Vec<(usize, usize)> {
+    fn walk(node: Node<'_>, source: &str, prefix_end: usize, out: &mut Vec<(usize, usize)>) {
+        if node.start_byte() >= prefix_end {
+            return;
+        }
+        let masked = match node.kind() {
+            "string" | "comment" => true,
+            // A backtick-quoted identifier's content is literal like a
+            // string's; plain identifiers cannot contain the scanned
+            // characters and stay transparent.
+            "identifier" => source.as_bytes().get(node.start_byte()) == Some(&b'`'),
+            _ => false,
+        };
+        if masked {
+            out.push((node.start_byte(), node.end_byte()));
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.start_byte() >= prefix_end {
+                break;
             }
+            walk(child, source, prefix_end, out);
         }
-        node = current.parent();
     }
-    match deepest_covering {
-        Some(node) if node.child_count() == 0 && !node.is_error() && !node.is_missing() => {
-            TreeCoverage::Explained
-        }
-        _ => TreeCoverage::Unexplained,
-    }
+    let mut out = Vec::new();
+    walk(tree.root_node(), source, prefix_end, &mut out);
+    out
 }
 
 fn point_in_node(node: Node<'_>, row: usize, column: usize) -> bool {
@@ -849,7 +915,7 @@ mod tests {
         let tree =
             with_parser(|parser| parser.parse(source, None)).expect("real test input must parse");
         assert_eq!(
-            unclosed_delimiters_for_judge(&tree, source, 1),
+            unclosed_delimiters_for_judge(&tree, source, 1).map(|scan| scan.openers),
             Some(vec![(0, 1, '(')])
         );
     }
@@ -1021,6 +1087,40 @@ mod tests {
             ),
             None,
             "a tabs-mode editor must use the legacy visual-column path"
+        );
+    }
+
+    #[test]
+    fn unrelated_earlier_errors_do_not_disable_the_judge() {
+        let cfg = config(IndentationStyle::RStudio);
+        // The malformed `x +*` statement sits outside the reference-to-probe
+        // window (its reference is the `f(` line) and must not force the
+        // legacy fallback — the lint's own fold tolerates it too.
+        assert_eq!(
+            judge(
+                "x +*\n\ny <- 1\nf(\n",
+                Position::new(4, 0),
+                &cfg,
+                InfixContinuationStyle::Indented,
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn tabs_outside_the_active_context_do_not_disable_the_judge() {
+        let cfg = config(IndentationStyle::RStudio);
+        // The tab sits between tokens of an earlier completed statement,
+        // above both the outermost unclosed opener and the reference line,
+        // so it cannot distort the emitted columns.
+        assert_eq!(
+            judge(
+                "x <-\t1\nf(\n",
+                Position::new(2, 0),
+                &cfg,
+                InfixContinuationStyle::Indented,
+            ),
+            Some(2)
         );
     }
 

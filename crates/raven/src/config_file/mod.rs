@@ -182,6 +182,11 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
     .get("linting")
     .cloned()
     .unwrap_or(serde_json::json!({}));
+    // Every input of per-document lint resolution just changed; drop the
+    // resolved-config cache with them.
+    if let Ok(mut cache) = state.effective_lint_config_cache.lock() {
+        cache.clear();
+    }
     state.workspace_exclusions = compile_workspace_exclusions(&merged, workspace_roots);
 }
 
@@ -202,6 +207,55 @@ mod tests {
         state.raw_project_settings = project;
         state.project_config_path = Some(PathBuf::from(project_config_path));
         state
+    }
+
+    /// The per-URI resolved-config cache serves repeated lookups and is
+    /// cleared by `recompute_parsed_configs`, so an override edit is visible
+    /// on the very next resolution instead of returning the cached value.
+    #[test]
+    fn effective_lint_config_cache_is_cleared_by_recompute() {
+        let root = if cfg!(windows) { "C:\\proj" } else { "/proj" };
+        let overrides_settings = |unit: u32| {
+            serde_json::json!({
+                "linting": {
+                    "enabled": true,
+                    "indentationUnit": 2,
+                    "overrides": [{"files": ["R/**"], "indentationUnit": unit}],
+                }
+            })
+        };
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![tower_lsp::lsp_types::Url::from_file_path(root).unwrap()];
+        state.raw_client_settings = overrides_settings(8);
+        recompute_parsed_configs(&mut state);
+
+        let uri = tower_lsp::lsp_types::Url::from_file_path(
+            std::path::Path::new(root).join("R").join("a.R"),
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .effective_lint_config_for_document(&uri)
+                .indentation_unit,
+            8
+        );
+        // Second lookup is the cache hit; it must return the same answer.
+        assert_eq!(
+            state
+                .effective_lint_config_for_document(&uri)
+                .indentation_unit,
+            8
+        );
+
+        state.raw_client_settings = overrides_settings(6);
+        recompute_parsed_configs(&mut state);
+        assert_eq!(
+            state
+                .effective_lint_config_for_document(&uri)
+                .indentation_unit,
+            6,
+            "recompute_parsed_configs must invalidate the resolved-config cache"
+        );
     }
 
     /// The settings a *configured* `.lintr` contributes — the `linting` object
