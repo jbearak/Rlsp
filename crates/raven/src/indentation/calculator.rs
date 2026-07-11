@@ -66,11 +66,36 @@ pub fn calculate_indentation(
             chain_start_line,
             chain_start_col,
             operator_type: _,
+            flattened_rhs,
         } => {
-            // Align to chain start column (RHS of assignment if present)
-            // but ensure at least one tab_size indent from the line start.
             let line_indent = get_line_indent(source, chain_start_line, config.tab_size);
-            std::cmp::max(chain_start_col, line_indent.saturating_add(config.tab_size))
+            if flattened_rhs {
+                // Chain on the RHS of a broken assignment: the assignment
+                // already added the level, so continuations stay at the
+                // chain-start line's indent (not chain_start_col, which can
+                // sit mid-line in mixed chains) — every lint mode flags a
+                // second level here (lintr's assignment_as_infix, #611).
+                line_indent
+            } else {
+                // Align to chain start column (RHS of assignment if present)
+                // but ensure at least one tab_size indent from the line start.
+                std::cmp::max(chain_start_col, line_indent.saturating_add(config.tab_size))
+            }
+        }
+        IndentContext::AfterAssignmentOperator {
+            base_line,
+            flattened,
+        } => {
+            // One level from the assignment statement's start line, in every
+            // style — an assignment RHS has nothing to align against (#611).
+            // A flattened assignment (itself the RHS of an enclosing broken
+            // assignment) adds no level of its own.
+            let base = get_line_indent(source, base_line, config.tab_size);
+            if flattened {
+                base
+            } else {
+                base.saturating_add(config.tab_size)
+            }
         }
         IndentContext::InsideParens {
             opener_line,
@@ -253,6 +278,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -275,6 +301,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 4,
             operator_type: OperatorType::MagrittrPipe,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -296,6 +323,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 4,
             operator_type: OperatorType::Plus,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -329,6 +357,7 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col: 0,
                 operator_type: op,
+                flattened_rhs: false,
             };
 
             let indent = calculate_indentation(context.clone(), config.clone(), "");
@@ -362,12 +391,88 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col: 5,
                 operator_type: op,
+                flattened_rhs: false,
             };
             assert_eq!(
                 calculate_indentation(ctx, config.clone(), ""),
                 5,
                 "Operator {:?} at col 5 should produce indent 5",
                 op
+            );
+        }
+    }
+
+    #[test]
+    fn test_flattened_chain_uses_chain_line_indent() {
+        use super::super::context::OperatorType;
+
+        // Chain on the RHS of a broken assignment (#611): the one-level
+        // floor is dropped and the continuation sits at the chain-start
+        // line's indent — even when the sub-chain starts mid-line
+        // (chain_start_col deeper than the line indent).
+        let config = IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+        let source = "result <-\n  a + data %>%\n";
+        let ctx = IndentContext::AfterContinuationOperator {
+            chain_start_line: 1,
+            chain_start_col: 6,
+            operator_type: OperatorType::MagrittrPipe,
+            flattened_rhs: true,
+        };
+        assert_eq!(calculate_indentation(ctx, config, source), 2);
+    }
+
+    #[test]
+    fn test_after_assignment_operator_one_level_from_base_line() {
+        let config = IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+        let source = "f <- function() {\n  x <-\n";
+        let ctx = IndentContext::AfterAssignmentOperator {
+            base_line: 1,
+            flattened: false,
+        };
+        assert_eq!(calculate_indentation(ctx, config, source), 4);
+    }
+
+    #[test]
+    fn test_after_assignment_operator_flattened_adds_no_level() {
+        let config = IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+        let source = "a <-\n  b <-\n";
+        let ctx = IndentContext::AfterAssignmentOperator {
+            base_line: 1,
+            flattened: true,
+        };
+        assert_eq!(calculate_indentation(ctx, config, source), 2);
+    }
+
+    #[test]
+    fn test_after_assignment_operator_style_independent() {
+        // The assignment context ignores the paren-alignment style choice.
+        let source = "result <-\n";
+        for style in [IndentationStyle::RStudio, IndentationStyle::RStudioMinus] {
+            let config = IndentationConfig {
+                tab_size: 2,
+                insert_spaces: true,
+                style,
+            };
+            let ctx = IndentContext::AfterAssignmentOperator {
+                base_line: 0,
+                flattened: false,
+            };
+            assert_eq!(
+                calculate_indentation(ctx, config, source),
+                2,
+                "style {style:?}"
             );
         }
     }
@@ -392,6 +497,7 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col,
                 operator_type: OperatorType::Pipe,
+                flattened_rhs: false,
             };
 
             let indent = calculate_indentation(context, config.clone(), "");
@@ -420,6 +526,7 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col,
                 operator_type: OperatorType::Pipe,
+                flattened_rhs: false,
             };
 
             let indent = calculate_indentation(context, config, "");
@@ -455,6 +562,7 @@ mod tests {
                 chain_start_line: 0,
                 chain_start_col,
                 operator_type: OperatorType::Pipe,
+                flattened_rhs: false,
             };
 
             let indent = calculate_indentation(context, config, "");
@@ -885,6 +993,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -995,6 +1104,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 100,
             operator_type: OperatorType::Pipe,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1016,6 +1126,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 100,
             operator_type: OperatorType::Plus,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1056,6 +1167,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1215,6 +1327,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1296,6 +1409,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1317,6 +1431,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
+            flattened_rhs: false,
         };
 
         let indent = calculate_indentation(context, config, "");
@@ -1389,6 +1504,7 @@ mod tests {
                     chain_start_line: 0,
                     chain_start_col,
                     operator_type,
+                    flattened_rhs: false,
                 };
 
                 let indent = calculate_indentation(context, config, "");
@@ -1444,6 +1560,7 @@ mod tests {
                     chain_start_line: 0,
                     chain_start_col,
                     operator_type,
+                    flattened_rhs: false,
                 };
 
                 let indent = calculate_indentation(context, config, "");
@@ -1497,6 +1614,7 @@ mod tests {
                         chain_start_line,
                         chain_start_col,
                         operator_type,
+                        flattened_rhs: false,
                     };
 
                     let indent = calculate_indentation(context, config.clone(), "");
@@ -1550,6 +1668,7 @@ mod tests {
                         chain_start_line,
                         chain_start_col,
                         operator_type: map_operator(op_idx),
+                        flattened_rhs: false,
                     };
 
                     let indent = calculate_indentation(context, config.clone(), "");

@@ -111,6 +111,30 @@ pub enum IndentContext {
         chain_start_col: u32,
         /// Type of the continuation operator.
         operator_type: OperatorType,
+        /// The chain is the right-hand side of an assignment whose operator
+        /// ends its line (lintr's `assignment_as_infix` suppression, #611).
+        /// Continuations then stay at the chain-start line's indent instead
+        /// of gaining the one-level floor — the assignment already paid for
+        /// the level, and every lint mode flags a second one.
+        flattened_rhs: bool,
+    },
+
+    /// After a line ending in an assignment operator
+    /// (`<-`, `<<-`, `=`, `:=`, `->`, `->>`), issue #611.
+    ///
+    /// The right-hand side indents one level from the line where the
+    /// assignment *statement* starts (not necessarily the operator's own
+    /// line: in `data %>%` ⏎ `  f() ->` ⏎ the statement starts at `data`).
+    /// This is style-independent — an assignment RHS is not a peer operand
+    /// of the LHS, so there is nothing to align against.
+    AfterAssignmentOperator {
+        /// Line where the assignment statement starts (base for the indent).
+        base_line: u32,
+        /// The assignment is itself the RHS of an enclosing broken
+        /// assignment (`a <-` ⏎ `  b <-` ⏎): the outer assignment already
+        /// added the level, so this one adds none (mirrors the lint's
+        /// `assignment_as_infix` suppression).
+        flattened: bool,
     },
 
     /// After a complete expression (no trailing operator, no unclosed delimiters).
@@ -170,6 +194,84 @@ fn classify_continuation_operator(trimmed: &str) -> Option<OperatorType> {
     } else {
         None
     }
+}
+
+/// Classifies the assignment operator a line ends with, if any, returning
+/// the operator's token text (which equals its tree-sitter node kind, used
+/// for AST validation in [`detect_assignment_continuation`]).
+///
+/// `trimmed` must already have its trailing whitespace and comment stripped,
+/// same contract as [`classify_continuation_operator`]. The two classifiers
+/// are deliberately separate: assignment operators must NOT count as chain
+/// members ([`ChainWalker`] stops at an assignment-ended line, keeping the
+/// chain start on the RHS's first line), and `%<-%`-style custom operators
+/// keep classifying as [`OperatorType::CustomInfix`] because the
+/// continuation classifier runs first in every caller.
+///
+/// The `=` arm excludes `==`, `<=`, `>=`, `!=`; `:=` is matched before `=`.
+fn classify_assignment_operator(trimmed: &str) -> Option<&'static str> {
+    if trimmed.ends_with("<<-") {
+        Some("<<-")
+    } else if trimmed.ends_with("<-") {
+        Some("<-")
+    } else if trimmed.ends_with("->>") {
+        Some("->>")
+    } else if trimmed.ends_with("->") {
+        Some("->")
+    } else if trimmed.ends_with(":=") {
+        Some(":=")
+    } else if trimmed.ends_with('=')
+        && !trimmed.ends_with("==")
+        && !trimmed.ends_with("<=")
+        && !trimmed.ends_with(">=")
+        && !trimmed.ends_with("!=")
+    {
+        Some("=")
+    } else {
+        None
+    }
+}
+
+/// Whether a line ending in this assignment operator suppresses the indent
+/// level of a construct on its RHS (lintr's `assignment_as_infix`
+/// suppressor set: `<-`, `<<-`, `=`, `:=` — right assignments `->`/`->>`
+/// are excluded, matching `suppressed_as_assignment_rhs` in the lint).
+///
+/// Text-heuristic counterpart used on the regex fallback path; the AST path
+/// calls the lint's predicate directly.
+fn ends_with_flattening_assignment(trimmed: &str) -> bool {
+    matches!(
+        classify_assignment_operator(trimmed),
+        Some("<-" | "<<-" | "=" | ":=")
+    )
+}
+
+/// Text-heuristic `assignment_as_infix` check for the fallback path: does
+/// the nearest code line above `line` (skipping blank and comment-only
+/// lines, which the lint's AST predicate is insensitive to) end with a
+/// suppressing assignment operator?
+///
+/// Documented approximation: unlike the lint's
+/// [`crate::linting::suppressed_as_assignment_rhs`], this cannot model the
+/// full upward traversal — a parenthesized RHS whose `(` sits on its own
+/// line between the assignment and `line` defeats it (no flattening), and it
+/// cannot see restorer boundaries at all; callers guard the common restorer
+/// shape by rejecting flattening when an unclosed delimiter opens at or
+/// after the chain-start line. Both gaps require an ERROR tree *and* the
+/// exotic shape simultaneously; the AST path handles them exactly.
+fn text_flattened_under_assignment(source: &str, line: u32) -> bool {
+    let lines: Vec<&str> = source.lines().collect();
+    for idx in (0..line as usize).rev() {
+        let Some(text) = lines.get(idx) else {
+            return false;
+        };
+        let trimmed = strip_trailing_comment(text).trim_end();
+        if trimmed.trim_start().is_empty() {
+            continue; // blank or comment-only line
+        }
+        return ends_with_flattening_assignment(trimmed);
+    }
+    false
 }
 
 /// Detects the syntactic context at the given position for indentation.
@@ -248,6 +350,14 @@ pub fn detect_context(
 
     // 2. Check if previous line ends with continuation operator
     if let Some(ctx) = detect_continuation_operator(tree, source, position, tab_size) {
+        return ctx;
+    }
+
+    // 2b. Check if previous line ends with an assignment operator (#611).
+    // Must precede the parens/braces detection: the assignment context
+    // preempts InsideBraces, while paren/bracket context is deferred to
+    // inside detect_assignment_continuation itself.
+    if let Some(ctx) = detect_assignment_continuation(tree, source, position) {
         return ctx;
     }
 
@@ -446,6 +556,16 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
         let trimmed = line_text.trim_start();
         if let Some(first_char) = trimmed.chars().next()
             && matches!(first_char, ')' | ']' | '}')
+            // A line consisting only of closing delimiters is the auto-close
+            // push-down scenario (Enter pushed the auto-inserted closers to
+            // the cursor line): skip delimiter alignment and fall through to
+            // content-level detection, mirroring `detect_closing_delimiter`
+            // on the AST path (whitespace between closers tolerated there
+            // via `trim()`, hence the filter).
+            && !trimmed
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .all(|c| matches!(c, ')' | ']' | '}'))
         {
             // Find matching opener using simple bracket counting
             if let Some((opener_line, opener_col)) =
@@ -469,6 +589,11 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
         }
     }
 
+    // Innermost unclosed delimiter before the cursor line: shared by the
+    // continuation flattening guard (2), the assignment paren gate (2b),
+    // and the delimiter context detection (3) — computed once.
+    let unclosed = find_unclosed_delimiter_heuristic(source, position.line);
+
     // 2. Check if previous line ends with continuation operator
     if position.line > 0
         && let Some(prev_line) = source.lines().nth((position.line - 1) as usize)
@@ -480,18 +605,45 @@ fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> I
             // pass the cursor line per `find_chain_start`'s contract.
             let (chain_start_line, chain_start_col) =
                 ChainWalker::new(source, tab_size).find_chain_start(position.line);
+            // assignment_as_infix flattening, text approximation: a broken
+            // assignment above the chain start suppresses the level, unless
+            // a delimiter opened at/after the chain start (restorer shape:
+            // the chain sits inside a call/parens, not directly on the RHS).
+            let flattened_rhs = text_flattened_under_assignment(source, chain_start_line)
+                && !matches!(unclosed, Some((row, _, _)) if row >= chain_start_line);
             return IndentContext::AfterContinuationOperator {
                 chain_start_line,
                 chain_start_col,
                 operator_type: op_type,
+                flattened_rhs,
+            };
+        }
+
+        // 2b. Check if previous line ends with an assignment operator (#611).
+        // Paren gate: inside an unclosed `(`/`[`, argument alignment wins
+        // (named arguments, call arguments, conditions); an unclosed `{`
+        // or nothing keeps the assignment context, preempting InsideBraces.
+        if classify_assignment_operator(trimmed).is_some()
+            && !matches!(unclosed, Some((_, _, '(' | '[')))
+        {
+            // The assignment statement's start line: walk back through
+            // continuation-operator-terminated lines from the assignment
+            // line (`data %>%` ⏎ `  f() ->` starts at `data`). Assignment
+            // lines themselves stop the walk, so a chained `a <-` above
+            // does not extend it.
+            let assign_line = position.line - 1;
+            let (base_line, _) = ChainWalker::new(source, tab_size).find_chain_start(assign_line);
+            let flattened = text_flattened_under_assignment(source, base_line)
+                && !matches!(unclosed, Some((row, _, _)) if row >= base_line);
+            return IndentContext::AfterAssignmentOperator {
+                base_line,
+                flattened,
             };
         }
     }
 
     // 3. Check for unclosed delimiters using bracket counting
-    if let Some((opener_line, opener_col, delimiter)) =
-        find_unclosed_delimiter_heuristic(source, position.line)
-    {
+    if let Some((opener_line, opener_col, delimiter)) = unclosed {
         match delimiter {
             '(' | '[' => {
                 let has_content = check_content_after_opener(source, opener_line, opener_col);
@@ -928,7 +1080,17 @@ fn find_subchain_start(
 /// the outermost chained expression, then uses `find_subchain_start` to locate
 /// the first operand of the current operator sub-chain (handling mixed chains
 /// where different operator classes meet).
-fn find_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Option<(u32, u32)> {
+///
+/// The third element of the result reports whether the chain is flattened —
+/// it sits on the RHS of an assignment whose operator ends its line, per the
+/// lint's [`crate::linting::suppressed_as_assignment_rhs`] predicate — so
+/// the caller can drop the one-level indent floor (#611). Computed here
+/// because only this function holds the outermost chain node.
+fn find_chain_start_from_ast(
+    tree: &Tree,
+    source: &str,
+    prev_line: u32,
+) -> Option<(u32, u32, bool)> {
     let root = tree.root_node();
 
     // Find the end of the actual code on prev_line (before comments/whitespace)
@@ -989,11 +1151,118 @@ fn find_chain_start_from_ast(tree: &Tree, source: &str, prev_line: u32) -> Optio
     // operand column. Use outermost's start line (which has the expression
     // root's indent level) so the calculator formula produces correct results.
     // For single-class chains, use outermost's start position directly.
+    let flattened = crate::linting::suppressed_as_assignment_rhs(outermost);
     let start = outermost.start_position();
     match find_subchain_start(outermost, our_class, source) {
-        Some(sub_col) => Some((start.row as u32, sub_col)),
-        None => Some((start.row as u32, start.column as u32)),
+        Some(sub_col) => Some((start.row as u32, sub_col, flattened)),
+        None => Some((start.row as u32, start.column as u32, flattened)),
     }
+}
+
+/// Whether an assignment `binary_operator` sits in paren/bracket context,
+/// where argument/content alignment (`InsideParens`) must win over the
+/// assignment continuation context (#611).
+///
+/// Walks up from the node: `arguments`/`argument`, `subset`/`subset2`,
+/// `parameters`/`parameter`, and `parenthesized_expression` ancestors defer;
+/// a `braced_expression` restores statement context first (`f(function() {`
+/// ⏎ `  x <-` ⏎ still indents one level, mirroring the lint's restorer
+/// semantics). Control-flow condition parens have no
+/// `parenthesized_expression` node in tree-sitter-r, so reaching an
+/// `if_statement`/`while_statement` via its `condition` field (or a
+/// `for_statement` via its `sequence` field) also defers, while reaching
+/// them via a body field keeps walking.
+///
+/// This is an O(tree-depth) ancestor walk — deliberately not a text scan,
+/// which a distant unclosed `(` hundreds of lines up (or parens inside a
+/// multiline string) would poison.
+fn assignment_in_paren_context(assign_binop: Node) -> bool {
+    let mut child = assign_binop;
+    while let Some(parent) = child.parent() {
+        match parent.kind() {
+            "arguments"
+            | "argument"
+            | "subset"
+            | "subset2"
+            | "parameters"
+            | "parameter"
+            | "parenthesized_expression" => return true,
+            "braced_expression" => return false,
+            "if_statement" | "while_statement"
+                if parent
+                    .child_by_field_name("condition")
+                    .is_some_and(|c| c.id() == child.id()) =>
+            {
+                return true;
+            }
+            "for_statement"
+                if parent
+                    .child_by_field_name("sequence")
+                    .is_some_and(|c| c.id() == child.id()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        child = parent;
+    }
+    false
+}
+
+/// Detects that the previous line ends with an assignment operator, whose
+/// RHS indents one level from the assignment statement's start line (#611).
+///
+/// Runs after [`detect_continuation_operator`] (mutually exclusive — a line
+/// cannot end with both operator classes) and before the parens/braces
+/// detection, which it deliberately preempts for braces (`f <- function() {`
+/// ⏎ `  x <-` ⏎ → one level from `x <-`, not the brace level) but defers to
+/// for paren/bracket context via [`assignment_in_paren_context`] (named
+/// arguments, formal defaults, call arguments, conditions — there the
+/// `InsideParens` alignment wins).
+///
+/// The trailing operator is validated against the AST: the node at the
+/// operator's position must be the operator token itself, with a
+/// `binary_operator` parent. This rejects assignment-looking text inside
+/// multiline strings and named-argument `=` (whose parent is `argument`).
+fn detect_assignment_continuation(
+    tree: &Tree,
+    source: &str,
+    position: Position,
+) -> Option<IndentContext> {
+    if position.line == 0 {
+        return None;
+    }
+
+    let prev_line = position.line - 1;
+    let line_text = source.lines().nth(prev_line as usize)?;
+    let trimmed = strip_trailing_comment(line_text);
+    let trimmed = trimmed.trim_end();
+    let op = classify_assignment_operator(trimmed)?;
+
+    // Locate the operator token's last byte (same arithmetic as
+    // `find_chain_start_from_ast`).
+    let leading_ws = line_text.len() - line_text.trim_start().len();
+    let content_len = trimmed.trim_start().len();
+    let end_col = leading_ws + content_len.saturating_sub(1);
+    let point = tree_sitter::Point::new(prev_line as usize, end_col);
+
+    let node = tree.root_node().descendant_for_point_range(point, point)?;
+    if node.kind() != op {
+        return None;
+    }
+    let binop = node.parent().filter(|p| p.kind() == "binary_operator")?;
+
+    if assignment_in_paren_context(binop) {
+        return None;
+    }
+
+    Some(IndentContext::AfterAssignmentOperator {
+        // The binop starts where the assignment statement starts — for
+        // `data %>%` ⏎ `  f() ->` the `->` binop's LHS is the whole chain,
+        // so the base is the `data` line, matching the lint's block level.
+        base_line: binop.start_position().row as u32,
+        flattened: crate::linting::suppressed_as_assignment_rhs(binop),
+    })
 }
 
 /// Detects if the previous line ends with a continuation operator.
@@ -1032,17 +1301,28 @@ fn detect_continuation_operator(
     let trimmed = trimmed.trim_end();
     let operator_type = classify_continuation_operator(trimmed)?;
 
-    // Try AST-based chain start detection first, fall back to text-based heuristic
-    let (chain_start_line, chain_start_col) = find_chain_start_from_ast(tree, source, prev_line)
-        .unwrap_or_else(|| {
+    // Try AST-based chain start detection first, fall back to text-based
+    // heuristic. The AST path evaluates the assignment_as_infix flattening
+    // exactly (via the lint's predicate); the text path approximates it and
+    // guards the restorer shape (chain inside a call opened at or after the
+    // chain start — see `text_flattened_under_assignment`).
+    let (chain_start_line, chain_start_col, flattened_rhs) =
+        find_chain_start_from_ast(tree, source, prev_line).unwrap_or_else(|| {
             let walker = ChainWalker::new(source, tab_size);
-            walker.find_chain_start(position.line)
+            let (line, col) = walker.find_chain_start(position.line);
+            let flattened = text_flattened_under_assignment(source, line)
+                && !matches!(
+                    find_unclosed_delimiter_heuristic(source, position.line),
+                    Some((row, _, _)) if row >= line
+                );
+            (line, col, flattened)
         });
 
     Some(IndentContext::AfterContinuationOperator {
         chain_start_line,
         chain_start_col,
         operator_type,
+        flattened_rhs,
     })
 }
 
@@ -1712,8 +1992,29 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_detect_context_closing_delimiter() {
+    fn test_fallback_detect_context_closing_delimiter_pushdown() {
+        // A closers-only cursor line is the auto-close push-down scenario:
+        // the fallback mirrors `detect_closing_delimiter` and indents it as
+        // content inside the parens instead of aligning the delimiter.
         let source = "func(\n  arg1\n)";
+        let position = Position {
+            line: 2,
+            character: 0,
+        };
+        let ctx = fallback_detect_context(source, position, 2);
+
+        assert!(
+            matches!(ctx, IndentContext::InsideParens { .. }),
+            "closers-only line should fall through to content detection, got {:?}",
+            ctx
+        );
+    }
+
+    #[test]
+    fn test_fallback_detect_context_closing_delimiter_with_content() {
+        // A closer followed by real content is NOT the push-down scenario:
+        // delimiter alignment applies.
+        let source = "func(\n  arg1\n) + 1";
         let position = Position {
             line: 2,
             character: 0,
@@ -1724,7 +2025,7 @@ mod tests {
             IndentContext::ClosingDelimiter { delimiter, .. } => {
                 assert_eq!(delimiter, ')');
             }
-            _ => panic!("Expected ClosingDelimiter context"),
+            _ => panic!("Expected ClosingDelimiter context, got {:?}", ctx),
         }
     }
 
@@ -2265,6 +2566,7 @@ mod tests {
             chain_start_line: 0,
             chain_start_col: 0,
             operator_type: OperatorType::Pipe,
+            flattened_rhs: false,
         };
         assert!(matches!(
             continuation,
@@ -5147,5 +5449,516 @@ mod auto_close_tests {
             indent, 19,
             "Should maintain paren alignment on second Enter"
         );
+    }
+}
+
+/// Tests for the assignment-operator continuation context (#611): a line
+/// ending in an assignment operator indents its RHS one level, and a chain
+/// on the RHS of a broken assignment loses the one-level floor
+/// (`assignment_as_infix` flattening). Detection is pinned on both the AST
+/// path (`detect_context`) and the regex fallback (`fallback_detect_context`),
+/// and columns are pinned through the real `detect_context` →
+/// `calculate_indentation` pipeline.
+#[cfg(test)]
+mod assignment_context_tests {
+    use super::*;
+    use crate::indentation::calculator::{
+        IndentationConfig, IndentationStyle, calculate_indentation,
+    };
+    use tower_lsp::lsp_types::Position;
+
+    fn parse_r(code: &str) -> Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        parser.parse(code, None).unwrap()
+    }
+
+    fn config(style: IndentationStyle) -> IndentationConfig {
+        IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style,
+        }
+    }
+
+    /// Detect at the start of `line` in `code` (the on-Enter cursor position).
+    fn detect(code: &str, line: u32) -> IndentContext {
+        let tree = parse_r(code);
+        detect_context(&tree, code, Position { line, character: 0 }, 2)
+    }
+
+    /// Full pipeline: detected context → calculated column, RStudio style.
+    fn indent_at(code: &str, line: u32) -> u32 {
+        let ctx = detect(code, line);
+        calculate_indentation(ctx, config(IndentationStyle::RStudio), code)
+    }
+
+    // ------------------------------------------------------------------
+    // Detection: the new context fires for every participating operator
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn assignment_operators_fire() {
+        for (code, base) in [
+            ("result <-\n", 0),
+            ("result <<-\n", 0),
+            ("x =\n", 0),
+            ("x :=\n", 0),
+            ("data %>% f() ->\n", 0),
+            ("data %>% f() ->>\n", 0),
+        ] {
+            let ctx = detect(code, 1);
+            assert_eq!(
+                ctx,
+                IndentContext::AfterAssignmentOperator {
+                    base_line: base,
+                    flattened: false,
+                },
+                "for {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn right_assignment_after_chain_uses_statement_start() {
+        // The `->` binop's LHS is the whole pipe chain, so the base is the
+        // `data` line: the target belongs one level from the statement
+        // start (column 2), not from the operator's physical line.
+        let code = "data %>%\n  f() ->\n";
+        let ctx = detect(code, 2);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 0,
+                flattened: false,
+            }
+        );
+        assert_eq!(indent_at(code, 2), 2);
+    }
+
+    #[test]
+    fn non_assignment_operator_endings_do_not_fire() {
+        for code in ["x ==\n", "x <=\n", "x >=\n", "x !=\n"] {
+            let ctx = detect(code, 1);
+            assert!(
+                !matches!(ctx, IndentContext::AfterAssignmentOperator { .. }),
+                "{code:?} must not classify as assignment, got {ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_and_comment_endings_do_not_fire() {
+        for code in [
+            "x <- \"a <-\"\n",    // line ends with a string, not the operator
+            "# x <-\n",           // comment-only line
+            "x <- 1 # note <-\n", // operator only inside the trailing comment
+        ] {
+            let ctx = detect(code, 1);
+            assert!(
+                !matches!(ctx, IndentContext::AfterAssignmentOperator { .. }),
+                "{code:?} must not classify as assignment, got {ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_string_interior_rejected_by_ast_validation() {
+        // The second line ends with `<-` textually, but it is string
+        // content: the node-kind check rejects it.
+        let code = "text <- \"first\nlooks like <-\n";
+        let ctx = detect(code, 2);
+        assert!(
+            !matches!(ctx, IndentContext::AfterAssignmentOperator { .. }),
+            "string interior must not classify as assignment, got {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn custom_infix_assignment_operator_is_not_an_assignment() {
+        // `%<-%` (zeallot-style) ends with `%`: it must not classify as an
+        // assignment (`ends_with("<-")` is false — the `%` is last). It is
+        // also not a recognized custom-infix continuation today, because
+        // `is_custom_infix_ending` does not allow `-` between the percent
+        // signs — pre-existing behavior this test does not change.
+        let code = "c(a, b) %<-%\n";
+        let ctx = detect(code, 1);
+        assert!(
+            !matches!(ctx, IndentContext::AfterAssignmentOperator { .. }),
+            "%<-% must not classify as assignment, got {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn non_ascii_lhs_fires() {
+        // Multi-byte identifier before the operator exercises the
+        // byte-column arithmetic used to locate the operator token.
+        let code = "名前 <-\n";
+        let ctx = detect(code, 1);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 0,
+                flattened: false,
+            }
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Paren-context gate: argument/paren alignment wins
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn named_argument_eq_defers_to_parens() {
+        for code in ["f(x =\n", "f(\n  x =\n"] {
+            let line = code.lines().count() as u32;
+            let ctx = detect(code, line);
+            assert!(
+                matches!(ctx, IndentContext::InsideParens { .. }),
+                "{code:?} must stay InsideParens, got {ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn formal_default_eq_defers_to_parens() {
+        let code = "f <- function(x =\n";
+        let ctx = detect(code, 1);
+        assert!(
+            matches!(ctx, IndentContext::InsideParens { .. }),
+            "formal default must stay InsideParens, got {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_inside_call_arguments_defers_to_parens() {
+        // The lint accepts the paren-aligned shape here in every mode
+        // (`long_function_name(x <-` ⏎ aligned after the paren is clean;
+        // one level from the line is flagged), so InsideParens must win.
+        let code = "long_function_name(x <-\n";
+        let ctx = detect(code, 1);
+        assert!(
+            matches!(ctx, IndentContext::InsideParens { .. }),
+            "assignment in call args must stay InsideParens, got {ctx:?}"
+        );
+        // RStudio: content after the opener → align to opener_col + 1.
+        assert_eq!(indent_at(code, 1), 19);
+    }
+
+    #[test]
+    fn assignment_under_brace_in_call_fires() {
+        // A braced_expression between the assignment and the call restores
+        // statement context (mirrors the lint's restorer): one level from
+        // the `x <-` line, not argument alignment.
+        let code = "f(function() {\n  x <-\n";
+        let ctx = detect(code, 2);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 1,
+                flattened: false,
+            }
+        );
+        assert_eq!(indent_at(code, 2), 4);
+    }
+
+    #[test]
+    fn distant_string_parens_do_not_poison_the_gate() {
+        // Parens inside a (closed) multiline string above must not defer a
+        // statement-level assignment: the gate is an AST ancestor walk, not
+        // a text scan.
+        let code = "text <- \"\n(\n\"\nresult <-\n";
+        let ctx = detect(code, 4);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 3,
+                flattened: false,
+            }
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Flattening: assignment_as_infix symmetry with the lint
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn chain_under_broken_assignment_is_flattened() {
+        let code = "result <-\n  data %>%\n";
+        let ctx = detect(code, 2);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterContinuationOperator {
+                chain_start_line: 1,
+                chain_start_col: 2,
+                operator_type: OperatorType::MagrittrPipe,
+                flattened_rhs: true,
+            }
+        );
+        assert_eq!(indent_at(code, 2), 2);
+    }
+
+    #[test]
+    fn second_continuation_under_broken_assignment_stays_flat() {
+        let code = "result <-\n  data %>%\n  filter(x) %>%\n";
+        assert_eq!(indent_at(code, 3), 2);
+    }
+
+    #[test]
+    fn mixed_chain_under_broken_assignment_flattens_to_line_indent() {
+        // The pipe sub-chain starts mid-line (`data` at column 6), but the
+        // flattened indent is the chain-start LINE's indent — the lint
+        // expects column 2 here in every mode.
+        let code = "result <-\n  a + data %>%\n";
+        assert_eq!(indent_at(code, 2), 2);
+    }
+
+    #[test]
+    fn chain_without_assignment_keeps_the_floor() {
+        // No broken assignment above: the one-level floor stays.
+        let code = "data %>%\n";
+        let ctx = detect(code, 1);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterContinuationOperator {
+                chain_start_line: 0,
+                chain_start_col: 0,
+                operator_type: OperatorType::MagrittrPipe,
+                flattened_rhs: false,
+            }
+        );
+        assert_eq!(indent_at(code, 1), 2);
+    }
+
+    #[test]
+    fn unbroken_assignment_chain_alignment_unchanged() {
+        // `result <- data %>%` (operator and chain start on one line) keeps
+        // the existing alignment under `data`.
+        let code = "result <- data %>%\n";
+        assert_eq!(indent_at(code, 1), 10);
+    }
+
+    #[test]
+    fn chained_broken_assignments_flatten() {
+        // `a <-` ⏎ `  b <-` ⏎: the inner assignment is itself the RHS of a
+        // broken assignment, so it adds no level — the lint expects the
+        // final RHS at column 2 in every mode.
+        let code = "a <-\n  b <-\n";
+        let ctx = detect(code, 2);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 1,
+                flattened: true,
+            }
+        );
+        assert_eq!(indent_at(code, 2), 2);
+    }
+
+    #[test]
+    fn comment_between_assignment_and_chain_still_flattens() {
+        let code = "result <-\n  # prepare\n  data %>%\n";
+        let ctx = detect(code, 3);
+        assert!(
+            matches!(
+                ctx,
+                IndentContext::AfterContinuationOperator {
+                    flattened_rhs: true,
+                    ..
+                }
+            ),
+            "comment between assignment and chain must not defeat flattening, got {ctx:?}"
+        );
+        assert_eq!(indent_at(code, 3), 2);
+    }
+
+    #[test]
+    fn chain_inside_call_under_assignment_is_not_flattened() {
+        // Restorer shape: the chain sits inside a call argument, not
+        // directly on the assignment's RHS — the call boundary restores
+        // normal continuation indentation (this routes through the regex
+        // fallback; the unclosed-`(`-at-chain-start guard rejects
+        // flattening).
+        let code = "result <-\n  f(data %>%\n";
+        let ctx = detect(code, 2);
+        assert!(
+            matches!(
+                ctx,
+                IndentContext::AfterContinuationOperator {
+                    flattened_rhs: false,
+                    ..
+                }
+            ),
+            "call boundary must restore (no flattening), got {ctx:?}"
+        );
+        // Behavior unchanged from before #611: one level from the chain line.
+        assert_eq!(indent_at(code, 2), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // Fallback path (ERROR trees)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn assignment_in_unparseable_function_body_fires_via_fallback() {
+        // `f <- function() {` ⏎ `  x <-` ⏎ parses with an ERROR node, so
+        // this exercises fallback_detect_context through the public entry.
+        let code = "f <- function() {\n  x <-\n";
+        let ctx = detect(code, 2);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 1,
+                flattened: false,
+            }
+        );
+        assert_eq!(indent_at(code, 2), 4);
+    }
+
+    #[test]
+    fn walrus_in_braces_fires_via_fallback() {
+        let code = "{\n  x :=\n";
+        assert_eq!(indent_at(code, 2), 4);
+    }
+
+    #[test]
+    fn walrus_inside_bracket_defers_to_parens_via_fallback() {
+        // `dt[, y :=` ⏎ routes through the fallback (ERROR tree); the
+        // unclosed `[` defers to bracket-content alignment.
+        let code = "dt[, y :=\n";
+        let ctx = detect(code, 1);
+        assert!(
+            matches!(ctx, IndentContext::InsideParens { .. }),
+            "unclosed `[` must defer, got {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn pushed_down_closers_do_not_defeat_assignment_detection() {
+        // Real editor state: auto-closed `})` pushed onto the cursor line by
+        // Enter. The fallback's closers-only exemption lets detection fall
+        // through to the assignment context instead of aligning the closer.
+        let code = "f(function() {\n  x <-\n})";
+        let ctx = detect(code, 2);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 1,
+                flattened: false,
+            }
+        );
+        assert_eq!(indent_at(code, 2), 4);
+    }
+
+    #[test]
+    fn fallback_direct_assignment_detection() {
+        // Exercise fallback_detect_context directly for the plain shape,
+        // independent of routing.
+        let code = "result <-\n";
+        let ctx = fallback_detect_context(
+            code,
+            Position {
+                line: 1,
+                character: 0,
+            },
+            2,
+        );
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 0,
+                flattened: false,
+            }
+        );
+    }
+
+    #[test]
+    fn fallback_flatten_skips_blank_and_comment_lines() {
+        let code = "result <-\n\n  # prep\n  data %>%\n";
+        let ctx = fallback_detect_context(
+            code,
+            Position {
+                line: 4,
+                character: 0,
+            },
+            2,
+        );
+        assert!(
+            matches!(
+                ctx,
+                IndentContext::AfterContinuationOperator {
+                    flattened_rhs: true,
+                    ..
+                }
+            ),
+            "blank/comment separators must not defeat fallback flattening, got {ctx:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Pipeline columns: the issue's motivating cases, style-independent
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn issue_shapes_have_pinned_columns() {
+        for (code, line, expected) in [
+            ("result <-\n", 1, 2),
+            ("x =\n", 1, 2),
+            ("f <- function() {\n  x <-\n", 2, 4),
+            ("data %>%\n  f() ->\n", 2, 2),
+            ("result <-\n  data %>%\n", 2, 2),
+            ("result <-\n  data %>%\n  filter(x) %>%\n", 3, 2),
+            ("a <-\n  b <-\n", 2, 2),
+        ] {
+            assert_eq!(
+                indent_at(code, line),
+                expected,
+                "column mismatch for {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_indent_is_style_independent() {
+        for style in [IndentationStyle::RStudio, IndentationStyle::RStudioMinus] {
+            for (code, line, expected) in [
+                ("result <-\n", 1, 2),
+                ("f <- function() {\n  x <-\n", 2, 4),
+                ("result <-\n  data %>%\n", 2, 2),
+            ] {
+                let ctx = detect(code, line);
+                assert_eq!(
+                    calculate_indentation(ctx, config(style), code),
+                    expected,
+                    "column mismatch for {code:?} under {style:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enter_before_existing_content_reindents_it() {
+        // Enter pressed with the RHS already typed (content pulled down to
+        // the cursor line): detection still fires and the formatter edit
+        // places the content at column 2.
+        let code = "result <-\nf(x)";
+        let ctx = detect(code, 1);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 0,
+                flattened: false,
+            }
+        );
+        let cfg = config(IndentationStyle::RStudio);
+        let target = calculate_indentation(ctx, cfg.clone(), code);
+        assert_eq!(target, 2);
+        let edit = crate::indentation::format_indentation(1, target, cfg, code);
+        assert_eq!(edit.new_text, "  ");
+        assert_eq!(edit.range.start.line, 1);
+        assert_eq!(edit.range.start.character, 0);
+        assert_eq!(edit.range.end.character, 0);
     }
 }

@@ -86,6 +86,38 @@ result <- function_call(first_arg,
 
 ## Examples
 
+### Assignment Continuations
+
+A line ending in an assignment operator (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) indents the next line one level — in every style, because an assignment's right-hand side is not a peer operand of the left-hand side, so there is nothing to align against:
+
+```r
+result <-
+  compute_something(x)
+```
+
+The level is measured from the line where the assignment *statement* starts. For a right assignment at the end of a chain, that is the chain's first line:
+
+```r
+data %>%
+  f() ->
+  target
+```
+
+Breaking after the operator is the escape hatch for a long left-hand side: the chain that follows gets one level, and subsequent continuations stay at that same level — the assignment already paid for the level, so the chain adds none (mirroring lintr's `assignment_as_infix`, which the linter's [indentation rule](linting.md) applies identically):
+
+```r
+result <-
+  data %>%
+  filter(x > 0) %>%
+  select(y)
+```
+
+The same flattening applies to chained broken assignments (`a <-` ⏎ `b <-` ⏎ puts the final right-hand side at one level, not two).
+
+An assignment operator ending a line *inside* call arguments — including a named argument's or formal default's `=` — keeps the argument alignment of the enclosing call instead ([see above](#styles)); `:=` inside `dt[...]` likewise keeps bracket-content alignment.
+
+Tier 1 has a matching declarative rule for `<-` / `<<-` only, so those two indent even with Tier 2 off; `=`, `:=`, `->`, `->>` need the AST to classify correctly and are Tier 2-only.
+
 ### Pipe Chains
 
 Continuation lines in a pipe chain align under the chain start — for a chain on the right-hand side of an assignment, that is the first operand after the assignment operator:
@@ -104,6 +136,8 @@ data |>
   filter(x > 0) |>
   select(y)
 ```
+
+Exception: when the chain is the right-hand side of an assignment whose operator ends its line, continuations stay at the chain-start line's indent — see [Assignment Continuations](#assignment-continuations).
 
 ### Nested Pipes in Function Calls
 

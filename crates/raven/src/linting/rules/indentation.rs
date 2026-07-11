@@ -956,7 +956,13 @@ fn named_eq_change(node: Node<'_>, out: &mut Vec<Change>) {
 /// assignment whose operator ends its line. Walking up, a call argument or a
 /// braced block "restores" the context (stops the search); a parenthesized
 /// expression does not.
-fn suppressed_as_assignment_rhs(node: Node<'_>) -> bool {
+///
+/// `pub(crate)` because the on-type indenter
+/// (`crate::indentation::context`) evaluates the same predicate when
+/// producing indentation (#611): producer and judge must agree on when the
+/// assignment level is suppressed, so both call this single implementation
+/// rather than maintaining parallel copies that could drift.
+pub(crate) fn suppressed_as_assignment_rhs(node: Node<'_>) -> bool {
     let mut child = node;
     while let Some(parent) = child.parent() {
         match parent.kind() {
@@ -1155,6 +1161,211 @@ mod tests {
 
     fn diagnostic_on_line(diags: &[Diagnostic], line: u32) -> Option<&Diagnostic> {
         diags.iter().find(|diag| diag.range.start.line == line)
+    }
+
+    /// Builds a snippet the way the on-type indenter would: starting from
+    /// the first line, each subsequent content line is placed at the column
+    /// the real `detect_context` → `calculate_indentation` pipeline computes
+    /// for an Enter press at that point. Used to pin the producer→judge
+    /// invariant for #611: the linter never flags what auto-indent produced.
+    fn build_with_auto_indent(first: &str, rest: &[&str]) -> String {
+        use crate::indentation::{
+            IndentationConfig, IndentationStyle, calculate_indentation, detect_context,
+        };
+        use tower_lsp::lsp_types::Position;
+
+        let config = IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+        let mut text = format!("{first}\n");
+        for content in rest {
+            let line = text.lines().count() as u32;
+            let tree = with_parser(|p| p.parse(&text, None)).expect("parse must succeed");
+            let ctx = detect_context(
+                &tree,
+                &text,
+                Position { line, character: 0 },
+                config.tab_size,
+            );
+            let col = calculate_indentation(ctx, config.clone(), &text);
+            text.push_str(&" ".repeat(col as usize));
+            text.push_str(content);
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn issue611_assignment_rhs_one_level_in_every_mode() {
+        // The issue's motivating table, rows 1–2: one level after a broken
+        // assignment is clean everywhere; column 0 (the pre-fix auto-indent
+        // output) is flagged everywhere.
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("result <-\n  f(x)\n", 2, style).is_empty(),
+                "one-level assignment RHS must be clean under {style:?}"
+            );
+            assert_eq!(
+                lint_with_style("result <-\nf(x)\n", 2, style).len(),
+                1,
+                "column-0 assignment RHS must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_broken_assignment_chain_is_flattened_in_every_mode() {
+        // Rows 3–4: a chain under a broken assignment gets no second level.
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("result <-\n  data %>%\n  filter(x)\n", 2, style).is_empty(),
+                "flattened chain must be clean under {style:?}"
+            );
+            assert!(
+                !lint_with_style("result <-\n  data %>%\n    filter(x)\n", 2, style).is_empty(),
+                "double-indented chain must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_chained_assignments_flatten_in_every_mode() {
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("a <-\n  b <-\n  c\n", 2, style).is_empty(),
+                "chained broken assignments must be clean at one level under {style:?}"
+            );
+            assert!(
+                !lint_with_style("a <-\n  b <-\n    c\n", 2, style).is_empty(),
+                "chained broken assignments must not stack levels under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_walrus_rhs_one_level_in_every_mode() {
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("{\n  x :=\n    v\n}\n", 2, style).is_empty(),
+                "`:=` RHS at one level must be clean under {style:?}"
+            );
+            assert!(
+                !lint_with_style("{\n  x :=\n  v\n}\n", 2, style).is_empty(),
+                "un-indented `:=` RHS must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_right_assignment_target_at_statement_level() {
+        // `data %>%` ⏎ `  f() ->` ⏎: the target belongs one level from the
+        // statement start (column 2), not two. Under `Aligned` the chain
+        // line itself is flagged (aligned-mode chain semantics, #610 —
+        // unrelated to the assignment target), so assert on the target line
+        // only there.
+        let text = "data %>%\n  f() ->\n  target\n";
+        for style in [
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Either,
+        ] {
+            assert!(
+                lint_with_style(text, 2, style).is_empty(),
+                "right-assignment target at statement level must be clean under {style:?}"
+            );
+        }
+        let aligned = lint_with_style(text, 2, InfixContinuationStyle::Aligned);
+        assert!(
+            diagnostic_on_line(&aligned, 2).is_none(),
+            "target line must not be flagged under Aligned; got {aligned:?}"
+        );
+        // Two levels on the target line is flagged where the chain shape
+        // itself is accepted (under Aligned the diagnostic lands on the
+        // chain line instead, so the target line carries no separate flag).
+        for style in [
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Either,
+        ] {
+            let deep = lint_with_style("data %>%\n  f() ->\n    target\n", 2, style);
+            assert!(
+                diagnostic_on_line(&deep, 2).is_some(),
+                "double-indented target must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_assignment_in_call_args_paren_alignment_accepted() {
+        // Inside call arguments the indenter defers to paren alignment
+        // (issue #611's `=` decision, applied to every assignment operator);
+        // the judge accepts the operator-hanging and block shapes here.
+        // Pins why the deferral is safe: this shape has lint-accepted forms
+        // that are NOT one-level-from-the-assignment-line.
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style(
+                    "long_function_name(x <-\n                     c)\n",
+                    2,
+                    style
+                )
+                .is_empty(),
+                "operator-hanging RHS inside call args must be clean under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_auto_indent_output_is_never_flagged() {
+        // Producer→judge round trip: build each snippet through the real
+        // indentation pipeline, then assert the linter accepts the result.
+        let built_cases: [(String, &str); 3] = [
+            (
+                build_with_auto_indent("result <-", &["f(x)"]),
+                "plain assignment",
+            ),
+            (
+                build_with_auto_indent("result <-", &["data %>%", "filter(x)"]),
+                "broken-assignment pipe chain",
+            ),
+            (
+                format!(
+                    "{}}}\n",
+                    build_with_auto_indent("f <- function() {", &["x <-", "value"])
+                ),
+                "assignment in function body",
+            ),
+        ];
+        for (text, name) in &built_cases {
+            for style in ALL_STYLES {
+                assert!(
+                    lint_with_style(text, 2, style).is_empty(),
+                    "auto-indent output for {name} must be clean under {style:?}; \
+                     built {text:?}, got {:?}",
+                    lint_with_style(text, 2, style)
+                );
+            }
+        }
+
+        // Right assignment after a chain: clean under Indented/Either; under
+        // Aligned only the chain line is flagged (#610 aligned-mode chain
+        // semantics), never the auto-indented target line.
+        let text = build_with_auto_indent("data %>%", &["f() ->", "target"]);
+        assert_eq!(text, "data %>%\n  f() ->\n  target\n");
+        for style in [
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Either,
+        ] {
+            assert!(
+                lint_with_style(&text, 2, style).is_empty(),
+                "auto-indent output for right assignment must be clean under {style:?}"
+            );
+        }
+        let aligned = lint_with_style(&text, 2, InfixContinuationStyle::Aligned);
+        assert!(
+            diagnostic_on_line(&aligned, 2).is_none(),
+            "auto-indented target line must not be flagged under Aligned; got {aligned:?}"
+        );
     }
 
     #[test]
