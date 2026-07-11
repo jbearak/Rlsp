@@ -107,12 +107,8 @@ mod lintr_parity;
 pub mod rule_ids;
 mod rules;
 
-/// Re-exported for the on-type indenter (`crate::indentation::context`),
-/// which must apply the same `assignment_as_infix` suppression the
-/// indentation lint judges by (#611). See the function's own doc comment.
 pub(crate) use rules::indentation::{
     IndentKind, LineIndentExpectation, accepted_indents_for_lines, leading_space_count,
-    suppressed_as_assignment_rhs,
 };
 
 #[cfg(test)]

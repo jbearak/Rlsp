@@ -613,12 +613,14 @@ Brief orientation for modules outside the cross-file and package-library subsyst
 
 ### Judge-backed Tier 2 indentation (#611)
 
-Tier 2 enters through `indentation::on_type_indentation`: it first uses the
-judge-backed path in [`indentation/judge.rs`](../crates/raven/src/indentation/judge.rs)
-and falls back to the legacy `detect_context` / `calculate_indentation` path.
+Tier 2 enters through `indentation::on_type_indentation` and uses the
+judge-backed path in [`indentation/judge.rs`](../crates/raven/src/indentation/judge.rs).
 The judge queries the same expectation engine as the indentation lint; see
-`accepted_indents_for_line`, `LineIndentExpectation`, and `IndentKind` in
+`accepted_indents_for_lines`, `LineIndentExpectation`, and `IndentKind` in
 [`linting/rules/indentation.rs`](../crates/raven/src/linting/rules/indentation.rs).
+There is no secondary indentation engine: when repair-and-ask returns `None`,
+the backend emits no edit and preserves the Tier 1/native indentation the
+editor applied before sending `textDocument/onTypeFormatting`.
 
 Maintain these boundaries:
 
@@ -629,12 +631,9 @@ Maintain these boundaries:
   stack; pushed-down closers reappear once, below the sentinel and before the
   closers synthesized for the still-open outer delimiters, each on its own
   line so bracket changes retain the lint's closer-on-own-line classification.
-  The judge's delimiter scan (`unclosed_delimiters_for_judge`) is its own
-  tree-coverage-masked implementation — it is NOT shared with the legacy
-  fallback's `unclosed_delimiters_heuristic` in `indentation/context.rs`, so
-  string/comment/backtick handling changes must be applied to whichever
-  scanner the affected tier uses.
-- The judge bails out to the legacy fallback for: multiline string and
+  Its delimiter scan (`unclosed_delimiters_for_judge`) masks tree-covered
+  strings, comments, and backquoted identifiers before synthesizing closers.
+- The judge returns `None` for multiline string and
   backtick-identifier interiors; unanswerable positions; a tabs-mode editor
   (`insertSpaces: false`) or a real (non-string) tab inside the active
   context — the rows from the outermost unclosed opener or the reference
@@ -644,8 +643,7 @@ Maintain these boundaries:
   nearest checkable line above the probe (the reference line) that does not
   sit at a lint-accepted column — the expectation model accumulates from
   column 0, so only lint-conforming context can be answered without
-  collapsing a user's offset indentation (the legacy path anchors to
-  physical indentation instead). Tabs and syntax errors on unrelated earlier
+  collapsing a user's offset indentation. Tabs and syntax errors on unrelated earlier
   statements do not disable the judge — the lint's own fold tolerates both.
 - On-type queries use the per-line expectation fold
   (`accepted_indents_for_lines`), which collects and sorts the change list
@@ -662,6 +660,40 @@ Maintain these boundaries:
 - `IndentKind` tags preserve each accepted column's provenance. `TopLevel`
   contributions created by expectation merging are never preference targets;
   selecting them recreates the accepted-0 trap.
+
+#### Latency budget
+
+On-type indentation must answer in p95 ≤ 16 ms at the bottom of a 10,000-line
+R document and ≤ 50 ms on a 100,000-line stress document in a release build.
+The Criterion benchmark
+`on_type_indentation/enter_bottom_10000_lines` in
+`crates/raven/benches/indentation.rs` measures the full
+`on_type_indentation` path. Per-request recomputation of the line index,
+masked intervals, and indentation-change collection is deliberate because
+those inputs cannot be stale. Revision-keyed caching is declined until a
+measured budget breach justifies the added invalidation state.
+
+#### Declined findings registry
+
+- **Escaped backticks in backquoted names:** R rejects them; commit
+  `93a3ca03` pins this as a does-not-fire test. Reconsider if R's grammar or
+  the supported parser begins accepting that spelling.
+- **Scanner unification:** moot because the legacy scanners and fallback
+  engine are deleted. Reconsider only if a second indentation producer is
+  intentionally introduced.
+- **Per-Enter O(document) prefix work:** accepted while it remains below the
+  latency budget above. Reconsider after a reproducible benchmark breach.
+- **Indent-unit-change republish filter resolves open documents twice:** this
+  is a cold O(open documents) path that runs only on indent-unit-change
+  notifications. Reconsider if profiling shows those notifications on a hot
+  path or workspaces with many open documents miss their budget.
+- **Rmd language-config generator matches the assignment rule by regex text:**
+  its exact-count assertion fails loudly. If that generator is touched, a
+  shared regex constant is the preferred upgrade.
+- **Deleting Tier 1 `onEnterRules`:** declined because issue #611 specifies
+  the `<-`/`<<-` Tier 1 rule and #610 defines per-axis `off` as “Tier 2
+  stands down; Tier 1 stands.” Reconsider only if those product contracts
+  change.
 
 - **`package_state/`** — Derived state for R package mode. Owns workspace detection result, namespace model, per-file facts (exported symbols, roxygen tags), and the aggregate scope contribution. Fully derive-based: `derive_package_state()` recomputes the entire `PackageState` from inputs.
 

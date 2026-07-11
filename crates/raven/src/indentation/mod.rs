@@ -1,15 +1,16 @@
-//! R Smart Indentation Module
+//! R smart indentation.
 //!
-//! This module provides AST-aware indentation for R code through the LSP
-//! `textDocument/onTypeFormatting` handler. It implements a context-based
-//! approach that detects syntactic context (pipe chains, function arguments,
-//! brace blocks) and computes appropriate indentation.
+//! Tier 2 indentation is judge-or-nothing: the on-type formatting handler
+//! repairs the just-edited buffer and asks the indentation lint's expectation
+//! engine for a valid column. When the judge cannot answer, this module returns
+//! `None` and emits no edit, preserving the indentation already supplied by
+//! the editor's Tier 1 rules or native indentation.
 //!
-//! # Architecture
-//!
-//! - `context`: Detects syntactic context at cursor position using tree-sitter AST
-//! - `calculator`: Computes indentation amount based on context and style configuration
-//! - `formatter`: Generates LSP TextEdit for indentation replacement
+//! The judge deliberately declines inside multiline string-like nodes, in
+//! tabs-mode or tab-shaped active contexts, when syntax errors intersect its
+//! reference-to-probe window, and when the surrounding reference indentation
+//! does not conform to the lint's accepted set. Invalid or ambiguous repairs
+//! likewise produce no answer.
 
 use tower_lsp::lsp_types::DocumentOnTypeFormattingOptions;
 use tower_lsp::lsp_types::Position;
@@ -17,25 +18,24 @@ use tree_sitter::Tree;
 
 use crate::linting::InfixContinuationStyle;
 
-mod calculator;
-mod context;
+mod config;
 mod formatter;
 mod judge;
 
-pub use calculator::{IndentationConfig, IndentationStyle, calculate_indentation};
-pub use context::{IndentContext, OperatorType, detect_context};
+pub use config::{IndentationConfig, IndentationStyle};
 pub use formatter::format_indentation;
 
-/// Tier 2 on-type indent for an Enter press: repair-and-ask against the
-/// lint's expectation engine, falling back to the legacy
-/// `detect_context`/`calculate_indentation` path when the judge cannot answer.
+/// Tier 2 on-type indent for an Enter press.
+///
+/// Returns the lint expectation engine's selected column, or `None` when the
+/// judge cannot answer so the caller can preserve the editor's indentation.
 pub fn on_type_indentation(
     tree: &Tree,
     source: &str,
     position: Position,
     config: &IndentationConfig,
     infix_style: InfixContinuationStyle,
-) -> u32 {
+) -> Option<u32> {
     on_type_indentation_with_judge_unit(
         tree,
         source,
@@ -46,8 +46,7 @@ pub fn on_type_indentation(
     )
 }
 
-/// Backend entry that lets the judge use the lint's resolved indentation
-/// unit while preserving the editor unit for the frozen legacy fallback.
+/// Backend entry that lets the judge use the lint's resolved indentation unit.
 pub(crate) fn on_type_indentation_with_judge_unit(
     tree: &Tree,
     source: &str,
@@ -55,7 +54,7 @@ pub(crate) fn on_type_indentation_with_judge_unit(
     config: &IndentationConfig,
     judge_indent_unit: u32,
     infix_style: InfixContinuationStyle,
-) -> u32 {
+) -> Option<u32> {
     let judge_config = IndentationConfig {
         tab_size: judge_indent_unit,
         ..config.clone()
@@ -64,14 +63,11 @@ pub(crate) fn on_type_indentation_with_judge_unit(
         judge::judge_backed_indentation(tree, source, position, &judge_config, infix_style)
     {
         log::trace!("on_type_indentation: judge-backed tier selected column {column}");
-        return column;
+        return Some(column);
     }
 
-    log::trace!("on_type_indentation: falling back to legacy context detection");
-    let context = detect_context(tree, source, position, config.tab_size);
-    let column = calculate_indentation(context, config.clone(), source);
-    log::trace!("on_type_indentation: legacy fallback tier selected column {column}");
-    column
+    log::trace!("on_type_indentation: judge bailed; preserving editor indentation");
+    None
 }
 
 /// Returns the LSP capability options for on-type formatting.
@@ -113,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn multiline_string_interior_uses_legacy_fallback_column() {
+    fn multiline_string_interior_preserves_editor_indentation() {
         let source = "text <- \"first\nstill open\n";
         let tree = with_parser(|parser| parser.parse(source, None)).expect("parse must succeed");
         let config = IndentationConfig {
@@ -130,14 +126,11 @@ mod tests {
             InfixContinuationStyle::Indented,
         );
 
-        assert_eq!(
-            column, 0,
-            "judge bail must preserve the legacy multiline-string column"
-        );
+        assert_eq!(column, None, "multiline-string interiors must emit no edit");
     }
 
     #[test]
-    fn offset_context_uses_legacy_physical_anchor() {
+    fn offset_context_preserves_editor_indentation() {
         let source = "    {\n";
         let tree = with_parser(|parser| parser.parse(source, None)).expect("parse must succeed");
         let config = IndentationConfig {
@@ -154,9 +147,6 @@ mod tests {
             InfixContinuationStyle::Indented,
         );
 
-        assert_eq!(
-            column, 6,
-            "an offset opener must keep the legacy physical-indent anchor"
-        );
+        assert_eq!(column, None, "offset contexts must emit no edit");
     }
 }

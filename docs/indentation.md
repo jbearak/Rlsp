@@ -9,9 +9,9 @@ Both tiers are active by default.
 | Tier | What It Does | How It Works |
 |------|-------------|--------------|
 | **Tier 1** | Basic indentation for pipes, operators, brackets | Declarative regex rules in VS Code's language configuration |
-| **Tier 2** | AST-aware indentation with style-specific alignment | LSP `onTypeFormatting` via the indentation lint's expectation engine, with a legacy context fallback |
+| **Tier 2** | AST-aware indentation with style-specific alignment | LSP `onTypeFormatting` via the indentation lint's expectation engine |
 
-When you press Enter, Tier 1 applies first (regex-based), then Tier 2 replaces the result with a more precise indentation computed from the AST. If Tier 2 is disabled, Tier 1's result stands.
+When you press Enter, Tier 1 applies first (regex-based), then Tier 2 replaces the result when the expectation engine can compute a more precise indentation from the AST. If Tier 2 is disabled or cannot answer, Tier 1's/native result stands.
 
 ## How It Works
 
@@ -39,7 +39,20 @@ When you press Enter, Tier 1 applies first (regex-based), then Tier 2 replaces t
 
 Style names follow the [ESS (Emacs Speaks Statistics)](https://ess.r-project.org/) conventions: `rstudio` matches the RStudio IDE's default alignment; `rstudio-minus` (`RStudio-` in ESS) drops same-line paren alignment.
 
-The style controls which lint-accepted layout Tier 2 prefers; it does not change which layouts the indentation lint accepts. `rstudio` prefers paren-argument and operator-chain alignment, while `rstudio-minus` prefers the corresponding block indent. The lint's separate [`infixContinuationStyle`](linting.md#indentation) setting determines which operator-continuation layouts are accepted, and Tier 2 always chooses from that accepted set. Consequently, the indentation lint never flags a column that auto-indent just produced. (On inputs where the expectation engine cannot answer — an unterminated multiline string, tab-indented context or a tabs-mode editor, or surrounding code that doesn't sit at a lint-accepted column — Tier 2 falls back to its legacy context-based indenter, which anchors to physical indentation instead and approximates rather than guarantees lint acceptance.)
+The style controls which lint-accepted layout Tier 2 prefers; it does not change which layouts the indentation lint accepts. `rstudio` prefers paren-argument and operator-chain alignment, while `rstudio-minus` prefers the corresponding block indent. The lint's separate [`infixContinuationStyle`](linting.md#indentation) setting determines which operator-continuation layouts are accepted, and Tier 2 always chooses from that accepted set. Consequently, the indentation lint never flags a column that auto-indent just produced.
+
+### When Tier 2 cannot answer
+
+When the expectation engine cannot answer, Raven leaves the editor's
+indentation unchanged. The editor has already applied its Tier 1
+`onEnterRules` and native indentation before it asks Raven for on-type
+formatting, so emitting no edit preserves that answer.
+
+The known fall-through classes are multiline-string or multiline-backtick
+interiors, tabs-mode or a real tab in the active indentation context, syntax
+error windows that remain unrepairable, and surrounding reference lines whose
+indentation does not conform to the lint's accepted columns. Ambiguous or
+out-of-bounds repair positions also leave the editor's indentation unchanged.
 
 ### Disabling Tier 2
 
@@ -160,7 +173,7 @@ Broken assignments still flatten later operator continuations unless a bracket o
 
 An assignment operator ending a line *inside* call arguments — including a named argument's or formal default's `=` — likewise keeps a lint-accepted argument layout for the enclosing call ([see above](#styles)).
 
-Tier 1 has a matching declarative rule for `<-` / `<<-` only, so those two indent even with Tier 2 off; `=`, `:=`, `->`, `->>` need Tier 2 to classify correctly. Like every Tier 1 rule, the regex sees only one line and cannot flatten a chain. Tier 2 first asks the indentation lint's expectation engine, so every answer it emits is lint-accepted; when that engine cannot answer, Tier 2 falls back to Raven's legacy context-based indenter.
+Tier 1 has a matching declarative rule for `<-` / `<<-` only, so those two indent even with Tier 2 off; `=`, `:=`, `->`, `->>` need Tier 2 to classify correctly. Like every Tier 1 rule, the regex sees only one line and cannot flatten a chain. Tier 2 first asks the indentation lint's expectation engine, so every answer it emits is lint-accepted; when that engine cannot answer, Raven emits no edit and preserves Tier 1/native indentation.
 
 ### Pipe Chains
 
@@ -232,7 +245,7 @@ Tier 2 replaces Tier 1's indentation, so doubling shouldn't happen. If it does, 
 
 ### Pipe chains not aligning correctly
 
-Tier 2 first asks the indentation lint's expectation engine and falls back to its legacy context detection when that path cannot answer. Both paths treat a blank line as a chain break, so check that:
+Tier 2 asks the indentation lint's expectation engine. If it cannot answer, Raven preserves the editor's indentation. For unexpected pipe indentation, check that:
 
 1. There's no blank line breaking the chain
 2. Each line ends with a continuation operator (`%>%`, `|>`, `+`, `~`, or `%infix%`)

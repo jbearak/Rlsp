@@ -3,7 +3,7 @@
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{InputEdit, Node, Point, Tree};
 
-use super::calculator::{IndentationConfig, IndentationStyle};
+use super::config::{IndentationConfig, IndentationStyle};
 use crate::linting::{
     IndentKind, InfixContinuationStyle, LineIndentExpectation, accepted_indents_for_lines,
     leading_space_count,
@@ -79,8 +79,8 @@ impl SelectionPrefs {
 /// (which legal column to produce). They live in different settings namespaces
 /// and must never be conflated.
 ///
-/// Returns `None` when the repair-and-ask path cannot answer, so the caller can
-/// fall back to the legacy `detect_context` / `calculate_indentation` path.
+/// Returns `None` when the repair-and-ask path cannot answer, so the caller
+/// emits no edit and the editor's Tier 1/native indentation stands.
 /// Beyond unanswerable repairs, the judge deliberately declines in three
 /// situations where its character-column model would misfire:
 ///
@@ -1113,8 +1113,8 @@ mod tests {
     fn unrelated_earlier_errors_do_not_disable_the_judge() {
         let cfg = config(IndentationStyle::RStudio);
         // The malformed `x +*` statement sits outside the reference-to-probe
-        // window (its reference is the `f(` line) and must not force the
-        // legacy fallback — the lint's own fold tolerates it too.
+        // window (its reference is the `f(` line) and must not make the
+        // judge bail — the lint's own fold tolerates it too.
         assert_eq!(
             judge(
                 "x +*\n\ny <- 1\nf(\n",

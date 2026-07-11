@@ -1315,13 +1315,7 @@ fn named_eq_change(node: Node<'_>, out: &mut Vec<Change>) {
 /// assignment whose operator ends its line. Walking up, a call argument or a
 /// braced block "restores" the context (stops the search); a parenthesized
 /// expression does not.
-///
-/// `pub(crate)` because the on-type indenter
-/// (`crate::indentation::context`) evaluates the same predicate when
-/// producing indentation (#611): producer and judge must agree on when the
-/// assignment level is suppressed, so both call this single implementation
-/// rather than maintaining parallel copies that could drift.
-pub(crate) fn suppressed_as_assignment_rhs(node: Node<'_>) -> bool {
+fn suppressed_as_assignment_rhs(node: Node<'_>) -> bool {
     let mut child = node;
     while let Some(parent) = child.parent() {
         match parent.kind() {
@@ -1768,7 +1762,7 @@ mod tests {
 
     /// Builds a snippet the way the on-type indenter would: starting from
     /// the first line, each subsequent content line is placed at the column
-    /// the real judge-first on-type pipeline computes for an Enter press at
+    /// the real judge-backed on-type pipeline computes for an Enter press at
     /// that point. Used to pin the producer→judge invariant for #611: the
     /// linter never flags what auto-indent produced.
     fn build_with_auto_indent(first: &str, rest: &[&str]) -> String {
@@ -1798,7 +1792,8 @@ mod tests {
                 Position { line, character: 0 },
                 &config,
                 infix_style,
-            );
+            )
+            .expect("the producer/judge invariant fixtures must be answerable");
             text.push_str(&" ".repeat(col as usize));
             text.push_str(content);
             text.push('\n');
@@ -1987,7 +1982,7 @@ mod tests {
     fn issue611_comment_interrupted_chain_target_at_statement_level() {
         // A comment-only line inside the chain does not move the statement
         // start: the `->` target belongs at the chain's block level (4),
-        // matching the indenter's comment-transparent ChainWalker output.
+        // matching the judge's comment-transparent chain handling.
         // Under `Aligned` the chain lines themselves are flagged (aligned
         // chains sit at the chain-start column — #610 semantics, unrelated
         // to the target), so assert on the target line only there.

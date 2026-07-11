@@ -9385,14 +9385,19 @@ impl LanguageServer for Backend {
         }
 
         // Calculate target indentation
-        let target_column = indentation::on_type_indentation_with_judge_unit(
+        let Some(target_column) = indentation::on_type_indentation_with_judge_unit(
             &tree,
             &source,
             position,
             &config,
             judge_indent_unit,
             infix_style,
-        );
+        ) else {
+            log::trace!(
+                "on_type_formatting: judge could not answer; preserving editor indentation"
+            );
+            return Ok(None);
+        };
 
         // Generate TextEdit (Requirement 8.4)
         let edit = indentation::format_indentation(position.line, target_column, config, &source);
@@ -25421,6 +25426,24 @@ lineLength = 200
         assert_eq!(edits[0].range.start.line, 1);
         assert_eq!(edits[0].range.start.character, 0);
         assert_eq!(edits[0].range.end.character, 0);
+    }
+
+    /// Issue #611: a judge bail preserves the indentation already applied by
+    /// the editor by returning no LSP edit.
+    #[tokio::test]
+    async fn on_type_formatting_emits_no_edit_when_judge_bails() {
+        let tmp = TempDir::new().unwrap();
+        let content = "text <- \"first\nstill open\n";
+        fs::write(tmp.path().join("script.R"), content).unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "script.R", "r", content).await;
+
+        let edits = svc
+            .inner()
+            .on_type_formatting(on_type_params(&uri, 2, 0))
+            .await
+            .expect("on_type_formatting must not error");
+
+        assert_eq!(edits, None);
     }
 
     #[tokio::test]

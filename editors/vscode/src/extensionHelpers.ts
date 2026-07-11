@@ -16,17 +16,12 @@ const R_DOCUMENT_EXTENSIONS = new Set([
 ]);
 
 const INDENT_UNIT_DOCUMENT_LANGUAGE_IDS = new Set([
-    'r',
-    'jags',
-    'stan',
+    ...R_DOCUMENT_LANGUAGE_IDS,
     'rmd',
     'quarto',
 ]);
 const INDENT_UNIT_DOCUMENT_EXTENSIONS = new Set([
-    '.r',
-    '.jags',
-    '.bugs',
-    '.stan',
+    ...R_DOCUMENT_EXTENSIONS,
     '.rmd',
     '.rmarkdown',
     '.qmd',
@@ -58,13 +53,10 @@ export function isRDocument(
 export function isIndentUnitDocument(
     document: Pick<vscode.TextDocument, 'isUntitled' | 'languageId' | 'uri'>,
 ): boolean {
-    if (document.isUntitled) {
-        return INDENT_UNIT_DOCUMENT_LANGUAGE_IDS.has(document.languageId);
-    }
-
-    return INDENT_UNIT_DOCUMENT_EXTENSIONS.has(
-        path.extname(document.uri.fsPath).toLowerCase(),
-    );
+    return INDENT_UNIT_DOCUMENT_LANGUAGE_IDS.has(document.languageId)
+        || INDENT_UNIT_DOCUMENT_EXTENSIONS.has(
+            path.extname(document.uri.fsPath).toLowerCase(),
+        );
 }
 
 type TabLike = { input: unknown; isActive?: boolean };

@@ -196,9 +196,10 @@ suite('Extension Helpers', () => {
     test('isIndentUnitDocument accepts supported file-backed extensions', () => {
         const makeFileDocument = (
             filePath: string,
+            languageId = 'plaintext',
         ): Pick<vscode.TextDocument, 'isUntitled' | 'languageId' | 'uri'> => ({
             isUntitled: false,
-            languageId: 'plaintext',
+            languageId,
             uri: vscode.Uri.file(filePath),
         });
 
@@ -209,6 +210,18 @@ suite('Extension Helpers', () => {
         assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/report.rmarkdown')), true);
         assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/report.qmd')), true);
         assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/notes.txt')), false);
+        assert.strictEqual(
+            isIndentUnitDocument(makeFileDocument('/tmp/no-extension', 'r')),
+            true,
+        );
+        assert.strictEqual(
+            isIndentUnitDocument(makeFileDocument('/tmp/notes.txt', 'rmd')),
+            true,
+        );
+        assert.strictEqual(
+            isIndentUnitDocument(makeFileDocument('/tmp/notes.txt', 'quarto')),
+            true,
+        );
     });
 
     test('getUpdatedGlobalLanguageConfig creates a global override when missing', () => {

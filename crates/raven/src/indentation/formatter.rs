@@ -5,7 +5,7 @@
 
 use tower_lsp::lsp_types::{Position, Range, TextEdit};
 
-use super::calculator::IndentationConfig;
+use super::config::IndentationConfig;
 
 /// Generates a TextEdit that replaces existing indentation with the target indentation.
 ///
