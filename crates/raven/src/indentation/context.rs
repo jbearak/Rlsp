@@ -204,9 +204,12 @@ fn classify_continuation_operator(trimmed: &str) -> Option<OperatorType> {
 /// same contract as [`classify_continuation_operator`]. The two classifiers
 /// are deliberately separate: assignment operators must NOT count as chain
 /// members ([`ChainWalker`] stops at an assignment-ended line, keeping the
-/// chain start on the RHS's first line), and `%<-%`-style custom operators
-/// keep classifying as [`OperatorType::CustomInfix`] because the
-/// continuation classifier runs first in every caller.
+/// chain start on the RHS's first line), and `%…%` custom operators are the
+/// continuation classifier's business (it runs first in every caller). A
+/// line ending in a `%`-delimited operator never reaches the arms below —
+/// it ends in `%`, not in an assignment token — so e.g. zeallot's `%<-%`
+/// is not an assignment here (nor a recognized custom infix today:
+/// `is_custom_infix_ending` rejects `-` between the percent signs).
 ///
 /// The `=` arm excludes `==`, `<=`, `>=`, `!=`; `:=` is matched before `=`.
 fn classify_assignment_operator(trimmed: &str) -> Option<&'static str> {
@@ -5644,6 +5647,24 @@ mod assignment_context_tests {
         assert!(
             !matches!(ctx, IndentContext::AfterAssignmentOperator { .. }),
             "%<-% must not classify as assignment, got {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn raw_string_with_quote_and_hash_fires() {
+        // Tier 2's tokenizer understands raw strings, so a `"` + `#` inside
+        // one does not hide the trailing operator (the Tier 1 regex cannot
+        // express raw strings — pinned as a known limitation in
+        // tests/bun/on-enter-rules.test.ts — which makes this coverage the
+        // load-bearing one).
+        let code = "x[r\"(a\"#b)\"] <-\n";
+        let ctx = detect(code, 1);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 0,
+                flattened: false,
+            }
         );
     }
 

@@ -97,4 +97,15 @@ describe('assignment onEnterRule (#611)', () => {
         const re = assignmentRule();
         expect(re.test('looks like <-')).toBe(true);
     });
+
+    test('known limitation: raw strings are not recognized', () => {
+        // R raw strings (`r"(...)"` with any number of dashes and three
+        // delimiter pairs) are beyond a single regex alternative, so a raw
+        // string containing `"` and `#` before the operator is a false
+        // NEGATIVE — the rule stays silent and Tier 2 (whose tokenizer does
+        // understand raw strings) supplies the indent when active. Pinned
+        // so a future fix is deliberate rather than accidental.
+        const re = assignmentRule();
+        expect(re.test('x[r"(a"#b)"] <-')).toBe(false);
+    });
 });
