@@ -587,6 +587,20 @@ fn should_use_fallback(root: Node, source: &str, position: Position) -> bool {
 ///
 /// The detected `IndentContext` based on regex heuristics.
 fn fallback_detect_context(source: &str, position: Position, tab_size: u32) -> IndentContext {
+    // 0. Enter inside a multiline string must not restructure literal
+    // content: assignment-looking text like `looks like <-` is string data.
+    // The AST path rejects this shape by validating operator nodes
+    // (`detect_assignment_continuation`) and answers column 0 for string
+    // interiors, but a malformed buffer can swallow the string into an
+    // ERROR subtree with no string node left to check — so this path must
+    // fall back to text-level cross-line quote tracking. Mirror the AST
+    // path's column-0 answer.
+    if line_starts_inside_string_heuristic(source, position.line) {
+        return IndentContext::AfterCompleteExpression {
+            enclosing_block_indent: 0,
+        };
+    }
+
     // 1. Check if current line starts with closing delimiter
     if let Some(line_text) = source.lines().nth(position.line as usize) {
         let trimmed = line_text.trim_start();
@@ -803,90 +817,40 @@ pub(super) fn unclosed_delimiters_heuristic(
     // Track unclosed delimiters with their positions
     let mut stack: Vec<(u32, u32, char)> = Vec::new();
 
-    // Process lines up to (but not including) current line
+    // Process lines up to (but not including) current line. String masking
+    // is shared with `strip_trailing_comment` via `StringScanState`: the
+    // delimiters inside `r"(...)"` are string content, not brackets
+    // (otherwise `x[r"(a"#b)"] <-` hallucinates an unclosed `[`).
     for line_idx in 0..current_line as usize {
         let line_text = lines.get(line_idx)?;
         let stripped = strip_trailing_comment(line_text);
 
-        let mut in_string = false;
-        let mut string_char = '"';
-        let mut escape_next = false;
-        let mut in_raw_string = false;
-        let mut raw_close_delim = ')';
-        let mut skip_raw_close_quote = false;
+        let mut state = StringScanState::default();
         let bytes = stripped.as_bytes();
-
         for (col, ch) in stripped.char_indices() {
-            if escape_next {
-                escape_next = false;
+            if !state.step(bytes, col, ch) {
                 continue;
             }
-            // Raw-string handling mirrors `strip_trailing_comment`: the
-            // delimiters inside `r"(...)"` are string content, not brackets
-            // (otherwise `x[r"(a"#b)"] <-` hallucinates an unclosed `[`).
-            if skip_raw_close_quote {
-                skip_raw_close_quote = false;
-                continue;
-            }
-            if in_raw_string {
-                if ch == raw_close_delim {
-                    let next_byte = col + ch.len_utf8();
-                    if next_byte < bytes.len() && bytes[next_byte] == b'"' {
-                        in_raw_string = false;
-                        skip_raw_close_quote = true;
+            match ch {
+                '(' | '[' | '{' => {
+                    stack.push((line_idx as u32, col as u32, ch));
+                }
+                ')' => {
+                    if let Some((_, _, '(')) = stack.last() {
+                        stack.pop();
                     }
                 }
-                continue;
-            }
-            // No escape handling inside backticks — same rule and rationale
-            // as `strip_trailing_comment`.
-            if ch == '\\' && in_string && string_char != '`' {
-                escape_next = true;
-                continue;
-            }
-            if !in_string && (ch == 'r' || ch == 'R') {
-                let next_byte = col + 1;
-                if next_byte + 1 < bytes.len() && bytes[next_byte] == b'"' {
-                    let close = match bytes[next_byte + 1] {
-                        b'(' => Some(')'),
-                        b'[' => Some(']'),
-                        b'{' => Some('}'),
-                        _ => None,
-                    };
-                    if let Some(cd) = close {
-                        in_raw_string = true;
-                        raw_close_delim = cd;
-                        continue;
+                ']' => {
+                    if let Some((_, _, '[')) = stack.last() {
+                        stack.pop();
                     }
                 }
-            }
-            if !in_string && (ch == '"' || ch == '\'' || ch == '`') {
-                in_string = true;
-                string_char = ch;
-            } else if in_string && ch == string_char {
-                in_string = false;
-            } else if !in_string {
-                match ch {
-                    '(' | '[' | '{' => {
-                        stack.push((line_idx as u32, col as u32, ch));
+                '}' => {
+                    if let Some((_, _, '{')) = stack.last() {
+                        stack.pop();
                     }
-                    ')' => {
-                        if let Some((_, _, '(')) = stack.last() {
-                            stack.pop();
-                        }
-                    }
-                    ']' => {
-                        if let Some((_, _, '[')) = stack.last() {
-                            stack.pop();
-                        }
-                    }
-                    '}' => {
-                        if let Some((_, _, '{')) = stack.last() {
-                            stack.pop();
-                        }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -1136,7 +1100,7 @@ fn find_subchain_start(
     outermost: tree_sitter::Node,
     target_class: u8,
     source: &str,
-) -> Option<u32> {
+) -> Option<tree_sitter::Point> {
     let mut current = outermost;
     loop {
         let lhs = current.child(0)?;
@@ -1148,9 +1112,27 @@ fn find_subchain_start(
             _ => {
                 // Cross-class boundary: sub-chain starts at RHS of this node.
                 let rhs = lhs.child(2)?;
-                return Some(rhs.start_position().column as u32);
+                return Some(rhs.start_position());
             }
         }
+    }
+}
+
+/// Convert a tree-sitter byte column on `row` to the visual measure the
+/// calculator's formulas consume (`get_line_indent`'s unit: tabs expand to
+/// `tab_size`, every other character counts one). Tree-sitter `Point`
+/// columns are byte offsets, so a multibyte character before the column
+/// would otherwise overshoot the alignment target.
+fn visual_col_at(source: &str, row: u32, byte_col: usize, tab_size: u32) -> u32 {
+    let Some(line) = source.lines().nth(row as usize) else {
+        return byte_col as u32;
+    };
+    match line.get(..byte_col) {
+        Some(prefix) => prefix
+            .chars()
+            .map(|c| if c == '\t' { tab_size } else { 1 })
+            .sum(),
+        None => byte_col as u32,
     }
 }
 
@@ -1242,6 +1224,7 @@ fn find_chain_start_from_ast(
     tree: &Tree,
     source: &str,
     prev_line: u32,
+    tab_size: u32,
 ) -> Option<(u32, u32, bool)> {
     let root = tree.root_node();
 
@@ -1297,16 +1280,19 @@ fn find_chain_start_from_ast(
     }
 
     // For mixed chains, find_subchain_start returns the sub-chain's first
-    // operand column. Use outermost's start line (which has the expression
+    // operand position. Use outermost's start line (which has the expression
     // root's indent level) so the calculator formula produces correct results.
     // For single-class chains, use outermost's start position directly.
+    // Columns convert from tree-sitter byte offsets to the calculator's
+    // visual measure (`visual_col_at`) on the column's own row.
     let flattened = crate::linting::suppressed_as_assignment_rhs(outermost)
         && !chain_hangs_in_same_line_bracket(outermost);
     let start = outermost.start_position();
-    match find_subchain_start(outermost, our_class, source) {
-        Some(sub_col) => Some((start.row as u32, sub_col, flattened)),
-        None => Some((start.row as u32, start.column as u32, flattened)),
-    }
+    let column = match find_subchain_start(outermost, our_class, source) {
+        Some(sub) => visual_col_at(source, sub.row as u32, sub.column, tab_size),
+        None => visual_col_at(source, start.row as u32, start.column, tab_size),
+    };
+    Some((start.row as u32, column, flattened))
 }
 
 /// Whether an assignment `binary_operator` sits in paren/bracket context,
@@ -1451,27 +1437,28 @@ fn detect_continuation_operator(
     // exactly (via the lint's predicate); the text path approximates it and
     // guards the restorer shape (chain inside a call opened at or after the
     // chain start — see `flattening_suppressor_line`).
-    let (chain_start_line, chain_start_col, flattened_floor) =
-        if let Some((line, col, flattened)) = find_chain_start_from_ast(tree, source, prev_line) {
-            let floor = flattened.then(|| {
-                flattening_suppressor_line(source, line)
-                    .map(|row| flattening_floor_from_suppressor(source, row, tab_size))
-                    .unwrap_or(0)
-            });
-            (line, col, floor)
-        } else {
-            let walker = ChainWalker::new(source, tab_size);
-            let (line, col) = walker.find_chain_start(position.line);
-            let floor = flattening_suppressor_line(source, line)
-                .filter(|_| {
-                    !matches!(
-                        find_unclosed_delimiter_heuristic(source, position.line),
-                        Some((row, _, _)) if row >= line
-                    )
-                })
-                .map(|row| flattening_floor_from_suppressor(source, row, tab_size));
-            (line, col, floor)
-        };
+    let (chain_start_line, chain_start_col, flattened_floor) = if let Some((line, col, flattened)) =
+        find_chain_start_from_ast(tree, source, prev_line, tab_size)
+    {
+        let floor = flattened.then(|| {
+            flattening_suppressor_line(source, line)
+                .map(|row| flattening_floor_from_suppressor(source, row, tab_size))
+                .unwrap_or(0)
+        });
+        (line, col, floor)
+    } else {
+        let walker = ChainWalker::new(source, tab_size);
+        let (line, col) = walker.find_chain_start(position.line);
+        let floor = flattening_suppressor_line(source, line)
+            .filter(|_| {
+                !matches!(
+                    find_unclosed_delimiter_heuristic(source, position.line),
+                    Some((row, _, _)) if row >= line
+                )
+            })
+            .map(|row| flattening_floor_from_suppressor(source, row, tab_size));
+        (line, col, floor)
+    };
     Some(IndentContext::AfterContinuationOperator {
         chain_start_line,
         chain_start_col,
@@ -1848,6 +1835,149 @@ impl<'a> ChainWalker<'a> {
     }
 }
 
+/// Closing pattern of an R raw string: the mirrored bracket, the opener's
+/// dash run, then the opener's quote (`r"---(` closes at `)---"`).
+#[derive(Clone, Copy)]
+struct RawStringClose {
+    delim: u8,
+    dashes: usize,
+    quote: u8,
+}
+
+/// Parse a raw-string opener whose `r`/`R` prefix sits at `r_at` in `bytes`:
+/// a quote (`"` or `'`), zero or more dashes, then an opening bracket.
+/// Returns the closing pattern and the number of characters the opener
+/// occupies after the prefix (all ASCII, so characters equal bytes).
+fn raw_string_open(bytes: &[u8], r_at: usize) -> Option<(RawStringClose, usize)> {
+    let quote = *bytes.get(r_at + 1)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let mut bracket_at = r_at + 2;
+    while bytes.get(bracket_at) == Some(&b'-') {
+        bracket_at += 1;
+    }
+    let delim = match bytes.get(bracket_at)? {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        _ => return None,
+    };
+    let close = RawStringClose {
+        delim,
+        dashes: bracket_at - (r_at + 2),
+        quote,
+    };
+    Some((close, bracket_at - r_at))
+}
+
+/// True when the raw-string closing pattern begins at `at` (`bytes[at]` is
+/// the closing bracket).
+fn raw_string_closes_at(bytes: &[u8], at: usize, close: RawStringClose) -> bool {
+    let dash_end = at + 1 + close.dashes;
+    bytes
+        .get(at + 1..dash_end)
+        .is_some_and(|run| run.iter().all(|b| *b == b'-'))
+        && bytes.get(dash_end) == Some(&close.quote)
+}
+
+/// String-masking scanner shared by the text-based fallback helpers: tracks
+/// ordinary strings (with backslash escapes), backquoted names, and raw
+/// strings including dashed delimiters (`r"---(...)---"`, single or double
+/// quoted). `strip_trailing_comment` and `unclosed_delimiters_heuristic` run
+/// one instance per line; `line_starts_inside_string_heuristic` carries one
+/// across lines to detect multiline-string interiors.
+#[derive(Default)]
+struct StringScanState {
+    in_string: bool,
+    string_char: char,
+    escape_next: bool,
+    raw_close: Option<RawStringClose>,
+    /// Characters already consumed as part of a raw-string open/close
+    /// pattern (ASCII, so characters equal bytes).
+    skip: usize,
+}
+
+impl StringScanState {
+    /// Advance over one character of `bytes` (the line being scanned).
+    /// Returns `true` when the character is real code outside any string,
+    /// `false` when it is string content or part of a string delimiter.
+    fn step(&mut self, bytes: &[u8], col: usize, ch: char) -> bool {
+        if self.skip > 0 {
+            self.skip -= 1;
+            return false;
+        }
+        if self.escape_next {
+            self.escape_next = false;
+            return false;
+        }
+        if let Some(close) = self.raw_close {
+            if ch == close.delim as char && raw_string_closes_at(bytes, col, close) {
+                self.raw_close = None;
+                self.skip = close.dashes + 1;
+            }
+            return false;
+        }
+        if self.in_string {
+            // No escape handling inside backticks: R's parser rejects `a\`b`
+            // ("unexpected symbol", verified on R 4.6.1) — a backquoted name
+            // cannot contain a backtick, so the first unescaped backtick
+            // always closes it.
+            if ch == '\\' && self.string_char != '`' {
+                self.escape_next = true;
+            } else if ch == self.string_char {
+                self.in_string = false;
+            }
+            return false;
+        }
+        if (ch == 'r' || ch == 'R')
+            && let Some((close, opener_len)) = raw_string_open(bytes, col)
+        {
+            self.raw_close = Some(close);
+            self.skip = opener_len;
+            return false;
+        }
+        if matches!(ch, '"' | '\'' | '`') {
+            self.in_string = true;
+            self.string_char = ch;
+            return false;
+        }
+        true
+    }
+
+    /// Carry state across a line boundary: a trailing backslash escapes the
+    /// newline itself (the string continues), and no pending raw-string skip
+    /// can span lines — the open/close patterns are verified within one line.
+    fn end_line(&mut self) {
+        self.escape_next = false;
+        self.skip = 0;
+    }
+
+    fn inside_string(&self) -> bool {
+        self.in_string || self.raw_close.is_some()
+    }
+}
+
+/// Whether `line` starts strictly inside a multiline string, per the text
+/// heuristic: quote tracking carried across lines with comment and
+/// raw-string awareness. The error-tree fallback uses this where the AST
+/// path validates operators against real nodes — a malformed buffer can
+/// swallow a multiline string into an ERROR subtree, leaving no string node
+/// to check.
+fn line_starts_inside_string_heuristic(source: &str, line: u32) -> bool {
+    let mut state = StringScanState::default();
+    for text in source.lines().take(line as usize) {
+        let bytes = text.as_bytes();
+        for (col, ch) in text.char_indices() {
+            if state.step(bytes, col, ch) && ch == '#' {
+                break;
+            }
+        }
+        state.end_line();
+    }
+    state.inside_string()
+}
+
 /// Strips trailing comments from a line of R code.
 ///
 /// R comments start with `#` and continue to end of line.
@@ -1861,78 +1991,13 @@ impl<'a> ChainWalker<'a> {
 ///
 /// The line text with trailing comment removed.
 fn strip_trailing_comment(line: &str) -> &str {
-    let mut in_string = false;
-    let mut string_char = '"';
-    let mut escape_next = false;
-    let mut in_raw_string = false;
-    let mut raw_close_delim: char = ')';
-    let mut skip_raw_close_quote = false;
-
+    let mut state = StringScanState::default();
     let bytes = line.as_bytes();
-
     for (i, c) in line.char_indices() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-
-        // Skip the closing '"' of a raw string (already consumed at close_delim)
-        if skip_raw_close_quote {
-            skip_raw_close_quote = false;
-            continue;
-        }
-
-        // Inside raw string: look for close_delim followed by '"'
-        if in_raw_string {
-            if c == raw_close_delim {
-                let next_byte = i + c.len_utf8();
-                if next_byte < bytes.len() && bytes[next_byte] == b'"' {
-                    in_raw_string = false;
-                    skip_raw_close_quote = true;
-                }
-            }
-            continue;
-        }
-
-        // No escape handling inside backticks: R's parser rejects `a\`b`
-        // ("unexpected symbol", verified on R 4.6.1) — a backquoted name
-        // cannot contain a backtick, so the first unescaped backtick always
-        // closes it. `#` inside backticks needs no escape and is handled by
-        // the in_string state alone.
-        if c == '\\' && in_string && string_char != '`' {
-            escape_next = true;
-            continue;
-        }
-
-        if !in_string && (c == 'r' || c == 'R') {
-            // Check for raw string: r"(...)", R"[...]", r"{...}"
-            let next_byte = i + 1;
-            if next_byte + 1 < bytes.len() && bytes[next_byte] == b'"' {
-                let open_delim = bytes[next_byte + 1];
-                let close = match open_delim {
-                    b'(' => Some(')'),
-                    b'[' => Some(']'),
-                    b'{' => Some('}'),
-                    _ => None,
-                };
-                if let Some(cd) = close {
-                    in_raw_string = true;
-                    raw_close_delim = cd;
-                    continue;
-                }
-            }
-        }
-
-        if !in_string && (c == '"' || c == '\'' || c == '`') {
-            in_string = true;
-            string_char = c;
-        } else if in_string && c == string_char {
-            in_string = false;
-        } else if !in_string && c == '#' {
+        if state.step(bytes, i, c) && c == '#' {
             return &line[..i];
         }
     }
-
     line
 }
 
@@ -3114,6 +3179,51 @@ mod tests {
             strip_trailing_comment(r#"x <- R"[# not a comment]" # real comment"#),
             r#"x <- R"[# not a comment]" "#
         );
+    }
+
+    #[test]
+    fn test_strip_trailing_comment_dashed_raw_string() {
+        // Dashed delimiters: the string only closes at `)--"`, so the
+        // embedded `"`, `#`, and undashed `)"` stay string content.
+        assert_eq!(
+            strip_trailing_comment(r##"x <- r"--(a"#b)")--" # real comment"##),
+            r##"x <- r"--(a"#b)")--" "##
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_comment_single_quoted_raw_string() {
+        assert_eq!(
+            strip_trailing_comment(r#"x <- r'(# not a comment)' # real comment"#),
+            r#"x <- r'(# not a comment)' "#
+        );
+    }
+
+    #[test]
+    fn test_unclosed_heuristic_masks_dashed_raw_string_brackets() {
+        // The `(` inside the dashed raw string must not register as an
+        // opener, and the real `]` must close the real `[`.
+        assert_eq!(
+            unclosed_delimiters_heuristic("x[r\"---(a\"#b)---\"] <-\n", 1),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn test_line_starts_inside_string_heuristic_tracks_across_lines() {
+        let source = "x <- \"first\nstill open\nclosed\" + y\nz\n";
+        assert!(!line_starts_inside_string_heuristic(source, 0));
+        assert!(line_starts_inside_string_heuristic(source, 1));
+        assert!(line_starts_inside_string_heuristic(source, 2));
+        assert!(!line_starts_inside_string_heuristic(source, 3));
+
+        // Raw strings, quotes in comments, and escaped quotes must not
+        // confuse the cross-line state.
+        let tricky = "a <- r\"-(open\nstill raw\n)-\" # \" not a string\nb <- \"esc\\\"aped\"\nc\n";
+        assert!(line_starts_inside_string_heuristic(tricky, 1));
+        assert!(line_starts_inside_string_heuristic(tricky, 2));
+        assert!(!line_starts_inside_string_heuristic(tricky, 3));
+        assert!(!line_starts_inside_string_heuristic(tricky, 4));
     }
 
     // ========================================================================
@@ -5799,6 +5909,63 @@ mod assignment_context_tests {
                 flattened_floor: None,
             }
         );
+    }
+
+    #[test]
+    fn dashed_raw_string_with_quote_and_hash_fires() {
+        // R's dashed raw strings (`r"---(...)---"`) put dashes between the
+        // quote and the bracket; the embedded `"` and `#` are still string
+        // content and must not hide the trailing assignment operator.
+        let code = "x[r\"---(a\"#b)---\"] <-\n";
+        let ctx = detect(code, 1);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterAssignmentOperator {
+                base_line: 0,
+                flattened_floor: None,
+            }
+        );
+    }
+
+    #[test]
+    fn error_fallback_rejects_assignment_text_inside_multiline_string() {
+        // The malformed prefix swallows the multiline string into an ERROR
+        // subtree (no string node survives for AST validation), and the
+        // string content line ends with `<-`. The fallback's cross-line
+        // string tracking must classify it as literal content — answering
+        // column 0 like the AST path — instead of assignment indentation
+        // that would rewrite the string.
+        let code = "if (a) {\nx <- \"first\nlooks like <-\n";
+        let ctx = detect(code, 3);
+        assert_eq!(
+            ctx,
+            IndentContext::AfterCompleteExpression {
+                enclosing_block_indent: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn ast_chain_start_uses_visual_columns_after_multibyte_text() {
+        // Tree-sitter points carry byte columns; `名前 <- ` is 10 bytes but
+        // 6 visual columns, and the chain continuation must align to the
+        // visual column of `data`.
+        let code = "名前 <- data %>%\n  f() %>%\n  g()\n";
+        let ctx = detect(code, 2);
+        match ctx {
+            IndentContext::AfterContinuationOperator {
+                chain_start_line,
+                chain_start_col,
+                ..
+            } => {
+                assert_eq!(chain_start_line, 0);
+                assert_eq!(
+                    chain_start_col, 6,
+                    "chain start must be a visual column, not a byte offset"
+                );
+            }
+            other => panic!("expected AfterContinuationOperator, got {other:?}"),
+        }
     }
 
     #[test]
