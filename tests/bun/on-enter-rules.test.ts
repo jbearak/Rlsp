@@ -54,6 +54,7 @@ describe('assignment onEnterRule (#611)', () => {
         'x[grepl("#", y)] <-',
         '`column#name` <-',
         'x[grepl("a\\"b", y)] <-',
+        '`a\\`b` <-',
     ];
 
     const doesNotFire = [

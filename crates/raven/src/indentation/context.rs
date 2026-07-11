@@ -247,18 +247,19 @@ fn ends_with_flattening_assignment(trimmed: &str) -> bool {
 }
 
 /// Text-heuristic `assignment_as_infix` check for the fallback path: does
-/// the nearest code line above `line` (skipping blank and comment-only
-/// lines, which the lint's AST predicate is insensitive to) end with a
-/// suppressing assignment operator?
+/// the nearest code line above `line` end with a suppressing assignment
+/// operator? The walk skips lines the lint's AST predicate is insensitive
+/// to: blank lines, comment-only lines, and lines consisting solely of
+/// `(` — a parenthesized expression does not restore the context in
+/// [`crate::linting::suppressed_as_assignment_rhs`], so an RHS wrapped as
+/// `a <-` ⏎ `  (` ⏎ `    data %>%` still flattens. A `{`-only line stops
+/// the walk (braces DO restore), as does any line with other content.
 ///
-/// Documented approximation: unlike the lint's
-/// [`crate::linting::suppressed_as_assignment_rhs`], this cannot model the
-/// full upward traversal — a parenthesized RHS whose `(` sits on its own
-/// line between the assignment and `line` defeats it (no flattening), and it
-/// cannot see restorer boundaries at all; callers guard the common restorer
-/// shape by rejecting flattening when an unclosed delimiter opens at or
-/// after the chain-start line. Both gaps require an ERROR tree *and* the
-/// exotic shape simultaneously; the AST path handles them exactly.
+/// Documented approximation: this cannot see restorer boundaries at all;
+/// callers guard the common restorer shape by rejecting flattening when an
+/// unclosed delimiter opens at or after the chain-start line. The residual
+/// gaps require an ERROR tree *and* an exotic shape simultaneously; the AST
+/// path handles them exactly.
 fn text_flattened_under_assignment(source: &str, line: u32) -> bool {
     let lines: Vec<&str> = source.lines().collect();
     for idx in (0..line as usize).rev() {
@@ -266,8 +267,12 @@ fn text_flattened_under_assignment(source: &str, line: u32) -> bool {
             return false;
         };
         let trimmed = strip_trailing_comment(text).trim_end();
-        if trimmed.trim_start().is_empty() {
+        let content = trimmed.trim_start();
+        if content.is_empty() {
             continue; // blank or comment-only line
+        }
+        if content.chars().all(|c| c == '(' || c.is_whitespace()) {
+            continue; // parens don't restore the assignment context
         }
         return ends_with_flattening_assignment(trimmed);
     }
@@ -283,9 +288,12 @@ fn text_flattened_under_assignment(source: &str, line: u32) -> bool {
 /// The detection follows this priority order:
 /// 1. ClosingDelimiter - if current line starts with closing delimiter
 /// 2. AfterContinuationOperator - if previous line ends with continuation operator
-/// 3. InsideParens - if inside unclosed parentheses
-/// 4. InsideBraces - if inside unclosed braces
-/// 5. AfterCompleteExpression - default fallback
+/// 3. AfterAssignmentOperator - if previous line ends with an assignment
+///    operator (#611; defers to InsideParens in paren/bracket context,
+///    preempts InsideBraces)
+/// 4. InsideParens - if inside unclosed parentheses
+/// 5. InsideBraces - if inside unclosed braces
+/// 6. AfterCompleteExpression - default fallback
 ///
 /// # Error Handling
 ///
@@ -5894,6 +5902,50 @@ mod assignment_context_tests {
                 }
             ),
             "blank/comment separators must not defeat fallback flattening, got {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn paren_wrapped_rhs_still_flattens() {
+        // A parenthesized expression does not restore the assignment
+        // context (mirrors the lint): the chain inside `(` on the broken
+        // assignment's RHS flattens to the chain-start line's indent.
+        // Main AST path (tree has MISSING nodes only):
+        let code = "a <-\n  (\n    data %>%\n";
+        assert_eq!(indent_at(code, 3), 4);
+
+        // Regex fallback path (ERROR tree from the unclosed function body);
+        // the text walk skips the `(`-only line:
+        let code = "f <- function() {\n  a <-\n    (\n      data %>%\n";
+        let ctx = detect(code, 4);
+        assert!(
+            matches!(
+                ctx,
+                IndentContext::AfterContinuationOperator {
+                    flattened_rhs: true,
+                    ..
+                }
+            ),
+            "`(`-only separator must not defeat fallback flattening, got {ctx:?}"
+        );
+        assert_eq!(indent_at(code, 4), 6);
+    }
+
+    #[test]
+    fn brace_wrapped_rhs_does_not_flatten_via_fallback() {
+        // A `{`-only line DOES restore the context (braces are a restorer
+        // in the lint): the chain inside gets normal block indentation.
+        let code = "f <- function() {\n  a <-\n    {\n      data %>%\n";
+        let ctx = detect(code, 4);
+        assert!(
+            matches!(
+                ctx,
+                IndentContext::AfterContinuationOperator {
+                    flattened_rhs: false,
+                    ..
+                }
+            ),
+            "`{{`-only separator must stop the flatten walk, got {ctx:?}"
         );
     }
 

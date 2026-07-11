@@ -1259,6 +1259,23 @@ mod tests {
     }
 
     #[test]
+    fn issue611_paren_wrapped_rhs_chain_stays_flattened() {
+        // Parens don't restore the assignment context: a chain inside `(`
+        // on a broken assignment's RHS still gets no second level. This is
+        // the completed form of the indenter's paren-skipping fallback walk
+        // (`text_flattened_under_assignment`), whose output columns (4 for
+        // the `(`, 6 for the chain) must be judge-approved.
+        let text = "f <- function() {\n  a <-\n    (\n      data %>%\n      g()\n    )\n}\n";
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style(text, 2, style).is_empty(),
+                "paren-wrapped flattened chain must be clean under {style:?}; got {:?}",
+                lint_with_style(text, 2, style)
+            );
+        }
+    }
+
+    #[test]
     fn issue611_right_assignment_target_at_statement_level() {
         // `data %>%` ⏎ `  f() ->` ⏎: the target belongs one level from the
         // statement start (column 2), not two. Under `Aligned` the chain
