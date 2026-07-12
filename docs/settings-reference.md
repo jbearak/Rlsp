@@ -54,7 +54,7 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.editor.dotInWord` | `"yes"` | `"ask"` \| `"yes"` \| `"no"` | — | [editor-integrations](editor-integrations.md) | Whether to treat `.` as part of a word in R and JAGS files. 'yes' (the default) treats dots as word characters by overriding editor.wordSeparators for [r] / [jags] — matching RStudio and Positron — 'no' leaves dots as separators, and 'ask' prompts on first use. |
 | `raven.help.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [help-viewer](help-viewer.md) | Initial editor column when the R help viewer first opens. |
 | `raven.indentation.argumentStyle` | `"aligned"` | `"aligned"` \| `"indented"` \| `"off"` | `indentation.argumentStyle` | [indentation](indentation.md) | How AST-aware indentation formats parenthesized argument continuations. |
-| `raven.indentation.enabled` | `true` | boolean | `indentation.enabled` | [indentation](indentation.md) | Enable AST-aware indentation (Tier 2). |
+| `raven.indentation.enabled` | `true` | boolean | `indentation.enabled` | [indentation](indentation.md) | Enable AST-aware indentation. |
 | `raven.indentation.infixContinuationStyle` | `"aligned"` | `"aligned"` \| `"indented"` \| `"off"` | `indentation.infixContinuationStyle` | [indentation](indentation.md) | How AST-aware indentation formats infix-operator chain continuations. |
 | `raven.knit.export.timeoutMs` | `120000` | integer (≥5000) | — | [knit](knit.md) | Timeout (milliseconds) for the Pandoc subprocess used by Knit: Export to PDF / Word / HTML. |
 | `raven.knit.fontFamily` | `""` | string | — | [knit](knit.md) | Body/prose font for the Raven: Knit Preview output. |

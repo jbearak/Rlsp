@@ -390,7 +390,7 @@ Each note below is printed only when its condition holds; a clean run on a fully
 
 **Startup notes (stderr, before diagnostics)** — one fires when R-backed package resolution is degraded **and** no offline package data is available to cover for it, so undefined-variable findings for package symbols may be unreliable. The text names the cause and the consequence.
 
-**The note is keyed on actual coverage, not merely on R's absence.** It is suppressed when offline package data loaded — an updated `names.db` (Tier 3) or a frozen `.raven/packages.json` (Tier 2) — because that data resolves package symbols without a live R library, so the warning would be a false alarm (and would tell a CI that *already ran* `raven packages update` to run it again). It fires only when coverage falls back to base R alone.
+**The note is keyed on actual coverage, not merely on R's absence.** It is suppressed when offline package data loaded — an updated `names.db` (Tier 3 of the [package-resolution fallback](package-database.md)) or a frozen `.raven/packages.json` (Tier 2) — because that data resolves package symbols without a live R library, so the warning would be a false alarm (and would tell a CI that *already ran* `raven packages update` to run it again). It fires only when coverage falls back to base R alone.
 
 All three variants share the same tail — ``package symbol resolution is limited to base R (covered by the embedded database). Run `raven packages update` for broad CRAN/Bioconductor coverage`` — because the limitation and its remedy are identical regardless of *why* the live R library was unavailable.
 

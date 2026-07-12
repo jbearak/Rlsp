@@ -471,7 +471,7 @@ Raven watches for changes to `DESCRIPTION` and `NAMESPACE` files. After running 
 
 `raven check` can give you package-aware diagnostics in CI without installing anything — symbols from your dependencies resolve against Raven's `names.db` database when it is present, so they don't show as undefined variables. That database isn't bundled with the binary; run `raven packages update` during CI image setup or cache warmup for broad CRAN/Bioconductor coverage. Raw Cargo/source installs still have embedded R base-package coverage.
 
-Generate and commit `.raven/packages.json` (Tier 2) when CI needs reproducible, project-specific package metadata pinned to what your project actually installed. That is distinct from `raven packages update`, which restores broad Tier 3 coverage from the moving `names-db` Release and is not version-pinned by the project.
+Generate and commit `.raven/packages.json` (Tier 2 of the three-tier [package-resolution fallback](package-database.md)) when CI needs reproducible, project-specific package metadata pinned to what your project actually installed. That is distinct from `raven packages update`, which restores broad Tier 3 (`names.db`) coverage from the moving `names-db` Release and is not version-pinned by the project.
 
 Tier 2 also improves diagnostic accuracy in two common cases:
 
@@ -484,7 +484,7 @@ To generate the file:
 raven packages freeze
 ```
 
-This writes `.raven/packages.json` — a "frozen Tier 1" snapshot of your installed packages' export names, `Depends`, and datasets — which `raven check` then prefers over Tier 3 when no R is present. Run it on a machine that has R and the project's dependencies installed; the file is generated, not hand-edited, committed for reproducible CI, and meant to be reviewed in PRs (a `git diff` shows "package X gained export Y").
+This writes `.raven/packages.json` — a frozen snapshot of your installed packages' (Tier 1's) export names, `Depends`, and datasets — which `raven check` then prefers over Tier 3 when no R is present. Run it on a machine that has R and the project's dependencies installed; the file is generated, not hand-edited, committed for reproducible CI, and meant to be reviewed in PRs (a `git diff` shows "package X gained export Y").
 
 Generation uses a **renv-first** library order: the renv project library first, system libraries only for packages renv doesn't cover. If your project uses [`renv`](https://rstudio.github.io/renv/), run `freeze` after `renv::restore()` for the best coverage — `renv.lock` acts as a *set selector* (which packages to include), while the exports are read from whatever is actually installed locally. Regeneration is a no-op when nothing changed, so re-running it produces no diff unless your dependencies' exports actually moved.
 
