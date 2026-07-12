@@ -108,7 +108,7 @@ fn bench_indentation_lint(c: &mut Criterion) {
     );
     assert!(
         !run_lints(&aligned, aligned_tree.root_node(), &strict_indented).is_empty(),
-        "aligned benchmark fixture must exercise Either's second fold"
+        "aligned benchmark fixture must violate strict Indented"
     );
     assert!(
         run_lints(&aligned, aligned_tree.root_node(), &strict_aligned).is_empty(),

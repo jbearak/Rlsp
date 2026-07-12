@@ -1,19 +1,20 @@
 # Smart Indentation
 
-Raven provides AST-aware indentation for R code through a two-tier system.
+Raven combines the editor's built-in indentation with AST-aware indentation
+for R code.
 
 ## Overview
 
-Both tiers are active by default.
+Both indentation mechanisms are active by default.
 
-| Tier | What it does | How it works |
+| Mechanism | What it does | How it works |
 |---|---|---|
-| **Tier 1** | Basic indentation for pipes, operators, assignments, and brackets | Declarative VS Code rules |
-| **Tier 2** | AST-aware indentation with independently configured argument and infix styles | LSP `onTypeFormatting` using the indentation lint's expectation engine |
+| **Built-in indentation** | Basic indentation for pipes, operators, assignments, and brackets | Declarative VS Code rules |
+| **AST-aware indentation** | Configurable argument and infix indentation informed by the syntax tree | LSP `onTypeFormatting` using the indentation lint's expectation engine |
 
-When you press Enter, Tier 1 runs first. Tier 2 then repairs the incomplete buffer, asks the shared expectation engine for both supported forms, and selects the configured producer style. If Tier 2 is disabled, an axis is `off`, or the judge cannot answer, Raven emits no indentation edit and the Tier 1/native result stands. The tier numbers are shorthand used on this page; other pages and the settings UI call these by name — "the editor's built-in indentation" (Tier 1) and "AST-aware indentation" (Tier 2).
+When you press Enter, built-in indentation runs first. AST-aware indentation then repairs the incomplete buffer, asks the shared expectation engine for both supported forms, and selects the configured producer style. If AST-aware indentation is disabled, the relevant axis is `off`, or the judge cannot answer, Raven emits no indentation edit and preserves the built-in result.
 
-The formatter and lint have independent policies: the formatter emits its configured style faithfully, and the lint checks its configured style. Compatible infix pairs (`aligned` with `aligned`, `indented` with `indented`, or either producer with lint `either`) do not conflict. A mismatched pair is a valid user configuration state. When the lint flags a non-assignment infix continuation at exactly the column the enabled auto-indenter produces, the diagnostic names both settings and suggests matching the lint to the producer (or using lint `either`), or changing the producer to the lint style. Advice is omitted for genuinely mis-indented or syntactically malformed code, when no producer policy is available, and in documents where `editor.insertSpaces` or `editor.formatOnType` disables Tier 2 (synced per document from VS Code) — no column can have come from it there.
+The formatter and lint have independent policies: the formatter emits its configured style faithfully, and the lint checks its configured style. Compatible infix pairs (`aligned` with `aligned`, `indented` with `indented`, or either producer with lint `either`) do not conflict. A mismatched pair is a valid user configuration state. When the lint flags a non-assignment infix continuation at exactly the column the enabled auto-indenter produces, the diagnostic names both settings and suggests matching the lint to the producer (or using lint `either`), or changing the producer to the lint style. Advice is omitted for genuinely mis-indented or syntactically malformed code, when no producer policy is available, and in documents where `editor.insertSpaces` or `editor.formatOnType` disables AST-aware indentation (synced per document from VS Code) — no column can have come from it there.
 
 The indentation unit is deliberately shared when Raven's indentation lint is enabled: the judge uses the lint's per-document resolved unit, including `"auto"` and `[[linting.overrides]]`. If that lint rule is disabled, the judge uses the editor's `tabSize`. The lint's style setting never steers the producer.
 
@@ -30,7 +31,7 @@ The indentation unit is deliberately shared when Raven's indentation lint is ena
 
 | Setting | Values | Default | Effect |
 |---|---|---|---|
-| `raven.indentation.enabled` | `true`, `false` | `true` | Tier 2 master switch |
+| `raven.indentation.enabled` | `true`, `false` | `true` | AST-aware indentation master switch |
 | `raven.indentation.argumentStyle` | `aligned`, `indented`, `off` | `aligned` | Parenthesized argument axis |
 | `raven.indentation.infixContinuationStyle` | `aligned`, `indented`, `off` | `aligned` | Infix-operator continuation axis |
 
@@ -64,8 +65,8 @@ result <- function_call(
 For infix chains:
 
 - `aligned` lines operands up at the first operand's actual column, floored one level from the owning statement: `max(first_operand_column, statement_indent + unit)`.
-- `indented` uses a uniform one-level continuation anchored at the chain-start line. It does not reproduce Tier 1's per-line cascade.
-- `off` makes Tier 2 stand down only when that axis decides the probe. Brace bodies, assignment continuations, and other style-neutral answers remain active.
+- `indented` uses a uniform one-level continuation anchored at the chain-start line. It does not reproduce the per-line cascade produced by built-in indentation.
+- `off` makes AST-aware indentation stand down only when that axis decides the probe. Brace bodies, assignment continuations, and other style-neutral answers remain active.
 
 Out of the box Raven emits aligned chains and the lint accepts both traditions. A project that runs real `lintr`, styler, or Air in CI should set both infix settings to `indented`. A strict alignment project sets both to `aligned`.
 
@@ -89,9 +90,9 @@ The alias never changes the infix axis. Resolution is per field:
 
 Thus `enabled = true` overrides alias `off`, and `argumentStyle = aligned` overrides alias `rstudio-minus` without changing either infix setting.
 
-### Disabling Tier 2
+### Disabling AST-aware indentation
 
-Set `raven.indentation.enabled` to `false` to disable all Tier 2 edits while retaining Tier 1. Setting both axes to `off` is different: style-neutral Tier 2 answers remain enabled. Setting `[r]`-scoped `editor.formatOnType` to `false` prevents the request entirely.
+Set `raven.indentation.enabled` to `false` to disable all AST-aware indentation edits while retaining built-in indentation. Setting both axes to `off` is different: style-neutral AST-aware indentation remains enabled. Setting `[r]`-scoped `editor.formatOnType` to `false` prevents the request entirely.
 
 The master switch preserves the old alias-`off` trigger behavior: Raven also skips its closing-delimiter duplicate cleanup. Axis-level `off` does not disable that cleanup.
 
@@ -135,7 +136,7 @@ output <- some_function(
 )
 ```
 
-With the infix axis `off`, Tier 2 returns no answer for the chain. Tier 1's line-local operator rule typically cascades instead of finding a uniform chain anchor:
+With the infix axis `off`, AST-aware indentation does not adjust the chain. The built-in line-local operator rule typically cascades instead of finding a uniform chain anchor:
 
 ```r
 x |>
@@ -143,7 +144,7 @@ x |>
     z
 ```
 
-Likewise, `argumentStyle = off` leaves argument indentation to native/Tier 1 bracket handling rather than applying Raven's opener alignment.
+Likewise, `argumentStyle = off` leaves argument indentation to the editor's built-in bracket handling rather than applying Raven's opener alignment.
 
 ## Assignment continuations
 
@@ -211,7 +212,7 @@ result <-
       value
 ```
 
-Tier 1 has a matching assignment rule for `<-` and `<<-`. The other assignment operators need Tier 2 because a line regex cannot classify them safely.
+Built-in indentation has a matching assignment rule for `<-` and `<<-`. The other assignment operators need AST-aware indentation because a line regex cannot classify them safely.
 
 ## Brace blocks
 
@@ -223,11 +224,11 @@ if (condition) {
 }
 ```
 
-## When Tier 2 cannot answer
+## When AST-aware indentation cannot answer
 
-Raven emits no edit for multiline string/backtick interiors, tabs-mode or a real tab in the active context, an unrepaired syntax-error window, a nonconforming reference line, or an ambiguous/out-of-bounds repair. That preserves the editor's Tier 1/native indentation. The tabs-mode stand-down also silences the lint's settings-mismatch advice for that document: the advice attributes a column to Tier 2, which emits nothing there.
+Raven emits no edit for multiline string/backtick interiors, tabs-mode or a real tab in the active context, an unrepaired syntax-error window, a nonconforming reference line, or an ambiguous/out-of-bounds repair. That preserves the editor's built-in indentation. The tabs-mode stand-down also silences the lint's settings-mismatch advice for that document: the advice attributes a column to the AST-aware auto-indenter, which emits nothing there.
 
-Tier 2 applies inside R chunk bodies in R Markdown and Quarto, but stands down in prose, YAML, and non-R chunks.
+AST-aware indentation applies inside R chunk bodies in R Markdown and Quarto, but stands down in prose, YAML, and non-R chunks.
 
 ## Troubleshooting
 
