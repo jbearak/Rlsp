@@ -694,6 +694,12 @@ measured budget breach justifies the added invalidation state.
   the `<-`/`<<-` Tier 1 rule and #610 defines per-axis `off` as “Tier 2
   stands down; Tier 1 stands.” Reconsider only if those product contracts
   change.
+- **Tabs-mode Tier 2 stand-down:** with `insertSpaces: false` or a real tab
+  in the active context, the judge returns `None` and no Tier 2 edit is
+  emitted (the deleted legacy fallback used to answer here). Deliberate: the
+  expectation engine counts characters, not tab stops, and the indentation
+  lint skips tab-led lines, so there is no lint-accepted set to select from.
+  Reconsider only alongside a visual-column model for the lint itself.
 
 - **`package_state/`** — Derived state for R package mode. Owns workspace detection result, namespace model, per-file facts (exported symbols, roxygen tags), and the aggregate scope contribution. Fully derive-based: `derive_package_state()` recomputes the entire `PackageState` from inputs.
 
