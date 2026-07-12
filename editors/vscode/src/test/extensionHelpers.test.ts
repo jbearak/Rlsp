@@ -1,12 +1,14 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import {
+    buildDocumentIndentUnitsPayload,
     clearIneligibleDiagnostics,
     diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
     isIndentUnitDocument,
     isRDocument,
     planDotInWordMigration,
+    resolveInsertSpacesForDocument,
     resolveTabSizeForDocument,
 } from '../extensionHelpers';
 
@@ -281,7 +283,7 @@ suite('Extension Helpers', () => {
                 inspect: () => undefined,
                 update: () => Promise.resolve(),
             } as unknown as vscode.WorkspaceConfiguration;
-        });
+        }, [], new Map());
 
         assert.ok(
             capturedScope !== undefined &&
@@ -307,7 +309,7 @@ suite('Extension Helpers', () => {
             has: () => true,
             inspect: () => undefined,
             update: () => Promise.resolve(),
-        } as unknown as vscode.WorkspaceConfiguration));
+        } as unknown as vscode.WorkspaceConfiguration), [], new Map());
         assert.strictEqual(tabSize, 4);
     });
 
@@ -327,8 +329,213 @@ suite('Extension Helpers', () => {
                     options: { tabSize: 4 },
                 } as unknown as vscode.TextEditor,
             ],
+            new Map(),
         );
         assert.strictEqual(tabSize, 4);
+    });
+
+    test('resolveInsertSpacesForDocument passes language-scoped configuration scope', () => {
+        const doc = {
+            uri: vscode.Uri.file('/proj/foo.R'),
+            languageId: 'r',
+        };
+
+        let capturedScope: vscode.ConfigurationScope | undefined;
+        resolveInsertSpacesForDocument(doc, (scope) => {
+            capturedScope = scope;
+            return {
+                get<T>(_key: string, defaultValue: T): T { return defaultValue; },
+                has: () => false,
+                inspect: () => undefined,
+                update: () => Promise.resolve(),
+            } as unknown as vscode.WorkspaceConfiguration;
+        }, [], new Map());
+
+        assert.ok(
+            capturedScope !== undefined &&
+            typeof capturedScope === 'object' &&
+            !(capturedScope instanceof vscode.Uri) &&
+            'languageId' in capturedScope,
+            `getConfiguration scope must include languageId for language-scoped settings; got: ${JSON.stringify(capturedScope)}`,
+        );
+        assert.strictEqual(
+            (capturedScope as { languageId: string }).languageId,
+            'r',
+            'languageId in scope must match the document language',
+        );
+    });
+
+    test('resolveInsertSpacesForDocument returns insertSpaces from configuration', () => {
+        const doc = { uri: vscode.Uri.file('/proj/foo.R'), languageId: 'r' };
+        const insertSpaces = resolveInsertSpacesForDocument(doc, () => ({
+            get<T>(key: string, defaultValue: T): T {
+                if (key === 'insertSpaces') return false as unknown as T;
+                return defaultValue;
+            },
+            has: () => true,
+            inspect: () => undefined,
+            update: () => Promise.resolve(),
+        } as unknown as vscode.WorkspaceConfiguration), [], new Map());
+        assert.strictEqual(insertSpaces, false);
+    });
+
+    test('resolveInsertSpacesForDocument prefers resolved visible editor value', () => {
+        const doc = { uri: vscode.Uri.file('/proj/foo.R'), languageId: 'r' };
+        const insertSpaces = resolveInsertSpacesForDocument(
+            doc,
+            () => ({
+                // Configuration says spaces; the visible editor's resolved
+                // options (tabs) must win.
+                get<T>(_key: string, defaultValue: T): T { return defaultValue; },
+                has: () => true,
+                inspect: () => undefined,
+                update: () => Promise.resolve(),
+            } as unknown as vscode.WorkspaceConfiguration),
+            [
+                {
+                    document: doc,
+                    options: { insertSpaces: false },
+                } as unknown as vscode.TextEditor,
+            ],
+            new Map(),
+        );
+        assert.strictEqual(insertSpaces, false);
+    });
+
+    test('resolveInsertSpacesForDocument ignores an unresolved editor value', () => {
+        // TextEditorOptions types insertSpaces as boolean | string; a
+        // non-boolean (unresolved "auto") must fall through to configuration.
+        const doc = { uri: vscode.Uri.file('/proj/foo.R'), languageId: 'r' };
+        const insertSpaces = resolveInsertSpacesForDocument(
+            doc,
+            () => ({
+                get<T>(key: string, defaultValue: T): T {
+                    if (key === 'insertSpaces') return false as unknown as T;
+                    return defaultValue;
+                },
+                has: () => true,
+                inspect: () => undefined,
+                update: () => Promise.resolve(),
+            } as unknown as vscode.WorkspaceConfiguration),
+            [
+                {
+                    document: doc,
+                    options: { insertSpaces: 'auto' },
+                } as unknown as vscode.TextEditor,
+            ],
+            new Map(),
+        );
+        assert.strictEqual(insertSpaces, false);
+    });
+
+    test('resolvers remember a hidden document\'s last-seen editor options', () => {
+        // Per-editor options (detectIndentation, status-bar overrides) are
+        // observable only while an editor is visible. Once the tab is
+        // hidden, a rebuild must reuse the remembered values instead of
+        // regressing to configuration.
+        const doc = { uri: vscode.Uri.file('/proj/foo.R'), languageId: 'r' };
+        const cache = new Map();
+        const configSaysSpacesUnit2 = () => ({
+            get<T>(key: string, defaultValue: T): T {
+                if (key === 'insertSpaces') return true as unknown as T;
+                if (key === 'tabSize') return 2 as unknown as T;
+                return defaultValue;
+            },
+            has: () => true,
+            inspect: () => undefined,
+            update: () => Promise.resolve(),
+        } as unknown as vscode.WorkspaceConfiguration);
+        const visibleTabsEditor = [
+            {
+                document: doc,
+                options: { insertSpaces: false, tabSize: 8 },
+            } as unknown as vscode.TextEditor,
+        ];
+
+        assert.strictEqual(
+            resolveInsertSpacesForDocument(doc, configSaysSpacesUnit2, visibleTabsEditor, cache),
+            false,
+        );
+        assert.strictEqual(
+            resolveTabSizeForDocument(doc, configSaysSpacesUnit2, visibleTabsEditor, cache),
+            8,
+        );
+
+        // Hidden now: the remembered editor values win over configuration.
+        assert.strictEqual(
+            resolveInsertSpacesForDocument(doc, configSaysSpacesUnit2, [], cache),
+            false,
+        );
+        assert.strictEqual(
+            resolveTabSizeForDocument(doc, configSaysSpacesUnit2, [], cache),
+            8,
+        );
+
+        // A different document shares no memo.
+        const other = { uri: vscode.Uri.file('/proj/other.R'), languageId: 'r' };
+        assert.strictEqual(
+            resolveInsertSpacesForDocument(other, configSaysSpacesUnit2, [], cache),
+            true,
+        );
+    });
+
+    test('buildDocumentIndentUnitsPayload includes indentUnit only in auto mode', () => {
+        const rDoc = {
+            isUntitled: false,
+            languageId: 'r',
+            uri: vscode.Uri.file('/proj/foo.R'),
+        };
+        const otherDoc = {
+            isUntitled: false,
+            languageId: 'plaintext',
+            uri: vscode.Uri.file('/proj/notes.txt'),
+        };
+        const resolveUnit = () => 4;
+        const resolveInsertSpaces = () => false;
+
+        const auto = buildDocumentIndentUnitsPayload(
+            'auto',
+            [rDoc, otherDoc],
+            resolveUnit,
+            resolveInsertSpaces,
+        );
+        assert.deepStrictEqual(auto, {
+            units: [{
+                uri: rDoc.uri.toString(),
+                indentUnit: 4,
+                insertSpaces: false,
+            }],
+        });
+
+        // Fixed unit: tabs-mode entries still flow (insertSpaces gates the
+        // mismatch advice regardless of the unit setting's mode), but must
+        // not carry indentUnit — an entry's unit would override the
+        // configured workspace-wide unit on the server.
+        const fixed = buildDocumentIndentUnitsPayload(
+            2,
+            [rDoc, otherDoc],
+            resolveUnit,
+            resolveInsertSpaces,
+        );
+        assert.deepStrictEqual(fixed, {
+            units: [{
+                uri: rDoc.uri.toString(),
+                insertSpaces: false,
+            }],
+        });
+        assert.ok(
+            fixed.units.every((unit) => !('indentUnit' in unit)),
+            'fixed-unit entries must omit the indentUnit key entirely',
+        );
+
+        // Fixed unit, all documents in spaces mode: the payload collapses to
+        // the legacy empty list — absent entries mean insertSpaces: true to
+        // current servers, and pre-#614 binaries (custom raven.server.path)
+        // can still parse the notification and clear stale units.
+        assert.deepStrictEqual(
+            buildDocumentIndentUnitsPayload(2, [rDoc, otherDoc], resolveUnit, () => true),
+            { units: [] },
+        );
     });
 
     test('planDotInWordMigration migrates an explicit old value to the new key', () => {

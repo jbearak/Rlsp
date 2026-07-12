@@ -639,25 +639,10 @@ fn indexed_lines(source: &str) -> Vec<(usize, &str)> {
 }
 
 fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> Option<u32> {
-    let has_kind = |kind| {
-        expected.primary_kinds.contains(kind)
-            || expected
-                .alternatives
-                .iter()
-                .any(|(_, kinds)| kinds.contains(kind))
-    };
-    let candidate = |kind: IndentKind| {
-        expected
-            .primary_kinds
-            .contains(kind)
-            .then_some(expected.primary)
-            .or_else(|| {
-                expected
-                    .alternatives
-                    .iter()
-                    .find_map(|(column, kinds)| kinds.contains(kind).then_some(*column))
-            })
-    };
+    // Candidate resolution delegates to the lint's primary-first lookup so
+    // the judge and the mismatch advice's equality check cannot drift.
+    let candidate = |kind: IndentKind| expected.column_for_kind(kind);
+    let has_kind = |kind: IndentKind| expected.column_for_kind(kind).is_some();
 
     // An axis set to `Off` stands down only when the axis is the sole
     // justification for the answer. A primary that also carries the

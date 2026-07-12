@@ -14,12 +14,15 @@ import {
     RavenInitializationOptions,
 } from './initializationOptions';
 import {
+    buildDocumentIndentUnitsPayload,
     clearIneligibleDiagnostics,
     diagnosticResourceUris,
+    forgetResolvedEditorOptions,
     getUpdatedGlobalLanguageConfig,
     isIndentUnitDocument,
     isRDocument,
     planDotInWordMigration,
+    resolveInsertSpacesForDocument,
     resolveTabSizeForDocument,
 } from './extensionHelpers';
 import { registerRunningStateReconciliation } from './client-state';
@@ -123,9 +126,14 @@ function getServerPath(context: vscode.ExtensionContext): string {
 }
 
 /**
- * Send raven/documentIndentUnitsChanged when `raven.linting.indentationUnit`
- * is `"auto"`. Sends an empty list (clearing all overrides) when the setting
- * is a fixed integer, so the server falls back to `lint_config.indentation_unit`.
+ * Send raven/documentIndentUnitsChanged for the open indent-unit documents.
+ * Entries carry the document's resolved `editor.insertSpaces` (it gates the
+ * indentation lint's mismatch advice, issue #614); `indentUnit` is included
+ * only when `raven.linting.indentationUnit` is `"auto"`, so a fixed integer
+ * setting keeps the workspace-wide unit from initializationOptions
+ * authoritative. See `buildDocumentIndentUnitsPayload` for the exact entry
+ * selection, including the fixed-mode trim that keeps the payload parseable
+ * by pre-#614 servers.
  */
 function sendDocumentIndentUnitsNotification() {
     // Fires from document/editor listeners that can run before the async
@@ -138,21 +146,13 @@ function sendDocumentIndentUnitsNotification() {
     const ravenCfg = vscode.workspace.getConfiguration('raven');
     const setting = ravenCfg.get<number | 'auto'>('linting.indentationUnit', 'auto');
 
-    if (setting !== 'auto') {
-        // Fixed integer: clear per-document overrides so the server uses the
-        // workspace-wide value it already received via initializationOptions.
-        client.sendNotification('raven/documentIndentUnitsChanged', { units: [] });
-        return;
-    }
-
-    const units = vscode.workspace.textDocuments
-        .filter(isIndentUnitDocument)
-        .map(doc => ({
-            uri: doc.uri.toString(),
-            indentUnit: resolveTabSizeForDocument(doc),
-        }));
-
-    client.sendNotification('raven/documentIndentUnitsChanged', { units });
+    const payload = buildDocumentIndentUnitsPayload(
+        setting,
+        vscode.workspace.textDocuments,
+        resolveTabSizeForDocument,
+        resolveInsertSpacesForDocument,
+    );
+    client.sendNotification('raven/documentIndentUnitsChanged', payload);
 }
 
 /**
@@ -648,10 +648,12 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
                 }
             }
             // editor.tabSize changes affect per-document indent units when
-            // raven.linting.indentationUnit is "auto".
+            // raven.linting.indentationUnit is "auto"; editor.insertSpaces
+            // changes affect every entry's synced insertSpaces value.
             if (
                 event.affectsConfiguration('raven.linting.indentationUnit') ||
-                event.affectsConfiguration('editor.tabSize')
+                event.affectsConfiguration('editor.tabSize') ||
+                event.affectsConfiguration('editor.insertSpaces')
             ) {
                 sendDocumentIndentUnitsNotification();
             }
@@ -697,6 +699,7 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     context.subscriptions.push(
         vscode.workspace.onDidCloseTextDocument((doc) => {
             if (isIndentUnitDocument(doc)) {
+                forgetResolvedEditorOptions(doc.uri.toString());
                 sendDocumentIndentUnitsNotification();
             }
         })

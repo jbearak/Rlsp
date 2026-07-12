@@ -694,8 +694,12 @@ measured budget breach justifies the added invalidation state.
   latency budget above. Reconsider after a reproducible benchmark breach.
 - **Indent-unit-change republish filter resolves open documents twice:** this
   is a cold O(open documents) path that runs only on indent-unit-change
-  notifications. Reconsider if profiling shows those notifications on a hot
-  path or workspaces with many open documents miss their budget.
+  notifications. It diffs both the effective indent unit and the resolved
+  mismatch-advice producer policy (the notification also carries per-document
+  `insertSpaces`, issue #614); the policy resolution is a few field reads on
+  top of the config resolution. Reconsider if profiling shows those
+  notifications on a hot path or workspaces with many open documents miss
+  their budget.
 - **Rmd language-config generator matches the assignment rule by regex text:**
   its exact-count assertion fails loudly. If that generator is touched, a
   shared regex constant is the preferred upgrade.
@@ -708,7 +712,8 @@ measured budget breach justifies the added invalidation state.
   emitted (the deleted legacy fallback used to answer here). Deliberate: the
   expectation engine counts characters, not tab stops, and the indentation
   lint skips tab-led lines, so there is no lint-accepted set to select from.
-  Reconsider only alongside a visual-column model for the lint itself.
+  Reconsider only alongside a visual-column model for the lint itself
+  (tracked as issue #618).
 - **`rstudio-minus` alias does not map to the infix axis:** the permanent
   `raven.indentation.style` alias sets `argumentStyle` only, matching the
   last released behavior (v0.14, where chain alignment was unconditional and
@@ -722,15 +727,19 @@ measured budget breach justifies the added invalidation state.
   settings to reconcile only when the rejected column exactly matches the
   resolved producer pass. Reconsider only if the combined settings
   doctrine itself is revisited.
-- **Mismatch advice cannot see tabs-mode editors:** the advice's producer
-  policy models settings-level availability only; the judge's per-request
-  bail conditions (`insertSpaces: false`, tab-shaped context) arrive in
-  `FormattingOptions` and are invisible to the diagnostics pass, so in a
-  tabs-mode editor the advice can attribute a space-led column to a producer
-  that would emit nothing there. Accepted as a known limitation (the flag
-  itself and the settings-reconciliation guidance both stay correct);
-  reconsider if per-document `insertSpaces` is ever synced to the server
-  like the indent unit is.
+- **Mismatch advice cannot see the per-Enter tab-shaped-context bail:** the
+  tabs-mode-editor half of this limitation was fixed in issue #614 —
+  `raven/documentIndentUnitsChanged` now carries per-document `insertSpaces`
+  and `resolved_indentation_producer_policy` returns `None` on a synced
+  `false`. The judge's remaining bail — a real (non-string) tab inside the
+  per-Enter active context — is position-dependent (the window runs from the
+  outermost unclosed opener or reference row down to the probe) and has no
+  stable per-document analog at diagnostics time, so it stays unmodeled: in
+  a spaces-mode editor with a stray tab elsewhere in a flagged line's
+  context, the advice can still attribute a column to a producer that would
+  stand down on that exact Enter. Narrow by construction (the lint already
+  skips tab-led lines themselves), and the settings-reconciliation guidance
+  stays correct. Reconsider alongside a visual-column model (issue #618).
 
 - **`package_state/`** — Derived state for R package mode. Owns workspace detection result, namespace model, per-file facts (exported symbols, roxygen tags), and the aggregate scope contribution. Fully derive-based: `derive_package_state()` recomputes the entire `PackageState` from inputs.
 
