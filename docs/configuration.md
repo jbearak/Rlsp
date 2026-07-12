@@ -193,14 +193,14 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.indentation.enabled` | `true` | Tier 2 AST-aware indentation master switch |
+| `raven.indentation.enabled` | `true` | AST-aware indentation master switch |
 | `raven.indentation.argumentStyle` | `"aligned"` | Parenthesized arguments: `"aligned"`, `"indented"`, or `"off"` |
 | `raven.indentation.infixContinuationStyle` | `"aligned"` | Infix continuations: `"aligned"`, `"indented"`, or `"off"` |
-| `raven.indentation.style` | `"rstudio"` | Deprecated permanent alias: `rstudio` → argument `aligned`, `rstudio-minus` → argument `indented`, `off` → Tier 2 disabled |
+| `raven.indentation.style` | `"rstudio"` | Deprecated permanent alias: `rstudio` → argument `aligned`, `rstudio-minus` → argument `indented`, `off` → AST-aware indentation disabled |
 
 Explicit new settings win per field over the alias. The alias never changes the infix axis. See [Smart Indentation](indentation.md#permanent-compatibility-alias) for the full precedence table and examples.
 
-Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto by default (the lowest-priority VS Code default). Tier 2 applies to plain R and to R chunk bodies; prose, YAML, and non-R chunks stand down. Disable it per language when desired:
+Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto by default (the lowest-priority VS Code default). AST-aware indentation applies to plain R and to R chunk bodies; prose, YAML, and non-R chunks stand down. Disable it per language when desired:
 
 ```json
 "[r]": {

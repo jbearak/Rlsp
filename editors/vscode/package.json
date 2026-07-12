@@ -1382,7 +1382,7 @@
         "raven.indentation.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Enable AST-aware indentation (Tier 2). When disabled, Raven emits no on-type indentation edits and Tier 1/native indentation stands."
+          "description": "Enable AST-aware indentation. When disabled, Raven emits no on-type indentation edits and the editor's built-in indentation stands."
         },
         "raven.indentation.argumentStyle": {
           "type": "string",
@@ -1394,7 +1394,7 @@
           "enumDescriptions": [
             "Align same-line arguments after the opener (equivalent to ESS RStudio)",
             "Indent arguments one level from the opener line (equivalent to ESS RStudio-)",
-            "Let Tier 1/native indentation stand for parenthesized argument constructs"
+            "Let the editor's built-in indentation stand for parenthesized argument constructs"
           ],
           "default": "aligned",
           "description": "How AST-aware indentation formats parenthesized argument continuations."
@@ -1409,7 +1409,7 @@
           "enumDescriptions": [
             "Align operands at the chain's first operand, floored one level from the owning statement",
             "Indent every continuation one level from the chain-start line",
-            "Let Tier 1/native indentation stand for infix-operator continuations"
+            "Let the editor's built-in indentation stand for infix-operator continuations"
           ],
           "default": "aligned",
           "description": "How AST-aware indentation formats infix-operator chain continuations. Assignment operators remain one level in for every value."

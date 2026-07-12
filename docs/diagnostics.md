@@ -182,7 +182,7 @@ Two opt-out settings turn off this descent and restore blanket suppression for h
 
 ### Package names vs. install status
 
-Raven can resolve a package's **export names** from three sources — installed packages, a committed `.raven/packages.json`, or Raven's broad `names.db` metadata when available — so symbols from `library(pkg)` resolve even when the package isn't installed (for example in CI with no R). That metadata isn't bundled with the binary; install it with `raven packages update` for broad CRAN/Bioconductor coverage. See [Package database](package-database.md). Crucially, knowing a package's exports is kept **separate** from knowing whether it is installed:
+Raven can resolve a package's **export names** from three sources, consulted in order — installed packages (Tier 1), a committed `.raven/packages.json` (Tier 2), or Raven's broad `names.db` metadata (Tier 3) when available — so symbols from `library(pkg)` resolve even when the package isn't installed (for example in CI with no R). That metadata isn't bundled with the binary; install it with `raven packages update` for broad CRAN/Bioconductor coverage. See [Package database](package-database.md). Crucially, knowing a package's exports is kept **separate** from knowing whether it is installed:
 
 - **Export resolution** (suppresses undefined-variable noise) uses all three tiers, in every mode.
 - **Install status** (drives the *missing-package* diagnostic) is **Tier 1 only** — it reflects what is actually present in the local library paths, and never the package symbol database. A database that knows `dplyr`'s exports does **not** make `dplyr` count as installed.
