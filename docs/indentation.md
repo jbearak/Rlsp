@@ -222,7 +222,12 @@ Likewise, `argumentStyle = off` leaves argument indentation to the editor's buil
 
 ## Assignment continuations
 
-Assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) always continue one level in, regardless of the argument, infix, or lint style; an assignment RHS is not a peer operand of its LHS.
+Assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) add one
+style-independent indentation level to the base established by the surrounding
+context; an assignment RHS is not a peer operand of its LHS. Inside a call,
+`argumentStyle` determines whether that base is opener-aligned or
+block-indented, so the final column can differ. Non-assignment operators nested
+inside the continuation still follow `infixContinuationStyle`.
 
 At top level the RHS begins one unit in (column 2 with a 2-space unit):
 
@@ -258,7 +263,10 @@ f(
 )
 ```
 
-A same-line opener follows the argument setting. In this incomplete assignment shape, `aligned` selects column 21 after the opener; `indented` selects column 4 (two 2-space units — the call's plus the assignment's):
+A same-line opener supplies the argument-style base before the assignment adds
+its level. In this incomplete assignment shape, `aligned` selects column 21
+after the opener; `indented` selects column 4 (two 2-space units — the call's
+plus the assignment's):
 
 ```r
 long_function_name(x <-
@@ -272,7 +280,10 @@ dt[, y :=
      value
 ```
 
-When a broken assignment is followed by a same-line call that starts a chain, the argument and infix choices can legitimately produce different columns: with a 2-space unit, aligned mode selects column 4, while indented mode selects column 6.
+When a broken assignment's right-hand side begins with a same-line call that
+starts a chain, the next line follows the infix setting. With a 2-space unit,
+`infixContinuationStyle = aligned` selects column 4, while `indented` selects
+column 6.
 
 ```r
 # aligned
