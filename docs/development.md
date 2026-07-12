@@ -718,8 +718,9 @@ measured budget breach justifies the added invalidation state.
 - **Strict lint `indented` flags formatter-`aligned` output:** deliberate
   combined-model semantics — a mismatched producer/lint pair is a valid user
   configuration state, not a bug; the deeper-only chain-start tolerance moved
-  into `either` (the default), and the mismatch-advice diagnostic (PR 3)
-  names the settings to reconcile. Reconsider only if the combined settings
+  into `either` (the default), and the mismatch-advice suffix names the
+  settings to reconcile only when the rejected column exactly matches the
+  resolved producer pass. Reconsider only if the combined settings
   doctrine itself is revisited.
 
 - **`package_state/`** — Derived state for R package mode. Owns workspace detection result, namespace model, per-file facts (exported symbols, roxygen tags), and the aggregate scope contribution. Fully derive-based: `derive_package_state()` recomputes the entire `PackageState` from inputs.
