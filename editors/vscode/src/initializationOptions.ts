@@ -106,6 +106,9 @@ export interface RavenInitializationOptions {
         triggerOnOpenParen?: boolean;
     };
     indentation?: {
+        enabled?: boolean;
+        argumentStyle?: "aligned" | "indented" | "off";
+        infixContinuationStyle?: "aligned" | "indented" | "off";
         style?: "rstudio" | "rstudio-minus" | "off";
     };
     linting?: {
@@ -404,9 +407,21 @@ export function getInitializationOptions(
         options.completion = { triggerOnOpenParen };
     }
 
+    const indentationEnabled = getExplicitSetting<boolean>(config, 'indentation.enabled');
+    const indentationArgumentStyle = getExplicitSetting<"aligned" | "indented" | "off">(config, 'indentation.argumentStyle');
+    const indentationInfixStyle = getExplicitSetting<"aligned" | "indented" | "off">(config, 'indentation.infixContinuationStyle');
     const indentationStyle = getExplicitSetting<"rstudio" | "rstudio-minus" | "off">(config, 'indentation.style');
-    if (indentationStyle !== undefined) {
-        options.indentation = { style: indentationStyle };
+    if (
+        indentationEnabled !== undefined ||
+        indentationArgumentStyle !== undefined ||
+        indentationInfixStyle !== undefined ||
+        indentationStyle !== undefined
+    ) {
+        options.indentation = {};
+        if (indentationEnabled !== undefined) options.indentation.enabled = indentationEnabled;
+        if (indentationArgumentStyle !== undefined) options.indentation.argumentStyle = indentationArgumentStyle;
+        if (indentationInfixStyle !== undefined) options.indentation.infixContinuationStyle = indentationInfixStyle;
+        if (indentationStyle !== undefined) options.indentation.style = indentationStyle;
     }
 
     // Linting settings: always emit the full section using each setting's
@@ -426,7 +441,7 @@ export function getInitializationOptions(
             // first notification arrives.
             return v === 'auto' ? 2 : v;
         })(),
-        infixContinuationStyle: config.get<"indented" | "aligned" | "either">('linting.infixContinuationStyle', 'indented'),
+        infixContinuationStyle: config.get<"indented" | "aligned" | "either">('linting.infixContinuationStyle', 'either'),
         assignmentOperator: config.get<"<-" | "=">('linting.assignmentOperator', '<-'),
         stringDelimiter: config.get<"\"" | "'">('linting.stringDelimiter', '"'),
         objectNameStyleFunction: config.get<ObjectNameStyleSetting>('linting.objectNameStyleFunction', ['snake_case', 'symbols']),

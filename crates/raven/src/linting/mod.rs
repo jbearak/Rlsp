@@ -62,11 +62,10 @@
 //!   multi-line wrapping, comma/`= )` neighbors, and comment-after-opener
 //!   are exempt.
 //! * `indentation` — flag lines whose leading whitespace doesn't match the
-//!   expected indent, using lintr's accumulated indent-change model (tidy
-//!   style); Raven additionally accepts the aligned/block/chain-start forms
-//!   the on-type formatter produces. `infix_continuation_style` makes the
-//!   treatment of end-of-line infix-operator continuations configurable
-//!   (block-indented, chain-start aligned, or either).
+//!   expected indent, using lintr's accumulated indent-change model. The
+//!   infix policy is strict block-indented, floored chain-aligned, or the
+//!   union; assignment continuations are exempt. Argument-layout tolerances
+//!   remain independent of that axis.
 //!
 //! Implementation note: most rules walk the already-parsed tree directly.
 //! `commented_code` re-parses each candidate comment body; `semicolon`
@@ -2639,17 +2638,18 @@ print.data.frame <- function(x, ...) NULL
             ..indentation_only_config()
         };
 
-        let indented = base.clone();
-        assert!(!lint(text, &indented).is_empty(), "default flags alignment");
+        assert!(
+            lint(text, &base).is_empty(),
+            "the default Either style accepts aligned operands"
+        );
 
-        let either = LintConfig {
-            infix_continuation_style: InfixContinuationStyle::Either,
+        let indented = LintConfig {
+            infix_continuation_style: InfixContinuationStyle::Indented,
             ..base.clone()
         };
         assert!(
-            lint(text, &either).is_empty(),
-            "got {:?}",
-            lint(text, &either)
+            !lint(text, &indented).is_empty(),
+            "explicit strict Indented flags alignment"
         );
 
         let aligned = LintConfig {

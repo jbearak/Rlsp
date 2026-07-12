@@ -43,6 +43,7 @@ enum ProbeKind {
 enum FormPref {
     Aligned,
     Block,
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,20 +53,16 @@ struct SelectionPrefs {
 }
 
 impl SelectionPrefs {
-    /// Project the existing indentation setting onto the two future preference
-    /// axes. This is intentionally the only place that knows about
-    /// `IndentationStyle`.
-    fn from_config(config: &IndentationConfig) -> Option<Self> {
-        match config.style {
-            IndentationStyle::RStudio => Some(Self {
-                args: FormPref::Aligned,
-                infix: FormPref::Aligned,
-            }),
-            IndentationStyle::RStudioMinus => Some(Self {
-                args: FormPref::Block,
-                infix: FormPref::Block,
-            }),
-            IndentationStyle::Off => None,
+    /// Direct image of the producer's two independent style axes.
+    fn from_config(config: &IndentationConfig) -> Self {
+        let form = |style| match style {
+            IndentationStyle::Aligned => FormPref::Aligned,
+            IndentationStyle::Indented => FormPref::Block,
+            IndentationStyle::Off => FormPref::Off,
+        };
+        Self {
+            args: form(config.argument_style),
+            infix: form(config.infix_continuation_style),
         }
     }
 }
@@ -73,11 +70,11 @@ impl SelectionPrefs {
 /// Compute the indent column for the cursor line after Enter by asking the
 /// indentation lint's own expectation engine on a repaired virtual buffer.
 ///
-/// The two style axes have deliberately separate jobs: the lint setting
-/// `raven.linting.infixContinuationStyle` defines the accepted set (which
-/// columns are legal), while the indentation style defines the emit preference
-/// (which legal column to produce). They live in different settings namespaces
-/// and must never be conflated.
+/// The expectation engine is queried under its internal `Either` union so the
+/// producer can choose the configured argument and infix forms independently
+/// of the lint's configured checking policy. Compatible producer/lint pairs
+/// select the same columns; mismatched pairs are an explicit configuration
+/// state rather than a reason for one setting to steer the other.
 ///
 /// Returns `None` when the repair-and-ask path cannot answer, so the caller
 /// emits no edit and the editor's Tier 1/native indentation stands.
@@ -105,12 +102,12 @@ pub fn judge_backed_indentation(
     source: &str,
     position: Position,
     config: &IndentationConfig,
-    infix_style: InfixContinuationStyle,
 ) -> Option<u32> {
-    let Some(prefs) = SelectionPrefs::from_config(config) else {
-        log::trace!("judge_backed_indentation: bail: indentation style is Off");
+    if !config.enabled {
+        log::trace!("judge_backed_indentation: bail: Tier 2 is disabled");
         return None;
-    };
+    }
+    let prefs = SelectionPrefs::from_config(config);
     if !config.insert_spaces {
         log::trace!("judge_backed_indentation: bail: editor inserts tabs, not spaces");
         return None;
@@ -203,7 +200,7 @@ pub fn judge_backed_indentation(
         &virtual_buffer.text,
         virtual_tree.root_node(),
         config.tab_size,
-        infix_style,
+        InfixContinuationStyle::Either,
         &targets,
     );
     let expected = expectations.pop()?;
@@ -223,7 +220,7 @@ pub fn judge_backed_indentation(
         expected.alternatives
     );
 
-    let selected = select_column(&expected, prefs);
+    let selected = select_column(&expected, prefs)?;
     log::trace!(
         "judge_backed_indentation: selected column={} with prefs={:?}",
         selected,
@@ -641,43 +638,46 @@ fn indexed_lines(source: &str) -> Vec<(usize, &str)> {
     lines
 }
 
-fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> u32 {
+fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> Option<u32> {
     let has_kind = |kind| {
-        expected
-            .alternatives
-            .iter()
-            .any(|(_, kinds)| kinds.contains(kind))
+        expected.primary_kinds.contains(kind)
+            || expected
+                .alternatives
+                .iter()
+                .any(|(_, kinds)| kinds.contains(kind))
     };
     let candidate = |kind: IndentKind| {
         expected
-            .alternatives
-            .iter()
-            .find_map(|(column, kinds)| kinds.contains(kind).then_some(*column))
+            .primary_kinds
+            .contains(kind)
+            .then_some(expected.primary)
+            .or_else(|| {
+                expected
+                    .alternatives
+                    .iter()
+                    .find_map(|(column, kinds)| kinds.contains(kind).then_some(*column))
+            })
     };
 
-    if has_kind(IndentKind::ChainStart) {
+    if has_kind(IndentKind::ChainStart) || has_kind(IndentKind::InfixBlock) {
         return match prefs.infix {
-            FormPref::Aligned => expected
-                .alternatives
-                .iter()
-                .filter_map(|(column, kinds)| {
-                    (kinds.contains(IndentKind::ChainStart) && *column > expected.primary)
-                        .then_some(*column)
-                })
-                .max()
-                .unwrap_or(expected.primary),
-            FormPref::Block => candidate(IndentKind::Block).unwrap_or(expected.primary),
+            FormPref::Aligned => candidate(IndentKind::ChainStart),
+            FormPref::Block => candidate(IndentKind::InfixBlock),
+            FormPref::Off => None,
         };
     }
 
-    if has_kind(IndentKind::OpenerAligned) || has_kind(IndentKind::Block) {
+    if has_kind(IndentKind::OpenerAligned) || has_kind(IndentKind::ArgumentBlock) {
         return match prefs.args {
-            FormPref::Aligned => candidate(IndentKind::OpenerAligned).unwrap_or(expected.primary),
-            FormPref::Block => candidate(IndentKind::Block).unwrap_or(expected.primary),
+            FormPref::Aligned => candidate(IndentKind::OpenerAligned)
+                .or_else(|| candidate(IndentKind::ArgumentBlock)),
+            FormPref::Block => candidate(IndentKind::ArgumentBlock)
+                .or_else(|| candidate(IndentKind::OpenerAligned)),
+            FormPref::Off => None,
         };
     }
 
-    expected.primary
+    Some(expected.primary)
 }
 
 #[cfg(test)]
@@ -821,10 +821,10 @@ mod tests {
             expected: 4,
         },
         Case {
-            name: "same-line opener defers to hanging form",
+            name: "same-line opener uses argument alignment",
             source: "long_function_name(x <-\n",
             line: 1,
-            expected: 19,
+            expected: 21,
         },
         Case {
             name: "backtick name closer does not pop real opener",
@@ -862,18 +862,20 @@ mod tests {
         IndentationConfig {
             tab_size: 2,
             insert_spaces: true,
-            style,
+            enabled: true,
+            argument_style: style,
+            infix_continuation_style: style,
         }
     }
     fn judge(
         source: &str,
         position: Position,
         config: &IndentationConfig,
-        infix_style: InfixContinuationStyle,
+        _infix_style: InfixContinuationStyle,
     ) -> Option<u32> {
         let tree =
             with_parser(|parser| parser.parse(source, None)).expect("real test input must parse");
-        judge_backed_indentation(&tree, source, position, config, infix_style)
+        judge_backed_indentation(&tree, source, position, config)
     }
 
     fn text_with_probe(source: &str, line: u32, column: u32) -> String {
@@ -905,25 +907,19 @@ mod tests {
     }
 
     #[test]
-    fn disputed_shapes_pin_the_frozen_accepted_sets() {
+    fn disputed_shapes_pin_strict_indented_sets() {
         let walrus = repaired_expectation("dt[, y :=\n", 1);
         assert_eq!(walrus.primary, 4);
         assert_eq!(
             walrus.alternatives,
-            vec![(
-                5,
-                IndentKindSet::of(&[IndentKind::OpenerAligned, IndentKind::ChainStart])
-            )]
+            vec![(5, IndentKindSet::single(IndentKind::OpenerAligned))]
         );
 
         let same_line_call = repaired_expectation("long_function_name(x <-\n", 1);
         assert_eq!(same_line_call.primary, 4);
         assert_eq!(
             same_line_call.alternatives,
-            vec![
-                (21, IndentKindSet::single(IndentKind::OpenerAligned)),
-                (19, IndentKindSet::single(IndentKind::ChainStart)),
-            ]
+            vec![(21, IndentKindSet::single(IndentKind::OpenerAligned))]
         );
     }
 
@@ -940,41 +936,224 @@ mod tests {
     }
 
     #[test]
-    fn repair_and_ask_shapes_return_lint_accepted_columns() {
+    fn repair_and_ask_shapes_are_clean_under_compatible_lint_styles() {
         for case in CASES {
-            for infix_style in [
-                InfixContinuationStyle::Indented,
-                InfixContinuationStyle::Aligned,
-                InfixContinuationStyle::Either,
+            for (emit_style, compatible_lint) in [
+                (IndentationStyle::Aligned, InfixContinuationStyle::Aligned),
+                (IndentationStyle::Indented, InfixContinuationStyle::Indented),
             ] {
                 let source_before = case.source.to_owned();
                 let column = judge(
                     case.source,
                     Position::new(case.line, 0),
-                    &config(IndentationStyle::RStudio),
-                    infix_style,
+                    &config(emit_style),
+                    InfixContinuationStyle::Either,
                 )
-                .unwrap_or_else(|| panic!("{} ({infix_style:?}) must be answerable", case.name));
+                .unwrap_or_else(|| panic!("{} ({emit_style:?}) must be answerable", case.name));
 
-                assert_eq!(
-                    column, case.expected,
-                    "{} ({infix_style:?}) returned the wrong column",
-                    case.name
-                );
+                if emit_style == IndentationStyle::Aligned {
+                    assert_eq!(
+                        column, case.expected,
+                        "{} returned the wrong column",
+                        case.name
+                    );
+                }
                 assert_eq!(
                     case.source, source_before,
-                    "{} leaked its virtual repair into the source",
+                    "{} leaked its repair",
                     case.name
                 );
 
                 let real_text = text_with_probe(case.source, case.line, column);
-                let diagnostics = lint_for_judge_test(&real_text, 2, infix_style);
-                assert!(
-                    diagnostics
-                        .iter()
-                        .all(|diagnostic| diagnostic.range.start.line != case.line),
-                    "{} ({infix_style:?}) emitted a column rejected by the lint: {diagnostics:?}\n{real_text}",
-                    case.name
+                for lint_style in [compatible_lint, InfixContinuationStyle::Either] {
+                    let diagnostics = lint_for_judge_test(&real_text, 2, lint_style);
+                    assert!(
+                        diagnostics
+                            .iter()
+                            .all(|diagnostic| diagnostic.range.start.line != case.line),
+                        "{} ({emit_style:?}/{lint_style:?}) emitted a rejected column: \
+                         {diagnostics:?}\n{real_text}",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mismatched_infix_pairs_flag_the_exact_emitted_column() {
+        let source = "x <- y |>\n";
+        for (emit_style, lint_style, expected_column) in [
+            (
+                IndentationStyle::Aligned,
+                InfixContinuationStyle::Indented,
+                5,
+            ),
+            (
+                IndentationStyle::Indented,
+                InfixContinuationStyle::Aligned,
+                2,
+            ),
+        ] {
+            let column = judge(
+                source,
+                Position::new(1, 0),
+                &config(emit_style),
+                InfixContinuationStyle::Either,
+            )
+            .expect("mismatch fixture must be answerable");
+            assert_eq!(column, expected_column);
+            let text = text_with_probe(source, 1, column);
+            let diagnostics = lint_for_judge_test(&text, 2, lint_style);
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.range.start.line == 1)
+                .expect("mismatched lint style must flag the probe");
+            assert_eq!(
+                diagnostic.range.end.character, column,
+                "the mismatch-advice trigger is the emitted column itself"
+            );
+        }
+    }
+
+    #[test]
+    fn per_axis_off_stands_down_only_for_that_construct() {
+        let mut argument_off = config(IndentationStyle::Aligned);
+        argument_off.argument_style = IndentationStyle::Off;
+        assert_eq!(
+            judge(
+                "long_function_name(a,\n",
+                Position::new(1, 0),
+                &argument_off,
+                InfixContinuationStyle::Either,
+            ),
+            None
+        );
+
+        let mut infix_off = config(IndentationStyle::Aligned);
+        infix_off.infix_continuation_style = IndentationStyle::Off;
+        assert_eq!(
+            judge(
+                "x |>\n",
+                Position::new(1, 0),
+                &infix_off,
+                InfixContinuationStyle::Either,
+            ),
+            None
+        );
+        assert_eq!(
+            judge(
+                "x <-\n",
+                Position::new(1, 0),
+                &infix_off,
+                InfixContinuationStyle::Either,
+            ),
+            Some(2),
+            "assignment continuations are style-neutral"
+        );
+
+        let both_off = IndentationConfig {
+            argument_style: IndentationStyle::Off,
+            infix_continuation_style: IndentationStyle::Off,
+            ..config(IndentationStyle::Aligned)
+        };
+        assert_eq!(
+            judge(
+                "{\n",
+                Position::new(1, 0),
+                &both_off,
+                InfixContinuationStyle::Either,
+            ),
+            Some(2),
+            "neutral brace blocks remain Tier 2-active"
+        );
+    }
+
+    #[test]
+    fn disabled_master_switch_returns_no_answer() {
+        let disabled = IndentationConfig {
+            enabled: false,
+            ..config(IndentationStyle::Aligned)
+        };
+        assert_eq!(
+            judge(
+                "{\n",
+                Position::new(1, 0),
+                &disabled,
+                InfixContinuationStyle::Either,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn documented_columns_match_the_real_judge_engine() {
+        let cases = [
+            (
+                "same-line call argument",
+                "result <- function_call(first_arg,\n",
+                1,
+                24,
+                2,
+            ),
+            (
+                "next-line call argument",
+                "result <- function_call(\n",
+                1,
+                2,
+                2,
+            ),
+            ("brace body", "if (condition) {\n", 1, 2, 2),
+            ("assignment RHS", "result <-\n", 1, 2, 2),
+            ("assignment under earlier opener", "f(\n  b <-\n", 2, 4, 4),
+            (
+                "assignment on same-line opener",
+                "long_function_name(x <-\n",
+                1,
+                21,
+                4,
+            ),
+            ("walrus on same-line opener", "dt[, y :=\n", 1, 5, 4),
+            ("assigned chain", "result <- data %>%\n", 1, 10, 2),
+            ("top-level chain floor", "data |>\n", 1, 2, 2),
+            ("brace-level chain floor", "{\n  x |>\n", 2, 4, 4),
+            (
+                "chain in next-line argument",
+                "output <- some_function(\n  data %>%\n",
+                2,
+                4,
+                4,
+            ),
+            (
+                "chain after broken assignment",
+                "result <-\n  data %>%\n",
+                2,
+                2,
+                2,
+            ),
+            (
+                "same-line call under broken assignment",
+                "result <-\n  f(data %>%\n",
+                2,
+                4,
+                6,
+            ),
+        ];
+
+        for (name, source, line, aligned, indented) in cases {
+            for (style, expected) in [
+                (IndentationStyle::Aligned, aligned),
+                (IndentationStyle::Indented, indented),
+            ] {
+                assert_eq!(
+                    judge(
+                        source,
+                        Position::new(line, 0),
+                        &config(style),
+                        InfixContinuationStyle::Either,
+                    ),
+                    Some(expected),
+                    "documented {name} column under {style:?}"
                 );
             }
         }
@@ -986,7 +1165,7 @@ mod tests {
         let column = judge(
             source,
             Position::new(1, 0),
-            &config(IndentationStyle::RStudioMinus),
+            &config(IndentationStyle::Indented),
             InfixContinuationStyle::Either,
         );
         assert_eq!(column, Some(2));
@@ -994,7 +1173,7 @@ mod tests {
 
     #[test]
     fn bails_for_invalid_positions_and_multiline_strings() {
-        let cfg = config(IndentationStyle::RStudio);
+        let cfg = config(IndentationStyle::Aligned);
         assert_eq!(
             judge(
                 "x\n",
@@ -1026,7 +1205,7 @@ mod tests {
 
     #[test]
     fn bails_inside_multiline_backtick_identifiers() {
-        let cfg = config(IndentationStyle::RStudio);
+        let cfg = config(IndentationStyle::Aligned);
         assert_eq!(
             judge(
                 "f(`a\nb`)\n",
@@ -1040,7 +1219,7 @@ mod tests {
 
     #[test]
     fn bails_when_context_does_not_conform_to_the_accepted_set() {
-        let cfg = config(IndentationStyle::RStudio);
+        let cfg = config(IndentationStyle::Aligned);
         for source in ["    {\n", "    result <-\n"] {
             assert_eq!(
                 judge(
@@ -1067,7 +1246,7 @@ mod tests {
 
     #[test]
     fn conformity_reference_skips_blank_and_comment_lines() {
-        let cfg = config(IndentationStyle::RStudio);
+        let cfg = config(IndentationStyle::Aligned);
         assert_eq!(
             judge(
                 "f(\n\n      # odd comment\n",
@@ -1081,7 +1260,7 @@ mod tests {
 
     #[test]
     fn bails_for_tab_contexts_and_tab_editors() {
-        let cfg = config(IndentationStyle::RStudio);
+        let cfg = config(IndentationStyle::Aligned);
         assert_eq!(
             judge(
                 "\tf(a,\n",
@@ -1095,7 +1274,7 @@ mod tests {
 
         let tabs = IndentationConfig {
             insert_spaces: false,
-            ..config(IndentationStyle::RStudio)
+            ..config(IndentationStyle::Aligned)
         };
         assert_eq!(
             judge(
@@ -1111,7 +1290,7 @@ mod tests {
 
     #[test]
     fn unrelated_earlier_errors_do_not_disable_the_judge() {
-        let cfg = config(IndentationStyle::RStudio);
+        let cfg = config(IndentationStyle::Aligned);
         // The malformed `x +*` statement sits outside the reference-to-probe
         // window (its reference is the `f(` line) and must not make the
         // judge bail — the lint's own fold tolerates it too.
@@ -1128,7 +1307,7 @@ mod tests {
 
     #[test]
     fn tabs_outside_the_active_context_do_not_disable_the_judge() {
-        let cfg = config(IndentationStyle::RStudio);
+        let cfg = config(IndentationStyle::Aligned);
         // The tab sits between tokens of an earlier completed statement,
         // above both the outermost unclosed opener and the reference line,
         // so it cannot distort the emitted columns.
@@ -1145,7 +1324,7 @@ mod tests {
 
     #[test]
     fn bails_when_the_repaired_buffer_still_has_errors() {
-        let cfg = config(IndentationStyle::RStudio);
+        let cfg = config(IndentationStyle::Aligned);
         assert_eq!(
             judge(
                 "x %+\n",
@@ -1205,6 +1384,7 @@ mod tests {
     fn selection_never_targets_top_level_alternative() {
         let expected = LineIndentExpectation {
             primary: 4,
+            primary_kinds: IndentKindSet::single(IndentKind::Block),
             alternatives: vec![(0, IndentKindSet::single(IndentKind::TopLevel))],
         };
         assert_eq!(
@@ -1215,7 +1395,7 @@ mod tests {
                     infix: FormPref::Block,
                 },
             ),
-            4
+            Some(4)
         );
     }
 }

@@ -694,7 +694,7 @@ pub async fn run_bounded_fanout_for_test<T, MakeFuture, FutureOutput>(
 ///   indentation lint; clamped to `[1, 8]`.
 /// * `infixContinuationStyle` (`"indented"` / `"aligned"` / `"either"`) —
 ///   continuation style for end-of-line infix operators in the indentation
-///   lint; any other string warns and falls back to `"indented"`.
+///   lint; any other string warns and falls back to `"either"`.
 /// * `assignmentOperator` (`"<-"` or `"="`) — preferred operator.
 /// * `stringDelimiter` (`"\""` or `"'"`) — preferred string delimiter.
 /// * `objectNameStyleFunction`, `objectNameStyleVariable`,
@@ -797,9 +797,9 @@ pub(crate) fn parse_lint_config(
             "either" => crate::linting::InfixContinuationStyle::Either,
             other => {
                 log::warn!(
-                    "Unrecognised linting.infixContinuationStyle '{other}', defaulting to 'indented'."
+                    "Unrecognised linting.infixContinuationStyle '{other}', defaulting to 'either'."
                 );
-                crate::linting::InfixContinuationStyle::Indented
+                crate::linting::InfixContinuationStyle::Either
             }
         };
     }
@@ -973,22 +973,42 @@ pub(crate) fn parse_indentation_config(
     settings: &serde_json::Value,
 ) -> Option<IndentationSettings> {
     let indentation = settings.get("indentation")?;
-
     let mut config = IndentationSettings::default();
 
-    if let Some(style_str) = indentation.get("style").and_then(|v| v.as_str()) {
-        config.style = match style_str.to_lowercase().as_str() {
-            "rstudio" => crate::indentation::IndentationStyle::RStudio,
-            "rstudio-minus" => crate::indentation::IndentationStyle::RStudioMinus,
+    // Resolve the permanent compatibility alias first. Explicit new fields
+    // are applied below and therefore win independently on each field.
+    if let Some(style) = indentation.get("style").and_then(|value| value.as_str()) {
+        match style.to_ascii_lowercase().as_str() {
+            "rstudio" => config.argument_style = crate::indentation::IndentationStyle::Aligned,
+            "rstudio-minus" => {
+                config.argument_style = crate::indentation::IndentationStyle::Indented;
+            }
+            "off" => config.enabled = false,
+            _ => log::warn!("Invalid indentation.style: {style}; ignoring compatibility alias"),
+        }
+    }
+
+    if let Some(enabled) = indentation.get("enabled").and_then(|value| value.as_bool()) {
+        config.enabled = enabled;
+    }
+
+    let parse_axis = |key: &str| {
+        let value = indentation.get(key)?.as_str()?;
+        Some(match value.to_ascii_lowercase().as_str() {
+            "aligned" => crate::indentation::IndentationStyle::Aligned,
+            "indented" => crate::indentation::IndentationStyle::Indented,
             "off" => crate::indentation::IndentationStyle::Off,
             _ => {
-                log::warn!(
-                    "Invalid indentation.style: {}, defaulting to rstudio",
-                    style_str
-                );
-                crate::indentation::IndentationStyle::RStudio
+                log::warn!("Invalid indentation.{key}: {value}; defaulting to aligned");
+                crate::indentation::IndentationStyle::Aligned
             }
-        };
+        })
+    };
+    if let Some(style) = parse_axis("argumentStyle") {
+        config.argument_style = style;
+    }
+    if let Some(style) = parse_axis("infixContinuationStyle") {
+        config.infix_continuation_style = style;
     }
 
     Some(config)
@@ -9224,7 +9244,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let is_newline = params.ch == "\n";
-        let (tree, source, style, lint_config) = {
+        let (tree, source, indentation_settings, lint_config) = {
             let state = self.state.read().await;
             let doc = match state.get_document(uri) {
                 Some(d) => d,
@@ -9256,20 +9276,20 @@ impl LanguageServer for Backend {
                 }
             };
             let source = doc.analysis_text();
-            let style = state.indentation_config.style;
+            let indentation_settings = state.indentation_config.clone();
 
-            // Only the Enter path (the judge tier) reads lint settings; the
-            // closing-delimiter triggers and the Off fast path below must not
-            // pay for override glob resolution while holding the read lock.
-            let lint_config = (is_newline && style != indentation::IndentationStyle::Off)
+            // Only the enabled Enter path reads lint settings, and only for
+            // the deliberately shared indentation unit. Producer style never
+            // comes from the lint configuration.
+            let lint_config = (is_newline && indentation_settings.enabled)
                 .then(|| state.effective_lint_config_for_document(uri));
-            (tree, source, style, lint_config)
+            (tree, source, indentation_settings, lint_config)
         };
 
-        // If style is Off, disable all formatting — return no edits
-        // so only Tier 1 declarative rules apply
-        if style == indentation::IndentationStyle::Off {
-            log::trace!("on_type_formatting: style is Off, returning no edits");
+        // The legacy `style = "off"` alias resolves to this master switch.
+        // Match its prior behavior by standing down before delimiter dedup.
+        if !indentation_settings.enabled {
+            log::trace!("on_type_formatting: Tier 2 is disabled, returning no edits");
             return Ok(None);
         }
 
@@ -9349,15 +9369,13 @@ impl LanguageServer for Backend {
         let config = indentation::IndentationConfig {
             tab_size,
             insert_spaces,
-            style,
+            enabled: indentation_settings.enabled,
+            argument_style: indentation_settings.argument_style,
+            infix_continuation_style: indentation_settings.infix_continuation_style,
         };
-        // The judge consults the lint's expectation engine as an oracle, but
-        // the lint's knobs steer it only while the indentation rule is
-        // actually enabled: a disabled rule must not change on-type
-        // formatting, so both the indent unit AND the infix continuation
-        // style revert to the editor unit and the default style (a leftover
-        // `infixContinuationStyle = "aligned"` would otherwise pin top-level
-        // chains to column 0 with no lint active to justify it).
+        // The expectation engine remains the column oracle, while only its
+        // indentation unit is deliberately shared with an active lint rule.
+        // Producer styles come exclusively from `indentation_settings`.
         let indentation_rule_active =
             lint_config.enabled && lint_config.indentation_severity.is_some();
         let judge_indent_unit = if indentation_rule_active {
@@ -9365,20 +9383,14 @@ impl LanguageServer for Backend {
         } else {
             tab_size
         };
-        let infix_style = if indentation_rule_active {
-            lint_config.infix_continuation_style
-        } else {
-            crate::linting::InfixContinuationStyle::default()
-        };
-
         if log::log_enabled!(log::Level::Trace) {
             let source_lines = source.lines().count();
             log::trace!(
-                "on_type_formatting: pos=({},{}), style={:?}, infix_style={:?}, tab_size={}, source_lines={}",
+                "on_type_formatting: pos=({},{}), argument_style={:?}, infix_style={:?}, tab_size={}, source_lines={}",
                 position.line,
                 position.character,
-                style,
-                infix_style,
+                config.argument_style,
+                config.infix_continuation_style,
                 tab_size,
                 source_lines
             );
@@ -9391,7 +9403,6 @@ impl LanguageServer for Backend {
             position,
             &config,
             judge_indent_unit,
-            infix_style,
         ) else {
             log::trace!(
                 "on_type_formatting: judge could not answer; preserving editor indentation"
@@ -14504,14 +14515,11 @@ mod tests {
             // Absent key keeps the default.
             let settings = json!({ "linting": { "lineLength": 100 } });
             let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
-            assert_eq!(
-                cfg.infix_continuation_style,
-                InfixContinuationStyle::Indented
-            );
+            assert_eq!(cfg.infix_continuation_style, InfixContinuationStyle::Either);
         }
 
         #[test]
-        fn parse_lint_config_invalid_infix_continuation_style_falls_back_to_indented() {
+        fn parse_lint_config_invalid_infix_continuation_style_falls_back_to_either() {
             use crate::linting::InfixContinuationStyle;
             // Unrecognized strings warn and fall back; mistyped non-string
             // values are skipped like every sibling string setting — either
@@ -14526,7 +14534,7 @@ mod tests {
                 let cfg = crate::backend::parse_lint_config(&settings, false).unwrap();
                 assert_eq!(
                     cfg.infix_continuation_style,
-                    InfixContinuationStyle::Indented,
+                    InfixContinuationStyle::Either,
                     "value {value:?}"
                 );
             }
@@ -15475,18 +15483,16 @@ mod tests {
     }
 
     // ============================================================================
-    // Unit Tests for Indentation Style Configuration Parsing
-    // **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+    // Unit tests for indentation settings and legacy-alias parsing
     // ============================================================================
     mod indentation_config_parsing {
         use crate::indentation::IndentationStyle;
         use crate::state::IndentationSettings;
         use serde_json::json;
 
-        /// Test that missing indentation section defaults to RStudio style
-        /// **Validates: Requirements 7.4**
+        /// A missing section uses the full indentation defaults.
         #[test]
-        fn test_missing_indentation_section_defaults_to_rstudio() {
+        fn test_missing_indentation_section_uses_defaults() {
             let settings = json!({
                 "crossFile": {}
             });
@@ -15496,16 +15502,15 @@ mod tests {
                 "Should return None when indentation section is absent"
             );
             assert_eq!(
-                IndentationSettings::default().style,
-                IndentationStyle::RStudio,
-                "Should default to RStudio style when indentation section is absent"
+                IndentationSettings::default().argument_style,
+                IndentationStyle::Aligned,
+                "the argument axis should default to aligned"
             );
         }
 
-        /// Test that empty indentation section defaults to RStudio style
-        /// **Validates: Requirements 7.4**
+        /// An empty section resolves each field to its default.
         #[test]
-        fn test_empty_indentation_section_defaults_to_rstudio() {
+        fn test_empty_indentation_section_uses_defaults() {
             let settings = json!({
                 "indentation": {}
             });
@@ -15513,16 +15518,15 @@ mod tests {
             assert!(config.is_some(), "Configuration parsing should succeed");
             let config = config.unwrap();
             assert_eq!(
-                config.style,
-                IndentationStyle::RStudio,
-                "Should default to RStudio style when style key is absent"
+                config.argument_style,
+                IndentationStyle::Aligned,
+                "the argument axis should default to aligned"
             );
         }
 
-        /// Test that "rstudio" value is parsed correctly
-        /// **Validates: Requirements 7.1, 7.2**
+        /// The legacy "rstudio" alias maps only the argument axis.
         #[test]
-        fn test_parse_rstudio_style() {
+        fn test_parse_rstudio_alias() {
             let settings = json!({
                 "indentation": {
                     "style": "rstudio"
@@ -15532,16 +15536,15 @@ mod tests {
             assert!(config.is_some(), "Configuration parsing should succeed");
             let config = config.unwrap();
             assert_eq!(
-                config.style,
-                IndentationStyle::RStudio,
-                "Should parse 'rstudio' as RStudio style"
+                config.argument_style,
+                IndentationStyle::Aligned,
+                "the alias should select aligned arguments"
             );
         }
 
-        /// Test that "rstudio-minus" value is parsed correctly
-        /// **Validates: Requirements 7.1, 7.3**
+        /// The legacy "rstudio-minus" alias maps only the argument axis.
         #[test]
-        fn test_parse_rstudio_minus_style() {
+        fn test_parse_rstudio_minus_alias() {
             let settings = json!({
                 "indentation": {
                     "style": "rstudio-minus"
@@ -15551,16 +15554,15 @@ mod tests {
             assert!(config.is_some(), "Configuration parsing should succeed");
             let config = config.unwrap();
             assert_eq!(
-                config.style,
-                IndentationStyle::RStudioMinus,
-                "Should parse 'rstudio-minus' as RStudioMinus style"
+                config.argument_style,
+                IndentationStyle::Indented,
+                "the alias should select indented arguments"
             );
         }
 
-        /// Test that invalid style value defaults to RStudio
-        /// **Validates: Requirements 7.4**
+        /// An invalid legacy alias leaves the aligned argument default intact.
         #[test]
-        fn test_invalid_style_defaults_to_rstudio() {
+        fn test_invalid_legacy_style_leaves_aligned_default() {
             let settings = json!({
                 "indentation": {
                     "style": "invalid-style"
@@ -15570,16 +15572,82 @@ mod tests {
             assert!(config.is_some(), "Configuration parsing should succeed");
             let config = config.unwrap();
             assert_eq!(
-                config.style,
-                IndentationStyle::RStudio,
-                "Should default to RStudio style for invalid values"
+                config.argument_style,
+                IndentationStyle::Aligned,
+                "an invalid alias should leave the aligned default"
             );
         }
 
-        /// Test that style parsing is case-insensitive
-        /// **Validates: Requirements 7.1**
         #[test]
-        fn test_style_parsing_case_insensitive() {
+        fn resolves_new_fields_over_alias_per_field() {
+            let cases = [
+                (
+                    json!({ "indentation": { "style": "rstudio" } }),
+                    true,
+                    IndentationStyle::Aligned,
+                    IndentationStyle::Aligned,
+                ),
+                (
+                    json!({ "indentation": { "style": "rstudio-minus" } }),
+                    true,
+                    IndentationStyle::Indented,
+                    IndentationStyle::Aligned,
+                ),
+                (
+                    json!({ "indentation": { "style": "off" } }),
+                    false,
+                    IndentationStyle::Aligned,
+                    IndentationStyle::Aligned,
+                ),
+                (
+                    json!({ "indentation": { "style": "off", "enabled": true } }),
+                    true,
+                    IndentationStyle::Aligned,
+                    IndentationStyle::Aligned,
+                ),
+                (
+                    json!({
+                        "indentation": {
+                            "style": "rstudio-minus",
+                            "argumentStyle": "aligned",
+                            "infixContinuationStyle": "indented"
+                        }
+                    }),
+                    true,
+                    IndentationStyle::Aligned,
+                    IndentationStyle::Indented,
+                ),
+                (
+                    json!({
+                        "indentation": {
+                            "style": "rstudio",
+                            "argumentStyle": "off",
+                            "infixContinuationStyle": "off"
+                        }
+                    }),
+                    true,
+                    IndentationStyle::Off,
+                    IndentationStyle::Off,
+                ),
+            ];
+
+            for (settings, enabled, argument_style, infix_style) in cases {
+                let config = crate::backend::parse_indentation_config(&settings).unwrap();
+                assert_eq!(config.enabled, enabled, "settings {settings:?}");
+                assert_eq!(
+                    config.argument_style, argument_style,
+                    "settings {settings:?}"
+                );
+                assert_eq!(
+                    config.infix_continuation_style, infix_style,
+                    "settings {settings:?}"
+                );
+            }
+        }
+
+        /// Legacy alias parsing remains case-insensitive.
+        #[test]
+        fn test_legacy_style_alias_parsing_is_case_insensitive() {
             // Test uppercase
             let settings = json!({
                 "crossFile": {},
@@ -15589,9 +15657,9 @@ mod tests {
             });
             let config = crate::backend::parse_indentation_config(&settings).unwrap();
             assert_eq!(
-                config.style,
-                IndentationStyle::RStudio,
-                "Should parse 'RSTUDIO' as RStudio style"
+                config.argument_style,
+                IndentationStyle::Aligned,
+                "the uppercase alias should select aligned arguments"
             );
 
             // Test mixed case
@@ -15603,9 +15671,9 @@ mod tests {
             });
             let config = crate::backend::parse_indentation_config(&settings).unwrap();
             assert_eq!(
-                config.style,
-                IndentationStyle::RStudioMinus,
-                "Should parse 'RStudio-Minus' as RStudioMinus style"
+                config.argument_style,
+                IndentationStyle::Indented,
+                "the mixed-case alias should select indented arguments"
             );
         }
     }
@@ -25480,49 +25548,7 @@ lineLength = 200
     }
 
     #[tokio::test]
-    async fn on_type_formatting_ignores_infix_style_when_indentation_rule_is_disabled() {
-        let tmp = TempDir::new().unwrap();
-        let content = "data %>%\n";
-        fs::write(tmp.path().join("script.R"), content).unwrap();
-        let (svc, uri) = open_in_workspace(&tmp, "script.R", "r", content).await;
-        let backend = svc.inner();
-
-        {
-            let mut state = backend.state.write().await;
-            state.lint_config.enabled = true;
-            state.lint_config.indentation_severity = Some(DiagnosticSeverity::INFORMATION);
-            state.lint_config.indentation_unit = 2;
-            state.lint_config.infix_continuation_style =
-                crate::linting::InfixContinuationStyle::Aligned;
-        }
-        let enabled = backend
-            .on_type_formatting(on_type_params_with_tab_size(&uri, 1, 0, 4))
-            .await
-            .expect("on_type_formatting must not error")
-            .expect("enabled aligned style must produce an edit");
-        assert_eq!(
-            enabled[0].new_text, "",
-            "with the rule enabled, aligned style pins the top-level chain to column 0"
-        );
-
-        {
-            let mut state = backend.state.write().await;
-            state.lint_config.indentation_severity = None;
-        }
-        let disabled = backend
-            .on_type_formatting(on_type_params_with_tab_size(&uri, 1, 0, 4))
-            .await
-            .expect("on_type_formatting must not error")
-            .expect("disabled indentation rule must still produce an edit");
-        assert_eq!(
-            disabled[0].new_text, "    ",
-            "a disabled indentation rule must not let infixContinuationStyle change \
-             on-type formatting: default style at the editor unit applies"
-        );
-    }
-
-    #[tokio::test]
-    async fn on_type_formatting_uses_per_file_infix_style_override() {
+    async fn lint_infix_style_and_overrides_do_not_steer_on_type_formatting() {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("raven.toml"),
@@ -25554,14 +25580,14 @@ infixContinuationStyle = "aligned"
             .on_type_formatting(on_type_params_with_tab_size(&override_uri, 1, 0, 4))
             .await
             .expect("on_type_formatting must not error")
-            .expect("matching infix-style override must produce an edit");
-        assert_eq!(overridden[0].new_text, "");
+            .expect("matching lint-style override must produce an edit");
+        assert_eq!(overridden[0].new_text, "  ");
 
         let base = backend
             .on_type_formatting(on_type_params_with_tab_size(&base_uri, 1, 0, 4))
             .await
             .expect("on_type_formatting must not error")
-            .expect("base infix style must produce an edit");
+            .expect("base lint style must produce an edit");
         assert_eq!(base[0].new_text, "  ");
     }
 

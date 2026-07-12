@@ -196,7 +196,7 @@ mod tests {
         let base = LintConfig::default();
         assert_eq!(
             base.infix_continuation_style,
-            crate::linting::InfixContinuationStyle::Indented
+            crate::linting::InfixContinuationStyle::Either
         );
         let section = json!({ "enabled": true });
         let root = PathBuf::from("/proj");

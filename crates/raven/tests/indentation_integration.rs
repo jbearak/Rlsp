@@ -10,7 +10,6 @@
 use raven::indentation::{
     IndentationConfig, IndentationStyle, format_indentation, on_type_indentation,
 };
-use raven::linting::InfixContinuationStyle;
 use tower_lsp::lsp_types::Position;
 use tree_sitter::Parser;
 
@@ -36,13 +35,7 @@ fn parse_r_code(code: &str) -> tree_sitter::Tree {
 /// Ask the public Tier 2 path for its optional indentation column.
 fn on_type_result(code: &str, line: u32, config: &IndentationConfig) -> Option<u32> {
     let tree = parse_r_code(code);
-    on_type_indentation(
-        &tree,
-        code,
-        Position::new(line, 0),
-        config,
-        InfixContinuationStyle::Indented,
-    )
+    on_type_indentation(&tree, code, Position::new(line, 0), config)
 }
 
 /// Simulate the full onTypeFormatting flow: parse → judge → format.
@@ -64,7 +57,9 @@ fn rstudio_config(tab_size: u32) -> IndentationConfig {
     IndentationConfig {
         tab_size,
         insert_spaces: true,
-        style: IndentationStyle::RStudio,
+        enabled: true,
+        argument_style: IndentationStyle::Aligned,
+        infix_continuation_style: IndentationStyle::Aligned,
     }
 }
 
@@ -73,7 +68,9 @@ fn rstudio_minus_config(tab_size: u32) -> IndentationConfig {
     IndentationConfig {
         tab_size,
         insert_spaces: true,
-        style: IndentationStyle::RStudioMinus,
+        enabled: true,
+        argument_style: IndentationStyle::Indented,
+        infix_continuation_style: IndentationStyle::Indented,
     }
 }
 
@@ -82,7 +79,9 @@ fn tabs_config(tab_size: u32, style: IndentationStyle) -> IndentationConfig {
     IndentationConfig {
         tab_size,
         insert_spaces: false,
-        style,
+        enabled: true,
+        argument_style: style,
+        infix_continuation_style: style,
     }
 }
 
@@ -535,7 +534,7 @@ fn test_insert_spaces_true() {
 #[test]
 fn test_insert_spaces_false() {
     let code = "func(\n";
-    let config = tabs_config(4, IndentationStyle::RStudio);
+    let config = tabs_config(4, IndentationStyle::Aligned);
     // Tabs-mode bail: the judge works in character columns, not tab stops.
     assert_eq!(on_type_result(code, 1, &config), None);
 }
@@ -544,7 +543,7 @@ fn test_insert_spaces_false() {
 fn test_insert_spaces_false_with_alignment() {
     // func( has opener at column 4; next-line indent = 4 columns = 1 tab
     let code = "func(\n";
-    let config = tabs_config(4, IndentationStyle::RStudio);
+    let config = tabs_config(4, IndentationStyle::Aligned);
     // Tabs-mode bail: the judge works in character columns, not tab stops.
     assert_eq!(on_type_result(code, 1, &config), None);
 }
@@ -554,7 +553,7 @@ fn test_insert_spaces_false_alignment_with_spaces() {
     // Test case where we need tabs + trailing spaces
     // func(arg1, -> opener at col 4, alignment at col 5
     let code = "func(arg1,\n";
-    let config = tabs_config(4, IndentationStyle::RStudio);
+    let config = tabs_config(4, IndentationStyle::Aligned);
     // Tabs-mode bail: the judge works in character columns, not tab stops.
     assert_eq!(on_type_result(code, 1, &config), None);
 }
@@ -563,7 +562,7 @@ fn test_insert_spaces_false_alignment_with_spaces() {
 fn test_insert_spaces_false_multiple_tabs() {
     // Test case needing multiple tabs
     let code = "        func(\n"; // 8 spaces indent
-    let config = tabs_config(4, IndentationStyle::RStudio);
+    let config = tabs_config(4, IndentationStyle::Aligned);
     // Tabs-mode bail takes precedence even when the legacy path could express
     // the column as a whole number of tabs.
     assert_eq!(on_type_result(code, 1, &config), None);
@@ -807,8 +806,8 @@ fn test_textedit_multiline_correct_line() {
 fn test_default_config_is_rstudio() {
     let config = IndentationConfig::default();
     assert_eq!(
-        config.style,
-        IndentationStyle::RStudio,
+        config.argument_style,
+        IndentationStyle::Aligned,
         "Default should be RStudio style"
     );
     assert_eq!(config.tab_size, 2, "Default tab_size should be 2");

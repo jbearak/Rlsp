@@ -1379,6 +1379,41 @@
           "default": true,
           "description": "Trigger parameter completions when typing '(' after a function name. When disabled, parameter suggestions require manual invocation (Ctrl+Space)."
         },
+        "raven.indentation.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable AST-aware indentation (Tier 2). When disabled, Raven emits no on-type indentation edits and Tier 1/native indentation stands."
+        },
+        "raven.indentation.argumentStyle": {
+          "type": "string",
+          "enum": [
+            "aligned",
+            "indented",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Align same-line arguments after the opener (equivalent to ESS RStudio)",
+            "Indent arguments one level from the opener line (equivalent to ESS RStudio-)",
+            "Let Tier 1/native indentation stand for parenthesized argument constructs"
+          ],
+          "default": "aligned",
+          "description": "How AST-aware indentation formats parenthesized argument continuations."
+        },
+        "raven.indentation.infixContinuationStyle": {
+          "type": "string",
+          "enum": [
+            "aligned",
+            "indented",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Align operands at the chain's first operand, floored one level from the owning statement",
+            "Indent every continuation one level from the chain-start line",
+            "Let Tier 1/native indentation stand for infix-operator continuations"
+          ],
+          "default": "aligned",
+          "description": "How AST-aware indentation formats infix-operator chain continuations. Assignment operators remain one level in for every value."
+        },
         "raven.indentation.style": {
           "type": "string",
           "enum": [
@@ -1387,12 +1422,13 @@
             "off"
           ],
           "enumDescriptions": [
-            "Aligns same-line arguments to opening paren (RStudio convention)",
-            "Indents all arguments one level in from the line that opens the call, ignoring the paren column",
-            "Disables AST-aware indentation (Tier 2), keeping only basic declarative rules (Tier 1)"
+            "Alias for argumentStyle = aligned",
+            "Alias for argumentStyle = indented",
+            "Alias for enabled = false"
           ],
           "default": "rstudio",
-          "description": "Indentation style for R code. Controls the AST-aware (Tier 2) indentation behavior. Set to 'off' to disable Tier 2 while keeping basic indentation rules active."
+          "deprecationMessage": "Deprecated compatibility alias. Use raven.indentation.enabled and raven.indentation.argumentStyle instead.",
+          "description": "Permanent compatibility alias. Explicit new settings win per field; this alias never changes raven.indentation.infixContinuationStyle."
         },
         "raven.rConsole.activation": {
           "type": "string",
@@ -2141,12 +2177,12 @@
             "either"
           ],
           "enumDescriptions": [
-            "Continuation lines indent one unit beyond the enclosing expectation (lintr-compatible); the chain-start column is also accepted when it sits deeper than that",
-            "Continuation lines must sit exactly at the operator chain's starting column; the indented form is flagged",
-            "Continuation lines may use either the indented form or the chain-start column"
+            "Strict lintr parity: continuation lines indent one unit beyond the enclosing expectation",
+            "Strict floored alignment: operands line up at the chain start, at least one level beyond the owning statement",
+            "Accept the union of the strict indented and aligned forms"
           ],
-          "default": "indented",
-          "markdownDescription": "How the indentation lint treats a line that continues an end-of-line infix operator (`|`, `+`, pipes, `$`/`@` chains). Assignment operators and named-argument `=` continuations are unaffected. Raven-specific; no `lintr` equivalent."
+          "default": "either",
+          "markdownDescription": "How the indentation lint treats a line that continues an end-of-line infix operator (`|`, `+`, pipes, `$`/`@` chains). Assignment operators and named-argument `=` continuations are unaffected. Raven-specific; no `lintr` equivalent. See also `raven.indentation.infixContinuationStyle`."
         },
         "raven.linting.indentationSeverity": {
           "type": "string",

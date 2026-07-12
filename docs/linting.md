@@ -212,68 +212,54 @@ Each rule lists the Raven settings that control it and the `lintr` linter it mir
 
 ### Indentation
 
-- **Raven:** `raven.linting.indentationUnit` (default `"auto"`, or a fixed integer clamped to `1..=8`), `raven.linting.infixContinuationStyle` (default `"indented"`), `raven.linting.indentationSeverity` (default `"information"`). When `indentationUnit` is set to `"auto"` (the default), each R file is linted against VS Code's `editor.tabSize` for that specific file, so files with different tab-size settings in the same workspace are each linted correctly. Set to a fixed integer (e.g. `2` or `4`) to use the same unit for all R files regardless of editor settings. Note: if a `[[linting.overrides]]` entry explicitly sets `indentationUnit` for a file, it takes precedence over the per-file `editor.tabSize`.
+- **Raven:** `raven.linting.indentationUnit` (default `"auto"`, or a fixed integer clamped to `1..=8`), `raven.linting.infixContinuationStyle` (default `"either"`), `raven.linting.indentationSeverity` (default `"information"`). With `indentationUnit = "auto"`, each file uses its resolved `editor.tabSize`; a matching `[[linting.overrides]]` entry still wins for that file.
 - **`lintr` equivalent:** `lintr::indentation_linter()` with its tidy-default hanging style.
-- Uses `lintr`'s accumulated "indent change" model (tidy hanging-indent style), verified against a 112-case differential corpus vs real `lintr`. Three kinds of tokens add indentation:
-  - A bracket opener indents the lines up to (but not including) a closer that starts its own line — so a standalone closing delimiter aligns with its opener's context. A closer that trails content demands the hanging (aligned-after-the-opener) indent, and tidyverse double-indent function definitions are recognized.
-  - An end-of-line operator (`+`, pipes, `$`/`@` chains, named-argument `=`) indents its continuation one more unit — except on the right-hand side of an assignment whose operator ends the line (`lintr`'s `assignment_as_infix` default), so this stays flat:
+- Uses `lintr`'s accumulated indent-change model, verified against a 112-case differential corpus. Bracket openers, end-of-line operators, and unbraced bodies contribute indentation; standalone closers align with their owning context. A run of consecutive lines wrong by the same amount produces one diagnostic.
+- Raven retains two argument-layout leniencies that are independent of the infix setting: it accepts same-line arguments aligned after the opener, and accepts a block form where tidy `lintr` demands a hanging/double indent. There is deliberately no lint-side `argumentStyle` setting.
+- A standalone comment-only line aligned with the trailing-comment column of an adjacent line expecting the same indent is exempt. Directive/suppression markers are never alignment anchors.
 
-    ```r
-    x <-
-      a +
-      b
-    ```
+`raven.linting.infixContinuationStyle` is Raven-specific; `.lintr` has no equivalent and cannot override it. It checks non-assignment end-of-line operators (`|`, `&`, `+`, comparisons, pipes, `%…%`, `$`/`@` chains):
 
-  - An unbraced `if`/`else`/`for`/`while`/`repeat`/function body, or a multi-line condition, indents one unit.
-- A run of consecutive lines mis-indented by the same amount produces a single diagnostic, matching `lintr`.
-- Under the default `infixContinuationStyle = "indented"`, Raven additionally accepts (never requires) three shapes `lintr` would flag (all examples use a 2-space unit):
-  - The aligned-argument style. `lintr` wants `b` at the block indent (column 2); Raven also accepts it aligned after the opener:
+- `"indented"` — strict `lintr` parity. The continuation receives exactly one additional block level; the former deeper-only chain-start tolerance is not part of this mode.
+- `"aligned"` — strict floored alignment. Subsequent operands use `max(first_operand_column, statement_indent + unit)`; the indented alternative is flagged.
+- `"either"` (default) — the union of the two complete passes. It accepts both editor traditions and both outputs from Raven's [producer setting](indentation.md#configuration), while still flagging anything matching neither form.
 
-    ```r
-    foo(a,
-        b
-    )
-    ```
+With a 4-space unit, strict `indented` requires the second operand at column 8:
 
-  - The block form where `lintr` demands a hanging or double indent. Here the closer trails the last argument, so `lintr` insists on alignment after the opener (column 4); Raven also accepts the plain block indent:
-
-    ```r
-    foo(a,
-      b)
-    ```
-
-  - The operator chain-start column, but *only when it sits deeper than the block indent*. `lintr` wants `bar()` at column 2; Raven also accepts column 10, aligned under `foo()` — which is where Raven's [smart indentation](indentation.md) (the AST-aware auto-indent applied when you press Enter) puts it, so the linter never flags indentation its own auto-indent just produced:
-
-    ```r
-    result <- foo() +
-              bar()
-    ```
-
-  These tolerances only ever *add* accepted layouts, so under the default Raven flags a strict subset of what `lintr` flags on those shapes. The chain-start tolerance is not the `"either"` setting: in the `"aligned"` example further below, the chain-start column (4) sits *left of* the block indent (8), so the default flags it — accepting that shape too is exactly what `"either"` adds.
-- A standalone comment-only line aligned with the trailing-comment column of an adjacent line expecting the same indent is not flagged — a common intentional documentation style. Directive/suppression markers (`# nolint`, `# raven: ...`, `# @lsp-...`) never get this exemption and are never used as alignment anchors.
-- `raven.linting.infixContinuationStyle` (Raven-specific; no `lintr` or `.lintr` equivalent — a `.lintr` can neither configure nor override it, so it stays `"indented"` unless set via `raven.toml` or editor settings) controls how a line continuing an end-of-line infix operator (`|`, `&`, `+`, comparisons, pipes, `%…%`, `$`/`@` chains) is judged. The aligned style is not a Raven invention: RStudio's *vertically align arguments in auto-indent* (on by default) produces exactly this layout for operator continuations in control-flow parentheses like `if (a ||`, and Emacs/ESS's `ess-align-continuations-in-calls` (also on by default) does so for operator continuations inside calls and brackets — at statement level both editors instead use a fixed continuation offset — and Raven's own [smart indentation](indentation.md) extends the aligned layout to operator chains generally. But no `lintr` configuration accepts it (`indent`, `hanging_indent_style`, and `assignment_as_infix` all still demand the extra level; verified against `lintr` 3.3.0.1). This setting closes that pre-existing gap:
-  - `"indented"` (default) — require the extra continuation level described above, matching `lintr`. With a 4-space unit this is clean, while the aligned form below is flagged:
-
-    ```r
-    changed <- !(
-        first_condition |
-            second_condition
-    )
-    ```
-
-  - `"aligned"` — require the continuation exactly at the operator chain's starting column, so peer operands line up. With a 4-space unit this is clean, while the extra-indent form is flagged:
-
-    ```r
-    changed <- !(
-        first_condition |
+```r
+changed <- !(
+    first_condition |
         second_condition
-    )
-    ```
+)
+```
 
-    This is a strict requirement. [Smart indentation](indentation.md) queries the configured lint style before choosing a column, so with `"aligned"` a top-level `data |>` pipeline continues at column 0 as required; auto-indent does not emit the otherwise-preferred one-unit form and then get flagged. This mode also disables the aligned-argument/block-form tolerances on the specific lines an operator continuation covers.
-  - `"either"` — accept both forms; anything clean under `"indented"` or `"aligned"` is clean under `"either"`. Genuinely under-indented code stays flagged because the chain-start line itself is still checked against its own expectation.
+Strict `aligned` requires column 4, matching the first operand; `either` accepts both snippets:
 
-  In every mode, assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) and named-argument `=` continuations are unaffected — `"aligned"` never demands the right-hand side of `x <-` line up under `x`.
+```r
+changed <- !(
+    first_condition |
+    second_condition
+)
+```
+
+The aligned floor applies at statement level. A top-level chain continues at column 2 with a 2-space unit, and column 0 is flagged:
+
+```r
+x |>
+  y
+```
+
+For `x <- y |>` the first operand begins at column 5, so aligned mode requires the continuation under `y`; indented mode requires column 2. The producer follows its own `raven.indentation.infixContinuationStyle` faithfully. Matching producer/lint values never conflict, and lint `either` is compatible with either producer value. Mismatched strict values are a user configuration state; a later PR will add advice for that state.
+
+RStudio's vertical-alignment preference and ESS's `ess-align-continuations-in-calls` produce aligned operator continuations inside parentheses/calls, while both use a fixed continuation offset at statement level. Real `lintr` 3.3.0.1, styler, and Air require the indented tradition. Projects that run those tools in CI should set both infix settings to `indented`; strict-alignment projects should set both to `aligned`.
+
+Assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) and named-argument `=` continuations are exempt from the infix axis in every mode. An RHS begun on the next line receives one level, never alignment under the LHS. Assignment flattening also keeps a continued RHS chain at that paid-for level:
+
+```r
+x <-
+  a +
+  b
+```
 
 ## Migrating from `.lintr`
 

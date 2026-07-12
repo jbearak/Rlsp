@@ -649,17 +649,26 @@ Maintain these boundaries:
   (`accepted_indents_for_lines`), which collects and sorts the change list
   once and folds only the requested lines — never the whole-document maps the
   diagnostic pass builds.
-- Selection is bounded by the judge's accepted set (whose primary column is
-  always accepted) and has separate internal argument and infix preference
-  axes. `SelectionPrefs::from_config` is the sole projection from
-  `IndentationStyle` onto those axes until #610 adds per-axis settings.
-- The lint infix style defines the accepted set; the indentation style defines
-  the emit preference. The producer queries the configured lint style. From the
-  producer's perspective, lint acceptance is frozen: changing the producer must
-  never reshape the accepted sets, which is lint-policy work such as #610.
-- `IndentKind` tags preserve each accepted column's provenance. `TopLevel`
-  contributions created by expectation merging are never preference targets;
-  selecting them recreates the accepted-0 trap.
+- The judge always queries `accepted_indents_for_lines` with the internal
+  `Either` union. `SelectionPrefs::from_config` is the direct image of the
+  producer's independent `argumentStyle` and `infixContinuationStyle` axes;
+  lint configuration never enters selection. Compatible same-named infix
+  pairs and lint `Either` are clean by construction, while mismatched strict
+  pairs remain observable configuration states.
+- The lint-resolved indentation unit is deliberately shared while the
+  indentation rule is active, including per-document `auto` resolution and
+  overrides. If the rule is disabled the editor unit is used. Do not confuse
+  this unit coupling with style coupling.
+- `IndentKind` tags preserve each column's provenance: neutral `Block`,
+  argument `ArgumentBlock`/`OpenerAligned`, and infix
+  `InfixBlock`/`ChainStart`. This lets an axis-level `off` return no answer
+  only when that axis decides the probe, without disabling brace or assignment
+  indentation. `TopLevel` merge contributions are never preference targets.
+- `Aligned` infix changes use the shared expectation engine's owning-statement
+  floor: `max(first_operand_column, statement_indent + unit)`. Program/brace
+  children are statement owners, call arguments are statement-like owners,
+  and transparent parenthesis/unary/assignment ancestors must not add a
+  second floor.
 
 #### Latency budget
 

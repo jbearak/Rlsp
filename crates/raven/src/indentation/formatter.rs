@@ -90,7 +90,9 @@ mod tests {
         IndentationConfig {
             tab_size,
             insert_spaces,
-            style: IndentationStyle::RStudio,
+            enabled: true,
+            argument_style: IndentationStyle::Aligned,
+            infix_continuation_style: IndentationStyle::Aligned,
         }
     }
 
@@ -511,7 +513,9 @@ mod tests {
             let config = IndentationConfig {
                 tab_size,
                 insert_spaces,
-                style: IndentationStyle::RStudio,
+                enabled: true,
+                argument_style: IndentationStyle::Aligned,
+                infix_continuation_style: IndentationStyle::Aligned,
             };
 
             let whitespace = generate_whitespace(target_column, &config);
@@ -587,12 +591,16 @@ mod tests {
             let config_a = IndentationConfig {
                 tab_size: tab_size_a,
                 insert_spaces: true,
-                style: IndentationStyle::RStudio,
+                enabled: true,
+                argument_style: IndentationStyle::Aligned,
+                infix_continuation_style: IndentationStyle::Aligned,
             };
             let config_b = IndentationConfig {
                 tab_size: tab_size_b,
                 insert_spaces: true,
-                style: IndentationStyle::RStudio,
+                enabled: true,
+                argument_style: IndentationStyle::Aligned,
+                infix_continuation_style: IndentationStyle::Aligned,
             };
 
             let whitespace_a = generate_whitespace(target_a, &config_a);
@@ -636,7 +644,9 @@ mod tests {
             let config = IndentationConfig {
                 tab_size,
                 insert_spaces: false,
-                style: IndentationStyle::RStudio,
+                enabled: true,
+                argument_style: IndentationStyle::Aligned,
+                infix_continuation_style: IndentationStyle::Aligned,
             };
 
             let whitespace = generate_whitespace(target_column, &config);
@@ -682,7 +692,9 @@ mod tests {
             let config = IndentationConfig {
                 tab_size,
                 insert_spaces,
-                style: IndentationStyle::RStudio,
+                enabled: true,
+                argument_style: IndentationStyle::Aligned,
+                infix_continuation_style: IndentationStyle::Aligned,
             };
 
             let edit = format_indentation(0, target_column, config, &source);
@@ -733,14 +745,16 @@ mod tests {
         ) {
             // Map index to style
             let style = match style_idx {
-                0 => IndentationStyle::RStudio,
-                _ => IndentationStyle::RStudioMinus,
+                0 => IndentationStyle::Aligned,
+                _ => IndentationStyle::Indented,
             };
 
             let config = IndentationConfig {
                 tab_size,
                 insert_spaces: true,
-                style,
+                enabled: true,
+                argument_style: style,
+                infix_continuation_style: style,
             };
 
             let whitespace = generate_whitespace(target_column, &config);
@@ -772,14 +786,16 @@ mod tests {
         ) {
             // Map index to style
             let style = match style_idx {
-                0 => IndentationStyle::RStudio,
-                _ => IndentationStyle::RStudioMinus,
+                0 => IndentationStyle::Aligned,
+                _ => IndentationStyle::Indented,
             };
 
             let config = IndentationConfig {
                 tab_size,
                 insert_spaces: false,
-                style,
+                enabled: true,
+                argument_style: style,
+                infix_continuation_style: style,
             };
 
             let whitespace = generate_whitespace(target_column, &config);
@@ -871,7 +887,9 @@ mod tests {
             let config = IndentationConfig {
                 tab_size,
                 insert_spaces,
-                style: IndentationStyle::RStudio,
+                enabled: true,
+                argument_style: IndentationStyle::Aligned,
+                infix_continuation_style: IndentationStyle::Aligned,
             };
 
             let edit = format_indentation(line_num, target_column, config, &source);
@@ -934,7 +952,9 @@ mod tests {
             let config = IndentationConfig {
                 tab_size,
                 insert_spaces,
-                style: IndentationStyle::RStudio,
+                enabled: true,
+                argument_style: IndentationStyle::Aligned,
+                infix_continuation_style: IndentationStyle::Aligned,
             };
 
             let edit = format_indentation(0, target_column, config, &source);
@@ -992,7 +1012,9 @@ mod tests {
             let config = IndentationConfig {
                 tab_size,
                 insert_spaces,
-                style: IndentationStyle::RStudio,
+                enabled: true,
+                argument_style: IndentationStyle::Aligned,
+                infix_continuation_style: IndentationStyle::Aligned,
             };
 
             // Call format_indentation to get a TextEdit
@@ -1073,14 +1095,16 @@ mod tests {
             style_idx in 0usize..2,
         ) {
             let style = match style_idx {
-                0 => IndentationStyle::RStudio,
-                _ => IndentationStyle::RStudioMinus,
+                0 => IndentationStyle::Aligned,
+                _ => IndentationStyle::Indented,
             };
 
             let config = IndentationConfig {
                 tab_size,
                 insert_spaces,
-                style,
+                enabled: true,
+                argument_style: style,
+                infix_continuation_style: style,
             };
 
             // Test case 1: Empty line (no whitespace, no content)

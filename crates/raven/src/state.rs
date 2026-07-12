@@ -122,11 +122,24 @@ impl Default for CompletionConfig {
 }
 
 /// Indentation configuration settings.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct IndentationSettings {
-    /// Indentation style for R code formatting.
-    /// _Requirements: 7.1, 7.2, 7.3, 7.4_
-    pub style: IndentationStyle,
+    /// Whether Tier 2 AST-aware indentation is enabled.
+    pub enabled: bool,
+    /// Parenthesized-argument formatting style.
+    pub argument_style: IndentationStyle,
+    /// Infix-operator continuation formatting style.
+    pub infix_continuation_style: IndentationStyle,
+}
+
+impl Default for IndentationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            argument_style: IndentationStyle::Aligned,
+            infix_continuation_style: IndentationStyle::Aligned,
+        }
+    }
 }
 
 use tower_lsp::lsp_types::Url;

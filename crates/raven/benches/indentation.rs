@@ -5,7 +5,6 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use raven::indentation::{IndentationConfig, on_type_indentation};
-use raven::linting::InfixContinuationStyle;
 use tower_lsp::lsp_types::Position;
 
 /// Build 10,000 lines containing calls, pipe chains, and nested braces.
@@ -44,7 +43,6 @@ fn bench_on_type_indentation(c: &mut Criterion) {
                 black_box(&source),
                 black_box(position),
                 black_box(&config),
-                black_box(InfixContinuationStyle::Indented),
             ))
         })
     });

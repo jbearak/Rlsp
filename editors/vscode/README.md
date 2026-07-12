@@ -4,7 +4,7 @@ Raven is a language server for R, Stan, and JAGS. Its defining idea: **what's in
 
 Because scope is resolved by position, Raven can flag genuinely undefined variables — and, parsing as you type, it catches parse errors (unclosed brackets, an `else` stranded from its `}`) and likely-bug patterns like mixed logical operators (`a & b | c`).
 
-[vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) (REditorSupport's R extension) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus RStudio-style indentation) on top of what you already have.
+[vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) (REditorSupport's R extension) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus configurable AST-aware indentation) on top of what you already have.
 
 vscode-R's language intelligence comes from [r-language-server](https://github.com/REditorSupport/languageserver), an R package that runs inside an R session and indexes the documents you have open (and, in an R package, its `R/` directory). Raven is written in Rust to be fast, and needs no R session: it indexes your whole workspace and follows `source()` chains, so completions and navigation reach symbols in files you haven't opened — jump straight to a variable's definition in another file.
 
@@ -22,7 +22,7 @@ Raven is designed to complement, not replace, your existing tools. But it *can* 
 - **[Document outline](https://github.com/jbearak/raven/blob/main/docs/document-outline.md)** — Hierarchical view with sections, classes, and nested functions
 - **Workspace symbols** — Project-wide symbol search (Cmd/Ctrl+T)
 - **File path intellisense** — Completions and cmd-click inside `source()` paths
-- **[Smart indentation](https://github.com/jbearak/raven/blob/main/docs/indentation.md)** — Context-aware auto-indent with RStudio-style alignment
+- **[Smart indentation](https://github.com/jbearak/raven/blob/main/docs/indentation.md)** — Context-aware auto-indent with configurable argument and chain styles
 - **[Cross-file awareness](https://github.com/jbearak/raven/blob/main/docs/cross-file.md)** — Follows `source()` chains to resolve scope across files
 - **[Directives](https://github.com/jbearak/raven/blob/main/docs/directives.md)** — Declare relationships and symbols the analyzer can't infer
 - **[Syntax highlighting](https://github.com/jbearak/raven/blob/main/docs/syntax-highlighting.md)** — R function names via LSP semantic tokens, plus JAGS and Stan syntax highlighting

@@ -1,32 +1,20 @@
 //! Flag lines whose leading whitespace doesn't match the expected indent.
 //!
-//! Mirrors `lintr::indentation_linter()` with the default "tidy" hanging-indent
-//! style, using lintr's accumulated "indent change" model: indent-inducing
-//! tokens (bracket openers, end-of-line infix operators, `else`/`repeat`,
-//! unbraced bodies) are collected in document order and each rewrites its
-//! covered lines' expectation relative to the *current* accumulated value.
-//! The full semantics live on [`set_expectations`]. Verified against a
-//! 112-case differential corpus vs real lintr under the default
-//! `InfixContinuationStyle::Indented`; in that mode the deliberate
-//! differences are all lenient (Raven additionally accepts the
-//! aligned-argument style, the block form where lintr demands hanging/double
-//! indents, and — only when deeper than the block indent — the chain-start
-//! column the on-type formatter produces, so Raven never flags code those
-//! styles produce, while every primary expectation matches lintr's).
+//! Mirrors `lintr::indentation_linter()` with the default tidy hanging style,
+//! using its accumulated indent-change model. The full fold semantics live on
+//! [`set_expectations`]. The explicit `Indented` pass is verified against a
+//! 112-case differential corpus; its infix behavior is strict lintr parity,
+//! while Raven's independent aligned-argument and block-form tolerances remain
+//! deliberate leniencies.
 //!
-//! `InfixContinuationStyle` (Raven-specific, no lintr equivalent) changes how
-//! end-of-line infix-operator continuations are judged: `Aligned` requires
-//! the chain-start column instead of the block indent, and `Either` accepts
-//! both forms. Assignment operators are exempt in every mode, and the
-//! `assignment_as_infix` suppression is style-independent — see
-//! `operator_change`. Note `Aligned` is a strict requirement, not a
-//! formatter-parity mode: the on-type formatter indents a continuation to
-//! `max(chain start, line indent + unit)`, so for a chain starting at a
-//! line's first column the formatter suggests one unit deeper than the
-//! column `Aligned` demands. `Aligned` also pins via `Hanging`, which clears
-//! every other tolerance accumulated on the covered lines (bracket
-//! aligned-argument and block-form alternatives included) — strict means
-//! strict.
+//! [`InfixContinuationStyle`] is Raven-specific. `Indented` applies the strict
+//! block change, `Aligned` pins to the first operand with the owning-statement
+//! one-level floor, and `Either` runs both complete folds and unions them.
+//! Assignment operators and `assignment_as_infix` suppression are
+//! style-independent; see [`operator_change`]. The producer uses this same
+//! `Either` expectation machinery but selects from its own settings, so
+//! compatible producer/lint pairs agree without either setting steering the
+//! other.
 //!
 //! Like lintr, a run of consecutive lines mis-indented by the same amount
 //! produces a single diagnostic (on the run's first line).
@@ -179,9 +167,13 @@ pub(crate) fn collect(
 pub(crate) enum IndentKind {
     /// Aligned-argument / opener column, including hanging bracket pins.
     OpenerAligned,
+    /// Unit-based indentation owned by a parenthesized argument construct.
+    ArgumentBlock,
     /// Operator-chain-start column.
     ChainStart,
-    /// A unit-based block-form level.
+    /// Unit-based indentation owned by a non-assignment infix continuation.
+    InfixBlock,
+    /// A style-neutral unit-based block level.
     Block,
     /// Column zero contributed because one style pass does not cover a line.
     ///
@@ -194,15 +186,19 @@ impl IndentKind {
     const fn bit(self) -> u8 {
         match self {
             IndentKind::OpenerAligned => 1 << 0,
-            IndentKind::ChainStart => 1 << 1,
-            IndentKind::Block => 1 << 2,
-            IndentKind::TopLevel => 1 << 3,
+            IndentKind::ArgumentBlock => 1 << 1,
+            IndentKind::ChainStart => 1 << 2,
+            IndentKind::InfixBlock => 1 << 3,
+            IndentKind::Block => 1 << 4,
+            IndentKind::TopLevel => 1 << 5,
         }
     }
 
-    const ALL: [IndentKind; 4] = [
+    const ALL: [IndentKind; 6] = [
         IndentKind::OpenerAligned,
+        IndentKind::ArgumentBlock,
         IndentKind::ChainStart,
+        IndentKind::InfixBlock,
         IndentKind::Block,
         IndentKind::TopLevel,
     ];
@@ -211,18 +207,13 @@ impl IndentKind {
 /// A set of [`IndentKind`] tags, packed into one byte. Expectations attach a
 /// set to every accepted column, and the whole-document diagnostic fold keeps
 /// one per line — a `Vec<IndentKind>` there costs a heap allocation per line
-/// for at most four flags.
+/// for at most six flags.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct IndentKindSet(u8);
 
 impl IndentKindSet {
     pub(crate) fn single(kind: IndentKind) -> Self {
         Self(kind.bit())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn of(kinds: &[IndentKind]) -> Self {
-        Self(kinds.iter().fold(0, |bits, kind| bits | kind.bit()))
     }
 
     pub(crate) fn contains(self, kind: IndentKind) -> bool {
@@ -247,6 +238,8 @@ impl std::fmt::Debug for IndentKindSet {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct LineIndentExpectation {
     pub(crate) primary: u32,
+    /// Every meaning attached to the primary column.
+    pub(crate) primary_kinds: IndentKindSet,
     /// Every additionally accepted column and all meanings attached to it.
     pub(crate) alternatives: Vec<(u32, IndentKindSet)>,
 }
@@ -335,6 +328,7 @@ pub(crate) fn accepted_indents_for_lines(
             let expected = expected.expect("every style pass fills every target slot");
             LineIndentExpectation {
                 primary: expected.primary,
+                primary_kinds: expected.primary_kinds,
                 alternatives: expected.alternatives,
             }
         })
@@ -384,8 +378,7 @@ fn expectations_for_targets(
             // Mirror the whole-document fold exactly: it only records lines
             // whose primary or alternatives are non-trivial, and an absent
             // line reads back as `top_level()` — so a fold landing on a bare
-            // column 0 (e.g. an `Aligned` pin at the line start)
-            // canonicalizes its kind to `TopLevel`.
+            // column 0 canonicalizes its kind to `TopLevel`.
             if primary == 0 && alternatives.is_empty() {
                 return Expected::top_level();
             }
@@ -767,16 +760,13 @@ fn comment_run_member(
 ///   function body (`)` at end of line with no `{` following) cover the body
 ///   lines as `Block`.
 ///
-/// Raven layers documented tolerances on top as alternative accepted values:
-/// aligned-with-opener style for argument lists whose opener carries content
-/// (`foo(a,\n    b\n)`), the block form where lintr demands hanging (and one
-/// unit where lintr demands two), and the chain-start column for operator
-/// continuations when it sits deeper than the block indent. Under the default
-/// `InfixContinuationStyle::Indented` these only ever *add* accepted values,
-/// so Raven flags a subset of what lintr flags on these shapes and primaries
-/// match lintr. The non-default styles change that for infix-operator
-/// continuations only: `Aligned` replaces the block primary with the
-/// chain-start column. `Either` never reaches this function — `collect` runs
+/// Raven layers argument-layout tolerances on top as alternative accepted
+/// values: aligned-with-opener style for lists whose opener carries content
+/// (`foo(a,\n    b\n)`), and the block form where lintr demands hanging (or
+/// one unit where lintr demands two). Infix behavior itself is strict per
+/// pass: `Indented` uses only the block change; `Aligned` replaces it with the
+/// floored chain-start pin. `Either` never reaches this function — `collect`
+/// runs
 /// one full pass (this fold plus the aligned-comment exemptions) per style
 /// and accepts a line that any pass accepts, so `Either` is the union of
 /// `Indented` and `Aligned` by construction. A per-alternative encoding in a
@@ -791,7 +781,7 @@ fn comment_run_member(
 /// runs both), every other pass contributes its primary and alternatives as
 /// alternatives. A line absent from a pass's map expects indent 0 there
 /// (`Expected::top_level`), so absence contributes 0 to the union — e.g. an
-/// `Aligned` pin at column 0 produces no map entry yet still accepts 0. Used
+/// a pass that does not cover a line still contributes top level. Used
 /// only for diagnostic messages and the run-coalescing diff; acceptance is
 /// decided per pass in `collect`.
 fn merge_pass_expectations(
@@ -895,22 +885,33 @@ fn apply_change_to_line(
 ) {
     let current = *primary;
     match change.ty {
-        ChangeType::Block => {
+        ChangeType::Block(kind) => {
             *primary = current + indent_unit;
-            *primary_kinds = IndentKindSet::single(IndentKind::Block);
+            if kind == IndentKind::Block {
+                // Style-neutral levels (notably assignment RHS indentation)
+                // compose with the axis that owns the surrounding context.
+                primary_kinds.merge(IndentKindSet::single(kind));
+            } else {
+                *primary_kinds = IndentKindSet::single(kind);
+            }
             for (column, _) in alternatives.iter_mut() {
                 *column += indent_unit;
             }
         }
-        ChangeType::Double => {
+        ChangeType::Double(kind) => {
             *primary = current + 2 * indent_unit;
-            *primary_kinds = IndentKindSet::single(IndentKind::Block);
+            *primary_kinds = IndentKindSet::single(kind);
             for (column, _) in alternatives.iter_mut() {
                 *column += 2 * indent_unit;
             }
         }
         ChangeType::Hanging(col, kind) => {
             *primary = col;
+            *primary_kinds = IndentKindSet::single(kind);
+            alternatives.clear();
+        }
+        ChangeType::FlooredHanging(col, statement_indent, kind) => {
+            *primary = col.max(statement_indent + indent_unit);
             *primary_kinds = IndentKindSet::single(kind);
             alternatives.clear();
         }
@@ -928,11 +929,8 @@ fn apply_change_to_line(
             alternatives.push((col, IndentKindSet::single(kind)));
         }
         AltRule::AlsoCol(_, _) => {}
-        AltRule::AlsoBlock => {
-            alternatives.push((
-                current + indent_unit,
-                IndentKindSet::single(IndentKind::Block),
-            ));
+        AltRule::AlsoBlock(kind) => {
+            alternatives.push((current + indent_unit, IndentKindSet::single(kind)));
         }
     }
 }
@@ -941,27 +939,27 @@ fn apply_change_to_line(
 #[derive(Clone, Copy)]
 enum ChangeType {
     /// One `indent_unit` beyond the current expectation.
-    Block,
+    Block(IndentKind),
     /// Two units (tidyverse double-indent function definitions).
-    Double,
+    Double(IndentKind),
     /// An absolute column (content trails the opener and the closer trails
-    /// content, or an infix continuation pinned to its chain-start column
-    /// under `InfixContinuationStyle::Aligned`). Clears any previously
-    /// accumulated alternatives on the covered lines.
+    /// content). Clears accumulated alternatives on the covered lines.
     Hanging(u32, IndentKind),
+    /// An absolute chain-start column floored one unit beyond the owning
+    /// statement's physical indent. Clears accumulated alternatives.
+    FlooredHanging(u32, u32, IndentKind),
 }
 
 /// Raven's extra accepted values, layered over the lintr primary.
 #[derive(Clone, Copy)]
 enum AltRule {
     None,
-    /// Accept this absolute column too (aligned-argument style, operator
-    /// chain-start alignment), but only when it sits strictly deeper than
-    /// the post-change primary.
+    /// Accept this absolute column too (aligned-argument style), but only when
+    /// it sits strictly deeper than the post-change primary.
     AlsoCol(u32, IndentKind),
     /// Accept one `indent_unit` over the pre-change expectation too (the
     /// block form where lintr demands hanging/double).
-    AlsoBlock,
+    AlsoBlock(IndentKind),
 }
 
 /// One indent-inducing token and the line range it governs.
@@ -1008,21 +1006,23 @@ fn collect_changes_bounded(
         return;
     }
     match node.kind() {
-        "braced_expression" => bracket_change(node, node, lines, false, out),
+        "braced_expression" => bracket_change(node, node, lines, false, IndentKind::Block, out),
         "call" | "subset" | "subset2" => {
             if let Some(args) = node.child_by_field_name("arguments") {
-                bracket_change(node, args, lines, false, out);
+                bracket_change(node, args, lines, false, IndentKind::ArgumentBlock, out);
             }
         }
         "function_definition" => {
             if let Some(params) = node.child_by_field_name("parameters") {
-                bracket_change(node, params, lines, true, out);
+                bracket_change(node, params, lines, true, IndentKind::ArgumentBlock, out);
             }
             unbraced_body_change(node, "body", lines, out);
         }
-        "parenthesized_expression" => bracket_change(node, node, lines, false, out),
+        "parenthesized_expression" => {
+            bracket_change(node, node, lines, false, IndentKind::ArgumentBlock, out)
+        }
         "if_statement" | "while_statement" | "for_statement" => {
-            bracket_change(node, node, lines, false, out);
+            bracket_change(node, node, lines, false, IndentKind::ArgumentBlock, out);
             let body_field = if node.kind() == "if_statement" {
                 "consequence"
             } else {
@@ -1040,7 +1040,7 @@ fn collect_changes_bounded(
                     token_byte: keyword.start_byte(),
                     begin: keyword.start_position().row as u32 + 1,
                     end: body.end_position().row as u32,
-                    ty: ChangeType::Block,
+                    ty: ChangeType::Block(IndentKind::Block),
                     alt: AltRule::None,
                 });
             }
@@ -1075,6 +1075,7 @@ fn bracket_change(
     bracket: Node<'_>,
     lines: &[&str],
     is_parameters: bool,
+    block_kind: IndentKind,
     out: &mut Vec<Change>,
 ) {
     let Some(open) = bracket.child_by_field_name("open") else {
@@ -1149,18 +1150,21 @@ fn bracket_change(
     }
 
     let (ty, alt) = if double {
-        (ChangeType::Double, AltRule::AlsoBlock)
+        (
+            ChangeType::Double(block_kind),
+            AltRule::AlsoBlock(block_kind),
+        )
     } else if closer_on_own_line {
         let alt = if has_content_after_opener {
             AltRule::AlsoCol(opener_end_col, IndentKind::OpenerAligned)
         } else {
             AltRule::None
         };
-        (ChangeType::Block, alt)
+        (ChangeType::Block(block_kind), alt)
     } else {
         (
             ChangeType::Hanging(opener_end_col, IndentKind::OpenerAligned),
-            AltRule::AlsoBlock,
+            AltRule::AlsoBlock(block_kind),
         )
     };
 
@@ -1201,12 +1205,34 @@ fn subtree_has_eol_opener(node: Node<'_>, lines: &[&str]) -> bool {
         .any(|child| subtree_has_eol_opener(child, lines))
 }
 
+/// Physical indent of the expression that owns an operator chain.
+///
+/// Program and brace children are statements. A call argument or parameter is
+/// likewise a statement-like boundary for indentation: a chain beginning on a
+/// new argument line gets its floor from that line. Parentheses, unary
+/// operators, assignments, and nested binary nodes are transparent, so a
+/// chain inside `x <- !(...)` retains `x`'s statement indent rather than
+/// treating the first operand's already-indented line as a second floor.
+fn owning_statement_indent(node: Node<'_>, lines: &[&str]) -> u32 {
+    let mut owner = node;
+    while let Some(parent) = owner.parent() {
+        if matches!(
+            parent.kind(),
+            "program" | "braced_expression" | "argument" | "parameter"
+        ) {
+            break;
+        }
+        owner = parent;
+    }
+    leading_space_count(line_text(lines, owner.start_position().row as u32))
+}
+
 /// Emit the continuation change for an infix operator whose right-hand side
 /// starts on a later line, subject to the `assignment_as_infix` suppression.
 ///
 /// Non-assignment operators honor `InfixContinuationStyle`: `Indented` keeps
-/// the block bump with the strictly-deeper chain-start tolerance and
-/// `Aligned` pins the continuation to the chain-start column outright.
+/// only the strict lintr-compatible block bump, while `Aligned` pins the
+/// continuation to the chain-start column with a one-level statement floor.
 /// `Either` never reaches this function — `set_expectations` folds it as the
 /// union of the two single-style passes. Assignment operators are exempt and
 /// always use the `Indented` shape: their RHS is not a peer operand of the
@@ -1245,15 +1271,12 @@ fn operator_change(
     {
         end = parent.end_position().row as u32;
     }
-    // The chain-start column: where the outermost operand of this operator
-    // node begins. Under `Indented` the on-type formatter may align
-    // continuations there when it sits deeper than the block indent; accept
-    // that too so the linter never disagrees with the formatter's output.
-    let chain_col = char_col(
-        lines,
-        node.start_position().row as u32,
-        node.start_position().column,
-    );
+    // The chain-start column is floored one unit beyond the physical indent
+    // of the owning statement. This keeps statement-level continuations one
+    // level in while preserving deeper RHS/paren alignment.
+    let chain_row = node.start_position().row as u32;
+    let chain_col = char_col(lines, chain_row, node.start_position().column);
+    let statement_indent = owning_statement_indent(node, lines);
     let is_assignment = matches!(op.kind(), "<-" | "<<-" | "=" | ":=" | "->" | "->>");
     let effective_style = if is_assignment {
         InfixContinuationStyle::Indented
@@ -1261,12 +1284,14 @@ fn operator_change(
         infix_style
     };
     let (ty, alt) = match effective_style {
-        InfixContinuationStyle::Indented => (
-            ChangeType::Block,
-            AltRule::AlsoCol(chain_col, IndentKind::ChainStart),
-        ),
+        InfixContinuationStyle::Indented if is_assignment => {
+            (ChangeType::Block(IndentKind::Block), AltRule::None)
+        }
+        InfixContinuationStyle::Indented => {
+            (ChangeType::Block(IndentKind::InfixBlock), AltRule::None)
+        }
         InfixContinuationStyle::Aligned => (
-            ChangeType::Hanging(chain_col, IndentKind::ChainStart),
+            ChangeType::FlooredHanging(chain_col, statement_indent, IndentKind::ChainStart),
             AltRule::None,
         ),
         InfixContinuationStyle::Either => {
@@ -1305,7 +1330,7 @@ fn named_eq_change(node: Node<'_>, out: &mut Vec<Change>) {
         token_byte: eq.start_byte(),
         begin: eq.end_position().row as u32 + 1,
         end: value.end_position().row as u32,
-        ty: ChangeType::Block,
+        ty: ChangeType::Block(IndentKind::Block),
         alt: AltRule::None,
     });
 }
@@ -1383,7 +1408,7 @@ fn unbraced_body_change(node: Node<'_>, body_field: &str, lines: &[&str], out: &
         token_byte: close.start_byte(),
         begin: close_row as u32 + 1,
         end: body.end_position().row as u32,
-        ty: ChangeType::Block,
+        ty: ChangeType::Block(IndentKind::Block),
         alt: AltRule::None,
     });
 }
@@ -1409,7 +1434,7 @@ fn else_change(node: Node<'_>, out: &mut Vec<Change>) {
         token_byte: else_kw.start_byte(),
         begin: else_kw.start_position().row as u32 + 1,
         end: alternative.end_position().row as u32,
-        ty: ChangeType::Block,
+        ty: ChangeType::Block(IndentKind::Block),
         alt: AltRule::None,
     });
 }
@@ -1488,8 +1513,8 @@ mod tests {
     use super::*;
     use crate::parser_pool::with_parser;
 
-    /// Lint under the default `Indented` style — the pre-#605 behavior every
-    /// pre-existing test in this module pins.
+    /// Lint under explicit strict `Indented` semantics — the lintr-parity
+    /// reference used by pre-existing tests, not the user-facing default.
     fn lint(text: &str, indent_unit: u32) -> Vec<Diagnostic> {
         lint_with_style(text, indent_unit, InfixContinuationStyle::Indented)
     }
@@ -1583,6 +1608,7 @@ mod tests {
         let merged = merged.expect("at least one style pass");
         LineIndentExpectation {
             primary: merged.primary,
+            primary_kinds: merged.primary_kinds,
             alternatives: merged.alternatives,
         }
     }
@@ -1642,7 +1668,7 @@ mod tests {
         );
         assert_eq!(
             folded[&1].primary_kinds,
-            IndentKindSet::single(IndentKind::Block)
+            IndentKindSet::single(IndentKind::ArgumentBlock)
         );
     }
 
@@ -1652,28 +1678,29 @@ mod tests {
         assert_eq!(expected.primary, 4);
         assert_eq!(
             expected.alternatives,
-            vec![(2, IndentKindSet::single(IndentKind::Block))]
+            vec![(2, IndentKindSet::single(IndentKind::ArgumentBlock))]
         );
     }
 
     #[test]
-    fn line_expectation_chain_start_keeps_strictly_deeper_guard() {
-        let deeper = line_expectation(
+    fn strict_indented_has_no_chain_start_tolerance() {
+        let strict = line_expectation(
             "result <- foo() +\n  bar()\n",
             2,
             InfixContinuationStyle::Indented,
             1,
         );
-        assert!(alternative_has_kind(&deeper, 10, IndentKind::ChainStart));
+        assert_eq!(strict.primary, 2);
+        assert!(strict.alternatives.is_empty());
+        assert!(strict.primary_kinds.contains(IndentKind::InfixBlock));
 
-        let not_deeper =
-            line_expectation("data +\n  value\n", 2, InfixContinuationStyle::Indented, 1);
-        assert!(
-            !not_deeper
-                .alternatives
-                .iter()
-                .any(|(_, kinds)| kinds.contains(IndentKind::ChainStart))
+        let either = line_expectation(
+            "result <- foo() +\n  bar()\n",
+            2,
+            InfixContinuationStyle::Either,
+            1,
         );
+        assert!(alternative_has_kind(&either, 10, IndentKind::ChainStart));
     }
 
     #[test]
@@ -1699,7 +1726,7 @@ mod tests {
         assert_eq!(expected.primary, 4);
         assert_eq!(
             expected.alternatives,
-            vec![(2, IndentKindSet::single(IndentKind::Block))]
+            vec![(2, IndentKindSet::single(IndentKind::ArgumentBlock))]
         );
     }
 
@@ -1710,6 +1737,7 @@ mod tests {
             expected,
             LineIndentExpectation {
                 primary: 0,
+                primary_kinds: IndentKindSet::single(IndentKind::TopLevel),
                 alternatives: Vec::new(),
             }
         );
@@ -1739,10 +1767,12 @@ mod tests {
     }
 
     #[test]
-    fn line_expectation_either_tags_absent_pass_as_top_level() {
+    fn line_expectation_either_merges_equal_floored_and_indented_columns() {
         let expected = line_expectation("data +\n  value\n", 2, InfixContinuationStyle::Either, 1);
         assert_eq!(expected.primary, 2);
-        assert!(alternative_has_kind(&expected, 0, IndentKind::TopLevel));
+        assert!(expected.alternatives.is_empty());
+        assert!(expected.primary_kinds.contains(IndentKind::InfixBlock));
+        assert!(expected.primary_kinds.contains(IndentKind::ChainStart));
     }
 
     #[test]
@@ -1763,8 +1793,8 @@ mod tests {
     /// Builds a snippet the way the on-type indenter would: starting from
     /// the first line, each subsequent content line is placed at the column
     /// the real judge-backed on-type pipeline computes for an Enter press at
-    /// that point. Used to pin the producer→judge invariant for #611: the
-    /// linter never flags what auto-indent produced.
+    /// that point. Compatible same-named lint styles and `Either` must accept
+    /// the resulting columns; mismatched strict styles may intentionally flag.
     fn build_with_auto_indent(first: &str, rest: &[&str]) -> String {
         build_with_auto_indent_for_style(first, rest, InfixContinuationStyle::Indented)
     }
@@ -1777,23 +1807,25 @@ mod tests {
         use crate::indentation::{IndentationConfig, IndentationStyle, on_type_indentation};
         use tower_lsp::lsp_types::Position;
 
+        let emit_style = match infix_style {
+            InfixContinuationStyle::Indented => IndentationStyle::Indented,
+            InfixContinuationStyle::Aligned | InfixContinuationStyle::Either => {
+                IndentationStyle::Aligned
+            }
+        };
         let config = IndentationConfig {
             tab_size: 2,
             insert_spaces: true,
-            style: IndentationStyle::RStudio,
+            enabled: true,
+            argument_style: IndentationStyle::Aligned,
+            infix_continuation_style: emit_style,
         };
         let mut text = format!("{first}\n");
         for content in rest {
             let line = text.lines().count() as u32;
             let tree = with_parser(|p| p.parse(&text, None)).expect("parse must succeed");
-            let col = on_type_indentation(
-                &tree,
-                &text,
-                Position { line, character: 0 },
-                &config,
-                infix_style,
-            )
-            .expect("the producer/judge invariant fixtures must be answerable");
+            let col = on_type_indentation(&tree, &text, Position { line, character: 0 }, &config)
+                .expect("the producer/judge invariant fixtures must be answerable");
             text.push_str(&" ".repeat(col as usize));
             text.push_str(content);
             text.push('\n');
@@ -2473,15 +2505,15 @@ mod tests {
     }
 
     #[test]
-    fn chain_start_col_accepted_as_alternative() {
-        // The on-type formatter aligns `bar()` with `foo()` (column 10 —
-        // `result <- ` is 10 chars wide) because the chain starts there.
-        // The linter must also accept the hanging indent (2). Both must
-        // pass without diagnostics.
+    fn either_accepts_chain_start_and_strict_indented_columns() {
         let aligned = "result <- foo() +\n          bar()\n";
-        let hanging = "result <- foo() +\n  bar()\n";
-        assert!(lint(aligned, 2).is_empty(), "aligned style should pass");
-        assert!(lint(hanging, 2).is_empty(), "hanging style should pass");
+        let indented = "result <- foo() +\n  bar()\n";
+        assert!(lint_with_style(aligned, 2, InfixContinuationStyle::Either).is_empty());
+        assert!(lint_with_style(indented, 2, InfixContinuationStyle::Either).is_empty());
+        assert!(
+            !lint_with_style(aligned, 2, InfixContinuationStyle::Indented).is_empty(),
+            "strict indented must reject the former deeper-only tolerance"
+        );
     }
 
     #[test]
@@ -2588,17 +2620,18 @@ mod tests {
     }
 
     #[test]
-    fn mixed_pipe_and_arithmetic_chain_accepts_hanging_and_subchain_aligned() {
-        // `f() |> g() + y + z` chains across pipe and arithmetic. The
-        // hanging form (2) and the chain-start column (which lines up with
-        // `f()` because the binop node spans from there) must both be
-        // accepted to avoid disagreeing with the on-type formatter.
-        let hanging = "x <- f() |>\n  g() + y +\n  z\n";
+    fn either_accepts_mixed_pipe_and_arithmetic_forms() {
+        let indented = "x <- f() |>\n  g() + y +\n  z\n";
         let aligned = "x <- f() |>\n     g() + y +\n     z\n";
-        assert!(lint(hanging, 2).is_empty(), "hanging style should pass");
+        for text in [indented, aligned] {
+            assert!(
+                lint_with_style(text, 2, InfixContinuationStyle::Either).is_empty(),
+                "Either must accept {text:?}"
+            );
+        }
         assert!(
-            lint(aligned, 2).is_empty(),
-            "subchain-aligned style should pass"
+            !lint_with_style(aligned, 2, InfixContinuationStyle::Indented).is_empty(),
+            "strict indented must reject chain-start alignment"
         );
     }
 
@@ -2728,20 +2761,19 @@ mod tests {
     }
 
     #[test]
-    fn aligned_style_top_level_chain_requires_column_zero() {
-        // A chain starting at a line's first column pins continuations to
-        // column 0 — deliberately stricter than the on-type formatter, which
-        // would suggest one unit here (see the module doc).
-        let aligned = "data |>\nf()\n";
-        let indented = "data |>\n  f()\n";
-        assert!(
-            lint_with_style(aligned, 2, InfixContinuationStyle::Aligned).is_empty(),
-            "got {:?}",
-            lint_with_style(aligned, 2, InfixContinuationStyle::Aligned)
-        );
-        let diags = lint_with_style(indented, 2, InfixContinuationStyle::Aligned);
-        assert_eq!(diags.len(), 1, "got {diags:?}");
-        assert_eq!(diags[0].range.start.line, 1);
+    fn aligned_style_floors_statement_level_chains() {
+        for (clean, flush, line, expected) in [
+            ("x |>\n  y\n", "x |>\ny\n", 1, "2"),
+            ("{\n  x |>\n    y\n}\n", "{\n  x |>\n  y\n}\n", 2, "4"),
+        ] {
+            assert!(
+                lint_with_style(clean, 2, InfixContinuationStyle::Aligned).is_empty(),
+                "floored aligned form must pass: {clean:?}"
+            );
+            let diags = lint_with_style(flush, 2, InfixContinuationStyle::Aligned);
+            let diag = diagnostic_on_line(&diags, line).expect("flush continuation is flagged");
+            assert!(diag.message.contains(expected), "got {diag:?}");
+        }
     }
 
     #[test]
@@ -2773,10 +2805,9 @@ mod tests {
 
     #[test]
     fn aligned_style_right_associative_extract_chain() {
-        // `$` is right-associative in tree-sitter-r: the inner `field$value`
-        // node starts at `field`'s written position. With everything at
-        // column 0 the outer and inner pins agree.
-        let text = "obj$\nfield$\nvalue\n";
+        // The statement-level floor applies to the outer and inner extract
+        // nodes, so every continued operand shares column 2.
+        let text = "obj$\n  field$\n  value\n";
         assert!(
             lint_with_style(text, 2, InfixContinuationStyle::Aligned).is_empty(),
             "got {:?}",
@@ -2788,16 +2819,16 @@ mod tests {
     fn aligned_style_extract_call_extension_composes_with_inner_bracket() {
         // The `$` change is extended over the whole following call; the
         // call's own bracket Block then stacks one unit on top of the pin.
-        let ok = "http_head(url)$\nthen(\n  x\n)\n";
+        let ok = "http_head(url)$\n  then(\n    x\n  )\n";
         assert!(
             lint_with_style(ok, 2, InfixContinuationStyle::Aligned).is_empty(),
             "got {:?}",
             lint_with_style(ok, 2, InfixContinuationStyle::Aligned)
         );
-        let bad = "http_head(url)$\n  then(\n    x\n  )\n";
+        let bad = "http_head(url)$\nthen(\n  x\n)\n";
         assert!(
             !lint_with_style(bad, 2, InfixContinuationStyle::Aligned).is_empty(),
-            "block-indented callee must be flagged under Aligned"
+            "a callee left of the statement floor must be flagged under Aligned"
         );
     }
 
@@ -2861,12 +2892,10 @@ mod tests {
     }
 
     #[test]
-    fn either_style_accepts_chain_starting_on_opener_line() {
-        // The chain starts one column right of the paren opener — *left* of
-        // the paren's block indent (2). Aligned pins to column 1, so Either
-        // must accept it too; this is the shape that rules out any
-        // enclosing-expectation guard on the aligned alternative.
-        let text = "(a +\n b\n)\n";
+    fn either_style_applies_floor_when_chain_starts_on_opener_line() {
+        // The raw chain start is column 1, but the owning statement starts at
+        // column 0, so aligned and Either both require the one-level floor.
+        let text = "(a +\n  b\n)\n";
         for style in [
             InfixContinuationStyle::Aligned,
             InfixContinuationStyle::Either,
@@ -3001,6 +3030,24 @@ mod tests {
                 diags.len(),
                 1,
                 "un-indented assignment RHS must be flagged under {style:?}; got {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aligned_break_after_assignment_keeps_all_rhs_operands_mutually_aligned() {
+        let text = "x <-\n    y +\n    z +\n    w\n";
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style(text, 4, style).is_empty(),
+                "assignment flattening must keep y/z/w at column 4 under {style:?}"
+            );
+        }
+        let lhs_aligned = "x <-\ny +\nz +\nw\n";
+        for style in ALL_STYLES {
+            assert!(
+                !lint_with_style(lhs_aligned, 4, style).is_empty(),
+                "the LHS column must not replace the one-level assignment floor"
             );
         }
     }

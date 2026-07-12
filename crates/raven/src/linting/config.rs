@@ -32,25 +32,21 @@ pub enum StringDelimiter {
 /// Continuation style for an infix-operator chain whose operator ends its
 /// line, used by the indentation rule (`rules::indentation`). Raven-specific —
 /// no `lintr` or `.lintr` equivalent: a `.lintr` can neither configure nor
-/// override it, so it stays [`Self::Indented`] unless another settings layer
+/// override it, so it stays [`Self::Either`] unless another settings layer
 /// (`raven.toml` or the LSP client) supplies it. Assignment operators (`<-`,
 /// `<<-`, `=`, `:=`, `->`, `->>`) are exempt: their continuations behave as
 /// [`Self::Indented`] in every mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InfixContinuationStyle {
     /// Block-indent the continuation one unit beyond the enclosing
-    /// expectation, also accepting the chain-start column when it sits
-    /// strictly deeper than that block indent. Matches `lintr`'s tidy style;
-    /// this is today's behavior and the default.
-    #[default]
+    /// expectation. Strictly matches `lintr`'s tidy style.
     Indented,
-    /// Require the continuation exactly at the operator chain's starting
-    /// column, replacing the block-indent primary.
+    /// Require the continuation at the operator chain's starting column,
+    /// floored at one unit beyond the owning statement's indent.
     Aligned,
-    /// Accept both the block-indent form and the chain-start column,
-    /// including when the chain-start column sits at or left of the block
-    /// primary — a strict superset of the other two styles. Genuinely
-    /// under-indented code stays flagged on the chain-start line itself.
+    /// Accept both the strict block-indent and floored chain-aligned forms.
+    /// Genuinely under-indented code stays flagged on the chain-start line.
+    #[default]
     Either,
 }
 

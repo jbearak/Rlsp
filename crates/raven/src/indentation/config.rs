@@ -7,8 +7,12 @@ pub struct IndentationConfig {
     pub tab_size: u32,
     /// Whether to use spaces (true) or tabs (false) for indentation.
     pub insert_spaces: bool,
-    /// The indentation style to use.
-    pub style: IndentationStyle,
+    /// Whether Tier 2 AST-aware indentation is enabled.
+    pub enabled: bool,
+    /// How Tier 2 formats parenthesized argument continuations.
+    pub argument_style: IndentationStyle,
+    /// How Tier 2 formats infix-operator continuations.
+    pub infix_continuation_style: IndentationStyle,
 }
 
 impl Default for IndentationConfig {
@@ -16,26 +20,22 @@ impl Default for IndentationConfig {
         Self {
             tab_size: 2,
             insert_spaces: true,
-            style: IndentationStyle::RStudio,
+            enabled: true,
+            argument_style: IndentationStyle::Aligned,
+            infix_continuation_style: IndentationStyle::Aligned,
         }
     }
 }
 
-/// Indentation style variants.
-///
-/// These correspond to common R coding conventions.
+/// Producer style for one configurable indentation axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndentationStyle {
-    /// RStudio style: same-line arguments align to the opening parenthesis,
-    /// while next-line arguments indent from the function line.
+    /// Align continuations to the syntactic anchor, with the infix axis's
+    /// one-level floor applied by the shared expectation engine.
     #[default]
-    RStudio,
-    /// RStudio-minus style: arguments indent from the opener line, ignoring
-    /// the parenthesis column.
-    RStudioMinus,
-    /// Disable Tier 2 AST-aware indentation.
-    ///
-    /// The on-type formatting handler returns no edits, leaving Tier 1
-    /// declarative rules and the editor's native indentation unchanged.
+    Aligned,
+    /// Indent continuations one level from the construct's owning line.
+    Indented,
+    /// Let Tier 1/native indentation stand for this construct.
     Off,
 }

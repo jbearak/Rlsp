@@ -185,7 +185,7 @@ const LINTING_GROUPS: LintingGroup[] = [
     },
     {
         comment: 'Raven-only, no lintr equivalent: infix continuation style',
-        entries: [{ key: 'raven.linting.infixContinuationStyle', value: 'indented' }],
+        entries: [{ key: 'raven.linting.infixContinuationStyle', value: 'either' }],
     },
 ];
 
@@ -688,7 +688,7 @@ export function renderRavenToml(linting: Record<string, unknown> | undefined): s
         ['lineLength', 80, 'maximum line length (characters)'],
         ['objectLength', 30, 'maximum identifier length'],
         ['indentationUnit', 2, 'expected indent unit'],
-        ['infixContinuationStyle', 'indented', '"indented" | "aligned" | "either" (Raven-only)'],
+        ['infixContinuationStyle', 'either', '"indented" | "aligned" | "either" (Raven-only)'],
         ['assignmentOperator', '<-', '"<-" or "="'],
         ['stringDelimiter', '"', '"\\"" or "\'"'],
         [
