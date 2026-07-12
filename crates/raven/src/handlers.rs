@@ -208,9 +208,10 @@ pub(crate) struct DiagnosticsSnapshot {
 /// a producer only from an explicit project `[indentation]` section. Beyond
 /// availability, the policy is `None` whenever the producer cannot emit:
 /// Tier 2 disabled, the producer's infix axis `off`, or the document's editor
-/// synced `insertSpaces: false` (`WorldState::per_document_indent_options`) —
-/// a tabs-mode editor where the judge stands down at Enter time, so no column
-/// can have come from it (issue #614). The judge's other per-request bail —
+/// synced `insertSpaces: false` or `formatOnType: false`
+/// (`WorldState::per_document_indent_options`) — an editor where the Enter
+/// producer cannot run, so no column can have come from it (issue #614). The
+/// judge's other per-request bail —
 /// a real tab inside the per-Enter active context — is position-dependent
 /// with no per-document analog here and stays unmodeled (a known residual
 /// limitation; see the declined-findings registry in docs/development.md).
@@ -218,14 +219,25 @@ pub(crate) fn resolved_indentation_producer_policy(
     state: &WorldState,
     uri: &Url,
 ) -> Option<crate::linting::IndentationProducerPolicy> {
-    if state
-        .per_document_indent_options
-        .get(uri.as_str())
-        .and_then(|options| options.insert_spaces)
-        == Some(false)
+    if let Some(options) = state.per_document_indent_options.get(uri.as_str())
+        && (options.insert_spaces == Some(false) || options.format_on_type == Some(false))
     {
         return None;
     }
+    base_indentation_producer_policy(state)
+}
+
+/// Resolve the document-independent portion of the auto-indent producer
+/// policy. Configuration reconciliation snapshots this value so a reload that
+/// also changes a package-watcher setting cannot be mistaken for a
+/// watcher-only change and leave mismatch-advice diagnostics stale.
+///
+/// This includes policy availability as well as the enabled/infix settings:
+/// adding or removing a default-valued project `[indentation]` section changes
+/// CLI-host policy availability even though the parsed settings remain equal.
+pub(crate) fn base_indentation_producer_policy(
+    state: &WorldState,
+) -> Option<crate::linting::IndentationProducerPolicy> {
     let producer_policy_available = state
         .raw_client_settings
         .as_object()
@@ -287,7 +299,7 @@ mod indentation_advice_policy_tests {
     }
 
     #[test]
-    fn synced_tabs_mode_gates_the_policy_per_document() {
+    fn synced_editor_options_gate_the_policy_per_document() {
         let mut state = WorldState::new();
         let uri = test_uri();
         state.raw_client_settings = serde_json::json!({"linting": {}});
@@ -320,6 +332,16 @@ mod indentation_advice_policy_tests {
             uri.as_str().to_string(),
             crate::state::DocumentIndentOptions {
                 insert_spaces: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolved_indentation_producer_policy(&state, &uri), None);
+
+        // Format-on-type disabled: VS Code never requests the producer.
+        state.per_document_indent_options.insert(
+            uri.as_str().to_string(),
+            crate::state::DocumentIndentOptions {
+                format_on_type: Some(false),
                 ..Default::default()
             },
         );

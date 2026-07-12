@@ -19,9 +19,11 @@ import {
     diagnosticResourceUris,
     forgetResolvedEditorOptions,
     getUpdatedGlobalLanguageConfig,
+    invalidateResolvedEditorOptions,
     isIndentUnitDocument,
     isRDocument,
     planDotInWordMigration,
+    resolveFormatOnTypeForDocument,
     resolveInsertSpacesForDocument,
     resolveTabSizeForDocument,
 } from './extensionHelpers';
@@ -127,13 +129,9 @@ function getServerPath(context: vscode.ExtensionContext): string {
 
 /**
  * Send raven/documentIndentUnitsChanged for the open indent-unit documents.
- * Entries carry the document's resolved `editor.insertSpaces` (it gates the
- * indentation lint's mismatch advice, issue #614); `indentUnit` is included
- * only when `raven.linting.indentationUnit` is `"auto"`, so a fixed integer
- * setting keeps the workspace-wide unit from initializationOptions
- * authoritative. See `buildDocumentIndentUnitsPayload` for the exact entry
- * selection, including the fixed-mode trim that keeps the payload parseable
- * by pre-#614 servers.
+ * The payload carries producer-relevant `editor.insertSpaces` and
+ * `editor.formatOnType` state separately from the v0.14-compatible unit list.
+ * See `buildDocumentIndentUnitsPayload` for the wire-compatibility invariant.
  */
 function sendDocumentIndentUnitsNotification() {
     // Fires from document/editor listeners that can run before the async
@@ -151,6 +149,7 @@ function sendDocumentIndentUnitsNotification() {
         vscode.workspace.textDocuments,
         resolveTabSizeForDocument,
         resolveInsertSpacesForDocument,
+        resolveFormatOnTypeForDocument,
     );
     client.sendNotification('raven/documentIndentUnitsChanged', payload);
 }
@@ -613,8 +612,15 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     );
 
     context.subscriptions.push(
-        vscode.window.onDidChangeVisibleTextEditors(() => {
+        vscode.window.onDidChangeVisibleTextEditors((editors) => {
             sendActivityNotification();
+            // A document can be opened first as a hidden text model. Initial
+            // TextEditor creation does not guarantee an options-change event,
+            // so visibility is the first reliable point at which
+            // detectIndentation/status-bar-resolved values can be observed.
+            if (editors.some((editor) => isIndentUnitDocument(editor.document))) {
+                sendDocumentIndentUnitsNotification();
+            }
         })
     );
 
@@ -647,13 +653,51 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
                     });
                 }
             }
-            // editor.tabSize changes affect per-document indent units when
-            // raven.linting.indentationUnit is "auto"; editor.insertSpaces
-            // changes affect every entry's synced insertSpaces value.
+            // Editor-setting changes must invalidate last-visible memos first:
+            // hidden documents otherwise keep stale resolved values forever.
+            // Visible editors repopulate from their live TextEditorOptions.
+            const affectedEditorUris = (section: string): Set<string> => {
+                if (!event.affectsConfiguration(section)) {
+                    return new Set();
+                }
+                return new Set(
+                    vscode.workspace.textDocuments
+                        .filter(isIndentUnitDocument)
+                        .filter((doc) => event.affectsConfiguration(section, {
+                            uri: doc.uri,
+                            languageId: doc.languageId,
+                        }))
+                        .map((doc) => doc.uri.toString())
+                );
+            };
+            const tabSizeUris = affectedEditorUris('editor.tabSize');
+            const insertSpacesUris = affectedEditorUris('editor.insertSpaces');
+            const detectIndentationUris = affectedEditorUris('editor.detectIndentation');
+            const formatOnTypeUris = affectedEditorUris('editor.formatOnType');
+            const tabSizeInvalidationUris = new Set([
+                ...tabSizeUris,
+                ...detectIndentationUris,
+            ]);
+            const insertSpacesInvalidationUris = new Set([
+                ...insertSpacesUris,
+                ...detectIndentationUris,
+            ]);
+            if (tabSizeInvalidationUris.size > 0 || insertSpacesInvalidationUris.size > 0) {
+                invalidateResolvedEditorOptions({
+                    tabSize: tabSizeInvalidationUris,
+                    insertSpaces: insertSpacesInvalidationUris,
+                });
+            }
+
+            // tabSize/detectIndentation affect per-document units in "auto"
+            // mode; insertSpaces/detectIndentation and formatOnType determine
+            // whether the Enter producer can run.
             if (
                 event.affectsConfiguration('raven.linting.indentationUnit') ||
-                event.affectsConfiguration('editor.tabSize') ||
-                event.affectsConfiguration('editor.insertSpaces')
+                tabSizeUris.size > 0 ||
+                insertSpacesUris.size > 0 ||
+                detectIndentationUris.size > 0 ||
+                formatOnTypeUris.size > 0
             ) {
                 sendDocumentIndentUnitsNotification();
             }

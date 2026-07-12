@@ -82,16 +82,18 @@ All benchmarks except `startup` require `--features test-support`. Set `RAVEN_BE
 - `cargo bench --bench cross_file --features test-support`
 - `cargo bench --bench libpath_capture --features test-support`
 - `cargo bench --bench edit_to_publish --features test-support`
+- `cargo bench --bench indentation --features test-support`
 
-The `Performance` GitHub Actions workflow uses the `startup` benchmark for PR
-comparison comments. Criterion's `main` baseline is cached from push-to-`main`
-runs only; PR runs restore that cache and save their results as a local `pr`
-baseline, but must not write the `target/criterion` cache. Allowing PRs to
-save the cache can create branch-scoped entries that contain only `pr`, which
-then shadow the default-branch cache and make future PRs report "No `main`
-baseline found". The PR comparison guard must use `critcmp --baselines` to
-detect saved baseline names; `critcmp --list` formats comparison output and
-does not prove that a restored `main` baseline exists.
+The `Performance` GitHub Actions workflow tracks `startup`, `indentation`, and
+the standalone-cache subset of `cross_file` for PR comparison comments.
+Criterion's `main` baseline is cached from push-to-`main` runs only; PR runs
+restore that cache and save their results as a local `pr` baseline, but must
+not write the `target/criterion` cache. Allowing PRs to save the cache can
+create branch-scoped entries that contain only `pr`, which then shadow the
+default-branch cache and make future PRs report "No `main` baseline found".
+The PR comparison guard must use `critcmp --baselines` to detect saved baseline
+names; `critcmp --list` formats comparison output and does not prove that a
+restored `main` baseline exists.
 
 ## Profiling startup
 
@@ -649,6 +651,12 @@ Maintain these boundaries:
   (`accepted_indents_for_lines`), which collects and sorts the change list
   once and folds only the requested lines — never the whole-document maps the
   diagnostic pass builds.
+- Whole-document `Either` linting also collects and sorts one style-neutral
+  change list. It folds `Indented` first and returns immediately when that
+  pass is clean (because `Either` is a superset); otherwise it folds `Aligned`
+  from the same changes. Aligned-comment exemptions remain separate per pass,
+  and accepted columns are merged only for lines rejected by every pass — do
+  not restore a third eager whole-document union map.
 - The judge always queries `accepted_indents_for_lines` with the internal
   `Either` union. `SelectionPrefs::from_config` is the direct image of the
   producer's independent `argumentStyle` and `infixContinuationStyle` axes;
@@ -659,6 +667,33 @@ Maintain these boundaries:
   indentation rule is active, including per-document `auto` resolution and
   overrides. If the rule is disabled the editor unit is used. Do not confuse
   this unit coupling with style coupling.
+- Mismatch advice reuses the opposite strict producer fold, but it may credit
+  the producer only when the nearest checkable reference line conforms to the
+  union of the lint and producer passes — the same `Either` conformity gate
+  the judge applies. An offset/nonconforming context makes the judge emit no
+  edit and must keep the ordinary lint message. The lint does not construct
+  the judge's repaired buffer, so any syntax-error tree conservatively keeps
+  the ordinary message rather than risking false producer attribution.
+- The per-document effective-lint-config cache is only for URIs in
+  `WorldState::documents`. `raven check` workers pass one-document overlays
+  while the shared document store remains empty; those one-shot resolutions
+  must bypass the cache to avoid a contended, workspace-sized map with no hits.
+- The VS Code client memoizes options last observed on visible editors so
+  hidden tabs retain `detectIndentation`/status-bar values. A document becoming
+  visible must resynchronize the payload, and `editor.tabSize` or
+  `editor.insertSpaces` changes must invalidate the matching cached field;
+  `editor.detectIndentation` changes invalidate both. Invalidation applies
+  only to document scopes affected by that setting event;
+  a folder-specific change must not erase another folder's detected values.
+  Resource/language-scoped `editor.formatOnType` is synced too. The server
+  compares the replacement map before resolving overrides or clearing its
+  cache, making ordinary unchanged visibility syncs cheap. The
+  `raven/documentIndentUnitsChanged` payload preserves the v0.14
+  `units` contract exactly (`indentUnit` required in auto mode, empty in fixed
+  mode); current producer gates travel in a separate optional `options` array
+  that old serde consumers ignore wholesale. This prevents a custom old
+  server from treating the lower-priority fixed client unit as a per-document
+  override of a project `indentationUnit`.
 - `IndentKind` tags preserve each column's provenance: neutral `Block`,
   argument `ArgumentBlock`/`OpenerAligned`, and infix
   `InfixBlock`/`ChainStart`. This lets an axis-level `off` return no answer
@@ -682,6 +717,11 @@ masked intervals, and indentation-change collection is deliberate because
 those inputs cannot be stale. Revision-keyed caching is declined until a
 measured budget breach justifies the added invalidation state.
 
+The same benchmark file measures whole-document default-`Either` linting on
+both indented-clean and aligned-only 10,000-line inputs. Keep both cases: the
+first guards the `Indented` fast path, while the second forces the shared
+change list through both strict folds.
+
 #### Declined findings registry
 
 - **Escaped backticks in backquoted names:** R rejects them; commit
@@ -696,8 +736,8 @@ measured budget breach justifies the added invalidation state.
   is a cold O(open documents) path that runs only on indent-unit-change
   notifications. It diffs both the effective indent unit and the resolved
   mismatch-advice producer policy (the notification also carries per-document
-  `insertSpaces`, issue #614); the policy resolution is a few field reads on
-  top of the config resolution. Reconsider if profiling shows those
+  `insertSpaces` and `formatOnType`, issue #614); the policy resolution is a
+  few field reads on top of the config resolution. Reconsider if profiling shows those
   notifications on a hot path or workspaces with many open documents miss
   their budget.
 - **Rmd language-config generator matches the assignment rule by regex text:**
@@ -728,11 +768,12 @@ measured budget breach justifies the added invalidation state.
   resolved producer pass. Reconsider only if the combined settings
   doctrine itself is revisited.
 - **Mismatch advice cannot see the per-Enter tab-shaped-context bail:** the
-  tabs-mode-editor half of this limitation was fixed in issue #614 —
-  `raven/documentIndentUnitsChanged` now carries per-document `insertSpaces`
-  and `resolved_indentation_producer_policy` returns `None` on a synced
-  `false`. The judge's remaining bail — a real (non-string) tab inside the
-  per-Enter active context — is position-dependent (the window runs from the
+  stable editor-policy half of this limitation was fixed in issue #614 — the
+  additive options array now carries per-document `insertSpaces` and
+  `formatOnType`, and `resolved_indentation_producer_policy` returns `None`
+  when either disables the Enter producer. The judge's remaining bail — a
+  real (non-string) tab inside the per-Enter active context — is
+  position-dependent (the window runs from the
   outermost unclosed opener or reference row down to the probe) and has no
   stable per-document analog at diagnostics time, so it stays unmodeled: in
   a spaces-mode editor with a stray tab elsewhere in a flagged line's

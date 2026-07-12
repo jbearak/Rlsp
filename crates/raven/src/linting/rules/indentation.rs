@@ -2,14 +2,16 @@
 //!
 //! Mirrors `lintr::indentation_linter()` with the default tidy hanging style,
 //! using its accumulated indent-change model. The full fold semantics live on
-//! [`set_expectations`]. The explicit `Indented` pass is verified against a
-//! 112-case differential corpus; its infix behavior is strict lintr parity,
-//! while Raven's independent aligned-argument and block-form tolerances remain
-//! deliberate leniencies.
+//! [`expectations_for_changes`]. The explicit `Indented` pass is verified
+//! against a 112-case differential corpus; its infix behavior is strict lintr
+//! parity, while Raven's independent aligned-argument and block-form
+//! tolerances remain deliberate leniencies.
 //!
 //! [`InfixContinuationStyle`] is Raven-specific. `Indented` applies the strict
 //! block change, `Aligned` pins to the first operand with the owning-statement
-//! one-level floor, and `Either` runs both complete folds and unions them.
+//! one-level floor, and `Either` unions the two strict folds. Both styles share
+//! one syntax-change collection; a document clean under `Indented` skips the
+//! second fold entirely.
 //! Assignment operators and `assignment_as_infix` suppression are
 //! style-independent; see [`operator_change`]. The producer uses this same
 //! `Either` expectation machinery but selects from its own settings, so
@@ -157,7 +159,16 @@ pub(crate) fn collect(
         return;
     }
 
-    let mismatch_advice = MismatchAdvice::new(producer_policy, infix_style);
+    // The Enter judge declines when a residual syntax error intersects its
+    // reference-to-probe window. The lint does not construct that repaired
+    // buffer, so conservatively suppress attribution anywhere in an erroneous
+    // tree: a false negative is preferable to claiming Raven emitted a column
+    // when the producer would have stood down.
+    let mismatch_advice = if root.has_error() {
+        None
+    } else {
+        MismatchAdvice::new(producer_policy, infix_style)
+    };
 
     let mut string_interior: HashSet<u32> = HashSet::new();
     collect_string_interior_lines(root, &mut string_interior);
@@ -173,34 +184,50 @@ pub(crate) fn collect(
     let mut comments: HashMap<u32, CommentCol> = HashMap::new();
     collect_comment_cols(root, &lines, &mut comments);
 
-    // One full pass (expectations + aligned-comment exemptions) per style.
-    // `Either` runs the `Indented` and `Aligned` passes and accepts a line
-    // that ANY pass accepts or exempts — the exemptions must be per-pass
-    // because comment-run grouping compares each pass's own `Expected`
-    // values, which a merged map cannot reproduce (a run that groups under
-    // `Aligned`'s uniform pins breaks against merged multi-value entries).
-    let pass_styles: &[InfixContinuationStyle] = match infix_style {
-        InfixContinuationStyle::Either => &[
-            InfixContinuationStyle::Indented,
-            InfixContinuationStyle::Aligned,
-        ],
-        InfixContinuationStyle::Indented => &[InfixContinuationStyle::Indented],
-        InfixContinuationStyle::Aligned => &[InfixContinuationStyle::Aligned],
-    };
-    let passes: Vec<(HashMap<u32, Expected>, HashSet<u32>)> = pass_styles
-        .iter()
-        .map(|&style| {
-            let expectations = expectations_for_style(root, &lines, indent_unit, style);
-            let exemptions =
-                collect_aligned_comment_exemptions(&lines, &expectations, &comments, &line_states);
-            (expectations, exemptions)
-        })
-        .collect();
+    // The two strict infix styles differ only when a collected non-assignment
+    // infix change is folded. Collect and sort the syntax changes once so the
+    // default `Either` policy does not walk the whole AST twice.
+    let mut changes = Vec::new();
+    collect_changes(root, &lines, &mut changes);
+    changes.sort_by_key(|change| change.token_byte);
 
-    // Merged per-line accepted values, used only for diagnostic messages and
-    // the run-coalescing diff (the primary comes from the first pass, which
-    // is the lintr-compatible `Indented` fold when `Either` runs both).
-    let merged: HashMap<u32, Expected> = merge_pass_expectations(&passes);
+    // Build the requested strict pass. `Either` starts with `Indented`, then
+    // builds `Aligned` only if the first pass rejects a checkable line. When
+    // both exist, a line accepted or exempted by either is accepted overall.
+    // Exemptions remain per-pass because comment-run grouping compares each
+    // pass's own `Expected` values, which a merged map cannot reproduce.
+    let build_pass = |style| {
+        let expectations = expectations_for_changes(&changes, lines.len(), indent_unit, style);
+        let exemptions =
+            collect_aligned_comment_exemptions(&lines, &expectations, &comments, &line_states);
+        (expectations, exemptions)
+    };
+    let first_style = match infix_style {
+        InfixContinuationStyle::Aligned => InfixContinuationStyle::Aligned,
+        InfixContinuationStyle::Indented | InfixContinuationStyle::Either => {
+            InfixContinuationStyle::Indented
+        }
+    };
+    let mut passes = vec![build_pass(first_style)];
+
+    if infix_style == InfixContinuationStyle::Either {
+        // `Either` is a strict superset of `Indented`. A document already
+        // clean under the first pass cannot gain a diagnostic from the aligned
+        // pass, so avoid its second whole-document fold and exemption scan.
+        let indented_is_clean = lines.iter().enumerate().all(|(idx, line_text)| {
+            line_is_accepted_by_pass(
+                idx,
+                line_text,
+                leading_space_count(line_text),
+                &line_states,
+                &passes[0],
+            )
+        });
+        if indented_is_clean {
+            return;
+        }
+        passes.push(build_pass(InfixContinuationStyle::Aligned));
+    }
 
     // This additional full fold exists only for one of the two strict
     // producer/lint mismatches, and is deferred until the first flagged line
@@ -216,27 +243,17 @@ pub(crate) fn collect(
 
     for (idx, line_text) in lines.iter().enumerate() {
         let line_no = idx as u32;
-        if line_states[idx].skips_indentation_check() {
-            continue;
-        }
-
         let actual = leading_space_count(line_text);
-        let standalone_comment = is_standalone_comment_line(line_text);
-        let acceptable = passes.iter().any(|(expectations, exemptions)| {
-            let expected = expectations
-                .get(&line_no)
-                .cloned()
-                .unwrap_or_else(Expected::top_level);
-            expected.is_acceptable(actual) || (exemptions.contains(&line_no) && standalone_comment)
-        });
+        let acceptable = passes
+            .iter()
+            .any(|pass| line_is_accepted_by_pass(idx, line_text, actual, &line_states, pass));
         if acceptable {
             continue;
         }
 
-        let expected = merged
-            .get(&line_no)
-            .cloned()
-            .unwrap_or_else(Expected::top_level);
+        // Only rejected lines need the union used for messages/coalescing.
+        // Avoid materializing and cloning a third whole-document map.
+        let expected = merged_expectation_for_line(&passes, line_no);
 
         let diff = i64::from(expected.primary) - i64::from(actual);
         let consecutive_same_diff = last_bad
@@ -248,14 +265,22 @@ pub(crate) fn collect(
 
         let mut message = expected.message(actual);
         if let Some(advice) = mismatch_advice {
+            let producer_expectations = producer_expectations.get_or_insert_with(|| {
+                expectations_for_changes(&changes, lines.len(), indent_unit, advice.producer_style)
+            });
             let producer_expected = producer_expectations
-                .get_or_insert_with(|| {
-                    expectations_for_style(root, &lines, indent_unit, advice.producer_style)
-                })
                 .get(&line_no)
                 .cloned()
                 .unwrap_or_else(Expected::top_level);
-            if producer_expected.column_for_kind(advice.producer_kind()) == Some(actual) {
+            if producer_expected.column_for_kind(advice.producer_kind()) == Some(actual)
+                && reference_conforms_for_advice(
+                    line_no,
+                    &lines,
+                    &line_states,
+                    &passes,
+                    producer_expectations,
+                )
+            {
                 advice.append_to(&mut message, actual);
             }
         }
@@ -272,6 +297,69 @@ pub(crate) fn collect(
             ..Default::default()
         });
     }
+}
+
+fn line_is_accepted_by_pass(
+    idx: usize,
+    line_text: &str,
+    actual: u32,
+    line_states: &[LineState],
+    pass: &(HashMap<u32, Expected>, HashSet<u32>),
+) -> bool {
+    if line_states[idx].skips_indentation_check() {
+        return true;
+    }
+    let line_no = idx as u32;
+    let (expectations, exemptions) = pass;
+    let acceptable_indent = expectations
+        .get(&line_no)
+        .map_or(actual == 0, |expected| expected.is_acceptable(actual));
+    acceptable_indent || (exemptions.contains(&line_no) && is_standalone_comment_line(line_text))
+}
+
+/// Whether the nearest real reference line above `line_no` conforms to the
+/// same internal `Either` expectation set the on-type judge uses. A strict
+/// producer/lint mismatch has already built the two opposite strict passes, so
+/// their union is available without another fold.
+///
+/// The judge declines when that reference is offset/mis-indented or contains a
+/// real leading tab. Suppress mismatch advice in the same situations: the
+/// configured producer column may match the flagged line numerically, but the
+/// producer would have emitted no edit there and must not be credited for it.
+fn reference_conforms_for_advice(
+    line_no: u32,
+    lines: &[&str],
+    line_states: &[LineState],
+    lint_passes: &[(HashMap<u32, Expected>, HashSet<u32>)],
+    producer_expectations: &HashMap<u32, Expected>,
+) -> bool {
+    let accepts = |expectations: &HashMap<u32, Expected>, line: u32, actual: u32| {
+        expectations
+            .get(&line)
+            .map_or(actual == 0, |expected| expected.is_acceptable(actual))
+    };
+
+    for idx in (0..line_no as usize).rev() {
+        let Some(state) = line_states.get(idx).copied() else {
+            continue;
+        };
+        let line = lines.get(idx).copied().unwrap_or("");
+        if state.is_blank || state.is_string_interior || is_standalone_comment_line(line) {
+            continue;
+        }
+        if state.has_tab_in_leading {
+            return false;
+        }
+
+        let reference = idx as u32;
+        let actual = leading_space_count(line);
+        return lint_passes
+            .iter()
+            .any(|(expectations, _)| accepts(expectations, reference, actual))
+            || accepts(producer_expectations, reference, actual);
+    }
+
+    true
 }
 
 /// What an additionally accepted indentation column represents.
@@ -414,10 +502,10 @@ pub(crate) fn accepted_indents_for_line(
 }
 
 /// Batched form of the test-only `accepted_indents_for_line`: one expectation
-/// per entry of `targets`, in order. The change list is collected and sorted once per
-/// style pass and then folded per target line, so this never materializes the
-/// whole-document expectation maps the diagnostic pass builds — the on-type
-/// judge calls it on every Enter press (#611).
+/// per entry of `targets`, in order. The change list is collected and sorted
+/// once, then reused by every required strict style fold and target line. This
+/// never materializes the whole-document expectation maps the diagnostic pass
+/// builds — the on-type judge calls it on every Enter press (#611).
 pub(crate) fn accepted_indents_for_lines(
     text: &str,
     root: Node<'_>,
@@ -441,11 +529,11 @@ pub(crate) fn accepted_indents_for_lines(
         .zip(targets.iter().copied().max())
         .map(|(min, max)| (min as usize, max as usize));
     let mut merged: Vec<Option<Expected>> = vec![None; targets.len()];
+    let mut changes = Vec::new();
+    collect_changes_bounded(root, &lines, bounds, &mut changes);
+    changes.sort_by_key(|change| change.token_byte);
     for &style in pass_styles {
-        let mut changes = Vec::new();
-        collect_changes_bounded(root, &lines, style, bounds, &mut changes);
-        changes.sort_by_key(|c| c.token_byte);
-        let pass = expectations_for_targets(&changes, lines.len(), indent_unit, targets);
+        let pass = expectations_for_targets(&changes, lines.len(), indent_unit, style, targets);
         for (slot, expected) in pass.into_iter().enumerate() {
             match &mut merged[slot] {
                 None => merged[slot] = Some(expected),
@@ -473,16 +561,17 @@ pub(crate) fn accepted_indents_for_lines(
 }
 
 /// Fold the sorted change list ONCE, applying each change to every covered
-/// target's accumulator — the exact per-line body of [`set_expectations`],
+/// target's accumulator — the exact per-line body of [`expectations_for_changes`],
 /// restricted to the requested lines (the judge asks for two per Enter).
 fn expectations_for_targets(
     changes: &[Change],
     line_count: usize,
     indent_unit: u32,
+    infix_style: InfixContinuationStyle,
     targets: &[u32],
 ) -> Vec<Expected> {
     /// One target line's in-progress fold: the same (primary, kinds,
-    /// alternatives) triple `set_expectations` keeps per document line.
+    /// alternatives) triple `expectations_for_changes` keeps per document line.
     type Accum = (u32, IndentKindSet, Vec<(u32, IndentKindSet)>);
     let mut accums: Vec<Accum> = targets
         .iter()
@@ -506,7 +595,14 @@ fn expectations_for_targets(
                 continue;
             }
             let (primary, kinds, alternatives) = &mut accums[slot];
-            apply_change_to_line(change, indent_unit, primary, kinds, alternatives);
+            apply_change_to_line(
+                change,
+                indent_unit,
+                infix_style,
+                primary,
+                kinds,
+                alternatives,
+            );
         }
     }
     accums
@@ -801,6 +897,9 @@ fn collect_aligned_comment_exemptions(
     comments: &HashMap<u32, CommentCol>,
     line_states: &[LineState],
 ) -> HashSet<u32> {
+    if comments.is_empty() {
+        return HashSet::new();
+    }
     let mut exempt = HashSet::new();
     let mut idx = 0usize;
 
@@ -870,131 +969,74 @@ fn comment_run_member(
     Some((comment, expected))
 }
 
-/// Build per-line expected indents with lintr's accumulated "indent change"
-/// model. Indent-inducing tokens are collected in document order; each change
-/// covers a line range and rewrites those lines' expectation as a function of
-/// the *current* expected value — `Block` adds one unit, `Double` two,
-/// `Hanging` pins an absolute column. This mirrors
-/// `lintr::indentation_linter()`'s algorithm (tidy style), so nested scopes
-/// accumulate exactly like lintr instead of anchoring to a line's physical
-/// indentation.
-///
-/// The changes:
-/// * A bracket opener (`{`, `(`, `[`, `[[` — from braces, call/subset
-///   arguments, parameter lists, parenthesized expressions, and
-///   `if`/`while`/`for` statement parens) covers the lines from the opener's
-///   next line through the last content line before the closer. A closer that
-///   starts its own line is therefore *outside* the range and keeps the
-///   surrounding expectation — closer alignment falls out of the model. The
-///   change is `Block` when the closer starts its own line and
-///   `Hanging(column after the opener)` when the closer trails content
-///   (lintr's tidy exclusivity). A function/lambda parameter list whose
-///   first parameter sits on a later line than `function` *and* whose closer
-///   trails the last parameter is `Double` (tidyverse double-indent
-///   definitions). An opener is skipped entirely when a same-line following
-///   sibling spans multiple lines and itself contains an end-of-line opener
-///   (`foo(bar(`, trailing lambdas `map(x, function(y) {` — only the inner
-///   bracket indents, lintr's double-indent avoidance).
-/// * An infix operator token at end of line (binary operators including
-///   `%…%`, plus `$`/`@`/`::` chains and the `=` of named arguments and
-///   formal defaults) covers its right-hand operand's lines as `Block` —
-///   unless suppressed by lintr's `assignment_as_infix` default: an operator
-///   nested under an assignment whose own operator ends its line (walking up
-///   until a call argument or braced block resets the context) adds no
-///   second level, so `x <-\n  a +\n  b` is flat. Under
-///   `InfixContinuationStyle::Aligned` the non-assignment operators instead
-///   pin their continuation to the chain-start column (`Hanging`); see
-///   `operator_change`.
-/// * `else` / `repeat` at end of line and an unbraced control-flow or
-///   function body (`)` at end of line with no `{` following) cover the body
-///   lines as `Block`.
-///
-/// Raven layers argument-layout tolerances on top as alternative accepted
-/// values: aligned-with-opener style for lists whose opener carries content
-/// (`foo(a,\n    b\n)`), and the block form where lintr demands hanging (or
-/// one unit where lintr demands two). Infix behavior itself is strict per
-/// pass: `Indented` uses only the block change; `Aligned` replaces it with the
-/// floored chain-start pin. `Either` never reaches this function — `collect`
-/// runs
-/// one full pass (this fold plus the aligned-comment exemptions) per style
-/// and accepts a line that any pass accepts, so `Either` is the union of
-/// `Indented` and `Aligned` by construction. A per-alternative encoding in a
-/// single fold cannot deliver that: downstream bracket tolerances and the
-/// comment-run grouping are functions of the fold's own primaries, which
-/// differ between the block path and the aligned pins. Genuine
-/// under-indentation stays flagged in every style because the chain-start
-/// line itself carries no aligned alternative and is checked against its own
-/// expectation.
-/// Union the per-line accepted sets of the style passes: the primary comes
+/// Union one line's accepted sets across the style passes: the primary comes
 /// from the first pass (the lintr-compatible `Indented` fold when `Either`
-/// runs both), every other pass contributes its primary and alternatives as
-/// alternatives. A line absent from a pass's map expects indent 0 there
-/// (`Expected::top_level`), so absence contributes 0 to the union — e.g. an
-/// a pass that does not cover a line still contributes top level. Used
-/// only for diagnostic messages and the run-coalescing diff; acceptance is
-/// decided per pass in `collect`.
-fn merge_pass_expectations(
+/// needs both), while every other pass contributes its primary and
+/// alternatives. A line absent from a pass's map contributes top level. This
+/// lazy union is used only for a rejected line's message and run-coalescing
+/// diff; acceptance and comment exemptions remain per-pass in [`collect`].
+fn merged_expectation_for_line(
     passes: &[(HashMap<u32, Expected>, HashSet<u32>)],
-) -> HashMap<u32, Expected> {
-    let maps: Vec<&HashMap<u32, Expected>> = passes.iter().map(|(map, _)| map).collect();
-    merge_expectation_maps(&maps)
-}
-
-fn merge_expectation_maps(maps: &[&HashMap<u32, Expected>]) -> HashMap<u32, Expected> {
-    let (first, rest) = maps.split_first().expect("at least one style pass");
-    let mut merged = (*first).clone();
-    for expectations in rest {
-        let mut merge_lines: Vec<u32> = merged
-            .keys()
-            .copied()
-            .chain(expectations.keys().copied())
-            .collect();
-        merge_lines.sort_unstable();
-        merge_lines.dedup();
-        for line in merge_lines {
-            let accepts = match expectations.get(&line) {
-                Some(expected) => std::iter::once((expected.primary, expected.primary_kinds))
-                    .chain(expected.alternatives.iter().copied())
-                    .collect::<Vec<_>>(),
-                None => vec![(0, IndentKindSet::single(IndentKind::TopLevel))],
-            };
-            let entry = merged.entry(line).or_insert_with(Expected::top_level);
-            for (column, kinds) in accepts {
-                entry.add_alternative(column, kinds);
+    line: u32,
+) -> Expected {
+    let ((first, _), rest) = passes.split_first().expect("at least one style pass");
+    let mut merged = first
+        .get(&line)
+        .cloned()
+        .unwrap_or_else(Expected::top_level);
+    for (expectations, _) in rest {
+        if let Some(expected) = expectations.get(&line) {
+            merged.add_alternative(expected.primary, expected.primary_kinds);
+            for (column, kinds) in &expected.alternatives {
+                merged.add_alternative(*column, *kinds);
             }
+        } else {
+            merged.add_alternative(0, IndentKindSet::single(IndentKind::TopLevel));
         }
     }
     merged
 }
 
+#[cfg(test)]
 fn expectations_for_style(
     root: Node<'_>,
     lines: &[&str],
     indent_unit: u32,
     infix_style: InfixContinuationStyle,
 ) -> HashMap<u32, Expected> {
-    let mut expectations = HashMap::new();
-    set_expectations(root, lines, indent_unit, infix_style, &mut expectations);
-    expectations
+    let mut changes = Vec::new();
+    collect_changes(root, lines, &mut changes);
+    changes.sort_by_key(|change| change.token_byte);
+    expectations_for_changes(&changes, lines.len(), indent_unit, infix_style)
 }
 
-fn set_expectations(
-    root: Node<'_>,
-    lines: &[&str],
+/// Fold a syntax-change list into one strict style's per-line expectations
+/// using lintr's accumulated-change model. `Block` changes add one unit,
+/// `Double` adds two, and hanging changes pin an absolute column, so nested
+/// scopes accumulate rather than anchoring to physical indentation.
+///
+/// Bracket openers cover their interior line range and choose block, hanging,
+/// or function-formal double indentation. End-of-line control-flow tokens add
+/// blocks. Non-assignment infix changes are collected style-neutrally and
+/// become either a strict block (`Indented`) or a floored chain-start pin
+/// (`Aligned`) here; assignment suppression remains style-independent.
+/// Raven's argument-layout block/aligned tolerances are carried as accepted
+/// alternatives within each strict fold.
+///
+/// `Either` is resolved by callers as the semantic union of those two strict
+/// folds. They reuse one AST walk and sort; [`collect`] may skip `Aligned`
+/// entirely when every checkable line is already accepted by `Indented`.
+fn expectations_for_changes(
+    changes: &[Change],
+    line_count: usize,
     indent_unit: u32,
     infix_style: InfixContinuationStyle,
-    out: &mut HashMap<u32, Expected>,
-) {
-    let mut changes: Vec<Change> = Vec::new();
-    collect_changes(root, lines, infix_style, &mut changes);
-    changes.sort_by_key(|c| c.token_byte);
-
-    let line_count = lines.len();
+) -> HashMap<u32, Expected> {
     let mut primary = vec![0u32; line_count];
     let mut primary_kinds = vec![IndentKindSet::single(IndentKind::TopLevel); line_count];
     let mut alternatives: Vec<Vec<(u32, IndentKindSet)>> = vec![Vec::new(); line_count];
 
-    for change in &changes {
+    for change in changes {
         let begin = change.begin as usize;
         let end = (change.end as usize).min(line_count.saturating_sub(1));
         if begin > end {
@@ -1004,6 +1046,7 @@ fn set_expectations(
             apply_change_to_line(
                 change,
                 indent_unit,
+                infix_style,
                 &mut primary[line],
                 &mut primary_kinds[line],
                 &mut alternatives[line],
@@ -1011,6 +1054,7 @@ fn set_expectations(
         }
     }
 
+    let mut out = HashMap::new();
     for line in 0..line_count {
         if primary[line] != 0 || !alternatives[line].is_empty() {
             let mut expected = Expected::single(primary[line], primary_kinds[line]);
@@ -1020,20 +1064,37 @@ fn set_expectations(
             out.insert(line as u32, expected);
         }
     }
+    out
 }
 
 /// Apply one indent change to one covered line's accumulated expectation —
-/// the shared body of the whole-document fold ([`set_expectations`]) and the
+/// the shared body of the whole-document fold ([`expectations_for_changes`]) and the
 /// per-target fold ([`expectations_for_targets`]), so the two cannot drift.
 fn apply_change_to_line(
     change: &Change,
     indent_unit: u32,
+    infix_style: InfixContinuationStyle,
     primary: &mut u32,
     primary_kinds: &mut IndentKindSet,
     alternatives: &mut Vec<(u32, IndentKindSet)>,
 ) {
     let current = *primary;
-    match change.ty {
+    let ty = match change.ty {
+        ChangeType::Infix {
+            chain_col,
+            statement_indent,
+        } => match infix_style {
+            InfixContinuationStyle::Indented => ChangeType::Block(IndentKind::InfixBlock),
+            InfixContinuationStyle::Aligned => {
+                ChangeType::FlooredHanging(chain_col, statement_indent, IndentKind::ChainStart)
+            }
+            InfixContinuationStyle::Either => {
+                unreachable!("Either is folded as separate strict style passes")
+            }
+        },
+        other => other,
+    };
+    match ty {
         ChangeType::Block(kind) => {
             *primary = current + indent_unit;
             if kind == IndentKind::Block {
@@ -1063,6 +1124,9 @@ fn apply_change_to_line(
             *primary = col.max(statement_indent + indent_unit);
             *primary_kinds = IndentKindSet::single(kind);
             alternatives.clear();
+        }
+        ChangeType::Infix { .. } => {
+            unreachable!("infix changes are resolved to a strict style before folding")
         }
     }
     match change.alt {
@@ -1097,6 +1161,12 @@ enum ChangeType {
     /// An absolute chain-start column floored one unit beyond the owning
     /// statement's physical indent. Clears accumulated alternatives.
     FlooredHanging(u32, u32, IndentKind),
+    /// A non-assignment infix continuation. Its strict block/aligned shape is
+    /// selected only while folding, allowing `Either` to share collection.
+    Infix {
+        chain_col: u32,
+        statement_indent: u32,
+    },
 }
 
 /// Raven's extra accepted values, layered over the lintr primary.
@@ -1123,13 +1193,8 @@ struct Change {
     alt: AltRule,
 }
 
-fn collect_changes(
-    node: Node<'_>,
-    lines: &[&str],
-    infix_style: InfixContinuationStyle,
-    out: &mut Vec<Change>,
-) {
-    collect_changes_bounded(node, lines, infix_style, None, out);
+fn collect_changes(node: Node<'_>, lines: &[&str], out: &mut Vec<Change>) {
+    collect_changes_bounded(node, lines, None, out);
 }
 
 /// [`collect_changes`] with optional row bounds: `Some((min_row, max_row))`
@@ -1145,7 +1210,6 @@ fn collect_changes(
 fn collect_changes_bounded(
     node: Node<'_>,
     lines: &[&str],
-    infix_style: InfixContinuationStyle,
     bounds: Option<(usize, usize)>,
     out: &mut Vec<Change>,
 ) {
@@ -1195,7 +1259,7 @@ fn collect_changes_bounded(
             }
         }
         "binary_operator" | "extract_operator" | "namespace_operator" => {
-            operator_change(node, lines, infix_style, out);
+            operator_change(node, lines, out);
         }
         "argument" | "parameter" => named_eq_change(node, out),
         _ => {}
@@ -1212,7 +1276,7 @@ fn collect_changes_bounded(
         {
             continue;
         }
-        collect_changes_bounded(child, lines, infix_style, bounds, out);
+        collect_changes_bounded(child, lines, bounds, out);
     }
 }
 
@@ -1379,23 +1443,17 @@ fn owning_statement_indent(node: Node<'_>, lines: &[&str]) -> u32 {
 /// Emit the continuation change for an infix operator whose right-hand side
 /// starts on a later line, subject to the `assignment_as_infix` suppression.
 ///
-/// Non-assignment operators honor `InfixContinuationStyle`: `Indented` keeps
-/// only the strict lintr-compatible block bump, while `Aligned` pins the
-/// continuation to the chain-start column with a one-level statement floor.
-/// `Either` never reaches this function — `set_expectations` folds it as the
-/// union of the two single-style passes. Assignment operators are exempt and
-/// always use the `Indented` shape: their RHS is not a peer operand of the
+/// Change collection is style-neutral: a non-assignment operator emits
+/// [`ChangeType::Infix`], which each strict fold resolves to the
+/// lintr-compatible block bump or the chain-start column with a one-level
+/// statement floor. Assignment operators are exempt and always emit the
+/// `Indented` shape: their RHS is not a peer operand of the
 /// LHS, so "align with the preceding operand" has no meaning there —
 /// `Aligned` would otherwise demand `x <-\n  a` put `a` in the assignment
 /// target's column. (`suppressed_as_assignment_rhs` cannot cover this: it
 /// suppresses operators *nested under* an assignment, not the assignment
 /// node itself.)
-fn operator_change(
-    node: Node<'_>,
-    lines: &[&str],
-    infix_style: InfixContinuationStyle,
-    out: &mut Vec<Change>,
-) {
+fn operator_change(node: Node<'_>, lines: &[&str], out: &mut Vec<Change>) {
     let Some(op) = node.child_by_field_name("operator") else {
         return;
     };
@@ -1427,24 +1485,12 @@ fn operator_change(
     let chain_col = char_col(lines, chain_row, node.start_position().column);
     let statement_indent = owning_statement_indent(node, lines);
     let is_assignment = matches!(op.kind(), "<-" | "<<-" | "=" | ":=" | "->" | "->>");
-    let effective_style = if is_assignment {
-        InfixContinuationStyle::Indented
+    let ty = if is_assignment {
+        ChangeType::Block(IndentKind::Block)
     } else {
-        infix_style
-    };
-    let (ty, alt) = match effective_style {
-        InfixContinuationStyle::Indented if is_assignment => {
-            (ChangeType::Block(IndentKind::Block), AltRule::None)
-        }
-        InfixContinuationStyle::Indented => {
-            (ChangeType::Block(IndentKind::InfixBlock), AltRule::None)
-        }
-        InfixContinuationStyle::Aligned => (
-            ChangeType::FlooredHanging(chain_col, statement_indent, IndentKind::ChainStart),
-            AltRule::None,
-        ),
-        InfixContinuationStyle::Either => {
-            unreachable!("set_expectations folds Either as the union of Indented and Aligned")
+        ChangeType::Infix {
+            chain_col,
+            statement_indent,
         }
     };
     out.push(Change {
@@ -1452,7 +1498,7 @@ fn operator_change(
         begin: op.end_position().row as u32 + 1,
         end,
         ty,
-        alt,
+        alt: AltRule::None,
     });
 }
 
@@ -2949,6 +2995,32 @@ mod tests {
     }
 
     #[test]
+    fn advice_is_suppressed_when_the_judge_would_reject_the_reference_indent() {
+        let diagnostics = lint_with_producer(
+            "    x <- y |>\n         z\n",
+            2,
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Aligned,
+        );
+        let continuation = diagnostic_on_line(&diagnostics, 1)
+            .expect("the offset aligned continuation remains a lint violation");
+        assert_no_advice(continuation);
+    }
+
+    #[test]
+    fn advice_is_suppressed_when_syntax_errors_make_the_judge_bail() {
+        let diagnostics = lint_with_producer(
+            "x +* y; x <- z |>\n             q\n",
+            2,
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Aligned,
+        );
+        let continuation = diagnostic_on_line(&diagnostics, 1)
+            .expect("the aligned continuation remains a lint violation");
+        assert_no_advice(continuation);
+    }
+
+    #[test]
     fn compatible_either_and_unavailable_policies_never_add_advice() {
         for diagnostics in [
             lint_with_producer(
@@ -3122,6 +3194,20 @@ mod tests {
                 lint_with_style(text, 4, InfixContinuationStyle::Either)
             );
         }
+    }
+
+    #[test]
+    fn either_style_reports_the_lazy_union_of_strict_columns() {
+        let diagnostics = lint_with_style(
+            "result <- foo() +\n     bar()\n",
+            2,
+            InfixContinuationStyle::Either,
+        );
+        assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "Indentation should be 2 or 10 spaces, not 5."
+        );
     }
 
     #[test]
