@@ -97,9 +97,9 @@ The master switch preserves the old alias-`off` trigger behavior: Raven also ski
 
 ## Infix examples
 
-All numeric columns below use the real judge with a 2-space unit and are pinned by `documented_columns_match_the_real_judge_engine`.
+All numeric columns below use the real judge with a 2-space unit and are pinned by `documented_columns_match_the_real_judge_engine`. The 2-space values are illustrative, not built in: every column scales with the resolved indentation unit (`raven.linting.indentationUnit`, default `"auto"` = the file's `editor.tabSize`, with `[[linting.overrides]]` honored) — with a 4-space unit, one level is column 4.
 
-For an assigned chain, `aligned` uses column 10 under `data`; `indented` uses column 2:
+For an assigned chain with a 2-space unit, `aligned` uses column 10 under `data`; `indented` uses column 2 (one unit):
 
 ```r
 # aligned
@@ -113,7 +113,7 @@ result <- data %>%
   select(y)
 ```
 
-At statement level the aligned floor bites. A top-level chain continues at column 2, never column 0. Inside a brace, a statement at column 2 continues at column 4:
+At statement level the aligned floor bites. With a 2-space unit, a top-level chain continues at column 2 (one unit), never column 0. Inside a brace, a statement at column 2 continues at column 4 (one unit deeper):
 
 ```r
 data |>
@@ -125,7 +125,7 @@ if (condition) {
 }
 ```
 
-A chain begun in a next-line call argument also continues at column 4 in either producer mode because the argument line itself is at column 2:
+A chain begun in a next-line call argument also continues one unit past the argument line (column 4 vs. column 2 with a 2-space unit) in either producer mode:
 
 ```r
 output <- some_function(
@@ -149,14 +149,14 @@ Likewise, `argumentStyle = off` leaves argument indentation to native/Tier 1 bra
 
 Assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) are style-neutral. Their continuation is one level in under every argument, infix, and lint mode; an assignment RHS is not a peer operand of its LHS.
 
-At top level the RHS begins at column 2:
+At top level the RHS begins one unit in (column 2 with a 2-space unit):
 
 ```r
 result <-
   compute_something(x)
 ```
 
-Breaking before a chain pays that level once. The chain remains at column 2 in every mode:
+Breaking before a chain pays that level once. The chain remains at that one-unit column (2 here) in every mode:
 
 ```r
 result <-
@@ -174,7 +174,7 @@ x <-
     w
 ```
 
-An earlier opener contributes its level before the assignment. Here `b <-` is at column 2 and `value` at column 4:
+An earlier opener contributes its level before the assignment. With a 2-space unit, `b <-` sits at column 2 (the call's unit) and `value` at column 4 (plus the assignment's):
 
 ```r
 f(
@@ -183,21 +183,21 @@ f(
 )
 ```
 
-A same-line opener is governed by the argument axis. In this incomplete assignment shape, `aligned` selects column 21 after the opener; `indented` selects column 4:
+A same-line opener is governed by the argument axis. In this incomplete assignment shape, `aligned` selects column 21 after the opener; `indented` selects column 4 (two 2-space units — the call's plus the assignment's):
 
 ```r
 long_function_name(x <-
                      value
 ```
 
-The analogous `:=` shape selects column 5 in aligned mode and column 4 in indented mode:
+The analogous `:=` shape selects column 5 (after the opener) in aligned mode and column 4 (two 2-space units) in indented mode:
 
 ```r
 dt[, y :=
      value
 ```
 
-When a broken assignment is followed by a same-line call that starts a chain, the producer axes legitimately differ: aligned mode selects column 4, while indented mode selects column 6.
+When a broken assignment is followed by a same-line call that starts a chain, the producer axes legitimately differ: with a 2-space unit, aligned mode selects column 4, while indented mode selects column 6.
 
 ```r
 # aligned
