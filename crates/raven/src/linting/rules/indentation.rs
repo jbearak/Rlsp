@@ -55,19 +55,109 @@ use crate::linting::nolint::{Suppressions, matches_keyword};
 use crate::linting::rule_ids;
 use crate::utf16::strip_leading_bom_for_scan;
 
+/// Resolved auto-indent policy available to the diagnostics pass.
+///
+/// The caller omits this when no producer policy exists (notably `raven
+/// check` without an `[indentation]` section), or when Tier 2 / the producer's
+/// infix axis is off. Keeping availability outside the rule prevents the lint
+/// from trying to resolve editor settings itself. The policy carries no
+/// indentation unit: the producer deliberately shares the lint's resolved
+/// per-document unit whenever the indentation rule is active, so the advice
+/// pass folds under the lint's own unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IndentationProducerPolicy {
+    pub(crate) infix_style: InfixContinuationStyle,
+}
+
+/// Per-document indentation lint inputs, bundled so adding optional diagnostic
+/// context does not grow the rule collector's positional argument list.
+#[derive(Clone, Copy)]
+pub(crate) struct IndentationLintPolicy {
+    pub(crate) indent_unit: u32,
+    pub(crate) infix_style: InfixContinuationStyle,
+    pub(crate) producer_policy: Option<IndentationProducerPolicy>,
+}
+
+#[derive(Clone, Copy)]
+struct MismatchAdvice {
+    producer_style: InfixContinuationStyle,
+    lint_style: InfixContinuationStyle,
+}
+
+impl MismatchAdvice {
+    /// Classify the only two representable strict style mismatches once per
+    /// document pass. Matching styles and `Either` stop here, before any
+    /// producer expectation pass is allocated or folded.
+    fn new(
+        producer: Option<IndentationProducerPolicy>,
+        lint_style: InfixContinuationStyle,
+    ) -> Option<Self> {
+        let producer = producer?;
+        let strict_opposites = matches!(
+            (producer.infix_style, lint_style),
+            (
+                InfixContinuationStyle::Aligned,
+                InfixContinuationStyle::Indented
+            ) | (
+                InfixContinuationStyle::Indented,
+                InfixContinuationStyle::Aligned
+            )
+        );
+        strict_opposites.then_some(Self {
+            producer_style: producer.infix_style,
+            lint_style,
+        })
+    }
+
+    fn producer_kind(self) -> IndentKind {
+        match self.producer_style {
+            InfixContinuationStyle::Aligned => IndentKind::ChainStart,
+            InfixContinuationStyle::Indented => IndentKind::InfixBlock,
+            InfixContinuationStyle::Either => {
+                unreachable!("mismatch advice is constructed only for strict producer styles")
+            }
+        }
+    }
+
+    fn append_to(self, message: &mut String, actual: u32) {
+        use std::fmt::Write as _;
+
+        let (producer, lint) = match (self.producer_style, self.lint_style) {
+            (InfixContinuationStyle::Aligned, InfixContinuationStyle::Indented) => {
+                ("aligned", "indented")
+            }
+            (InfixContinuationStyle::Indented, InfixContinuationStyle::Aligned) => {
+                ("indented", "aligned")
+            }
+            _ => unreachable!("mismatch advice is constructed only for strict opposite styles"),
+        };
+        write!(
+            message,
+            " Column {actual} matches `raven.indentation.infixContinuationStyle = \"{producer}\"`; set `raven.linting.infixContinuationStyle` to `\"{producer}\"` or `\"either\"`, or change the auto-indent style to `\"{lint}\"`."
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
 pub(crate) fn collect(
     text: &str,
     root: Node<'_>,
-    indent_unit: u32,
-    infix_style: InfixContinuationStyle,
+    policy: IndentationLintPolicy,
     severity: DiagnosticSeverity,
     suppressions: &Suppressions,
     out: &mut Vec<Diagnostic>,
 ) {
+    let IndentationLintPolicy {
+        indent_unit,
+        infix_style,
+        producer_policy,
+    } = policy;
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return;
     }
+
+    let mismatch_advice = MismatchAdvice::new(producer_policy, infix_style);
 
     let mut string_interior: HashSet<u32> = HashSet::new();
     collect_string_interior_lines(root, &mut string_interior);
@@ -112,6 +202,14 @@ pub(crate) fn collect(
     // is the lintr-compatible `Indented` fold when `Either` runs both).
     let merged: HashMap<u32, Expected> = merge_pass_expectations(&passes);
 
+    // This additional full fold exists only for one of the two strict
+    // producer/lint mismatches, and is deferred until the first flagged line
+    // so clean documents never pay for it. It uses the producer's strict
+    // style (under the shared lint unit) so equality below means "the
+    // producer would emit this column", rather than merely "some tolerated
+    // column happens to match".
+    let mut producer_expectations: Option<HashMap<u32, Expected>> = None;
+
     // lintr suppresses consecutive lints with the same indentation
     // difference — one diagnostic per run of equally mis-indented lines.
     let mut last_bad: Option<(u32, i64)> = None;
@@ -148,6 +246,20 @@ pub(crate) fn collect(
             continue;
         }
 
+        let mut message = expected.message(actual);
+        if let Some(advice) = mismatch_advice {
+            let producer_expected = producer_expectations
+                .get_or_insert_with(|| {
+                    expectations_for_style(root, &lines, indent_unit, advice.producer_style)
+                })
+                .get(&line_no)
+                .cloned()
+                .unwrap_or_else(Expected::top_level);
+            if producer_expected.column_for_kind(advice.producer_kind()) == Some(actual) {
+                advice.append_to(&mut message, actual);
+            }
+        }
+
         out.push(Diagnostic {
             range: Range {
                 start: Position::new(line_no, 0),
@@ -156,7 +268,7 @@ pub(crate) fn collect(
             severity: Some(severity),
             source: Some(LINT_SOURCE.to_string()),
             code: Some(NumberOrString::String(rule_ids::INDENTATION.to_string())),
-            message: expected.message(actual),
+            message,
             ..Default::default()
         });
     }
@@ -404,8 +516,11 @@ pub(crate) fn lint_for_judge_test(
     collect(
         text,
         tree.root_node(),
-        indent_unit,
-        infix_style,
+        IndentationLintPolicy {
+            indent_unit,
+            infix_style,
+            producer_policy: None,
+        },
         DiagnosticSeverity::HINT,
         &suppressions,
         &mut out,
@@ -481,6 +596,21 @@ impl Expected {
                 .alternatives
                 .iter()
                 .any(|(column, _)| *column == actual)
+    }
+
+    /// Return the column the producer selects for `kind`, matching the
+    /// producer judge's primary-first lookup. Requiring the infix-specific
+    /// kind is also the assignment exemption: assignment continuations never
+    /// carry `ChainStart` or `InfixBlock` (see `operator_change`).
+    fn column_for_kind(&self, kind: IndentKind) -> Option<u32> {
+        self.primary_kinds
+            .contains(kind)
+            .then_some(self.primary)
+            .or_else(|| {
+                self.alternatives
+                    .iter()
+                    .find_map(|(column, kinds)| kinds.contains(kind).then_some(*column))
+            })
     }
 
     fn add_alternative(&mut self, column: u32, kinds: IndentKindSet) {
@@ -1530,8 +1660,37 @@ mod tests {
         collect(
             text,
             tree.root_node(),
-            indent_unit,
-            infix_style,
+            IndentationLintPolicy {
+                indent_unit,
+                infix_style,
+                producer_policy: None,
+            },
+            DiagnosticSeverity::HINT,
+            &suppressions,
+            &mut out,
+        );
+        out
+    }
+
+    fn lint_with_producer(
+        text: &str,
+        lint_unit: u32,
+        lint_style: InfixContinuationStyle,
+        producer_style: InfixContinuationStyle,
+    ) -> Vec<Diagnostic> {
+        let tree = with_parser(|p| p.parse(text, None)).expect("parse must succeed");
+        let suppressions = crate::linting::nolint::Suppressions::from_text(text);
+        let mut out = Vec::new();
+        collect(
+            text,
+            tree.root_node(),
+            IndentationLintPolicy {
+                indent_unit: lint_unit,
+                infix_style: lint_style,
+                producer_policy: Some(IndentationProducerPolicy {
+                    infix_style: producer_style,
+                }),
+            },
             DiagnosticSeverity::HINT,
             &suppressions,
             &mut out,
@@ -1541,6 +1700,15 @@ mod tests {
 
     fn diagnostic_on_line(diags: &[Diagnostic], line: u32) -> Option<&Diagnostic> {
         diags.iter().find(|diag| diag.range.start.line == line)
+    }
+
+    fn assert_no_advice(diagnostic: &Diagnostic) {
+        assert!(
+            !diagnostic.message.contains("raven.indentation")
+                && !diagnostic.message.contains("This indentation matches"),
+            "expected ordinary indentation message, got {:?}",
+            diagnostic.message
+        );
     }
 
     #[test]
@@ -2712,6 +2880,82 @@ mod tests {
     /// Same shape with the lintr-style extra continuation level.
     const MOTIVATING_INDENTED: &str =
         "changed <- !(\n    first_condition |\n        second_condition\n)\n";
+
+    #[test]
+    fn strict_mismatch_advice_names_both_settings_in_both_directions() {
+        let aligned = lint_with_producer(
+            "result <- foo() +\n          bar()\n",
+            2,
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Aligned,
+        );
+        assert_eq!(
+            aligned[0].message,
+            "Indentation should be 2 spaces, not 10. Column 10 matches `raven.indentation.infixContinuationStyle = \"aligned\"`; set `raven.linting.infixContinuationStyle` to `\"aligned\"` or `\"either\"`, or change the auto-indent style to `\"indented\"`."
+        );
+
+        let indented = lint_with_producer(
+            "x <- y |>\n  z\n",
+            2,
+            InfixContinuationStyle::Aligned,
+            InfixContinuationStyle::Indented,
+        );
+        assert_eq!(
+            indented[0].message,
+            "Indentation should be 5 spaces, not 2. Column 2 matches `raven.indentation.infixContinuationStyle = \"indented\"`; set `raven.linting.infixContinuationStyle` to `\"indented\"` or `\"either\"`, or change the auto-indent style to `\"aligned\"`."
+        );
+    }
+
+    #[test]
+    fn advice_requires_exact_producer_column_and_non_assignment_infix_kind() {
+        for diagnostics in [
+            // Wrong under both strict styles: not the producer's column.
+            lint_with_producer(
+                "x <- y |>\n    z\n",
+                2,
+                InfixContinuationStyle::Indented,
+                InfixContinuationStyle::Aligned,
+            ),
+            // Assignment continuations never carry an infix-style kind.
+            lint_with_producer(
+                "x <-\n    y\n",
+                2,
+                InfixContinuationStyle::Aligned,
+                InfixContinuationStyle::Indented,
+            ),
+        ] {
+            assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
+            assert_no_advice(&diagnostics[0]);
+        }
+    }
+
+    #[test]
+    fn compatible_either_and_unavailable_policies_never_add_advice() {
+        for diagnostics in [
+            lint_with_producer(
+                "x <- y |>\n   z\n",
+                2,
+                InfixContinuationStyle::Aligned,
+                InfixContinuationStyle::Aligned,
+            ),
+            lint_with_producer(
+                "x <- y |>\n   z\n",
+                2,
+                InfixContinuationStyle::Indented,
+                InfixContinuationStyle::Indented,
+            ),
+            lint_with_producer(
+                "x <- y |>\n   z\n",
+                2,
+                InfixContinuationStyle::Either,
+                InfixContinuationStyle::Aligned,
+            ),
+            lint_with_style("x <- y |>\n  z\n", 2, InfixContinuationStyle::Aligned),
+        ] {
+            assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
+            assert_no_advice(&diagnostics[0]);
+        }
+    }
 
     #[test]
     fn aligned_style_requires_chain_start_column_for_mid_line_chain() {

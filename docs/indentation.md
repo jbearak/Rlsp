@@ -13,7 +13,7 @@ Both tiers are active by default.
 
 When you press Enter, Tier 1 runs first. Tier 2 then repairs the incomplete buffer, asks the shared expectation engine for both supported forms, and selects the configured producer style. If Tier 2 is disabled, an axis is `off`, or the judge cannot answer, Raven emits no indentation edit and the Tier 1/native result stands.
 
-The formatter and lint have independent policies: the formatter emits its configured style faithfully, and the lint checks its configured style. Compatible infix pairs (`aligned` with `aligned`, `indented` with `indented`, or either producer with lint `either`) do not conflict. A mismatched pair is a valid user configuration state; a later PR will add an advice diagnostic for it.
+The formatter and lint have independent policies: the formatter emits its configured style faithfully, and the lint checks its configured style. Compatible infix pairs (`aligned` with `aligned`, `indented` with `indented`, or either producer with lint `either`) do not conflict. A mismatched pair is a valid user configuration state. When the lint flags a non-assignment infix continuation at exactly the column the enabled auto-indenter produces, the diagnostic names both settings and suggests matching the lint to the producer (or using lint `either`), or changing the producer to the lint style. Advice is omitted for genuinely mis-indented code and when no producer policy is available.
 
 The indentation unit is deliberately shared when Raven's indentation lint is enabled: the judge uses the lint's per-document resolved unit, including `"auto"` and `[[linting.overrides]]`. If that lint rule is disabled, the judge uses the editor's `tabSize`. The lint's style setting never steers the producer.
 

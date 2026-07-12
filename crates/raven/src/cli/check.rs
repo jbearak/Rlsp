@@ -2288,6 +2288,66 @@ mod tests {
     }
 
     #[test]
+    fn indentation_advice_requires_cli_producer_config() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("main.R");
+        fs::write(&target, "result <- foo() +\n          bar()\n").unwrap();
+
+        let linting = r#"
+[linting]
+enabled = true
+indentationUnit = 2
+indentationSeverity = "information"
+infixContinuationStyle = "indented"
+"#;
+        fs::write(
+            tmp.path().join("raven.toml"),
+            format!(
+                "{linting}\n[indentation]\nenabled = true\ninfixContinuationStyle = \"aligned\"\n"
+            ),
+        )
+        .unwrap();
+
+        let mut args = base_args(tmp.path());
+        args.no_config = false;
+        args.paths = vec![target];
+        let with_policy = collect_diagnostics_blocking(&args);
+        let with_policy_message = with_policy
+            .iter()
+            .find(|(_, diagnostic)| {
+                diagnostic.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        crate::linting::rule_ids::INDENTATION.to_string(),
+                    ))
+            })
+            .map(|(_, diagnostic)| diagnostic.message.as_str())
+            .expect("configured indentation violation must be reported");
+        assert!(
+            with_policy_message.contains(
+                "Column 10 matches `raven.indentation.infixContinuationStyle = \"aligned\"`"
+            ),
+            "explicit CLI producer policy must add advice: {with_policy_message}"
+        );
+
+        fs::write(tmp.path().join("raven.toml"), linting).unwrap();
+        let without_policy = collect_diagnostics_blocking(&args);
+        let without_policy_message = without_policy
+            .iter()
+            .find(|(_, diagnostic)| {
+                diagnostic.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        crate::linting::rule_ids::INDENTATION.to_string(),
+                    ))
+            })
+            .map(|(_, diagnostic)| diagnostic.message.as_str())
+            .expect("configured indentation violation must still be reported");
+        assert_eq!(
+            without_policy_message,
+            "Indentation should be 2 spaces, not 10."
+        );
+    }
+
+    #[test]
     fn collect_targets_nonexistent_flags_operator_error() {
         let tmp = TempDir::new().unwrap();
         let mut operator_error = false;

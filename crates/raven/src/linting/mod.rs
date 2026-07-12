@@ -107,7 +107,8 @@ pub mod rule_ids;
 mod rules;
 
 pub(crate) use rules::indentation::{
-    IndentKind, LineIndentExpectation, accepted_indents_for_lines, leading_space_count,
+    IndentKind, IndentationLintPolicy, IndentationProducerPolicy, LineIndentExpectation,
+    accepted_indents_for_lines, leading_space_count,
 };
 
 #[cfg(test)]
@@ -140,7 +141,24 @@ pub fn run_lints(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Vec<Di
     }
 
     let suppressions = nolint::Suppressions::from_text(text);
-    run_lints_with(text, tree_root, config, suppressions)
+    run_lints_with(text, tree_root, config, suppressions, None)
+}
+
+/// Run enabled lint rules with an optional resolved auto-indent producer
+/// policy. Only the diagnostics snapshot supplies this; callers without a
+/// producer (including the standalone lint CLI) retain the ordinary messages.
+pub(crate) fn run_lints_with_producer_policy(
+    text: &str,
+    tree_root: Node<'_>,
+    config: &LintConfig,
+    producer_policy: Option<IndentationProducerPolicy>,
+) -> Vec<Diagnostic> {
+    if !config.enabled {
+        return Vec::new();
+    }
+
+    let suppressions = nolint::Suppressions::from_text(text);
+    run_lints_with(text, tree_root, config, suppressions, producer_policy)
 }
 
 /// Same as [`run_lints`] but with **no** suppression filtering — every
@@ -152,7 +170,13 @@ pub fn run_lints_raw(text: &str, tree_root: Node<'_>, config: &LintConfig) -> Ve
     if !config.enabled {
         return Vec::new();
     }
-    run_lints_with(text, tree_root, config, nolint::Suppressions::default())
+    run_lints_with(
+        text,
+        tree_root,
+        config,
+        nolint::Suppressions::default(),
+        None,
+    )
 }
 
 fn run_lints_with(
@@ -160,6 +184,7 @@ fn run_lints_with(
     tree_root: Node<'_>,
     config: &LintConfig,
     suppressions: nolint::Suppressions,
+    producer_policy: Option<IndentationProducerPolicy>,
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
 
@@ -259,8 +284,11 @@ fn run_lints_with(
         rules::indentation::collect(
             text,
             tree_root,
-            config.indentation_unit,
-            config.infix_continuation_style,
+            IndentationLintPolicy {
+                indent_unit: config.indentation_unit,
+                infix_style: config.infix_continuation_style,
+                producer_policy,
+            },
             sev,
             &suppressions,
             &mut out,
