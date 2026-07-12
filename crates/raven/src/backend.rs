@@ -144,29 +144,37 @@ fn initial_editor_diagnostic_uris(
 #[serde(rename_all = "camelCase")]
 struct DocumentIndentUnit {
     uri: String,
-    /// Resolved `editor.tabSize`. Present only when
-    /// `raven.linting.indentationUnit` is `"auto"`; a fixed unit setting
-    /// omits it so the workspace-wide value stays authoritative.
+    /// Resolved `editor.tabSize` in `"auto"` mode.
     indent_unit: Option<u32>,
-    /// Resolved `editor.insertSpaces` (issue #614). In `"auto"` unit mode
-    /// current extensions send it on every entry; in fixed-unit mode they
-    /// send entries only for `insertSpaces: false` documents (absent is
-    /// equivalent to `true` for the mismatch-advice gate, and the trim keeps
-    /// the common payload parseable by pre-#614 servers). Absent from older
-    /// clients, which leaves the mismatch-advice producer policy ungated.
+    /// Legacy combined entries from extensions predating the separate
+    /// top-level `options` array remain accepted.
     insert_spaces: Option<bool>,
+}
+
+/// Producer-relevant editor options in the additive current wire format.
+/// Keeping these out of [`DocumentIndentUnit`] lets a v0.14 custom server
+/// ignore the whole top-level array while preserving its required-unit schema.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentIndentProducerOptions {
+    uri: String,
+    insert_spaces: Option<bool>,
+    format_on_type: Option<bool>,
 }
 
 /// Parameters for the raven/documentIndentUnitsChanged notification.
 ///
 /// The extension sends this whenever any open R document's resolved
-/// `editor.tabSize` / `editor.insertSpaces` changes (and on open/close and
-/// client start). The map replaces the server's previous per-document
-/// overrides wholesale.
+/// `editor.tabSize`, `editor.insertSpaces`, or `editor.formatOnType` changes
+/// (and on open/close and client start). Both arrays replace the server's
+/// previous per-document state wholesale. `options` is additive wire
+/// evolution: v0.14 servers ignore it and still see the original unit array.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DocumentIndentUnitsChangedParams {
     units: Vec<DocumentIndentUnit>,
+    #[serde(default)]
+    options: Vec<DocumentIndentProducerOptions>,
 }
 
 /// Parameters for the raven/semanticTokensForRString custom request.
@@ -5425,12 +5433,37 @@ fn external_project_config_watch_changed(
 struct ConfigChangeSnapshot {
     prev_cross_file: crate::cross_file::CrossFileConfig,
     prev_lint: crate::linting::LintConfig,
+    /// Raw merged linting section, including per-document overrides that do
+    /// not necessarily change the parsed workspace-wide `LintConfig`.
+    prev_merged_linting_section: serde_json::Value,
+    /// Document-independent producer policy for indentation mismatch advice,
+    /// including whether a host/project policy is available at all.
+    prev_indentation_producer_policy: Option<crate::linting::IndentationProducerPolicy>,
     prev_completion: crate::state::CompletionConfig,
     prev_workspace_exclusions: Vec<String>,
     /// `recompute_parsed_configs` resets `symbol_config` to defaults. The
     /// helper restores `hierarchical_document_symbol_support` from this
     /// value (set from client capabilities at initialize time).
     prev_hier_support: bool,
+}
+
+impl ConfigChangeSnapshot {
+    /// Capture every pre-recompute input used by downstream change detection.
+    /// Keeping construction here prevents reload call sites from silently
+    /// omitting a newly added diagnostic-affecting field.
+    fn capture(state: &WorldState) -> Self {
+        Self {
+            prev_cross_file: state.cross_file_config.clone(),
+            prev_lint: state.lint_config.clone(),
+            prev_merged_linting_section: state.merged_linting_section.clone(),
+            prev_indentation_producer_policy: crate::handlers::base_indentation_producer_policy(
+                state,
+            ),
+            prev_completion: state.completion_config.clone(),
+            prev_workspace_exclusions: state.workspace_exclusions.patterns().to_vec(),
+            prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
+        }
+    }
 }
 
 /// Flags + carried state derived under the write lock inside
@@ -8466,13 +8499,7 @@ impl LanguageServer for Backend {
         let (snapshot, project_config_path) = {
             let mut state = self.state.write().await;
 
-            let prev = ConfigChangeSnapshot {
-                prev_cross_file: state.cross_file_config.clone(),
-                prev_lint: state.lint_config.clone(),
-                prev_completion: state.completion_config.clone(),
-                prev_workspace_exclusions: state.workspace_exclusions.patterns().to_vec(),
-                prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
-            };
+            let prev = ConfigChangeSnapshot::capture(&state);
 
             // Store the new raw client settings and re-merge with the project
             // file (if any). recompute_parsed_configs() overwrites every
@@ -8582,13 +8609,7 @@ impl LanguageServer for Backend {
             // downstream action outside the lock.
             let snapshot = {
                 let mut state = self.state.write().await;
-                let prev = ConfigChangeSnapshot {
-                    prev_cross_file: state.cross_file_config.clone(),
-                    prev_lint: state.lint_config.clone(),
-                    prev_completion: state.completion_config.clone(),
-                    prev_workspace_exclusions: state.workspace_exclusions.patterns().to_vec(),
-                    prev_hier_support: state.symbol_config.hierarchical_document_symbol_support,
-                };
+                let prev = ConfigChangeSnapshot::capture(&state);
 
                 // Re-run discovery from the workspace root. Order matters:
                 // raven.toml beats .lintr (DiscoveredConfig embodies that).
@@ -9223,32 +9244,27 @@ impl LanguageServer for Backend {
 
     /// Handles on-type formatting requests triggered by newline characters.
     ///
-    /// This provides AST-aware indentation for R code, computing the correct
-    /// indentation based on syntactic context (pipe chains, function arguments,
-    /// brace blocks, etc.).
-    ///
-    /// # Requirements
-    ///
-    /// Validates: Requirements 3.1, 6.1, 6.2, 8.3, 8.4
-    /// - 3.1: Chain start detection with iteration limit
-    /// - 6.1: Read FormattingOptions.tab_size from LSP request parameters
-    /// - 6.2: Read FormattingOptions.insert_spaces from LSP request parameters
-    /// - 8.3: Compute indentation using tree-sitter AST
-    /// - 8.4: Return TextEdit array that overrides VS Code's declarative indentation
-    ///
-    /// # Error Handling
-    ///
-    /// - Invalid AST states: Falls back to regex-based detection
-    /// - UTF-16 position validation: Validates position is within document bounds
-    /// - Malformed FormattingOptions: Clamps tab_size to 1-8, defaults insert_spaces to true
-    /// - Chain start infinite loop: Iteration limit of 1000 lines
-    /// - Missing/unmatched delimiters: Handled gracefully with heuristics
+    /// Newline requests use the judge-backed expectation engine; if it cannot
+    /// answer, the server emits no edit and preserves the editor's Tier 1 or
+    /// native indentation. Tabs mode returns before document/config work
+    /// because that engine models character columns. Closing-delimiter
+    /// triggers remain available for duplicate auto-close repair.
     async fn on_type_formatting(
         &self,
         params: DocumentOnTypeFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
         // Only handle registered trigger characters
         if params.ch != "\n" && !matches!(params.ch.as_str(), ")" | "]" | "}") {
+            return Ok(None);
+        }
+
+        // The judge deliberately emits no indentation edit in tabs mode: its
+        // expectation engine models character columns, not rendered tab
+        // stops. Bail before cloning/parsing the document or resolving lint
+        // overrides; closing-delimiter triggers still reach the duplicate
+        // auto-close repair below.
+        if params.ch == "\n" && !params.options.insert_spaces {
+            log::trace!("on_type_formatting: editor inserts tabs, returning no edits");
             return Ok(None);
         }
 
@@ -9622,6 +9638,11 @@ impl Backend {
             // `LintConfig`) still need an explicit `*_changed` guard below —
             // extend the chain when adding another such struct.
             let lint_config_changed = state.lint_config != prev.prev_lint;
+            let linting_section_changed =
+                state.merged_linting_section != prev.prev_merged_linting_section;
+            let indentation_producer_policy_changed =
+                crate::handlers::base_indentation_producer_policy(&state)
+                    != prev.prev_indentation_producer_policy;
             let workspace_exclusions_changed =
                 state.workspace_exclusions.patterns() != prev.prev_workspace_exclusions.as_slice();
             let workspace_exclusion_package_reseed = workspace_exclusions_changed.then(|| {
@@ -9635,6 +9656,8 @@ impl Backend {
 
             let only_watch_changed = watch_settings_changed
                 && !lint_config_changed
+                && !linting_section_changed
+                && !indentation_producer_policy_changed
                 && !workspace_exclusions_changed
                 && {
                     let mut probe = state.cross_file_config.clone();
@@ -11063,25 +11086,41 @@ impl Backend {
     /// mismatch-advice producer policy changed.
     async fn handle_document_indent_units_changed(&self, params: DocumentIndentUnitsChangedParams) {
         log::trace!(
-            "Received documentIndentUnitsChanged: {} entries",
-            params.units.len()
+            "Received documentIndentUnitsChanged: {} unit entries, {} option entries",
+            params.units.len(),
+            params.options.len()
         );
 
-        let mut new_options = std::collections::HashMap::new();
+        let mut new_options =
+            std::collections::HashMap::<String, crate::state::DocumentIndentOptions>::new();
         for entry in params.units {
-            let options = crate::state::DocumentIndentOptions {
-                indent_unit: entry.indent_unit.map(normalize_document_indent_unit),
-                insert_spaces: entry.insert_spaces,
-            };
-            // An entry with neither field carries no state; keep it out of
-            // the map so it cannot register as a change.
-            if options != crate::state::DocumentIndentOptions::default() {
-                new_options.insert(entry.uri, options);
+            let options = new_options.entry(entry.uri).or_default();
+            options.indent_unit = entry.indent_unit.map(normalize_document_indent_unit);
+            options.insert_spaces = entry.insert_spaces;
+        }
+        for entry in params.options {
+            let options = new_options.entry(entry.uri).or_default();
+            if entry.insert_spaces.is_some() {
+                options.insert_spaces = entry.insert_spaces;
+            }
+            if entry.format_on_type.is_some() {
+                options.format_on_type = entry.format_on_type;
             }
         }
+        // Empty legacy/current entries carry no state and should not register
+        // as a map change.
+        new_options.retain(|_, options| *options != crate::state::DocumentIndentOptions::default());
 
         let affected_uris: Vec<Url> = {
             let mut state = self.state.write().await;
+
+            // Visibility changes can resend the same resolved editor state.
+            // Preserve the resolved-config cache and avoid two override folds
+            // per open document when the replacement map is unchanged.
+            if state.per_document_indent_options == new_options {
+                log::trace!("documentIndentUnitsChanged is unchanged; skipping reconciliation");
+                return;
+            }
 
             // Resolve before and after the map swap so matching lint overrides
             // can keep their indentationUnit authoritative without triggering
@@ -12943,9 +12982,8 @@ mod tests {
             assert_eq!(super::super::normalize_document_indent_unit(99), 8);
         }
 
-        /// Wire-compat matrix for the notification entries: legacy auto-mode
-        /// payloads (`indentUnit` only), fixed-unit-mode payloads
-        /// (`insertSpaces` only, issue #614), and full entries all parse.
+        /// Wire-compat matrix for legacy combined entries and the additive
+        /// current top-level options array.
         #[test]
         fn deserializes_all_entry_generations() {
             let params: DocumentIndentUnitsChangedParams = serde_json::from_value(
@@ -12954,13 +12992,7 @@ mod tests {
             .unwrap();
             assert_eq!(params.units[0].indent_unit, Some(4));
             assert_eq!(params.units[0].insert_spaces, None);
-
-            let params: DocumentIndentUnitsChangedParams = serde_json::from_value(
-                serde_json::json!({"units": [{"uri": "file:///fixed.R", "insertSpaces": false}]}),
-            )
-            .unwrap();
-            assert_eq!(params.units[0].indent_unit, None);
-            assert_eq!(params.units[0].insert_spaces, Some(false));
+            assert!(params.options.is_empty());
 
             let params: DocumentIndentUnitsChangedParams =
                 serde_json::from_value(serde_json::json!(
@@ -12971,18 +13003,151 @@ mod tests {
             assert_eq!(params.units[0].insert_spaces, Some(true));
 
             let params: DocumentIndentUnitsChangedParams =
+                serde_json::from_value(serde_json::json!({
+                    "units": [],
+                    "options": [{
+                        "uri": "file:///fixed.R",
+                        "insertSpaces": false,
+                        "formatOnType": true
+                    }]
+                }))
+                .unwrap();
+            assert!(params.units.is_empty());
+            assert_eq!(params.options.len(), 1);
+            assert_eq!(params.options[0].insert_spaces, Some(false));
+            assert_eq!(params.options[0].format_on_type, Some(true));
+
+            let params: DocumentIndentUnitsChangedParams =
                 serde_json::from_value(serde_json::json!({"units": []})).unwrap();
             assert!(params.units.is_empty());
+            assert!(params.options.is_empty());
         }
 
-        /// An insert-spaces-only flip must land in
+        #[test]
+        fn fixed_mode_options_preserve_the_v014_consumer_contract() {
+            #[derive(serde::Deserialize)]
+            struct V014Params {
+                units: Vec<V014Unit>,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct V014Unit {
+                #[serde(rename = "uri")]
+                _uri: String,
+                #[serde(rename = "indentUnit")]
+                _indent_unit: u32,
+            }
+
+            let legacy: V014Params = serde_json::from_value(serde_json::json!({
+                "units": [],
+                "options": [{
+                    "uri": "file:///fixed.R",
+                    "insertSpaces": false,
+                    "formatOnType": false
+                }]
+            }))
+            .expect("v0.14 serde ignores the additive top-level options field");
+            assert!(legacy.units.is_empty());
+        }
+
+        #[tokio::test]
+        async fn separate_options_do_not_override_effective_config() {
+            let (svc, _socket) = LspService::new(super::super::Backend::new);
+            let backend = svc.inner();
+            let uri = Url::parse("file:///project-unit.R").unwrap();
+            backend.state.write().await.lint_config.indentation_unit = 4;
+
+            backend
+                .handle_document_indent_units_changed(DocumentIndentUnitsChangedParams {
+                    units: vec![],
+                    options: vec![super::super::DocumentIndentProducerOptions {
+                        uri: uri.to_string(),
+                        insert_spaces: Some(false),
+                        format_on_type: Some(true),
+                    }],
+                })
+                .await;
+
+            let state = backend.state.read().await;
+            assert_eq!(
+                state
+                    .effective_lint_config_for_document(&uri)
+                    .indentation_unit,
+                4,
+                "producer options must not override merged project/client config"
+            );
+            assert_eq!(
+                state.per_document_indent_options.get(uri.as_str()),
+                Some(&crate::state::DocumentIndentOptions {
+                    indent_unit: None,
+                    insert_spaces: Some(false),
+                    format_on_type: Some(true),
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn identical_payload_preserves_the_effective_config_cache() {
+            let (svc, _socket) = LspService::new(super::super::Backend::new);
+            let backend = svc.inner();
+            let uri = Url::parse("file:///unchanged-options.R").unwrap();
+            let options = crate::state::DocumentIndentOptions {
+                indent_unit: None,
+                insert_spaces: Some(false),
+                format_on_type: Some(true),
+            };
+            {
+                let mut state = backend.state.write().await;
+                state.open_document(uri.clone(), "x <- 1\n", Some(1));
+                state
+                    .per_document_indent_options
+                    .insert(uri.to_string(), options);
+                let mut sentinel = crate::linting::LintConfig::default();
+                sentinel.indentation_unit = 7;
+                state
+                    .effective_lint_config_cache
+                    .lock()
+                    .unwrap()
+                    .insert(uri.to_string(), sentinel);
+            }
+
+            backend
+                .handle_document_indent_units_changed(DocumentIndentUnitsChangedParams {
+                    units: vec![],
+                    options: vec![super::super::DocumentIndentProducerOptions {
+                        uri: uri.to_string(),
+                        insert_spaces: Some(false),
+                        format_on_type: Some(true),
+                    }],
+                })
+                .await;
+
+            let state = backend.state.read().await;
+            assert_eq!(
+                state
+                    .effective_lint_config_cache
+                    .lock()
+                    .unwrap()
+                    .get(uri.as_str())
+                    .map(|config| config.indentation_unit),
+                Some(7),
+                "a no-op visibility sync must not clear the warm override cache"
+            );
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(&uri),
+                0,
+                "an identical payload must not mark diagnostics for republish"
+            );
+        }
+
+        /// A format-on-type-only flip must land in
         /// `WorldState::per_document_indent_options` and force-republish the
         /// affected document: the flip changes the resolved mismatch-advice
         /// producer policy even though no effective indent unit changed.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn insert_spaces_flip_updates_state_and_republishes() {
+        async fn format_on_type_flip_updates_state_and_republishes() {
             let tmp = TempDir::new().unwrap();
-            let path = tmp.path().join("tabs-mode.R");
+            let path = tmp.path().join("format-on-type-off.R");
             let text = "x <- 1\n";
             std::fs::write(&path, text).unwrap();
             let uri = Url::from_file_path(path).unwrap();
@@ -13004,7 +13169,7 @@ mod tests {
                 // as didOpen's initial publish; keep both immediate.
                 state.cross_file_config.revalidation_debounce_ms = 0;
                 // A non-empty client settings layer makes the mismatch-advice
-                // producer policy resolvable, so the insertSpaces flip below
+                // producer policy resolvable, so the formatOnType flip below
                 // changes it (Some -> None) and must republish.
                 state.raw_client_settings = serde_json::json!({"linting": {}});
             }
@@ -13030,10 +13195,11 @@ mod tests {
 
             backend
                 .handle_document_indent_units_changed(DocumentIndentUnitsChangedParams {
-                    units: vec![super::super::DocumentIndentUnit {
+                    units: vec![],
+                    options: vec![super::super::DocumentIndentProducerOptions {
                         uri: uri.to_string(),
-                        indent_unit: None,
-                        insert_spaces: Some(false),
+                        insert_spaces: Some(true),
+                        format_on_type: Some(false),
                     }],
                 })
                 .await;
@@ -13044,7 +13210,8 @@ mod tests {
                     state.per_document_indent_options.get(uri.as_str()),
                     Some(&crate::state::DocumentIndentOptions {
                         indent_unit: None,
-                        insert_spaces: Some(false),
+                        insert_spaces: Some(true),
+                        format_on_type: Some(false),
                     })
                 );
             }
@@ -13132,10 +13299,11 @@ mod tests {
             // The editor reports tabs-mode: same flag, no attribution.
             backend
                 .handle_document_indent_units_changed(DocumentIndentUnitsChangedParams {
-                    units: vec![super::super::DocumentIndentUnit {
+                    units: vec![],
+                    options: vec![super::super::DocumentIndentProducerOptions {
                         uri: uri.to_string(),
-                        indent_unit: None,
                         insert_spaces: Some(false),
+                        format_on_type: Some(true),
                     }],
                 })
                 .await;
@@ -13147,10 +13315,11 @@ mod tests {
             // Back to spaces-mode: the advice returns without any edit.
             backend
                 .handle_document_indent_units_changed(DocumentIndentUnitsChangedParams {
-                    units: vec![super::super::DocumentIndentUnit {
+                    units: vec![],
+                    options: vec![super::super::DocumentIndentProducerOptions {
                         uri: uri.to_string(),
-                        indent_unit: None,
                         insert_spaces: Some(true),
+                        format_on_type: Some(true),
                     }],
                 })
                 .await;
@@ -15997,6 +16166,46 @@ mod refresh_packages_tests {
             client,
             Arc::new(RequestCancellationRegistry::new()),
         ))
+    }
+
+    /// A reload may change watcher lifecycle and diagnostic-affecting settings
+    /// in one settings.json/raven.toml save. The watcher-only fast path must
+    /// account for the indentation producer policy or same-version mismatch
+    /// advice remains stale.
+    #[tokio::test]
+    async fn watcher_and_indentation_policy_change_republishes_open_documents() {
+        let backend = make_test_backend();
+        let uri = Url::parse("file:///config-reload.R").unwrap();
+        let snapshot = {
+            let mut state = backend.state.write().await;
+            state.raw_client_settings = serde_json::json!({
+                "indentation": { "infixContinuationStyle": "aligned" },
+                "packages": { "watchDebounceMs": 250 }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            state.open_document(uri.clone(), "x <- y |>\n     z\n", Some(1));
+
+            let snapshot = ConfigChangeSnapshot::capture(&state);
+            state.raw_client_settings = serde_json::json!({
+                "indentation": { "infixContinuationStyle": "indented" },
+                "packages": { "watchDebounceMs": 750 }
+            });
+            crate::config_file::recompute_parsed_configs(&mut state);
+            snapshot
+        };
+
+        let to_publish = backend.reconcile_after_config_recompute(snapshot).await;
+        assert_eq!(to_publish, vec![uri.clone()]);
+        assert!(
+            backend
+                .state
+                .read()
+                .await
+                .diagnostics_gate
+                .force_republish_count_for_test(&uri)
+                > 0,
+            "the combined reload must force a same-version diagnostic republish"
+        );
     }
 
     #[tokio::test]

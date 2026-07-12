@@ -183,6 +183,45 @@ export function forgetResolvedEditorOptions(uri: string): void {
 }
 
 /**
+ * Invalidate cached fields whose backing editor configuration changed.
+ * Visible editors immediately repopulate their resolved values; hidden
+ * documents fall through to the newly resolved language/resource-scoped
+ * configuration instead of retaining a stale memo.
+ * A `true` selector invalidates that field globally; a URI set limits it to
+ * configuration scopes VS Code reports as affected.
+ *
+ * The optional `cache` parameter exists for unit testing; callers should omit
+ * it.
+ */
+export function invalidateResolvedEditorOptions(
+    fields: {
+        tabSize?: boolean | ReadonlySet<string>;
+        insertSpaces?: boolean | ReadonlySet<string>;
+    },
+    cache: ResolvedEditorOptionsCache = lastResolvedEditorOptions,
+): void {
+    if (fields.tabSize === true && fields.insertSpaces === true) {
+        cache.clear();
+        return;
+    }
+
+    const includes = (field: boolean | ReadonlySet<string> | undefined, uri: string): boolean =>
+        field === true || (typeof field !== 'boolean' && field?.has(uri) === true);
+    for (const [uri, options] of cache) {
+        const next = { ...options };
+        if (includes(fields.tabSize, uri)) delete next.tabSize;
+        if (includes(fields.insertSpaces, uri)) {
+            delete next.insertSpaces;
+        }
+        if (next.tabSize === undefined && next.insertSpaces === undefined) {
+            cache.delete(uri);
+        } else {
+            cache.set(uri, next);
+        }
+    }
+}
+
+/**
  * Resolve the effective `editor.tabSize` for a document. The scope MUST
  * include `languageId` so VS Code returns language-scoped overrides (e.g.
  * `[r] { "editor.tabSize": 2 }`) instead of only the resource-scoped value.
@@ -253,49 +292,64 @@ export function resolveInsertSpacesForDocument(
         .get<boolean>('insertSpaces', true);
 }
 
-/** One entry of the `raven/documentIndentUnitsChanged` payload. */
+/** Resolve resource- and language-scoped `editor.formatOnType`. */
+export function resolveFormatOnTypeForDocument(
+    document: Pick<vscode.TextDocument, 'uri' | 'languageId'>,
+    getCfg: (scope: vscode.ConfigurationScope) => vscode.WorkspaceConfiguration = (scope) =>
+        vscode.workspace.getConfiguration('editor', scope),
+): boolean {
+    return getCfg({ uri: document.uri, languageId: document.languageId })
+        .get<boolean>('formatOnType', true);
+}
+
+/** One legacy-compatible indent-unit entry in the notification payload. */
 export type DocumentIndentUnitEntry = {
     uri: string;
-    /** Present only in `raven.linting.indentationUnit = "auto"` mode. */
-    indentUnit?: number;
+    indentUnit: number;
+};
+
+/** Producer-relevant editor options understood by current servers. */
+export type DocumentIndentOptionsEntry = {
+    uri: string;
     insertSpaces: boolean;
+    formatOnType: boolean;
 };
 
 /**
- * Build the `raven/documentIndentUnitsChanged` payload. In `"auto"` unit
- * mode: one entry per indent-unit document, carrying both `indentUnit` and
- * `insertSpaces`. With a fixed integer unit setting, `indentUnit` must be
- * omitted — the server's workspace-wide value must stay authoritative, and
- * an entry's unit would override it
- * (`WorldState::effective_lint_config_for_document`) — and entries are
- * trimmed to the documents whose `insertSpaces` is `false`: the server
- * treats an absent entry exactly like `insertSpaces: true` for the
- * mismatch-advice gate (issue #614), and the trim keeps the common
- * all-spaces case as the legacy `{units: []}` payload, which pre-#614
- * server binaries (a user-configured `raven.server.path`) still parse —
- * they reject entries missing `indentUnit` and would otherwise retain
- * stale per-document units.
+ * Build the `raven/documentIndentUnitsChanged` payload. `units` deliberately
+ * preserves the v0.14 wire contract: it contains required `indentUnit` values
+ * in `"auto"` mode and is empty in fixed mode, so a custom old server cannot
+ * mistake the client unit for a per-document override of a higher-priority
+ * project setting. Producer-relevant editor state evolves separately in the
+ * optional top-level `options` array, which old serde consumers ignore.
+ *
+ * Current servers treat an absent options entry like both booleans are true,
+ * so only documents where tabs mode or `editor.formatOnType = false` disables
+ * the Enter producer need an entry. Replacing the arrays wholesale clears a
+ * stale disabled state when a document returns to the defaults.
  */
 export function buildDocumentIndentUnitsPayload(
     indentationUnitSetting: number | 'auto',
     documents: readonly Pick<vscode.TextDocument, 'isUntitled' | 'languageId' | 'uri'>[],
     resolveUnit: (document: Pick<vscode.TextDocument, 'uri' | 'languageId'>) => number,
     resolveInsertSpaces: (document: Pick<vscode.TextDocument, 'uri' | 'languageId'>) => boolean,
-): { units: DocumentIndentUnitEntry[] } {
-    const units = documents
-        .filter(isIndentUnitDocument)
-        .map((doc) => {
-            const entry: DocumentIndentUnitEntry = {
-                uri: doc.uri.toString(),
-                insertSpaces: resolveInsertSpaces(doc),
-            };
-            if (indentationUnitSetting === 'auto') {
-                entry.indentUnit = resolveUnit(doc);
-            }
-            return entry;
-        })
-        .filter((entry) => entry.indentUnit !== undefined || !entry.insertSpaces);
-    return { units };
+    resolveFormatOnType: (document: Pick<vscode.TextDocument, 'uri' | 'languageId'>) => boolean,
+): { units: DocumentIndentUnitEntry[]; options: DocumentIndentOptionsEntry[] } {
+    const eligible = documents.filter(isIndentUnitDocument);
+    const units = indentationUnitSetting === 'auto'
+        ? eligible.map((doc) => ({
+            uri: doc.uri.toString(),
+            indentUnit: resolveUnit(doc),
+        }))
+        : [];
+    const options = eligible
+        .map((doc) => ({
+            uri: doc.uri.toString(),
+            insertSpaces: resolveInsertSpaces(doc),
+            formatOnType: resolveFormatOnType(doc),
+        }))
+        .filter((entry) => !entry.insertSpaces || !entry.formatOnType);
+    return { units, options };
 }
 
 export type DotInWordMigrationAction = {

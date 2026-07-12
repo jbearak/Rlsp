@@ -264,12 +264,38 @@ mod tests {
                 .contains_key(uri.as_str()),
             "close_document must evict the closed URI's resolved config"
         );
-        // Repopulate so the remainder still pins recompute invalidation.
+        // A one-shot/non-open lookup (the shape used by `raven check` worker
+        // overlays) must not repopulate the shared cache.
         assert_eq!(
             state
                 .effective_lint_config_for_document(&uri)
                 .indentation_unit,
             8
+        );
+        assert!(
+            !state
+                .effective_lint_config_cache
+                .lock()
+                .unwrap()
+                .contains_key(uri.as_str()),
+            "non-open document resolution must bypass the shared cache"
+        );
+
+        // Reopen and repopulate so the remainder still pins recompute
+        // invalidation for the LSP path.
+        state.open_document(uri.clone(), "", Some(2));
+        assert_eq!(
+            state
+                .effective_lint_config_for_document(&uri)
+                .indentation_unit,
+            8
+        );
+        assert!(
+            state
+                .effective_lint_config_cache
+                .lock()
+                .unwrap()
+                .contains_key(uri.as_str())
         );
 
         state.raw_client_settings = overrides_settings(6);

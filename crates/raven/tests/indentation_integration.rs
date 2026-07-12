@@ -392,7 +392,7 @@ fn test_closing_paren_alignment() {
   arg1,
   arg2
 )"#;
-    // Non-conforming reference bail: the legacy closer-line fixture is not a
+    // Non-conforming reference bail: this closer-line fixture is not a
     // lint-conforming post-Enter reference/probe pair.
     assert_eq!(on_type_result(code, 3, &rstudio_config(2)), None);
 }
@@ -426,7 +426,7 @@ fn test_closing_bracket_alignment() {
   1,
   2
 ]"#;
-    // Non-conforming reference bail: the legacy closer-line fixture is not a
+    // Non-conforming reference bail: this closer-line fixture is not a
     // lint-conforming post-Enter reference/probe pair.
     assert_eq!(on_type_result(code, 3, &rstudio_config(2)), None);
 }
@@ -563,8 +563,8 @@ fn test_insert_spaces_false_multiple_tabs() {
     // Test case needing multiple tabs
     let code = "        func(\n"; // 8 spaces indent
     let config = tabs_config(4, IndentationStyle::Aligned);
-    // Tabs-mode bail takes precedence even when the legacy path could express
-    // the column as a whole number of tabs.
+    // Tabs-mode bail preserves the editor's native tab handling even when the
+    // requested column is a whole number of tab stops.
     assert_eq!(on_type_result(code, 1, &config), None);
 }
 
@@ -888,7 +888,7 @@ fn test_full_cycle_closing_delimiter() {
 )"#;
     let config = rstudio_config(2);
 
-    // Non-conforming reference bail: this legacy closer-line fixture is not
+    // Non-conforming reference bail: this closer-line fixture is not
     // the post-Enter blank/closer state the judge can validate.
     assert_eq!(on_type_result(code, 2, &config), None);
 }
@@ -977,7 +977,7 @@ fn test_style_does_not_affect_closing_delimiters() {
 )"#;
 
     // Non-conforming reference bail: neither style emits an edit for this
-    // legacy closer-line fixture.
+    // closer-line fixture.
     assert_eq!(on_type_result(code, 2, &rstudio_config(2)), None);
     assert_eq!(on_type_result(code, 2, &rstudio_minus_config(2)), None);
 }

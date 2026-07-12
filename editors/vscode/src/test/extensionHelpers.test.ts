@@ -5,9 +5,11 @@ import {
     clearIneligibleDiagnostics,
     diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
+    invalidateResolvedEditorOptions,
     isIndentUnitDocument,
     isRDocument,
     planDotInWordMigration,
+    resolveFormatOnTypeForDocument,
     resolveInsertSpacesForDocument,
     resolveTabSizeForDocument,
 } from '../extensionHelpers';
@@ -479,7 +481,42 @@ suite('Extension Helpers', () => {
         );
     });
 
-    test('buildDocumentIndentUnitsPayload includes indentUnit only in auto mode', () => {
+    test('editor configuration changes invalidate only the affected cached fields', () => {
+        const cache = new Map([
+            ['file:///one.R', { tabSize: 2, insertSpaces: true }],
+            ['file:///two.R', { tabSize: 4 }],
+        ]);
+
+        invalidateResolvedEditorOptions({ tabSize: new Set(['file:///one.R']) }, cache);
+        assert.deepStrictEqual(
+            [...cache.entries()],
+            [
+                ['file:///one.R', { insertSpaces: true }],
+                ['file:///two.R', { tabSize: 4 }],
+            ],
+            'resource-scoped invalidation must preserve other documents and fields',
+        );
+
+        invalidateResolvedEditorOptions({ insertSpaces: true, tabSize: true }, cache);
+        assert.strictEqual(cache.size, 0, 'global invalidation must clear both fields');
+    });
+
+    test('resolveFormatOnTypeForDocument uses language- and resource-scoped configuration', () => {
+        const doc = { uri: vscode.Uri.file('/proj/foo.R'), languageId: 'r' };
+        let observedScope: vscode.ConfigurationScope | undefined;
+        const enabled = resolveFormatOnTypeForDocument(doc, (scope) => {
+            observedScope = scope;
+            return {
+                get<T>(key: string, defaultValue: T): T {
+                    return key === 'formatOnType' ? false as unknown as T : defaultValue;
+                },
+            } as vscode.WorkspaceConfiguration;
+        });
+        assert.strictEqual(enabled, false);
+        assert.deepStrictEqual(observedScope, { uri: doc.uri, languageId: 'r' });
+    });
+
+    test('buildDocumentIndentUnitsPayload preserves the v0.14 unit contract', () => {
         const rDoc = {
             isUntitled: false,
             languageId: 'r',
@@ -492,49 +529,67 @@ suite('Extension Helpers', () => {
         };
         const resolveUnit = () => 4;
         const resolveInsertSpaces = () => false;
+        const resolveFormatOnType = () => true;
 
         const auto = buildDocumentIndentUnitsPayload(
             'auto',
             [rDoc, otherDoc],
             resolveUnit,
             resolveInsertSpaces,
+            resolveFormatOnType,
         );
         assert.deepStrictEqual(auto, {
             units: [{
                 uri: rDoc.uri.toString(),
                 indentUnit: 4,
+            }],
+            options: [{
+                uri: rDoc.uri.toString(),
                 insertSpaces: false,
+                formatOnType: true,
             }],
         });
 
-        // Fixed unit: tabs-mode entries still flow (insertSpaces gates the
-        // mismatch advice regardless of the unit setting's mode), but must
-        // not carry indentUnit — an entry's unit would override the
-        // configured workspace-wide unit on the server.
+        // Fixed mode keeps the exact legacy empty unit array even when current
+        // producer options need syncing. A v0.14/custom server ignores the
+        // new top-level array, so it cannot override project unit 4 with the
+        // lower-precedence client unit 2.
         const fixed = buildDocumentIndentUnitsPayload(
             2,
             [rDoc, otherDoc],
             resolveUnit,
             resolveInsertSpaces,
+            resolveFormatOnType,
         );
         assert.deepStrictEqual(fixed, {
-            units: [{
+            units: [],
+            options: [{
                 uri: rDoc.uri.toString(),
                 insertSpaces: false,
+                formatOnType: true,
             }],
         });
-        assert.ok(
-            fixed.units.every((unit) => !('indentUnit' in unit)),
-            'fixed-unit entries must omit the indentUnit key entirely',
-        );
 
-        // Fixed unit, all documents in spaces mode: the payload collapses to
-        // the legacy empty list — absent entries mean insertSpaces: true to
-        // current servers, and pre-#614 binaries (custom raven.server.path)
-        // can still parse the notification and clear stale units.
+        // Both producer gates at their defaults collapse the current options
+        // array too. Disabling format-on-type alone retains an options entry.
         assert.deepStrictEqual(
-            buildDocumentIndentUnitsPayload(2, [rDoc, otherDoc], resolveUnit, () => true),
-            { units: [] },
+            buildDocumentIndentUnitsPayload(
+                2, [rDoc, otherDoc], resolveUnit, () => true, () => true,
+            ),
+            { units: [], options: [] },
+        );
+        assert.deepStrictEqual(
+            buildDocumentIndentUnitsPayload(
+                2, [rDoc, otherDoc], resolveUnit, () => true, () => false,
+            ),
+            {
+                units: [],
+                options: [{
+                    uri: rDoc.uri.toString(),
+                    insertSpaces: true,
+                    formatOnType: false,
+                }],
+            },
         );
     });
 

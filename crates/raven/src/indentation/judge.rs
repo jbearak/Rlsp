@@ -84,19 +84,18 @@ impl SelectionPrefs {
 /// * The editor inserts tabs, or a real (non-string) tab sits inside the
 ///   active context (from the outermost unclosed opener or the reference
 ///   line down to the probe) — the expectation engine counts characters
-///   while the editor renders tab stops, so tab-shaped context keeps the
-///   legacy visual-column path. Tabs on earlier completed statements are
-///   irrelevant and do not disable the judge.
+///   while the editor renders tab stops, so Raven emits no Tier 2 edit and
+///   preserves Tier 1/native indentation. Tabs on earlier completed
+///   statements are irrelevant and do not disable the judge.
 /// * The repaired buffer still has a syntax error intersecting the
 ///   reference-to-probe row window — the expectation engine would answer
-///   top-level (column 0) for a probe it cannot model, deindenting the new
-///   line, where the legacy path degrades gracefully. Errors on unrelated
-///   earlier statements (which the lint's own fold tolerates too) do not
-///   disable the judge.
+///   top-level (column 0) for a probe it cannot model and could deindent the
+///   new line. Errors on unrelated earlier statements (which the lint's own
+///   fold tolerates too) do not disable the judge.
 /// * The nearest checkable line above the probe does not sit at a column the
 ///   lint accepts — the expectation model accumulates from column 0 and would
-///   collapse a user's deliberately offset context (e.g. a top-level `    {`),
-///   while the legacy path anchors to physical indentation.
+///   collapse a user's deliberately offset context (e.g. a top-level `    {`);
+///   emitting no edit preserves the editor's existing physical indentation.
 pub fn judge_backed_indentation(
     tree: &Tree,
     source: &str,
@@ -186,7 +185,7 @@ pub fn judge_backed_indentation(
     {
         log::trace!(
             "judge_backed_indentation: bail: a real tab inside the active context needs the \
-             legacy visual-column path"
+             editor's native visual-column handling"
         );
         return None;
     }
@@ -1237,7 +1236,7 @@ mod tests {
                     InfixContinuationStyle::Indented,
                 ),
                 None,
-                "offset context {source:?} must fall back to the legacy anchor"
+                "offset context {source:?} must preserve editor indentation"
             );
         }
         assert_eq!(
@@ -1248,7 +1247,7 @@ mod tests {
                 InfixContinuationStyle::Indented,
             ),
             None,
-            "over-indented sibling must fall back to the legacy anchor"
+            "over-indented sibling must preserve editor indentation"
         );
     }
 
@@ -1277,7 +1276,7 @@ mod tests {
                 InfixContinuationStyle::Indented,
             ),
             None,
-            "tab-indented context must use the legacy visual-column path"
+            "tab-indented context must preserve the editor's visual-column handling"
         );
 
         let tabs = IndentationConfig {
@@ -1292,7 +1291,7 @@ mod tests {
                 InfixContinuationStyle::Indented,
             ),
             None,
-            "a tabs-mode editor must use the legacy visual-column path"
+            "a tabs-mode editor must preserve its native tab handling"
         );
     }
 
