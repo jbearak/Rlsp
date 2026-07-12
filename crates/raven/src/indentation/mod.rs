@@ -16,8 +16,6 @@ use tower_lsp::lsp_types::DocumentOnTypeFormattingOptions;
 use tower_lsp::lsp_types::Position;
 use tree_sitter::Tree;
 
-use crate::linting::InfixContinuationStyle;
-
 mod config;
 mod formatter;
 mod judge;
@@ -34,16 +32,8 @@ pub fn on_type_indentation(
     source: &str,
     position: Position,
     config: &IndentationConfig,
-    infix_style: InfixContinuationStyle,
 ) -> Option<u32> {
-    on_type_indentation_with_judge_unit(
-        tree,
-        source,
-        position,
-        config,
-        config.tab_size,
-        infix_style,
-    )
+    on_type_indentation_with_judge_unit(tree, source, position, config, config.tab_size)
 }
 
 /// Backend entry that lets the judge use the lint's resolved indentation unit.
@@ -53,15 +43,12 @@ pub(crate) fn on_type_indentation_with_judge_unit(
     position: Position,
     config: &IndentationConfig,
     judge_indent_unit: u32,
-    infix_style: InfixContinuationStyle,
 ) -> Option<u32> {
     let judge_config = IndentationConfig {
         tab_size: judge_indent_unit,
         ..config.clone()
     };
-    if let Some(column) =
-        judge::judge_backed_indentation(tree, source, position, &judge_config, infix_style)
-    {
+    if let Some(column) = judge::judge_backed_indentation(tree, source, position, &judge_config) {
         log::trace!("on_type_indentation: judge-backed tier selected column {column}");
         return Some(column);
     }
@@ -87,7 +74,6 @@ mod tests {
     use super::{
         IndentationConfig, IndentationStyle, on_type_formatting_capability, on_type_indentation,
     };
-    use crate::linting::InfixContinuationStyle;
     use crate::parser_pool::with_parser;
     use tower_lsp::lsp_types::Position;
 
@@ -115,16 +101,12 @@ mod tests {
         let config = IndentationConfig {
             tab_size: 2,
             insert_spaces: true,
-            style: IndentationStyle::RStudio,
+            enabled: true,
+            argument_style: IndentationStyle::Aligned,
+            infix_continuation_style: IndentationStyle::Aligned,
         };
 
-        let column = on_type_indentation(
-            &tree,
-            source,
-            Position::new(1, 0),
-            &config,
-            InfixContinuationStyle::Indented,
-        );
+        let column = on_type_indentation(&tree, source, Position::new(1, 0), &config);
 
         assert_eq!(column, None, "multiline-string interiors must emit no edit");
     }
@@ -136,16 +118,12 @@ mod tests {
         let config = IndentationConfig {
             tab_size: 2,
             insert_spaces: true,
-            style: IndentationStyle::RStudio,
+            enabled: true,
+            argument_style: IndentationStyle::Aligned,
+            infix_continuation_style: IndentationStyle::Aligned,
         };
 
-        let column = on_type_indentation(
-            &tree,
-            source,
-            Position::new(1, 0),
-            &config,
-            InfixContinuationStyle::Indented,
-        );
+        let column = on_type_indentation(&tree, source, Position::new(1, 0), &config);
 
         assert_eq!(column, None, "offset contexts must emit no edit");
     }

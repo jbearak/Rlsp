@@ -6,70 +6,37 @@ Raven provides AST-aware indentation for R code through a two-tier system.
 
 Both tiers are active by default.
 
-| Tier | What It Does | How It Works |
-|------|-------------|--------------|
-| **Tier 1** | Basic indentation for pipes, operators, brackets | Declarative regex rules in VS Code's language configuration |
-| **Tier 2** | AST-aware indentation with style-specific alignment | LSP `onTypeFormatting` via the indentation lint's expectation engine |
+| Tier | What it does | How it works |
+|---|---|---|
+| **Tier 1** | Basic indentation for pipes, operators, assignments, and brackets | Declarative VS Code rules |
+| **Tier 2** | AST-aware indentation with independently configured argument and infix styles | LSP `onTypeFormatting` using the indentation lint's expectation engine |
 
-When you press Enter, Tier 1 applies first (regex-based), then Tier 2 replaces the result when the expectation engine can compute a more precise indentation from the AST. If Tier 2 is disabled or cannot answer, Tier 1's/native result stands.
+When you press Enter, Tier 1 runs first. Tier 2 then repairs the incomplete buffer, asks the shared expectation engine for both supported forms, and selects the configured producer style. If Tier 2 is disabled, an axis is `off`, or the judge cannot answer, Raven emits no indentation edit and the Tier 1/native result stands.
 
-## How It Works
+The formatter and lint have independent policies: the formatter emits its configured style faithfully, and the lint checks its configured style. Compatible infix pairs (`aligned` with `aligned`, `indented` with `indented`, or either producer with lint `either`) do not conflict. A mismatched pair is a valid user configuration state; a later PR will add an advice diagnostic for it.
 
-1. You press Enter in an R file
-2. VS Code applies Tier 1 rules (basic regex indentation)
-3. Raven's LSP asks the same expectation engine that powers Raven's indentation lint which columns are valid at the cursor
-4. The LSP chooses a valid column according to the configured indentation style and returns a TextEdit that replaces the indentation
-5. Your cursor lands at the column computed for the configured indentation style
+The indentation unit is deliberately shared when Raven's indentation lint is enabled: the judge uses the lint's per-document resolved unit, including `"auto"` and `[[linting.overrides]]`. If that lint rule is disabled, the judge uses the editor's `tabSize`. The lint's style setting never steers the producer.
 
 ## Configuration
 
-### Indentation Style
-
 ```json
 {
-  "raven.indentation.style": "rstudio"
+  "raven.indentation.enabled": true,
+  "raven.indentation.argumentStyle": "aligned",
+  "raven.indentation.infixContinuationStyle": "aligned",
+  "raven.linting.infixContinuationStyle": "either"
 }
 ```
 
-| Value | Description |
-|-------|-------------|
-| `"rstudio"` | (Default) Prefer aligned forms for same-line arguments and operator chains; next-line arguments indent from the opener line |
-| `"rstudio-minus"` | Prefer block-indented forms for arguments and operator chains, regardless of opener position |
-| `"off"` | Disables Tier 2; only Tier 1 declarative rules remain active |
+| Setting | Values | Default | Effect |
+|---|---|---|---|
+| `raven.indentation.enabled` | `true`, `false` | `true` | Tier 2 master switch |
+| `raven.indentation.argumentStyle` | `aligned`, `indented`, `off` | `aligned` | Parenthesized argument axis |
+| `raven.indentation.infixContinuationStyle` | `aligned`, `indented`, `off` | `aligned` | Infix-operator continuation axis |
 
-Style names follow the [ESS (Emacs Speaks Statistics)](https://ess.r-project.org/) conventions: `rstudio` matches the RStudio IDE's default alignment; `rstudio-minus` (`RStudio-` in ESS) drops same-line paren alignment.
+For the argument axis, `aligned` is ESS `RStudio`: a same-line argument aligns after the opener. `indented` is ESS `RStudio-`: arguments use one level from the opener line. If the opener is followed immediately by a newline, both forms coincide.
 
-The style controls which lint-accepted layout Tier 2 prefers; it does not change which layouts the indentation lint accepts. `rstudio` prefers paren-argument and operator-chain alignment, while `rstudio-minus` prefers the corresponding block indent. The lint's separate [`infixContinuationStyle`](linting.md#indentation) setting determines which operator-continuation layouts are accepted, and Tier 2 always chooses from that accepted set. Consequently, the indentation lint never flags a column that auto-indent just produced.
-
-### When Tier 2 cannot answer
-
-When the expectation engine cannot answer, Raven leaves the editor's
-indentation unchanged. The editor has already applied its Tier 1
-`onEnterRules` and native indentation before it asks Raven for on-type
-formatting, so emitting no edit preserves that answer.
-
-The known fall-through classes are multiline-string or multiline-backtick
-interiors, tabs-mode or a real tab in the active indentation context, syntax
-error windows that remain unrepairable, and surrounding reference lines whose
-indentation does not conform to the lint's accepted columns. Ambiguous or
-out-of-bounds repair positions also leave the editor's indentation unchanged.
-
-### Disabling Tier 2
-
-Two ways to disable AST-aware indentation:
-
-1. Set `raven.indentation.style` to `"off"` — the LSP returns no edits, Tier 1 still works
-2. Set `editor.formatOnType` to `false` for R — VS Code won't send `onTypeFormatting` requests at all
-
-The difference: `"off"` is a Raven setting that keeps `formatOnType` available for other languages. Disabling `formatOnType` is a VS Code editor setting that affects all languages (unless overridden per-language).
-
-Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto files as a default. This is the lowest-priority setting in VS Code — if you explicitly set `editor.formatOnType` to `false` (globally or for `[r]`), your setting takes precedence. Tier 2 indentation also applies inside R code chunks of R Markdown and Quarto files — pressing Enter inside a chunk body indents exactly as it would in a plain `.R` file. On prose, YAML front matter, or a non-R chunk, Tier 2 stands down so markdown isn't reflowed with R rules (Tier 1 still applies).
-
-## Styles
-
-### RStudio Style (Default)
-
-When the opening parenthesis is followed by content on the same line, continuation arguments align to the column after the paren:
+Aligned arguments:
 
 ```r
 result <- function_call(first_arg,
@@ -77,19 +44,7 @@ result <- function_call(first_arg,
                         third_arg)
 ```
 
-When the opening parenthesis is followed by a newline, arguments indent by one level from the function line:
-
-```r
-result <- function_call(
-  first_arg,
-  second_arg,
-  third_arg
-)
-```
-
-### RStudio-Minus Style
-
-All arguments indent from the function call's line (the opener line), regardless of where the opening paren is:
+Indented arguments:
 
 ```r
 result <- function_call(first_arg,
@@ -97,26 +52,111 @@ result <- function_call(first_arg,
   third_arg)
 ```
 
-## Examples
+A newline immediately after the opener uses column 2 in either mode with a 2-space unit:
 
-### Assignment Continuations
+```r
+result <- function_call(
+  first_arg,
+  second_arg
+)
+```
 
-A line ending in an assignment operator (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) normally indents the next line one level — in every style, because an assignment's right-hand side is not a peer operand of the left-hand side, so there is nothing to align against. With a 2-space indentation unit, the right-hand side starts at column 2:
+For infix chains:
+
+- `aligned` lines operands up at the first operand's actual column, floored one level from the owning statement: `max(first_operand_column, statement_indent + unit)`.
+- `indented` uses a uniform one-level continuation anchored at the chain-start line. It does not reproduce Tier 1's per-line cascade.
+- `off` makes Tier 2 stand down only when that axis decides the probe. Brace bodies, assignment continuations, and other style-neutral answers remain active.
+
+Out of the box Raven emits aligned chains and the lint accepts both traditions. A project that runs real `lintr`, styler, or Air in CI should set both infix settings to `indented`. A strict alignment project sets both to `aligned`.
+
+### Permanent compatibility alias
+
+`raven.indentation.style` remains accepted permanently:
+
+| Alias value | Applicable field |
+|---|---|
+| `rstudio` | `argumentStyle = aligned` |
+| `rstudio-minus` | `argumentStyle = indented` |
+| `off` | `enabled = false` |
+
+The alias never changes the infix axis. Resolution is per field:
+
+| Resolved field | Highest precedence | Then | Default |
+|---|---|---|---|
+| `enabled` | explicit `indentation.enabled` | alias `style = off` | `true` |
+| `argumentStyle` | explicit `indentation.argumentStyle` | alias `rstudio` / `rstudio-minus` | `aligned` |
+| `infixContinuationStyle` | explicit `indentation.infixContinuationStyle` | — | `aligned` |
+
+Thus `enabled = true` overrides alias `off`, and `argumentStyle = aligned` overrides alias `rstudio-minus` without changing either infix setting.
+
+### Disabling Tier 2
+
+Set `raven.indentation.enabled` to `false` to disable all Tier 2 edits while retaining Tier 1. Setting both axes to `off` is different: style-neutral Tier 2 answers remain enabled. Setting `[r]`-scoped `editor.formatOnType` to `false` prevents the request entirely.
+
+The master switch preserves the old alias-`off` trigger behavior: Raven also skips its closing-delimiter duplicate cleanup. Axis-level `off` does not disable that cleanup.
+
+## Infix examples
+
+All numeric columns below use the real judge with a 2-space unit and are pinned by `documented_columns_match_the_real_judge_engine`.
+
+For an assigned chain, `aligned` uses column 10 under `data`; `indented` uses column 2:
+
+```r
+# aligned
+result <- data %>%
+          filter(x > 0) %>%
+          select(y)
+
+# indented
+result <- data %>%
+  filter(x > 0) %>%
+  select(y)
+```
+
+At statement level the aligned floor bites. A top-level chain continues at column 2, never column 0. Inside a brace, a statement at column 2 continues at column 4:
+
+```r
+data |>
+  transform()
+
+if (condition) {
+  data |>
+    transform()
+}
+```
+
+A chain begun in a next-line call argument also continues at column 4 in either producer mode because the argument line itself is at column 2:
+
+```r
+output <- some_function(
+  data %>%
+    filter(x > 0) %>%
+    select(y)
+)
+```
+
+With the infix axis `off`, Tier 2 returns no answer for the chain. Tier 1's line-local operator rule typically cascades instead of finding a uniform chain anchor:
+
+```r
+x |>
+  y |>
+    z
+```
+
+Likewise, `argumentStyle = off` leaves argument indentation to native/Tier 1 bracket handling rather than applying Raven's opener alignment.
+
+## Assignment continuations
+
+Assignment operators (`<-`, `<<-`, `=`, `:=`, `->`, `->>`) are style-neutral. Their continuation is one level in under every argument, infix, and lint mode; an assignment RHS is not a peer operand of its LHS.
+
+At top level the RHS begins at column 2:
 
 ```r
 result <-
   compute_something(x)
 ```
 
-The level is measured from the line where the assignment *statement* starts. For a right assignment at the end of a chain, that is the chain's first line:
-
-```r
-data %>%
-  f() ->
-  target
-```
-
-Breaking after the operator is the escape hatch for a long left-hand side: the chain that follows starts at column 2, and subsequent continuations stay at column 2 — the assignment already paid for the level, so the chain adds none (mirroring lintr's `assignment_as_infix`, which the linter's [indentation rule](linting.md) applies identically):
+Breaking before a chain pays that level once. The chain remains at column 2 in every mode:
 
 ```r
 result <-
@@ -125,127 +165,72 @@ result <-
   select(y)
 ```
 
-The same flattening applies to chained broken assignments: `a <-` ⏎ `b <-` ⏎ puts both `b <-` and the final right-hand side at column 2, not columns 2 and 4.
+For a syntactically continuous arithmetic chain, all RHS operands remain mutually aligned at column 4 with a 4-space unit; the LHS column is irrelevant:
 
-An enclosing bracket opened on an earlier line does not override the assignment continuation. In each of these shapes, `b <-` starts at column 2 and its right-hand side starts one level deeper, at column 4:
+```r
+x <-
+    y +
+    z +
+    w
+```
+
+An earlier opener contributes its level before the assignment. Here `b <-` is at column 2 and `value` at column 4:
 
 ```r
 f(
   b <-
     value
-
-(
-  b <-
-    value
-
-x[
-  b <-
-    value
-
-f(a,
-  b <-
-    value
+)
 ```
 
-An opener on the assignment's own line still supplies its hanging or aligned form. Under the default `rstudio` style, this right-hand side starts at column 19:
+A same-line opener is governed by the argument axis. In this incomplete assignment shape, `aligned` selects column 21 after the opener; `indented` selects column 4:
 
 ```r
 long_function_name(x <-
-                   value
+                     value
 ```
 
-Likewise, the default style puts this `:=` right-hand side at the lint-accepted aligned argument/chain column 5 (`rstudio-minus` chooses the block form at column 4):
+The analogous `:=` shape selects column 5 in aligned mode and column 4 in indented mode:
 
 ```r
 dt[, y :=
      value
 ```
 
-When the assignment is followed by a call whose same-line argument starts a chain, the assignment and opener contributions are both preserved. The continuation below starts at column 6 in both styles:
+When a broken assignment is followed by a same-line call that starts a chain, the producer axes legitimately differ: aligned mode selects column 4, while indented mode selects column 6.
 
 ```r
+# aligned
+result <-
+  f(data %>%
+    value
+
+# indented
 result <-
   f(data %>%
       value
 ```
 
-Broken assignments still flatten later operator continuations unless a bracket opened on the chain's own line contributes a hanging level. Thus `a <-` ⏎ `(data %>%` ⏎ puts the next operand at column 4; a chain inside same-line `if (…)` condition parens similarly retains the condition's hanging level.
+Tier 1 has a matching assignment rule for `<-` and `<<-`. The other assignment operators need Tier 2 because a line regex cannot classify them safely.
 
-An assignment operator ending a line *inside* call arguments — including a named argument's or formal default's `=` — likewise keeps a lint-accepted argument layout for the enclosing call ([see above](#styles)).
+## Brace blocks
 
-Tier 1 has a matching declarative rule for `<-` / `<<-` only, so those two indent even with Tier 2 off; `=`, `:=`, `->`, `->>` need Tier 2 to classify correctly. Like every Tier 1 rule, the regex sees only one line and cannot flatten a chain. Tier 2 first asks the indentation lint's expectation engine, so every answer it emits is lint-accepted; when that engine cannot answer, Raven emits no edit and preserves Tier 1/native indentation.
-
-### Pipe Chains
-
-Under the default `rstudio` indentation style and `indented` lint style, continuation lines in a pipe chain align under the chain start — for a chain on the right-hand side of an assignment, that is the first operand after the assignment operator:
-
-```r
-result <- data %>%
-          filter(x > 0) %>%
-          mutate(y = x * 2) %>%
-          select(y)
-```
-
-With the default `indented` lint style, a continuation whose chain starts in the first column gets one indent level instead of aligning to column 0:
-
-```r
-data |>
-  filter(x > 0) |>
-  select(y)
-```
-
-Exception: when the chain is the right-hand side of an assignment whose operator ends its line, continuations stay at the chain-start line's indent — see [Assignment Continuations](#assignment-continuations).
-
-### Nested Pipes in Function Calls
-
-```r
-output <- some_function(
-  data %>%
-    filter(x > 0) %>%
-    select(y),
-  other_arg
-)
-```
-
-### Function Calls in Pipe Chains
-
-```r
-result <- data %>%
-          mutate(new_col = complex_function(arg1,
-                                            arg2,
-                                            arg3)) %>%
-          filter(new_col > 0)
-```
-
-### Brace Blocks
+Brace bodies are style-neutral and remain active even when both axes are `off`. With a 2-space unit the body begins at column 2:
 
 ```r
 if (condition) {
   do_something()
-  do_something_else()
 }
 ```
 
+## When Tier 2 cannot answer
+
+Raven emits no edit for multiline string/backtick interiors, tabs-mode or a real tab in the active context, an unrepaired syntax-error window, a nonconforming reference line, or an ambiguous/out-of-bounds repair. That preserves the editor's Tier 1/native indentation.
+
+Tier 2 applies inside R chunk bodies in R Markdown and Quarto, but stands down in prose, YAML, and non-R chunks.
+
 ## Troubleshooting
 
-### Indentation not working at all
+If indentation is inactive, check the language mode, `raven.indentation.enabled`, the relevant axis, and `editor.formatOnType`. Setting changes take effect immediately.
 
-1. Check the file's language mode (status bar): R, R Markdown, and Quarto are all supported — but in `.Rmd` / `.Rmarkdown` / `.qmd` files, Tier 2 indentation applies only inside R chunk bodies, not in prose or YAML
-2. Verify Raven is running (check VS Code's status bar)
-3. Reload VS Code: `Ctrl+Shift+P` → "Developer: Reload Window"
-
-### Wrong indentation style
-
-1. Check `raven.indentation.style` — valid values are `"rstudio"`, `"rstudio-minus"`, `"off"`
-2. The change takes effect immediately — open a new line in an R file to test
-
-### Indentation looks doubled
-
-Tier 2 replaces Tier 1's indentation, so doubling shouldn't happen. If it does, check for conflicting R extensions that also handle `onTypeFormatting`.
-
-### Pipe chains not aligning correctly
-
-Tier 2 asks the indentation lint's expectation engine. If it cannot answer, Raven preserves the editor's indentation. For unexpected pipe indentation, check that:
-
-1. There's no blank line breaking the chain
-2. Each line ends with a continuation operator (`%>%`, `|>`, `+`, `~`, or `%infix%`)
+If a chain uses the wrong tradition, compare `raven.indentation.infixContinuationStyle` (producer) with `raven.linting.infixContinuationStyle` (checker). Use matching values for strict projects or lint `either` when both layouts are welcome.

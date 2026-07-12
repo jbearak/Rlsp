@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
 
-use super::{LintConfig, rule_ids, run_lints};
+use super::{InfixContinuationStyle, LintConfig, rule_ids, run_lints};
 use crate::parser_pool::with_parser;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -487,6 +487,7 @@ fn config_for(rule: Rule) -> LintConfig {
         Rule::SpacesInside => config.spaces_inside_severity = severity,
         Rule::Indentation => {
             config.indentation_unit = 4;
+            config.infix_continuation_style = InfixContinuationStyle::Indented;
             config.indentation_severity = severity;
         }
     }

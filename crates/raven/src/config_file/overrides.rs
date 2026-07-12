@@ -196,19 +196,20 @@ mod tests {
         let base = LintConfig::default();
         assert_eq!(
             base.infix_continuation_style,
-            crate::linting::InfixContinuationStyle::Indented
+            crate::linting::InfixContinuationStyle::Either
         );
         let section = json!({ "enabled": true });
         let root = PathBuf::from("/proj");
         let overrides = make_overrides(
             &root,
-            vec![("R/**/*.R", json!({ "infixContinuationStyle": "either" }))],
+            vec![("R/**/*.R", json!({ "infixContinuationStyle": "indented" }))],
         );
         let uri = Url::parse("file:///proj/R/foo.R").unwrap();
         let out = resolve_lint_for_document(&base, &section, &overrides, &uri);
         assert_eq!(
             out.infix_continuation_style,
-            crate::linting::InfixContinuationStyle::Either
+            crate::linting::InfixContinuationStyle::Indented,
+            "the override must switch the style away from the Either base"
         );
     }
 

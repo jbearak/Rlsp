@@ -122,6 +122,9 @@ const SETTINGS_MAPPING: Array<{
     // Completion settings
     { vsCodeKey: 'completion.triggerOnOpenParen', jsonPath: ['completion', 'triggerOnOpenParen'], type: 'boolean' },
     // Indentation settings
+    { vsCodeKey: 'indentation.enabled', jsonPath: ['indentation', 'enabled'], type: 'boolean' },
+    { vsCodeKey: 'indentation.argumentStyle', jsonPath: ['indentation', 'argumentStyle'], type: 'enum', enumValues: ['aligned', 'indented', 'off'] as const },
+    { vsCodeKey: 'indentation.infixContinuationStyle', jsonPath: ['indentation', 'infixContinuationStyle'], type: 'enum', enumValues: ['aligned', 'indented', 'off'] as const },
     { vsCodeKey: 'indentation.style', jsonPath: ['indentation', 'style'], type: 'enum', enumValues: ['rstudio', 'rstudio-minus', 'off'] as const },
     // Linting settings — always emitted using each key's package.json default
     // so that resetting a key propagates to the server instead of leaving
@@ -131,7 +134,7 @@ const SETTINGS_MAPPING: Array<{
     { vsCodeKey: 'linting.lineLength', jsonPath: ['linting', 'lineLength'], type: 'number', defaultWhenUnconfigured: 80 },
     { vsCodeKey: 'linting.objectLength', jsonPath: ['linting', 'objectLength'], type: 'number', defaultWhenUnconfigured: 30 },
     { vsCodeKey: 'linting.indentationUnit', jsonPath: ['linting', 'indentationUnit'], type: 'number', defaultWhenUnconfigured: 2 },
-    { vsCodeKey: 'linting.infixContinuationStyle', jsonPath: ['linting', 'infixContinuationStyle'], type: 'enum', enumValues: ['indented', 'aligned', 'either'] as const, defaultWhenUnconfigured: 'indented' },
+    { vsCodeKey: 'linting.infixContinuationStyle', jsonPath: ['linting', 'infixContinuationStyle'], type: 'enum', enumValues: ['indented', 'aligned', 'either'] as const, defaultWhenUnconfigured: 'either' },
     { vsCodeKey: 'linting.assignmentOperator', jsonPath: ['linting', 'assignmentOperator'], type: 'enum', enumValues: ['<-', '='] as const, defaultWhenUnconfigured: '<-' },
     { vsCodeKey: 'linting.stringDelimiter', jsonPath: ['linting', 'stringDelimiter'], type: 'enum', enumValues: ['"', "'"] as const, defaultWhenUnconfigured: '"' },
     { vsCodeKey: 'linting.lineLengthSeverity', jsonPath: ['linting', 'lineLengthSeverity'], type: 'enum', enumValues: ['error', 'warning', 'information', 'hint', 'off'] as const, defaultWhenUnconfigured: 'information' },
@@ -391,7 +394,7 @@ suite('Settings Transmission Property Tests', () => {
                 lineLength: 80,
                 objectLength: 30,
                 indentationUnit: 2,
-                infixContinuationStyle: 'indented',
+                infixContinuationStyle: 'either',
                 assignmentOperator: '<-',
                 stringDelimiter: '"',
                 objectNameStyleFunction: ['snake_case', 'symbols'],
@@ -586,7 +589,7 @@ suite('Settings Transmission Unit Tests', () => {
             lineLength: 80,
             objectLength: 30,
             indentationUnit: 2,
-            infixContinuationStyle: 'indented',
+            infixContinuationStyle: 'either',
             assignmentOperator: '<-',
             stringDelimiter: '"',
             objectNameStyleFunction: ['snake_case', 'symbols'],
@@ -613,6 +616,22 @@ suite('Settings Transmission Unit Tests', () => {
             functionLeftParenthesesSeverity: 'information',
             spacesInsideSeverity: 'information',
             indentationSeverity: 'information',
+        });
+    });
+
+    test('indentation settings forward new fields and compatibility alias together', () => {
+        const configuredSettings = new Map<string, unknown>([
+            ['indentation.enabled', true],
+            ['indentation.argumentStyle', 'off'],
+            ['indentation.infixContinuationStyle', 'indented'],
+            ['indentation.style', 'rstudio-minus'],
+        ]);
+        const options = getInitializationOptions(createMockConfig(configuredSettings));
+        assert.deepStrictEqual(options.indentation, {
+            enabled: true,
+            argumentStyle: 'off',
+            infixContinuationStyle: 'indented',
+            style: 'rstudio-minus',
         });
     });
 

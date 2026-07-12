@@ -331,6 +331,35 @@ lineLengthSeverity = "warning"
     }
 
     #[test]
+    fn parses_indentation_axes_and_compatibility_alias() {
+        let toml = r#"
+[indentation]
+enabled = true
+argumentStyle = "off"
+infixContinuationStyle = "indented"
+style = "rstudio-minus"
+"#;
+        let out = load_str(toml, "test").unwrap();
+        assert!(out.warnings.is_empty(), "got {:?}", out.warnings);
+        assert_eq!(
+            out.settings["indentation"]["enabled"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            out.settings["indentation"]["argumentStyle"],
+            serde_json::json!("off")
+        );
+        assert_eq!(
+            out.settings["indentation"]["infixContinuationStyle"],
+            serde_json::json!("indented")
+        );
+        assert_eq!(
+            out.settings["indentation"]["style"],
+            serde_json::json!("rstudio-minus")
+        );
+    }
+
+    #[test]
     fn parses_nested_crossfile_section() {
         let toml = r#"
 [crossFile.onDemandIndexing]

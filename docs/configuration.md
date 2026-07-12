@@ -193,14 +193,14 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.indentation.style` | `"rstudio"` | Indentation style for R code |
+| `raven.indentation.enabled` | `true` | Tier 2 AST-aware indentation master switch |
+| `raven.indentation.argumentStyle` | `"aligned"` | Parenthesized arguments: `"aligned"`, `"indented"`, or `"off"` |
+| `raven.indentation.infixContinuationStyle` | `"aligned"` | Infix continuations: `"aligned"`, `"indented"`, or `"off"` |
+| `raven.indentation.style` | `"rstudio"` | Deprecated permanent alias: `rstudio` → argument `aligned`, `rstudio-minus` → argument `indented`, `off` → Tier 2 disabled |
 
-Values:
-- `"rstudio"` — Same-line arguments align to opening paren; next-line arguments indent from function line (matches RStudio default)
-- `"rstudio-minus"` — All arguments indent relative to previous line, regardless of paren position
-- `"off"` — Disables AST-aware indentation (Tier 2); only basic declarative rules remain
+Explicit new settings win per field over the alias. The alias never changes the infix axis. See [Smart Indentation](indentation.md#permanent-compatibility-alias) for the full precedence table and examples.
 
-Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto files by default (lowest-priority VS Code default). This is required for Tier 2 indentation — though Tier 2 itself applies only to plain R files, so the default has no indentation effect in `.Rmd` / `.Rmarkdown` / `.qmd` (those use Tier 1 only). Disable per-language:
+Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto by default (the lowest-priority VS Code default). Tier 2 applies to plain R and to R chunk bodies; prose, YAML, and non-R chunks stand down. Disable it per language when desired:
 
 ```json
 "[r]": {
@@ -214,7 +214,7 @@ Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto files b
 }
 ```
 
-See [Smart Indentation](indentation.md) for details.
+Out of the box Raven emits aligned infix continuations and its lint accepts both forms. Projects using real `lintr`, styler, or Air in CI should set both infix settings to `"indented"`; strict-alignment projects should set both to `"aligned"`.
 
 ## Linting Settings
 
@@ -227,7 +227,7 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 | `raven.linting.lineLength` | `80` | Maximum line length (characters) |
 | `raven.linting.objectLength` | `30` | Maximum identifier length for the object-length lint |
 | `raven.linting.indentationUnit` | `"auto"` | Spaces per indent level used by the indentation lint. In VS Code, `"auto"` tracks each file's resolved `editor.tabSize`; set an integer `1..=8` for a fixed unit. |
-| `raven.linting.infixContinuationStyle` | `"indented"` | How the indentation lint treats a line continuing an end-of-line infix operator: `"indented"` (one extra level, `lintr`-compatible), `"aligned"` (at the operator chain's starting column), or `"either"`. Raven-only; see [Indentation](linting.md#indentation). |
+| `raven.linting.infixContinuationStyle` | `"either"` | Infix checking policy: strict `"indented"` (`lintr` parity), strict floored `"aligned"`, or their `"either"` union. Raven-only; see [Indentation](linting.md#indentation). |
 | `raven.linting.assignmentOperator` | `"<-"` | Preferred assignment operator (`"<-"` or `"="`) |
 | `raven.linting.stringDelimiter` | `"\""` | Preferred string-literal delimiter (`"\""` or `"'"`); used by the quotes lint |
 | `raven.linting.lineLengthSeverity` | `"information"` | Severity for over-long lines (or `"off"`) |
