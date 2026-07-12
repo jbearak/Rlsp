@@ -696,6 +696,26 @@ pub struct WorldState {
     /// are configured. Per-document resolution scans this list.
     pub lint_overrides: Vec<crate::config_file::CompiledLintOverride>,
 
+    /// The merged (client + raw project) `linting` settings section, cached
+    /// by `recompute_parsed_configs` alongside `lint_overrides` so
+    /// per-document override resolution never re-merges and re-clones the
+    /// raw settings trees on the typing hot path. `{}` when the merged
+    /// settings carry no `linting` section. Only meaningful together with
+    /// `lint_overrides` — both are written by the same single writer.
+    pub merged_linting_section: serde_json::Value,
+
+    /// Per-URI cache of the override-resolved per-document `LintConfig`
+    /// (the expensive branch of `effective_lint_config_for_document`:
+    /// glob matching, JSON patching, and a config re-parse). Interior
+    /// mutability because resolution runs under the `WorldState` READ lock.
+    /// Invalidated by the two writers of its inputs: cleared by
+    /// `recompute_parsed_configs` (config layers / overrides changed) and by
+    /// the `per_document_indent_unit` swap in
+    /// `raven/documentIndentUnitsChanged` (the patched base feeds
+    /// resolution). Bounded by the set of open documents between clears.
+    pub effective_lint_config_cache:
+        std::sync::Mutex<std::collections::HashMap<String, crate::linting::LintConfig>>,
+
     /// Compiled `[workspace].exclude` entries. Empty when no project-level
     /// exclusions are configured. These apply to workspace/default discovery,
     /// indexing, watcher resync, on-demand indexing, and LSP diagnostics.
@@ -860,6 +880,48 @@ impl WorldState {
     /// Passthrough for legacy `state.package_workspace` reads.
     pub fn package_workspace(&self) -> Option<&crate::package_namespace::PackageWorkspace> {
         self.package_state.workspace()
+    }
+
+    /// The effective per-document `LintConfig`: the workspace-wide base,
+    /// patched with the auto-detected per-document indentation unit, then any
+    /// matching `[[linting.overrides]]` entries layered on top. Passing the
+    /// patched config as the *base* to `resolve_lint_for_document` keeps an
+    /// override's `indentationUnit` winning over the per-document value, not
+    /// the other way around.
+    ///
+    /// This is the single implementation shared by diagnostics
+    /// (`DiagnosticsSnapshot::build`) and on-type formatting (the judge tier),
+    /// so the two can never drift and disagree about a document's accepted
+    /// columns. With no overrides configured (the common case) this is a
+    /// plain config clone; with overrides it resolves against the
+    /// `merged_linting_section` cached by `recompute_parsed_configs`, so no
+    /// caller ever re-merges the raw settings trees on the typing hot path.
+    pub fn effective_lint_config_for_document(
+        &self,
+        uri: &tower_lsp::lsp_types::Url,
+    ) -> crate::linting::LintConfig {
+        let mut base = self.lint_config.clone();
+        if let Some(&unit) = self.per_document_indent_unit.get(uri.as_str()) {
+            base.indentation_unit = unit;
+        }
+        if self.lint_overrides.is_empty() {
+            return base;
+        }
+        if let Ok(cache) = self.effective_lint_config_cache.lock()
+            && let Some(hit) = cache.get(uri.as_str())
+        {
+            return hit.clone();
+        }
+        let resolved = crate::config_file::resolve_lint_for_document(
+            &base,
+            &self.merged_linting_section,
+            &self.lint_overrides,
+            uri,
+        );
+        if let Ok(mut cache) = self.effective_lint_config_cache.lock() {
+            cache.insert(uri.as_str().to_owned(), resolved.clone());
+        }
+        resolved
     }
 
     /// Bump the package/config generation (issue #483) so the persistent
@@ -1134,6 +1196,8 @@ impl WorldState {
             raw_project_settings: None,
             project_config_path: None,
             lint_overrides: Vec::new(),
+            merged_linting_section: serde_json::json!({}),
+            effective_lint_config_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions::default(),
             per_document_indent_unit: std::collections::HashMap::new(),
             cross_file_meta: MetadataCache::new(),
@@ -1665,6 +1729,9 @@ impl WorldState {
     pub fn close_document(&mut self, uri: &Url) -> Vec<Url> {
         let aliases = self.open_document_aliases.close(uri);
         self.documents.remove(uri);
+        if let Ok(mut cache) = self.effective_lint_config_cache.lock() {
+            cache.remove(uri.as_str());
+        }
         aliases
     }
 

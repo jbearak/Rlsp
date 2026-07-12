@@ -665,7 +665,7 @@
           ".Rmarkdown",
           ".RMARKDOWN"
         ],
-        "configuration": "./language-configuration.json"
+        "configuration": "./rmd-language-configuration.json"
       },
       {
         "id": "quarto",
@@ -678,7 +678,7 @@
           ".Qmd",
           ".QMD"
         ],
-        "configuration": "./language-configuration.json"
+        "configuration": "./rmd-language-configuration.json"
       },
       {
         "id": "jags",

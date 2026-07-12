@@ -112,8 +112,7 @@ pub(crate) fn collect(
     let passes: Vec<(HashMap<u32, Expected>, HashSet<u32>)> = pass_styles
         .iter()
         .map(|&style| {
-            let mut expectations: HashMap<u32, Expected> = HashMap::new();
-            set_expectations(root, &lines, indent_unit, style, &mut expectations);
+            let expectations = expectations_for_style(root, &lines, indent_unit, style);
             let exemptions =
                 collect_aligned_comment_exemptions(&lines, &expectations, &comments, &line_states);
             (expectations, exemptions)
@@ -175,6 +174,251 @@ pub(crate) fn collect(
     }
 }
 
+/// What an additionally accepted indentation column represents.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IndentKind {
+    /// Aligned-argument / opener column, including hanging bracket pins.
+    OpenerAligned,
+    /// Operator-chain-start column.
+    ChainStart,
+    /// A unit-based block-form level.
+    Block,
+    /// Column zero contributed because one style pass does not cover a line.
+    ///
+    /// This is never a style preference target; it exists only to complete
+    /// the accepted set when style passes are merged.
+    TopLevel,
+}
+
+impl IndentKind {
+    const fn bit(self) -> u8 {
+        match self {
+            IndentKind::OpenerAligned => 1 << 0,
+            IndentKind::ChainStart => 1 << 1,
+            IndentKind::Block => 1 << 2,
+            IndentKind::TopLevel => 1 << 3,
+        }
+    }
+
+    const ALL: [IndentKind; 4] = [
+        IndentKind::OpenerAligned,
+        IndentKind::ChainStart,
+        IndentKind::Block,
+        IndentKind::TopLevel,
+    ];
+}
+
+/// A set of [`IndentKind`] tags, packed into one byte. Expectations attach a
+/// set to every accepted column, and the whole-document diagnostic fold keeps
+/// one per line — a `Vec<IndentKind>` there costs a heap allocation per line
+/// for at most four flags.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct IndentKindSet(u8);
+
+impl IndentKindSet {
+    pub(crate) fn single(kind: IndentKind) -> Self {
+        Self(kind.bit())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn of(kinds: &[IndentKind]) -> Self {
+        Self(kinds.iter().fold(0, |bits, kind| bits | kind.bit()))
+    }
+
+    pub(crate) fn contains(self, kind: IndentKind) -> bool {
+        self.0 & kind.bit() != 0
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+impl std::fmt::Debug for IndentKindSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set()
+            .entries(IndentKind::ALL.iter().filter(|kind| self.contains(**kind)))
+            .finish()
+    }
+}
+
+/// Accepted indentation columns for one line, computed by the lint's own
+/// expectation engine.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct LineIndentExpectation {
+    pub(crate) primary: u32,
+    /// Every additionally accepted column and all meanings attached to it.
+    pub(crate) alternatives: Vec<(u32, IndentKindSet)>,
+}
+
+impl LineIndentExpectation {
+    /// True when `actual` is the primary or any accepted alternative column —
+    /// the same acceptance the diagnostic pass applies via
+    /// `Expected::is_acceptable`.
+    pub(crate) fn accepts(&self, actual: u32) -> bool {
+        actual == self.primary
+            || self
+                .alternatives
+                .iter()
+                .any(|(column, _)| *column == actual)
+    }
+}
+
+/// Accepted indent columns for `line`, as the indentation lint would compute
+/// them, minus suppression/blank/string-interior/tab skips and comment
+/// exemptions. The on-type indentation producer probes with a plain
+/// identifier line, so none of those exemptions apply. Test-only convenience
+/// over [`accepted_indents_for_lines`], which production callers use to fold
+/// several lines from one change collection.
+#[cfg(test)]
+pub(crate) fn accepted_indents_for_line(
+    text: &str,
+    root: Node<'_>,
+    indent_unit: u32,
+    infix_style: InfixContinuationStyle,
+    line: u32,
+) -> LineIndentExpectation {
+    accepted_indents_for_lines(text, root, indent_unit, infix_style, &[line])
+        .pop()
+        .expect("one target line yields one expectation")
+}
+
+/// Batched form of the test-only `accepted_indents_for_line`: one expectation
+/// per entry of `targets`, in order. The change list is collected and sorted once per
+/// style pass and then folded per target line, so this never materializes the
+/// whole-document expectation maps the diagnostic pass builds — the on-type
+/// judge calls it on every Enter press (#611).
+pub(crate) fn accepted_indents_for_lines(
+    text: &str,
+    root: Node<'_>,
+    indent_unit: u32,
+    infix_style: InfixContinuationStyle,
+    targets: &[u32],
+) -> Vec<LineIndentExpectation> {
+    let lines: Vec<&str> = text.lines().collect();
+    let pass_styles: &[InfixContinuationStyle] = match infix_style {
+        InfixContinuationStyle::Either => &[
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Aligned,
+        ],
+        InfixContinuationStyle::Indented => &[InfixContinuationStyle::Indented],
+        InfixContinuationStyle::Aligned => &[InfixContinuationStyle::Aligned],
+    };
+    let bounds = targets
+        .iter()
+        .copied()
+        .min()
+        .zip(targets.iter().copied().max())
+        .map(|(min, max)| (min as usize, max as usize));
+    let mut merged: Vec<Option<Expected>> = vec![None; targets.len()];
+    for &style in pass_styles {
+        let mut changes = Vec::new();
+        collect_changes_bounded(root, &lines, style, bounds, &mut changes);
+        changes.sort_by_key(|c| c.token_byte);
+        let pass = expectations_for_targets(&changes, lines.len(), indent_unit, targets);
+        for (slot, expected) in pass.into_iter().enumerate() {
+            match &mut merged[slot] {
+                None => merged[slot] = Some(expected),
+                Some(existing) => {
+                    existing.add_alternative(expected.primary, expected.primary_kinds);
+                    for (column, kinds) in expected.alternatives {
+                        existing.add_alternative(column, kinds);
+                    }
+                }
+            }
+        }
+    }
+
+    merged
+        .into_iter()
+        .map(|expected| {
+            let expected = expected.expect("every style pass fills every target slot");
+            LineIndentExpectation {
+                primary: expected.primary,
+                alternatives: expected.alternatives,
+            }
+        })
+        .collect()
+}
+
+/// Fold the sorted change list ONCE, applying each change to every covered
+/// target's accumulator — the exact per-line body of [`set_expectations`],
+/// restricted to the requested lines (the judge asks for two per Enter).
+fn expectations_for_targets(
+    changes: &[Change],
+    line_count: usize,
+    indent_unit: u32,
+    targets: &[u32],
+) -> Vec<Expected> {
+    /// One target line's in-progress fold: the same (primary, kinds,
+    /// alternatives) triple `set_expectations` keeps per document line.
+    type Accum = (u32, IndentKindSet, Vec<(u32, IndentKindSet)>);
+    let mut accums: Vec<Accum> = targets
+        .iter()
+        .map(|_| {
+            (
+                0u32,
+                IndentKindSet::single(IndentKind::TopLevel),
+                Vec::new(),
+            )
+        })
+        .collect();
+    for change in changes {
+        let begin = change.begin as usize;
+        let end = (change.end as usize).min(line_count.saturating_sub(1));
+        if begin > end {
+            continue;
+        }
+        for (slot, &line) in targets.iter().enumerate() {
+            let line = line as usize;
+            if line < begin || line > end {
+                continue;
+            }
+            let (primary, kinds, alternatives) = &mut accums[slot];
+            apply_change_to_line(change, indent_unit, primary, kinds, alternatives);
+        }
+    }
+    accums
+        .into_iter()
+        .map(|(primary, kinds, alternatives)| {
+            // Mirror the whole-document fold exactly: it only records lines
+            // whose primary or alternatives are non-trivial, and an absent
+            // line reads back as `top_level()` — so a fold landing on a bare
+            // column 0 (e.g. an `Aligned` pin at the line start)
+            // canonicalizes its kind to `TopLevel`.
+            if primary == 0 && alternatives.is_empty() {
+                return Expected::top_level();
+            }
+            let mut expected = Expected::single(primary, kinds);
+            for (column, kinds) in alternatives {
+                expected.add_alternative(column, kinds);
+            }
+            expected
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn lint_for_judge_test(
+    text: &str,
+    indent_unit: u32,
+    infix_style: InfixContinuationStyle,
+) -> Vec<Diagnostic> {
+    let tree = crate::parser_pool::with_parser(|parser| parser.parse(text, None))
+        .expect("test input must parse");
+    let suppressions = crate::linting::nolint::Suppressions::from_text(text);
+    let mut out = Vec::new();
+    collect(
+        text,
+        tree.root_node(),
+        indent_unit,
+        infix_style,
+        DiagnosticSeverity::HINT,
+        &suppressions,
+        &mut out,
+    );
+    out
+}
 #[derive(Clone, Copy)]
 struct LineState {
     is_suppressed: bool,
@@ -221,23 +465,45 @@ impl LineState {
 #[derive(Clone)]
 struct Expected {
     primary: u32,
-    alternatives: Vec<u32>,
+    primary_kinds: IndentKindSet,
+    alternatives: Vec<(u32, IndentKindSet)>,
 }
 
 impl Expected {
-    fn single(value: u32) -> Self {
+    fn single(value: u32, kinds: IndentKindSet) -> Self {
         Self {
             primary: value,
+            primary_kinds: kinds,
             alternatives: Vec::new(),
         }
     }
 
     fn top_level() -> Self {
-        Self::single(0)
+        Self::single(0, IndentKindSet::single(IndentKind::TopLevel))
     }
 
     fn is_acceptable(&self, actual: u32) -> bool {
-        actual == self.primary || self.alternatives.contains(&actual)
+        actual == self.primary
+            || self
+                .alternatives
+                .iter()
+                .any(|(column, _)| *column == actual)
+    }
+
+    fn add_alternative(&mut self, column: u32, kinds: IndentKindSet) {
+        if column == self.primary {
+            self.primary_kinds.merge(kinds);
+            return;
+        }
+        if let Some((_, existing_kinds)) = self
+            .alternatives
+            .iter_mut()
+            .find(|(existing, _)| *existing == column)
+        {
+            existing_kinds.merge(kinds);
+        } else {
+            self.alternatives.push((column, kinds));
+        }
     }
 
     /// Value-equality on the acceptable indents, independent of alternative
@@ -251,10 +517,18 @@ impl Expected {
             return false;
         }
 
-        let mut left = self.alternatives.clone();
+        let mut left: Vec<u32> = self
+            .alternatives
+            .iter()
+            .map(|(column, _)| *column)
+            .collect();
         left.sort_unstable();
         left.dedup();
-        let mut right = other.alternatives.clone();
+        let mut right: Vec<u32> = other
+            .alternatives
+            .iter()
+            .map(|(column, _)| *column)
+            .collect();
         right.sort_unstable();
         right.dedup();
         left == right
@@ -268,7 +542,7 @@ impl Expected {
             )
         } else {
             let mut options: Vec<u32> = std::iter::once(self.primary)
-                .chain(self.alternatives.iter().copied())
+                .chain(self.alternatives.iter().map(|(column, _)| *column))
                 .collect();
             options.sort_unstable();
             options.dedup();
@@ -523,9 +797,14 @@ fn comment_run_member(
 fn merge_pass_expectations(
     passes: &[(HashMap<u32, Expected>, HashSet<u32>)],
 ) -> HashMap<u32, Expected> {
-    let (first, rest) = passes.split_first().expect("at least one style pass");
-    let mut merged = first.0.clone();
-    for (expectations, _) in rest {
+    let maps: Vec<&HashMap<u32, Expected>> = passes.iter().map(|(map, _)| map).collect();
+    merge_expectation_maps(&maps)
+}
+
+fn merge_expectation_maps(maps: &[&HashMap<u32, Expected>]) -> HashMap<u32, Expected> {
+    let (first, rest) = maps.split_first().expect("at least one style pass");
+    let mut merged = (*first).clone();
+    for expectations in rest {
         let mut merge_lines: Vec<u32> = merged
             .keys()
             .copied()
@@ -534,21 +813,30 @@ fn merge_pass_expectations(
         merge_lines.sort_unstable();
         merge_lines.dedup();
         for line in merge_lines {
-            let accepts: Vec<u32> = match expectations.get(&line) {
-                Some(e) => std::iter::once(e.primary)
-                    .chain(e.alternatives.iter().copied())
-                    .collect(),
-                None => vec![0],
+            let accepts = match expectations.get(&line) {
+                Some(expected) => std::iter::once((expected.primary, expected.primary_kinds))
+                    .chain(expected.alternatives.iter().copied())
+                    .collect::<Vec<_>>(),
+                None => vec![(0, IndentKindSet::single(IndentKind::TopLevel))],
             };
             let entry = merged.entry(line).or_insert_with(Expected::top_level);
-            for col in accepts {
-                if col != entry.primary && !entry.alternatives.contains(&col) {
-                    entry.alternatives.push(col);
-                }
+            for (column, kinds) in accepts {
+                entry.add_alternative(column, kinds);
             }
         }
     }
     merged
+}
+
+fn expectations_for_style(
+    root: Node<'_>,
+    lines: &[&str],
+    indent_unit: u32,
+    infix_style: InfixContinuationStyle,
+) -> HashMap<u32, Expected> {
+    let mut expectations = HashMap::new();
+    set_expectations(root, lines, indent_unit, infix_style, &mut expectations);
+    expectations
 }
 
 fn set_expectations(
@@ -564,7 +852,8 @@ fn set_expectations(
 
     let line_count = lines.len();
     let mut primary = vec![0u32; line_count];
-    let mut alternatives: Vec<Vec<u32>> = vec![Vec::new(); line_count];
+    let mut primary_kinds = vec![IndentKindSet::single(IndentKind::TopLevel); line_count];
+    let mut alternatives: Vec<Vec<(u32, IndentKindSet)>> = vec![Vec::new(); line_count];
 
     for change in &changes {
         let begin = change.begin as usize;
@@ -573,50 +862,77 @@ fn set_expectations(
             continue;
         }
         for line in begin..=end {
-            let current = primary[line];
-            match change.ty {
-                ChangeType::Block => {
-                    primary[line] = current + indent_unit;
-                    for alt in &mut alternatives[line] {
-                        *alt += indent_unit;
-                    }
-                }
-                ChangeType::Double => {
-                    primary[line] = current + 2 * indent_unit;
-                    for alt in &mut alternatives[line] {
-                        *alt += 2 * indent_unit;
-                    }
-                }
-                ChangeType::Hanging(col) => {
-                    primary[line] = col;
-                    alternatives[line].clear();
-                }
-            }
-            match change.alt {
-                AltRule::None => {}
-                // Only accept an absolute-column tolerance that sits to the
-                // *right* of the primary — the aligned/chain-start styles are
-                // deeper than the block/hanging primary. A column at or left
-                // of the primary would legalize under-indented continuations
-                // (`x <- (\n  a +\n  b\n)` must still flag `b` under the
-                // default `Indented` style; `Either` accepts it via the
-                // union of the two folds, not via this guard).
-                AltRule::AlsoCol(col) if col > primary[line] => alternatives[line].push(col),
-                AltRule::AlsoCol(_) => {}
-                AltRule::AlsoBlock => alternatives[line].push(current + indent_unit),
-            }
+            apply_change_to_line(
+                change,
+                indent_unit,
+                &mut primary[line],
+                &mut primary_kinds[line],
+                &mut alternatives[line],
+            );
         }
     }
 
     for line in 0..line_count {
         if primary[line] != 0 || !alternatives[line].is_empty() {
-            let mut expected = Expected::single(primary[line]);
-            for &alt in &alternatives[line] {
-                if alt != expected.primary && !expected.alternatives.contains(&alt) {
-                    expected.alternatives.push(alt);
-                }
+            let mut expected = Expected::single(primary[line], primary_kinds[line]);
+            for (column, kinds) in &alternatives[line] {
+                expected.add_alternative(*column, *kinds);
             }
             out.insert(line as u32, expected);
+        }
+    }
+}
+
+/// Apply one indent change to one covered line's accumulated expectation —
+/// the shared body of the whole-document fold ([`set_expectations`]) and the
+/// per-target fold ([`expectations_for_targets`]), so the two cannot drift.
+fn apply_change_to_line(
+    change: &Change,
+    indent_unit: u32,
+    primary: &mut u32,
+    primary_kinds: &mut IndentKindSet,
+    alternatives: &mut Vec<(u32, IndentKindSet)>,
+) {
+    let current = *primary;
+    match change.ty {
+        ChangeType::Block => {
+            *primary = current + indent_unit;
+            *primary_kinds = IndentKindSet::single(IndentKind::Block);
+            for (column, _) in alternatives.iter_mut() {
+                *column += indent_unit;
+            }
+        }
+        ChangeType::Double => {
+            *primary = current + 2 * indent_unit;
+            *primary_kinds = IndentKindSet::single(IndentKind::Block);
+            for (column, _) in alternatives.iter_mut() {
+                *column += 2 * indent_unit;
+            }
+        }
+        ChangeType::Hanging(col, kind) => {
+            *primary = col;
+            *primary_kinds = IndentKindSet::single(kind);
+            alternatives.clear();
+        }
+    }
+    match change.alt {
+        AltRule::None => {}
+        // Only accept an absolute-column tolerance that sits to the
+        // *right* of the primary — the aligned/chain-start styles are
+        // deeper than the block/hanging primary. A column at or left
+        // of the primary would legalize under-indented continuations
+        // (`x <- (\n  a +\n  b\n)` must still flag `b` under the
+        // default `Indented` style; `Either` accepts it via the
+        // union of the two folds, not via this guard).
+        AltRule::AlsoCol(col, kind) if col > *primary => {
+            alternatives.push((col, IndentKindSet::single(kind)));
+        }
+        AltRule::AlsoCol(_, _) => {}
+        AltRule::AlsoBlock => {
+            alternatives.push((
+                current + indent_unit,
+                IndentKindSet::single(IndentKind::Block),
+            ));
         }
     }
 }
@@ -632,7 +948,7 @@ enum ChangeType {
     /// content, or an infix continuation pinned to its chain-start column
     /// under `InfixContinuationStyle::Aligned`). Clears any previously
     /// accumulated alternatives on the covered lines.
-    Hanging(u32),
+    Hanging(u32, IndentKind),
 }
 
 /// Raven's extra accepted values, layered over the lintr primary.
@@ -642,7 +958,7 @@ enum AltRule {
     /// Accept this absolute column too (aligned-argument style, operator
     /// chain-start alignment), but only when it sits strictly deeper than
     /// the post-change primary.
-    AlsoCol(u32),
+    AlsoCol(u32, IndentKind),
     /// Accept one `indent_unit` over the pre-change expectation too (the
     /// block form where lintr demands hanging/double).
     AlsoBlock,
@@ -666,6 +982,31 @@ fn collect_changes(
     infix_style: InfixContinuationStyle,
     out: &mut Vec<Change>,
 ) {
+    collect_changes_bounded(node, lines, infix_style, None, out);
+}
+
+/// [`collect_changes`] with optional row bounds: `Some((min_row, max_row))`
+/// prunes the traversal to subtrees that can still emit a change covering one
+/// of those rows, so the per-line query (`accepted_indents_for_lines`) does
+/// not walk the whole document AST on every Enter press. A subtree starting
+/// below `max_row` never can — every change begins at its inducing token's
+/// row plus one at the earliest. One ending above `min_row` can only reach
+/// down via `operator_change`'s call-function extension (the change runs to
+/// the *parent call's* end), so a child ending above `min_row` is skipped
+/// unless it is that call's `function` field; everything deeper extends at
+/// most to an ancestor within the skipped subtree.
+fn collect_changes_bounded(
+    node: Node<'_>,
+    lines: &[&str],
+    infix_style: InfixContinuationStyle,
+    bounds: Option<(usize, usize)>,
+    out: &mut Vec<Change>,
+) {
+    if let Some((_, max_row)) = bounds
+        && node.start_position().row > max_row
+    {
+        return;
+    }
     match node.kind() {
         "braced_expression" => bracket_change(node, node, lines, false, out),
         "call" | "subset" | "subset2" => {
@@ -713,7 +1054,16 @@ fn collect_changes(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_changes(child, lines, infix_style, out);
+        if let Some((min_row, _)) = bounds
+            && child.end_position().row < min_row
+            && !(node.kind() == "call"
+                && node
+                    .child_by_field_name("function")
+                    .is_some_and(|function| function.id() == child.id()))
+        {
+            continue;
+        }
+        collect_changes_bounded(child, lines, infix_style, bounds, out);
     }
 }
 
@@ -802,13 +1152,16 @@ fn bracket_change(
         (ChangeType::Double, AltRule::AlsoBlock)
     } else if closer_on_own_line {
         let alt = if has_content_after_opener {
-            AltRule::AlsoCol(opener_end_col)
+            AltRule::AlsoCol(opener_end_col, IndentKind::OpenerAligned)
         } else {
             AltRule::None
         };
         (ChangeType::Block, alt)
     } else {
-        (ChangeType::Hanging(opener_end_col), AltRule::AlsoBlock)
+        (
+            ChangeType::Hanging(opener_end_col, IndentKind::OpenerAligned),
+            AltRule::AlsoBlock,
+        )
     };
 
     out.push(Change {
@@ -908,8 +1261,14 @@ fn operator_change(
         infix_style
     };
     let (ty, alt) = match effective_style {
-        InfixContinuationStyle::Indented => (ChangeType::Block, AltRule::AlsoCol(chain_col)),
-        InfixContinuationStyle::Aligned => (ChangeType::Hanging(chain_col), AltRule::None),
+        InfixContinuationStyle::Indented => (
+            ChangeType::Block,
+            AltRule::AlsoCol(chain_col, IndentKind::ChainStart),
+        ),
+        InfixContinuationStyle::Aligned => (
+            ChangeType::Hanging(chain_col, IndentKind::ChainStart),
+            AltRule::None,
+        ),
         InfixContinuationStyle::Either => {
             unreachable!("set_expectations folds Either as the union of Indented and Aligned")
         }
@@ -1055,11 +1414,13 @@ fn else_change(node: Node<'_>, out: &mut Vec<Change>) {
     });
 }
 
-/// Collect line numbers that start strictly inside a multi-line string. For a
-/// string spanning rows `[r1, r2]` with `r2 > r1`, lines `r1 + 1 ..= r2` start
-/// inside the string and are skipped by the linter.
+/// Collect line numbers that start strictly inside a multi-line string or
+/// backtick-quoted identifier. For a node spanning rows `[r1, r2]` with
+/// `r2 > r1`, lines `r1 + 1 ..= r2` start inside literal content and are
+/// skipped by the linter. Plain identifiers cannot span rows, so every
+/// multiline `identifier` node is backtick-quoted.
 fn collect_string_interior_lines(node: Node<'_>, set: &mut HashSet<u32>) {
-    if node.kind() == "string" {
+    if matches!(node.kind(), "string" | "identifier") {
         let start = node.start_position().row as u32;
         let end = node.end_position().row as u32;
         if end > start {
@@ -1092,7 +1453,7 @@ fn line_text<'a>(lines: &'a [&'a str], line: u32) -> &'a str {
     lines.get(line as usize).copied().unwrap_or("")
 }
 
-fn leading_space_count(line: &str) -> u32 {
+pub(crate) fn leading_space_count(line: &str) -> u32 {
     line.chars().take_while(|c| *c == ' ').count() as u32
 }
 
@@ -1155,6 +1516,610 @@ mod tests {
 
     fn diagnostic_on_line(diags: &[Diagnostic], line: u32) -> Option<&Diagnostic> {
         diags.iter().find(|diag| diag.range.start.line == line)
+    }
+
+    #[test]
+    fn multiline_backtick_identifier_interior_is_not_indentation() {
+        let diagnostics = lint("x <- `a\n  b`\n", 2);
+        assert!(
+            diagnostic_on_line(&diagnostics, 1).is_none(),
+            "backtick identifier content must not be linted as indentation: {diagnostics:?}"
+        );
+    }
+
+    fn line_expectation(
+        text: &str,
+        indent_unit: u32,
+        style: InfixContinuationStyle,
+        line: u32,
+    ) -> LineIndentExpectation {
+        let tree = with_parser(|p| p.parse(text, None)).expect("parse must succeed");
+        accepted_indents_for_line(text, tree.root_node(), indent_unit, style, line)
+    }
+
+    fn alternative_has_kind(
+        expected: &LineIndentExpectation,
+        column: u32,
+        kind: IndentKind,
+    ) -> bool {
+        expected
+            .alternatives
+            .iter()
+            .any(|(candidate, kinds)| *candidate == column && kinds.contains(kind))
+    }
+
+    /// The old unpruned per-line semantics, reconstructed from the
+    /// whole-document diagnostic fold: what `accepted_indents_for_lines`
+    /// must keep matching after traversal pruning.
+    fn whole_document_expectation(
+        root: Node<'_>,
+        lines: &[&str],
+        indent_unit: u32,
+        infix_style: InfixContinuationStyle,
+        line: u32,
+    ) -> LineIndentExpectation {
+        let styles: &[InfixContinuationStyle] = match infix_style {
+            InfixContinuationStyle::Either => &[
+                InfixContinuationStyle::Indented,
+                InfixContinuationStyle::Aligned,
+            ],
+            InfixContinuationStyle::Indented => &[InfixContinuationStyle::Indented],
+            InfixContinuationStyle::Aligned => &[InfixContinuationStyle::Aligned],
+        };
+        let mut merged: Option<Expected> = None;
+        for &style in styles {
+            let mut map = expectations_for_style(root, lines, indent_unit, style);
+            let expected = map.remove(&line).unwrap_or_else(Expected::top_level);
+            match &mut merged {
+                None => merged = Some(expected),
+                Some(existing) => {
+                    existing.add_alternative(expected.primary, expected.primary_kinds);
+                    for (column, kinds) in expected.alternatives {
+                        existing.add_alternative(column, kinds);
+                    }
+                }
+            }
+        }
+        let merged = merged.expect("at least one style pass");
+        LineIndentExpectation {
+            primary: merged.primary,
+            alternatives: merged.alternatives,
+        }
+    }
+
+    #[test]
+    fn per_line_query_matches_whole_document_fold_on_every_line() {
+        // Structurally rich shapes: nested calls, double-indent definitions,
+        // operator chains (including the call-function extension that lets a
+        // change reach its parent call's end), unbraced bodies, `else`,
+        // `repeat`, walrus subsets, and named arguments.
+        let sources = [
+            "f <- function(\n    x,\n    y) {\n  a <- x %>%\n    g() %>%\n    h(1,\n      2)\n  \
+             if (a)\n    b <- 2\n  else\n    c(3,\n      4)\n}\n",
+            "res <- http_head(url)$\n  then(function(x) {\n    x + 1\n  })\n",
+            "dt[, y :=\n     z]\nrepeat\n  f(\n    1)\nresult <- a +\n  b\n",
+        ];
+        for source in sources {
+            let tree = with_parser(|p| p.parse(source, None)).expect("test source must parse");
+            let lines: Vec<&str> = source.lines().collect();
+            for style in [
+                InfixContinuationStyle::Indented,
+                InfixContinuationStyle::Aligned,
+                InfixContinuationStyle::Either,
+            ] {
+                for line in 0..lines.len() as u32 {
+                    let queried =
+                        accepted_indents_for_line(source, tree.root_node(), 2, style, line);
+                    let reference =
+                        whole_document_expectation(tree.root_node(), &lines, 2, style, line);
+                    assert_eq!(
+                        queried, reference,
+                        "pruned per-line query diverged on line {line} ({style:?}) of \
+                         {source:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn line_expectation_tags_block_and_opener_aligned_columns() {
+        let text = "foo(a,\n  b\n)\n";
+        let expected = line_expectation(text, 2, InfixContinuationStyle::Indented, 1);
+        assert_eq!(expected.primary, 2);
+        assert_eq!(
+            expected.alternatives,
+            vec![(4, IndentKindSet::single(IndentKind::OpenerAligned))]
+        );
+
+        let tree = with_parser(|p| p.parse(text, None)).expect("parse must succeed");
+        let lines: Vec<&str> = text.lines().collect();
+        let folded = expectations_for_style(
+            tree.root_node(),
+            &lines,
+            2,
+            InfixContinuationStyle::Indented,
+        );
+        assert_eq!(
+            folded[&1].primary_kinds,
+            IndentKindSet::single(IndentKind::Block)
+        );
+    }
+
+    #[test]
+    fn line_expectation_tags_hanging_primary_block_alternative() {
+        let expected = line_expectation("foo(a,\n  b)\n", 2, InfixContinuationStyle::Indented, 1);
+        assert_eq!(expected.primary, 4);
+        assert_eq!(
+            expected.alternatives,
+            vec![(2, IndentKindSet::single(IndentKind::Block))]
+        );
+    }
+
+    #[test]
+    fn line_expectation_chain_start_keeps_strictly_deeper_guard() {
+        let deeper = line_expectation(
+            "result <- foo() +\n  bar()\n",
+            2,
+            InfixContinuationStyle::Indented,
+            1,
+        );
+        assert!(alternative_has_kind(&deeper, 10, IndentKind::ChainStart));
+
+        let not_deeper =
+            line_expectation("data +\n  value\n", 2, InfixContinuationStyle::Indented, 1);
+        assert!(
+            !not_deeper
+                .alternatives
+                .iter()
+                .any(|(_, kinds)| kinds.contains(IndentKind::ChainStart))
+        );
+    }
+
+    #[test]
+    fn line_expectation_assignment_continuation_has_no_alternatives() {
+        let expected = line_expectation(
+            "result <-\n  f(x)\n",
+            2,
+            InfixContinuationStyle::Indented,
+            1,
+        );
+        assert_eq!(expected.primary, 2);
+        assert!(expected.alternatives.is_empty());
+    }
+
+    #[test]
+    fn line_expectation_double_indent_has_block_alternative() {
+        let expected = line_expectation(
+            "f <- function(\n    x) x\n",
+            2,
+            InfixContinuationStyle::Indented,
+            1,
+        );
+        assert_eq!(expected.primary, 4);
+        assert_eq!(
+            expected.alternatives,
+            vec![(2, IndentKindSet::single(IndentKind::Block))]
+        );
+    }
+
+    #[test]
+    fn line_expectation_uncovered_line_is_top_level_without_alternatives() {
+        let expected = line_expectation("x <- 1\n", 2, InfixContinuationStyle::Indented, 0);
+        assert_eq!(
+            expected,
+            LineIndentExpectation {
+                primary: 0,
+                alternatives: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn line_expectation_either_unions_values_and_preserves_demoted_primary_kind() {
+        let text = "result <- foo() +\n  bar()\n";
+        let indented = line_expectation(text, 2, InfixContinuationStyle::Indented, 1);
+        let aligned = line_expectation(text, 2, InfixContinuationStyle::Aligned, 1);
+        let either = line_expectation(text, 2, InfixContinuationStyle::Either, 1);
+
+        let mut singles = vec![indented.primary, aligned.primary];
+        singles.extend(indented.alternatives.iter().map(|(column, _)| *column));
+        singles.extend(aligned.alternatives.iter().map(|(column, _)| *column));
+        singles.sort_unstable();
+        singles.dedup();
+
+        let mut union = vec![either.primary];
+        union.extend(either.alternatives.iter().map(|(column, _)| *column));
+        union.sort_unstable();
+        union.dedup();
+
+        assert_eq!(union, singles);
+        assert_eq!(either.primary, indented.primary);
+        assert!(alternative_has_kind(&either, 10, IndentKind::ChainStart));
+    }
+
+    #[test]
+    fn line_expectation_either_tags_absent_pass_as_top_level() {
+        let expected = line_expectation("data +\n  value\n", 2, InfixContinuationStyle::Either, 1);
+        assert_eq!(expected.primary, 2);
+        assert!(alternative_has_kind(&expected, 0, IndentKind::TopLevel));
+    }
+
+    #[test]
+    fn expectation_tags_do_not_change_messages_or_structure() {
+        let mut expected = Expected::single(2, IndentKindSet::single(IndentKind::Block));
+        expected.add_alternative(4, IndentKindSet::single(IndentKind::OpenerAligned));
+        assert_eq!(
+            expected.message(1),
+            "Indentation should be 2 or 4 spaces, not 1."
+        );
+
+        let mut differently_tagged =
+            Expected::single(2, IndentKindSet::single(IndentKind::ChainStart));
+        differently_tagged.add_alternative(4, IndentKindSet::single(IndentKind::Block));
+        assert!(expected.has_same_structure_as(&differently_tagged));
+    }
+
+    /// Builds a snippet the way the on-type indenter would: starting from
+    /// the first line, each subsequent content line is placed at the column
+    /// the real judge-backed on-type pipeline computes for an Enter press at
+    /// that point. Used to pin the producer→judge invariant for #611: the
+    /// linter never flags what auto-indent produced.
+    fn build_with_auto_indent(first: &str, rest: &[&str]) -> String {
+        build_with_auto_indent_for_style(first, rest, InfixContinuationStyle::Indented)
+    }
+
+    fn build_with_auto_indent_for_style(
+        first: &str,
+        rest: &[&str],
+        infix_style: InfixContinuationStyle,
+    ) -> String {
+        use crate::indentation::{IndentationConfig, IndentationStyle, on_type_indentation};
+        use tower_lsp::lsp_types::Position;
+
+        let config = IndentationConfig {
+            tab_size: 2,
+            insert_spaces: true,
+            style: IndentationStyle::RStudio,
+        };
+        let mut text = format!("{first}\n");
+        for content in rest {
+            let line = text.lines().count() as u32;
+            let tree = with_parser(|p| p.parse(&text, None)).expect("parse must succeed");
+            let col = on_type_indentation(
+                &tree,
+                &text,
+                Position { line, character: 0 },
+                &config,
+                infix_style,
+            )
+            .expect("the producer/judge invariant fixtures must be answerable");
+            text.push_str(&" ".repeat(col as usize));
+            text.push_str(content);
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn pass9_earlier_openers_use_judge_column_and_round_trip_clean() {
+        for style in ALL_STYLES {
+            for (first, assignment) in [
+                ("f(", "b <-"),
+                ("(", "x <-"),
+                ("x[", "a <-"),
+                ("f(a,", "b <-"),
+            ] {
+                let text = build_with_auto_indent_for_style(first, &[assignment, "value"], style);
+                let value_line = text.lines().nth(2).expect("value line must exist");
+                assert_eq!(
+                    value_line, "    value",
+                    "earlier opener shape {first:?} must indent the assignment RHS to column 4 under {style:?}"
+                );
+                assert!(
+                    lint_with_style(&text, 2, style).is_empty(),
+                    "facade output for earlier opener shape {first:?} must round-trip clean under {style:?}; got {:?}",
+                    lint_with_style(&text, 2, style)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue611_assignment_rhs_one_level_in_every_mode() {
+        // The issue's motivating table, rows 1–2: one level after a broken
+        // assignment is clean everywhere; column 0 (the pre-fix auto-indent
+        // output) is flagged everywhere.
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("result <-\n  f(x)\n", 2, style).is_empty(),
+                "one-level assignment RHS must be clean under {style:?}"
+            );
+            assert_eq!(
+                lint_with_style("result <-\nf(x)\n", 2, style).len(),
+                1,
+                "column-0 assignment RHS must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_broken_assignment_chain_is_flattened_in_every_mode() {
+        // Rows 3–4: a chain under a broken assignment gets no second level.
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("result <-\n  data %>%\n  filter(x)\n", 2, style).is_empty(),
+                "flattened chain must be clean under {style:?}"
+            );
+            assert!(
+                !lint_with_style("result <-\n  data %>%\n    filter(x)\n", 2, style).is_empty(),
+                "double-indented chain must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_chained_assignments_flatten_in_every_mode() {
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("a <-\n  b <-\n  c\n", 2, style).is_empty(),
+                "chained broken assignments must be clean at one level under {style:?}"
+            );
+            assert!(
+                !lint_with_style("a <-\n  b <-\n    c\n", 2, style).is_empty(),
+                "chained broken assignments must not stack levels under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_walrus_rhs_one_level_in_every_mode() {
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("{\n  x :=\n    v\n}\n", 2, style).is_empty(),
+                "`:=` RHS at one level must be clean under {style:?}"
+            );
+            assert!(
+                !lint_with_style("{\n  x :=\n  v\n}\n", 2, style).is_empty(),
+                "un-indented `:=` RHS must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_paren_wrapped_rhs_chain_stays_flattened() {
+        // Parens don't restore the assignment context: a chain inside `(`
+        // on a broken assignment's RHS still gets no second level. This is
+        // the completed form of the indenter's paren-skipping fallback walk
+        // (`text_flattened_under_assignment`), whose output columns (4 for
+        // the `(`, 6 for the chain) must be judge-approved.
+        let text = "f <- function() {\n  a <-\n    (\n      data %>%\n      g()\n    )\n}\n";
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style(text, 2, style).is_empty(),
+                "paren-wrapped flattened chain must be clean under {style:?}; got {:?}",
+                lint_with_style(text, 2, style)
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_same_line_condition_chain_keeps_hanging_level() {
+        // A chain inside `if (`/`while (` condition parens under a broken
+        // assignment: the condition's bracket level survives the
+        // assignment suppression — the indenter's formula output (6 for
+        // `if`, 9 for `while`) is accepted; the bare line indent (2) is
+        // flagged in every mode.
+        for style in ALL_STYLES {
+            for clean in [
+                "a <-\n  if (data %>%\n      g()) 1\n",
+                "a <-\n  while (data %>%\n         g()) 1\n",
+            ] {
+                assert!(
+                    lint_with_style(clean, 2, style).is_empty(),
+                    "{clean:?} must be clean under {style:?}"
+                );
+            }
+            for flagged in [
+                "a <-\n  if (data %>%\n  g()) 1\n",
+                "a <-\n  while (data %>%\n  g()) 1\n",
+            ] {
+                assert!(
+                    !lint_with_style(flagged, 2, style).is_empty(),
+                    "bare line indent {flagged:?} must be flagged under {style:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue611_same_line_statement_body_chain_is_flattened() {
+        // A chain in a same-row `if` BODY has no bracket level: the
+        // flattened column (2) is the only accepted shape.
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style("a <-\n  if (x) data %>%\n  g()\n", 2, style).is_empty(),
+                "flattened if-body chain must be clean under {style:?}"
+            );
+            assert!(
+                !lint_with_style("a <-\n  if (x) data %>%\n    g()\n", 2, style).is_empty(),
+                "indented if-body chain must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_same_line_paren_chain_keeps_hanging_level() {
+        // `a <-` ⏎ `  (data %>%` ⏎: the paren opened on the chain's own
+        // line contributes a hanging level the assignment suppression does
+        // not remove — the indenter's formula output (4) and the hanging
+        // column (3) are accepted; the bare line indent (2, what naive
+        // flattening would produce) is flagged in every mode.
+        for style in ALL_STYLES {
+            for clean in [
+                "a <-\n  (data %>%\n    g())\n",
+                "a <-\n  (data %>%\n   g())\n",
+                "a <-\n  (!data %>%\n    g())\n",
+            ] {
+                assert!(
+                    lint_with_style(clean, 2, style).is_empty(),
+                    "{clean:?} must be clean under {style:?}"
+                );
+            }
+            for flagged in [
+                "a <-\n  (data %>%\n  g())\n",
+                "a <-\n  (!data %>%\n  g())\n",
+            ] {
+                assert!(
+                    !lint_with_style(flagged, 2, style).is_empty(),
+                    "bare line indent {flagged:?} must be flagged under {style:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue611_comment_interrupted_chain_target_at_statement_level() {
+        // A comment-only line inside the chain does not move the statement
+        // start: the `->` target belongs at the chain's block level (4),
+        // matching the judge's comment-transparent chain handling.
+        // Under `Aligned` the chain lines themselves are flagged (aligned
+        // chains sit at the chain-start column — #610 semantics, unrelated
+        // to the target), so assert on the target line only there.
+        let text = "f <- function() {\n  data %>%\n    # explanation\n    g() ->\n    target\n}\n";
+        for style in [
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Either,
+        ] {
+            assert!(
+                lint_with_style(text, 2, style).is_empty(),
+                "comment-interrupted chain target must be clean under {style:?}; got {:?}",
+                lint_with_style(text, 2, style)
+            );
+        }
+        let aligned = lint_with_style(text, 2, InfixContinuationStyle::Aligned);
+        assert!(
+            diagnostic_on_line(&aligned, 4).is_none(),
+            "target line must not be flagged under Aligned; got {aligned:?}"
+        );
+    }
+
+    #[test]
+    fn issue611_right_assignment_target_at_statement_level() {
+        // `data %>%` ⏎ `  f() ->` ⏎: the target belongs one level from the
+        // statement start (column 2), not two. Under `Aligned` the chain
+        // line itself is flagged (aligned-mode chain semantics, #610 —
+        // unrelated to the assignment target), so assert on the target line
+        // only there.
+        let text = "data %>%\n  f() ->\n  target\n";
+        for style in [
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Either,
+        ] {
+            assert!(
+                lint_with_style(text, 2, style).is_empty(),
+                "right-assignment target at statement level must be clean under {style:?}"
+            );
+        }
+        let aligned = lint_with_style(text, 2, InfixContinuationStyle::Aligned);
+        assert!(
+            diagnostic_on_line(&aligned, 2).is_none(),
+            "target line must not be flagged under Aligned; got {aligned:?}"
+        );
+        // Two levels on the target line is flagged where the chain shape
+        // itself is accepted (under Aligned the diagnostic lands on the
+        // chain line instead, so the target line carries no separate flag).
+        for style in [
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Either,
+        ] {
+            let deep = lint_with_style("data %>%\n  f() ->\n    target\n", 2, style);
+            assert!(
+                diagnostic_on_line(&deep, 2).is_some(),
+                "double-indented target must be flagged under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_assignment_in_call_args_paren_alignment_accepted() {
+        // Inside call arguments the indenter defers to paren alignment
+        // (issue #611's `=` decision, applied to every assignment operator);
+        // the judge accepts the operator-hanging and block shapes here.
+        // Pins why the deferral is safe: this shape has lint-accepted forms
+        // that are NOT one-level-from-the-assignment-line.
+        for style in ALL_STYLES {
+            assert!(
+                lint_with_style(
+                    "long_function_name(x <-\n                     c)\n",
+                    2,
+                    style
+                )
+                .is_empty(),
+                "operator-hanging RHS inside call args must be clean under {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue611_auto_indent_output_is_never_flagged() {
+        // Producer→judge round trip: build each snippet through the real
+        // indentation pipeline, then assert the linter accepts the result.
+        for style in ALL_STYLES {
+            let built_cases: [(String, &str); 3] = [
+                (
+                    build_with_auto_indent_for_style("result <-", &["f(x)"], style),
+                    "plain assignment",
+                ),
+                (
+                    build_with_auto_indent_for_style(
+                        "result <-",
+                        &["data %>%", "filter(x)"],
+                        style,
+                    ),
+                    "broken-assignment pipe chain",
+                ),
+                (
+                    format!(
+                        "{}}}\n",
+                        build_with_auto_indent_for_style(
+                            "f <- function() {",
+                            &["x <-", "value"],
+                            style,
+                        )
+                    ),
+                    "assignment in function body",
+                ),
+            ];
+            for (text, name) in &built_cases {
+                assert!(
+                    lint_with_style(text, 2, style).is_empty(),
+                    "auto-indent output for {name} must be clean under {style:?}; \
+                     built {text:?}, got {:?}",
+                    lint_with_style(text, 2, style)
+                );
+            }
+        }
+
+        // Right assignment after a chain: clean under Indented/Either; under
+        // Aligned only the chain line is flagged (#610 aligned-mode chain
+        // semantics), never the auto-indented target line.
+        let text = build_with_auto_indent("data %>%", &["f() ->", "target"]);
+        assert_eq!(text, "data %>%\n  f() ->\n  target\n");
+        for style in [
+            InfixContinuationStyle::Indented,
+            InfixContinuationStyle::Either,
+        ] {
+            assert!(
+                lint_with_style(&text, 2, style).is_empty(),
+                "auto-indent output for right assignment must be clean under {style:?}"
+            );
+        }
+        let aligned = lint_with_style(&text, 2, InfixContinuationStyle::Aligned);
+        assert!(
+            diagnostic_on_line(&aligned, 2).is_none(),
+            "auto-indented target line must not be flagged under Aligned; got {aligned:?}"
+        );
     }
 
     #[test]

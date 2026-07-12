@@ -352,42 +352,11 @@ impl DiagnosticsSnapshot {
             total_elapsed,
         );
 
-        // Resolve the effective `LintConfig` for this URI by layering any
-        // matching `[[linting.overrides]]` patches over the base
-        // `state.lint_config`. Fast path: when no overrides are configured
-        // (the common case), skip the merge + section-clone work entirely.
-        // The merge+resolve only runs once per snapshot build, but a project
-        // with many open documents and zero overrides shouldn't pay for it.
-        // Start with the workspace-wide lint config, patched with the per-document
-        // indent unit if present. This value has lower priority than any explicit
-        // `[[linting.overrides]]` entry: passing the patched config as the *base*
-        // to `resolve_lint_for_document` ensures an override's `indentationUnit`
-        // field overwrites the per-document value, not the other way around.
-        let base_lint_config = {
-            let mut base = state.lint_config.clone();
-            if let Some(&unit) = state.per_document_indent_unit.get(uri.as_str()) {
-                base.indentation_unit = unit;
-            }
-            base
-        };
-        let mut lint_config = if state.lint_overrides.is_empty() {
-            base_lint_config
-        } else {
-            let merged = crate::config_file::merge_settings(
-                &state.raw_client_settings,
-                state.raw_project_settings.as_ref(),
-            );
-            let section = merged
-                .get("linting")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-            crate::config_file::resolve_lint_for_document(
-                &base_lint_config,
-                &section,
-                &state.lint_overrides,
-                uri,
-            )
-        };
+        // Resolve the effective `LintConfig` for this URI: per-document indent
+        // unit patched into the base, then matching `[[linting.overrides]]`
+        // layered on top. Shared with the on-type judge tier via
+        // `WorldState::effective_lint_config_for_document`.
+        let mut lint_config = state.effective_lint_config_for_document(uri);
         // The trailing-blank-lines rule describes the FILE's shape, but lints
         // run on the masked analysis text, where the closing fence / prose
         // after the last chunk is blanked — it would read as trailing blank

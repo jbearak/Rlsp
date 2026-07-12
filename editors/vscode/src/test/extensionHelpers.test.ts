@@ -4,6 +4,7 @@ import {
     clearIneligibleDiagnostics,
     diagnosticResourceUris,
     getUpdatedGlobalLanguageConfig,
+    isIndentUnitDocument,
     isRDocument,
     planDotInWordMigration,
     resolveTabSizeForDocument,
@@ -173,6 +174,54 @@ suite('Extension Helpers', () => {
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/report.Rmd')), false);
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/report.qmd')), false);
         assert.strictEqual(isRDocument(makeFileDocument('/tmp/notes.txt')), false);
+    });
+
+    test('isIndentUnitDocument accepts untitled chunk-capable documents', () => {
+        const makeUntitledDocument = (
+            languageId: string,
+        ): Pick<vscode.TextDocument, 'isUntitled' | 'languageId' | 'uri'> => ({
+            isUntitled: true,
+            languageId,
+            uri: vscode.Uri.parse(`untitled:${languageId}`),
+        });
+
+        assert.strictEqual(isIndentUnitDocument(makeUntitledDocument('r')), true);
+        assert.strictEqual(isIndentUnitDocument(makeUntitledDocument('jags')), true);
+        assert.strictEqual(isIndentUnitDocument(makeUntitledDocument('stan')), true);
+        assert.strictEqual(isIndentUnitDocument(makeUntitledDocument('rmd')), true);
+        assert.strictEqual(isIndentUnitDocument(makeUntitledDocument('quarto')), true);
+        assert.strictEqual(isIndentUnitDocument(makeUntitledDocument('plaintext')), false);
+    });
+
+    test('isIndentUnitDocument accepts supported file-backed extensions', () => {
+        const makeFileDocument = (
+            filePath: string,
+            languageId = 'plaintext',
+        ): Pick<vscode.TextDocument, 'isUntitled' | 'languageId' | 'uri'> => ({
+            isUntitled: false,
+            languageId,
+            uri: vscode.Uri.file(filePath),
+        });
+
+        assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/script.R')), true);
+        assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/model.BUGS')), true);
+        assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/model.StAn')), true);
+        assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/report.Rmd')), true);
+        assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/report.rmarkdown')), true);
+        assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/report.qmd')), true);
+        assert.strictEqual(isIndentUnitDocument(makeFileDocument('/tmp/notes.txt')), false);
+        assert.strictEqual(
+            isIndentUnitDocument(makeFileDocument('/tmp/no-extension', 'r')),
+            true,
+        );
+        assert.strictEqual(
+            isIndentUnitDocument(makeFileDocument('/tmp/notes.txt', 'rmd')),
+            true,
+        );
+        assert.strictEqual(
+            isIndentUnitDocument(makeFileDocument('/tmp/notes.txt', 'quarto')),
+            true,
+        );
     });
 
     test('getUpdatedGlobalLanguageConfig creates a global override when missing', () => {

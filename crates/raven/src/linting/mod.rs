@@ -107,6 +107,15 @@ mod lintr_parity;
 pub mod rule_ids;
 mod rules;
 
+pub(crate) use rules::indentation::{
+    IndentKind, LineIndentExpectation, accepted_indents_for_lines, leading_space_count,
+};
+
+#[cfg(test)]
+pub(crate) use rules::indentation::{IndentKindSet, accepted_indents_for_line};
+
+#[cfg(test)]
+pub(crate) use rules::indentation::lint_for_judge_test;
 use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter::Node;
 

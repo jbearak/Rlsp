@@ -170,6 +170,23 @@ pub fn recompute_parsed_configs(state: &mut crate::state::WorldState) {
         // since-removed root.
         state.lint_overrides = Vec::new();
     }
+    // Cache the merged `linting` section next to the compiled overrides so
+    // per-document resolution (`effective_lint_config_for_document`) never
+    // re-merges the raw settings trees on the typing hot path. Deliberately
+    // merged from the RAW project layer (not `normalized_project`), exactly
+    // as the per-document resolvers always did before the cache existed.
+    state.merged_linting_section = merge_settings(
+        &state.raw_client_settings,
+        state.raw_project_settings.as_ref(),
+    )
+    .get("linting")
+    .cloned()
+    .unwrap_or(serde_json::json!({}));
+    // Every input of per-document lint resolution just changed; drop the
+    // resolved-config cache with them.
+    if let Ok(mut cache) = state.effective_lint_config_cache.lock() {
+        cache.clear();
+    }
     state.workspace_exclusions = compile_workspace_exclusions(&merged, workspace_roots);
 }
 
@@ -190,6 +207,80 @@ mod tests {
         state.raw_project_settings = project;
         state.project_config_path = Some(PathBuf::from(project_config_path));
         state
+    }
+
+    /// The per-URI resolved-config cache serves repeated lookups, evicts a
+    /// closed document, and is cleared by `recompute_parsed_configs`, so no
+    /// stale value survives either lifecycle transition.
+    #[test]
+    fn effective_lint_config_cache_is_cleared_by_recompute() {
+        let root = if cfg!(windows) { "C:\\proj" } else { "/proj" };
+        let overrides_settings = |unit: u32| {
+            serde_json::json!({
+                "linting": {
+                    "enabled": true,
+                    "indentationUnit": 2,
+                    "overrides": [{"files": ["R/**"], "indentationUnit": unit}],
+                }
+            })
+        };
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![tower_lsp::lsp_types::Url::from_file_path(root).unwrap()];
+        state.raw_client_settings = overrides_settings(8);
+        recompute_parsed_configs(&mut state);
+
+        let uri = tower_lsp::lsp_types::Url::from_file_path(
+            std::path::Path::new(root).join("R").join("a.R"),
+        )
+        .unwrap();
+        state.open_document(uri.clone(), "", Some(1));
+        assert_eq!(
+            state
+                .effective_lint_config_for_document(&uri)
+                .indentation_unit,
+            8
+        );
+        // Second lookup is the cache hit; it must return the same answer.
+        assert_eq!(
+            state
+                .effective_lint_config_for_document(&uri)
+                .indentation_unit,
+            8
+        );
+        assert!(
+            state
+                .effective_lint_config_cache
+                .lock()
+                .unwrap()
+                .contains_key(uri.as_str())
+        );
+
+        state.close_document(&uri);
+        assert!(
+            !state
+                .effective_lint_config_cache
+                .lock()
+                .unwrap()
+                .contains_key(uri.as_str()),
+            "close_document must evict the closed URI's resolved config"
+        );
+        // Repopulate so the remainder still pins recompute invalidation.
+        assert_eq!(
+            state
+                .effective_lint_config_for_document(&uri)
+                .indentation_unit,
+            8
+        );
+
+        state.raw_client_settings = overrides_settings(6);
+        recompute_parsed_configs(&mut state);
+        assert_eq!(
+            state
+                .effective_lint_config_for_document(&uri)
+                .indentation_unit,
+            6,
+            "recompute_parsed_configs must invalidate the resolved-config cache"
+        );
     }
 
     /// The settings a *configured* `.lintr` contributes — the `linting` object

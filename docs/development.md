@@ -611,6 +611,96 @@ datasets come via the embedded base table, above.)
 
 Brief orientation for modules outside the cross-file and package-library subsystems.
 
+### Judge-backed Tier 2 indentation (#611)
+
+Tier 2 enters through `indentation::on_type_indentation` and uses the
+judge-backed path in [`indentation/judge.rs`](../crates/raven/src/indentation/judge.rs).
+The judge queries the same expectation engine as the indentation lint; see
+`accepted_indents_for_lines`, `LineIndentExpectation`, and `IndentKind` in
+[`linting/rules/indentation.rs`](../crates/raven/src/linting/rules/indentation.rs).
+There is no secondary indentation engine: when repair-and-ask returns `None`,
+the backend emits no edit and preserves the Tier 1/native indentation the
+editor applied before sending `textDocument/onTypeFormatting`.
+
+Maintain these boundaries:
+
+- Repair-and-ask builds a virtual buffer with a sentinel identifier on an empty
+  or closer-only cursor line, splicing exactly one region so the document's
+  tree can be reparsed incrementally (`InputEdit` in `VirtualBuffer`). The
+  probe line's own leading closers consume their openers from the scanned
+  stack; pushed-down closers reappear once, below the sentinel and before the
+  closers synthesized for the still-open outer delimiters, each on its own
+  line so bracket changes retain the lint's closer-on-own-line classification.
+  Its delimiter scan (`unclosed_delimiters_for_judge`) masks tree-covered
+  strings, comments, and backquoted identifiers before synthesizing closers.
+- The judge returns `None` for multiline string and
+  backtick-identifier interiors; unanswerable positions; a tabs-mode editor
+  (`insertSpaces: false`) or a real (non-string) tab inside the active
+  context — the rows from the outermost unclosed opener or the reference
+  line down to the probe — because the expectation engine measures character
+  columns while the editor renders tab stops; a repaired buffer whose parse
+  still holds an error intersecting the reference-to-probe row window; and a
+  nearest checkable line above the probe (the reference line) that does not
+  sit at a lint-accepted column — the expectation model accumulates from
+  column 0, so only lint-conforming context can be answered without
+  collapsing a user's offset indentation. Tabs and syntax errors on unrelated earlier
+  statements do not disable the judge — the lint's own fold tolerates both.
+- On-type queries use the per-line expectation fold
+  (`accepted_indents_for_lines`), which collects and sorts the change list
+  once and folds only the requested lines — never the whole-document maps the
+  diagnostic pass builds.
+- Selection is bounded by the judge's accepted set (whose primary column is
+  always accepted) and has separate internal argument and infix preference
+  axes. `SelectionPrefs::from_config` is the sole projection from
+  `IndentationStyle` onto those axes until #610 adds per-axis settings.
+- The lint infix style defines the accepted set; the indentation style defines
+  the emit preference. The producer queries the configured lint style. From the
+  producer's perspective, lint acceptance is frozen: changing the producer must
+  never reshape the accepted sets, which is lint-policy work such as #610.
+- `IndentKind` tags preserve each accepted column's provenance. `TopLevel`
+  contributions created by expectation merging are never preference targets;
+  selecting them recreates the accepted-0 trap.
+
+#### Latency budget
+
+On-type indentation must answer in p95 ≤ 16 ms at the bottom of a 10,000-line
+R document and ≤ 50 ms on a 100,000-line stress document in a release build.
+The Criterion benchmark
+`on_type_indentation/enter_bottom_10000_lines` in
+`crates/raven/benches/indentation.rs` measures the full
+`on_type_indentation` path. Per-request recomputation of the line index,
+masked intervals, and indentation-change collection is deliberate because
+those inputs cannot be stale. Revision-keyed caching is declined until a
+measured budget breach justifies the added invalidation state.
+
+#### Declined findings registry
+
+- **Escaped backticks in backquoted names:** R rejects them; commit
+  `93a3ca03` pins this as a does-not-fire test. Reconsider if R's grammar or
+  the supported parser begins accepting that spelling.
+- **Scanner unification:** moot because the legacy scanners and fallback
+  engine are deleted. Reconsider only if a second indentation producer is
+  intentionally introduced.
+- **Per-Enter O(document) prefix work:** accepted while it remains below the
+  latency budget above. Reconsider after a reproducible benchmark breach.
+- **Indent-unit-change republish filter resolves open documents twice:** this
+  is a cold O(open documents) path that runs only on indent-unit-change
+  notifications. Reconsider if profiling shows those notifications on a hot
+  path or workspaces with many open documents miss their budget.
+- **Rmd language-config generator matches the assignment rule by regex text:**
+  its exact-count assertion fails loudly. If that generator is touched, a
+  shared regex constant is the preferred upgrade.
+- **Deleting Tier 1 `onEnterRules`:** declined because issue #611 specifies
+  the `<-`/`<<-` Tier 1 rule and #610 defines per-axis `off` as “Tier 2
+  stands down; Tier 1 stands.” Reconsider only if those product contracts
+  change.
+- **Tabs-mode Tier 2 stand-down:** with `insertSpaces: false` or a real tab
+  in the active context, the judge returns `None` and no Tier 2 edit is
+  emitted (the deleted legacy fallback used to answer here). Deliberate: the
+  expectation engine counts characters, not tab stops, and the indentation
+  lint skips tab-led lines, so there is no lint-accepted set to select from.
+  Reconsider only alongside a visual-column model for the lint itself.
+
 - **`package_state/`** — Derived state for R package mode. Owns workspace detection result, namespace model, per-file facts (exported symbols, roxygen tags), and the aggregate scope contribution. Fully derive-based: `derive_package_state()` recomputes the entire `PackageState` from inputs.
 
   **Local-dev overlay for `load_all()`.** `PackageLibrary` maintains a local-dev overlay that surfaces the workspace package's internal symbols (non-exported `R/` definitions, sysdata, `.onLoad` names, NAMESPACE imports). The overlay is keyed on a fixed sentinel package name (the `LOAD_ALL_SENTINEL` constant, `__raven_load_all__`), **not** on a name derived from `DESCRIPTION` — the workspace `DESCRIPTION` `Package:` name feeds only the user-facing display label (`load_all_owner_display`), never the overlay key. When Raven detects a `load_all()` call in a file, it resolves the internals through this overlay exactly as it would resolve an installed package via `library()`. `apply_package_event` refreshes the overlay on `R/` filesystem events so adding, editing, or deleting a file under `R/` keeps the overlay in sync without restarting the LSP; every other code path that *replaces* `package_library` (LSP libpath rebuild/init, and `raven check`'s `maybe_init_r`) must call `refresh_local_dev_overlay` afterward, since a fresh library starts with a `None` overlay. The overlay integrates with the three-tier export resolution model (Tier 1 always wins for an actually-installed package).

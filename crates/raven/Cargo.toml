@@ -103,6 +103,11 @@ name = "package_cache_and_fanout"
 harness = false
 required-features = ["test-support"]
 
+[[bench]]
+name = "indentation"
+harness = false
+required-features = ["test-support"]
+
 [[example]]
 name = "profile_diagnostics"
 required-features = ["test-support"]

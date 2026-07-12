@@ -337,8 +337,8 @@ suite('Ark LSP Extension', () => {
 
     // `wordPattern` in the language configs makes a dotted identifier like
     // `my.variable` a single "word" — driving Cmd+click navigation,
-    // `getWordRangeAtPosition`, and expand-selection. `rmd`/`quarto` reuse the
-    // R `language-configuration.json` (so they inherit the pattern); `jags` has
+    // `getWordRangeAtPosition`, and expand-selection. `rmd`/`quarto` share the
+    // R wordPattern via `rmd-language-configuration.json`; `jags` has
     // its own copy of the same pattern. With VS Code's default word definition
     // (dots ARE separators) the word range starting on the first segment would
     // stop at the dot and yield only "my", so asserting the full span proves

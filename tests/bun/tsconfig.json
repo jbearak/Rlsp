@@ -49,6 +49,7 @@
     "data-viewer-abort.test.ts",
     "data-viewer-sort-filter-cancel.test.ts",
     "data-viewer-panel-restore-cancel.test.ts",
-    "help-command-palette-gating.test.ts"
+    "help-command-palette-gating.test.ts",
+    "on-enter-rules.test.ts"
   ]
 }
