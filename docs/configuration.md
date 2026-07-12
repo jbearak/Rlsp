@@ -193,14 +193,14 @@ These Command Palette entries write starter R config files to the first workspac
 
 | Setting | Default | Description |
 |---|---|---|
-| `raven.indentation.enabled` | `true` | AST-aware indentation master switch |
+| `raven.indentation.enabled` | `true` | Syntax-aware indentation master switch |
 | `raven.indentation.argumentStyle` | `"aligned"` | Parenthesized arguments: `"aligned"`, `"indented"`, or `"off"` |
 | `raven.indentation.infixContinuationStyle` | `"aligned"` | Infix continuations: `"aligned"`, `"indented"`, or `"off"` |
-| `raven.indentation.style` | `"rstudio"` | Deprecated permanent alias: `rstudio` → argument `aligned`, `rstudio-minus` → argument `indented`, `off` → AST-aware indentation disabled |
+| `raven.indentation.style` | `"rstudio"` | Deprecated permanent alias: `rstudio` → argument `aligned`, `rstudio-minus` → argument `indented`, `off` → syntax-aware indentation disabled |
 
-Explicit new settings win per field over the alias. The alias never changes the infix axis. See [Smart Indentation](indentation.md#permanent-compatibility-alias) for the full precedence table and examples.
+Explicit new settings win per field over the alias. The alias never changes the infix setting. See [Smart Indentation](indentation.md#permanent-compatibility-alias) for the full precedence table and examples.
 
-Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto by default (the lowest-priority VS Code default). AST-aware indentation applies to plain R and to R chunk bodies; prose, YAML, and non-R chunks stand down. Disable it per language when desired:
+Raven sets `editor.formatOnType` to `true` for R, R Markdown, and Quarto by default (the lowest-priority VS Code default). Syntax-aware indentation applies to plain R and to R chunk bodies; prose, YAML, and non-R chunks stand down. Disable it per language when desired:
 
 ```json
 "[r]": {
@@ -253,7 +253,7 @@ Native style/lint diagnostics. Tri-state master switch `raven.linting.enabled` (
 | `raven.linting.vectorLogicSeverity` | `"information"` | Severity for the vector-logic lint (`&` / `\|` in `if` / `while` conditions) |
 | `raven.linting.functionLeftParenthesesSeverity` | `"information"` | Severity for the function-left-parentheses lint (whitespace between `function` and `(`) |
 | `raven.linting.spacesInsideSeverity` | `"information"` | Severity for the spaces-inside lint (whitespace inside `(`, `[`, `[[`) |
-| `raven.linting.indentationSeverity` | `"information"` | Severity for the indentation lint (lines whose leading whitespace doesn't match the expected indent for their AST scope) |
+| `raven.linting.indentationSeverity` | `"information"` | Severity for the indentation lint (lines whose leading whitespace doesn't match the surrounding syntax) |
 
 To disable an individual rule while leaving the rest enabled, set its severity to `"off"`. For the object-name lint, you can also include `"any"` in any of the three style settings to disable just that symbol kind while keeping the others active. An explicit empty style array with regexes is regex-only mode; empty styles and empty regexes together disable that kind.
 

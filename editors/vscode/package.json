@@ -1382,7 +1382,7 @@
         "raven.indentation.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Enable AST-aware indentation. When disabled, Raven emits no on-type indentation edits and the editor's built-in indentation stands."
+          "description": "Enable syntax-aware indentation. When disabled, Raven emits no on-type indentation edits and the editor's built-in indentation stands."
         },
         "raven.indentation.argumentStyle": {
           "type": "string",
@@ -1397,7 +1397,7 @@
             "Let the editor's built-in indentation stand for parenthesized argument constructs"
           ],
           "default": "aligned",
-          "description": "How AST-aware indentation formats parenthesized argument continuations."
+          "description": "How syntax-aware indentation formats parenthesized argument continuations."
         },
         "raven.indentation.infixContinuationStyle": {
           "type": "string",
@@ -1407,12 +1407,12 @@
             "off"
           ],
           "enumDescriptions": [
-            "Align operands at the chain's first operand, floored one level from the owning statement",
-            "Indent every continuation one level from the chain-start line",
+            "Align operands at the chain's first operand, but at least one level past the owning statement",
+            "Add one continuation level beyond the enclosing indentation context",
             "Let the editor's built-in indentation stand for infix-operator continuations"
           ],
           "default": "aligned",
-          "description": "How AST-aware indentation formats infix-operator chain continuations. Assignment operators remain one level in for every value."
+          "description": "How syntax-aware indentation formats infix-operator chain continuations. Assignment operators remain one level in for every value."
         },
         "raven.indentation.style": {
           "type": "string",
@@ -2201,7 +2201,7 @@
             "Disable the indentation lint"
           ],
           "default": "information",
-          "description": "Severity for the indentation lint. Flags lines whose leading whitespace doesn't match the expected indent given their AST scope (braced blocks, multi-line argument lists, continuation lines)."
+          "description": "Severity for the indentation lint. Flags lines whose leading whitespace doesn't match the surrounding syntax (braced blocks, multi-line argument lists, continuation lines)."
         }
       }
     }

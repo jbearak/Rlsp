@@ -4,7 +4,7 @@ Raven is a language server for R, Stan, and JAGS. Its defining idea: **what's in
 
 Because scope is resolved by position, Raven can flag genuinely undefined variables — and, parsing as you type, it catches parse errors (unclosed brackets, an `else` stranded from its `}`) and likely-bug patterns like mixed logical operators (`a & b | c`).
 
-[vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) (REditorSupport's R extension) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus configurable AST-aware indentation) on top of what you already have.
+[vscode-R](https://marketplace.visualstudio.com/items?itemName=REditorSupport.r) (REditorSupport's R extension) is the established R extension for VS Code; Raven's language server runs alongside it, contributing cross-file, scope-aware code intelligence (plus configurable syntax-aware indentation) on top of what you already have.
 
 vscode-R's language intelligence comes from [r-language-server](https://github.com/REditorSupport/languageserver), an R package that runs inside an R session and indexes the documents you have open (and, in an R package, its `R/` directory). Raven is written in Rust to be fast, and needs no R session: it indexes your whole workspace and follows `source()` chains, so completions and navigation reach symbols in files you haven't opened — jump straight to a variable's definition in another file.
 
