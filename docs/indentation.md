@@ -1,8 +1,7 @@
 # Smart Indentation
 
 Raven combines the editor's built-in indentation with syntax-aware indentation
-for R code. The settings UI calls the second mechanism "AST-aware"
-indentation.
+for R code.
 
 ## Overview
 
@@ -24,20 +23,6 @@ Both indentation mechanisms are active by default.
 > clear.
 
 ## Configuration
-
-These are the default settings:
-
-```json
-{
-  "raven.indentation.enabled": true,
-  "raven.indentation.argumentStyle": "aligned",
-  "raven.indentation.infixContinuationStyle": "aligned",
-  "raven.linting.enabled": "auto",
-  "raven.linting.indentationUnit": "auto",
-  "raven.linting.infixContinuationStyle": "either",
-  "raven.linting.indentationSeverity": "information"
-}
-```
 
 ### Auto-indentation settings
 
