@@ -659,11 +659,22 @@ fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> Opt
             })
     };
 
+    // An axis set to `Off` stands down only when the axis is the sole
+    // justification for the answer. A primary that also carries the
+    // style-neutral `Block` kind (an assignment RHS level composed onto the
+    // surrounding context) is answerable regardless of the axis setting.
+    let style_neutral_primary = || {
+        expected
+            .primary_kinds
+            .contains(IndentKind::Block)
+            .then_some(expected.primary)
+    };
+
     if has_kind(IndentKind::ChainStart) || has_kind(IndentKind::InfixBlock) {
         return match prefs.infix {
             FormPref::Aligned => candidate(IndentKind::ChainStart),
             FormPref::Block => candidate(IndentKind::InfixBlock),
-            FormPref::Off => None,
+            FormPref::Off => style_neutral_primary(),
         };
     }
 
@@ -673,7 +684,7 @@ fn select_column(expected: &LineIndentExpectation, prefs: SelectionPrefs) -> Opt
                 .or_else(|| candidate(IndentKind::ArgumentBlock)),
             FormPref::Block => candidate(IndentKind::ArgumentBlock)
                 .or_else(|| candidate(IndentKind::OpenerAligned)),
-            FormPref::Off => None,
+            FormPref::Off => style_neutral_primary(),
         };
     }
 
@@ -1066,6 +1077,18 @@ mod tests {
             ),
             Some(2),
             "neutral brace blocks remain Tier 2-active"
+        );
+
+        assert_eq!(
+            judge(
+                "f(\n  x :=\n",
+                Position::new(2, 0),
+                &argument_off,
+                InfixContinuationStyle::Either,
+            ),
+            Some(4),
+            "a style-neutral assignment continuation answers even when the \
+             surrounding construct's axis is off"
         );
     }
 

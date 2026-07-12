@@ -709,6 +709,18 @@ measured budget breach justifies the added invalidation state.
   expectation engine counts characters, not tab stops, and the indentation
   lint skips tab-led lines, so there is no lint-accepted set to select from.
   Reconsider only alongside a visual-column model for the lint itself.
+- **`rstudio-minus` alias does not map to the infix axis:** the permanent
+  `raven.indentation.style` alias sets `argumentStyle` only, matching the
+  last released behavior (v0.14, where chain alignment was unconditional and
+  the style governed paren arguments only). The brief window on `main` where
+  the judge projected `rstudio-minus` onto both axes was never released and
+  is not a compatibility target. Reconsider only if a release had shipped it.
+- **Strict lint `indented` flags formatter-`aligned` output:** deliberate
+  combined-model semantics — a mismatched producer/lint pair is a valid user
+  configuration state, not a bug; the deeper-only chain-start tolerance moved
+  into `either` (the default), and the mismatch-advice diagnostic (PR 3)
+  names the settings to reconcile. Reconsider only if the combined settings
+  doctrine itself is revisited.
 
 - **`package_state/`** — Derived state for R package mode. Owns workspace detection result, namespace model, per-file facts (exported symbols, roxygen tags), and the aggregate scope contribution. Fully derive-based: `derive_package_state()` recomputes the entire `PackageState` from inputs.
 
