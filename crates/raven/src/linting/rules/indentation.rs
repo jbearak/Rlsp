@@ -367,6 +367,31 @@ impl LineIndentExpectation {
                 .iter()
                 .any(|(column, _)| *column == actual)
     }
+
+    /// The column the producer selects for `kind` — the same primary-first
+    /// lookup the diagnostic pass applies via `Expected::column_for_kind`,
+    /// shared through [`column_for_kind_in`] so the judge's `select_column`
+    /// and the mismatch advice's equality check cannot drift (issue #614).
+    pub(crate) fn column_for_kind(&self, kind: IndentKind) -> Option<u32> {
+        column_for_kind_in(self.primary, self.primary_kinds, &self.alternatives, kind)
+    }
+}
+
+/// Primary-first producer-selection lookup shared by `Expected` (the lint's
+/// internal accumulator) and [`LineIndentExpectation`] (the judge-facing
+/// projection): the primary column when it carries `kind`, else the first
+/// alternative that does.
+fn column_for_kind_in(
+    primary: u32,
+    primary_kinds: IndentKindSet,
+    alternatives: &[(u32, IndentKindSet)],
+    kind: IndentKind,
+) -> Option<u32> {
+    primary_kinds.contains(kind).then_some(primary).or_else(|| {
+        alternatives
+            .iter()
+            .find_map(|(column, kinds)| kinds.contains(kind).then_some(*column))
+    })
 }
 
 /// Accepted indent columns for `line`, as the indentation lint would compute
@@ -598,19 +623,13 @@ impl Expected {
                 .any(|(column, _)| *column == actual)
     }
 
-    /// Return the column the producer selects for `kind`, matching the
-    /// producer judge's primary-first lookup. Requiring the infix-specific
-    /// kind is also the assignment exemption: assignment continuations never
-    /// carry `ChainStart` or `InfixBlock` (see `operator_change`).
+    /// Return the column the producer selects for `kind`, via the
+    /// [`column_for_kind_in`] lookup shared with the judge (issue #614).
+    /// Requiring the infix-specific kind is also the assignment exemption:
+    /// assignment continuations never carry `ChainStart` or `InfixBlock`
+    /// (see `operator_change`).
     fn column_for_kind(&self, kind: IndentKind) -> Option<u32> {
-        self.primary_kinds
-            .contains(kind)
-            .then_some(self.primary)
-            .or_else(|| {
-                self.alternatives
-                    .iter()
-                    .find_map(|(column, kinds)| kinds.contains(kind).then_some(*column))
-            })
+        column_for_kind_in(self.primary, self.primary_kinds, &self.alternatives, kind)
     }
 
     fn add_alternative(&mut self, column: u32, kinds: IndentKindSet) {

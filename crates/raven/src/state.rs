@@ -142,6 +142,25 @@ impl Default for IndentationSettings {
     }
 }
 
+/// One document's editor options synced by the client via
+/// `raven/documentIndentUnitsChanged` (`WorldState::per_document_indent_options`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocumentIndentOptions {
+    /// Resolved `editor.tabSize`, present only when
+    /// `raven.linting.indentationUnit` is `"auto"`. Patches the base
+    /// `LintConfig::indentation_unit` in `effective_lint_config_for_document`;
+    /// absent, the workspace-wide unit stays authoritative.
+    pub indent_unit: Option<u32>,
+    /// Resolved `editor.insertSpaces` (issue #614). Consumed only by
+    /// `resolved_indentation_producer_policy`: a synced `false` marks a
+    /// tabs-mode editor where the Tier 2 judge stands down, so the
+    /// indentation lint's mismatch advice must not attribute a column to it.
+    /// Absent keeps the advice available — the CLI's `[indentation]` project
+    /// section implies an intentional producer policy with no editor to
+    /// contradict it.
+    pub insert_spaces: Option<bool>,
+}
+
 use tower_lsp::lsp_types::Url;
 use tree_sitter::Parser;
 use tree_sitter::Tree;
@@ -723,7 +742,7 @@ pub struct WorldState {
     /// mutability because resolution runs under the `WorldState` READ lock.
     /// Invalidated by the two writers of its inputs: cleared by
     /// `recompute_parsed_configs` (config layers / overrides changed) and by
-    /// the `per_document_indent_unit` swap in
+    /// the `per_document_indent_options` swap in
     /// `raven/documentIndentUnitsChanged` (the patched base feeds
     /// resolution). Bounded by the set of open documents between clears.
     pub effective_lint_config_cache:
@@ -734,12 +753,12 @@ pub struct WorldState {
     /// indexing, watcher resync, on-demand indexing, and LSP diagnostics.
     pub workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions,
 
-    /// Per-document `indentation_unit` overrides sent by the client via
-    /// `raven/documentIndentUnitsChanged` when the user sets
-    /// `raven.linting.indentationUnit` to `"auto"`. Keyed by URI string.
-    /// Empty when the setting is a fixed integer; absent URIs fall back to
-    /// `lint_config.indentation_unit`.
-    pub per_document_indent_unit: std::collections::HashMap<String, u32>,
+    /// Per-document editor options sent by the client via
+    /// `raven/documentIndentUnitsChanged`, keyed by URI string. Both fields
+    /// are independently optional; absent URIs (or absent fields) fall back
+    /// exactly like an empty map — non-VS-Code clients, older extensions,
+    /// and `raven check` never populate it.
+    pub per_document_indent_options: std::collections::HashMap<String, DocumentIndentOptions>,
 
     pub cross_file_meta: MetadataCache,
     pub cross_file_graph: DependencyGraph,
@@ -914,7 +933,11 @@ impl WorldState {
         uri: &tower_lsp::lsp_types::Url,
     ) -> crate::linting::LintConfig {
         let mut base = self.lint_config.clone();
-        if let Some(&unit) = self.per_document_indent_unit.get(uri.as_str()) {
+        if let Some(unit) = self
+            .per_document_indent_options
+            .get(uri.as_str())
+            .and_then(|options| options.indent_unit)
+        {
             base.indentation_unit = unit;
         }
         if self.lint_overrides.is_empty() {
@@ -1212,7 +1235,7 @@ impl WorldState {
             merged_linting_section: serde_json::json!({}),
             effective_lint_config_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions::default(),
-            per_document_indent_unit: std::collections::HashMap::new(),
+            per_document_indent_options: std::collections::HashMap::new(),
             cross_file_meta: MetadataCache::new(),
             cross_file_graph: DependencyGraph::new(),
             standalone_scope_cache: Arc::new(

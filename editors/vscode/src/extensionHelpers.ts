@@ -162,28 +162,140 @@ export function clearIneligibleDiagnostics(
 }
 
 /**
+ * Last editor-resolved options per document URI. Per-editor options
+ * (`detectIndentation` results, status-bar overrides) are only observable
+ * while the document has a visible editor; without this memo, a
+ * notification rebuild triggered while a document's tab is hidden would
+ * silently regress that document to the configured defaults. Entries are
+ * dropped when the document closes (`forgetResolvedEditorOptions`) so a
+ * reopen starts from configuration until an editor is seen again.
+ */
+export type ResolvedEditorOptionsCache = Map<
+    string,
+    { tabSize?: number; insertSpaces?: boolean }
+>;
+
+const lastResolvedEditorOptions: ResolvedEditorOptionsCache = new Map();
+
+/** Drop a closed document's memoized editor options. */
+export function forgetResolvedEditorOptions(uri: string): void {
+    lastResolvedEditorOptions.delete(uri);
+}
+
+/**
  * Resolve the effective `editor.tabSize` for a document. The scope MUST
  * include `languageId` so VS Code returns language-scoped overrides (e.g.
  * `[r] { "editor.tabSize": 2 }`) instead of only the resource-scoped value.
+ * Falls back visible editor -> last-seen editor value (`cache`) ->
+ * configuration.
  *
- * The optional `getCfg` parameter exists for unit testing; callers should
- * omit it and let the default use `vscode.workspace.getConfiguration`.
+ * The optional `getCfg` and `cache` parameters exist for unit testing;
+ * callers should omit them.
  */
 export function resolveTabSizeForDocument(
     document: Pick<vscode.TextDocument, 'uri' | 'languageId'>,
     getCfg: (scope: vscode.ConfigurationScope) => vscode.WorkspaceConfiguration = (scope) =>
         vscode.workspace.getConfiguration('editor', scope),
     visibleTextEditors: readonly vscode.TextEditor[] = vscode.window.visibleTextEditors,
+    cache: ResolvedEditorOptionsCache = lastResolvedEditorOptions,
 ): number {
+    const key = document.uri.toString();
     const editor = visibleTextEditors.find((candidate) =>
-        candidate.document.uri.toString() === document.uri.toString()
+        candidate.document.uri.toString() === key
     );
     if (typeof editor?.options.tabSize === 'number') {
+        cache.set(key, { ...cache.get(key), tabSize: editor.options.tabSize });
         return editor.options.tabSize;
+    }
+
+    const remembered = cache.get(key)?.tabSize;
+    if (typeof remembered === 'number') {
+        return remembered;
     }
 
     return getCfg({ uri: document.uri, languageId: document.languageId })
         .get<number>('tabSize', 2);
+}
+
+/**
+ * Resolve the effective `editor.insertSpaces` for a document, mirroring
+ * `resolveTabSizeForDocument`: visible editor's resolved options (VS Code
+ * has already applied detectIndentation there) -> last-seen editor value
+ * (`cache`) -> language-scoped configuration. The scope MUST include
+ * `languageId` so language overrides like `[r] { "editor.insertSpaces":
+ * false }` apply.
+ *
+ * The optional `getCfg` and `cache` parameters exist for unit testing;
+ * callers should omit them.
+ */
+export function resolveInsertSpacesForDocument(
+    document: Pick<vscode.TextDocument, 'uri' | 'languageId'>,
+    getCfg: (scope: vscode.ConfigurationScope) => vscode.WorkspaceConfiguration = (scope) =>
+        vscode.workspace.getConfiguration('editor', scope),
+    visibleTextEditors: readonly vscode.TextEditor[] = vscode.window.visibleTextEditors,
+    cache: ResolvedEditorOptionsCache = lastResolvedEditorOptions,
+): boolean {
+    const key = document.uri.toString();
+    const editor = visibleTextEditors.find((candidate) =>
+        candidate.document.uri.toString() === key
+    );
+    if (typeof editor?.options.insertSpaces === 'boolean') {
+        cache.set(key, { ...cache.get(key), insertSpaces: editor.options.insertSpaces });
+        return editor.options.insertSpaces;
+    }
+
+    const remembered = cache.get(key)?.insertSpaces;
+    if (typeof remembered === 'boolean') {
+        return remembered;
+    }
+
+    return getCfg({ uri: document.uri, languageId: document.languageId })
+        .get<boolean>('insertSpaces', true);
+}
+
+/** One entry of the `raven/documentIndentUnitsChanged` payload. */
+export type DocumentIndentUnitEntry = {
+    uri: string;
+    /** Present only in `raven.linting.indentationUnit = "auto"` mode. */
+    indentUnit?: number;
+    insertSpaces: boolean;
+};
+
+/**
+ * Build the `raven/documentIndentUnitsChanged` payload. In `"auto"` unit
+ * mode: one entry per indent-unit document, carrying both `indentUnit` and
+ * `insertSpaces`. With a fixed integer unit setting, `indentUnit` must be
+ * omitted — the server's workspace-wide value must stay authoritative, and
+ * an entry's unit would override it
+ * (`WorldState::effective_lint_config_for_document`) — and entries are
+ * trimmed to the documents whose `insertSpaces` is `false`: the server
+ * treats an absent entry exactly like `insertSpaces: true` for the
+ * mismatch-advice gate (issue #614), and the trim keeps the common
+ * all-spaces case as the legacy `{units: []}` payload, which pre-#614
+ * server binaries (a user-configured `raven.server.path`) still parse —
+ * they reject entries missing `indentUnit` and would otherwise retain
+ * stale per-document units.
+ */
+export function buildDocumentIndentUnitsPayload(
+    indentationUnitSetting: number | 'auto',
+    documents: readonly Pick<vscode.TextDocument, 'isUntitled' | 'languageId' | 'uri'>[],
+    resolveUnit: (document: Pick<vscode.TextDocument, 'uri' | 'languageId'>) => number,
+    resolveInsertSpaces: (document: Pick<vscode.TextDocument, 'uri' | 'languageId'>) => boolean,
+): { units: DocumentIndentUnitEntry[] } {
+    const units = documents
+        .filter(isIndentUnitDocument)
+        .map((doc) => {
+            const entry: DocumentIndentUnitEntry = {
+                uri: doc.uri.toString(),
+                insertSpaces: resolveInsertSpaces(doc),
+            };
+            if (indentationUnitSetting === 'auto') {
+                entry.indentUnit = resolveUnit(doc);
+            }
+            return entry;
+        })
+        .filter((entry) => entry.indentUnit !== undefined || !entry.insertSpaces);
+    return { units };
 }
 
 export type DotInWordMigrationAction = {

@@ -199,22 +199,33 @@ pub(crate) struct DiagnosticsSnapshot {
 }
 
 /// Resolve the auto-indent producer policy the indentation lint's
-/// settings-mismatch advice compares against, or `None` when no producer is
-/// in play and the advice must stay silent.
+/// settings-mismatch advice compares against for `uri`, or `None` when no
+/// producer is in play and the advice must stay silent.
 ///
 /// Availability rule: a non-empty client settings layer means an LSP editor
 /// is attached and the Tier 2 producer exists (even when its resolved values
 /// are server defaults); the headless CLI has an empty client layer and gains
 /// a producer only from an explicit project `[indentation]` section. Beyond
 /// availability, the policy is `None` whenever the producer cannot emit:
-/// Tier 2 disabled, or the producer's infix axis `off`. It does NOT model the
-/// per-request bail conditions the judge applies at Enter time (tabs-mode
-/// editors, tab-shaped context) — those live only in `FormattingOptions`, so
-/// advice can over-attribute a column to the producer in a tabs-mode editor
-/// (tracked as a known limitation).
-fn resolved_indentation_producer_policy(
+/// Tier 2 disabled, the producer's infix axis `off`, or the document's editor
+/// synced `insertSpaces: false` (`WorldState::per_document_indent_options`) —
+/// a tabs-mode editor where the judge stands down at Enter time, so no column
+/// can have come from it (issue #614). The judge's other per-request bail —
+/// a real tab inside the per-Enter active context — is position-dependent
+/// with no per-document analog here and stays unmodeled (a known residual
+/// limitation; see the declined-findings registry in docs/development.md).
+pub(crate) fn resolved_indentation_producer_policy(
     state: &WorldState,
+    uri: &Url,
 ) -> Option<crate::linting::IndentationProducerPolicy> {
+    if state
+        .per_document_indent_options
+        .get(uri.as_str())
+        .and_then(|options| options.insert_spaces)
+        == Some(false)
+    {
+        return None;
+    }
     let producer_policy_available = state
         .raw_client_settings
         .as_object()
@@ -247,27 +258,79 @@ fn resolved_indentation_producer_policy(
 mod indentation_advice_policy_tests {
     use super::*;
 
+    fn test_uri() -> Url {
+        Url::parse("file:///test.R").expect("static test URI must parse")
+    }
+
     #[test]
     fn producer_policy_requires_a_host_policy_and_enabled_non_off_tier_two() {
         let mut state = WorldState::new();
+        let uri = test_uri();
 
-        assert_eq!(resolved_indentation_producer_policy(&state), None);
+        assert_eq!(resolved_indentation_producer_policy(&state, &uri), None);
 
         state.raw_client_settings = serde_json::json!({"linting": {}});
         assert_eq!(
-            resolved_indentation_producer_policy(&state),
+            resolved_indentation_producer_policy(&state, &uri),
             Some(crate::linting::IndentationProducerPolicy {
                 infix_style: crate::linting::InfixContinuationStyle::Aligned,
             })
         );
 
         state.indentation_config.enabled = false;
-        assert_eq!(resolved_indentation_producer_policy(&state), None);
+        assert_eq!(resolved_indentation_producer_policy(&state, &uri), None);
 
         state.indentation_config.enabled = true;
         state.indentation_config.infix_continuation_style =
             crate::indentation::IndentationStyle::Off;
-        assert_eq!(resolved_indentation_producer_policy(&state), None);
+        assert_eq!(resolved_indentation_producer_policy(&state, &uri), None);
+    }
+
+    #[test]
+    fn synced_tabs_mode_gates_the_policy_per_document() {
+        let mut state = WorldState::new();
+        let uri = test_uri();
+        state.raw_client_settings = serde_json::json!({"linting": {}});
+
+        let available = Some(crate::linting::IndentationProducerPolicy {
+            infix_style: crate::linting::InfixContinuationStyle::Aligned,
+        });
+
+        // Absent entry (older extension / non-VS-Code client): advice stays.
+        assert_eq!(
+            resolved_indentation_producer_policy(&state, &uri),
+            available
+        );
+
+        // Synced spaces-mode: advice stays.
+        state.per_document_indent_options.insert(
+            uri.as_str().to_string(),
+            crate::state::DocumentIndentOptions {
+                insert_spaces: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            resolved_indentation_producer_policy(&state, &uri),
+            available
+        );
+
+        // Synced tabs-mode: the judge stands down there, so no advice.
+        state.per_document_indent_options.insert(
+            uri.as_str().to_string(),
+            crate::state::DocumentIndentOptions {
+                insert_spaces: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolved_indentation_producer_policy(&state, &uri), None);
+
+        // Tabs-mode in a DIFFERENT document does not gate this one.
+        let other = Url::parse("file:///other.R").expect("static test URI must parse");
+        assert_eq!(
+            resolved_indentation_producer_policy(&state, &other),
+            available
+        );
     }
 
     fn mismatch_message(state: &WorldState) -> String {
@@ -285,7 +348,7 @@ mod indentation_advice_policy_tests {
             text,
             tree.root_node(),
             &lint,
-            resolved_indentation_producer_policy(state),
+            resolved_indentation_producer_policy(state, &test_uri()),
         )[0]
         .message
         .clone()
@@ -312,6 +375,24 @@ mod indentation_advice_policy_tests {
     }
 
     #[test]
+    fn synced_tabs_mode_keeps_ordinary_lint_message() {
+        let mut state = WorldState::new();
+        state.raw_client_settings = serde_json::json!({"linting": {}});
+        state.per_document_indent_options.insert(
+            test_uri().as_str().to_string(),
+            crate::state::DocumentIndentOptions {
+                insert_spaces: Some(false),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            mismatch_message(&state),
+            "Indentation should be 2 spaces, not 10."
+        );
+    }
+
+    #[test]
     fn project_indentation_section_resolves_cli_producer_policy() {
         let mut state = WorldState::new();
         state.raw_project_settings = Some(serde_json::json!({
@@ -321,7 +402,8 @@ mod indentation_advice_policy_tests {
             crate::indentation::IndentationStyle::Indented;
 
         assert_eq!(
-            resolved_indentation_producer_policy(&state).map(|policy| policy.infix_style),
+            resolved_indentation_producer_policy(&state, &test_uri())
+                .map(|policy| policy.infix_style),
             Some(crate::linting::InfixContinuationStyle::Indented)
         );
     }
@@ -499,7 +581,7 @@ impl DiagnosticsSnapshot {
             lint_config.trailing_blank_lines_severity = None;
         }
 
-        let indentation_producer_policy = resolved_indentation_producer_policy(state);
+        let indentation_producer_policy = resolved_indentation_producer_policy(state, uri);
 
         Some(DiagnosticsSnapshot {
             tree,
