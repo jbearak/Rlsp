@@ -198,14 +198,23 @@ pub(crate) struct DiagnosticsSnapshot {
     pub(crate) standalone_ctx: Option<crate::cross_file::standalone_cache::StandaloneCacheCtx>,
 }
 
+/// Resolve the auto-indent producer policy the indentation lint's
+/// settings-mismatch advice compares against, or `None` when no producer is
+/// in play and the advice must stay silent.
+///
+/// Availability rule: a non-empty client settings layer means an LSP editor
+/// is attached and the Tier 2 producer exists (even when its resolved values
+/// are server defaults); the headless CLI has an empty client layer and gains
+/// a producer only from an explicit project `[indentation]` section. Beyond
+/// availability, the policy is `None` whenever the producer cannot emit:
+/// Tier 2 disabled, or the producer's infix axis `off`. It does NOT model the
+/// per-request bail conditions the judge applies at Enter time (tabs-mode
+/// editors, tab-shaped context) — those live only in `FormattingOptions`, so
+/// advice can over-attribute a column to the producer in a tabs-mode editor
+/// (tracked as a known limitation).
 fn resolved_indentation_producer_policy(
     state: &WorldState,
-    lint_config: &crate::linting::LintConfig,
 ) -> Option<crate::linting::IndentationProducerPolicy> {
-    // A real client settings layer means the LSP-side producer is available,
-    // including when its resolved values are server defaults. The headless
-    // CLI has an empty client layer and gains a producer only from an explicit
-    // project `[indentation]` section.
     let producer_policy_available = state
         .raw_client_settings
         .as_object()
@@ -228,13 +237,10 @@ fn resolved_indentation_producer_policy(
         }
         crate::indentation::IndentationStyle::Off => return None,
     };
-    // With the indentation lint active, Tier 2 deliberately uses this same
-    // resolved per-document unit. The advice layer still handles unequal
-    // units for callers that can provide an independently resolved producer.
-    Some(crate::linting::IndentationProducerPolicy {
-        indent_unit: lint_config.indentation_unit,
-        infix_style,
-    })
+    // No unit in the policy: with the indentation rule active, Tier 2
+    // deliberately shares the lint's resolved per-document unit, so the
+    // advice pass folds under the lint's own unit.
+    Some(crate::linting::IndentationProducerPolicy { infix_style })
 }
 
 #[cfg(test)]
@@ -243,30 +249,25 @@ mod indentation_advice_policy_tests {
 
     #[test]
     fn producer_policy_requires_a_host_policy_and_enabled_non_off_tier_two() {
-        let lint = crate::linting::LintConfig {
-            indentation_unit: 4,
-            ..crate::linting::LintConfig::default()
-        };
         let mut state = WorldState::new();
 
-        assert_eq!(resolved_indentation_producer_policy(&state, &lint), None);
+        assert_eq!(resolved_indentation_producer_policy(&state), None);
 
         state.raw_client_settings = serde_json::json!({"linting": {}});
         assert_eq!(
-            resolved_indentation_producer_policy(&state, &lint),
+            resolved_indentation_producer_policy(&state),
             Some(crate::linting::IndentationProducerPolicy {
-                indent_unit: 4,
                 infix_style: crate::linting::InfixContinuationStyle::Aligned,
             })
         );
 
         state.indentation_config.enabled = false;
-        assert_eq!(resolved_indentation_producer_policy(&state, &lint), None);
+        assert_eq!(resolved_indentation_producer_policy(&state), None);
 
         state.indentation_config.enabled = true;
         state.indentation_config.infix_continuation_style =
             crate::indentation::IndentationStyle::Off;
-        assert_eq!(resolved_indentation_producer_policy(&state, &lint), None);
+        assert_eq!(resolved_indentation_producer_policy(&state), None);
     }
 
     fn mismatch_message(state: &WorldState) -> String {
@@ -284,7 +285,7 @@ mod indentation_advice_policy_tests {
             text,
             tree.root_node(),
             &lint,
-            resolved_indentation_producer_policy(state, &lint),
+            resolved_indentation_producer_policy(state),
         )[0]
         .message
         .clone()
@@ -312,7 +313,6 @@ mod indentation_advice_policy_tests {
 
     #[test]
     fn project_indentation_section_resolves_cli_producer_policy() {
-        let lint = crate::linting::LintConfig::default();
         let mut state = WorldState::new();
         state.raw_project_settings = Some(serde_json::json!({
             "indentation": {"infixContinuationStyle": "indented"}
@@ -321,7 +321,7 @@ mod indentation_advice_policy_tests {
             crate::indentation::IndentationStyle::Indented;
 
         assert_eq!(
-            resolved_indentation_producer_policy(&state, &lint).map(|policy| policy.infix_style),
+            resolved_indentation_producer_policy(&state).map(|policy| policy.infix_style),
             Some(crate::linting::InfixContinuationStyle::Indented)
         );
     }
@@ -499,7 +499,7 @@ impl DiagnosticsSnapshot {
             lint_config.trailing_blank_lines_severity = None;
         }
 
-        let indentation_producer_policy = resolved_indentation_producer_policy(state, &lint_config);
+        let indentation_producer_policy = resolved_indentation_producer_policy(state);
 
         Some(DiagnosticsSnapshot {
             tree,

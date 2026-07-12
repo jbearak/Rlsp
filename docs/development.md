@@ -722,6 +722,15 @@ measured budget breach justifies the added invalidation state.
   settings to reconcile only when the rejected column exactly matches the
   resolved producer pass. Reconsider only if the combined settings
   doctrine itself is revisited.
+- **Mismatch advice cannot see tabs-mode editors:** the advice's producer
+  policy models settings-level availability only; the judge's per-request
+  bail conditions (`insertSpaces: false`, tab-shaped context) arrive in
+  `FormattingOptions` and are invisible to the diagnostics pass, so in a
+  tabs-mode editor the advice can attribute a space-led column to a producer
+  that would emit nothing there. Accepted as a known limitation (the flag
+  itself and the settings-reconciliation guidance both stay correct);
+  reconsider if per-document `insertSpaces` is ever synced to the server
+  like the indent unit is.
 
 - **`package_state/`** — Derived state for R package mode. Owns workspace detection result, namespace model, per-file facts (exported symbols, roxygen tags), and the aggregate scope contribution. Fully derive-based: `derive_package_state()` recomputes the entire `PackageState` from inputs.
 

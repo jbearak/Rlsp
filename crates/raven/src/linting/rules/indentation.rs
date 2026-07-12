@@ -60,10 +60,12 @@ use crate::utf16::strip_leading_bom_for_scan;
 /// The caller omits this when no producer policy exists (notably `raven
 /// check` without an `[indentation]` section), or when Tier 2 / the producer's
 /// infix axis is off. Keeping availability outside the rule prevents the lint
-/// from trying to resolve editor settings itself.
+/// from trying to resolve editor settings itself. The policy carries no
+/// indentation unit: the producer deliberately shares the lint's resolved
+/// per-document unit whenever the indentation rule is active, so the advice
+/// pass folds under the lint's own unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IndentationProducerPolicy {
-    pub(crate) indent_unit: u32,
     pub(crate) infix_style: InfixContinuationStyle,
 }
 
@@ -78,8 +80,6 @@ pub(crate) struct IndentationLintPolicy {
 
 #[derive(Clone, Copy)]
 struct MismatchAdvice {
-    producer_unit: u32,
-    lint_unit: u32,
     producer_style: InfixContinuationStyle,
     lint_style: InfixContinuationStyle,
 }
@@ -90,7 +90,6 @@ impl MismatchAdvice {
     /// producer expectation pass is allocated or folded.
     fn new(
         producer: Option<IndentationProducerPolicy>,
-        lint_unit: u32,
         lint_style: InfixContinuationStyle,
     ) -> Option<Self> {
         let producer = producer?;
@@ -105,8 +104,6 @@ impl MismatchAdvice {
             )
         );
         strict_opposites.then_some(Self {
-            producer_unit: producer.indent_unit,
-            lint_unit,
             producer_style: producer.infix_style,
             lint_style,
         })
@@ -124,16 +121,6 @@ impl MismatchAdvice {
 
     fn append_to(self, message: &mut String, actual: u32) {
         use std::fmt::Write as _;
-
-        if self.producer_unit != self.lint_unit {
-            write!(
-                message,
-                " This indentation matches an indentation unit of {}, while the lint uses {}. Set `raven.linting.indentationUnit` to match or use `\"auto\"`.",
-                self.producer_unit, self.lint_unit
-            )
-            .expect("writing to a String cannot fail");
-            return;
-        }
 
         let (producer, lint) = match (self.producer_style, self.lint_style) {
             (InfixContinuationStyle::Aligned, InfixContinuationStyle::Indented) => {
@@ -170,7 +157,7 @@ pub(crate) fn collect(
         return;
     }
 
-    let mismatch_advice = MismatchAdvice::new(producer_policy, indent_unit, infix_style);
+    let mismatch_advice = MismatchAdvice::new(producer_policy, infix_style);
 
     let mut string_interior: HashSet<u32> = HashSet::new();
     collect_string_interior_lines(root, &mut string_interior);
@@ -216,12 +203,12 @@ pub(crate) fn collect(
     let merged: HashMap<u32, Expected> = merge_pass_expectations(&passes);
 
     // This additional full fold exists only for one of the two strict
-    // producer/lint mismatches. It uses the producer's own unit and strict
-    // style so equality below means "the producer would emit this column",
-    // rather than merely "some tolerated column happens to match".
-    let producer_expectations = mismatch_advice.map(|advice| {
-        expectations_for_style(root, &lines, advice.producer_unit, advice.producer_style)
-    });
+    // producer/lint mismatches, and is deferred until the first flagged line
+    // so clean documents never pay for it. It uses the producer's strict
+    // style (under the shared lint unit) so equality below means "the
+    // producer would emit this column", rather than merely "some tolerated
+    // column happens to match".
+    let mut producer_expectations: Option<HashMap<u32, Expected>> = None;
 
     // lintr suppresses consecutive lints with the same indentation
     // difference — one diagnostic per run of equally mis-indented lines.
@@ -260,10 +247,11 @@ pub(crate) fn collect(
         }
 
         let mut message = expected.message(actual);
-        if let (Some(advice), Some(producer_expectations)) =
-            (mismatch_advice, producer_expectations.as_ref())
-        {
+        if let Some(advice) = mismatch_advice {
             let producer_expected = producer_expectations
+                .get_or_insert_with(|| {
+                    expectations_for_style(root, &lines, indent_unit, advice.producer_style)
+                })
                 .get(&line_no)
                 .cloned()
                 .unwrap_or_else(Expected::top_level);
@@ -1688,7 +1676,6 @@ mod tests {
         text: &str,
         lint_unit: u32,
         lint_style: InfixContinuationStyle,
-        producer_unit: u32,
         producer_style: InfixContinuationStyle,
     ) -> Vec<Diagnostic> {
         let tree = with_parser(|p| p.parse(text, None)).expect("parse must succeed");
@@ -1701,7 +1688,6 @@ mod tests {
                 indent_unit: lint_unit,
                 infix_style: lint_style,
                 producer_policy: Some(IndentationProducerPolicy {
-                    indent_unit: producer_unit,
                     infix_style: producer_style,
                 }),
             },
@@ -2901,7 +2887,6 @@ mod tests {
             "result <- foo() +\n          bar()\n",
             2,
             InfixContinuationStyle::Indented,
-            2,
             InfixContinuationStyle::Aligned,
         );
         assert_eq!(
@@ -2913,29 +2898,12 @@ mod tests {
             "x <- y |>\n  z\n",
             2,
             InfixContinuationStyle::Aligned,
-            2,
             InfixContinuationStyle::Indented,
         );
         assert_eq!(
             indented[0].message,
             "Indentation should be 5 spaces, not 2. Column 2 matches `raven.indentation.infixContinuationStyle = \"indented\"`; set `raven.linting.infixContinuationStyle` to `\"indented\"` or `\"either\"`, or change the auto-indent style to `\"aligned\"`."
         );
-    }
-
-    #[test]
-    fn unit_mismatch_uses_unit_advice_instead_of_style_advice() {
-        let diagnostics = lint_with_producer(
-            "x <- y |>\n    z\n",
-            2,
-            InfixContinuationStyle::Aligned,
-            4,
-            InfixContinuationStyle::Indented,
-        );
-        assert_eq!(
-            diagnostics[0].message,
-            "Indentation should be 5 spaces, not 4. This indentation matches an indentation unit of 4, while the lint uses 2. Set `raven.linting.indentationUnit` to match or use `\"auto\"`."
-        );
-        assert!(!diagnostics[0].message.contains("infixContinuationStyle"));
     }
 
     #[test]
@@ -2946,7 +2914,6 @@ mod tests {
                 "x <- y |>\n    z\n",
                 2,
                 InfixContinuationStyle::Indented,
-                2,
                 InfixContinuationStyle::Aligned,
             ),
             // Assignment continuations never carry an infix-style kind.
@@ -2954,7 +2921,6 @@ mod tests {
                 "x <-\n    y\n",
                 2,
                 InfixContinuationStyle::Aligned,
-                2,
                 InfixContinuationStyle::Indented,
             ),
         ] {
@@ -2970,21 +2936,18 @@ mod tests {
                 "x <- y |>\n   z\n",
                 2,
                 InfixContinuationStyle::Aligned,
-                2,
                 InfixContinuationStyle::Aligned,
             ),
             lint_with_producer(
                 "x <- y |>\n   z\n",
                 2,
                 InfixContinuationStyle::Indented,
-                2,
                 InfixContinuationStyle::Indented,
             ),
             lint_with_producer(
                 "x <- y |>\n   z\n",
                 2,
                 InfixContinuationStyle::Either,
-                2,
                 InfixContinuationStyle::Aligned,
             ),
             lint_with_style("x <- y |>\n  z\n", 2, InfixContinuationStyle::Aligned),
