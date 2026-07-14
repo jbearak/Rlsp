@@ -50,7 +50,7 @@ describe('Quarto preview URL parser', () => {
         });
     });
 
-    test('handles Browse-only at end-of-stream and Listening-only immediately', () => {
+    test('handles lone Browse and Listening candidates at end-of-stream', () => {
         const browseOnly = new QuartoPreviewOutputScanner();
         expect(browseOnly.feed('Browse at http://localhost:3210/document/\n')).toBeNull();
         expect(browseOnly.finish()).toEqual({
@@ -59,9 +59,23 @@ describe('Quarto preview URL parser', () => {
         });
 
         const listeningOnly = new QuartoPreviewOutputScanner();
-        expect(listeningOnly.feed('Listening on http://[::1]:7777/preview\n')).toEqual({
+        expect(listeningOnly.feed('Listening on http://[::1]:7777/preview\n')).toBeNull();
+        expect(listeningOnly.finish()).toEqual({
             origin: 'http://[::1]:7777',
             url: 'http://[::1]:7777/preview',
+        });
+    });
+
+    test('correlates Browse path when it arrives after Listening', () => {
+        const scanner = new QuartoPreviewOutputScanner();
+        expect(scanner.feed(
+            'Listening on http://127.0.0.1:4444/\n',
+        )).toBeNull();
+        expect(scanner.feed(
+            'Browse at http://localhost:4444/chapter/?preview=1#top\n',
+        )).toEqual({
+            origin: 'http://127.0.0.1:4444',
+            url: 'http://127.0.0.1:4444/chapter/?preview=1#top',
         });
     });
 
@@ -144,7 +158,10 @@ describe('Quarto preview URL parser', () => {
 
     test('keeps capturing raw tail after URL parsing stops', () => {
         const scanner = new QuartoPreviewOutputScanner();
-        scanner.feed('Listening on http://127.0.0.1:9999/\n');
+        scanner.feed(
+            'Browse at http://localhost:9999/\n' +
+            'Listening on http://127.0.0.1:9999/\n',
+        );
         expect(scanner.feed('fatal error after URL advertisement\n')).toBeNull();
         expect(scanner.startupTail()).toEndWith('fatal error after URL advertisement\n');
         expect(scanner.result()?.url).toBe('http://127.0.0.1:9999/');

@@ -21,6 +21,8 @@
  * the result retains only a 256-Ki-character tail of each stream. Quarto emits
  * `Output created:` near the end, so the tail is sufficient for output-path
  * parsing and useful failure context without allowing unbounded accumulation.
+ * Runtime tails retain bounded chunks and join only at completion, avoiding a
+ * full 256-KiB string recopy for every small process chunk.
  * Cancellation, timeout, and shutdown share one per-child teardown promise and
  * detach their exact data listeners and flush already-received partial stderr
  * once before signaling. Deactivation marks the result cancelled, keeping the
@@ -106,6 +108,48 @@ export function appendQuartoRenderTail(
     return combined.length <= limit ? combined : combined.slice(-limit);
 }
 
+/** Bounded chunk tail with no whole-tail copy on ordinary append. */
+export class QuartoRenderTailBuffer {
+    private chunks: string[] = [];
+    private head = 0;
+    private length = 0;
+
+    constructor(private readonly limit = QUARTO_RENDER_RETAINED_OUTPUT_CHARS) {}
+
+    append(chunk: string): void {
+        if (this.limit <= 0) return;
+        if (chunk.length >= this.limit) {
+            this.chunks = [chunk.slice(-this.limit)];
+            this.head = 0;
+            this.length = this.limit;
+            return;
+        }
+        this.chunks.push(chunk);
+        this.length += chunk.length;
+        let overflow = this.length - this.limit;
+        while (overflow > 0) {
+            const first = this.chunks[this.head];
+            if (first.length <= overflow) {
+                this.head++;
+                this.length -= first.length;
+                overflow -= first.length;
+            } else {
+                this.chunks[this.head] = first.slice(overflow);
+                this.length -= overflow;
+                overflow = 0;
+            }
+        }
+        if (this.head > 1_024 && this.head * 2 > this.chunks.length) {
+            this.chunks = this.chunks.slice(this.head);
+            this.head = 0;
+        }
+    }
+
+    value(): string {
+        return this.chunks.slice(this.head).join('');
+    }
+}
+
 export class QuartoRenderEngine {
     private readonly liveChildren = new Set<LiveRenderChild>();
     private deactivating = false;
@@ -171,8 +215,8 @@ export class QuartoRenderEngine {
         child: ChildProcess,
         live: LiveRenderChild,
     ): Promise<KnitEngineResult> {
-        let stdout = '';
-        let stderr = '';
+        const stdout = new QuartoRenderTailBuffer();
+        const stderr = new QuartoRenderTailBuffer();
         let cancelled = false;
         let timedOut = false;
         let spawnError: NodeJS.ErrnoException | null = null;
@@ -181,11 +225,11 @@ export class QuartoRenderEngine {
 
         let outputDetached = false;
         const onStdoutData = (chunk: string): void => {
-            stdout = appendQuartoRenderTail(stdout, chunk);
+            stdout.append(chunk);
             opts.output.append(chunk);
         };
         const onStderrData = (chunk: string): void => {
-            stderr = appendQuartoRenderTail(stderr, chunk);
+            stderr.append(chunk);
             stderrWriter.feed(chunk);
         };
         child.stdout?.setEncoding('utf8');
@@ -233,7 +277,14 @@ export class QuartoRenderEngine {
         for (const timer of timers) clearTimeout(timer);
         cancelHook.dispose();
         if (live.shuttingDown) cancelled = true;
-        return { exitCode, stdout, stderr, cancelled, timedOut, spawnError };
+        return {
+            exitCode,
+            stdout: stdout.value(),
+            stderr: stderr.value(),
+            cancelled,
+            timedOut,
+            spawnError,
+        };
     }
 }
 

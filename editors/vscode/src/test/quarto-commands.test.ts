@@ -7,6 +7,7 @@ import type { KnitEngineResult } from '../knit/knit-engine';
 import { QuartoNotFoundError } from '../quarto/quarto-detect';
 import { activate, awaitActive } from './helper';
 import {
+    createQuartoPreviewRunnerForTesting,
     createQuartoRenderRunnerForTesting,
     runQuartoPreflightForTesting,
     runQuartoStopForTesting,
@@ -179,6 +180,10 @@ suite('Quarto command preflight', () => {
                     isWorkspaceTrusted: () => { throw new Error('trust must not run'); },
                     openTextDocument: async () => { throw new Error('open must not run'); },
                     runtime: {
+                        registerPendingStart: () => { throw new Error('register must not run'); },
+                        reconcilePendingStart: () => { throw new Error('reconcile must not run'); },
+                        consumePendingStart: () => { throw new Error('consume must not run'); },
+                        releasePendingStart: () => { throw new Error('release must not run'); },
                         startOrRestart: async () => { throw new Error('start must not run'); },
                         stopByLookup: async () => 'none',
                     } as QuartoCommandDeps['runtime'],
@@ -210,6 +215,10 @@ suite('Quarto command preflight', () => {
                         projectRoot: null,
                     }),
                     runtime: {
+                        registerPendingStart: () => { throw new Error('register must not run'); },
+                        reconcilePendingStart: () => { throw new Error('reconcile must not run'); },
+                        consumePendingStart: () => { throw new Error('consume must not run'); },
+                        releasePendingStart: () => { throw new Error('release must not run'); },
                         startOrRestart: async () => {
                             throw new Error('start must not run');
                         },
@@ -230,6 +239,109 @@ suite('Quarto command preflight', () => {
             ]);
         } finally {
             (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('Stop during slow Preview resolution cancels the pending launch', async () => {
+        const resolveStarted = new Deferred<void>();
+        const finishResolve = new Deferred<string>();
+        const messages: string[] = [];
+        const original = vscode.window.showInformationMessage;
+        let pendingActive = false;
+        let launches = 0;
+        const runtime = {
+            registerPendingStart: (sourceFsPath: string) => {
+                pendingActive = true;
+                return { id: 1, sourceFsPath };
+            },
+            reconcilePendingStart: () => pendingActive,
+            consumePendingStart: () => {
+                const active = pendingActive;
+                pendingActive = false;
+                return active;
+            },
+            releasePendingStart: () => { pendingActive = false; },
+            startOrRestart: async () => {
+                launches++;
+                return { kind: 'superseded' as const, generation: 1 };
+            },
+            stopByLookup: async () => {
+                const stopped = pendingActive;
+                pendingActive = false;
+                return stopped ? 'stopped' as const : 'none' as const;
+            },
+        };
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            messages.push(message);
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/project/pending.qmd');
+            const deps = fakeDeps({
+                runtime,
+                resolver: {
+                    resolve: async () => {
+                        resolveStarted.resolve(undefined);
+                        return finishResolve.promise;
+                    },
+                },
+                resolveContext: () => ({
+                    key: '/project',
+                    cwd: '/project',
+                    projectRoot: '/project',
+                }),
+            });
+            const runPreview = createQuartoPreviewRunnerForTesting(deps);
+            const starting = runPreview(uri);
+            await resolveStarted.promise;
+
+            await runQuartoStopForTesting(uri, deps);
+            finishResolve.resolve('quarto');
+            await starting;
+
+            assert.strictEqual(launches, 0);
+            assert.ok(messages.includes('Quarto preview stopped.'));
+        } finally {
+            finishResolve.resolve('quarto');
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('deactivation Preview rejection and disposed output stay silent', async () => {
+        const original = vscode.window.showErrorMessage;
+        let errors = 0;
+        (vscode.window as { showErrorMessage: unknown }).showErrorMessage = (
+            _message: string,
+        ): Thenable<string | undefined> => {
+            errors++;
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/project/deactivating.qmd');
+            const deps = fakeDeps({
+                output: {
+                    appendLine: () => { throw new Error('disposed output'); },
+                } as unknown as vscode.OutputChannel,
+                runtime: {
+                    registerPendingStart: (sourceFsPath) => ({ id: 1, sourceFsPath }),
+                    reconcilePendingStart: () => true,
+                    consumePendingStart: () => true,
+                    releasePendingStart: () => undefined,
+                    startOrRestart: async () => {
+                        throw new Error(
+                            'Quarto runtime is deactivating; new previews are disabled.',
+                        );
+                    },
+                    stopByLookup: async () => 'none',
+                },
+            });
+
+            await createQuartoPreviewRunnerForTesting(deps)(uri);
+            assert.strictEqual(errors, 0);
+        } finally {
+            (vscode.window as { showErrorMessage: unknown }).showErrorMessage = original;
         }
     });
 
@@ -339,6 +451,73 @@ suite('Quarto command preflight', () => {
         await first;
     });
 
+    test('different files in one Quarto project share the render guard', async () => {
+        const renderStarted = new Deferred<void>();
+        const finishRender = new Deferred<KnitEngineResult>();
+        let renders = 0;
+        let opens = 0;
+        const firstUri = vscode.Uri.file('/project/chapters/a.qmd');
+        const secondUri = vscode.Uri.file('/project/chapters/b.qmd');
+        const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+            resolveContext: () => ({
+                key: '/project',
+                cwd: '/project',
+                projectRoot: '/project',
+            }),
+            openTextDocument: async (uri) => {
+                opens++;
+                return fakeDocument(uri, '# document');
+            },
+            runRender: async () => {
+                renders++;
+                renderStarted.resolve(undefined);
+                return finishRender.promise;
+            },
+        }));
+
+        const first = runRender(firstUri);
+        await renderStarted.promise;
+        await runRender(secondUri);
+
+        assert.strictEqual(renders, 1);
+        assert.strictEqual(opens, 1);
+        finishRender.resolve(successfulRenderResult());
+        await first;
+    });
+
+    test('different projects and standalone files render concurrently', async () => {
+        const runPair = async (projectRoots: boolean): Promise<void> => {
+            const bothStarted = new Deferred<void>();
+            const finishRender = new Deferred<KnitEngineResult>();
+            let renders = 0;
+            const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+                resolveContext: (sourceFsPath) => {
+                    const parent = path.dirname(sourceFsPath);
+                    return {
+                        key: projectRoots ? parent : sourceFsPath,
+                        cwd: parent,
+                        projectRoot: projectRoots ? parent : null,
+                    };
+                },
+                realpath: (sourceFsPath) => sourceFsPath,
+                runRender: async () => {
+                    renders++;
+                    if (renders === 2) bothStarted.resolve(undefined);
+                    return finishRender.promise;
+                },
+            }));
+            const first = runRender(vscode.Uri.file('/project-a/a.qmd'));
+            const second = runRender(vscode.Uri.file('/project-b/b.qmd'));
+            await bothStarted.promise;
+            assert.strictEqual(renders, 2);
+            finishRender.resolve(successfulRenderResult());
+            await Promise.all([first, second]);
+        };
+
+        await runPair(true);
+        await runPair(false);
+    });
+
     test('configured-path resolver error is surfaced with install actions', async () => {
         const prompts: Array<{ message: string; actions: string[] }> = [];
         const original = vscode.window.showErrorMessage;
@@ -398,6 +577,10 @@ suite('Quarto command preflight', () => {
         return {
             resolver: { resolve: async () => 'quarto' },
             runtime: {
+                registerPendingStart: (sourceFsPath) => ({ id: 1, sourceFsPath }),
+                reconcilePendingStart: () => true,
+                consumePendingStart: () => true,
+                releasePendingStart: () => undefined,
                 startOrRestart: async () => ({ kind: 'superseded', generation: 1 }),
                 stopByLookup: async () => 'none',
             } as QuartoCommandDeps['runtime'],

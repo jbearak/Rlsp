@@ -10,13 +10,16 @@
  * exits successfully but does not print Quarto's `Quarto CLI` marker is
  * rejected. The production probe drains both pipes, captures only a bounded
  * stdout prefix, and has a hard timeout so a wedged configured binary cannot
- * block command progress forever. Cache entries are the resolution promises,
- * so concurrent first use for one effective setting shares a single probe;
- * rejected promises are evicted to permit a later retry.
+ * block command progress forever. Probe children lead POSIX process groups;
+ * timeout termination uses the same platform-aware tree signal as render and
+ * preview. Cache entries are the resolution promises, so concurrent first use
+ * for one effective setting shares a single probe; rejected promises are
+ * evicted to permit a later retry.
  */
 
 import * as childProcess from 'child_process';
 import * as path from 'path';
+import { sendSignal } from '../knit/process-signals';
 import { isQuartoHelpOutput } from './quarto-probe';
 
 export class QuartoNotFoundError extends Error {
@@ -145,12 +148,15 @@ const QUARTO_PROBE_CAPTURE_LIMIT = 64 * 1024;
 export function probeQuartoBinary(
     bin: string,
     timeoutMs: number = QUARTO_PROBE_TIMEOUT_MS,
+    spawnProcess: typeof childProcess.spawn = childProcess.spawn,
+    signalProcess: typeof sendSignal = sendSignal,
 ): Promise<string> {
     return new Promise<string>((resolve, reject) => {
         let child: childProcess.ChildProcess;
         try {
-            child = childProcess.spawn(bin, ['--help'], {
+            child = spawnProcess(bin, ['--help'], {
                 stdio: ['ignore', 'pipe', 'pipe'],
+                detached: process.platform !== 'win32',
             });
         } catch (err) {
             reject(err);
@@ -167,7 +173,7 @@ export function probeQuartoBinary(
         };
         const timer = setTimeout(() => {
             finish(() => {
-                try { child.kill('SIGKILL'); } catch { /* best effort */ }
+                signalProcess(child, 'SIGKILL');
                 reject(new Error(`Quarto probe timed out after ${timeoutMs}ms`));
             });
         }, timeoutMs);

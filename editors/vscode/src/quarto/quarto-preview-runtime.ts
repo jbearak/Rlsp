@@ -1,12 +1,13 @@
 /**
  * Activation-scoped Quarto preview runtime with generation-safe sessions.
  *
- * Generation discipline is the central invariant: `startOrRestart` increments
- * the key's generation and replaces the map entry synchronously before its
- * first await. Every process close, readiness result, URI mapping, panel state
- * update, and panel-dispose stop carries `{ key, generation }` and is ignored
- * when stale. Restart therefore cannot let an old child, probe, mapping, or
- * disposed panel overwrite the replacement session.
+ * Generation discipline is the central invariant: every `startOrRestart`
+ * claims the next activation-global generation and replaces the map entry
+ * synchronously before its first await. Every process close, readiness result,
+ * URI mapping, panel state update, and panel-dispose stop carries
+ * `{ key, generation }` and is ignored when stale. Restart therefore cannot
+ * let an old child, probe, mapping, or disposed panel overwrite the replacement
+ * session, while a single counter avoids retaining historical keys forever.
  *
  * Source aliases point to the generation that originated a session. Stop can
  * consequently find a running preview after `_quarto.yml` appears or
@@ -32,6 +33,10 @@
  * Process stop/shutdown and recursive teardown are rejection-safe: injected or
  * defensive failures are logged and treated as settled so one rejected promise
  * cannot poison retirement ownership or a future predecessor drain.
+ * Command preflight is represented by a source-keyed pending-start intent.
+ * Stop can cancel that intent before a process session exists; once project
+ * discovery completes, the same intent is also addressable by final project
+ * key. Consuming the intent is the last synchronous gate before session claim.
  *
  * Shutdown rejects new starts, snapshots both live and retiring sessions,
  * sends immediate termination concurrently, and applies a cancelable global
@@ -95,6 +100,18 @@ export type QuartoStartResult =
     | { kind: 'failed'; generation: number; error: Error };
 
 export type QuartoStopResult = 'stopped' | 'already-stopping' | 'none';
+
+/** Opaque command-to-runtime ownership for a Preview still in preflight. */
+export interface QuartoPendingStart {
+    readonly id: number;
+    readonly sourceFsPath: string;
+}
+
+interface PendingStartRecord {
+    readonly token: QuartoPendingStart;
+    readonly sourceKey: string;
+    key: string | null;
+}
 
 /** One generation-tagged process slot. */
 export class Session {
@@ -196,11 +213,50 @@ export class QuartoRuntime {
     private readonly retiring = new Set<Session>();
     private readonly retirementHolds = new Map<Session, number>();
     private readonly sourceAliases = new Map<string, { key: string; generation: number }>();
-    private readonly nextGeneration = new Map<string, number>();
+    private readonly pendingStarts = new Map<number, PendingStartRecord>();
+    private nextPendingStartId = 0;
+    private nextGeneration = 0;
     private deactivating = false;
     private shutdownPromise: Promise<void> | null = null;
 
     constructor(private readonly deps: QuartoRuntimeDeps) {}
+
+    /** Register Preview intent synchronously before command preflight awaits. */
+    registerPendingStart(sourceFsPath: string): QuartoPendingStart {
+        const token = {
+            id: ++this.nextPendingStartId,
+            sourceFsPath,
+        };
+        if (!this.deactivating) {
+            this.pendingStarts.set(token.id, {
+                token,
+                sourceKey: canonicalOpKey({ fsPath: sourceFsPath }),
+                key: null,
+            });
+        }
+        return token;
+    }
+
+    /** Add the final project key while retaining the original source alias. */
+    reconcilePendingStart(token: QuartoPendingStart, key: string): boolean {
+        const pending = this.pendingStarts.get(token.id);
+        if (!pending || this.deactivating) return false;
+        pending.key = key;
+        return true;
+    }
+
+    /** Consume the uncancelled intent immediately before `startOrRestart`. */
+    consumePendingStart(token: QuartoPendingStart): boolean {
+        const pending = this.pendingStarts.get(token.id);
+        if (!pending || this.deactivating) return false;
+        this.pendingStarts.delete(token.id);
+        return true;
+    }
+
+    /** Release intent after any preflight/resolve early return. */
+    releasePendingStart(token: QuartoPendingStart): void {
+        this.pendingStarts.delete(token.id);
+    }
 
     /**
      * Claim a replacement synchronously, then drain its predecessor teardown.
@@ -222,8 +278,7 @@ export class QuartoRuntime {
             [oldByNewKey, oldByAlias, ...matchingRetirements]
                 .filter((old): old is Session => old !== null),
         )];
-        const generation = (this.nextGeneration.get(args.key) ?? 0) + 1;
-        this.nextGeneration.set(args.key, generation);
+        const generation = ++this.nextGeneration;
         const session = new Session(
             args.key,
             generation,
@@ -330,8 +385,9 @@ export class QuartoRuntime {
 
     /** Stop only when the panel's generation still owns the key. */
     async stopGeneration(key: string, generation: number): Promise<QuartoStopResult> {
+        const cancelledPending = this.cancelPendingStarts(key);
         const session = this.current(key, generation);
-        if (!session) return 'none';
+        if (!session) return cancelledPending ? 'stopped' : 'none';
         return this.stopSession(session);
     }
 
@@ -340,12 +396,13 @@ export class QuartoRuntime {
      * key and source path, and this method also consults the historical alias.
      */
     async stopByLookup(key: string, sourceFsPath: string): Promise<QuartoStopResult> {
+        const cancelledPending = this.cancelPendingStarts(key, sourceFsPath);
         let session = this.sessions.get(key) ?? null;
         if (!session) {
             const alias = this.sourceAliases.get(canonicalOpKey({ fsPath: sourceFsPath }));
             if (alias) session = this.current(alias.key, alias.generation);
         }
-        if (!session) return 'none';
+        if (!session) return cancelledPending ? 'stopped' : 'none';
         return this.stopSession(session);
     }
 
@@ -364,6 +421,7 @@ export class QuartoRuntime {
         ])];
         this.sessions.clear();
         this.sourceAliases.clear();
+        this.pendingStarts.clear();
         const all = Promise.allSettled(snapshot.map((session) => session.shutdown()));
         const bound = (this.deps.shutdownDelay ?? cancelableDelay)(
             this.deps.shutdownGlobalTimeoutMs ?? 7_000,
@@ -478,6 +536,24 @@ export class QuartoRuntime {
         if (alias?.key === session.key && alias.generation === session.generation) {
             this.sourceAliases.delete(sourceKey);
         }
+    }
+
+    private cancelPendingStarts(key: string, sourceFsPath?: string): boolean {
+        const sourceKey = sourceFsPath === undefined
+            ? null
+            : canonicalOpKey({ fsPath: sourceFsPath });
+        let cancelled = false;
+        for (const [id, pending] of this.pendingStarts) {
+            if (
+                pending.key === key
+                || pending.sourceKey === key
+                || pending.sourceKey === sourceKey
+            ) {
+                this.pendingStarts.delete(id);
+                cancelled = true;
+            }
+        }
+        return cancelled;
     }
 }
 

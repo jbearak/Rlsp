@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'bun:test';
+import type { ChildProcess, spawn } from 'child_process';
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
 import {
     defaultQuartoFallbacks,
+    probeQuartoBinary,
     QuartoNotFoundError,
     QuartoResolver,
 } from '../../editors/vscode/src/quarto/quarto-detect';
@@ -154,5 +158,32 @@ describe('defaultQuartoFallbacks', () => {
             '/usr/local/bin/quarto',
             '/opt/quarto/bin/quarto',
         ]);
+    });
+});
+
+describe('probeQuartoBinary teardown', () => {
+    it('spawns a process-group leader and tree-kills it on timeout', async () => {
+        class FakeChild extends EventEmitter {
+            readonly stdout = new PassThrough();
+            readonly stderr = new PassThrough();
+            pid = 4321;
+        }
+        const child = new FakeChild();
+        let detached: boolean | undefined;
+        const signals: string[] = [];
+        const spawnProcess = ((_bin, _args, options) => {
+            detached = options.detached;
+            return child as unknown as ChildProcess;
+        }) as typeof spawn;
+
+        await expect(probeQuartoBinary(
+            'quarto',
+            1,
+            spawnProcess,
+            (_child, signal) => { signals.push(signal); },
+        )).rejects.toThrow('timed out');
+
+        expect(detached).toBe(process.platform !== 'win32');
+        expect(signals).toEqual(['SIGKILL']);
     });
 });

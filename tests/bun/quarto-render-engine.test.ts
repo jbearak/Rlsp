@@ -13,6 +13,7 @@ import {
     MAX_NODE_TIMER_MS,
     normalizeQuartoRenderTimeoutMs,
     QuartoRenderEngine,
+    QuartoRenderTailBuffer,
     QUARTO_RENDER_RETAINED_OUTPUT_CHARS,
 } from '../../editors/vscode/src/quarto/quarto-render-engine';
 
@@ -60,6 +61,12 @@ describe('Quarto render result handling', () => {
         expect(parseRenderedOutputPath(retained).paths).toEqual([
             'rendered/report.html',
         ]);
+
+        const chunks = new QuartoRenderTailBuffer(8);
+        chunks.append('0123');
+        chunks.append('4567');
+        chunks.append('89');
+        expect(chunks.value()).toBe('23456789');
     });
 
     it('caps both the settings schema and armed Node timer delay', () => {

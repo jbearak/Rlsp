@@ -57,6 +57,7 @@ function processFor(
         output: { append() {}, appendLine() {} } as never,
         onUnexpectedExit() {},
         startupTimeoutMs: 1_000,
+        browseCorrelationDelayMs: 5,
         spawnProcess,
         ...overrides,
     });
@@ -127,11 +128,29 @@ describe('probeQuartoPreviewUrl', () => {
         await new Promise((resolve) => setTimeout(resolve, 120));
         expect(requests).toBe(1);
     });
+
+    it('dials localhost readiness URLs through the IPv4 listener', async () => {
+        const requested: string[] = [];
+        const status = await probeQuartoPreviewUrl(
+            'http://localhost:4777/chapter/?preview=1',
+            1,
+            0,
+            async (url) => {
+                requested.push(url);
+                return 204;
+            },
+        );
+
+        expect(status).toBe(204);
+        expect(requested).toEqual([
+            'http://127.0.0.1:4777/chapter/?preview=1',
+        ]);
+    });
 });
 
 describe('Quarto preview startup idle timeout', () => {
     it('uses a generous output-idle default', () => {
-        expect(QUARTO_PREVIEW_STARTUP_TIMEOUT_MS).toBe(60_000);
+        expect(QUARTO_PREVIEW_STARTUP_TIMEOUT_MS).toBe(120_000);
     });
 
     it('keeps a long initial render alive while output remains active', async () => {
@@ -230,6 +249,29 @@ describe('Quarto preview output line handling', () => {
 });
 
 describe('Quarto preview process stop ladder', () => {
+    it('stop before correlation fires clears the timer and settles start promptly', async () => {
+        const child = new NeverClosingFakeChild();
+        let probes = 0;
+        const process = processFor(child, {
+            browseCorrelationDelayMs: 100,
+            probe: async () => {
+                probes++;
+                return 200;
+            },
+            signalGraceMs: 1,
+            killWaitMs: 1,
+        });
+        const starting = process.start();
+        child.stderr.write('Browse at http://localhost:4555/chapter/\n');
+
+        const stopping = process.stop();
+        await expect(starting).rejects.toThrow('startup was stopped');
+        await stopping;
+        await new Promise((resolve) => setTimeout(resolve, 120));
+
+        expect(probes).toBe(0);
+    });
+
     it('aborts an active readiness probe when stop begins', async () => {
         const child = new FakeChild();
         const probeStarted = new Deferred<void>();
@@ -402,14 +444,17 @@ describe('Quarto deactivation ordering', () => {
         const runtimeShutdown = source.indexOf(
             'const previews = lifecycle.runtime.shutdown();',
         );
+        const commandShutdown = source.indexOf(
+            'const commands = lifecycle.commands.shutdown();',
+        );
         const panelDisposal = source.indexOf(
             'QuartoPreviewPanel.disposeAllForDeactivation();',
         );
-        const boundedAggregate = source.indexOf(
-            'Promise.allSettled([previews, renders])',
-        );
+        const boundedAggregate = source.indexOf('Promise.allSettled([');
         const outputDisposal = source.indexOf('lifecycle.output.dispose();');
 
+        expect(commandShutdown).toBeGreaterThan(-1);
+        expect(runtimeShutdown).toBeGreaterThan(commandShutdown);
         expect(runtimeShutdown).toBeGreaterThan(-1);
         expect(panelDisposal).toBeGreaterThan(runtimeShutdown);
         expect(boundedAggregate).toBeGreaterThan(panelDisposal);

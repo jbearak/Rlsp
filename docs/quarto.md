@@ -89,7 +89,7 @@ therefore:
    it in the preview panel.
 
 A long initial render remains in startup while Quarto continues producing
-output. Raven treats startup as hung only after 60 seconds with no stdout or
+output. Raven treats startup as hung only after 120 seconds with no stdout or
 stderr activity, and stopping Preview cancels any outstanding readiness probe.
 
 A persistent 404 is treated as a non-browser-previewable output format, and
@@ -114,7 +114,8 @@ panel also stops the generation owned by that panel.
 
 Stopping is idempotent: a second request while the process is already stopping
 does nothing. Raven reports when the preview stopped or when no matching
-preview is running.
+preview is running. Stop also cancels a Preview command that is still saving,
+discovering Quarto, or otherwise completing preflight, before a process starts.
 
 ### Quarto Render
 
@@ -126,18 +127,20 @@ quarto render <file>
 
 The command runs in the same project-aware working directory as Preview. It
 uses a cancellable progress notification, streams output to **Raven: Quarto**,
-and permits only one render at a time for a given physical source file, including
-when it is opened through a symlink. It does not start a preview server. The
-per-file guard is released when the Quarto process finishes; choosing or
-dismissing an action in the outcome notification does not block a subsequent
-render.
+and permits only one render at a time for a Quarto project, preventing two
+documents from concurrently modifying shared `_site`, `.quarto`, or freeze
+state. Standalone files retain independent render slots, with symlink aliases
+treated as the same file. It does not start a preview server. The guard is
+released when the Quarto process finishes; choosing or dismissing an action in
+the outcome notification does not block a subsequent render.
 
 After Quarto exits:
 
 - If Quarto reports an HTML, PDF, or DOCX output path, Raven shows a **Saved**
   notification with format-appropriate open actions. In a remote workspace,
   the external-open action becomes **Download**. **Open in Editor** remains
-  available.
+  available. Relative paths are checked against both the source document's
+  directory and the Quarto project working directory.
 - For another reported output type, Raven shows a **Rendered** notification
   with **Reveal**.
 - If Quarto exits successfully but does not print an output path Raven can

@@ -134,6 +134,58 @@ const startArgs = {
 };
 
 describe('QuartoRuntime generation discipline', () => {
+    it('uses one monotonic generation counter across distinct keys', async () => {
+        const h = harness();
+        const first = h.runtime.startOrRestart({
+            ...startArgs,
+            key: '/project-a',
+            sourceFsPath: '/project-a/a.qmd',
+            cwd: '/project-a',
+        });
+        const second = h.runtime.startOrRestart({
+            ...startArgs,
+            key: '/project-b',
+            sourceFsPath: '/project-b/b.qmd',
+            cwd: '/project-b',
+        });
+        await waitForProcessCount(h.processes, 2);
+        h.processes[0].process.ready.resolve({
+            rawUrl: 'http://127.0.0.1:1/',
+            origin: 'http://127.0.0.1:1',
+            statusCode: 200,
+        });
+        h.processes[1].process.ready.resolve({
+            rawUrl: 'http://127.0.0.1:2/',
+            origin: 'http://127.0.0.1:2',
+            statusCode: 200,
+        });
+
+        expect((await first).generation).toBe(1);
+        expect((await second).generation).toBe(2);
+    });
+
+    it('Stop cancels pending Preview intent before a session exists', async () => {
+        const h = harness();
+        const source = '/project/pending.qmd';
+        const pending = h.runtime.registerPendingStart(source);
+
+        expect(await h.runtime.stopByLookup('/project', source)).toBe('stopped');
+        expect(h.runtime.reconcilePendingStart(pending, '/project')).toBe(false);
+        expect(h.runtime.consumePendingStart(pending)).toBe(false);
+        expect(h.processes).toHaveLength(0);
+        expect(await h.runtime.stopByLookup('/project', source)).toBe('none');
+    });
+
+    it('generation Stop cancels a reconciled pending Preview intent', async () => {
+        const h = harness();
+        const pending = h.runtime.registerPendingStart('/project/pending.qmd');
+        expect(h.runtime.reconcilePendingStart(pending, '/project')).toBe(true);
+
+        expect(await h.runtime.stopGeneration('/project', 99)).toBe('stopped');
+        expect(h.runtime.consumePendingStart(pending)).toBe(false);
+        expect(h.processes).toHaveLength(0);
+    });
+
     it('simultaneous Start/Start claims generation 2 before generation 1 can finish', async () => {
         const h = harness();
         const first = h.runtime.startOrRestart(startArgs);

@@ -6,16 +6,21 @@
  * per-document Shiny rejection, then project-context discovery. Stop
  * intentionally bypasses every one of those gates: it performs no trust check,
  * save, frontmatter parse, or CLI resolution, and looks up the existing runtime
- * by current key or source alias.
+ * by current key or source alias. Preview registers a source-keyed pending
+ * intent before its first await; Stop can cancel it during preflight or binary
+ * discovery, and the continuation consumes it immediately before runtime
+ * session claim.
  *
  * Render key ownership is reserved before the document is opened or saved and
- * covers preflight + resolver + subprocess work. The local guard resolves
- * symlinks when possible, while runtime ownership keeps its existing lexical
- * canonicalization. The guard is released before install or outcome
- * notifications are awaited, so a completed render's toast cannot block the
- * next invocation. Notifications remain outside `withProgress`; raw results
- * use knit's precedence exactly: spawn error, then cancellation, then timeout,
- * so a cancellation racing the timer stays silent.
+ * covers preflight + resolver + subprocess work. Project renders share their
+ * project key; standalone renders use a symlink-resolved source key when
+ * possible. Runtime ownership keeps its existing lexical canonicalization.
+ * The guard is released before install or outcome notifications are awaited,
+ * so a completed render's toast cannot block the next invocation.
+ * Activation-scoped command ownership lets deactivation await asynchronous
+ * continuations under a bound. Notifications remain outside `withProgress`;
+ * raw results use knit's precedence exactly: spawn error, then cancellation,
+ * then timeout, so a cancellation racing the timer stays silent.
  */
 
 import * as fs from 'fs';
@@ -27,6 +32,7 @@ import { parseRenderedOutputPath } from '../knit/output-path';
 import { canonicalOpKey } from '../knit/raven-knit-paths';
 import { extractFrontmatter, parseFrontmatter } from '../knit/yaml-frontmatter';
 import { QuartoNotFoundError, type QuartoResolver } from './quarto-detect';
+import { QuartoCommandLifecycle } from './quarto-command-lifecycle';
 import { isShinyServerDocument } from './quarto-frontmatter';
 import { stripAnsi } from './preview-url-parser';
 import {
@@ -34,17 +40,29 @@ import {
     type QuartoContext,
 } from './quarto-project';
 import { isQuartoProjectMarkerFile } from './quarto-project-fs';
-import type { QuartoRuntime } from './quarto-preview-runtime';
+import type {
+    QuartoPendingStart,
+    QuartoRuntime,
+} from './quarto-preview-runtime';
 import {
     classifyQuartoRenderResult,
     DEFAULT_QUARTO_RENDER_TIMEOUT_MS,
     normalizeQuartoRenderTimeoutMs,
     type QuartoRenderOptions,
 } from './quarto-render-engine';
+import { resolveQuartoRenderedOutputPath } from './quarto-render-output';
 
 export interface QuartoCommandDeps {
     resolver: Pick<QuartoResolver<vscode.Uri>, 'resolve'>;
-    runtime: Pick<QuartoRuntime, 'startOrRestart' | 'stopByLookup'>;
+    runtime: Pick<
+        QuartoRuntime,
+        | 'startOrRestart'
+        | 'stopByLookup'
+        | 'registerPendingStart'
+        | 'reconcilePendingStart'
+        | 'consumePendingStart'
+        | 'releasePendingStart'
+    >;
     output: vscode.OutputChannel;
     runRender: (opts: QuartoRenderOptions) => Promise<KnitEngineResult>;
     resolveContext?: (sourceFsPath: string) => QuartoContext;
@@ -76,34 +94,15 @@ type QuartoRenderRunner = (uri?: vscode.Uri) => Promise<void>;
 export function registerQuartoCommands(
     context: vscode.ExtensionContext,
     deps: QuartoCommandDeps,
-): void {
+): QuartoCommandLifecycle {
+    const commandLifecycle = new QuartoCommandLifecycle();
     const runGuardedRender = createQuartoRenderRunner(deps);
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('raven.quarto.preview', async (uri?: vscode.Uri) => {
-            const preflight = await runPreflight(uri, 'Preview', deps);
-            if (!preflight) return;
-            let quartoPath: string;
-            try {
-                quartoPath = await deps.resolver.resolve(preflight.uri);
-            } catch (err) {
-                if (err instanceof QuartoNotFoundError) {
-                    await offerQuartoInstall(err);
-                    return;
-                }
-                throw err;
-            }
-            deps.output.appendLine(`\n[preview] ${preflight.uri.fsPath}`);
-            await deps.runtime.startOrRestart({
-                key: preflight.context.key,
-                cwd: preflight.context.cwd,
-                sourceFsPath: preflight.uri.fsPath,
-                quartoPath,
-            });
-        }),
-        vscode.commands.registerCommand('raven.quarto.render', async (uri?: vscode.Uri) => {
-            await runGuardedRender(uri);
-        }),
+        vscode.commands.registerCommand('raven.quarto.preview', (uri?: vscode.Uri) =>
+            commandLifecycle.run(() => runPreviewCommand(uri, deps))),
+        vscode.commands.registerCommand('raven.quarto.render', (uri?: vscode.Uri) =>
+            commandLifecycle.run(() => runGuardedRender(uri))),
         vscode.commands.registerCommand('raven.quarto.stopPreview', async (uri?: vscode.Uri) => {
             await runStopCommand(uri, deps);
         }),
@@ -111,6 +110,7 @@ export function registerQuartoCommands(
             deps.output.show(true);
         }),
     );
+    return commandLifecycle;
 }
 
 /** Exported seam for Mocha command-policy tests. */
@@ -135,6 +135,64 @@ export function createQuartoRenderRunnerForTesting(
     deps: QuartoCommandDeps,
 ): QuartoRenderRunner {
     return createQuartoRenderRunner(deps);
+}
+
+/** Exported factory for pending-Preview command-policy tests. */
+export function createQuartoPreviewRunnerForTesting(
+    deps: QuartoCommandDeps,
+): (uri?: vscode.Uri) => Promise<void> {
+    return (uri) => runPreviewCommand(uri, deps);
+}
+
+async function runPreviewCommand(
+    explicitUri: vscode.Uri | undefined,
+    deps: QuartoCommandDeps,
+): Promise<void> {
+    const uri = explicitUri ?? vscode.window.activeTextEditor?.document.uri;
+    let pending: QuartoPendingStart | null = isFileQmdUri(uri)
+        ? deps.runtime.registerPendingStart(uri.fsPath)
+        : null;
+    try {
+        const preflight = await runPreflight(uri, 'Preview', deps);
+        if (!preflight || !pending) return;
+        if (!deps.runtime.reconcilePendingStart(pending, preflight.context.key)) return;
+
+        let quartoPath: string;
+        try {
+            quartoPath = await deps.resolver.resolve(preflight.uri);
+        } catch (err) {
+            if (!deps.runtime.consumePendingStart(pending)) {
+                pending = null;
+                return;
+            }
+            pending = null;
+            if (err instanceof QuartoNotFoundError) {
+                await offerQuartoInstall(err);
+                return;
+            }
+            throw err;
+        }
+        if (!deps.runtime.consumePendingStart(pending)) {
+            pending = null;
+            return;
+        }
+        pending = null;
+
+        safeAppendLine(deps.output, `\n[preview] ${preflight.uri.fsPath}`);
+        try {
+            await deps.runtime.startOrRestart({
+                key: preflight.context.key,
+                cwd: preflight.context.cwd,
+                sourceFsPath: preflight.uri.fsPath,
+                quartoPath,
+            });
+        } catch (err) {
+            if (isRuntimeDeactivatingError(err)) return;
+            throw err;
+        }
+    } finally {
+        if (pending) deps.runtime.releasePendingStart(pending);
+    }
 }
 
 async function runPreflight(
@@ -173,10 +231,16 @@ async function validateQuartoRunUri(
     return true;
 }
 
+function isFileQmdUri(uri: vscode.Uri | undefined): uri is vscode.Uri {
+    return uri?.scheme === 'file'
+        && path.extname(uri.fsPath || uri.path).toLowerCase() === '.qmd';
+}
+
 async function runPreflightForValidatedUri(
     uri: vscode.Uri,
     label: 'Preview' | 'Render',
     deps: QuartoCommandDeps,
+    knownContext?: QuartoContext,
 ): Promise<QuartoPreflight | null> {
     const trusted = deps.isWorkspaceTrusted?.() ?? vscode.workspace.isTrusted;
     if (!trusted) {
@@ -206,7 +270,7 @@ async function runPreflightForValidatedUri(
         try {
             saved = await document.save();
         } catch (err) {
-            deps.output.appendLine(`[quarto] save failed: ${errorMessage(err)}`);
+            safeAppendLine(deps.output, `[quarto] save failed: ${errorMessage(err)}`);
         }
         if (!saved) {
             await vscode.window.showWarningMessage(
@@ -227,16 +291,17 @@ async function runPreflightForValidatedUri(
         return null;
     }
     if (!parsed.ok) {
-        deps.output.appendLine(
+        safeAppendLine(
+            deps.output,
             `[quarto] frontmatter parse failed; Quarto will validate it: ${parsed.error}`,
         );
     }
 
-    const resolveContext = deps.resolveContext ?? ((sourceFsPath: string) =>
-        resolveQuartoContext(sourceFsPath, {
-            isProjectMarkerFile: isQuartoProjectMarkerFile,
-        }));
-    return { uri, document, context: resolveContext(uri.fsPath) };
+    return {
+        uri,
+        document,
+        context: knownContext ?? resolveContextForSource(uri.fsPath, deps),
+    };
 }
 
 async function runStopCommand(
@@ -276,7 +341,8 @@ function createQuartoRenderRunner(deps: QuartoCommandDeps): QuartoRenderRunner {
         }
         if (!await validateQuartoRunUri(uri, 'Render')) return;
 
-        const opKey = renderGuardKey(uri, deps);
+        const context = resolveContextForSource(uri.fsPath, deps);
+        const opKey = renderGuardKey(uri, context, deps);
         if (inFlightRenders.has(opKey)) {
             await vscode.window.showInformationMessage(
                 `A Quarto render is already running for ` +
@@ -288,7 +354,12 @@ function createQuartoRenderRunner(deps: QuartoCommandDeps): QuartoRenderRunner {
         // Deferring the work by one microtask lets ownership enter the map
         // before openTextDocument/save can run, even for simultaneous calls.
         const run = Promise.resolve().then(async (): Promise<QuartoRenderRunResult> => {
-            const preflight = await runPreflightForValidatedUri(uri, 'Render', deps);
+            const preflight = await runPreflightForValidatedUri(
+                uri,
+                'Render',
+                deps,
+                context,
+            );
             if (!preflight) return { kind: 'preflight-stopped' };
             return runRenderProcess(preflight, deps);
         });
@@ -314,13 +385,29 @@ function createQuartoRenderRunner(deps: QuartoCommandDeps): QuartoRenderRunner {
     };
 }
 
-function renderGuardKey(uri: vscode.Uri, deps: QuartoCommandDeps): string {
+function renderGuardKey(
+    uri: vscode.Uri,
+    context: QuartoContext,
+    deps: QuartoCommandDeps,
+): string {
+    if (context.projectRoot !== null) return `project:${context.key}`;
     try {
         const realpath = deps.realpath ?? fs.realpathSync.native;
-        return canonicalOpKey({ fsPath: realpath(uri.fsPath) });
+        return `file:${canonicalOpKey({ fsPath: realpath(uri.fsPath) })}`;
     } catch {
-        return canonicalOpKey(uri);
+        return `file:${canonicalOpKey(uri)}`;
     }
+}
+
+function resolveContextForSource(
+    sourceFsPath: string,
+    deps: QuartoCommandDeps,
+): QuartoContext {
+    const resolveContext = deps.resolveContext ?? ((candidate: string) =>
+        resolveQuartoContext(candidate, {
+            isProjectMarkerFile: isQuartoProjectMarkerFile,
+        }));
+    return resolveContext(sourceFsPath);
 }
 
 async function runRenderProcess(
@@ -341,7 +428,7 @@ async function runRenderProcess(
         .getConfiguration('raven.quarto', preflight.uri)
         .get<unknown>('render.timeoutMs', DEFAULT_QUARTO_RENDER_TIMEOUT_MS);
     const timeoutMs = normalizeQuartoRenderTimeoutMs(configuredTimeoutMs);
-    deps.output.appendLine(`\n[render] ${preflight.uri.fsPath}`);
+    safeAppendLine(deps.output, `\n[render] ${preflight.uri.fsPath}`);
     const result = await vscode.window.withProgress<KnitEngineResult>(
         {
             location: vscode.ProgressLocation.Notification,
@@ -368,7 +455,10 @@ async function renderOutcome(
 ): Promise<void> {
     const kind = classifyQuartoRenderResult(result);
     if (kind === 'spawnError') {
-        output.appendLine(`[render] spawn error: ${result.spawnError?.message ?? 'unknown error'}`);
+        safeAppendLine(
+            output,
+            `[render] spawn error: ${result.spawnError?.message ?? 'unknown error'}`,
+        );
         await offerQuartoInstall();
         return;
     }
@@ -401,7 +491,11 @@ async function renderOutcome(
         );
         return;
     }
-    const outputPath = path.isAbsolute(last) ? last : path.resolve(preflight.context.cwd, last);
+    const outputPath = resolveQuartoRenderedOutputPath(
+        last,
+        preflight.uri.fsPath,
+        preflight.context.cwd,
+    );
     const uri = vscode.Uri.file(outputPath);
     const format = exportedFormat(outputPath);
     if (format) {
@@ -451,4 +545,13 @@ async function offerQuartoInstall(error?: QuartoNotFoundError): Promise<void> {
 
 function errorMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
+}
+
+function isRuntimeDeactivatingError(err: unknown): boolean {
+    return err instanceof Error
+        && err.message.includes('Quarto runtime is deactivating');
+}
+
+function safeAppendLine(output: vscode.OutputChannel, value: string): void {
+    try { output.appendLine(value); } catch { /* output may be disposed */ }
 }
