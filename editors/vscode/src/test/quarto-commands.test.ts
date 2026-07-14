@@ -27,6 +27,8 @@ class Deferred<T> {
 
 suite('Quarto command preflight', () => {
     let output: vscode.OutputChannel;
+    let trueShowInformationMessage: typeof vscode.window.showInformationMessage;
+    let trueShowErrorMessage: typeof vscode.window.showErrorMessage;
 
     suiteSetup(async () => {
         await activate();
@@ -34,6 +36,26 @@ suite('Quarto command preflight', () => {
     });
 
     suiteTeardown(() => output.dispose());
+
+    setup(() => {
+        trueShowInformationMessage = vscode.window.showInformationMessage;
+        trueShowErrorMessage = vscode.window.showErrorMessage;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            _message: string,
+        ): Thenable<string | undefined> => Promise.resolve(undefined);
+        (vscode.window as { showErrorMessage: unknown }).showErrorMessage = (
+            _message: string,
+        ): Thenable<string | undefined> => Promise.resolve(undefined);
+    });
+
+    teardown(() => {
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            trueShowInformationMessage
+        );
+        (vscode.window as { showErrorMessage: unknown }).showErrorMessage = (
+            trueShowErrorMessage
+        );
+    });
 
     test('workspace trust gate offers Manage Workspace Trust', async () => {
         const messages: string[] = [];
@@ -101,7 +123,7 @@ suite('Quarto command preflight', () => {
         }
     });
 
-    test('dirty document is saved before context resolution', async () => {
+    test('dirty document is saved before the render subprocess reads it', async () => {
         const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-quarto-save-'));
         const sourcePath = path.join(tmp, 'save-before-run.qMd');
         fs.writeFileSync(sourcePath, '---\ntitle: Save\n---\n\nBefore\n', 'utf8');
@@ -115,16 +137,28 @@ suite('Quarto command preflight', () => {
         ));
         assert.strictEqual(doc.isDirty, true);
 
-        let resolvedAfterSave = false;
+        let renderSawSavedMarker = false;
         try {
-            const result = await runQuartoPreflightForTesting(uri, 'Render', fakeDeps({
-                resolveContext: async () => {
-                    resolvedAfterSave = fs.readFileSync(sourcePath, 'utf8').includes('Saved marker');
-                    return { key: sourcePath, cwd: tmp, projectRoot: null };
+            const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+                resolveContext: async () => ({
+                    key: sourcePath,
+                    cwd: tmp,
+                    projectRoot: null,
+                }),
+                openTextDocument: async (requestedUri) => {
+                    assert.strictEqual(requestedUri.toString(), uri.toString());
+                    return doc;
+                },
+                runRender: async () => {
+                    renderSawSavedMarker = fs.readFileSync(sourcePath, 'utf8')
+                        .includes('Saved marker');
+                    return successfulRenderResult();
                 },
             }));
-            assert.ok(result);
-            assert.strictEqual(resolvedAfterSave, true);
+
+            await runRender(uri);
+
+            assert.strictEqual(renderSawSavedMarker, true);
             assert.strictEqual(doc.isDirty, false);
         } finally {
             await awaitActive(editor);
