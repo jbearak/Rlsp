@@ -107,7 +107,13 @@ export function inlineLocalImagesAsDataUrls(
     options: InlineImagesOptions = {},
 ): string {
     const allowedRoots = [docDir, ...(options.additionalRoots ?? [])];
-    return html.replace(/<img\b([^>]*)>/gi, (match, attrs: string) => {
+    // Quote-aware `<img>` matcher: the attribute run is a sequence of
+    // double-quoted strings, single-quoted strings, or non-quote /
+    // non-`>` characters, so a literal `>` inside an attribute value
+    // (e.g. `alt="a > b"`) doesn't prematurely terminate the tag. The
+    // three alternatives are mutually exclusive (`[^>"']` excludes both
+    // quotes), so there is no ambiguity to backtrack over.
+    return html.replace(/<img\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/gi, (match, attrs: string) => {
         // Locate the `src` attribute with a quote-aware tokenizer rather
         // than a regex over the raw attribute blob. A regex can't tell
         // an `src=` at an attribute boundary from `src=`-looking text
@@ -135,11 +141,19 @@ export function inlineLocalImagesAsDataUrls(
         // Protocol-relative URL.
         if (src.startsWith('//')) return match;
 
-        // Split src into path, `?query`, and `#fragment`. htmlwidgets
-        // and similar renderers emit cache-busters (`plot.png?v=1`) and
-        // SVG view fragments (`diagram.svg#layer-1`). Feeding the whole
-        // src to `path.resolve` / `path.extname` would fold the suffix
-        // into the filename (wrong file, and `.png?v=1` maps to no MIME).
+        // Decode HTML entities up front. An HTML parser resolves entity
+        // references in an attribute value before anything consumes it,
+        // so a workspace image `a&b.png` emitted as `a&amp;b.png` (or as
+        // the numeric `a&#38;b.png`) must be decoded to `a&b.png`. Doing
+        // this BEFORE the URL split below also stops a numeric reference
+        // like `&#38;` from having its `#` misread as a fragment.
+        const decodedSrc = decodeHtmlEntities(src);
+
+        // Split into path, `?query`, and `#fragment`. htmlwidgets and
+        // similar renderers emit cache-busters (`plot.png?v=1`) and SVG
+        // view fragments (`diagram.svg#layer-1`). Feeding the whole value
+        // to `path.resolve` / `path.extname` would fold the suffix into
+        // the filename (wrong file, and `.png?v=1` maps to no MIME).
         //
         // Only the fragment rides along on the emitted data URL: a
         // fragment is a real URL component (split off before the data is
@@ -148,24 +162,22 @@ export function inlineLocalImagesAsDataUrls(
         // forgiving-base64 a `?` in the data portion is an invalid
         // base64 code point that fails the decode, so appending it would
         // break the image.
-        const hashIdx = src.indexOf('#');
-        const fragment = hashIdx >= 0 ? src.slice(hashIdx) : '';
-        const beforeHash = hashIdx >= 0 ? src.slice(0, hashIdx) : src;
+        const hashIdx = decodedSrc.indexOf('#');
+        const fragment = hashIdx >= 0 ? decodedSrc.slice(hashIdx) : '';
+        const beforeHash = hashIdx >= 0 ? decodedSrc.slice(0, hashIdx) : decodedSrc;
         const queryIdx = beforeHash.indexOf('?');
         const srcPath = queryIdx >= 0 ? beforeHash.slice(0, queryIdx) : beforeHash;
         const srcSuffix = fragment;
 
-        // Recover the on-disk path from what the markdown/HTML renderer
-        // emitted. VS Code's `markdown.api.render` percent-encodes image
-        // paths (so a workspace image `café.png` arrives as
-        // `caf%C3%A9.png`) and HTML-escapes `&` (`a&b.png` → `a&amp;b.png`),
-        // while a raw passthrough `<img>` tag is left verbatim. A browser
-        // percent-DECODES a `src` before hitting the filesystem, so try
-        // the decoded spelling FIRST (matching what the browser and
-        // Open-in-Browser would load); fall back to the literal spelling
-        // only if the decoded one doesn't resolve, which also covers a
-        // filename that genuinely contains `%`/`&`.
-        const pathCandidates = decodedPathCandidates(srcPath);
+        // A browser percent-DECODES a `src` path before hitting the
+        // filesystem (VS Code's `markdown.api.render` percent-encodes
+        // paths, so a workspace image `café.png` arrives as
+        // `caf%C3%A9.png`). Try the decoded spelling FIRST — matching
+        // what the browser and Open-in-Browser would load — and fall
+        // back to the literal spelling only if the decoded one doesn't
+        // resolve, which also covers a filename that genuinely contains
+        // a `%`.
+        const pathCandidates = percentDecodedCandidates(srcPath);
 
         // Absolute paths resolve as-is; relative paths resolve against
         // the rendered document's directory (`docDir`). The leading
@@ -235,7 +247,9 @@ export function inlineLocalImagesAsDataUrls(
         }
 
         const dataUrl = `data:${mime};base64,${bytes.toString('base64')}${srcSuffix}`;
-        const rewrittenAttrs = attrs.replace(srcAttr.match, `src="${dataUrl}"`);
+        const rewrittenAttrs = attrs.slice(0, srcAttr.start)
+            + `src="${dataUrl}"`
+            + attrs.slice(srcAttr.end);
         const finalAttrs = options.markSvgPlots && ext === '.svg' && isKnitFigurePath(normalizedRelative)
             ? withImgAttribute(rewrittenAttrs, 'data-raven-plot-svg', 'true')
             : rewrittenAttrs;
@@ -249,10 +263,15 @@ interface HtmlAttribute {
     /** The attribute value with surrounding quotes stripped. */
     value: string;
     /**
-     * The exact source substring matched (name through value), so a
-     * caller can `String.prototype.replace` it back into the tag.
+     * Half-open `[start, end)` offsets of the matched `name=value` span
+     * within the attribute string. Splice by these offsets rather than
+     * `String.prototype.replace(matchText, …)`: an identical
+     * `src=value` substring can also appear inside an EARLIER
+     * attribute's quoted value (`alt="src='x'"`), and a textual replace
+     * would hit that first occurrence instead of the real attribute.
      */
-    match: string;
+    start: number;
+    end: number;
 }
 
 /**
@@ -280,46 +299,66 @@ function findAttribute(attrs: string, name: string): HtmlAttribute | null {
                     || (raw[0] === "'" && raw.endsWith("'")));
             value = quoted ? raw.slice(1, -1) : raw;
         }
-        return { name: m[1], value, match: m[0] };
+        return { name: m[1], value, start: m.index, end: m.index + m[0].length };
     }
     return null;
 }
 
 /**
- * The distinct on-disk-path spellings to try for a rendered image
- * `src`, DECODED first. A browser percent-decodes (and the HTML parser
- * entity-decodes) a `src` before hitting the filesystem, so the decoded
- * spelling is what actually loads — trying it first means that when both
- * `a b.png` and a literal `a%20b.png` exist, `src="a%20b.png"` inlines
- * `a b.png`, matching the browser. The literal spelling is kept as a
- * fallback so a filename that genuinely contains `%`/`&` (and whose
- * decoded form doesn't exist) still resolves.
+ * The distinct path spellings to try (already entity-decoded),
+ * percent-DECODED first. A browser percent-decodes a `src` path before
+ * hitting the filesystem, so the decoded spelling is what actually
+ * loads — trying it first means that when both `a b.png` and a literal
+ * `a%20b.png` exist, `src="a%20b.png"` inlines `a b.png`, matching the
+ * browser. The literal spelling is kept as a fallback so a filename that
+ * genuinely contains a `%` (whose decoded form doesn't exist) still
+ * resolves.
  */
-function decodedPathCandidates(srcPath: string): string[] {
-    let decoded = decodeHtmlEntities(srcPath);
+function percentDecodedCandidates(srcPath: string): string[] {
+    let decoded = srcPath;
     try {
-        decoded = decodeURIComponent(decoded);
+        decoded = decodeURIComponent(srcPath);
     } catch {
         // Malformed percent-escape (e.g. a literal `%` in the name) —
-        // keep the entity-decoded form; the literal fallback below
-        // still covers the un-encoded case.
+        // keep the literal form; the fallback below covers it too.
     }
     return decoded === srcPath ? [srcPath] : [decoded, srcPath];
 }
 
+/** The named HTML entities a markdown/HTML renderer emits in a path. */
+const NAMED_ENTITIES: Readonly<Record<string, string>> = {
+    amp: '&',
+    lt: '<',
+    gt: '>',
+    quot: '"',
+    apos: "'",
+};
+
 /**
- * Decode the small set of HTML entities a markdown/HTML renderer emits
- * inside an attribute value. `&amp;` is decoded LAST so a double-encoded
- * sequence like `&amp;lt;` collapses to `&lt;` rather than `<`.
+ * Decode the HTML entities a markdown/HTML renderer emits inside an
+ * attribute value — the common named ones plus decimal (`&#38;`) and
+ * hex (`&#x26;`) numeric references. A single left-to-right pass decodes
+ * each entity exactly once and never rescans its own output, so a
+ * double-encoded sequence like `&amp;lt;` correctly collapses to `&lt;`
+ * rather than `<`. An out-of-range or malformed numeric reference is
+ * left verbatim.
  */
 function decodeHtmlEntities(s: string): string {
-    return s
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&#0*39;/g, "'")
-        .replace(/&#x0*27;/gi, "'")
-        .replace(/&amp;/g, '&');
+    return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, body: string) => {
+        if (body[0] === '#') {
+            const cp = (body[1] === 'x' || body[1] === 'X')
+                ? parseInt(body.slice(2), 16)
+                : parseInt(body.slice(1), 10);
+            if (!Number.isFinite(cp) || cp < 0 || cp > 0x10ffff) return whole;
+            try {
+                return String.fromCodePoint(cp);
+            } catch {
+                return whole;
+            }
+        }
+        const decoded = NAMED_ENTITIES[body.toLowerCase()];
+        return decoded ?? whole;
+    });
 }
 
 /**

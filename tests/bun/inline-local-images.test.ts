@@ -492,6 +492,52 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
+    test('replaces the real src even when an earlier attr holds identical src= text', () => {
+        withTempDir((dir) => {
+            fs.writeFileSync(path.join(dir, 'logo.png'), TINY_PNG);
+            // The alt value is textually identical to the real src
+            // attribute. A `String.replace(matchText, …)` would rewrite
+            // the copy inside alt (first textual occurrence); positional
+            // splicing must target the real attribute instead.
+            const html = `<img alt="src='logo.png'" src="logo.png">`;
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+            // The alt attribute must be preserved verbatim.
+            expect(out).toContain(`alt="src='logo.png'"`);
+        });
+    });
+
+    test('inlines when an attribute value contains a literal > character', () => {
+        withTempDir((dir) => {
+            fs.mkdirSync(path.join(dir, 'figure'));
+            fs.writeFileSync(path.join(dir, 'figure', 'plot.png'), TINY_PNG);
+            // A literal `>` inside alt must not terminate the <img> tag
+            // before the src attribute is seen.
+            const html = '<img alt="a > b" src="figure/plot.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+            expect(out).toContain('alt="a > b"');
+        });
+    });
+
+    test('decodes a decimal numeric HTML entity in the path', () => {
+        withTempDir((dir) => {
+            fs.writeFileSync(path.join(dir, 'a&b.png'), TINY_PNG);
+            const html = '<img src="a&#38;b.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('decodes a hex numeric HTML entity in the path', () => {
+        withTempDir((dir) => {
+            fs.writeFileSync(path.join(dir, 'a&b.png'), TINY_PNG);
+            const html = '<img src="a&#x26;b.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
     test('prefers the decoded filename over a literal percent-encoded twin', () => {
         // Both `a b.png` and a literal `a%20b.png` exist. A browser
         // percent-decodes `src="a%20b.png"` to `a b.png`, so the inliner
