@@ -25,11 +25,10 @@
  *     whichever default editor / extension the host has registered for
  *     that file type.
  *
- * Every action funnels through a small fallback: if the underlying
- * VS Code API throws or returns false we log the file path to the
- * "Raven: Knit" output channel and surface a warning toast — the
- * rendered file is still on disk, the user just needs to reach it via a
- * different channel.
+ * Every action funnels through a small fallback: if the underlying VS Code
+ * API throws or returns false we log the file path and surface a warning toast
+ * naming the caller's output channel. Knit callers omit `channelLabel` and
+ * retain the `Raven: Knit` default; Quarto supplies `Raven: Quarto`.
  */
 
 import * as path from 'path';
@@ -49,6 +48,7 @@ export async function openExportedFile(
     savedUri: vscode.Uri,
     format: ExportFormat,
     output: vscode.OutputChannel,
+    channelLabel: string = 'Raven: Knit',
 ): Promise<void> {
     const remote = isRemoteWorkspace();
     const primaryLabel = remote ? DOWNLOAD_LABEL : OPEN_LABELS[format];
@@ -61,14 +61,14 @@ export async function openExportedFile(
     if (action === undefined) return;
 
     if (action === DOWNLOAD_LABEL) {
-        await downloadFile(savedUri, output);
+        await downloadFile(savedUri, output, channelLabel);
         return;
     }
     if (action === OPEN_IN_EDITOR_LABEL) {
-        await openInEditor(savedUri, output);
+        await openInEditor(savedUri, output, channelLabel);
         return;
     }
-    await openExternal(savedUri, primaryLabel, output);
+    await openExternal(savedUri, primaryLabel, output, channelLabel);
 }
 
 function isRemoteWorkspace(): boolean {
@@ -80,6 +80,7 @@ async function openExternal(
     savedUri: vscode.Uri,
     label: string,
     output: vscode.OutputChannel,
+    channelLabel: string,
 ): Promise<void> {
     let opened = false;
     try {
@@ -92,13 +93,15 @@ async function openExternal(
     if (opened) return;
     output.appendLine(`[Export] file:// did not open. Output is at: ${savedUri.fsPath}`);
     void vscode.window.showWarningMessage(
-        `${label} is not available for this workspace. The file path has been written to the Raven: Knit output channel.`,
+        `${label} is not available for this workspace. ` +
+        `The file path has been written to the ${channelLabel} output channel.`,
     );
 }
 
 async function openInEditor(
     savedUri: vscode.Uri,
     output: vscode.OutputChannel,
+    channelLabel: string,
 ): Promise<void> {
     try {
         await vscode.commands.executeCommand('vscode.open', savedUri);
@@ -108,7 +111,8 @@ async function openInEditor(
         );
         output.appendLine(`[Export] Output is at: ${savedUri.fsPath}`);
         void vscode.window.showWarningMessage(
-            `${OPEN_IN_EDITOR_LABEL} failed. The file path has been written to the Raven: Knit output channel.`,
+            `${OPEN_IN_EDITOR_LABEL} failed. ` +
+            `The file path has been written to the ${channelLabel} output channel.`,
         );
     }
 }
@@ -116,6 +120,7 @@ async function openInEditor(
 async function downloadFile(
     savedUri: vscode.Uri,
     output: vscode.OutputChannel,
+    channelLabel: string,
 ): Promise<void> {
     try {
         // `explorer.download` reads the explorer's current selection
@@ -130,7 +135,8 @@ async function downloadFile(
         );
         output.appendLine(`[Export] Output is at: ${savedUri.fsPath}`);
         void vscode.window.showWarningMessage(
-            `${DOWNLOAD_LABEL} is not available for this workspace. The file path has been written to the Raven: Knit output channel.`,
+            `${DOWNLOAD_LABEL} is not available for this workspace. ` +
+            `The file path has been written to the ${channelLabel} output channel.`,
         );
     }
 }

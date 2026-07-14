@@ -42,6 +42,7 @@ Raven also provides lightweight support for **JAGS** (`.jags`, `.bugs`) and **St
 - **[R console](docs/r-console.md)** — Interactive R console with statement detection and a temp-file fallback for large blocks; supports R, arf, and radian
 - **[Code chunks](docs/chunks.md)** — R Markdown / Quarto chunk detection with Run Chunk / Run Above / Run All commands, CodeLens buttons, navigation, and background highlighting; full R language intelligence (diagnostics, completion, hover, navigation) inside chunk bodies; `# %%` cell support in `.R` files
 - **[Knit Preview + Export](docs/knit.md)** — `Raven: Knit Preview` renders R Markdown to an HTML preview without requiring Pandoc; companion `Export to HTML / PDF / Word` commands save the result next to the `.Rmd` / `.Rmarkdown` via Pandoc
+- **[Quarto Preview + Render](docs/quarto.md)** — CLI-backed live preview and one-shot rendering for `.qmd` files, independent of the Quarto VS Code extension
 - **[Plot viewer](docs/plot-viewer.md)** — Plots render in a VS Code panel via [httpgd](https://nx10.dev/httpgd/), with history navigation, save (PNG/SVG/PDF), and theme-aware background
 - **[Data viewer](docs/data-viewer.md)** — `View(df)` opens a virtualized grid backed by Apache Arrow; viewport-based rendering keeps scrolling responsive on multi-million-row frames
 - **[Help viewer](docs/help-viewer.md)** — Scope-aware R help: hovering shows the function in scope at the cursor instead of falling through to a multi-package list when scope can't be inferred

@@ -28,6 +28,7 @@ interface GrammarContribution {
     scopeName: string;
     path: string;
     embeddedLanguages?: Record<string, string>;
+    tokenTypes?: Record<string, string>;
 }
 
 function readContributions(): GrammarContribution[] {
@@ -44,6 +45,24 @@ describe('contributes.grammars file paths', () => {
     test('at least one grammar is contributed', () => {
         // Sanity: catch a malformed parse before per-grammar tests.
         expect(contributions.length).toBeGreaterThan(0);
+    });
+
+    test('entries sharing a scopeName carry identical embedded-language metadata', () => {
+        const byScope = new Map<string, GrammarContribution[]>();
+        for (const grammar of contributions) {
+            const entries = byScope.get(grammar.scopeName) ?? [];
+            entries.push(grammar);
+            byScope.set(grammar.scopeName, entries);
+        }
+        for (const entries of byScope.values()) {
+            if (entries.length < 2) continue;
+            const expectedEmbedded = entries[0].embeddedLanguages;
+            const expectedTokenTypes = entries[0].tokenTypes;
+            for (const grammar of entries.slice(1)) {
+                expect(grammar.embeddedLanguages).toEqual(expectedEmbedded);
+                expect(grammar.tokenTypes).toEqual(expectedTokenTypes);
+            }
+        }
     });
 
     for (const grammar of contributions) {
@@ -81,6 +100,26 @@ describe('contributes.grammars file paths', () => {
             });
         }
     }
+});
+
+test('the quarto language contribution covers every .qmd casing', () => {
+    const raw = fs.readFileSync(PACKAGE_JSON, 'utf8');
+    const pkg = JSON.parse(raw) as {
+        contributes?: {
+            languages?: Array<{ id: string; extensions?: string[] }>;
+        };
+    };
+    const quarto = pkg.contributes?.languages?.find(({ id }) => id === 'quarto');
+    expect(quarto?.extensions).toEqual([
+        '.qmd',
+        '.qmD',
+        '.qMd',
+        '.qMD',
+        '.Qmd',
+        '.QmD',
+        '.QMd',
+        '.QMD',
+    ]);
 });
 
 /**

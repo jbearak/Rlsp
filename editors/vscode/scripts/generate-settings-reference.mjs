@@ -70,6 +70,7 @@ const DOC_LINKS = {
   dataViewer: "data-viewer.md",
   knit: "knit.md",
   pandoc: "knit.md",
+  quarto: "quarto.md",
   sendToR: "r-console.md",
   rTerminal: "r-console.md",
   rConsole: "r-console.md",

@@ -106,6 +106,9 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.pandoc.path` | `""` | string | — | [knit](knit.md) | Absolute path to a Pandoc binary; leave empty to search PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled pandoc, etc.). |
 | `raven.pandoc.pdfEngine` | `"xelatex"` | `"xelatex"` \| `"pdflatex"` \| `"lualatex"` \| `"tectonic"` \| `"wkhtmltopdf"` | — | [knit](knit.md) | PDF engine used by Pandoc when exporting to PDF. |
 | `raven.plot.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [plot-viewer](plot-viewer.md) | Initial editor column when the plot viewer first opens. |
+| `raven.quarto.path` | `""` | string | — | [quarto](quarto.md) | Absolute path to a Quarto CLI binary; leave empty to search PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled Quarto, etc.). |
+| `raven.quarto.render.timeoutMs` | `600000` | integer (1–2147483647) | — | [quarto](quarto.md) | Hard timeout (milliseconds) for the Quarto render subprocess. |
+| `raven.quarto.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [quarto](quarto.md) | Editor column used for newly-created Quarto preview panels. |
 | `raven.rConsole.activation` | `"auto"` | `"enabled"` \| `"disabled"` \| `"auto"` | — | [r-console](r-console.md) | Controls when Raven activates its R-language IDE surfaces: the R console, plot/data viewers, chunk run commands, and the .Rmd / .Rmarkdown knit command. |
 | `raven.rTerminal.program` | `"R"` | `"R"` \| `"arf"` \| `"radian"` | — | [r-console](r-console.md) | Program to use for the R terminal. 'R' is the standard R console; 'arf' and 'radian' are modern third-party R consoles (must be installed separately). |
 | `raven.sendToR.advanceCursorOnSend` | `true` | boolean | — | [r-console](r-console.md) | Advance cursor to the next line after sending a single statement to R. |

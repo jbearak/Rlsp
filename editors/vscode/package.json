@@ -30,20 +30,22 @@
   ],
   "activationEvents": [
     "onTerminalProfile:raven.rTerminal",
-    "onWebviewPanel:raven.knitOutput"
+    "onWebviewPanel:raven.knitOutput",
+    "onWebviewPanel:raven.quartoPreview"
   ],
   "main": "./dist/extension.js",
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "Raven: Knit Preview executes R code from the workspace and is disabled in untrusted workspaces. Executable-path settings are also read from user/global settings only.",
+      "description": "Raven: Knit Preview and Quarto Preview/Render execute code from the workspace and are disabled in untrusted workspaces. Executable-path settings are also read from user/global settings only.",
       "restrictedConfigurations": [
         "raven.rTerminal.program",
         "raven.server.path",
         "raven.packages.rPath",
         "raven.packages.additionalLibraryPaths",
         "raven.pandoc.path",
-        "raven.pandoc.pdfEngine"
+        "raven.pandoc.pdfEngine",
+        "raven.quarto.path"
       ]
     }
   },
@@ -227,7 +229,8 @@
       {
         "command": "raven.knit",
         "title": "Knit Preview",
-        "category": "Raven"
+        "category": "Raven",
+        "icon": "$(preview)"
       },
       {
         "command": "raven.knit.exportHtml",
@@ -252,6 +255,27 @@
       {
         "command": "raven.knit.cleanupCache",
         "title": "Clean Up Knit Preview Cache",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.quarto.preview",
+        "title": "Quarto Preview",
+        "category": "Raven",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "raven.quarto.render",
+        "title": "Quarto Render",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.quarto.stopPreview",
+        "title": "Stop Quarto Preview",
+        "category": "Raven"
+      },
+      {
+        "command": "raven.quarto.openOutputChannel",
+        "title": "Show Quarto Output",
         "category": "Raven"
       },
       {
@@ -460,6 +484,21 @@
           "command": "raven.knit.cleanupCache"
         },
         {
+          "command": "raven.quarto.preview",
+          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i"
+        },
+        {
+          "command": "raven.quarto.render",
+          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i"
+        },
+        {
+          "command": "raven.quarto.stopPreview",
+          "when": "resourceExtname =~ /\\.qmd$/i"
+        },
+        {
+          "command": "raven.quarto.openOutputChannel"
+        },
+        {
           "command": "raven.openHelpPanel",
           "when": "false"
         },
@@ -482,6 +521,16 @@
           "submenu": "raven.build",
           "when": "(editorLangId == r || editorLangId == rmd || editorLangId == quarto) && raven.rConsoleEnabled && raven.isRPackage",
           "group": "navigation"
+        },
+        {
+          "command": "raven.quarto.preview",
+          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
+          "group": "navigation@5"
+        },
+        {
+          "command": "raven.knit",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/",
+          "group": "navigation@5"
         }
       ],
       "raven.build": [
@@ -574,6 +623,21 @@
           "command": "raven.sourceFile",
           "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "4_file@5"
+        },
+        {
+          "command": "raven.quarto.preview",
+          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
+          "group": "5_quarto@1"
+        },
+        {
+          "command": "raven.quarto.render",
+          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
+          "group": "5_quarto@2"
+        },
+        {
+          "command": "raven.quarto.stopPreview",
+          "when": "resourceExtname =~ /\\.qmd$/i",
+          "group": "5_quarto@3"
         },
         {
           "submenu": "raven.sendToR.terminal",
@@ -675,7 +739,12 @@
         ],
         "extensions": [
           ".qmd",
+          ".qmD",
+          ".qMd",
+          ".qMD",
           ".Qmd",
+          ".QmD",
+          ".QMd",
           ".QMD"
         ],
         "configuration": "./rmd-language-configuration.json"
@@ -765,6 +834,26 @@
       },
       {
         "language": "rmd",
+        "scopeName": "text.html.markdown.rmarkdown",
+        "path": "./syntaxes/rmd.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.c": "c",
+          "meta.embedded.block.cpp": "cpp",
+          "meta.embedded.block.css": "css",
+          "meta.embedded.block.css.scss": "scss",
+          "meta.embedded.block.js": "javascript",
+          "meta.embedded.block.json": "json",
+          "meta.embedded.block.julia": "julia",
+          "meta.embedded.block.python": "python",
+          "meta.embedded.block.r": "r",
+          "meta.embedded.block.sql": "sql",
+          "meta.embedded.block.stan": "stan",
+          "meta.embedded.block.yaml": "yaml",
+          "meta.embedded.inline.r": "r"
+        }
+      },
+      {
+        "language": "quarto",
         "scopeName": "text.html.markdown.rmarkdown",
         "path": "./syntaxes/rmd.tmLanguage.json",
         "embeddedLanguages": {
@@ -1495,6 +1584,32 @@
           ],
           "default": "xelatex",
           "description": "PDF engine used by Pandoc when exporting to PDF. Most users should leave this at xelatex; tectonic is a fully self-contained LaTeX alternative, and wkhtmltopdf renders via HTML/WebKit instead of LaTeX."
+        },
+        "raven.quarto.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Absolute path to a Quarto CLI binary; leave empty to search PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled Quarto, etc.)."
+        },
+        "raven.quarto.viewerColumn": {
+          "type": "string",
+          "enum": [
+            "active",
+            "beside"
+          ],
+          "enumDescriptions": [
+            "Open the Quarto preview in the active editor column.",
+            "Open the Quarto preview beside the active editor."
+          ],
+          "default": "beside",
+          "description": "Editor column used for newly-created Quarto preview panels."
+        },
+        "raven.quarto.render.timeoutMs": {
+          "type": "integer",
+          "default": 600000,
+          "minimum": 1,
+          "maximum": 2147483647,
+          "description": "Hard timeout (milliseconds) for the Quarto render subprocess. Cancellation and timeout use the SIGINT → SIGTERM → SIGKILL process-tree ladder."
         },
         "raven.knit.fontFamily": {
           "type": "string",

@@ -26,7 +26,10 @@ R and R Markdown grammars are the exception, because:
 4. Vendoring is the only path that makes the grammar bytes reachable
    from where the knit pipeline runs. The same vendored grammars
    federate to the editor renderer via `contributes.grammars`, so
-   `.Rmd` files highlight out of the box in remote setups.
+   `.Rmd` files highlight out of the box in remote setups. Raven also maps its
+   `quarto` language ID to this same vendored R Markdown grammar so `.qmd`
+   highlighting remains available when the `quarto.quarto` extension is
+   disabled; the grammar bytes and scope are intentionally shared.
 
 Sibling grammars still win when installed:
 `editors/vscode/src/knit/grammar-registry.ts` carries both
@@ -58,7 +61,10 @@ To resync `r.tmLanguage.json` / `rmd.tmLanguage.json`:
    and the rmd `embeddedLanguages` map in `editors/vscode/package.json`
    still match the new upstream `package.json`. If upstream renames a
    scope or adds an embedded language we want surfaced, update the
-   manifest in lockstep.
+   manifest in lockstep. The `rmd` and `quarto` contributions share that
+   scope, so both entries must carry identical `embeddedLanguages` (and
+   `tokenTypes`, if added) metadata; VS Code keeps one definition per scope
+   and either entry may otherwise clobber embedded-language behavior.
 7. If you add or remove a vendored grammar (not merely resync the bytes of
    an existing one), keep the user-facing docs that describe syntax
    highlighting and remote-host behavior in lockstep —

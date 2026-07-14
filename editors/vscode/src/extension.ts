@@ -57,6 +57,10 @@ import {
     resolveRConsoleActivation,
 } from './r-console-activation';
 import { registerKnit, disposeKnitGrammarRegistryForDeactivation } from './knit';
+import {
+    registerQuarto,
+    stopAllQuartoForDeactivation,
+} from './quarto';
 import { validateServerBinary } from './server-binary-check';
 import { dotLintrAutoEnableAllowed } from './lintr-auto-enable';
 
@@ -473,6 +477,12 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // `raven.rmdKnit.enabled` to match the resolved gate gates the
     // command-palette entry.
     registerKnit(context, r_console_resolved === 'enabled', () => client);
+
+    // Quarto Preview / Render is an independent CLI-backed workflow. It is
+    // registered unconditionally and performs its own trust + CLI preflight;
+    // unlike chunk execution and Knit Preview it is not part of the R-console
+    // activation gate.
+    registerQuarto(context);
 
     // Register restart command — re-reads trace config so changed settings take effect.
     //
@@ -984,6 +994,10 @@ export function deactivate(): Thenable<void> | undefined {
     // cached registry permanently stale across install/uninstall events.
     disposeKnitGrammarRegistryForDeactivation();
     const stops: Thenable<void>[] = [];
+    // One awaited Quarto lifecycle thenable stops preview and render process
+    // trees, disposes preview panels that retain activation-scoped callbacks,
+    // and releases the shared output channel last.
+    stops.push(stopAllQuartoForDeactivation());
     if (active_plot_services) stops.push(active_plot_services.dispose());
     if (client) stops.push(client.stop());
     if (stops.length === 0) return undefined;

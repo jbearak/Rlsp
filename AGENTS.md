@@ -31,6 +31,7 @@ User-facing:
 - `docs/r-console.md`
 - `docs/chunks.md`
 - `docs/knit.md`
+- `docs/quarto.md`
 - `docs/plot-viewer.md`
 - `docs/data-viewer.md`
 - `docs/help-viewer.md`
@@ -55,6 +56,7 @@ Code (authoritative for behavior):
 - Diagnostic collectors: `crates/raven/src/handlers.rs` — `is_structural_non_reference` is the single source of truth for "structural identifier; not a reference".
 - Config layering: `crates/raven/src/config_file/mod.rs` — `recompute_parsed_configs` is the only writer of the parsed config fields; callers mutate the raw layers and then call it.
 - Knit pipeline (TS): `editors/vscode/src/knit/` — each file documents its own role and invariants at module level (`yaml-frontmatter.ts`, `r-expression.ts`, `knit-engine.ts`, `post-knit-renderer.ts`, `render-html.ts`, `grammar-registry.ts`, `code-highlighter.ts`, `knit-paths.ts`, `knit-output-panel.ts`, `knit-output.ts`, `operation-controller.ts`, `vscode-theme-palette.ts`).
+- Quarto pipeline (TS): `editors/vscode/src/quarto/` — each file documents its own role and invariants at module level.
 - Plot viewer (TS): `editors/vscode/src/plot/` — `PlotViewerPanel`, `sanitize_svg`, `App.svelte`, and `state.ts` document their own invariants.
 
 ## Documentation requirements

@@ -248,3 +248,55 @@ describe('openExportedFile — remote workspace', () => {
         expect(state.infoMessageLabels).toEqual(['Open in Browser', 'Open in Editor']);
     });
 });
+
+describe('openExportedFile — caller output-channel label', () => {
+    it('uses the custom label when external open is unavailable', async () => {
+        state.infoMessageResponse = 'Open in Browser';
+        state.openExternalResult = false;
+
+        await openExportedFile(
+            fileUri('/tmp/report.html') as never,
+            'html',
+            outputChannel() as never,
+            'Raven: Quarto',
+        );
+
+        expect(state.warningMessages[0]).toContain('Raven: Quarto output channel');
+        expect(state.warningMessages[0]).not.toContain('Raven: Knit output channel');
+    });
+
+    it('uses the custom label when editor open fails', async () => {
+        state.infoMessageResponse = 'Open in Editor';
+        state.executeCommandImpl = (id: string) => {
+            if (id === 'vscode.open') throw new Error('boom');
+            return undefined;
+        };
+
+        await openExportedFile(
+            fileUri('/tmp/report.pdf') as never,
+            'pdf',
+            outputChannel() as never,
+            'Raven: Quarto',
+        );
+
+        expect(state.warningMessages[0]).toContain('Raven: Quarto output channel');
+    });
+
+    it('uses the custom label when remote download fails', async () => {
+        state.remoteName = 'ssh-remote';
+        state.infoMessageResponse = 'Download';
+        state.executeCommandImpl = (id: string) => {
+            if (id === 'explorer.download') throw new Error('boom');
+            return undefined;
+        };
+
+        await openExportedFile(
+            fileUri('/tmp/report.docx') as never,
+            'docx',
+            outputChannel() as never,
+            'Raven: Quarto',
+        );
+
+        expect(state.warningMessages[0]).toContain('Raven: Quarto output channel');
+    });
+});

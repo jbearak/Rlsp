@@ -1,5 +1,6 @@
 /**
- * Platform-aware signal helpers for the knit + pandoc subprocess engines.
+ * Platform-aware signal helpers for the knit, pandoc, and Quarto subprocess
+ * engines.
  *
  *   - POSIX: send the signal to the child's process group (`-pid`) so
  *     helpers spawned by the child (pandoc → xelatex → bibtex …) are
