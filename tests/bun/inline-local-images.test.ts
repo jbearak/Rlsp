@@ -209,24 +209,20 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
-    test('inlines through a ?query cache-buster suffix', () => {
+    test('inlines through a ?query cache-buster suffix and drops the query', () => {
         // htmlwidgets and similar markdown renderers append a
-        // version-style query to defeat HTTP caching. With the
-        // suffix landing inside `path.extname`, the inline pass
-        // used to bail out (MIME lookup fails on `.png?v=1`) and
-        // the broken-image icon appeared in the nested iframe.
-        // Splitting on `?` recovers the real file path.
+        // version-style query to defeat HTTP caching. The suffix must be
+        // split off the path (else the MIME lookup on `.png?v=1` fails
+        // and the image breaks) AND dropped from the emitted data URL: a
+        // `?` in the base64 data portion is invalid and would fail the
+        // browser's forgiving-base64 decode.
         withTempDir((dir) => {
             fs.mkdirSync(path.join(dir, 'figure'));
             fs.writeFileSync(path.join(dir, 'figure', 'plot.png'), TINY_PNG);
             const html = '<img src="figure/plot.png?v=1">';
             const out = inlineLocalImagesAsDataUrls(html, dir);
             expect(out).toContain('src="data:image/png;base64,');
-            // The query suffix rides along on the data URL. It's
-            // meaningless to a data URL processor but harmless
-            // (and it preserves round-trip fidelity if anything
-            // downstream inspects the URL).
-            expect(out).toMatch(/src="data:image\/png;base64,[^"]+\?v=1"/);
+            expect(out).not.toContain('?v=1');
         });
     });
 
@@ -448,17 +444,67 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
-    test('handles both ?query and #fragment together', () => {
-        // Cover the case where both appear (`?v=1#frag`). We
-        // split on the first `?` or `#` so the entire suffix
-        // (`?v=1#frag`) rides along on the data URL.
+    test('drops the ?query but keeps the #fragment when both are present', () => {
+        // `?v=1#frag`: the fragment is a real URL component (selects an
+        // SVG `<view>`) and must survive; the query is dropped because a
+        // `?` in the base64 data portion is an invalid code point that
+        // fails forgiving-base64 decoding and breaks the image.
         withTempDir((dir) => {
             const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
             fs.writeFileSync(path.join(dir, 'icon.svg'), svg);
             const html = '<img src="icon.svg?v=1#frag">';
             const out = inlineLocalImagesAsDataUrls(html, dir);
             expect(out).toContain('src="data:image/svg+xml;base64,');
-            expect(out).toMatch(/src="data:image\/svg\+xml;base64,[^"]+\?v=1#frag"/);
+            expect(out).toMatch(/src="data:image\/svg\+xml;base64,[^"?]+#frag"/);
+            expect(out).not.toContain('?v=1');
+        });
+    });
+
+    test('inlines the src, not a src= substring inside another attribute', () => {
+        withTempDir((dir) => {
+            fs.writeFileSync(path.join(dir, 'real.png'), TINY_PNG);
+            // The alt value literally contains `src='thumb.png'`; a
+            // quote-blind matcher would rewrite that instead of the real
+            // src and mangle the alt text.
+            const html = `<img alt="see src='thumb.png'" src="real.png">`;
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+            // The alt attribute must be preserved verbatim.
+            expect(out).toContain(`alt="see src='thumb.png'"`);
+        });
+    });
+
+    test('allows a root that is a filesystem root (trailing-separator boundary)', () => {
+        // A workspace folder that is the filesystem root ends in the
+        // path separator; the boundary check must not build a `//`
+        // prefix that rejects everything under it.
+        withTempDir((dir) => {
+            const docDir = path.join(dir, '.raven_output');
+            fs.mkdirSync(docDir, { recursive: true });
+            // Image lives outside docDir but under the "/" root we allow.
+            const img = path.join(dir, 'pic.png');
+            fs.writeFileSync(img, TINY_PNG);
+            const html = `<img src="${img}">`;
+            const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                additionalRoots: [path.parse(dir).root],
+            });
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('prefers the decoded filename over a literal percent-encoded twin', () => {
+        // Both `a b.png` and a literal `a%20b.png` exist. A browser
+        // percent-decodes `src="a%20b.png"` to `a b.png`, so the inliner
+        // must inline `a b.png`, not the literal twin.
+        withTempDir((dir) => {
+            const decodedBytes = TINY_PNG;
+            const literalBytes = Buffer.from('not-a-real-png-but-distinct');
+            fs.writeFileSync(path.join(dir, 'a b.png'), decodedBytes);
+            fs.writeFileSync(path.join(dir, 'a%20b.png'), literalBytes);
+            const html = '<img src="a%20b.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain(`src="data:image/png;base64,${decodedBytes.toString('base64')}"`);
+            expect(out).not.toContain(literalBytes.toString('base64'));
         });
     });
 });

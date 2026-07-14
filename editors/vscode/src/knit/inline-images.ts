@@ -108,15 +108,17 @@ export function inlineLocalImagesAsDataUrls(
 ): string {
     const allowedRoots = [docDir, ...(options.additionalRoots ?? [])];
     return html.replace(/<img\b([^>]*)>/gi, (match, attrs: string) => {
-        // The leading `(?<![-\w])` stops the matcher from selecting the
-        // `src` inside another attribute — most importantly `data-src`
-        // (a `-` is a word boundary, so a bare `\bsrc` would match it
-        // and rewrite the wrong attribute). `srcset` is not matched
-        // because `src` there is followed by `set`, not `=`.
-        const srcMatch = attrs.match(/(?<![-\w])src\s*=\s*"([^"]*)"/i)
-            ?? attrs.match(/(?<![-\w])src\s*=\s*'([^']*)'/i);
-        if (!srcMatch) return match;
-        const src = srcMatch[1];
+        // Locate the `src` attribute with a quote-aware tokenizer rather
+        // than a regex over the raw attribute blob. A regex can't tell
+        // an `src=` at an attribute boundary from `src=`-looking text
+        // *inside* another attribute's quoted value (e.g.
+        // `alt="see src='x'"`) or from a different attribute name that
+        // ends in `src` (`data-src`, which a `\bsrc` would match on the
+        // `-` boundary). The tokenizer consumes each quoted value whole,
+        // so only a real `src` attribute is selected.
+        const srcAttr = findAttribute(attrs, 'src');
+        if (!srcAttr) return match;
+        const src = srcAttr.value;
 
         // Already an absolute URL (any scheme, e.g. `https:`,
         // `data:`, `vscode-webview:`, `file:`) — pass through. A
@@ -133,40 +135,36 @@ export function inlineLocalImagesAsDataUrls(
         // Protocol-relative URL.
         if (src.startsWith('//')) return match;
 
-        // Split src into the path portion and any trailing
-        // `?query` / `#fragment` suffix. htmlwidgets and similar
-        // markdown renderers sometimes emit cache-busters
-        // (`figure/plot.png?v=1`) and SVG view fragments
-        // (`diagram.svg#layer-1`). If we feed the whole src to
-        // `path.resolve` / `path.extname`, the suffix lands inside
-        // the filename and:
-        //   - the file-resolution `path.resolve(docDir, 'foo.png?v=1')`
-        //     points at a non-existent file (silent failure: the
-        //     src is returned unchanged and the broken-image icon
-        //     still surfaces in the nested iframe);
-        //   - `path.extname` returns `.png?v=1`, which doesn't map
-        //     to a MIME and the inline pass bails out.
+        // Split src into path, `?query`, and `#fragment`. htmlwidgets
+        // and similar renderers emit cache-busters (`plot.png?v=1`) and
+        // SVG view fragments (`diagram.svg#layer-1`). Feeding the whole
+        // src to `path.resolve` / `path.extname` would fold the suffix
+        // into the filename (wrong file, and `.png?v=1` maps to no MIME).
         //
-        // Splitting on the first `?` or `#` recovers the original
-        // file path. The fragment portion is re-attached to the
-        // emitted data URL because SVG fragment identifiers can
-        // navigate to a specific `<view>` element when used in
-        // `<img src="x.svg#viewname">`. The query portion is
-        // meaningless on a data URL (the URL itself IS the
-        // content, so there's nothing to cache-bust) but is also
-        // preserved for round-trip honesty — the cost is just a
-        // few extra bytes in the rewritten HTML.
-        const suffixStart = src.search(/[?#]/);
-        const srcPath = suffixStart >= 0 ? src.slice(0, suffixStart) : src;
-        const srcSuffix = suffixStart >= 0 ? src.slice(suffixStart) : '';
+        // Only the fragment rides along on the emitted data URL: a
+        // fragment is a real URL component (split off before the data is
+        // decoded) and selects a named SVG `<view>`. The query is
+        // DROPPED — a data URL has no cache to bust, and per WHATWG
+        // forgiving-base64 a `?` in the data portion is an invalid
+        // base64 code point that fails the decode, so appending it would
+        // break the image.
+        const hashIdx = src.indexOf('#');
+        const fragment = hashIdx >= 0 ? src.slice(hashIdx) : '';
+        const beforeHash = hashIdx >= 0 ? src.slice(0, hashIdx) : src;
+        const queryIdx = beforeHash.indexOf('?');
+        const srcPath = queryIdx >= 0 ? beforeHash.slice(0, queryIdx) : beforeHash;
+        const srcSuffix = fragment;
 
         // Recover the on-disk path from what the markdown/HTML renderer
         // emitted. VS Code's `markdown.api.render` percent-encodes image
         // paths (so a workspace image `café.png` arrives as
         // `caf%C3%A9.png`) and HTML-escapes `&` (`a&b.png` → `a&amp;b.png`),
-        // while a raw passthrough `<img>` tag is left verbatim. Try the
-        // literal spelling first — so a filename that genuinely contains
-        // `%` or `&` still resolves — then the decoded spelling.
+        // while a raw passthrough `<img>` tag is left verbatim. A browser
+        // percent-DECODES a `src` before hitting the filesystem, so try
+        // the decoded spelling FIRST (matching what the browser and
+        // Open-in-Browser would load); fall back to the literal spelling
+        // only if the decoded one doesn't resolve, which also covers a
+        // filename that genuinely contains `%`/`&`.
         const pathCandidates = decodedPathCandidates(srcPath);
 
         // Absolute paths resolve as-is; relative paths resolve against
@@ -237,7 +235,7 @@ export function inlineLocalImagesAsDataUrls(
         }
 
         const dataUrl = `data:${mime};base64,${bytes.toString('base64')}${srcSuffix}`;
-        const rewrittenAttrs = attrs.replace(srcMatch[0], `src="${dataUrl}"`);
+        const rewrittenAttrs = attrs.replace(srcAttr.match, `src="${dataUrl}"`);
         const finalAttrs = options.markSvgPlots && ext === '.svg' && isKnitFigurePath(normalizedRelative)
             ? withImgAttribute(rewrittenAttrs, 'data-raven-plot-svg', 'true')
             : rewrittenAttrs;
@@ -245,13 +243,57 @@ export function inlineLocalImagesAsDataUrls(
     });
 }
 
+interface HtmlAttribute {
+    /** The attribute name as written (original case). */
+    name: string;
+    /** The attribute value with surrounding quotes stripped. */
+    value: string;
+    /**
+     * The exact source substring matched (name through value), so a
+     * caller can `String.prototype.replace` it back into the tag.
+     */
+    match: string;
+}
+
+/**
+ * Find the first attribute named `name` (case-insensitive) in an HTML
+ * tag's attribute string. The scan is quote-aware — each attribute's
+ * quoted value is consumed whole — so `name=`-looking text inside
+ * another attribute's value (e.g. `alt="see src='x'"`) is never
+ * mistaken for a real attribute, and a differently-named attribute that
+ * merely ends in `name` (e.g. `data-src`) is not matched. Returns the
+ * attribute, or `null` if absent.
+ */
+function findAttribute(attrs: string, name: string): HtmlAttribute | null {
+    // name  — a run with no whitespace, `=`, `/`, `>`, or quote.
+    // value — double-quoted | single-quoted | unquoted run (optional).
+    const re = /([^\s=/>"']+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]*))?/g;
+    const target = name.toLowerCase();
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(attrs)) !== null) {
+        if (m[1].toLowerCase() !== target) continue;
+        const raw = m[2];
+        let value = '';
+        if (raw !== undefined) {
+            const quoted = raw.length >= 2
+                && ((raw[0] === '"' && raw.endsWith('"'))
+                    || (raw[0] === "'" && raw.endsWith("'")));
+            value = quoted ? raw.slice(1, -1) : raw;
+        }
+        return { name: m[1], value, match: m[0] };
+    }
+    return null;
+}
+
 /**
  * The distinct on-disk-path spellings to try for a rendered image
- * `src`, most-literal first. The second entry (present only when it
- * differs) undoes the HTML-entity and percent-encoding that a markdown
- * renderer applies to image paths, recovering names with `&`, spaces,
- * or non-ASCII characters. Trying the literal spelling first means a
- * filename that genuinely contains `%`/`&` still resolves.
+ * `src`, DECODED first. A browser percent-decodes (and the HTML parser
+ * entity-decodes) a `src` before hitting the filesystem, so the decoded
+ * spelling is what actually loads — trying it first means that when both
+ * `a b.png` and a literal `a%20b.png` exist, `src="a%20b.png"` inlines
+ * `a b.png`, matching the browser. The literal spelling is kept as a
+ * fallback so a filename that genuinely contains `%`/`&` (and whose
+ * decoded form doesn't exist) still resolves.
  */
 function decodedPathCandidates(srcPath: string): string[] {
     let decoded = decodeHtmlEntities(srcPath);
@@ -259,10 +301,10 @@ function decodedPathCandidates(srcPath: string): string[] {
         decoded = decodeURIComponent(decoded);
     } catch {
         // Malformed percent-escape (e.g. a literal `%` in the name) —
-        // keep the entity-decoded form; the literal-first candidate
-        // already covers the un-encoded case.
+        // keep the entity-decoded form; the literal fallback below
+        // still covers the un-encoded case.
     }
-    return decoded === srcPath ? [srcPath] : [srcPath, decoded];
+    return decoded === srcPath ? [srcPath] : [decoded, srcPath];
 }
 
 /**
@@ -288,9 +330,12 @@ function decodeHtmlEntities(s: string): string {
  * Both sides are `realpath`-resolved so a symlink living inside a root
  * cannot smuggle in a target outside it. A candidate that doesn't
  * exist (`realpathSync` throws) yields `null`, as does a root that
- * doesn't exist (skipped). The `+ path.sep` on both sides makes the
+ * doesn't exist (skipped). Appending `path.sep` to both sides makes the
  * `startsWith` a true directory-boundary check — `/a/roots` must not
- * be considered contained by `/a/root`.
+ * be considered contained by `/a/root`. A root that already ends in the
+ * separator (a filesystem root such as `/` or `C:\`) is normalized
+ * first so the boundary prefix doesn't become `//` / `C:\\` and reject
+ * everything under it.
  */
 function canonicalizeContainedPath(candidate: string, roots: string[]): string | null {
     let realCandidate: string;
@@ -307,7 +352,8 @@ function canonicalizeContainedPath(candidate: string, roots: string[]): string |
             continue;
         }
         if (realCandidate === realRoot) return realCandidate;
-        if ((realCandidate + path.sep).startsWith(realRoot + path.sep)) {
+        const boundary = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+        if ((realCandidate + path.sep).startsWith(boundary)) {
             return realCandidate;
         }
     }
