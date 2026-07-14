@@ -69,7 +69,9 @@ What each row does depends on whether REditorSupport.r is installed:
 
 Both extensions register CodeLens providers for `.qmd`, and VS Code doesn't expose a way for one extension to suppress another's lenses, so when both rows appear they stay independent. Quarto's check looks for the REditorSupport extension by ID, so Raven can't satisfy it from this side regardless of which commands Raven registers — the only clean fix lives upstream in the Quarto extension.
 
-If the duplication bothers you and you're not relying on Quarto's other features (preview, format conversion, project tooling, or the Python / Julia / Observable cell executors), disabling the Quarto extension removes its row entirely — Raven's R console, chunk navigation, run commands, and CodeLens cover the same execution surface for `.qmd` files. Otherwise, the simplest habit is to use Raven's row for R chunks; Quarto's row remains useful for cells in other languages when their respective extensions are installed.
+If the duplication bothers you, a standalone Raven workflow is now viable with `quarto.quarto` disabled. Raven maps `.qmd` to its bundled R Markdown grammar for syntax highlighting, supplies Quarto and R snippets, provides chunk navigation and CodeLens execution through Raven's R console, and offers CLI-backed [Quarto Preview and Render](./quarto.md). With no competing R extension, the default `raven.rConsole.activation: "auto"` enables Raven's R console; set it to `"enabled"` if another R extension would otherwise close that gate.
+
+The trade-off is that disabling `quarto.quarto` also removes its Visual Mode, Quarto-aware YAML intelligence, and Python / Julia cell executors. Raven's chunk executor handles R through Raven's R console; it does not replace those non-R execution surfaces. If you need them, keep both extensions and use Raven's CodeLens row for R chunks. Quarto's row remains useful for other languages when their respective executors are installed.
 
 ### `.Rmd` / `.Rmarkdown` files belong to the `rmd` language
 

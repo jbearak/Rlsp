@@ -4,8 +4,8 @@
  *
  * Source-of-truth message: Raven's knit expression (built in
  * `r-expression`) emits `Output created: <path>` via `cat()` to stdout.
- * The caller passes the subprocess's combined stdout+stderr, so a line R
- * happens to route through `message()` is still matched. If parsing
+ * Knit and Quarto callers pass the subprocess's combined stdout+stderr, so a
+ * line routed through either stream is still matched. If parsing
  * fails we surface "Knit succeeded (output path unknown)" rather than
  * fabricating a path — the subprocess exit code is the ground truth for
  * success/failure; output parsing is a UX nicety.

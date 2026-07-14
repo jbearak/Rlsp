@@ -613,6 +613,65 @@ datasets come via the embedded base table, above.)
 
 Brief orientation for modules outside the cross-file and package-library subsystems.
 
+### Quarto process lifecycle
+
+The VS Code extension's Quarto implementation lives under
+`editors/vscode/src/quarto/`. One activation-scoped lifecycle owns the
+`QuartoRuntime`, `QuartoRenderEngine`, preview panels, and shared **Raven:
+Quarto** output channel in that extension-host window. The render engine
+registers every child synchronously when it spawns and rejects new renders as
+soon as lifecycle shutdown begins. Render stdout/stderr still stream in full,
+but only a bounded tail is retained for result parsing and failure context.
+Preview stop and both engines' deactivation paths detach Raven's exact stream
+listeners before signaling. Each child has one shared ladder: deactivation
+tightens an in-flight graceful stop instead of starting a competing sequence.
+If a child does not confirm `close` after the bounded SIGKILL wait, teardown
+logs a non-throwing abandonment warning and continues; cancelled or timed-out
+renders also resolve their result at that bound. The detached child can no
+longer write through the subsequently disposed output channel.
+
+Preview replacement is generation-based. `startOrRestart` claims and installs
+the new generation synchronously before its first `await`; every asynchronous
+continuation carries `{ key, generation }` and becomes a no-op unless that pair
+still owns the live session. This applies to process exits, readiness probes,
+external-URI mapping, panel updates, and panel-dispose stops. Keep that
+discipline when adding another async phase so an old preview cannot overwrite
+or terminate its replacement. If intentional Stop closes a child before
+readiness, the resulting startup rejection is superseded rather than failed;
+the stop owner alone emits `stopped` and removes the session after teardown.
+
+Removing a predecessor from the live map does not remove it from lifecycle
+ownership. The runtime registers it in a retirement set until its shared stop
+promise settles. Each newly claimed session also records the exact predecessors
+it displaced. Its memoized teardown stops itself and recursively tears down that
+acyclic predecessor graph, so a replacement that supersedes an unspawned
+intermediate session inherits the intermediate session's complete pending
+drain. Retirement membership remains tied only to each session's own stop, not
+the recursive teardown during replacement. Explicit and panel-dispose stops
+keep the session current and add a retirement hold through teardown, so a
+concurrent replacement can still discover and inherit the drain. Successful
+pre-spawn drains clear the new session's predecessor array, and teardown clears
+its captured predecessor references on settlement; do not retain historical
+session/process wrappers from the live generation. Deactivation snapshots the
+identity-deduplicated union of live and retiring sessions and starts immediate
+shutdown on all of them; keep detached stopping children in that union when
+changing restart sequencing.
+
+Treat `vscode.env.asExternalUri()` results as installation-scoped: obtain a
+fresh mapping for every iframe installation, and derive the iframe URL and CSP
+from that same value. Never cache a mapped preview URI. Webview serializer
+restore is deliberately inert: it restores a placeholder panel and never
+spawns Quarto or executes workspace code. Deactivation disposes all preview
+panels and clears their static registry; otherwise a disable/enable cycle would
+retain callbacks and generation counters from the disposed runtime.
+
+Extension deactivation awaits `stopAllQuartoForDeactivation()`. That one
+thenable starts preview and render shutdown before disposing panels, so panel
+callbacks cannot start a second graceful ladder. It waits for both bounded
+aggregates and disposes the shared output channel last; `context.subscriptions`
+disposal alone is not the awaited process-kill mechanism. For debugging, run
+**Raven: Show Quarto Output** and inspect the **Raven: Quarto** output channel.
+
 ### Judge-backed Tier 2 indentation (#611)
 
 Tier 2 enters through `indentation::on_type_indentation` and uses the
