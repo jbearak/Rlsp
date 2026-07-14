@@ -12,11 +12,11 @@
  * The scanner processes each completed line once. Callers that merge process
  * streams must reassemble lines per stream and call `feedLine`; `feed` retains
  * its single-stream decoder for direct use and compatibility. The scanner
- * stops parsing after a trusted result or failure, while Browse-only fallback
- * acceptance remains provisional so a later `Listening on` line can still
- * supply the trusted origin. A separately capped raw tail is retained for
- * honest startup-error display without allowing unbounded process output to
- * consume memory.
+ * stops parsing after a correlated result or failure. Lone Browse and
+ * Listening candidates remain provisional so either process stream ordering
+ * can be correlated during the engine's short grace window. A separately
+ * capped raw tail is retained for honest startup-error display without
+ * allowing unbounded process output to consume memory.
  */
 
 export interface PreviewUrlResult {
@@ -88,17 +88,16 @@ export function validatePreviewUrl(raw: string): PreviewUrlResult | null {
 /**
  * Incrementally scan Quarto's combined stdout/stderr for its preview URL.
  *
- * `Browse at` is retained provisionally because real Quarto prints it before
- * `Listening on`; emitting it immediately would let the less-trusted line
- * win and lose trusted-origin correlation. `finish()` processes an unterminated
- * final line and emits the Browse candidate only when end-of-stream proves no
- * Listening line arrived. A Listening-only stream emits immediately using
- * that validated URL as-is.
+ * Both `Browse at` and `Listening on` are retained provisionally until they can
+ * be correlated. This handles their usual order as well as reverse cross-pipe
+ * delivery. `finish()` accepts whichever safe lone candidate remains when
+ * end-of-stream proves its partner will not arrive.
  */
 export class QuartoPreviewOutputScanner {
     private carry = '';
     private tail = '';
     private browse: PreviewUrlResult | null = null;
+    private listening: PreviewUrlResult | null = null;
     private emitted: PreviewUrlResult | null = null;
     private failureDetail: string | null = null;
     private stopped = false;
@@ -164,6 +163,7 @@ export class QuartoPreviewOutputScanner {
             const result = this.processLine(line);
             if (result || this.stopped) return result;
         }
+        if (this.listening) return this.emit(this.listening);
         if (this.browse) return this.emit(this.browse);
         this.stopped = true;
         return null;
@@ -192,9 +192,20 @@ export class QuartoPreviewOutputScanner {
         return this.browse;
     }
 
+    /** Accept a validated Listening-only candidate after correlation grace. */
+    acceptListeningCandidate(): PreviewUrlResult | null {
+        if (this.stopped) return this.emitted;
+        return this.listening;
+    }
+
     /** True when a validated Browse candidate is awaiting correlation. */
     hasBrowseCandidate(): boolean {
         return !this.stopped && this.browse !== null;
+    }
+
+    /** True when a validated Listening candidate awaits a Browse path. */
+    hasListeningCandidate(): boolean {
+        return !this.stopped && this.listening !== null;
     }
 
     /** Human-readable hard-failure detail for a rejected advertised URL. */
@@ -225,6 +236,7 @@ export class QuartoPreviewOutputScanner {
                 return null;
             }
             this.browse = candidate;
+            if (this.listening) return this.emitCorrelated();
         }
 
         const listeningMatch = line.match(/(?:^|\s)Listening on\s+(\S+)/);
@@ -234,11 +246,18 @@ export class QuartoPreviewOutputScanner {
             this.reject(`Rejected unsafe Quarto listening URL: ${listeningMatch[1]}`);
             return null;
         }
+        this.listening = listening;
 
-        if (!this.browse) return this.emit(listening);
+        if (!this.browse) return null;
+        return this.emitCorrelated();
+    }
+
+    private emitCorrelated(): PreviewUrlResult | null {
+        if (!this.browse || !this.listening) return null;
         const browseUrl = new URL(this.browse.url);
         const correlated = validatePreviewUrl(
-            `${listening.origin}${browseUrl.pathname}${browseUrl.search}${browseUrl.hash}`,
+            `${this.listening.origin}` +
+            `${browseUrl.pathname}${browseUrl.search}${browseUrl.hash}`,
         );
         if (!correlated) {
             this.reject('Could not correlate Quarto preview URLs safely.');

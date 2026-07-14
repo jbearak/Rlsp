@@ -11,10 +11,11 @@
  * engine retries bounded Node `http` GETs against the validated raw loopback
  * URL before resolving `start()`. Startup uses a generous output-idle timeout,
  * reset by every stdout/stderr chunk, so long initial renders remain alive
- * while a truly silent process is still bounded. Probe retries are aborted as
- * soon as startup settles or teardown begins. Any startup failure claims the
- * same shared stop ladder itself after capturing the startup tail, so the
- * engine remains leak-safe even without its runtime owner.
+ * while a truly silent process is still bounded. Probe retries and correlation
+ * timers are cancelled as soon as startup settles or teardown begins, and an
+ * intentional stop promptly rejects a still-pending `start()`. Any startup
+ * failure claims the same shared stop ladder itself after capturing the
+ * startup tail, so the engine remains leak-safe even without its runtime owner.
  *
  * Browse-only fallback waits for a correlation window and remains provisional
  * through its readiness probe and one final grace window. A late
@@ -42,8 +43,11 @@ import {
 } from './preview-url-parser';
 import { QuartoProcessTeardown } from './quarto-process-teardown';
 
-/** Maximum silence during startup; active initial renders reset this timer. */
-export const QUARTO_PREVIEW_STARTUP_TIMEOUT_MS = 60_000;
+/**
+ * Maximum startup silence. Two minutes favors slow, quiet renders while still
+ * bounding a genuinely hung process; any output activity resets the interval.
+ */
+export const QUARTO_PREVIEW_STARTUP_TIMEOUT_MS = 120_000;
 export const QUARTO_PREVIEW_PROBE_ATTEMPTS = 20;
 export const QUARTO_PREVIEW_PROBE_DELAY_MS = 250;
 export const QUARTO_PREVIEW_BROWSE_CORRELATION_DELAY_MS = 1_500;
@@ -92,7 +96,6 @@ export interface QuartoPreviewProcessLike {
 }
 
 export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
-    private child: ChildProcess | null = null;
     private scanner = new QuartoPreviewOutputScanner();
     private startPromise: Promise<QuartoPreviewReady> | null = null;
     private teardownPromise: Promise<void> | null = null;
@@ -101,11 +104,12 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
     private intentionalStop = false;
     private closed = false;
     private ready = false;
-    private browseTimer: NodeJS.Timeout | null = null;
+    private correlationTimer: NodeJS.Timeout | null = null;
     private lateListeningTimer: NodeJS.Timeout | null = null;
     private outputDetached = false;
     private outputDetacher: (() => void) | null = null;
     private activeProbeAbortController: AbortController | null = null;
+    private cancelPendingStart: (() => void) | null = null;
 
     constructor(private readonly opts: QuartoPreviewProcessOptions) {}
 
@@ -140,11 +144,10 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                 reject(this.startError(`Could not spawn Quarto: ${errorMessage(err)}`));
                 return;
             }
-            this.child = child;
 
             let settled = false;
             let probeSequence = 0;
-            let browseFallbackStarted = false;
+            let correlationFallbackStarted = false;
             let startupTimer: NodeJS.Timeout;
             let closeResolve: () => void = () => undefined;
             this.closePromise = new Promise<void>((r) => { closeResolve = r; });
@@ -156,11 +159,12 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                 if (settled) return false;
                 settled = true;
                 clearTimeout(startupTimer);
+                this.cancelPendingStart = null;
                 this.activeProbeAbortController?.abort();
                 this.activeProbeAbortController = null;
-                if (this.browseTimer) {
-                    clearTimeout(this.browseTimer);
-                    this.browseTimer = null;
+                if (this.correlationTimer) {
+                    clearTimeout(this.correlationTimer);
+                    this.correlationTimer = null;
                 }
                 if (this.lateListeningTimer) {
                     clearTimeout(this.lateListeningTimer);
@@ -176,6 +180,10 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                 const error = this.startError(message);
                 if (!finishStart(() => reject(error))) return;
                 void this.stop().catch(() => undefined);
+            };
+            this.cancelPendingStart = () => {
+                const error = this.startError('Quarto preview startup was stopped.');
+                finishStart(() => reject(error));
             };
             const startupTimeoutMs = this.opts.startupTimeoutMs
                 ?? QUARTO_PREVIEW_STARTUP_TIMEOUT_MS;
@@ -269,23 +277,31 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                     return;
                 }
                 if (candidate) {
-                    if (this.browseTimer) {
-                        clearTimeout(this.browseTimer);
-                        this.browseTimer = null;
+                    if (this.correlationTimer) {
+                        clearTimeout(this.correlationTimer);
+                        this.correlationTimer = null;
                     }
                     beginProbe(candidate, false);
                     return;
                 }
                 if (
-                    this.scanner.hasBrowseCandidate()
-                    && this.browseTimer === null
-                    && !browseFallbackStarted
+                    (
+                        this.scanner.hasBrowseCandidate()
+                        || this.scanner.hasListeningCandidate()
+                    )
+                    && this.correlationTimer === null
+                    && !correlationFallbackStarted
                 ) {
-                    this.browseTimer = setTimeout(() => {
-                        this.browseTimer = null;
-                        browseFallbackStarted = true;
+                    this.correlationTimer = setTimeout(() => {
+                        this.correlationTimer = null;
+                        correlationFallbackStarted = true;
                         const browseOnly = this.scanner.acceptBrowseCandidate();
-                        if (browseOnly) beginProbe(browseOnly, true);
+                        if (browseOnly) {
+                            beginProbe(browseOnly, true);
+                            return;
+                        }
+                        const listeningOnly = this.scanner.acceptListeningCandidate();
+                        if (listeningOnly) beginProbe(listeningOnly, false);
                     }, correlationDelayMs);
                 }
             };
@@ -357,6 +373,7 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
 
     stop(): Promise<void> {
         this.intentionalStop = true;
+        this.cancelPendingStart?.();
         this.abortStartupWork();
         this.detachProcessOutput();
         if (this.teardownPromise) return this.teardownPromise;
@@ -366,6 +383,7 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
 
     shutdown(): Promise<void> {
         this.intentionalStop = true;
+        this.cancelPendingStart?.();
         this.abortStartupWork();
         this.detachProcessOutput();
         if (!this.teardown) {
@@ -387,6 +405,14 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
     }
 
     private abortStartupWork(): void {
+        if (this.correlationTimer) {
+            clearTimeout(this.correlationTimer);
+            this.correlationTimer = null;
+        }
+        if (this.lateListeningTimer) {
+            clearTimeout(this.lateListeningTimer);
+            this.lateListeningTimer = null;
+        }
         this.activeProbeAbortController?.abort();
         this.activeProbeAbortController = null;
     }
@@ -409,12 +435,13 @@ export async function probeQuartoPreviewUrl(
     request: (url: string, signal?: AbortSignal) => Promise<number> = requestStatus,
     signal?: AbortSignal,
 ): Promise<number> {
+    const requestUrl = ipv4ProbeUrl(rawUrl);
     let lastOutcome: '404' | 'error' | null = null;
     let lastError: Error | null = null;
     for (let attempt = 0; attempt < attempts; attempt++) {
         throwIfAborted(signal);
         try {
-            const status = await request(rawUrl, signal);
+            const status = await request(requestUrl, signal);
             if (status !== 404) return status;
             lastOutcome = '404';
             lastError = null;
@@ -436,6 +463,13 @@ export async function probeQuartoPreviewUrl(
         'connection',
         `Could not connect to the Quarto preview server${lastError ? `: ${lastError.message}` : '.'}`,
     );
+}
+
+/** Match the explicitly IPv4-bound Quarto listener for host-side requests. */
+function ipv4ProbeUrl(rawUrl: string): string {
+    const parsed = new URL(rawUrl);
+    if (parsed.hostname === 'localhost') parsed.hostname = '127.0.0.1';
+    return parsed.toString();
 }
 
 export type QuartoPreviewProbeErrorKind = 'not-browser-previewable' | 'connection';
@@ -530,6 +564,10 @@ export class QuartoOutputLineBuffer {
     ) {}
 
     feed(chunk: string): void {
+        // An empty chunk carries no line data and must not clear a pending
+        // split-CRLF decision; Node never emits empty `data` events, but the
+        // class is reused and unit-tested directly.
+        if (chunk === '') return;
         let input = chunk;
         if (this.swallowLeadingLf) {
             // The pending CRLF decision belongs only to this next chunk. Even

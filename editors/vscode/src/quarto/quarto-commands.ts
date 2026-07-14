@@ -315,12 +315,11 @@ function createQuartoRenderRunner(deps: QuartoCommandDeps): QuartoRenderRunner {
 }
 
 function renderGuardKey(uri: vscode.Uri, deps: QuartoCommandDeps): string {
-    const lexicalKey = canonicalOpKey(uri);
     try {
         const realpath = deps.realpath ?? fs.realpathSync.native;
         return canonicalOpKey({ fsPath: realpath(uri.fsPath) });
     } catch {
-        return lexicalKey;
+        return canonicalOpKey(uri);
     }
 }
 
