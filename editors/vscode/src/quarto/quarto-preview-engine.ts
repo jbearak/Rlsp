@@ -9,15 +9,20 @@
  * corrupt one another. Bare-CR progress records count as line boundaries. A
  * parsed URL is not readiness: Quarto can print it before binding, so the
  * engine retries bounded Node `http` GETs against the validated raw loopback
- * URL before resolving `start()`. Any startup failure claims the same shared
- * stop ladder itself after capturing the startup tail, so the engine remains
- * leak-safe even without its runtime owner.
+ * URL before resolving `start()`. Startup uses a generous output-idle timeout,
+ * reset by every stdout/stderr chunk, so long initial renders remain alive
+ * while a truly silent process is still bounded. Probe retries are aborted as
+ * soon as startup settles or teardown begins. Any startup failure claims the
+ * same shared stop ladder itself after capturing the startup tail, so the
+ * engine remains leak-safe even without its runtime owner.
  *
  * Browse-only fallback waits for a correlation window and remains provisional
- * while its readiness probe runs. If that probe cannot connect, a short final
- * window lets a late `Listening on` line supersede it and probe the corrected,
- * trusted-origin URL. Probe diagnosis follows the last attempt: trailing
- * connection errors cannot be masked by an earlier 404.
+ * through its readiness probe and one final grace window. A late
+ * `Listening on` line can therefore supersede either a failed or successful
+ * Browse-only probe before `start()` resolves and probe the corrected,
+ * trusted-origin URL.
+ * Probe diagnosis follows the last attempt: trailing connection errors cannot
+ * be masked by an earlier 404.
  *
  * Intentional stop is marked before the first signal. One shared per-child
  * teardown promise owns the ladder: `stop()` escalates SIGINT -> SIGTERM ->
@@ -37,7 +42,8 @@ import {
 } from './preview-url-parser';
 import { QuartoProcessTeardown } from './quarto-process-teardown';
 
-export const QUARTO_PREVIEW_STARTUP_TIMEOUT_MS = 30_000;
+/** Maximum silence during startup; active initial renders reset this timer. */
+export const QUARTO_PREVIEW_STARTUP_TIMEOUT_MS = 60_000;
 export const QUARTO_PREVIEW_PROBE_ATTEMPTS = 20;
 export const QUARTO_PREVIEW_PROBE_DELAY_MS = 250;
 export const QUARTO_PREVIEW_BROWSE_CORRELATION_DELAY_MS = 1_500;
@@ -68,7 +74,7 @@ export interface QuartoPreviewProcessOptions {
     /** Dependency-injected for engine tests. */
     spawnProcess?: typeof spawn;
     startupTimeoutMs?: number;
-    probe?: typeof probeQuartoPreviewUrl;
+    probe?: (rawUrl: string, signal: AbortSignal) => Promise<number>;
     /** Dependency-injected correlation window for engine tests. */
     browseCorrelationDelayMs?: number;
     /** Dependency-injected grace after a Browse-only connection failure. */
@@ -99,6 +105,7 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
     private lateListeningTimer: NodeJS.Timeout | null = null;
     private outputDetached = false;
     private outputDetacher: (() => void) | null = null;
+    private activeProbeAbortController: AbortController | null = null;
 
     constructor(private readonly opts: QuartoPreviewProcessOptions) {}
 
@@ -138,6 +145,7 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
             let settled = false;
             let probeSequence = 0;
             let browseFallbackStarted = false;
+            let startupTimer: NodeJS.Timeout;
             let closeResolve: () => void = () => undefined;
             this.closePromise = new Promise<void>((r) => { closeResolve = r; });
             const correlationDelayMs = this.opts.browseCorrelationDelayMs
@@ -148,6 +156,8 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                 if (settled) return false;
                 settled = true;
                 clearTimeout(startupTimer);
+                this.activeProbeAbortController?.abort();
+                this.activeProbeAbortController = null;
                 if (this.browseTimer) {
                     clearTimeout(this.browseTimer);
                     this.browseTimer = null;
@@ -167,19 +177,63 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                 if (!finishStart(() => reject(error))) return;
                 void this.stop().catch(() => undefined);
             };
+            const startupTimeoutMs = this.opts.startupTimeoutMs
+                ?? QUARTO_PREVIEW_STARTUP_TIMEOUT_MS;
+            const resetStartupTimer = (): void => {
+                if (settled) return;
+                clearTimeout(startupTimer);
+                startupTimer = setTimeout(() => {
+                    fail(
+                        `Quarto preview produced no startup output for ` +
+                        `${startupTimeoutMs}ms.`,
+                    );
+                }, startupTimeoutMs);
+            };
             const beginProbe = (
                 candidate: PreviewUrlResult,
                 browseOnly: boolean,
             ): void => {
                 if (settled) return;
                 const probeId = ++probeSequence;
+                this.activeProbeAbortController?.abort();
+                const probeAbort = new AbortController();
+                this.activeProbeAbortController = probeAbort;
                 if (!browseOnly && this.lateListeningTimer) {
                     clearTimeout(this.lateListeningTimer);
                     this.lateListeningTimer = null;
                 }
-                const probe = this.opts.probe ?? probeQuartoPreviewUrl;
-                void probe(candidate.url).then((statusCode) => {
+                const probe = this.opts.probe
+                    ?? ((url: string, signal: AbortSignal) =>
+                        probeQuartoPreviewUrl(
+                            url,
+                            QUARTO_PREVIEW_PROBE_ATTEMPTS,
+                            QUARTO_PREVIEW_PROBE_DELAY_MS,
+                            requestStatus,
+                            signal,
+                        ));
+                void probe(candidate.url, probeAbort.signal).then((statusCode) => {
                     if (settled || probeId !== probeSequence) return;
+                    if (browseOnly) {
+                        // A document can print a plausible Browse line before
+                        // Quarto reports its actual listener. Even a successful
+                        // provisional probe gets one last correlation window.
+                        const graceMs = this.opts.lateListeningGraceMs
+                            ?? correlationDelayMs;
+                        this.lateListeningTimer = setTimeout(() => {
+                            this.lateListeningTimer = null;
+                            if (!settled && probeId === probeSequence) {
+                                finishStart(() => {
+                                    this.ready = true;
+                                    resolve({
+                                        rawUrl: candidate.url,
+                                        origin: candidate.origin,
+                                        statusCode,
+                                    });
+                                });
+                            }
+                        }, graceMs);
+                        return;
+                    }
                     finishStart(() => {
                         this.ready = true;
                         resolve({
@@ -239,11 +293,13 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
             const stderrWriter = new PrefixedStderrWriter(this.opts.output, scanLine);
 
             const onStdoutData = (chunk: string): void => {
+                resetStartupTimer();
                 this.opts.output.append(chunk);
                 this.scanner.captureRaw(chunk);
                 stdoutLines.feed(chunk);
             };
             const onStderrData = (chunk: string): void => {
+                resetStartupTimer();
                 this.scanner.captureRaw(chunk);
                 stderrWriter.feed(chunk);
             };
@@ -295,17 +351,13 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                 }
             });
 
-            const startupTimer = setTimeout(() => {
-                fail(
-                    `Quarto preview did not become ready within ` +
-                    `${this.opts.startupTimeoutMs ?? QUARTO_PREVIEW_STARTUP_TIMEOUT_MS}ms.`,
-                );
-            }, this.opts.startupTimeoutMs ?? QUARTO_PREVIEW_STARTUP_TIMEOUT_MS);
+            resetStartupTimer();
         });
     }
 
     stop(): Promise<void> {
         this.intentionalStop = true;
+        this.abortStartupWork();
         this.detachProcessOutput();
         if (this.teardownPromise) return this.teardownPromise;
         this.teardownPromise = this.teardown?.stop() ?? Promise.resolve();
@@ -314,6 +366,7 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
 
     shutdown(): Promise<void> {
         this.intentionalStop = true;
+        this.abortStartupWork();
         this.detachProcessOutput();
         if (!this.teardown) {
             if (this.teardownPromise) return this.teardownPromise;
@@ -333,6 +386,11 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
         this.outputDetacher = null;
     }
 
+    private abortStartupWork(): void {
+        this.activeProbeAbortController?.abort();
+        this.activeProbeAbortController = null;
+    }
+
     private startError(message: string): QuartoPreviewStartError {
         return new QuartoPreviewStartError(message, this.scanner.startupTail());
     }
@@ -348,21 +406,24 @@ export async function probeQuartoPreviewUrl(
     rawUrl: string,
     attempts: number = QUARTO_PREVIEW_PROBE_ATTEMPTS,
     delayMs: number = QUARTO_PREVIEW_PROBE_DELAY_MS,
-    request: (url: string) => Promise<number> = requestStatus,
+    request: (url: string, signal?: AbortSignal) => Promise<number> = requestStatus,
+    signal?: AbortSignal,
 ): Promise<number> {
     let lastOutcome: '404' | 'error' | null = null;
     let lastError: Error | null = null;
     for (let attempt = 0; attempt < attempts; attempt++) {
+        throwIfAborted(signal);
         try {
-            const status = await request(rawUrl);
+            const status = await request(rawUrl, signal);
             if (status !== 404) return status;
             lastOutcome = '404';
             lastError = null;
         } catch (err) {
+            if (signal?.aborted) throw abortError();
             lastOutcome = 'error';
             lastError = err instanceof Error ? err : new Error(String(err));
         }
-        if (attempt + 1 < attempts) await delay(delayMs);
+        if (attempt + 1 < attempts) await delay(delayMs, signal);
     }
     if (lastOutcome === '404') {
         throw new QuartoPreviewProbeError(
@@ -387,23 +448,59 @@ export class QuartoPreviewProbeError extends Error {
     }
 }
 
-function requestStatus(rawUrl: string): Promise<number> {
+function requestStatus(rawUrl: string, signal?: AbortSignal): Promise<number> {
     return new Promise<number>((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(abortError());
+            return;
+        }
         const req = http.request(rawUrl, { method: 'GET' }, (response) => {
+            signal?.removeEventListener('abort', onAbort);
             const status = response.statusCode ?? 0;
             response.resume();
             resolve(status);
         });
+        const onAbort = (): void => {
+            req.destroy(abortError());
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
         req.setTimeout(750, () => {
             req.destroy(new Error('HTTP readiness probe timed out'));
         });
-        req.on('error', reject);
+        req.on('error', (err) => {
+            signal?.removeEventListener('abort', onAbort);
+            reject(err);
+        });
         req.end();
     });
 }
 
-function delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(abortError());
+            return;
+        }
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        const onAbort = (): void => {
+            clearTimeout(timer);
+            reject(abortError());
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+    if (signal?.aborted) throw abortError();
+}
+
+function abortError(): Error {
+    const error = new Error('Quarto preview readiness probe aborted');
+    error.name = 'AbortError';
+    return error;
 }
 
 function errorMessage(err: unknown): string {

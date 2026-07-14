@@ -9,7 +9,9 @@ import {
     appendQuartoRenderTail,
     clampQuartoRenderTimeoutMs,
     classifyQuartoRenderResult,
+    DEFAULT_QUARTO_RENDER_TIMEOUT_MS,
     MAX_NODE_TIMER_MS,
+    normalizeQuartoRenderTimeoutMs,
     QuartoRenderEngine,
     QUARTO_RENDER_RETAINED_OUTPUT_CHARS,
 } from '../../editors/vscode/src/quarto/quarto-render-engine';
@@ -63,6 +65,7 @@ describe('Quarto render result handling', () => {
     it('caps both the settings schema and armed Node timer delay', () => {
         expect(clampQuartoRenderTimeoutMs(Number.MAX_SAFE_INTEGER)).toBe(MAX_NODE_TIMER_MS);
         expect(clampQuartoRenderTimeoutMs(600_000)).toBe(600_000);
+        expect(clampQuartoRenderTimeoutMs(0)).toBe(DEFAULT_QUARTO_RENDER_TIMEOUT_MS);
 
         const manifest = JSON.parse(readFileSync(
             new URL('../../editors/vscode/package.json', import.meta.url),
@@ -72,6 +75,16 @@ describe('Quarto render result handling', () => {
             'raven.quarto.render.timeoutMs'
         ];
         expect(schema.maximum).toBe(MAX_NODE_TIMER_MS);
+    });
+
+    it('normalizes invalid configured timeouts to the default', () => {
+        for (const configured of [0, -1, Number.NaN, Infinity, undefined, '1']) {
+            expect(normalizeQuartoRenderTimeoutMs(configured)).toBe(
+                DEFAULT_QUARTO_RENDER_TIMEOUT_MS,
+            );
+        }
+        expect(normalizeQuartoRenderTimeoutMs(1)).toBe(1);
+        expect(normalizeQuartoRenderTimeoutMs(45_000)).toBe(45_000);
     });
 });
 
@@ -166,8 +179,10 @@ describe('QuartoRenderEngine lifecycle', () => {
 
         expect(engine.getLiveChildCountForTesting()).toBe(1);
         await engine.shutdown();
-        await running;
+        const shutdownResult = await running;
         expect(child.signals).toEqual(['SIGTERM']);
+        expect(shutdownResult.cancelled).toBe(true);
+        expect(classifyQuartoRenderResult(shutdownResult)).toBe('cancelled');
         expect(engine.getLiveChildCountForTesting()).toBe(0);
 
         const afterShutdown = await engine.run({

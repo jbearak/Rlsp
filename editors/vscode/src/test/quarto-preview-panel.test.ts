@@ -278,6 +278,56 @@ suite('QuartoPreviewPanel integration', () => {
         ));
     });
 
+    test('Open in Browser false result warns and logs the copyable URL', async () => {
+        const lines: string[] = [];
+        const warnings: string[] = [];
+        const originalOpenExternal = vscode.env.openExternal;
+        const originalShowWarning = vscode.window.showWarningMessage;
+        (vscode.env as { openExternal: unknown }).openExternal = async () => false;
+        (vscode.window as { showWarningMessage: unknown }).showWarningMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            warnings.push(message);
+            return Promise.resolve(undefined);
+        };
+        try {
+            const browserDeps: QuartoPreviewPanelDeps = {
+                ...deps,
+                output: {
+                    appendLine: (line: string) => { lines.push(line); },
+                } as unknown as vscode.OutputChannel,
+            };
+            const rawUrl = 'http://127.0.0.1:4555/chapter/';
+            const instance = QuartoPreviewPanel.applyRuntimeUpdate({
+                key: '/project',
+                generation: 1,
+                sourceFsPath: '/project/a.qmd',
+                state: { kind: 'starting' },
+            }, browserDeps);
+            assert.ok(instance);
+            QuartoPreviewPanel.applyRuntimeUpdate({
+                key: '/project',
+                generation: 1,
+                sourceFsPath: '/project/a.qmd',
+                rawUrl,
+                state: { kind: 'serving', externalUrl: rawUrl },
+            }, browserDeps);
+
+            await instance.handleMessageForTesting({ type: 'open-in-browser' });
+
+            assert.deepStrictEqual(lines, [`[panel] Open in Browser failed: ${rawUrl}`]);
+            assert.deepStrictEqual(warnings, [
+                'VS Code could not open the Quarto preview in a browser. ' +
+                'The URL was written to Raven: Quarto output.',
+            ]);
+        } finally {
+            (vscode.env as { openExternal: unknown }).openExternal = originalOpenExternal;
+            (vscode.window as { showWarningMessage: unknown }).showWarningMessage = (
+                originalShowWarning
+            );
+        }
+    });
+
     test('serializer restore reapplies options, shows placeholder, and never starts', () => {
         const panel = vscode.window.createWebviewPanel(
             'raven.quartoPreview.test.restore',

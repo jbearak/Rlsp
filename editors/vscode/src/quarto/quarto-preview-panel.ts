@@ -26,7 +26,8 @@
  * disposal stops only the generation that panel currently represents.
  * Async message and dispose-stop handling are caught at their event boundaries
  * so rejected VS Code commands, URI opens, or runtime stops are reported
- * without becoming unhandled host rejections.
+ * without becoming unhandled host rejections. A false Open-in-Browser result
+ * warns the user and records the raw validated URL for manual copying.
  * Deactivation disposes every panel and clears the static registry because VS
  * Code keeps JS modules alive across disable/enable cycles; retaining a panel
  * would retain the old runtime dependencies and generation counters too.
@@ -204,6 +205,11 @@ export class QuartoPreviewPanel {
         return this.panel;
     }
 
+    /** Test-only message entry point for browser-open outcome coverage. */
+    async handleMessageForTesting(message: unknown): Promise<void> {
+        await this.handleMessage(message);
+    }
+
     private applyUpdate(update: QuartoRuntimeViewUpdate): boolean {
         if (update.generation < this.generation || this.disposed) return false;
         let sourceChanged = false;
@@ -273,7 +279,18 @@ export class QuartoPreviewPanel {
                 return;
             case 'open-in-browser':
                 if (this.rawUrl) {
-                    await vscode.env.openExternal(vscode.Uri.parse(this.rawUrl));
+                    const opened = await vscode.env.openExternal(
+                        vscode.Uri.parse(this.rawUrl),
+                    );
+                    if (!opened) {
+                        this.deps.output.appendLine(
+                            `[panel] Open in Browser failed: ${this.rawUrl}`,
+                        );
+                        await vscode.window.showWarningMessage(
+                            'VS Code could not open the Quarto preview in a browser. ' +
+                            'The URL was written to Raven: Quarto output.',
+                        );
+                    }
                 }
                 return;
             case 'stop-preview':

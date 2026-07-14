@@ -3,6 +3,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import type { KnitEngineResult } from '../knit/knit-engine';
+import { QuartoNotFoundError } from '../quarto/quarto-detect';
 import { activate, awaitActive } from './helper';
 import {
     createQuartoRenderRunnerForTesting,
@@ -263,17 +265,12 @@ suite('Quarto command preflight', () => {
                 },
             });
             const runRender = createQuartoRenderRunnerForTesting(deps);
-            const preflight = {
-                uri,
-                document: fakeDocument(uri, '# document'),
-                context: { key: uri.fsPath, cwd: '/tmp', projectRoot: null },
-            };
 
-            const first = runRender(preflight);
+            const first = runRender(uri);
             await firstToastShown.promise;
             assert.strictEqual(renderCalls, 1);
 
-            await runRender(preflight);
+            await runRender(uri);
             assert.strictEqual(renderCalls, 2);
 
             dismissFirstToast.resolve(undefined);
@@ -281,6 +278,119 @@ suite('Quarto command preflight', () => {
         } finally {
             dismissFirstToast.resolve(undefined);
             (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('busy render guard runs before document open and save', async () => {
+        const renderStarted = new Deferred<void>();
+        const finishRender = new Deferred<KnitEngineResult>();
+        let opens = 0;
+        let saves = 0;
+        const uri = vscode.Uri.file('/tmp/early-render-guard.qmd');
+        const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+            openTextDocument: async () => {
+                opens++;
+                return {
+                    ...fakeDocument(uri, '# document'),
+                    isDirty: true,
+                    save: async () => {
+                        saves++;
+                        return true;
+                    },
+                } as vscode.TextDocument;
+            },
+            runRender: async () => {
+                renderStarted.resolve(undefined);
+                return finishRender.promise;
+            },
+        }));
+
+        const first = runRender(uri);
+        await renderStarted.promise;
+        await runRender(uri);
+
+        assert.strictEqual(opens, 1);
+        assert.strictEqual(saves, 1);
+        finishRender.resolve(successfulRenderResult());
+        await first;
+    });
+
+    test('realpath aliases share one in-flight render guard', async () => {
+        const renderStarted = new Deferred<void>();
+        const finishRender = new Deferred<KnitEngineResult>();
+        let renders = 0;
+        const real = vscode.Uri.file('/project/real/doc.qmd');
+        const alias = vscode.Uri.file('/project/link/doc.qmd');
+        const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+            realpath: () => real.fsPath,
+            runRender: async () => {
+                renders++;
+                renderStarted.resolve(undefined);
+                return finishRender.promise;
+            },
+        }));
+
+        const first = runRender(real);
+        await renderStarted.promise;
+        await runRender(alias);
+
+        assert.strictEqual(renders, 1);
+        finishRender.resolve(successfulRenderResult());
+        await first;
+    });
+
+    test('configured-path resolver error is surfaced with install actions', async () => {
+        const prompts: Array<{ message: string; actions: string[] }> = [];
+        const original = vscode.window.showErrorMessage;
+        (vscode.window as { showErrorMessage: unknown }).showErrorMessage = (
+            message: string,
+            ...actions: string[]
+        ): Thenable<string | undefined> => {
+            prompts.push({ message, actions });
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/tmp/configured-path.qmd');
+            const configuredError = new QuartoNotFoundError(
+                'Configured Quarto path is unusable or is not Quarto: /bad/quarto',
+            );
+            const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+                resolver: { resolve: async () => { throw configuredError; } },
+            }));
+
+            await runRender(uri);
+
+            assert.deepStrictEqual(prompts, [{
+                message: configuredError.message,
+                actions: ['Install…', 'Set Path…'],
+            }]);
+        } finally {
+            (vscode.window as { showErrorMessage: unknown }).showErrorMessage = original;
+        }
+    });
+
+    test('shutdown-classified cancellation produces no failure toast', async () => {
+        let errors = 0;
+        const original = vscode.window.showErrorMessage;
+        (vscode.window as { showErrorMessage: unknown }).showErrorMessage = (
+            _message: string,
+        ): Thenable<string | undefined> => {
+            errors++;
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/tmp/deactivation.qmd');
+            const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+                runRender: async () => successfulRenderResult({
+                    exitCode: null,
+                    cancelled: true,
+                }),
+            }));
+
+            await runRender(uri);
+            assert.strictEqual(errors, 0);
+        } finally {
+            (vscode.window as { showErrorMessage: unknown }).showErrorMessage = original;
         }
     });
 
@@ -306,10 +416,25 @@ suite('Quarto command preflight', () => {
                 cwd: path.dirname(sourceFsPath),
                 projectRoot: null,
             }),
+            openTextDocument: async (uri) => fakeDocument(uri, '# document'),
             ...overrides,
         };
     }
 });
+
+function successfulRenderResult(
+    overrides: Partial<KnitEngineResult> = {},
+): KnitEngineResult {
+    return {
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        cancelled: false,
+        timedOut: false,
+        spawnError: null,
+        ...overrides,
+    };
+}
 
 function fakeDocument(uri: vscode.Uri, text: string): vscode.TextDocument {
     return {

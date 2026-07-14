@@ -23,10 +23,11 @@
  * parsing and useful failure context without allowing unbounded accumulation.
  * Cancellation, timeout, and shutdown share one per-child teardown promise and
  * detach their exact data listeners and flush already-received partial stderr
- * once before signaling. Deactivation can tighten an in-flight graceful ladder
- * but never starts a second one. A bounded post-SIGKILL wait completes the
- * render result even without `close`; its abandonment warning cannot throw
- * through a disposed output channel.
+ * once before signaling. Deactivation marks the result cancelled, keeping the
+ * command outcome silent, and can tighten an in-flight graceful ladder without
+ * starting a second one. A bounded post-SIGKILL wait completes the render
+ * result even without `close`; its abandonment warning cannot throw through a
+ * disposed output channel.
  */
 
 import { ChildProcess, spawn } from 'child_process';
@@ -54,10 +55,23 @@ const SHUTDOWN_KILL_WAIT_MS = 1_000;
 
 export const QUARTO_RENDER_RETAINED_OUTPUT_CHARS = 256 * 1024;
 export const MAX_NODE_TIMER_MS = 2_147_483_647;
+export const DEFAULT_QUARTO_RENDER_TIMEOUT_MS = 600_000;
+
+/** Fall back for malformed/stale settings before arming a Node timer. */
+export function normalizeQuartoRenderTimeoutMs(configured: unknown): number {
+    if (
+        typeof configured !== 'number'
+        || !Number.isFinite(configured)
+        || configured < 1
+    ) {
+        return DEFAULT_QUARTO_RENDER_TIMEOUT_MS;
+    }
+    return configured;
+}
 
 /** Clamp a configured timeout to the largest delay Node timers represent. */
 export function clampQuartoRenderTimeoutMs(timeoutMs: number): number {
-    return Math.min(timeoutMs, MAX_NODE_TIMER_MS);
+    return Math.min(normalizeQuartoRenderTimeoutMs(timeoutMs), MAX_NODE_TIMER_MS);
 }
 
 export type QuartoRenderResultKind =
@@ -218,6 +232,7 @@ export class QuartoRenderEngine {
         const exitCode = await live.waitForCompletion();
         for (const timer of timers) clearTimeout(timer);
         cancelHook.dispose();
+        if (live.shuttingDown) cancelled = true;
         return { exitCode, stdout, stderr, cancelled, timedOut, spawnError };
     }
 }

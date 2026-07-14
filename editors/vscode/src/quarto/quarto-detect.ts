@@ -10,7 +10,9 @@
  * exits successfully but does not print Quarto's `Quarto CLI` marker is
  * rejected. The production probe drains both pipes, captures only a bounded
  * stdout prefix, and has a hard timeout so a wedged configured binary cannot
- * block command progress forever.
+ * block command progress forever. Cache entries are the resolution promises,
+ * so concurrent first use for one effective setting shares a single probe;
+ * rejected promises are evicted to permit a later retry.
  */
 
 import * as childProcess from 'child_process';
@@ -72,20 +74,30 @@ export function defaultQuartoFallbacks(
 }
 
 export class QuartoResolver<Resource> {
-    private readonly cache = new Map<string, string>();
+    private readonly cache = new Map<string, Promise<string>>();
 
     constructor(private readonly deps: QuartoResolverDeps<Resource>) {}
 
-    async resolve(resource: Resource): Promise<string> {
+    resolve(resource: Resource): Promise<string> {
         const configured = this.deps.getConfigured(resource).trim();
         const cached = this.cache.get(configured);
         if (cached !== undefined) return cached;
 
+        const resolution = this.resolveUncached(configured);
+        this.cache.set(configured, resolution);
+        void resolution.catch(() => {
+            if (this.cache.get(configured) === resolution) {
+                this.cache.delete(configured);
+            }
+        });
+        return resolution;
+    }
+
+    private async resolveUncached(configured: string): Promise<string> {
         if (configured !== '') {
             try {
                 await this.deps.access(configured);
                 await this.deps.probe(configured);
-                this.cache.set(configured, configured);
                 return configured;
             } catch {
                 throw new QuartoNotFoundError(
@@ -96,7 +108,6 @@ export class QuartoResolver<Resource> {
 
         try {
             await this.deps.probe('quarto');
-            this.cache.set(configured, 'quarto');
             return 'quarto';
         } catch {
             // Continue through platform fallbacks.
@@ -107,7 +118,6 @@ export class QuartoResolver<Resource> {
             try {
                 await this.deps.access(candidate);
                 await this.deps.probe(candidate);
-                this.cache.set(configured, candidate);
                 return candidate;
             } catch {
                 // Try the next standard installation path.

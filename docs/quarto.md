@@ -88,6 +88,10 @@ therefore:
 4. probes the URL from the extension host until it responds before installing
    it in the preview panel.
 
+A long initial render remains in startup while Quarto continues producing
+output. Raven treats startup as hung only after 60 seconds with no stdout or
+stderr activity, and stopping Preview cancels any outstanding readiness probe.
+
 A persistent 404 is treated as a non-browser-previewable output format, and
 the panel tells you to use `Raven: Quarto Render` instead.
 
@@ -98,7 +102,8 @@ page reloads itself.
 
 The panel also provides **Open in Browser**, **Stop Preview**, and, after a
 stop, failure, restored tab, or unexpected process exit, **Restart Preview**.
-Raven never opens an external browser automatically.
+Raven never opens an external browser automatically. If VS Code cannot open the
+browser, Raven warns and writes the URL to **Raven: Quarto** so you can copy it.
 
 ### Stop Quarto Preview
 
@@ -121,10 +126,11 @@ quarto render <file>
 
 The command runs in the same project-aware working directory as Preview. It
 uses a cancellable progress notification, streams output to **Raven: Quarto**,
-and permits only one render at a time for a given source file. It does not
-start a preview server. The per-file guard is released when the Quarto process
-finishes; choosing or dismissing an action in the outcome notification does not
-block a subsequent render.
+and permits only one render at a time for a given physical source file, including
+when it is opened through a symlink. It does not start a preview server. The
+per-file guard is released when the Quarto process finishes; choosing or
+dismissing an action in the outcome notification does not block a subsequent
+render.
 
 After Quarto exits:
 

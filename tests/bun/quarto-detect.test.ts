@@ -76,6 +76,33 @@ describe('QuartoResolver', () => {
         expect(probes).toEqual(['/folder-a/quarto', '/folder-b/quarto']);
     });
 
+    it('shares one in-flight probe across concurrent first-use calls', async () => {
+        let probeCalls = 0;
+        let releaseProbe: (value: string) => void = () => undefined;
+        const probeResult = new Promise<string>((resolve) => {
+            releaseProbe = resolve;
+        });
+        const resolver = new QuartoResolver({
+            getConfigured: () => '/custom/quarto',
+            access: accessOk,
+            probe: async () => {
+                probeCalls++;
+                return probeResult;
+            },
+        });
+
+        const first = resolver.resolve('a');
+        const second = resolver.resolve('b');
+        expect(first).toBe(second);
+        releaseProbe('Quarto CLI help');
+
+        expect(await Promise.all([first, second])).toEqual([
+            '/custom/quarto',
+            '/custom/quarto',
+        ]);
+        expect(probeCalls).toBe(1);
+    });
+
     it('invalidate clears every configured-value cache entry', async () => {
         let probes = 0;
         const resolver = new QuartoResolver({

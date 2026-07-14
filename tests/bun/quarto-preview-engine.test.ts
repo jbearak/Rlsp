@@ -11,6 +11,7 @@ import {
     QuartoPreviewProcess,
     QUARTO_PREVIEW_BROWSE_CORRELATION_DELAY_MS,
     QUARTO_PREVIEW_LINE_CARRY_LIMIT,
+    QUARTO_PREVIEW_STARTUP_TIMEOUT_MS,
 } from '../../editors/vscode/src/quarto/quarto-preview-engine';
 
 class Deferred<T> {
@@ -103,6 +104,64 @@ describe('probeQuartoPreviewUrl', () => {
             );
         }
     });
+
+    it('aborts retry waits promptly without issuing later requests', async () => {
+        const controller = new AbortController();
+        const firstRequest = new Deferred<void>();
+        let requests = 0;
+        const probing = probeQuartoPreviewUrl(
+            'http://127.0.0.1:1/',
+            20,
+            100,
+            async () => {
+                requests++;
+                firstRequest.resolve();
+                throw new Error('connect ECONNREFUSED');
+            },
+            controller.signal,
+        );
+
+        await firstRequest.promise;
+        controller.abort();
+        await expect(probing).rejects.toMatchObject({ name: 'AbortError' });
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        expect(requests).toBe(1);
+    });
+});
+
+describe('Quarto preview startup idle timeout', () => {
+    it('uses a generous output-idle default', () => {
+        expect(QUARTO_PREVIEW_STARTUP_TIMEOUT_MS).toBe(60_000);
+    });
+
+    it('keeps a long initial render alive while output remains active', async () => {
+        const child = new FakeChild();
+        const process = processFor(child, {
+            startupTimeoutMs: 100,
+            probe: async () => 200,
+        });
+        const starting = process.start();
+
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        child.stderr.write('rendering chunk one\n');
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        child.stderr.write('Listening on http://127.0.0.1:4888/\n');
+
+        expect((await starting).rawUrl).toBe('http://127.0.0.1:4888/');
+    });
+
+    it('fails a child that stays silent for the full idle window', async () => {
+        const child = new FakeChild();
+        const process = processFor(child, {
+            startupTimeoutMs: 10,
+            signalGraceMs: 1,
+            killWaitMs: 1,
+        });
+
+        await expect(process.start()).rejects.toThrow(
+            'produced no startup output for 10ms',
+        );
+    });
 });
 
 describe('Quarto preview output line handling', () => {
@@ -171,6 +230,31 @@ describe('Quarto preview output line handling', () => {
 });
 
 describe('Quarto preview process stop ladder', () => {
+    it('aborts an active readiness probe when stop begins', async () => {
+        const child = new FakeChild();
+        const probeStarted = new Deferred<void>();
+        const probeAborted = new Deferred<void>();
+        const process = processFor(child, {
+            probe: async (_url, signal) => new Promise<number>((_resolve, reject) => {
+                probeStarted.resolve();
+                signal.addEventListener('abort', () => {
+                    probeAborted.resolve();
+                    reject(new Error('probe aborted'));
+                }, { once: true });
+            }),
+            signalGraceMs: 1,
+            killWaitMs: 1,
+        });
+        const starting = process.start().catch((err) => err as Error);
+        child.stderr.write('Listening on http://127.0.0.1:4444/\n');
+        await probeStarted.promise;
+
+        await process.stop();
+
+        await probeAborted.promise;
+        expect(await starting).toBeInstanceOf(Error);
+    });
+
     it('self-stops exactly once after a readiness probe failure', async () => {
         const child = new NeverClosingFakeChild();
         const output: string[] = [];
@@ -366,5 +450,33 @@ describe('Browse-only preview correlation', () => {
             'http://127.0.0.1:4666/chapter/',
         ]);
         expect(ready.rawUrl).toBe('http://127.0.0.1:4666/chapter/');
+    });
+
+    it('lets late Listening supersede a successful Browse-only probe', async () => {
+        const child = new FakeChild();
+        const firstProbe = new Deferred<void>();
+        const probed: string[] = [];
+        const process = processFor(child, {
+            browseCorrelationDelayMs: 1,
+            lateListeningGraceMs: 100,
+            probe: async (url) => {
+                probed.push(url);
+                if (probed.length === 1) firstProbe.resolve();
+                return 200;
+            },
+        });
+        const starting = process.start();
+        child.stderr.write('Browse at http://localhost:4777/chapter/\n');
+
+        await firstProbe.promise;
+        await Promise.resolve();
+        child.stderr.write('Listening on http://127.0.0.1:4888/\n');
+
+        const ready = await starting;
+        expect(probed).toEqual([
+            'http://localhost:4777/chapter/',
+            'http://127.0.0.1:4888/chapter/',
+        ]);
+        expect(ready.rawUrl).toBe('http://127.0.0.1:4888/chapter/');
     });
 });
