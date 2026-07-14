@@ -21,8 +21,9 @@
  * the tab it just closed.
  *
  * Restored panels reapply `webview.options` before any other work because VS
- * Code does not persist them. Restoration validates `{ sourceFsPath }`, wires
- * the inert panel, and renders a placeholder; it never starts Quarto. Panel
+ * Code does not persist them. Restoration validates `{ sourceFsPath }`, awaits
+ * async physical project-key discovery, wires the inert panel, and renders a
+ * placeholder; it never starts Quarto. Panel
  * disposal stops only the generation that panel currently represents.
  * Async message and dispose-stop handling are caught at their event boundaries
  * so rejected VS Code commands, URI opens, or runtime stops are reported
@@ -46,7 +47,7 @@ import type { QuartoRuntimeViewUpdate } from './quarto-preview-runtime';
 export interface QuartoPreviewPanelDeps {
     output: vscode.OutputChannel;
     stopGeneration(key: string, generation: number): Promise<unknown>;
-    keyForSource(sourceFsPath: string): string;
+    keyForSource(sourceFsPath: string): Promise<string>;
 }
 
 type ViewerColumnSetting = 'active' | 'beside';
@@ -147,11 +148,11 @@ export class QuartoPreviewPanel {
      * Adopt a serialized panel without starting a preview process.
      * `webview.options` is intentionally the first mutation.
      */
-    static restore(
+    static async restore(
         panel: vscode.WebviewPanel,
         persistedState: unknown,
         deps: QuartoPreviewPanelDeps,
-    ): QuartoPreviewPanel | null {
+    ): Promise<QuartoPreviewPanel | null> {
         panel.webview.options = {
             enableScripts: true,
             localResourceRoots: [],
@@ -161,7 +162,7 @@ export class QuartoPreviewPanel {
             panel.dispose();
             return null;
         }
-        const key = deps.keyForSource(persistedState.sourceFsPath);
+        const key = await deps.keyForSource(persistedState.sourceFsPath);
         const existing = this.instances.get(key);
         if (existing && !existing.disposed) {
             existing.panel.reveal(existing.panel.viewColumn, true);

@@ -3,15 +3,15 @@
  *
  * Project markers must be regular files. Missing paths, directories named
  * `_quarto.yml` / `_quarto.yaml`, and filesystem errors all mean “not a
- * marker”; the pure ancestor walk receives only this boolean predicate.
+ * marker”; the pure async ancestor walk receives only this boolean predicate.
  */
 
 import * as fs from 'fs';
 
 /** Return whether `candidate` is a regular Quarto project-marker file. */
-export function isQuartoProjectMarkerFile(candidate: string): boolean {
+export async function isQuartoProjectMarkerFile(candidate: string): Promise<boolean> {
     try {
-        return fs.statSync(candidate).isFile();
+        return (await fs.promises.stat(candidate)).isFile();
     } catch {
         return false;
     }

@@ -1,19 +1,24 @@
 /**
- * Pure project-key and working-directory discovery for Quarto commands.
+ * Asynchronous project-key and working-directory discovery for Quarto commands.
  *
  * This is deliberately only Raven's keying/cwd heuristic. Quarto performs
  * its own richer project discovery from the target path. The walk is not
  * bounded by a VS Code workspace: it visits every ancestor through the
- * filesystem root and checks both supported project-file spellings through a
- * regular-file predicate; a directory named like a marker is not a project.
+ * filesystem root and checks both supported project-file spellings through an
+ * async regular-file predicate; a directory named like a marker is not a
+ * project. The source is realpathed before the walk, so symlink aliases outside
+ * a project classify identically to the physical source within it. Filesystem
+ * failures retain the lexical path as a safe fallback.
  */
 
 import * as path from 'path';
 import { canonicalOpKey } from '../knit/raven-knit-paths';
 
 export interface QuartoProjectDeps {
-    /** Synchronous regular-marker-file check, dependency-injected for pure tests. */
-    isProjectMarkerFile(candidate: string): boolean;
+    /** Async source realpath, dependency-injected for pure tests. */
+    realpath(candidate: string): Promise<string>;
+    /** Async regular-marker-file check, dependency-injected for pure tests. */
+    isProjectMarkerFile(candidate: string): Promise<boolean>;
 }
 
 export interface QuartoContext {
@@ -32,16 +37,17 @@ export interface QuartoContext {
  * `path.dirname(dir) === dir` condition is the only walk bound, which keeps
  * discovery correct for files outside the active workspace.
  */
-export function findQuartoProjectRoot(
+export async function findQuartoProjectRoot(
     startDir: string,
     deps: QuartoProjectDeps,
-): string | null {
+): Promise<string | null> {
     let dir = path.resolve(startDir);
     for (;;) {
-        if (
-            deps.isProjectMarkerFile(path.join(dir, '_quarto.yml')) ||
-            deps.isProjectMarkerFile(path.join(dir, '_quarto.yaml'))
-        ) {
+        const [hasYml, hasYaml] = await Promise.all([
+            deps.isProjectMarkerFile(path.join(dir, '_quarto.yml')),
+            deps.isProjectMarkerFile(path.join(dir, '_quarto.yaml')),
+        ]);
+        if (hasYml || hasYaml) {
             return dir;
         }
 
@@ -59,13 +65,19 @@ export function findQuartoProjectRoot(
  * The returned cwd/projectRoot retain normal filesystem path casing for
  * process spawning and display.
  */
-export function resolveQuartoContext(
+export async function resolveQuartoContext(
     fileFsPath: string,
     deps: QuartoProjectDeps,
-): QuartoContext {
-    const resolvedFile = path.resolve(fileFsPath);
+): Promise<QuartoContext> {
+    const lexicalFile = path.resolve(fileFsPath);
+    let resolvedFile = lexicalFile;
+    try {
+        resolvedFile = path.resolve(await deps.realpath(lexicalFile));
+    } catch {
+        // Missing/broken paths retain lexical behavior; Quarto reports them.
+    }
     const fileDir = path.dirname(resolvedFile);
-    const projectRoot = findQuartoProjectRoot(fileDir, deps);
+    const projectRoot = await findQuartoProjectRoot(fileDir, deps);
     const keyPath = projectRoot ?? resolvedFile;
     return {
         key: canonicalOpKey({ fsPath: keyPath }),

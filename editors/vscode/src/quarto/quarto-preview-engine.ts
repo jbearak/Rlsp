@@ -303,12 +303,7 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                             return;
                         }
                         const listeningOnly = this.scanner.acceptListeningCandidate();
-                        if (listeningOnly) {
-                            beginProbe(listeningOnly, false);
-                            return;
-                        }
-                        const failure = this.scanner.rejectUncorrelatedBrowseCandidate();
-                        if (failure) fail(failure);
+                        if (listeningOnly) beginProbe(listeningOnly, false);
                     }, correlationDelayMs);
                 }
             };

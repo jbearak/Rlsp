@@ -18,6 +18,7 @@ describe('Quarto rendered output path resolution', () => {
                 'rendered/doc.html',
                 source,
                 project,
+                0,
             )).toBe(output);
         } finally {
             fs.rmSync(project, { recursive: true, force: true });
@@ -32,6 +33,7 @@ describe('Quarto rendered output path resolution', () => {
             'site/doc.html',
             source,
             '/project',
+            150,
             {
                 exists: (candidate) => (
                     candidate === sourceOutput || candidate === cwdOutput
@@ -47,7 +49,26 @@ describe('Quarto rendered output path resolution', () => {
             'missing/doc.html',
             source,
             '/project',
+            0,
             { exists: () => false, mtimeMs: () => 0 },
         )).toBe(path.resolve('/project/chapters', 'missing/doc.html'));
+    });
+
+    it('prefers the cwd-relative project output on a fresh coarse-mtime tie', () => {
+        const source = '/project/chapters/doc.qmd';
+        const sourceOutput = path.resolve('/project/chapters', 'doc.html');
+        const cwdOutput = path.resolve('/project', 'doc.html');
+        expect(resolveQuartoRenderedOutputPath(
+            'doc.html',
+            source,
+            '/project',
+            1_000,
+            {
+                exists: (candidate) => (
+                    candidate === sourceOutput || candidate === cwdOutput
+                ),
+                mtimeMs: () => 1_000,
+            },
+        )).toBe(cwdOutput);
     });
 });

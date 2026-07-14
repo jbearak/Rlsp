@@ -34,7 +34,7 @@ suite('QuartoPreviewPanel integration', () => {
             stopGeneration: async (key, generation) => {
                 stops.push({ key, generation });
             },
-            keyForSource: (sourceFsPath) => sourceFsPath,
+            keyForSource: async (sourceFsPath) => sourceFsPath,
         };
     });
 
@@ -328,7 +328,7 @@ suite('QuartoPreviewPanel integration', () => {
         }
     });
 
-    test('serializer restore reapplies options, shows placeholder, and never starts', () => {
+    test('serializer restore reapplies options, shows placeholder, and never starts', async () => {
         const panel = vscode.window.createWebviewPanel(
             'raven.quartoPreview.test.restore',
             'Restore',
@@ -336,7 +336,7 @@ suite('QuartoPreviewPanel integration', () => {
             {},
         );
         panel.webview.options = {};
-        const restored = QuartoPreviewPanel.restore(
+        const restored = await QuartoPreviewPanel.restore(
             panel,
             { sourceFsPath: '/project/restored.qmd' },
             deps,
@@ -357,7 +357,7 @@ suite('QuartoPreviewPanel integration', () => {
         );
         const disposed = new Deferred();
         panel.onDidDispose(() => { disposed.resolve(); });
-        const restored = QuartoPreviewPanel.restore(
+        const restored = await QuartoPreviewPanel.restore(
             panel,
             { sourceFsPath: 42, extra: true },
             deps,

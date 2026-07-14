@@ -50,18 +50,19 @@ describe('Quarto preview URL parser', () => {
         });
     });
 
-    test('uses a proxy Browse path only after a loopback Listening origin arrives', () => {
+    test('ignores a proxy Browse URL and uses the complete loopback Listening URL', () => {
         const scanner = new QuartoPreviewOutputScanner();
         expect(scanner.feed(
             'Browse at https://preview.example.test/proxy/chapter/?preview=1#top\n',
         )).toBeNull();
         expect(scanner.failure()).toBeNull();
-        expect(scanner.acceptBrowseCandidate()).toBeNull();
+        expect(scanner.hasBrowseCandidate()).toBe(false);
         expect(scanner.feed(
-            'Listening on http://127.0.0.1:4444/\n',
-        )).toEqual({
+            'Listening on http://127.0.0.1:4444/listener/root?ready=1\n',
+        )).toBeNull();
+        expect(scanner.finish()).toEqual({
             origin: 'http://127.0.0.1:4444',
-            url: 'http://127.0.0.1:4444/proxy/chapter/?preview=1#top',
+            url: 'http://127.0.0.1:4444/listener/root?ready=1',
         });
     });
 
@@ -145,17 +146,16 @@ describe('Quarto preview URL parser', () => {
         }
     });
 
-    test('requires a loopback origin before a non-loopback Browse path can finish', () => {
-        for (const provisional of [
+    test('ignores lone non-loopback Browse URLs without hard failure', () => {
+        for (const ignored of [
             'https://evil.example/path',
             'http://localhost.evil/path',
-            'http://user:pass@127.0.0.1:1/path',
         ]) {
             const scanner = new QuartoPreviewOutputScanner();
-            expect(scanner.feed(`Browse at ${provisional}\n`)).toBeNull();
+            expect(scanner.feed(`Browse at ${ignored}\n`)).toBeNull();
             expect(scanner.failure()).toBeNull();
             expect(scanner.finish()).toBeNull();
-            expect(scanner.failure()).toContain('without a loopback Listening origin');
+            expect(scanner.failure()).toBeNull();
         }
     });
 
@@ -163,6 +163,10 @@ describe('Quarto preview URL parser', () => {
         const malformedBrowse = new QuartoPreviewOutputScanner();
         malformedBrowse.feed('Browse at ftp://127.0.0.1/path\n');
         expect(malformedBrowse.failure()).toContain('Rejected unsafe');
+
+        const credentialedLoopback = new QuartoPreviewOutputScanner();
+        credentialedLoopback.feed('Browse at http://user:pass@127.0.0.1/path\n');
+        expect(credentialedLoopback.failure()).toContain('Rejected unsafe');
 
         const unsafeListening = new QuartoPreviewOutputScanner();
         unsafeListening.feed('Listening on https://preview.example.test/\n');

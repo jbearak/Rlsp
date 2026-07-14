@@ -4,11 +4,12 @@
  * This module is a security boundary. A rendered workspace document can
  * write arbitrary text into the same stdout/stderr streams as Quarto, so a
  * line that merely looks like `Browse at ...` is hostile until it has been
- * parsed. Only loopback HTTP URLs without credentials cross this boundary as
- * origins. A non-loopback HTTP(S) Browse URL may contribute its path while it
- * waits for a validated loopback `Listening on` origin; its origin is never
- * framed or probed. Malformed Browse URLs and unsafe Listening origins remain
- * hard failures so later output cannot silently replace them.
+ * parsed. Only loopback HTTP URLs without credentials cross this boundary.
+ * A non-loopback HTTP(S) Browse URL is ignored completely: it contributes no
+ * origin or path and is never framed or probed. Remote forwarding belongs to
+ * the downstream `vscode.env.asExternalUri` mapping of the validated loopback
+ * Listening URL. Malformed Browse URLs and unsafe loopback/Listening URLs
+ * remain hard failures so later output cannot silently replace them.
  *
  * The scanner processes each completed line once. Callers that merge process
  * streams must reassemble lines per stream and call `feedLine`; `feed` retains
@@ -98,7 +99,6 @@ export class QuartoPreviewOutputScanner {
     private carry = '';
     private tail = '';
     private browse: PreviewUrlResult | null = null;
-    private browsePath: string | null = null;
     private listening: PreviewUrlResult | null = null;
     private emitted: PreviewUrlResult | null = null;
     private failureDetail: string | null = null;
@@ -167,12 +167,6 @@ export class QuartoPreviewOutputScanner {
         }
         if (this.listening) return this.emit(this.listening);
         if (this.browse) return this.emit(this.browse);
-        if (this.browsePath !== null) {
-            this.reject(
-                'Rejected Quarto Browse URL without a loopback Listening origin.',
-            );
-            return null;
-        }
         this.stopped = true;
         return null;
     }
@@ -200,29 +194,15 @@ export class QuartoPreviewOutputScanner {
         return this.browse;
     }
 
-    /**
-     * Reject a path-only Browse candidate once its Listening correlation
-     * window expires. Until then the untrusted advertised origin is retained
-     * only as a path and can never become a probe/frame URL by itself.
-     */
-    rejectUncorrelatedBrowseCandidate(): string | null {
-        if (!this.stopped && this.browsePath !== null && this.browse === null) {
-            this.reject(
-                'Rejected Quarto Browse URL without a loopback Listening origin.',
-            );
-        }
-        return this.failureDetail;
-    }
-
     /** Accept a validated Listening-only candidate after correlation grace. */
     acceptListeningCandidate(): PreviewUrlResult | null {
         if (this.stopped) return this.emitted;
         return this.listening;
     }
 
-    /** True when a Browse path candidate is awaiting correlation. */
+    /** True when a validated loopback Browse candidate awaits correlation. */
     hasBrowseCandidate(): boolean {
-        return !this.stopped && this.browsePath !== null;
+        return !this.stopped && this.browse !== null;
     }
 
     /** True when a validated Listening candidate awaits a Browse path. */
@@ -254,17 +234,11 @@ export class QuartoPreviewOutputScanner {
         if (browseMatch) {
             const candidate = validatePreviewUrl(browseMatch[1]);
             if (!candidate) {
-                const browsePath = parseProvisionalBrowsePath(browseMatch[1]);
-                if (browsePath === null) {
-                    this.reject(`Rejected unsafe Quarto preview URL: ${browseMatch[1]}`);
-                    return null;
-                }
-                this.browse = null;
-                this.browsePath = browsePath;
-            } else {
-                this.browse = candidate;
-                this.browsePath = pathFromUrl(candidate.url);
+                if (isIgnorableNonLoopbackBrowseUrl(browseMatch[1])) return null;
+                this.reject(`Rejected unsafe Quarto preview URL: ${browseMatch[1]}`);
+                return null;
             }
+            this.browse = candidate;
             if (this.listening) return this.emitCorrelated();
         }
 
@@ -277,14 +251,16 @@ export class QuartoPreviewOutputScanner {
         }
         this.listening = listening;
 
-        if (this.browsePath === null) return null;
+        if (!this.browse) return null;
         return this.emitCorrelated();
     }
 
     private emitCorrelated(): PreviewUrlResult | null {
-        if (this.browsePath === null || !this.listening) return null;
+        if (!this.browse || !this.listening) return null;
+        const browseUrl = new URL(this.browse.url);
         const correlated = validatePreviewUrl(
-            `${this.listening.origin}${this.browsePath}`,
+            `${this.listening.origin}` +
+            `${browseUrl.pathname}${browseUrl.search}${browseUrl.hash}`,
         );
         if (!correlated) {
             this.reject('Could not correlate Quarto preview URLs safely.');
@@ -305,19 +281,16 @@ export class QuartoPreviewOutputScanner {
     }
 }
 
-/** Keep only a web Browse URL's document path; its origin remains untrusted. */
-function parseProvisionalBrowsePath(raw: string): string | null {
+/** Ignore remote HTTP(S) advertisements; only asExternalUri performs proxying. */
+function isIgnorableNonLoopbackBrowseUrl(raw: string): boolean {
     let parsed: URL;
     try {
         parsed = new URL(raw.trim());
     } catch {
-        return null;
+        return false;
     }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-    return pathFromUrl(parsed.toString());
-}
-
-function pathFromUrl(raw: string): string {
-    const parsed = new URL(raw);
-    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    return parsed.hostname !== '127.0.0.1'
+        && parsed.hostname !== 'localhost'
+        && parsed.hostname !== '[::1]';
 }

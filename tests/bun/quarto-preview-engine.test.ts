@@ -488,6 +488,36 @@ describe('Browse-only preview correlation', () => {
         expect(QUARTO_PREVIEW_BROWSE_CORRELATION_DELAY_MS).toBe(1_500);
     });
 
+    it('ignores proxy Browse output and probes the Listening URL with its own path', async () => {
+        const child = new FakeChild();
+        const probed: string[] = [];
+        const process = processFor(child, {
+            browseCorrelationDelayMs: 5,
+            probe: async (url) => {
+                probed.push(url);
+                return 200;
+            },
+        });
+        const starting = process.start();
+        child.stderr.write(
+            'Browse at https://proxy.example.test/proxy/4999/document/\n',
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        expect(probed).toEqual([]);
+        child.stderr.write(
+            'Listening on http://127.0.0.1:4999/listener/path?ready=1\n',
+        );
+
+        const ready = await starting;
+        expect(probed).toEqual([
+            'http://127.0.0.1:4999/listener/path?ready=1',
+        ]);
+        expect(ready.rawUrl).toBe(
+            'http://127.0.0.1:4999/listener/path?ready=1',
+        );
+    });
+
     it('lets late Listening supersede a failed Browse-only probe', async () => {
         const child = new FakeChild();
         const firstProbe = new Deferred<void>();

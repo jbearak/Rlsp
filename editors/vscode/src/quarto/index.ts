@@ -53,9 +53,11 @@ export function registerQuarto(context: vscode.ExtensionContext): void {
     const panelDeps: QuartoPreviewPanelDeps = {
         output,
         stopGeneration: (key, generation) => runtime.stopGeneration(key, generation),
-        keyForSource: (sourceFsPath) => resolveQuartoContext(
-            sourceFsPath,
-            { isProjectMarkerFile: isQuartoProjectMarkerFile },
+        keyForSource: async (sourceFsPath) => (
+            await resolveQuartoContext(sourceFsPath, {
+                realpath: fs.promises.realpath,
+                isProjectMarkerFile: isQuartoProjectMarkerFile,
+            })
         ).key,
     };
     runtime = new QuartoRuntime({
@@ -104,7 +106,7 @@ export function registerQuarto(context: vscode.ExtensionContext): void {
             'raven.quartoPreview',
             {
                 deserializeWebviewPanel: async (panel, state) => {
-                    QuartoPreviewPanel.restore(panel, state, panelDeps);
+                    await QuartoPreviewPanel.restore(panel, state, panelDeps);
                 },
             },
         );

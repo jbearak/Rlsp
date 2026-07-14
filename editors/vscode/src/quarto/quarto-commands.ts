@@ -1,21 +1,21 @@
 /**
  * Quarto Preview / Render / Stop command policy.
  *
- * Preview and Render share an ordered preflight: URI selection, on-disk `file`
- * scheme and case-insensitive `.qmd` validation, workspace trust, open/save,
- * per-document Shiny rejection, then project-context discovery. Stop
- * intentionally bypasses every one of those gates: it performs no trust check,
- * save, frontmatter parse, or CLI resolution, and looks up the existing runtime
- * by current key or source alias. Preview registers a source-keyed pending
+ * Preview and Render share URI, trust, save, and frontmatter policy. Render
+ * performs its non-mutating async project-context lookup before open/save so
+ * it can reserve the physical guard key before those side effects; Preview
+ * discovers context within preflight. Stop intentionally bypasses the mutating
+ * gates and CLI resolution, first looking up the lexical source alias before
+ * any async project fallback. Preview registers a source-keyed pending
  * intent before its first await; Stop can cancel it during preflight or binary
  * discovery, and the continuation consumes it immediately before runtime
  * session claim.
  *
  * Render key ownership is reserved before the document is opened or saved and
- * covers preflight + resolver + subprocess work. Project renders share a
- * symlink-resolved project key; standalone renders use a symlink-resolved
- * source key when possible. Runtime ownership keeps its existing lexical
- * canonicalization.
+ * covers preflight + resolver + subprocess work. Async context discovery
+ * realpaths the source before classifying it, so project and standalone guard
+ * keys share one physical identity even when the editor URI is a symlink.
+ * Runtime source-alias ownership keeps its existing lexical canonicalization.
  * The guard is released before install or outcome notifications are awaited,
  * so a completed render's toast cannot block the next invocation.
  * Activation-scoped command ownership lets deactivation await asynchronous
@@ -66,11 +66,11 @@ export interface QuartoCommandDeps {
     >;
     output: vscode.OutputChannel;
     runRender: (opts: QuartoRenderOptions) => Promise<KnitEngineResult>;
-    resolveContext?: (sourceFsPath: string) => QuartoContext;
+    resolveContext?: (sourceFsPath: string) => Promise<QuartoContext>;
     isWorkspaceTrusted?: () => boolean;
     openTextDocument?: (uri: vscode.Uri) => Thenable<vscode.TextDocument>;
-    /** Dependency-injected realpath seam for render-guard tests. */
-    realpath?: (sourceFsPath: string) => string;
+    /** Dependency-injected clock for render-output freshness tests. */
+    now?: () => number;
 }
 
 export interface QuartoPreflight {
@@ -84,6 +84,7 @@ type QuartoRenderRunResult =
         kind: 'completed';
         result: KnitEngineResult;
         timeoutMs: number;
+        renderStartMs: number;
         preflight: QuartoPreflight;
     }
     | { kind: 'preflight-stopped' }
@@ -301,7 +302,7 @@ async function runPreflightForValidatedUri(
     return {
         uri,
         document,
-        context: knownContext ?? resolveContextForSource(uri.fsPath, deps),
+        context: knownContext ?? await resolveContextForSource(uri.fsPath, deps),
     };
 }
 
@@ -316,12 +317,20 @@ async function runStopCommand(
         );
         return;
     }
-    const resolveContext = deps.resolveContext ?? ((sourceFsPath: string) =>
-        resolveQuartoContext(sourceFsPath, {
-            isProjectMarkerFile: isQuartoProjectMarkerFile,
-        }));
-    const quartoContext = resolveContext(uri.fsPath);
-    const outcome = await deps.runtime.stopByLookup(quartoContext.key, uri.fsPath);
+    // Preserve pending-start cancellation without waiting for remote-fs
+    // discovery. A running project preview is normally found by source alias;
+    // only a different physical alias needs the async project-key fallback.
+    const lexicalKey = canonicalOpKey(uri);
+    let outcome = await deps.runtime.stopByLookup(lexicalKey, uri.fsPath);
+    if (outcome === 'none') {
+        const quartoContext = await resolveContextForSource(uri.fsPath, deps);
+        if (quartoContext.key !== lexicalKey) {
+            outcome = await deps.runtime.stopByLookup(
+                quartoContext.key,
+                uri.fsPath,
+            );
+        }
+    }
     if (outcome === 'stopped') {
         await vscode.window.showInformationMessage('Quarto preview stopped.');
     } else if (outcome === 'none') {
@@ -342,8 +351,8 @@ function createQuartoRenderRunner(deps: QuartoCommandDeps): QuartoRenderRunner {
         }
         if (!await validateQuartoRunUri(uri, 'Render')) return;
 
-        const context = resolveContextForSource(uri.fsPath, deps);
-        const opKey = renderGuardKey(uri, context, deps);
+        const context = await resolveContextForSource(uri.fsPath, deps);
+        const opKey = renderGuardKey(context);
         if (inFlightRenders.has(opKey)) {
             await vscode.window.showInformationMessage(
                 `A Quarto render is already running for ` +
@@ -381,38 +390,29 @@ function createQuartoRenderRunner(deps: QuartoCommandDeps): QuartoRenderRunner {
             completed.result,
             completed.preflight,
             completed.timeoutMs,
+            completed.renderStartMs,
             deps.output,
         );
     };
 }
 
 function renderGuardKey(
-    uri: vscode.Uri,
     context: QuartoContext,
-    deps: QuartoCommandDeps,
 ): string {
-    const target = context.projectRoot ?? uri.fsPath;
     const kind = context.projectRoot === null ? 'file' : 'project';
-    try {
-        const realpath = deps.realpath ?? fs.realpathSync.native;
-        return `${kind}:${canonicalOpKey({ fsPath: realpath(target) })}`;
-    } catch {
-        const lexical = context.projectRoot === null
-            ? canonicalOpKey(uri)
-            : canonicalOpKey({ fsPath: context.key });
-        return `${kind}:${lexical}`;
-    }
+    return `${kind}:${context.key}`;
 }
 
-function resolveContextForSource(
+async function resolveContextForSource(
     sourceFsPath: string,
     deps: QuartoCommandDeps,
-): QuartoContext {
+): Promise<QuartoContext> {
     const resolveContext = deps.resolveContext ?? ((candidate: string) =>
         resolveQuartoContext(candidate, {
+            realpath: fs.promises.realpath,
             isProjectMarkerFile: isQuartoProjectMarkerFile,
         }));
-    return resolveContext(sourceFsPath);
+    return await resolveContext(sourceFsPath);
 }
 
 async function runRenderProcess(
@@ -434,28 +434,33 @@ async function runRenderProcess(
         .get<unknown>('render.timeoutMs', DEFAULT_QUARTO_RENDER_TIMEOUT_MS);
     const timeoutMs = normalizeQuartoRenderTimeoutMs(configuredTimeoutMs);
     safeAppendLine(deps.output, `\n[render] ${preflight.uri.fsPath}`);
+    let renderStartMs = 0;
     const result = await vscode.window.withProgress<KnitEngineResult>(
         {
             location: vscode.ProgressLocation.Notification,
             cancellable: true,
             title: `Rendering ${path.basename(preflight.uri.fsPath)} with Quarto…`,
         },
-        async (_progress, cancellation) => deps.runRender({
-            quartoPath,
-            sourceFsPath: preflight.uri.fsPath,
-            cwd: preflight.context.cwd,
-            timeoutMs,
-            output: deps.output,
-            cancellation,
-        }),
+        async (_progress, cancellation) => {
+            renderStartMs = (deps.now ?? Date.now)();
+            return deps.runRender({
+                quartoPath,
+                sourceFsPath: preflight.uri.fsPath,
+                cwd: preflight.context.cwd,
+                timeoutMs,
+                output: deps.output,
+                cancellation,
+            });
+        },
     );
-    return { kind: 'completed', result, timeoutMs, preflight };
+    return { kind: 'completed', result, timeoutMs, renderStartMs, preflight };
 }
 
 async function renderOutcome(
     result: KnitEngineResult,
     preflight: QuartoPreflight,
     timeoutMs: number,
+    renderStartMs: number,
     output: vscode.OutputChannel,
 ): Promise<void> {
     const kind = classifyQuartoRenderResult(result);
@@ -500,6 +505,7 @@ async function renderOutcome(
         last,
         preflight.uri.fsPath,
         preflight.context.cwd,
+        renderStartMs,
     );
     const uri = vscode.Uri.file(outputPath);
     const format = exportedFormat(outputPath);

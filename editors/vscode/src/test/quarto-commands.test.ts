@@ -118,7 +118,7 @@ suite('Quarto command preflight', () => {
         let resolvedAfterSave = false;
         try {
             const result = await runQuartoPreflightForTesting(uri, 'Render', fakeDeps({
-                resolveContext: () => {
+                resolveContext: async () => {
                     resolvedAfterSave = fs.readFileSync(sourcePath, 'utf8').includes('Saved marker');
                     return { key: sourcePath, cwd: tmp, projectRoot: null };
                 },
@@ -209,7 +209,7 @@ suite('Quarto command preflight', () => {
             await runQuartoStopForTesting(
                 vscode.Uri.parse('git:/repo/doc.qmd?ref'),
                 fakeDeps({
-                    resolveContext: (sourceFsPath) => ({
+                    resolveContext: async (sourceFsPath) => ({
                         key: sourceFsPath,
                         cwd: path.dirname(sourceFsPath),
                         projectRoot: null,
@@ -287,7 +287,7 @@ suite('Quarto command preflight', () => {
                         return finishResolve.promise;
                     },
                 },
-                resolveContext: () => ({
+                resolveContext: async () => ({
                     key: '/project',
                     cwd: '/project',
                     projectRoot: '/project',
@@ -427,14 +427,18 @@ suite('Quarto command preflight', () => {
         await first;
     });
 
-    test('realpath aliases share one in-flight render guard', async () => {
+    test('physical source aliases share one standalone render guard', async () => {
         const renderStarted = new Deferred<void>();
         const finishRender = new Deferred<KnitEngineResult>();
         let renders = 0;
         const real = vscode.Uri.file('/project/real/doc.qmd');
         const alias = vscode.Uri.file('/project/link/doc.qmd');
         const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
-            realpath: () => real.fsPath,
+            resolveContext: async () => ({
+                key: real.fsPath,
+                cwd: path.dirname(real.fsPath),
+                projectRoot: null,
+            }),
             runRender: async () => {
                 renders++;
                 renderStarted.resolve(undefined);
@@ -459,7 +463,7 @@ suite('Quarto command preflight', () => {
         const firstUri = vscode.Uri.file('/project/chapters/a.qmd');
         const secondUri = vscode.Uri.file('/project/chapters/b.qmd');
         const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
-            resolveContext: () => ({
+            resolveContext: async () => ({
                 key: '/project',
                 cwd: '/project',
                 projectRoot: '/project',
@@ -489,29 +493,35 @@ suite('Quarto command preflight', () => {
         const renderStarted = new Deferred<void>();
         const finishRender = new Deferred<KnitEngineResult>();
         let renders = 0;
-        const realRoot = '/real/project';
-        const firstUri = vscode.Uri.file('/aliases/one/project/a.qmd');
-        const secondUri = vscode.Uri.file('/aliases/two/project/b.qmd');
-        const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
-            resolveContext: (sourceFsPath) => {
-                const projectRoot = path.dirname(sourceFsPath);
-                return { key: projectRoot, cwd: projectRoot, projectRoot };
-            },
-            realpath: () => realRoot,
-            runRender: async () => {
-                renders++;
-                renderStarted.resolve(undefined);
-                return finishRender.promise;
-            },
-        }));
+        const base = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-quarto-guard-'));
+        try {
+            const projectRoot = path.join(base, 'project');
+            const realSource = path.join(projectRoot, 'chapters', 'doc.qmd');
+            const aliasSource = path.join(base, 'outside.qmd');
+            fs.mkdirSync(path.dirname(realSource), { recursive: true });
+            fs.writeFileSync(path.join(projectRoot, '_quarto.yml'), 'project:\n  type: default\n');
+            fs.writeFileSync(realSource, '# document\n');
+            fs.symlinkSync(realSource, aliasSource);
+            const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+                resolveContext: undefined,
+                runRender: async () => {
+                    renders++;
+                    renderStarted.resolve(undefined);
+                    return finishRender.promise;
+                },
+            }));
 
-        const first = runRender(firstUri);
-        await renderStarted.promise;
-        await runRender(secondUri);
+            const first = runRender(vscode.Uri.file(realSource));
+            await renderStarted.promise;
+            await runRender(vscode.Uri.file(aliasSource));
 
-        assert.strictEqual(renders, 1);
-        finishRender.resolve(successfulRenderResult());
-        await first;
+            assert.strictEqual(renders, 1);
+            finishRender.resolve(successfulRenderResult());
+            await first;
+        } finally {
+            finishRender.resolve(successfulRenderResult());
+            fs.rmSync(base, { recursive: true, force: true });
+        }
     });
 
     test('different projects and standalone files render concurrently', async () => {
@@ -520,7 +530,7 @@ suite('Quarto command preflight', () => {
             const finishRender = new Deferred<KnitEngineResult>();
             let renders = 0;
             const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
-                resolveContext: (sourceFsPath) => {
+                resolveContext: async (sourceFsPath) => {
                     const parent = path.dirname(sourceFsPath);
                     return {
                         key: projectRoots ? parent : sourceFsPath,
@@ -528,7 +538,6 @@ suite('Quarto command preflight', () => {
                         projectRoot: projectRoots ? parent : null,
                     };
                 },
-                realpath: (sourceFsPath) => sourceFsPath,
                 runRender: async () => {
                     renders++;
                     if (renders === 2) bothStarted.resolve(undefined);
@@ -623,7 +632,7 @@ suite('Quarto command preflight', () => {
                 spawnError: null,
             }),
             isWorkspaceTrusted: () => true,
-            resolveContext: (sourceFsPath) => ({
+            resolveContext: async (sourceFsPath) => ({
                 key: sourceFsPath,
                 cwd: path.dirname(sourceFsPath),
                 projectRoot: null,
