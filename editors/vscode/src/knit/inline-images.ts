@@ -106,7 +106,11 @@ export function inlineLocalImagesAsDataUrls(
     output?: InlineImagesOutputSink,
     options: InlineImagesOptions = {},
 ): string {
-    const allowedRoots = [docDir, ...(options.additionalRoots ?? [])];
+    // Canonicalize the allowed roots ONCE (not per image): a document
+    // with N images and R roots would otherwise do O(N×R) synchronous
+    // `realpath` calls on the extension host. Non-existent roots drop
+    // out here.
+    const canonicalRoots = canonicalizeRoots([docDir, ...(options.additionalRoots ?? [])]);
     // Quote-aware `<img>` matcher: the attribute run is a sequence of
     // double-quoted strings, single-quoted strings, or non-quote /
     // non-`>` characters, so a literal `>` inside an attribute value
@@ -124,7 +128,19 @@ export function inlineLocalImagesAsDataUrls(
         // so only a real `src` attribute is selected.
         const srcAttr = findAttribute(attrs, 'src');
         if (!srcAttr) return match;
-        const src = srcAttr.value;
+
+        // Decode HTML entities up front. An HTML parser resolves entity
+        // references in an attribute value before anything consumes it,
+        // so every guard and split below sees what the browser sees:
+        //   - `https&#58;//example.com/x.png` is the remote URL
+        //     `https://example.com/x.png` (so the scheme guard must run
+        //     on the decoded value, not the raw one);
+        //   - a workspace image `a&b.png` emitted as `a&amp;b.png` or the
+        //     numeric `a&#38;b.png` decodes to `a&b.png`;
+        //   - decoding before the URL split also stops a numeric
+        //     reference like `&#38;` from having its `#` misread as a
+        //     fragment delimiter.
+        const src = decodeHtmlEntities(srcAttr.value);
 
         // Already an absolute URL (any scheme, e.g. `https:`,
         // `data:`, `vscode-webview:`, `file:`) — pass through. A
@@ -141,14 +157,6 @@ export function inlineLocalImagesAsDataUrls(
         // Protocol-relative URL.
         if (src.startsWith('//')) return match;
 
-        // Decode HTML entities up front. An HTML parser resolves entity
-        // references in an attribute value before anything consumes it,
-        // so a workspace image `a&b.png` emitted as `a&amp;b.png` (or as
-        // the numeric `a&#38;b.png`) must be decoded to `a&b.png`. Doing
-        // this BEFORE the URL split below also stops a numeric reference
-        // like `&#38;` from having its `#` misread as a fragment.
-        const decodedSrc = decodeHtmlEntities(src);
-
         // Split into path, `?query`, and `#fragment`. htmlwidgets and
         // similar renderers emit cache-busters (`plot.png?v=1`) and SVG
         // view fragments (`diagram.svg#layer-1`). Feeding the whole value
@@ -162,9 +170,9 @@ export function inlineLocalImagesAsDataUrls(
         // forgiving-base64 a `?` in the data portion is an invalid
         // base64 code point that fails the decode, so appending it would
         // break the image.
-        const hashIdx = decodedSrc.indexOf('#');
-        const fragment = hashIdx >= 0 ? decodedSrc.slice(hashIdx) : '';
-        const beforeHash = hashIdx >= 0 ? decodedSrc.slice(0, hashIdx) : decodedSrc;
+        const hashIdx = src.indexOf('#');
+        const fragment = hashIdx >= 0 ? src.slice(hashIdx) : '';
+        const beforeHash = hashIdx >= 0 ? src.slice(0, hashIdx) : src;
         const queryIdx = beforeHash.indexOf('?');
         const srcPath = queryIdx >= 0 ? beforeHash.slice(0, queryIdx) : beforeHash;
         const srcSuffix = fragment;
@@ -206,7 +214,7 @@ export function inlineLocalImagesAsDataUrls(
             // missing file, a symlink target outside every root, or a
             // path that simply lives elsewhere all leave the `src`
             // untouched.
-            const real = canonicalizeContainedPath(resolved, allowedRoots);
+            const real = canonicalizeContainedPath(resolved, canonicalRoots);
             if (real !== null) {
                 realResolved = real;
                 logicalResolved = resolved;
@@ -362,34 +370,45 @@ function decodeHtmlEntities(s: string): string {
 }
 
 /**
+/**
+ * `realpath`-resolve each root once, dropping any that don't exist.
+ * Hoisted out of the per-image loop so containment is O(N + R), not
+ * O(N×R), synchronous `realpath` calls.
+ */
+function canonicalizeRoots(roots: string[]): string[] {
+    const out: string[] = [];
+    for (const root of roots) {
+        try {
+            out.push(fs.realpathSync(root));
+        } catch {
+            // A root that doesn't exist can contain nothing — skip it.
+        }
+    }
+    return out;
+}
+
+/**
  * Canonicalize `candidate` with `realpath` and return the real path
- * only if it is contained by (or equal to) at least one canonicalized
- * `root`; otherwise `null`.
+ * only if it is contained by (or equal to) at least one already-
+ * canonicalized `canonicalRoots` entry; otherwise `null`.
  *
  * Both sides are `realpath`-resolved so a symlink living inside a root
  * cannot smuggle in a target outside it. A candidate that doesn't
- * exist (`realpathSync` throws) yields `null`, as does a root that
- * doesn't exist (skipped). Appending `path.sep` to both sides makes the
- * `startsWith` a true directory-boundary check — `/a/roots` must not
- * be considered contained by `/a/root`. A root that already ends in the
- * separator (a filesystem root such as `/` or `C:\`) is normalized
- * first so the boundary prefix doesn't become `//` / `C:\\` and reject
- * everything under it.
+ * exist (`realpathSync` throws) yields `null`. Appending `path.sep` to
+ * both sides makes the `startsWith` a true directory-boundary check —
+ * `/a/roots` must not be considered contained by `/a/root`. A root that
+ * already ends in the separator (a filesystem root such as `/` or
+ * `C:\`) is normalized first so the boundary prefix doesn't become
+ * `//` / `C:\\` and reject everything under it.
  */
-function canonicalizeContainedPath(candidate: string, roots: string[]): string | null {
+function canonicalizeContainedPath(candidate: string, canonicalRoots: string[]): string | null {
     let realCandidate: string;
     try {
         realCandidate = fs.realpathSync(candidate);
     } catch {
         return null;
     }
-    for (const root of roots) {
-        let realRoot: string;
-        try {
-            realRoot = fs.realpathSync(root);
-        } catch {
-            continue;
-        }
+    for (const realRoot of canonicalRoots) {
         if (realCandidate === realRoot) return realCandidate;
         const boundary = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
         if ((realCandidate + path.sep).startsWith(boundary)) {

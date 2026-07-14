@@ -35,6 +35,26 @@ const TINY_PNG = Buffer.from(
     'hex',
 );
 
+const ON_WINDOWS = process.platform === 'win32';
+
+// Whether this host can create symlinks (Windows CI often cannot).
+// Probed once so the symlink-escape test is an explicit, visible skip
+// rather than a test that silently passes without asserting anything.
+const SYMLINKS_SUPPORTED = (() => {
+    try {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-symcap-'));
+        try {
+            fs.writeFileSync(path.join(dir, 'target'), 'x');
+            fs.symlinkSync(path.join(dir, 'target'), path.join(dir, 'link'));
+            return true;
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    } catch {
+        return false;
+    }
+})();
+
 describe('inlineLocalImagesAsDataUrls', () => {
     test('replaces a relative <img src> with a data: URL', () => {
         withTempDir((dir) => {
@@ -302,7 +322,7 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
-    test('does not follow a symlink out of an allowed root', () => {
+    test.skipIf(!SYMLINKS_SUPPORTED)('does not follow a symlink out of an allowed root', () => {
         withTempDir((workspace) => {
             const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-outside-'));
             try {
@@ -310,12 +330,7 @@ describe('inlineLocalImagesAsDataUrls', () => {
                 fs.writeFileSync(secret, TINY_PNG);
                 // A symlink that lives inside the workspace but points out.
                 const link = path.join(workspace, 'leak.png');
-                try {
-                    fs.symlinkSync(secret, link);
-                } catch {
-                    // Platform without symlink support (or perms) — skip.
-                    return;
-                }
+                fs.symlinkSync(secret, link);
                 const html = '<img src="leak.png">';
                 const out = inlineLocalImagesAsDataUrls(html, workspace);
                 expect(out).toBe(html);
@@ -404,8 +419,10 @@ describe('inlineLocalImagesAsDataUrls', () => {
 
     test('still resolves a filename that literally contains a percent', () => {
         withTempDir((dir) => {
-            // Raw passthrough <img> whose file is literally named with `%`.
-            // The literal-first candidate must win over the decoded one.
+            // Raw passthrough <img> whose file is literally named with `%`
+            // and whose decoded form (`a b.png`) does NOT exist. The
+            // decoded candidate is tried first; when it misses, the
+            // literal fallback resolves the real file.
             fs.writeFileSync(path.join(dir, 'a%20b.png'), TINY_PNG);
             const html = '<img src="a%20b.png">';
             const out = inlineLocalImagesAsDataUrls(html, dir);
@@ -413,11 +430,20 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
-    test('leaves a one-letter URL scheme alone (not a drive path off Windows)', () => {
+    test.skipIf(ON_WINDOWS)('leaves a one-letter URL scheme alone (not a drive path off Windows)', () => {
         // Off Windows, `x:/logo.png` is a custom URL scheme, not a drive
-        // path; it must pass through untouched.
-        const html = '<img src="x:/logo.png">';
-        expect(inlineLocalImagesAsDataUrls(html, '/tmp')).toBe(html);
+        // path; it must be classified as a URL and pass through. To prove
+        // it isn't being resolved as a filesystem path, place a file
+        // where a path interpretation would land and assert it is NOT
+        // inlined.
+        withTempDir((dir) => {
+            fs.mkdirSync(path.join(dir, 'x:'), { recursive: true });
+            fs.writeFileSync(path.join(dir, 'x:', 'logo.png'), TINY_PNG);
+            const html = '<img src="x:/logo.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toBe(html);
+            expect(out).not.toContain('data:');
+        });
     });
 
     test('logs a diagnostic when a would-be-inlinable image cannot be resolved', () => {

@@ -750,19 +750,17 @@ export class KnitOutputPanel {
         // `include_graphics()` can reference an image that already
         // lives elsewhere in the workspace (issue #627). Allow the
         // inliner to reach outside the temp preview dir by handing it
-        // the source document's own directory plus every open workspace
-        // folder. Including all folders (not just the one containing the
-        // source) covers `current`-mode knits in a multi-root workspace,
-        // where R's working directory — and therefore an absolute image
-        // path — can belong to a different folder than the source. For a
-        // loose file with no workspace this is just the source dir. The
-        // inliner still `realpath`-guards containment.
+        // the workspace folder containing the source document — or, for
+        // a loose file with no workspace, the source document's own
+        // directory. Scoping to the *containing* folder (rather than
+        // every open folder) keeps the boundary to the project the user
+        // is previewing; the inliner still `realpath`-guards containment.
         const sourceDir = path.dirname(this.sourceUri.fsPath);
-        const workspaceRoots = (vscode.workspace.workspaceFolders ?? [])
-            .map((folder) => folder.uri.fsPath);
+        const workspaceRoot = vscode.workspace.getWorkspaceFolder(this.sourceUri)?.uri.fsPath
+            ?? sourceDir;
         htmlContent = inlineLocalImagesAsDataUrls(htmlContent, docDir, this.output, {
             markSvgPlots: true,
-            additionalRoots: [sourceDir, ...workspaceRoots],
+            additionalRoots: [workspaceRoot],
         });
         this.panel.webview.html = buildShellHtml({
             htmlContent,
