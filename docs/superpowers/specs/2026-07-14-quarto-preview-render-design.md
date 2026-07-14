@@ -38,15 +38,16 @@ hard-coded REditorSupport R executor) currently lose integrated `.qmd` render/pr
    `vscode.extensions.getExtension('quarto.quarto')` anywhere in this feature. **Stop is
    exempt**: it operates on an existing runtime entry and requires no trust, no save, no
    frontmatter parse, and no CLI resolution.
-4. **UI:** command palette + a NEW `raven.quarto` editor-title submenu (sibling of
-   `raven.sendToR` / `raven.build`). Do NOT nest in `raven.sendToR`: its submenu-level
-   `when` requires `raven.rConsoleEnabled`, and ~half its member commands rely on the
-   wrapper for that gate. When-clauses: `resourceExtname =~ /\.qmd$/i` (case-insensitive
-   flag — enumerated-case alternation misses mixed-case variants; cf. CLAUDE.md's
-   mixed-case-extension learning). Preview/Render entries additionally gate on
-   `isWorkspaceTrusted` (hide execution UI in Restricted Mode; handlers still re-check).
-   Stop stays visible without trust (extname-gated); `raven.quarto.openOutputChannel`
-   ("Show Quarto Output") is palette-visible ungated.
+4. **UI:** command palette + Quarto Preview/Render/Stop entries in the existing
+   `raven.sendToR` editor-title submenu, plus a direct `$(preview)` editor-title button.
+   The button runs Quarto Preview for `.qmd` and Knit Preview for `.Rmd` / `.Rmarkdown`;
+   both command contributions carry the same icon. The Send-to-R wrapper remains gated by
+   `raven.rConsoleEnabled`, intentionally hiding its Quarto members when the console is
+   off, while the direct Preview button and palette remain available. When-clauses use
+   `resourceExtname =~ /\.qmd$/i` (case-insensitive flag — enumerated-case alternation
+   misses mixed-case variants). Preview/Render additionally gate on `isWorkspaceTrusted`;
+   Stop remains extname-gated without trust. `raven.quarto.openOutputChannel` stays
+   palette-visible and ungated. There is no standalone `raven.quarto` submenu.
 5. **`server: shiny` is rejected best-effort** from the document's own frontmatter with a
    clear message (requires the separate `quarto serve` lifecycle; deliberately deferred).
    Project-level (`_quarto.yml`, `_metadata.yml`, profiles) Shiny config is NOT detected —
@@ -210,11 +211,11 @@ ownership of the terminal `stopped` update and session removal.
 | `quarto-frontmatter.ts` | pure | `isShinyServerDocument(fm)`: `server: shiny` or `server: { type: shiny }` only (best-effort; no `runtime:` borrowing) |
 | `quarto-messages.ts` | pure | discriminated unions + exact-key-set validators (`webview-ready`, `open-in-browser`, `stop-preview`, `request-restart`, `load-timeout`, `report-error` / `state-update`) |
 | `quarto-preview-html.ts` | pure | shell HTML builder; states `starting` / `serving` / `failed` / `exited-unexpectedly` / `stopped` / `restore-placeholder`; all interpolation escaped per the security model |
-| `quarto-preview-engine.ts` | impure | `QuartoPreviewProcess`: spawn `quarto preview <file> --no-browser --host 127.0.0.1` (argv array, never shell; `detached` on POSIX; env inherited); stream both pipes to output channel + line decoder; ready = race(validated URL + probe OK, startup timeout constant, early exit → capped raw tail surfaced); `stop()` = detach stream listeners, then SIGINT→5s→SIGTERM→5s→SIGKILL via `sendSignal`, bounded final close confirmation with warning, idempotent shared promise; unexpected-exit callback |
+| `quarto-preview-engine.ts` | impure | `QuartoPreviewProcess`: spawn `quarto preview <file> --no-browser --host 127.0.0.1` (argv array, never shell; `detached` on POSIX; env inherited); stream both pipes to output channel + line decoder; ready = race(validated URL + probe OK, startup timeout constant, early exit → capped raw tail surfaced); every startup failure self-claims the shared stop after tail capture; `stop()` = detach stream listeners, then SIGINT→5s→SIGTERM→5s→SIGKILL via `sendSignal`, bounded final close confirmation with warning, idempotent shared promise; unexpected-exit callback |
 | `quarto-process-teardown.ts` | impure | shared per-child stop/shutdown controller; one signal ladder, shutdown tightening, confirmed-close races, bounded SIGKILL abandonment, non-throwing warning |
-| `quarto-preview-runtime.ts` | impure | `QuartoRuntime` + `Session` (generation discipline, live + retiring lifecycle ownership, shutdown, source-path aliases for Stop) |
+| `quarto-preview-runtime.ts` | impure | `QuartoRuntime` + `Session` (generation discipline, live + retiring lifecycle ownership, rejection-safe stop/teardown/shutdown, source-path aliases for Stop) |
 | `quarto-preview-panel.ts` | impure | per-key panel registry; `enableScripts: true`, `localResourceRoots: []`, `retainContextWhenHidden: true`; **authoritative view-state lives host-side** and is re-posted on `webview-ready` and on `onDidChangeViewState` visible (hidden webviews drop messages); serializer adopt → **must reapply `webview.options` first** (VS Code doesn't persist them), then wire listeners, then placeholder HTML; NEVER auto-spawn on restore; `onDidDispose` → runtime stop (generation-checked); deactivation disposes all panels and clears the static registry |
-| `quarto-render-engine.ts` | impure | activation-scoped one-shot `quarto render <file>` registry; `KnitEngineResult`-shaped result; CancellationToken + timeout use the shared bounded ladder and resolve even without `close`; bounded retained stdout/stderr tails; deactivation rejects new spawns, tightens any in-flight stop, detaches stream listeners, and terminates live process trees with bounded close confirmation |
+| `quarto-render-engine.ts` | impure | activation-scoped one-shot `quarto render <file>` registry; pre-cancelled tokens return without spawn; `KnitEngineResult`-shaped result; CancellationToken + timeout use the shared bounded ladder and resolve even without `close`; bounded retained stdout/stderr tails; deactivation rejects new spawns, tightens any in-flight stop, detaches stream listeners, and terminates live process trees with bounded close confirmation |
 | `quarto-commands.ts` | impure | preflight for Preview/Render only (uri → `.qmd` check (case-insensitive) → trust → save-if-dirty → shiny gate → `resolveQuartoContext`); Stop bypasses preflight (runtime lookup by key or source alias); render in-flight guard = small local `Map` keyed by canonical file path; **defined outcome branches** below |
 | `index.ts` | impure | `registerQuarto(context)`: builds the activation lifecycle, registers commands + serializer (once per activation; guard reset on dispose so disable/enable works), config-invalidation listener; exports `stopAllQuartoForDeactivation()` coordinating panels, preview/render shutdown, and output disposal |
 
@@ -246,9 +247,10 @@ Post-ready unexpected exit → `exited-unexpectedly` banner, iframe left in plac
 - `contributes.commands`: `raven.quarto.preview` ("Quarto Preview"), `raven.quarto.render`
   ("Quarto Render"), `raven.quarto.stopPreview` ("Stop Quarto Preview"),
   `raven.quarto.openOutputChannel` ("Show Quarto Output") — category "Raven".
-- `contributes.submenus`: `raven.quarto` ("Quarto"); `editor/title` entry gated
-  `resourceExtname =~ /\.qmd$/i`; member entries: Preview/Render add
-  `isWorkspaceTrusted`, Stop does not.
+- `contributes.menus.editor/title`: direct `$(preview)` commands for Quarto Preview on
+  `.qmd` and Knit Preview on `.Rmd` / `.Rmarkdown`; no standalone Quarto submenu.
+- `contributes.menus.raven.sendToR`: trailing Quarto Preview/Render/Stop group;
+  Preview/Render require trust and `.qmd`, Stop requires only `.qmd`.
 - `contributes.menus.commandPalette`: same gates; `openOutputChannel` ungated.
 - `contributes.grammars`: `{ language: "quarto", scopeName:
   "text.html.markdown.rmarkdown", path: "./syntaxes/rmd.tmLanguage.json" }` (+ SOURCE.md
@@ -295,8 +297,9 @@ Mocha (`editors/vscode/src/test/`, `awaitActive` after `showTextDocument`):
 - panel: create/reuse per key; dispose stops process; serializer restore reapplies
   `webview.options`, renders placeholder, never spawns; malformed persisted state;
   hidden-panel resync on visibility.
-- menu gating: submenu `when` has `/\.qmd$/i`, no `raven.rConsoleEnabled`, no
-  quarto.quarto reference; Preview/Render entries carry `isWorkspaceTrusted`.
+- menu gating: no standalone Quarto submenu; direct Quarto/Knit preview buttons carry
+  exact normalized gates and `$(preview)` icons; Send-to-R Quarto entries carry exact
+  `.qmd` trust/stop gates; no `quarto.quarto` reference.
 
 Manual acceptance (issue #624): htmlwidget + Reveal.js interactivity in the frame; save →
 auto-refresh; Remote SSH forwarding; no leaked processes across restart/replace/close/

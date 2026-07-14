@@ -30,6 +30,8 @@ class FakeProcess implements QuartoPreviewProcessLike {
     shutdownCalls = 0;
     live = true;
     rejectReadyOnStop = false;
+    stopError: Error | null = null;
+    shutdownError: Error | null = null;
 
     start(): Promise<QuartoPreviewReady> {
         return this.ready.promise;
@@ -40,12 +42,14 @@ class FakeProcess implements QuartoPreviewProcessLike {
         if (this.rejectReadyOnStop) {
             this.ready.reject(new Error('closed during preview startup'));
         }
+        if (this.stopError) throw this.stopError;
         if (this.stopDeferred) await this.stopDeferred.promise;
         this.live = false;
     }
 
     async shutdown(): Promise<void> {
         this.shutdownCalls++;
+        if (this.shutdownError) throw this.shutdownError;
         this.live = false;
     }
 }
@@ -57,6 +61,7 @@ function harness(
     const processes: Array<{ args: QuartoRuntimeProcessArgs; process: FakeProcess }> = [];
     const liveCountsAtSpawn: number[] = [];
     const updates: QuartoRuntimeViewUpdate[] = [];
+    const lifecycleErrors: string[] = [];
     const runtime = new QuartoRuntime({
         processFactory: (args) => {
             const process = new FakeProcess();
@@ -66,10 +71,11 @@ function harness(
         },
         asExternalUri: mapper ?? (async (raw) => `external:${raw}`),
         onViewUpdate: (update) => updates.push(update),
+        onLifecycleError: (message) => lifecycleErrors.push(message),
         shutdownGlobalTimeoutMs: 50,
         ...overrides,
     });
-    return { runtime, processes, updates, liveCountsAtSpawn };
+    return { runtime, processes, updates, liveCountsAtSpawn, lifecycleErrors };
 }
 
 async function waitForProcessCount(
@@ -246,6 +252,37 @@ describe('QuartoRuntime generation discipline', () => {
         expect(h.processes[0].process.stopCalls).toBe(1);
         h.processes[0].process.ready.resolve({ rawUrl: 'http://127.0.0.1:1/', origin: 'http://127.0.0.1:1', statusCode: 200 });
         await start;
+    });
+
+    it('settles rejected process stops across restart and explicit cleanup', async () => {
+        const h = harness();
+        const first = h.runtime.startOrRestart(startArgs);
+        await waitForProcessCount(h.processes, 1);
+        h.processes[0].process.ready.resolve({
+            rawUrl: 'http://127.0.0.1:1/',
+            origin: 'http://127.0.0.1:1',
+            statusCode: 200,
+        });
+        expect((await first).kind).toBe('ready');
+        h.processes[0].process.stopError = new Error('old stop rejected');
+
+        const restart = h.runtime.startOrRestart(startArgs);
+        await waitForProcessCount(h.processes, 2);
+        h.processes[1].process.ready.resolve({
+            rawUrl: 'http://127.0.0.1:2/',
+            origin: 'http://127.0.0.1:2',
+            statusCode: 200,
+        });
+        expect((await restart).kind).toBe('ready');
+        h.processes[1].process.stopError = new Error('current stop rejected');
+
+        expect(await h.runtime.stopGeneration('/project', 2)).toBe('stopped');
+        expect(h.runtime.getSessionsForTesting().size).toBe(0);
+        expect(h.updates.at(-1)?.state.kind).toBe('stopped');
+        expect(h.lifecycleErrors).toEqual([
+            expect.stringContaining('old stop rejected'),
+            expect.stringContaining('current stop rejected'),
+        ]);
     });
 
     it('source alias finds the session after the freshly computed key changes', async () => {
@@ -625,6 +662,25 @@ describe('QuartoRuntime generation discipline', () => {
         h.processes[0].process.ready.resolve({ rawUrl: 'http://127.0.0.1:1/', origin: 'http://127.0.0.1:1', statusCode: 200 });
         await start;
         await expect(h.runtime.startOrRestart(startArgs)).rejects.toThrow('deactivating');
+    });
+
+    it('settles and logs an injected shutdown rejection', async () => {
+        const h = harness();
+        const start = h.runtime.startOrRestart(startArgs);
+        await waitForProcessCount(h.processes, 1);
+        h.processes[0].process.shutdownError = new Error('shutdown rejected');
+
+        await expect(h.runtime.shutdown()).resolves.toBeUndefined();
+        expect(h.runtime.getSessionsForTesting().size).toBe(0);
+        expect(h.lifecycleErrors).toEqual([
+            expect.stringContaining('shutdown rejected'),
+        ]);
+        h.processes[0].process.ready.resolve({
+            rawUrl: 'http://127.0.0.1:1/',
+            origin: 'http://127.0.0.1:1',
+            statusCode: 200,
+        });
+        await start;
     });
 
     it('cancels the global shutdown bound when child shutdown settles first', async () => {

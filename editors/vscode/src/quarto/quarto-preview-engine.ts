@@ -9,7 +9,9 @@
  * corrupt one another. Bare-CR progress records count as line boundaries. A
  * parsed URL is not readiness: Quarto can print it before binding, so the
  * engine retries bounded Node `http` GETs against the validated raw loopback
- * URL before resolving `start()`.
+ * URL before resolving `start()`. Any startup failure claims the same shared
+ * stop ladder itself after capturing the startup tail, so the engine remains
+ * leak-safe even without its runtime owner.
  *
  * Browse-only fallback waits for a correlation window and remains provisional
  * while its readiness probe runs. If that probe cannot connect, a short final
@@ -142,8 +144,8 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                 ?? QUARTO_PREVIEW_BROWSE_CORRELATION_DELAY_MS;
             const finishStart = (
                 fn: () => void,
-            ): void => {
-                if (settled) return;
+            ): boolean => {
+                if (settled) return false;
                 settled = true;
                 clearTimeout(startupTimer);
                 if (this.browseTimer) {
@@ -155,10 +157,15 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                     this.lateListeningTimer = null;
                 }
                 fn();
+                return true;
             };
 
             const fail = (message: string): void => {
-                finishStart(() => reject(this.startError(message)));
+                // Capture raw startup context before stop detaches the stream
+                // listeners and flushes their line carries.
+                const error = this.startError(message);
+                if (!finishStart(() => reject(error))) return;
+                void this.stop().catch(() => undefined);
             };
             const beginProbe = (
                 candidate: PreviewUrlResult,

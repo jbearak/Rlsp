@@ -12,10 +12,18 @@ uses the public Quarto CLI rather than the Quarto VS Code extension:
 - **`Raven: Show Quarto Output`** opens the shared **Raven: Quarto** output
   channel.
 
-Preview and Render are available from the Command Palette and the editor-title
-**Raven > Quarto** menu when a `.qmd` file is active. They do not depend on
-Raven's R console or on the `quarto.quarto` extension. Both commands execute
-the document through Quarto, so they require a trusted workspace. Stop remains
+Quarto commands are available from the Command Palette and, for `.qmd` files,
+inside the editor-title **Send to R** ($(play)) menu. A dedicated $(preview)
+button in the editor title bar starts Quarto Preview directly. The same button
+appears for `.Rmd` / `.Rmarkdown` files and runs Knit Preview there, providing
+one consistent preview action across both formats. You can right-click the
+editor toolbar and choose **Hide** if you do not want the button.
+
+The direct Quarto Preview button and palette commands do not depend on Raven's
+R console or on the `quarto.quarto` extension. The **Send to R** menu itself is
+shown only when Raven's R console is enabled, so Render and Stop remain
+palette-accessible when that console is off. Preview and Render execute the
+document through Quarto and therefore require a trusted workspace. Stop remains
 available in Restricted Mode so you can terminate an existing preview.
 
 Raven's [Knit Preview](knit.md) remains a separate pipeline for `.Rmd` and

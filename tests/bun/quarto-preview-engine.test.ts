@@ -171,6 +171,36 @@ describe('Quarto preview output line handling', () => {
 });
 
 describe('Quarto preview process stop ladder', () => {
+    it('self-stops exactly once after a readiness probe failure', async () => {
+        const child = new NeverClosingFakeChild();
+        const output: string[] = [];
+        let unexpectedExits = 0;
+        const process = processFor(child, {
+            output: {
+                append: (value: string) => output.push(value),
+                appendLine: (value: string) => output.push(`${value}\n`),
+            } as never,
+            onUnexpectedExit: () => { unexpectedExits++; },
+            probe: async () => { throw new Error('probe rejected'); },
+            signalGraceMs: 1,
+            killWaitMs: 1,
+        });
+        const starting = process.start();
+        child.stderr.write('Listening on http://127.0.0.1:4444/\n');
+
+        await expect(starting).rejects.toThrow('probe rejected');
+        expect(child.signals[0]).toBe('SIGINT');
+        await process.stop();
+
+        expect(child.signals).toEqual(['SIGINT', 'SIGTERM', 'SIGKILL']);
+        expect(unexpectedExits).toBe(0);
+        const afterFailure = output.join('');
+        child.stdout.write('ignored after failure');
+        child.stderr.write('ignored after failure\n');
+        await Promise.resolve();
+        expect(output.join('')).toBe(afterFailure);
+    });
+
     it('bounds an unconfirmed SIGKILL and detaches output listeners', async () => {
         const child = new NeverClosingFakeChild();
         const output: string[] = [];

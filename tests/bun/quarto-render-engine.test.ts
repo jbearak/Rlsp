@@ -111,6 +111,37 @@ class FakeCancellation {
 }
 
 describe('QuartoRenderEngine lifecycle', () => {
+    it('does not spawn when cancellation is already requested', async () => {
+        let spawnCalls = 0;
+        const spawnProcess = (() => {
+            spawnCalls++;
+            return new FakeChild() as unknown as ChildProcess;
+        }) as typeof spawn;
+        const engine = new QuartoRenderEngine();
+        const result = await engine.run({
+            quartoPath: 'quarto',
+            sourceFsPath: '/project/doc.qmd',
+            cwd: '/project',
+            timeoutMs: 60_000,
+            output: { append() {}, appendLine() {} } as never,
+            cancellation: {
+                isCancellationRequested: true,
+                onCancellationRequested: () => ({ dispose() {} }),
+            } as never,
+            spawnProcess,
+        });
+
+        expect(result).toEqual({
+            exitCode: null,
+            stdout: '',
+            stderr: '',
+            cancelled: true,
+            timedOut: false,
+            spawnError: null,
+        });
+        expect(spawnCalls).toBe(0);
+    });
+
     it('terminates live children on shutdown and rejects later spawns', async () => {
         const child = new FakeChild();
         let spawnCalls = 0;

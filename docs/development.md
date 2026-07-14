@@ -630,6 +630,14 @@ logs a non-throwing abandonment warning and continues; cancelled or timed-out
 renders also resolve their result at that bound. The detached child can no
 longer write through the subsequently disposed output channel.
 
+Preview startup failures capture their bounded raw tail and then claim that
+same idempotent stop ladder themselves; the runtime's defensive stop cannot
+double-signal. Runtime `Session` stop, shutdown, and recursive teardown convert
+injected rejections into output-channel diagnostics plus settled ownership, so
+a rejected promise cannot poison a predecessor chain or strand a generation.
+One-shot render checks an already-cancelled token before spawn, preventing any
+document code from running before the post-spawn cancellation hook exists.
+
 Preview replacement is generation-based. `startOrRestart` claims and installs
 the new generation synchronously before its first `await`; every asynchronous
 continuation carries `{ key, generation }` and becomes a no-op unless that pair

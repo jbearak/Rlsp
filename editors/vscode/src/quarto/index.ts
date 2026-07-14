@@ -66,6 +66,9 @@ export function registerQuarto(context: vscode.ExtensionContext): void {
         onViewUpdate: (update) => {
             QuartoPreviewPanel.applyRuntimeUpdate(update, panelDeps);
         },
+        onLifecycleError: (message) => {
+            try { output.appendLine(message); } catch { /* disposing */ }
+        },
     });
     const lifecycle: QuartoLifecycle = {
         runtime,

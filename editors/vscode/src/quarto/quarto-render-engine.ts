@@ -5,11 +5,13 @@
  * argv-only spawning, inherited environment, POSIX process-group ownership,
  * streamed output, and SIGINT -> SIGTERM -> SIGKILL escalation for both user
  * cancellation and timeout. Every spawned child is registered before control
- * returns to the event loop. `shutdown()` first rejects new work, then sends
- * every live child immediate SIGTERM followed by bounded SIGKILL, so extension
- * deactivation cannot leave workspace code running. Command policy and
- * notifications live outside the engine so progress UI can close before any
- * outcome toast is shown.
+ * returns to the event loop. A token already cancelled at `run()` entry returns
+ * without spawning, so document code cannot execute before the normal
+ * post-spawn cancellation hook is installed. `shutdown()` first rejects new
+ * work, then sends every live child immediate SIGTERM followed by bounded
+ * SIGKILL, so extension deactivation cannot leave workspace code running.
+ * Command policy and notifications live outside the engine so progress UI can
+ * close before any outcome toast is shown.
  *
  * The render timeout is capped at Node's signed 32-bit timer maximum at the
  * arm site as well as in the settings schema. This prevents stale or synced
@@ -96,7 +98,9 @@ export class QuartoRenderEngine {
     private shutdownPromise: Promise<void> | null = null;
 
     async run(opts: QuartoRenderOptions): Promise<KnitEngineResult> {
-        if (this.deactivating) return emptyCancelledResult();
+        if (this.deactivating || opts.cancellation.isCancellationRequested) {
+            return emptyCancelledResult();
+        }
 
         let child: ChildProcess;
         try {

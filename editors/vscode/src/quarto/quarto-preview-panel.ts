@@ -24,9 +24,9 @@
  * Code does not persist them. Restoration validates `{ sourceFsPath }`, wires
  * the inert panel, and renders a placeholder; it never starts Quarto. Panel
  * disposal stops only the generation that panel currently represents.
- * Async message handling is caught at the webview event boundary so rejected
- * VS Code commands or URI opens are reported without becoming unhandled host
- * rejections.
+ * Async message and dispose-stop handling are caught at their event boundaries
+ * so rejected VS Code commands, URI opens, or runtime stops are reported
+ * without becoming unhandled host rejections.
  * Deactivation disposes every panel and clears the static registry because VS
  * Code keeps JS modules alive across disable/enable cycles; retaining a panel
  * would retain the old runtime dependencies and generation counters too.
@@ -254,7 +254,11 @@ export class QuartoPreviewPanel {
             if (QuartoPreviewPanel.instances.get(this.key) === this) {
                 QuartoPreviewPanel.instances.delete(this.key);
             }
-            void this.deps.stopGeneration(this.key, this.generation);
+            void this.deps.stopGeneration(this.key, this.generation).catch((err) => {
+                this.deps.output.appendLine(
+                    '[panel] stopGeneration failed: ' + String(err),
+                );
+            });
         });
     }
 

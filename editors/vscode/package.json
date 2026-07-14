@@ -229,7 +229,8 @@
       {
         "command": "raven.knit",
         "title": "Knit Preview",
-        "category": "Raven"
+        "category": "Raven",
+        "icon": "$(preview)"
       },
       {
         "command": "raven.knit.exportHtml",
@@ -259,7 +260,8 @@
       {
         "command": "raven.quarto.preview",
         "title": "Quarto Preview",
-        "category": "Raven"
+        "category": "Raven",
+        "icon": "$(preview)"
       },
       {
         "command": "raven.quarto.render",
@@ -419,11 +421,6 @@
         "id": "raven.build",
         "label": "R Package Build",
         "icon": "$(package)"
-      },
-      {
-        "id": "raven.quarto",
-        "label": "Quarto",
-        "icon": "$(preview)"
       }
     ],
     "menus": {
@@ -526,25 +523,14 @@
           "group": "navigation"
         },
         {
-          "submenu": "raven.quarto",
-          "when": "resourceExtname =~ /\\.qmd$/i",
-          "group": "navigation"
-        }
-      ],
-      "raven.quarto": [
-        {
           "command": "raven.quarto.preview",
-          "when": "isWorkspaceTrusted",
-          "group": "1_run@1"
+          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
+          "group": "navigation@5"
         },
         {
-          "command": "raven.quarto.render",
-          "when": "isWorkspaceTrusted",
-          "group": "1_run@2"
-        },
-        {
-          "command": "raven.quarto.stopPreview",
-          "group": "1_run@3"
+          "command": "raven.knit",
+          "when": "raven.rmdKnit.enabled && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/",
+          "group": "navigation@5"
         }
       ],
       "raven.build": [
@@ -637,6 +623,21 @@
           "command": "raven.sourceFile",
           "when": "editorLangId == r && !(resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN|qmd|Qmd|QMD)$/)",
           "group": "4_file@5"
+        },
+        {
+          "command": "raven.quarto.preview",
+          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
+          "group": "5_quarto@1"
+        },
+        {
+          "command": "raven.quarto.render",
+          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
+          "group": "5_quarto@2"
+        },
+        {
+          "command": "raven.quarto.stopPreview",
+          "when": "resourceExtname =~ /\\.qmd$/i",
+          "group": "5_quarto@3"
         },
         {
           "submenu": "raven.sendToR.terminal",

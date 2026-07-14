@@ -1,10 +1,21 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
-import { activate, sleep } from './helper';
+import { activate } from './helper';
 import {
     QuartoPreviewPanel,
     type QuartoPreviewPanelDeps,
 } from '../quarto/quarto-preview-panel';
+
+class Deferred {
+    readonly promise: Promise<void>;
+    resolve!: () => void;
+
+    constructor() {
+        this.promise = new Promise<void>((resolve) => {
+            this.resolve = resolve;
+        });
+    }
+}
 
 suite('QuartoPreviewPanel integration', () => {
     let output: vscode.OutputChannel;
@@ -65,6 +76,14 @@ suite('QuartoPreviewPanel integration', () => {
     });
 
     test('disposing a panel stops only its bound runtime generation', async () => {
+        const stopped = new Deferred();
+        deps = {
+            ...deps,
+            stopGeneration: async (key, generation) => {
+                stops.push({ key, generation });
+                stopped.resolve();
+            },
+        };
         const instance = QuartoPreviewPanel.applyRuntimeUpdate({
             key: '/project',
             generation: 7,
@@ -73,11 +92,50 @@ suite('QuartoPreviewPanel integration', () => {
         }, deps);
         assert.ok(instance);
         instance.getPanelForTesting().dispose();
-        await sleep(10);
+        await stopped.promise;
         assert.deepStrictEqual(stops, [{ key: '/project', generation: 7 }]);
     });
 
+    test('dispose reports a rejected generation stop at the event boundary', async () => {
+        const logged = new Deferred();
+        const lines: string[] = [];
+        const rejectingDeps: QuartoPreviewPanelDeps = {
+            ...deps,
+            output: {
+                appendLine: (line: string) => {
+                    lines.push(line);
+                    logged.resolve();
+                },
+            } as vscode.OutputChannel,
+            stopGeneration: async () => {
+                throw new Error('injected stop rejection');
+            },
+        };
+        const instance = QuartoPreviewPanel.applyRuntimeUpdate({
+            key: '/project',
+            generation: 9,
+            sourceFsPath: '/project/a.qmd',
+            state: { kind: 'starting' },
+        }, rejectingDeps);
+        assert.ok(instance);
+
+        instance.getPanelForTesting().dispose();
+        await logged.promise;
+
+        assert.deepStrictEqual(lines, [
+            '[panel] stopGeneration failed: Error: injected stop rejection',
+        ]);
+    });
+
     test('rekeys and adopts the same-source panel when project identity changes', async () => {
+        const stoppedTwice = new Deferred();
+        deps = {
+            ...deps,
+            stopGeneration: async (key, generation) => {
+                stops.push({ key, generation });
+                if (stops.length === 2) stoppedTwice.resolve();
+            },
+        };
         const standaloneA = QuartoPreviewPanel.applyRuntimeUpdate({
             key: '/project/a.qmd',
             generation: 4,
@@ -109,7 +167,7 @@ suite('QuartoPreviewPanel integration', () => {
         assert.strictEqual(adopted.getPanelForTesting().title, 'Quarto Preview: a.qmd');
 
         adopted.getPanelForTesting().dispose();
-        await sleep(10);
+        await stoppedTwice.promise;
         assert.deepStrictEqual(stops, [
             { key: '/project', generation: 1 },
             { key: '/project', generation: 2 },
@@ -117,6 +175,14 @@ suite('QuartoPreviewPanel integration', () => {
     });
 
     test('deactivation disposes every panel and clears the static registry', async () => {
+        const stoppedTwice = new Deferred();
+        deps = {
+            ...deps,
+            stopGeneration: async (key, generation) => {
+                stops.push({ key, generation });
+                if (stops.length === 2) stoppedTwice.resolve();
+            },
+        };
         const first = QuartoPreviewPanel.applyRuntimeUpdate({
             key: '/project-a',
             generation: 3,
@@ -136,7 +202,7 @@ suite('QuartoPreviewPanel integration', () => {
         second.getPanelForTesting().onDidDispose(() => { disposals++; });
 
         QuartoPreviewPanel.disposeAllForDeactivation();
-        await sleep(10);
+        await stoppedTwice.promise;
 
         assert.strictEqual(QuartoPreviewPanel.getInstancesForTesting().size, 0);
         assert.strictEqual(disposals, 2);
@@ -239,16 +305,15 @@ suite('QuartoPreviewPanel integration', () => {
             vscode.ViewColumn.Beside,
             {},
         );
-        let disposed = false;
-        panel.onDidDispose(() => { disposed = true; });
+        const disposed = new Deferred();
+        panel.onDidDispose(() => { disposed.resolve(); });
         const restored = QuartoPreviewPanel.restore(
             panel,
             { sourceFsPath: 42, extra: true },
             deps,
         );
-        await sleep(10);
+        await disposed.promise;
         assert.strictEqual(restored, null);
-        assert.strictEqual(disposed, true);
         assert.strictEqual(stops.length, 0);
     });
 });

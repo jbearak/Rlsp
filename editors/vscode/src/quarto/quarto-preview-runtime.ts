@@ -29,6 +29,9 @@
  * live predecessor. Only the still-current stop owner emits `stopped`; a
  * not-yet-ready child's intentional-close rejection is superseded rather than
  * allowed to emit `failed` or remove that ownership early.
+ * Process stop/shutdown and recursive teardown are rejection-safe: injected or
+ * defensive failures are logged and treated as settled so one rejected promise
+ * cannot poison retirement ownership or a future predecessor drain.
  *
  * Shutdown rejects new starts, snapshots both live and retiring sessions,
  * sends immediate termination concurrently, and applies a cancelable global
@@ -67,6 +70,8 @@ export interface QuartoRuntimeDeps {
     processFactory(args: QuartoRuntimeProcessArgs): QuartoPreviewProcessLike;
     asExternalUri(rawUrl: string): Promise<string>;
     onViewUpdate(update: QuartoRuntimeViewUpdate): void;
+    /** Lifecycle diagnostics; production routes these to the Quarto output. */
+    onLifecycleError?(message: string): void;
     shutdownGlobalTimeoutMs?: number;
     /** Dependency-injected only to verify global-bound timer cancellation. */
     shutdownDelay?: (ms: number) => QuartoCancelableDelay;
@@ -106,6 +111,7 @@ export class Session {
         readonly generation: number,
         readonly sourceFsPath: string,
         predecessors: readonly Session[],
+        private readonly logError: (message: string) => void,
     ) {
         this.predecessors = [...predecessors];
     }
@@ -113,7 +119,10 @@ export class Session {
     stop(): Promise<void> {
         if (this.stopPromise) return this.stopPromise;
         this.stopping = true;
-        this.stopPromise = this.process?.stop() ?? Promise.resolve();
+        this.stopPromise = this.settleProcessOperation(
+            'stop',
+            () => this.process?.stop(),
+        );
         return this.stopPromise;
     }
 
@@ -128,6 +137,9 @@ export class Session {
             ...predecessors.map((predecessor) => predecessor.teardown()),
         ])
             .then(() => undefined)
+            .catch((err) => {
+                this.reportFailure('teardown', err);
+            })
             .finally(() => this.releasePredecessors());
         return this.teardownPromise;
     }
@@ -145,8 +157,37 @@ export class Session {
     shutdown(): Promise<void> {
         if (this.shutdownPromise) return this.shutdownPromise;
         this.stopping = true;
-        this.shutdownPromise = this.process?.shutdown() ?? Promise.resolve();
+        this.shutdownPromise = this.settleProcessOperation(
+            'shutdown',
+            () => this.process?.shutdown(),
+        );
         return this.shutdownPromise;
+    }
+
+    private settleProcessOperation(
+        operation: 'stop' | 'shutdown',
+        run: () => Promise<void> | undefined,
+    ): Promise<void> {
+        try {
+            const result = run();
+            return Promise.resolve(result).catch((err) => {
+                this.reportFailure(operation, err);
+            });
+        } catch (err) {
+            this.reportFailure(operation, err);
+            return Promise.resolve();
+        }
+    }
+
+    private reportFailure(operation: string, err: unknown): void {
+        try {
+            this.logError(
+                `[runtime] preview ${operation} failed for ${this.key}` +
+                `#${this.generation}: ${errorMessage(err)}`,
+            );
+        } catch {
+            // Logging must not re-poison an otherwise settled teardown.
+        }
     }
 }
 
@@ -188,6 +229,7 @@ export class QuartoRuntime {
             generation,
             args.sourceFsPath,
             oldSessions,
+            (message) => this.deps.onLifecycleError?.(message),
         );
 
         // Claim before the first await. The new-key and source-alias lookups
@@ -230,7 +272,7 @@ export class QuartoRuntime {
             });
             session.process = process;
             if (!this.isCurrent(session) || session.stopping || this.deactivating) {
-                await process.shutdown();
+                await session.shutdown();
                 return { kind: 'superseded', generation };
             }
 
@@ -241,7 +283,7 @@ export class QuartoRuntime {
                 || session.exited
                 || this.deactivating
             ) {
-                await process.shutdown();
+                await session.shutdown();
                 return { kind: 'superseded', generation };
             }
 
@@ -252,7 +294,7 @@ export class QuartoRuntime {
                 || session.exited
                 || this.deactivating
             ) {
-                await process.shutdown();
+                await session.shutdown();
                 return { kind: 'superseded', generation };
             }
 
@@ -442,6 +484,10 @@ export class QuartoRuntime {
 function readStartupTail(error: Error): string {
     const candidate = error as Error & { startupTail?: unknown };
     return typeof candidate.startupTail === 'string' ? candidate.startupTail.trim() : '';
+}
+
+function errorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
 }
 
 function cancelableDelay(ms: number): QuartoCancelableDelay {
