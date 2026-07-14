@@ -131,6 +131,18 @@ describe('composeStylesheet', () => {
         expect(css).toContain(githubDark.background);
     });
 
+    test('constrains ordinary images to the content width (issue #629)', () => {
+        // A bare <img> (e.g. a large PNG from include_graphics) must be
+        // capped to the content width without being enlarged or
+        // distorted. The same stylesheet feeds the webview iframe and
+        // "Open in Browser", so this one assertion covers both.
+        const css = composeStylesheet(null);
+        expect(css).toMatch(/\bimg\s*\{[^}]*max-width:\s*100%/);
+        expect(css).toMatch(/\bimg\s*\{[^}]*height:\s*auto/);
+        // The extracted-SVG plot rules must remain intact and separate.
+        expect(css).toContain('.raven-knit-plot-host svg {');
+    });
+
     test('vscode-light produces only the light palette and no media query', () => {
         const css = composeStylesheet('vscode-light');
         expect(css).toContain('color-scheme: light');
