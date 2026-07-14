@@ -75,7 +75,7 @@ describe('inlineLocalImagesAsDataUrls', () => {
         expect(inlineLocalImagesAsDataUrls(html, '/tmp')).toBe(html);
     });
 
-    test('leaves absolute filesystem paths alone', () => {
+    test('leaves absolute filesystem paths outside every allowed root alone', () => {
         const html = '<img src="/usr/share/icons/x.png">';
         expect(inlineLocalImagesAsDataUrls(html, '/tmp')).toBe(html);
     });
@@ -245,6 +245,119 @@ describe('inlineLocalImagesAsDataUrls', () => {
             const out = inlineLocalImagesAsDataUrls(html, dir);
             expect(out).toContain('src="data:image/svg+xml;base64,');
             expect(out).toMatch(/src="data:image\/svg\+xml;base64,[^"]+#layer-1"/);
+        });
+    });
+
+    // --- issue #627: existing workspace images via include_graphics() ---
+
+    test('inlines an absolute path inside an additional allowed root', () => {
+        withTempDir((workspace) => {
+            const docDir = path.join(workspace, 'docs', '.raven_output');
+            const imgDir = path.join(workspace, 'images');
+            fs.mkdirSync(docDir, { recursive: true });
+            fs.mkdirSync(imgDir, { recursive: true });
+            const abs = path.join(imgDir, 'existing.png');
+            fs.writeFileSync(abs, TINY_PNG);
+
+            const html = `<img src="${abs}">`;
+            const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                additionalRoots: [workspace],
+            });
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('inlines a relative path that traverses out of docDir but stays in a root', () => {
+        withTempDir((workspace) => {
+            const docDir = path.join(workspace, 'docs', '.raven_output');
+            const imgDir = path.join(workspace, 'images');
+            fs.mkdirSync(docDir, { recursive: true });
+            fs.mkdirSync(imgDir, { recursive: true });
+            fs.writeFileSync(path.join(imgDir, 'existing.png'), TINY_PNG);
+
+            // From docDir up to workspace, then into images/.
+            const rel = path.relative(docDir, path.join(imgDir, 'existing.png'));
+            const html = `<img src="${rel}">`;
+            const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                additionalRoots: [workspace],
+            });
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('blocks an absolute path outside every allowed root', () => {
+        withTempDir((workspace) => {
+            const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-outside-'));
+            try {
+                const docDir = path.join(workspace, 'docs', '.raven_output');
+                fs.mkdirSync(docDir, { recursive: true });
+                const secret = path.join(outside, 'secret.png');
+                fs.writeFileSync(secret, TINY_PNG);
+
+                const html = `<img src="${secret}">`;
+                const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                    additionalRoots: [workspace],
+                });
+                expect(out).toBe(html);
+                expect(out).not.toContain('data:image/png;base64,');
+            } finally {
+                try { fs.rmSync(outside, { recursive: true, force: true }); } catch { /* noop */ }
+            }
+        });
+    });
+
+    test('does not follow a symlink out of an allowed root', () => {
+        withTempDir((workspace) => {
+            const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-outside-'));
+            try {
+                const secret = path.join(outside, 'secret.png');
+                fs.writeFileSync(secret, TINY_PNG);
+                // A symlink that lives inside the workspace but points out.
+                const link = path.join(workspace, 'leak.png');
+                try {
+                    fs.symlinkSync(secret, link);
+                } catch {
+                    // Platform without symlink support (or perms) — skip.
+                    return;
+                }
+                const html = '<img src="leak.png">';
+                const out = inlineLocalImagesAsDataUrls(html, workspace);
+                expect(out).toBe(html);
+                expect(out).not.toContain('data:image/png;base64,');
+            } finally {
+                try { fs.rmSync(outside, { recursive: true, force: true }); } catch { /* noop */ }
+            }
+        });
+    });
+
+    test('handles spaces and non-ASCII characters in image names', () => {
+        withTempDir((workspace) => {
+            const docDir = path.join(workspace, '.raven_output');
+            const imgDir = path.join(workspace, 'images');
+            fs.mkdirSync(docDir, { recursive: true });
+            fs.mkdirSync(imgDir, { recursive: true });
+            const name = 'my café pläot.png';
+            fs.writeFileSync(path.join(imgDir, name), TINY_PNG);
+
+            const rel = path.relative(docDir, path.join(imgDir, name));
+            const html = `<img src="${rel}">`;
+            const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                additionalRoots: [workspace],
+            });
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('skips a non-existent additional root without throwing', () => {
+        withTempDir((dir) => {
+            fs.mkdirSync(path.join(dir, 'figure'));
+            fs.writeFileSync(path.join(dir, 'figure', 'p.png'), TINY_PNG);
+            const html = '<img src="figure/p.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir, undefined, {
+                additionalRoots: [path.join(dir, 'does-not-exist')],
+            });
+            // docDir is still an allowed root, so the figure image inlines.
+            expect(out).toContain('src="data:image/png;base64,');
         });
     });
 

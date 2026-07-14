@@ -255,6 +255,24 @@ when an R Markdown file is open.
     does not intercept nested-frame navigations); a `<base href>`
     injected at the top of the inlined HTML lets relative images,
     CSS, and fonts resolve through the webview's resource handler.
+
+    Local `<img>` sources are additionally read off disk and inlined
+    as `data:` URLs before the HTML reaches the iframe, because a
+    nested `<iframe srcdoc>` cannot fetch webview subresources. This
+    covers both knitr's generated `figure/` plots and pre-existing
+    workspace images referenced with `knitr::include_graphics()` — an
+    absolute path, or a relative path that walks out of the preview
+    directory, inlines as long as the file resolves (after `realpath`,
+    so symlinks cannot escape) inside either the temp preview directory
+    or the workspace folder containing the source document (its own
+    directory when no workspace is open). A path outside both roots is
+    left untouched. To keep `include_graphics()` from failing the knit
+    by relativizing an absolute path against `root.dir`, Raven sets
+    `options(knitr.graphics.rel_path = FALSE)` for its knit subprocess
+    only. The on-disk `.html` keeps the original `<img>` paths, so
+    **Open in Browser** stays small; only the in-memory copy handed to
+    the iframe is rewritten.
+
     Intra-document anchor links (`#section`) work; clicking an
     external `<a>` does nothing (use **Open in Browser** for full
     interactivity, including htmlwidgets). When the output-path

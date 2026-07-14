@@ -747,8 +747,18 @@ export class KnitOutputPanel {
         // "Open in Browser" stays self-contained without an inflated
         // base64 payload. The mutation only touches the in-memory
         // copy handed to the iframe.
+        // `include_graphics()` can reference an image that already
+        // lives elsewhere in the workspace (issue #627). Allow the
+        // inliner to reach outside the temp preview dir by handing it
+        // the workspace folder containing the source document — or,
+        // for a loose file with no workspace, the source document's own
+        // directory. The inliner still `realpath`-guards containment.
+        const sourceDir = path.dirname(this.sourceUri.fsPath);
+        const workspaceRoot = vscode.workspace.getWorkspaceFolder(this.sourceUri)?.uri.fsPath
+            ?? sourceDir;
         htmlContent = inlineLocalImagesAsDataUrls(htmlContent, docDir, this.output, {
             markSvgPlots: true,
+            additionalRoots: [workspaceRoot],
         });
         this.panel.webview.html = buildShellHtml({
             htmlContent,
