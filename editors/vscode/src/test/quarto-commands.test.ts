@@ -485,6 +485,35 @@ suite('Quarto command preflight', () => {
         await first;
     });
 
+    test('symlink aliases of one Quarto project share the render guard', async () => {
+        const renderStarted = new Deferred<void>();
+        const finishRender = new Deferred<KnitEngineResult>();
+        let renders = 0;
+        const realRoot = '/real/project';
+        const firstUri = vscode.Uri.file('/aliases/one/project/a.qmd');
+        const secondUri = vscode.Uri.file('/aliases/two/project/b.qmd');
+        const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+            resolveContext: (sourceFsPath) => {
+                const projectRoot = path.dirname(sourceFsPath);
+                return { key: projectRoot, cwd: projectRoot, projectRoot };
+            },
+            realpath: () => realRoot,
+            runRender: async () => {
+                renders++;
+                renderStarted.resolve(undefined);
+                return finishRender.promise;
+            },
+        }));
+
+        const first = runRender(firstUri);
+        await renderStarted.promise;
+        await runRender(secondUri);
+
+        assert.strictEqual(renders, 1);
+        finishRender.resolve(successfulRenderResult());
+        await first;
+    });
+
     test('different projects and standalone files render concurrently', async () => {
         const runPair = async (projectRoots: boolean): Promise<void> => {
             const bothStarted = new Deferred<void>();

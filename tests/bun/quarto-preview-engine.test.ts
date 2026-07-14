@@ -184,6 +184,27 @@ describe('Quarto preview startup idle timeout', () => {
 });
 
 describe('Quarto preview output line handling', () => {
+    it('returns the IPv4 URL that is safe to frame for localhost advertisements', async () => {
+        const child = new FakeChild();
+        const probed: string[] = [];
+        const process = processFor(child, {
+            probe: async (url) => {
+                probed.push(url);
+                return 200;
+            },
+        });
+        const starting = process.start();
+        child.stderr.write('Listening on http://localhost:4888/chapter/\n');
+
+        const ready = await starting;
+        expect(probed).toEqual(['http://127.0.0.1:4888/chapter/']);
+        expect(ready).toEqual({
+            rawUrl: 'http://127.0.0.1:4888/chapter/',
+            origin: 'http://127.0.0.1:4888',
+            statusCode: 200,
+        });
+    });
+
     it('preserves a new empty line after swallowing a split CRLF', () => {
         const lines: string[] = [];
         const buffer = new QuartoOutputLineBuffer((line) => lines.push(line));
@@ -491,7 +512,7 @@ describe('Browse-only preview correlation', () => {
 
         const ready = await starting;
         expect(probed).toEqual([
-            'http://localhost:4555/chapter/',
+            'http://127.0.0.1:4555/chapter/',
             'http://127.0.0.1:4666/chapter/',
         ]);
         expect(ready.rawUrl).toBe('http://127.0.0.1:4666/chapter/');
@@ -519,9 +540,42 @@ describe('Browse-only preview correlation', () => {
 
         const ready = await starting;
         expect(probed).toEqual([
-            'http://localhost:4777/chapter/',
+            'http://127.0.0.1:4777/chapter/',
             'http://127.0.0.1:4888/chapter/',
         ]);
         expect(ready.rawUrl).toBe('http://127.0.0.1:4888/chapter/');
+    });
+
+    it('lets late Listening supersede a provisional Browse 404', async () => {
+        const child = new FakeChild();
+        const firstProbe = new Deferred<void>();
+        const probed: string[] = [];
+        const process = processFor(child, {
+            browseCorrelationDelayMs: 1,
+            lateListeningGraceMs: 100,
+            probe: async (url) => {
+                probed.push(url);
+                if (probed.length === 1) {
+                    firstProbe.resolve();
+                    throw new QuartoPreviewProbeError(
+                        'not-browser-previewable',
+                        'provisional 404',
+                    );
+                }
+                return 200;
+            },
+        });
+        const starting = process.start();
+        child.stderr.write('Browse at http://localhost:4991/chapter/\n');
+
+        await firstProbe.promise;
+        child.stderr.write('Listening on http://127.0.0.1:4992/\n');
+
+        const ready = await starting;
+        expect(probed).toEqual([
+            'http://127.0.0.1:4991/chapter/',
+            'http://127.0.0.1:4992/chapter/',
+        ]);
+        expect(ready.rawUrl).toBe('http://127.0.0.1:4992/chapter/');
     });
 });

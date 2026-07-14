@@ -50,6 +50,21 @@ describe('Quarto preview URL parser', () => {
         });
     });
 
+    test('uses a proxy Browse path only after a loopback Listening origin arrives', () => {
+        const scanner = new QuartoPreviewOutputScanner();
+        expect(scanner.feed(
+            'Browse at https://preview.example.test/proxy/chapter/?preview=1#top\n',
+        )).toBeNull();
+        expect(scanner.failure()).toBeNull();
+        expect(scanner.acceptBrowseCandidate()).toBeNull();
+        expect(scanner.feed(
+            'Listening on http://127.0.0.1:4444/\n',
+        )).toEqual({
+            origin: 'http://127.0.0.1:4444',
+            url: 'http://127.0.0.1:4444/proxy/chapter/?preview=1#top',
+        });
+    });
+
     test('handles lone Browse and Listening candidates at end-of-stream', () => {
         const browseOnly = new QuartoPreviewOutputScanner();
         expect(browseOnly.feed('Browse at http://localhost:3210/document/\n')).toBeNull();
@@ -130,18 +145,28 @@ describe('Quarto preview URL parser', () => {
         }
     });
 
-    test('treats hostile advertised URLs as hard failures', () => {
-        for (const hostile of [
-            'https://evil.example/',
-            'http://localhost.evil/',
-            'http://user:pass@127.0.0.1:1/',
-            'ftp://127.0.0.1/',
+    test('requires a loopback origin before a non-loopback Browse path can finish', () => {
+        for (const provisional of [
+            'https://evil.example/path',
+            'http://localhost.evil/path',
+            'http://user:pass@127.0.0.1:1/path',
         ]) {
             const scanner = new QuartoPreviewOutputScanner();
-            expect(scanner.feed(`Browse at ${hostile}\n`)).toBeNull();
-            expect(scanner.failure()).toContain('Rejected unsafe');
-            expect(scanner.feed('Listening on http://127.0.0.1:9999/\n')).toBeNull();
+            expect(scanner.feed(`Browse at ${provisional}\n`)).toBeNull();
+            expect(scanner.failure()).toBeNull();
+            expect(scanner.finish()).toBeNull();
+            expect(scanner.failure()).toContain('without a loopback Listening origin');
         }
+    });
+
+    test('keeps malformed Browse and non-loopback Listening URLs as hard failures', () => {
+        const malformedBrowse = new QuartoPreviewOutputScanner();
+        malformedBrowse.feed('Browse at ftp://127.0.0.1/path\n');
+        expect(malformedBrowse.failure()).toContain('Rejected unsafe');
+
+        const unsafeListening = new QuartoPreviewOutputScanner();
+        unsafeListening.feed('Listening on https://preview.example.test/\n');
+        expect(unsafeListening.failure()).toContain('Rejected unsafe');
     });
 
     test('caps the raw startup tail', () => {

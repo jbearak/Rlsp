@@ -24,20 +24,30 @@ describe('Quarto rendered output path resolution', () => {
         }
     });
 
-    it('uses an existing cwd-relative path, then source-relative fallback', () => {
+    it('chooses a fresh cwd-relative website output over a stale source-relative file', () => {
         const source = '/project/chapters/doc.qmd';
+        const sourceOutput = path.resolve('/project/chapters', 'site/doc.html');
         const cwdOutput = path.resolve('/project', 'site/doc.html');
         expect(resolveQuartoRenderedOutputPath(
             'site/doc.html',
             source,
             '/project',
-            (candidate) => candidate === cwdOutput,
+            {
+                exists: (candidate) => (
+                    candidate === sourceOutput || candidate === cwdOutput
+                ),
+                mtimeMs: (candidate) => candidate === cwdOutput ? 200 : 100,
+            },
         )).toBe(cwdOutput);
+    });
+
+    it('falls back gracefully to the source-relative path when neither exists', () => {
+        const source = '/project/chapters/doc.qmd';
         expect(resolveQuartoRenderedOutputPath(
             'missing/doc.html',
             source,
             '/project',
-            () => false,
+            { exists: () => false, mtimeMs: () => 0 },
         )).toBe(path.resolve('/project/chapters', 'missing/doc.html'));
     });
 });

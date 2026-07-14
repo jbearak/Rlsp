@@ -19,9 +19,10 @@
  *
  * Browse-only fallback waits for a correlation window and remains provisional
  * through its readiness probe and one final grace window. A late
- * `Listening on` line can therefore supersede either a failed or successful
+ * `Listening on` line can therefore supersede any failed or successful
  * Browse-only probe before `start()` resolves and probe the corrected,
- * trusted-origin URL.
+ * trusted-origin URL. Exact `localhost` candidates are normalized to the IPv4
+ * address Quarto was explicitly bound to before either probing or framing.
  * Probe diagnosis follows the last attempt: trailing connection errors cannot
  * be masked by an earlier 404.
  *
@@ -202,6 +203,7 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                 browseOnly: boolean,
             ): void => {
                 if (settled) return;
+                const readyCandidate = normalizePreviewUrlForIpv4Listener(candidate);
                 const probeId = ++probeSequence;
                 this.activeProbeAbortController?.abort();
                 const probeAbort = new AbortController();
@@ -219,7 +221,7 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                             requestStatus,
                             signal,
                         ));
-                void probe(candidate.url, probeAbort.signal).then((statusCode) => {
+                void probe(readyCandidate.url, probeAbort.signal).then((statusCode) => {
                     if (settled || probeId !== probeSequence) return;
                     if (browseOnly) {
                         // A document can print a plausible Browse line before
@@ -233,8 +235,8 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                                 finishStart(() => {
                                     this.ready = true;
                                     resolve({
-                                        rawUrl: candidate.url,
-                                        origin: candidate.origin,
+                                        rawUrl: readyCandidate.url,
+                                        origin: readyCandidate.origin,
                                         statusCode,
                                     });
                                 });
@@ -245,17 +247,17 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                     finishStart(() => {
                         this.ready = true;
                         resolve({
-                            rawUrl: candidate.url,
-                            origin: candidate.origin,
+                            rawUrl: readyCandidate.url,
+                            origin: readyCandidate.origin,
                             statusCode,
                         });
                     });
                 }, (err) => {
                     if (settled || probeId !== probeSequence) return;
-                    if (browseOnly && isConnectionProbeFailure(err)) {
+                    if (browseOnly) {
                         // Browse can precede a differently-bound Listening
-                        // line. Keep scanning briefly instead of letting a
-                        // provisional connection failure become final.
+                        // line. Keep every provisional diagnosis, including a
+                        // 404, pending briefly so the trusted listener wins.
                         const graceMs = this.opts.lateListeningGraceMs
                             ?? correlationDelayMs;
                         this.lateListeningTimer = setTimeout(() => {
@@ -301,7 +303,12 @@ export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
                             return;
                         }
                         const listeningOnly = this.scanner.acceptListeningCandidate();
-                        if (listeningOnly) beginProbe(listeningOnly, false);
+                        if (listeningOnly) {
+                            beginProbe(listeningOnly, false);
+                            return;
+                        }
+                        const failure = this.scanner.rejectUncorrelatedBrowseCandidate();
+                        if (failure) fail(failure);
                     }, correlationDelayMs);
                 }
             };
@@ -435,7 +442,9 @@ export async function probeQuartoPreviewUrl(
     request: (url: string, signal?: AbortSignal) => Promise<number> = requestStatus,
     signal?: AbortSignal,
 ): Promise<number> {
-    const requestUrl = ipv4ProbeUrl(rawUrl);
+    const requestUrl = normalizePreviewUrlForIpv4Listener(
+        validatePreviewUrlForNormalization(rawUrl),
+    ).url;
     let lastOutcome: '404' | 'error' | null = null;
     let lastError: Error | null = null;
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -465,11 +474,19 @@ export async function probeQuartoPreviewUrl(
     );
 }
 
-/** Match the explicitly IPv4-bound Quarto listener for host-side requests. */
-function ipv4ProbeUrl(rawUrl: string): string {
+/** Match the explicitly IPv4-bound Quarto listener for probes and webviews. */
+function normalizePreviewUrlForIpv4Listener(
+    candidate: PreviewUrlResult,
+): PreviewUrlResult {
+    const parsed = new URL(candidate.url);
+    if (parsed.hostname !== 'localhost') return candidate;
+    parsed.hostname = '127.0.0.1';
+    return { origin: parsed.origin, url: parsed.toString() };
+}
+
+function validatePreviewUrlForNormalization(rawUrl: string): PreviewUrlResult {
     const parsed = new URL(rawUrl);
-    if (parsed.hostname === 'localhost') parsed.hostname = '127.0.0.1';
-    return parsed.toString();
+    return { origin: parsed.origin, url: parsed.toString() };
 }
 
 export type QuartoPreviewProbeErrorKind = 'not-browser-previewable' | 'connection';
@@ -539,11 +556,6 @@ function abortError(): Error {
 
 function errorMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
-}
-
-function isConnectionProbeFailure(err: unknown): boolean {
-    return !(err instanceof QuartoPreviewProbeError)
-        || err.kind === 'connection';
 }
 
 /**

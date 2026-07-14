@@ -12,9 +12,10 @@
  * session claim.
  *
  * Render key ownership is reserved before the document is opened or saved and
- * covers preflight + resolver + subprocess work. Project renders share their
- * project key; standalone renders use a symlink-resolved source key when
- * possible. Runtime ownership keeps its existing lexical canonicalization.
+ * covers preflight + resolver + subprocess work. Project renders share a
+ * symlink-resolved project key; standalone renders use a symlink-resolved
+ * source key when possible. Runtime ownership keeps its existing lexical
+ * canonicalization.
  * The guard is released before install or outcome notifications are awaited,
  * so a completed render's toast cannot block the next invocation.
  * Activation-scoped command ownership lets deactivation await asynchronous
@@ -390,12 +391,16 @@ function renderGuardKey(
     context: QuartoContext,
     deps: QuartoCommandDeps,
 ): string {
-    if (context.projectRoot !== null) return `project:${context.key}`;
+    const target = context.projectRoot ?? uri.fsPath;
+    const kind = context.projectRoot === null ? 'file' : 'project';
     try {
         const realpath = deps.realpath ?? fs.realpathSync.native;
-        return `file:${canonicalOpKey({ fsPath: realpath(uri.fsPath) })}`;
+        return `${kind}:${canonicalOpKey({ fsPath: realpath(target) })}`;
     } catch {
-        return `file:${canonicalOpKey(uri)}`;
+        const lexical = context.projectRoot === null
+            ? canonicalOpKey(uri)
+            : canonicalOpKey({ fsPath: context.key });
+        return `${kind}:${lexical}`;
     }
 }
 

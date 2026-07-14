@@ -3,11 +3,12 @@
  *
  * This module is a security boundary. A rendered workspace document can
  * write arbitrary text into the same stdout/stderr streams as Quarto, so a
- * line that merely looks like `Browse at ...` is hostile until its URL has
- * passed `validatePreviewUrl`. Only loopback HTTP URLs without credentials
- * cross this boundary. `Listening on` supplies the trusted origin; `Browse
- * at` supplies only the document-specific path. A rejected candidate stops
- * the scanner as a hard failure so later output cannot silently replace it.
+ * line that merely looks like `Browse at ...` is hostile until it has been
+ * parsed. Only loopback HTTP URLs without credentials cross this boundary as
+ * origins. A non-loopback HTTP(S) Browse URL may contribute its path while it
+ * waits for a validated loopback `Listening on` origin; its origin is never
+ * framed or probed. Malformed Browse URLs and unsafe Listening origins remain
+ * hard failures so later output cannot silently replace them.
  *
  * The scanner processes each completed line once. Callers that merge process
  * streams must reassemble lines per stream and call `feedLine`; `feed` retains
@@ -97,6 +98,7 @@ export class QuartoPreviewOutputScanner {
     private carry = '';
     private tail = '';
     private browse: PreviewUrlResult | null = null;
+    private browsePath: string | null = null;
     private listening: PreviewUrlResult | null = null;
     private emitted: PreviewUrlResult | null = null;
     private failureDetail: string | null = null;
@@ -165,6 +167,12 @@ export class QuartoPreviewOutputScanner {
         }
         if (this.listening) return this.emit(this.listening);
         if (this.browse) return this.emit(this.browse);
+        if (this.browsePath !== null) {
+            this.reject(
+                'Rejected Quarto Browse URL without a loopback Listening origin.',
+            );
+            return null;
+        }
         this.stopped = true;
         return null;
     }
@@ -192,15 +200,29 @@ export class QuartoPreviewOutputScanner {
         return this.browse;
     }
 
+    /**
+     * Reject a path-only Browse candidate once its Listening correlation
+     * window expires. Until then the untrusted advertised origin is retained
+     * only as a path and can never become a probe/frame URL by itself.
+     */
+    rejectUncorrelatedBrowseCandidate(): string | null {
+        if (!this.stopped && this.browsePath !== null && this.browse === null) {
+            this.reject(
+                'Rejected Quarto Browse URL without a loopback Listening origin.',
+            );
+        }
+        return this.failureDetail;
+    }
+
     /** Accept a validated Listening-only candidate after correlation grace. */
     acceptListeningCandidate(): PreviewUrlResult | null {
         if (this.stopped) return this.emitted;
         return this.listening;
     }
 
-    /** True when a validated Browse candidate is awaiting correlation. */
+    /** True when a Browse path candidate is awaiting correlation. */
     hasBrowseCandidate(): boolean {
-        return !this.stopped && this.browse !== null;
+        return !this.stopped && this.browsePath !== null;
     }
 
     /** True when a validated Listening candidate awaits a Browse path. */
@@ -232,10 +254,17 @@ export class QuartoPreviewOutputScanner {
         if (browseMatch) {
             const candidate = validatePreviewUrl(browseMatch[1]);
             if (!candidate) {
-                this.reject(`Rejected unsafe Quarto preview URL: ${browseMatch[1]}`);
-                return null;
+                const browsePath = parseProvisionalBrowsePath(browseMatch[1]);
+                if (browsePath === null) {
+                    this.reject(`Rejected unsafe Quarto preview URL: ${browseMatch[1]}`);
+                    return null;
+                }
+                this.browse = null;
+                this.browsePath = browsePath;
+            } else {
+                this.browse = candidate;
+                this.browsePath = pathFromUrl(candidate.url);
             }
-            this.browse = candidate;
             if (this.listening) return this.emitCorrelated();
         }
 
@@ -248,16 +277,14 @@ export class QuartoPreviewOutputScanner {
         }
         this.listening = listening;
 
-        if (!this.browse) return null;
+        if (this.browsePath === null) return null;
         return this.emitCorrelated();
     }
 
     private emitCorrelated(): PreviewUrlResult | null {
-        if (!this.browse || !this.listening) return null;
-        const browseUrl = new URL(this.browse.url);
+        if (this.browsePath === null || !this.listening) return null;
         const correlated = validatePreviewUrl(
-            `${this.listening.origin}` +
-            `${browseUrl.pathname}${browseUrl.search}${browseUrl.hash}`,
+            `${this.listening.origin}${this.browsePath}`,
         );
         if (!correlated) {
             this.reject('Could not correlate Quarto preview URLs safely.');
@@ -276,4 +303,21 @@ export class QuartoPreviewOutputScanner {
         this.failureDetail = detail;
         this.stopped = true;
     }
+}
+
+/** Keep only a web Browse URL's document path; its origin remains untrusted. */
+function parseProvisionalBrowsePath(raw: string): string | null {
+    let parsed: URL;
+    try {
+        parsed = new URL(raw.trim());
+    } catch {
+        return null;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    return pathFromUrl(parsed.toString());
+}
+
+function pathFromUrl(raw: string): string {
+    const parsed = new URL(raw);
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
 }
