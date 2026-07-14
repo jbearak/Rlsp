@@ -5,10 +5,22 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { activate, awaitActive } from './helper';
 import {
+    createQuartoRenderRunnerForTesting,
     runQuartoPreflightForTesting,
     runQuartoStopForTesting,
     type QuartoCommandDeps,
 } from '../quarto/quarto-commands';
+
+class Deferred<T> {
+    readonly promise: Promise<T>;
+    resolve!: (value: T) => void;
+
+    constructor() {
+        this.promise = new Promise<T>((resolve) => {
+            this.resolve = resolve;
+        });
+    }
+}
 
 suite('Quarto command preflight', () => {
     let output: vscode.OutputChannel;
@@ -37,6 +49,50 @@ suite('Quarto command preflight', () => {
             );
             assert.strictEqual(result, null);
             assert.ok(messages.some((message) => message.includes('untrusted workspaces')));
+        } finally {
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('non-file qmd URI is rejected before any document code can run', async () => {
+        const messages: string[] = [];
+        let opened = false;
+        let resolved = false;
+        let rendered = false;
+        const original = vscode.window.showInformationMessage;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            messages.push(message);
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.parse('git:/repo/doc.qmd?ref');
+            const result = await runQuartoPreflightForTesting(uri, 'Render', fakeDeps({
+                resolver: {
+                    resolve: async () => {
+                        resolved = true;
+                        return 'quarto';
+                    },
+                },
+                openTextDocument: async () => {
+                    opened = true;
+                    throw new Error('virtual document must not open');
+                },
+                runRender: async () => {
+                    rendered = true;
+                    throw new Error('virtual document must not render');
+                },
+            }));
+
+            assert.strictEqual(result, null);
+            assert.deepStrictEqual(messages, [
+                "Raven: Quarto Render needs a saved .qmd file on disk; " +
+                "this editor (git) isn't a file.",
+            ]);
+            assert.strictEqual(opened, false);
+            assert.strictEqual(resolved, false);
+            assert.strictEqual(rendered, false);
         } finally {
             (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
         }
@@ -128,6 +184,102 @@ suite('Quarto command preflight', () => {
             );
             assert.ok(messages.includes('No Quarto preview is running for this document.'));
         } finally {
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('Stop on a non-file editor degrades to no matching preview', async () => {
+        const messages: string[] = [];
+        const lookups: Array<{ key: string; source: string }> = [];
+        const original = vscode.window.showInformationMessage;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            messages.push(message);
+            return Promise.resolve(undefined);
+        };
+        try {
+            await runQuartoStopForTesting(
+                vscode.Uri.parse('git:/repo/doc.qmd?ref'),
+                fakeDeps({
+                    resolveContext: (sourceFsPath) => ({
+                        key: sourceFsPath,
+                        cwd: path.dirname(sourceFsPath),
+                        projectRoot: null,
+                    }),
+                    runtime: {
+                        startOrRestart: async () => {
+                            throw new Error('start must not run');
+                        },
+                        stopByLookup: async (key, source) => {
+                            lookups.push({ key, source });
+                            return 'none';
+                        },
+                    } as QuartoCommandDeps['runtime'],
+                }),
+            );
+
+            assert.deepStrictEqual(lookups, [{
+                key: '/repo/doc.qmd',
+                source: '/repo/doc.qmd',
+            }]);
+            assert.deepStrictEqual(messages, [
+                'No Quarto preview is running for this document.',
+            ]);
+        } finally {
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('render key is released before the outcome notification settles', async () => {
+        const firstToastShown = new Deferred<void>();
+        const dismissFirstToast = new Deferred<string | undefined>();
+        const original = vscode.window.showInformationMessage;
+        let toastCalls = 0;
+        let renderCalls = 0;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            _message: string,
+        ): Thenable<string | undefined> => {
+            toastCalls++;
+            if (toastCalls === 1) {
+                firstToastShown.resolve(undefined);
+                return dismissFirstToast.promise;
+            }
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/tmp/render-lock.qmd');
+            const deps = fakeDeps({
+                runRender: async () => {
+                    renderCalls++;
+                    return {
+                        exitCode: 0,
+                        stdout: '',
+                        stderr: '',
+                        cancelled: false,
+                        timedOut: false,
+                        spawnError: null,
+                    };
+                },
+            });
+            const runRender = createQuartoRenderRunnerForTesting(deps);
+            const preflight = {
+                uri,
+                document: fakeDocument(uri, '# document'),
+                context: { key: uri.fsPath, cwd: '/tmp', projectRoot: null },
+            };
+
+            const first = runRender(preflight);
+            await firstToastShown.promise;
+            assert.strictEqual(renderCalls, 1);
+
+            await runRender(preflight);
+            assert.strictEqual(renderCalls, 2);
+
+            dismissFirstToast.resolve(undefined);
+            await first;
+        } finally {
+            dismissFirstToast.resolve(undefined);
             (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
         }
     });

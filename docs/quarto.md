@@ -64,7 +64,10 @@ If Raven cannot find Quarto, the error offers **Install…** and **Set Path…**
 
 `Raven: Quarto Preview` saves a dirty document first. If saving is refused or
 fails, Raven stops because Quarto would otherwise render stale content. Raven
-then runs the equivalent of:
+also requires a saved `.qmd` file opened from the filesystem. Virtual documents
+such as Git-diff revisions are rejected so Quarto cannot render a different
+on-disk revision from the one shown in the editor. Raven then runs the
+equivalent of:
 
 ```text
 quarto preview <file> --no-browser --host 127.0.0.1
@@ -119,7 +122,9 @@ quarto render <file>
 The command runs in the same project-aware working directory as Preview. It
 uses a cancellable progress notification, streams output to **Raven: Quarto**,
 and permits only one render at a time for a given source file. It does not
-start a preview server.
+start a preview server. The per-file guard is released when the Quarto process
+finishes; choosing or dismissing an action in the outcome notification does not
+block a subsequent render.
 
 After Quarto exits:
 
