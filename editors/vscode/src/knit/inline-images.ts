@@ -108,17 +108,27 @@ export function inlineLocalImagesAsDataUrls(
 ): string {
     const allowedRoots = [docDir, ...(options.additionalRoots ?? [])];
     return html.replace(/<img\b([^>]*)>/gi, (match, attrs: string) => {
-        const srcMatch = attrs.match(/\bsrc\s*=\s*"([^"]*)"/i)
-            ?? attrs.match(/\bsrc\s*=\s*'([^']*)'/i);
+        // The leading `(?<![-\w])` stops the matcher from selecting the
+        // `src` inside another attribute — most importantly `data-src`
+        // (a `-` is a word boundary, so a bare `\bsrc` would match it
+        // and rewrite the wrong attribute). `srcset` is not matched
+        // because `src` there is followed by `set`, not `=`.
+        const srcMatch = attrs.match(/(?<![-\w])src\s*=\s*"([^"]*)"/i)
+            ?? attrs.match(/(?<![-\w])src\s*=\s*'([^']*)'/i);
         if (!srcMatch) return match;
         const src = srcMatch[1];
 
         // Already an absolute URL (any scheme, e.g. `https:`,
         // `data:`, `vscode-webview:`, `file:`) — pass through. A
         // Windows drive path (`C:\…`) also matches the single-letter
-        // "scheme" shape, so exclude it: it's an absolute filesystem
-        // path we may still want to inline.
-        const isWindowsDrivePath = /^[a-z]:[\\/]/i.test(src);
+        // "scheme" shape, so on Windows exclude it: it's an absolute
+        // filesystem path we may still want to inline. The platform
+        // gate matters — off Windows a `C:\…` string is not a real
+        // path, and treating a genuine one-letter URL scheme (`x:/…`)
+        // as a drive would be wrong, so there we let the scheme guard
+        // pass it through untouched.
+        const isWindowsDrivePath = process.platform === 'win32'
+            && /^[a-z]:[\\/]/i.test(src);
         if (!isWindowsDrivePath && /^(?:[a-z][a-z0-9+\-.]*:)/i.test(src)) return match;
         // Protocol-relative URL.
         if (src.startsWith('//')) return match;
@@ -150,30 +160,69 @@ export function inlineLocalImagesAsDataUrls(
         const srcPath = suffixStart >= 0 ? src.slice(0, suffixStart) : src;
         const srcSuffix = suffixStart >= 0 ? src.slice(suffixStart) : '';
 
+        // Recover the on-disk path from what the markdown/HTML renderer
+        // emitted. VS Code's `markdown.api.render` percent-encodes image
+        // paths (so a workspace image `café.png` arrives as
+        // `caf%C3%A9.png`) and HTML-escapes `&` (`a&b.png` → `a&amp;b.png`),
+        // while a raw passthrough `<img>` tag is left verbatim. Try the
+        // literal spelling first — so a filename that genuinely contains
+        // `%` or `&` still resolves — then the decoded spelling.
+        const pathCandidates = decodedPathCandidates(srcPath);
+
         // Absolute paths resolve as-is; relative paths resolve against
         // the rendered document's directory (`docDir`). The leading
         // `./` strip doesn't change semantics — it just keeps
         // `normalizedRelative` (used for the figure-plot marker) clean.
-        const resolved = path.isAbsolute(srcPath)
-            ? path.resolve(srcPath)
-            : path.resolve(docDir, srcPath.replace(/^\.\//, ''));
+        const resolveCandidate = (cand: string): string => path.isAbsolute(cand)
+            ? path.resolve(cand)
+            : path.resolve(docDir, cand.replace(/^\.\//, ''));
 
-        const ext = path.extname(resolved).toLowerCase();
-        const mime = mimeForImageExtension(ext);
-        if (!mime) return match;
-
-        // Canonicalize the candidate and each allowed root with
-        // `realpath` (so a symlink can't escape a root) and require the
-        // file to be contained by at least one. Fails closed: a missing
-        // file, a symlink target outside every root, or a path that
-        // simply lives elsewhere all leave the `src` untouched.
-        const realResolved = canonicalizeContainedPath(resolved, allowedRoots);
-        if (realResolved === null) return match;
+        let realResolved: string | null = null;
+        // The logical (pre-realpath) resolved path of the first
+        // image-extensioned candidate, used for the figure-plot marker,
+        // the data-URL MIME, and the diagnostic log line.
+        let logicalResolved: string | null = null;
+        let mime: string | null = null;
+        for (const cand of pathCandidates) {
+            const resolved = resolveCandidate(cand);
+            const candMime = mimeForImageExtension(path.extname(resolved).toLowerCase());
+            // Unknown extensions are passed through; we don't read
+            // arbitrary file types off disk.
+            if (!candMime) continue;
+            if (logicalResolved === null) logicalResolved = resolved;
+            // Canonicalize the candidate and each allowed root with
+            // `realpath` (so a symlink can't escape a root) and require
+            // the file to be contained by at least one. Fails closed: a
+            // missing file, a symlink target outside every root, or a
+            // path that simply lives elsewhere all leave the `src`
+            // untouched.
+            const real = canonicalizeContainedPath(resolved, allowedRoots);
+            if (real !== null) {
+                realResolved = real;
+                logicalResolved = resolved;
+                mime = candMime;
+                break;
+            }
+        }
+        // No candidate had a known image extension — leave the tag alone.
+        if (logicalResolved === null) return match;
+        if (realResolved === null || mime === null) {
+            // The path looked inlinable but didn't resolve inside an
+            // allowed root (missing, unreadable, or outside the
+            // workspace). Surface it so a broken image in the preview
+            // has a matching line in the Raven Knit output channel.
+            output?.appendLine(
+                `[panel] not inlining image ${logicalResolved} `
+                + '(missing, unreadable, or outside the preview/workspace roots)',
+            );
+            return match;
+        }
 
         // The figure-plot marker keys off the path relative to `docDir`
         // (its logical, pre-realpath form), so it only ever matches the
         // preview-generated `docDir/figure/*` tree, not workspace images.
-        const normalizedRelative = path.relative(path.resolve(docDir), resolved);
+        const normalizedRelative = path.relative(path.resolve(docDir), logicalResolved);
+        const ext = path.extname(logicalResolved).toLowerCase();
 
         let bytes: Buffer;
         try {
@@ -194,6 +243,41 @@ export function inlineLocalImagesAsDataUrls(
             : rewrittenAttrs;
         return `<img${finalAttrs}>`;
     });
+}
+
+/**
+ * The distinct on-disk-path spellings to try for a rendered image
+ * `src`, most-literal first. The second entry (present only when it
+ * differs) undoes the HTML-entity and percent-encoding that a markdown
+ * renderer applies to image paths, recovering names with `&`, spaces,
+ * or non-ASCII characters. Trying the literal spelling first means a
+ * filename that genuinely contains `%`/`&` still resolves.
+ */
+function decodedPathCandidates(srcPath: string): string[] {
+    let decoded = decodeHtmlEntities(srcPath);
+    try {
+        decoded = decodeURIComponent(decoded);
+    } catch {
+        // Malformed percent-escape (e.g. a literal `%` in the name) —
+        // keep the entity-decoded form; the literal-first candidate
+        // already covers the un-encoded case.
+    }
+    return decoded === srcPath ? [srcPath] : [srcPath, decoded];
+}
+
+/**
+ * Decode the small set of HTML entities a markdown/HTML renderer emits
+ * inside an attribute value. `&amp;` is decoded LAST so a double-encoded
+ * sequence like `&amp;lt;` collapses to `&lt;` rather than `<`.
+ */
+function decodeHtmlEntities(s: string): string {
+    return s
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#0*39;/g, "'")
+        .replace(/&#x0*27;/gi, "'")
+        .replace(/&amp;/g, '&');
 }
 
 /**

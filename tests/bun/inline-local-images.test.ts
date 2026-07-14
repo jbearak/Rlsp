@@ -361,6 +361,93 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
+    // --- sol-review follow-ups (#627) ---
+
+    test('rewrites src, not data-src, even when data-src comes first', () => {
+        withTempDir((dir) => {
+            fs.mkdirSync(path.join(dir, 'figure'));
+            fs.writeFileSync(path.join(dir, 'figure', 'real.png'), TINY_PNG);
+            // data-src precedes the real src; a bare \bsrc matcher would
+            // wrongly select the `src` inside `data-src`.
+            const html = '<img data-src="figure/thumb.png" src="figure/real.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+            // The data-src attribute must survive untouched.
+            expect(out).toContain('data-src="figure/thumb.png"');
+        });
+    });
+
+    test('resolves a percent-encoded non-ASCII path (markdown-it output)', () => {
+        withTempDir((dir) => {
+            fs.mkdirSync(path.join(dir, 'images'));
+            fs.writeFileSync(path.join(dir, 'images', 'café.png'), TINY_PNG);
+            // markdown-it percent-encodes the path in the rendered HTML.
+            const html = '<img src="images/caf%C3%A9.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('resolves a percent-encoded space in the path', () => {
+        withTempDir((dir) => {
+            fs.writeFileSync(path.join(dir, 'a b.png'), TINY_PNG);
+            const html = '<img src="a%20b.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('resolves an HTML-entity-escaped ampersand in the path', () => {
+        withTempDir((dir) => {
+            fs.writeFileSync(path.join(dir, 'a&b.png'), TINY_PNG);
+            const html = '<img src="a&amp;b.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('still resolves a filename that literally contains a percent', () => {
+        withTempDir((dir) => {
+            // Raw passthrough <img> whose file is literally named with `%`.
+            // The literal-first candidate must win over the decoded one.
+            fs.writeFileSync(path.join(dir, 'a%20b.png'), TINY_PNG);
+            const html = '<img src="a%20b.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('leaves a one-letter URL scheme alone (not a drive path off Windows)', () => {
+        // Off Windows, `x:/logo.png` is a custom URL scheme, not a drive
+        // path; it must pass through untouched.
+        const html = '<img src="x:/logo.png">';
+        expect(inlineLocalImagesAsDataUrls(html, '/tmp')).toBe(html);
+    });
+
+    test('logs a diagnostic when a would-be-inlinable image cannot be resolved', () => {
+        withTempDir((dir) => {
+            const lines: string[] = [];
+            const sink = { appendLine: (l: string) => lines.push(l) };
+            const html = '<img src="images/missing.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir, sink);
+            expect(out).toBe(html);
+            expect(lines.some((l) => l.includes('not inlining image') && l.includes('missing.png')))
+                .toBe(true);
+        });
+    });
+
+    test('does not log for images that inline successfully', () => {
+        withTempDir((dir) => {
+            fs.mkdirSync(path.join(dir, 'figure'));
+            fs.writeFileSync(path.join(dir, 'figure', 'p.png'), TINY_PNG);
+            const lines: string[] = [];
+            const sink = { appendLine: (l: string) => lines.push(l) };
+            const out = inlineLocalImagesAsDataUrls('<img src="figure/p.png">', dir, sink);
+            expect(out).toContain('src="data:image/png;base64,');
+            expect(lines).toEqual([]);
+        });
+    });
+
     test('handles both ?query and #fragment together', () => {
         // Cover the case where both appear (`?v=1#frag`). We
         // split on the first `?` or `#` so the entire suffix

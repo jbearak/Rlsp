@@ -281,6 +281,14 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
         // the panel's data-URL inliner resolves it (see
         // `inlineLocalImagesAsDataUrls`). This is a subprocess-local
         // option, so it never leaks into the user's interactive session.
+        //
+        // Caveat (Windows + Open in Browser): an absolute path here is a
+        // drive path like `C:/…`, which a browser opening the on-disk
+        // `.html` may parse as a URL scheme. The in-panel webview is
+        // unaffected because the inliner turns the image into a data URL.
+        // The knit itself no longer errors either way, which is the bug
+        // this fixes; a fully browser-portable Windows path is a
+        // separate follow-up.
         ' options(knitr.graphics.rel_path = FALSE);',
         ` knitr::opts_knit$set(root.dir = ${rootDirLiteral}, base.dir = ${baseDirLit});`,
         ` knitr::opts_chunk$set(fig.path = ${figPathLit});`,
