@@ -86,7 +86,14 @@ class ChunkCodeLensProvider implements vscode.CodeLensProvider {
         // Fast path: plain `.R` files without `# %%` markers (and prose-only
         // `.Rmd` documents) skip the per-line scan entirely.
         if (!has_chunk_anchor(document.getText(), kind)) return [];
-        const lens_command_ids = resolve_lens_command_ids(document);
+        const configured_lens_command_ids = resolve_lens_command_ids(document);
+        // Regular Markdown is documentation, not a chunk-authoring format.
+        // Keep its surface deliberately narrow: an explicitly tagged R block
+        // gets only "Run Chunk", while Rmd/Qmd and `.R` cells retain the full
+        // user-configurable lens row.
+        const lens_command_ids = kind === 'markdown'
+            ? configured_lens_command_ids.filter((id) => id === 'raven.runCurrentChunk')
+            : configured_lens_command_ids;
         if (lens_command_ids.length === 0) return [];
         const lines: string[] = [];
         for (let i = 0; i < document.lineCount; i++) lines.push(document.lineAt(i).text);
@@ -134,9 +141,10 @@ class ChunkCodeLensProvider implements vscode.CodeLensProvider {
 export function register_chunk_codelens(context: vscode.ExtensionContext): ChunkCodeLensProvider {
     const provider = new ChunkCodeLensProvider();
     context.subscriptions.push(
-        // Chunks live in `.R` files (via `# %%` cells) and in `.Rmd` / `.qmd`
-        // files (via fenced code blocks). After the language-ID split each
-        // file type uses its own `languageId`, so the selector lists all three.
+        // Chunks live in `.R` files (via `# %%` cells), `.Rmd` / `.qmd` files
+        // (via knitr-style fenced blocks), and regular Markdown (via bare
+        // ` ```r ` fenced blocks). Registration itself remains gated by the
+        // resolved Raven R-console activation state in `extension.ts`.
         vscode.languages.registerCodeLensProvider(
             [
                 { scheme: 'file', language: 'r' },
@@ -145,6 +153,8 @@ export function register_chunk_codelens(context: vscode.ExtensionContext): Chunk
                 { scheme: 'untitled', language: 'rmd' },
                 { scheme: 'file', language: 'quarto' },
                 { scheme: 'untitled', language: 'quarto' },
+                { scheme: 'file', language: 'markdown' },
+                { scheme: 'untitled', language: 'markdown' },
             ],
             provider,
         ),

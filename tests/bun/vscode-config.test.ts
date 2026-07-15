@@ -161,6 +161,24 @@ test("VS Code package metadata activates on r/jags/stan via contributes.language
   expect(languageIds).toContain("stan");
 });
 
+test("VS Code package metadata explicitly activates for Markdown CodeLens", () => {
+  // Markdown is owned by VS Code, not contributed by Raven, so it does not
+  // receive Raven's implicit activation event. The explicit event is required
+  // for the programmatic CodeLens provider to register when a Markdown file is
+  // the first Raven-relevant document opened in a window.
+  const packageJsonPath = path.join(
+    import.meta.dir,
+    "..",
+    "..",
+    "editors",
+    "vscode",
+    "package.json",
+  );
+  const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+
+  expect(pkg.activationEvents).toContain("onLanguage:markdown");
+});
+
 test("VS Code package metadata pins R Markdown files to the rmd language via files.associations", () => {
   // The Quarto extension contributes `editorLangId == quarto` for `.rmd` (it
   // accepts both `.qmd` and `.rmd`). When only Raven and Quarto are installed,

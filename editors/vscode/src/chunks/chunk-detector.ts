@@ -1,5 +1,20 @@
+const MarkdownIt = require('markdown-it') as new (options?: { html?: boolean }) => {
+    parse(source: string, env: Record<string, never>): MarkdownItToken[];
+};
+
+interface MarkdownItToken {
+    type: string;
+    map: [number, number] | null;
+    info: string;
+    markup: string;
+    content: string;
+}
+
+const markdown_parser = new MarkdownIt({ html: true });
+
 /**
- * Code-chunk detection for R Markdown / Quarto fenced blocks and `.R` cell markers.
+ * Code-chunk detection for R Markdown / Quarto fenced blocks, regular Markdown
+ * fenced code blocks, and `.R` cell markers.
  *
  * Pure functions (no VS Code dependency) — unit-testable from `tests/bun/`.
  *
@@ -7,13 +22,16 @@
  *   - Rmd/Qmd fenced block: ```` ```{r ...} ```` … ```` ``` ```` (backticks or tildes,
  *     fence must start at column 0; closing fence must use the same character and be
  *     at least as long as the opener).
+ *   - Markdown fenced block: ```` ```r ```` … ```` ``` ```` (backticks or tildes,
+ *     case-insensitive language tag, with up to three leading spaces as CommonMark
+ *     permits for a top-level fence).
  *   - `.R` cell marker: a line matching `/^#+\s*%%/` starts a new cell that extends
  *     until the next marker or end-of-file.
  *
  * The `language` field is normalized to lower case. For `.R` cells it is always `'r'`.
  */
 
-export type ChunkKind = 'rmd' | 'r';
+export type ChunkKind = 'rmd' | 'markdown' | 'r';
 export type DocumentKind = ChunkKind;
 
 export interface Chunk {
@@ -21,14 +39,14 @@ export interface Chunk {
     header_line: number;
     /**
      * 0-based line index of the last content line (inclusive).
-     * For an Rmd chunk, this is one line above `closing_fence_line` when the fence
-     * is present, or the last line of the file when unclosed.
+     * For a fenced chunk, this is one line above `closing_fence_line` when the
+     * fence is present, or the last line of the file when unclosed.
      * For a `.R` cell, this is the line above the next cell marker (or EOF).
      */
     end_line: number;
     /**
-     * 0-based line index of the closing fence (Rmd only). `null` for `.R` cells and
-     * for unclosed Rmd chunks that run off the end of the file.
+     * 0-based line index of the closing fence. `null` for `.R` cells and for
+     * unclosed fenced chunks that run off the end of the file.
      */
     closing_fence_line: number | null;
     /** Language tag from the chunk header, lower-cased. `.R` cells are always `'r'`. */
@@ -41,6 +59,8 @@ export interface Chunk {
     is_eval_false: boolean;
     /** Marker for which detection path produced this chunk. */
     kind: ChunkKind;
+    /** Parser-normalized body for Markdown fences. */
+    executable_code?: string;
 }
 
 const FENCE_HEADER_RE = /^(`{3,}|~{3,})\s*\{([A-Za-z0-9_+.\-]+)([^}]*)\}\s*$/;
@@ -70,23 +90,30 @@ const SECTION_DIVIDER_RE = /^#+(?!')\s*.*[-#+=*]{4,}\s*$/;
 export function classify_chunk_document(file_name_or_uri: string): DocumentKind {
     const lower = file_name_or_uri.toLowerCase();
     if (lower.endsWith('.rmd') || lower.endsWith('.rmarkdown') || lower.endsWith('.qmd')) return 'rmd';
+    if (lower.endsWith('.md') || lower.endsWith('.markdown')) return 'markdown';
     return 'r';
 }
 
 /**
  * Classify a document by inspecting both its languageId and its URI. Used at
  * the VS Code adapter layer (commands, CodeLens, decorations) where we have
- * a full `TextDocument`. Checks languageId first so untitled buffers — which
- * have no file extension to inspect — classify correctly under our `rmd` /
- * `quarto` language IDs, then falls back to the extension-based check as a
- * safety net for environments where another extension has claimed the
- * languageId for `.Rmd` / `.Rmarkdown` / `.qmd` files.
+ * a full `TextDocument`. Language IDs classify untitled buffers, while saved
+ * Rmd/Qmd paths retain their extension-backed classification if another
+ * extension or user association reports them as generic Markdown.
  */
 export function classify_chunk_document_for_document(
     document: { languageId: string; uri: { fsPath: string; path: string } },
 ): DocumentKind {
     const lang = document.languageId.toLowerCase();
     if (lang === 'rmd' || lang === 'quarto') return 'rmd';
+    if (lang === 'markdown') {
+        // Saved Rmd/Qmd files can be claimed as generic Markdown by a user
+        // association or sibling extension. Preserve their extension-backed
+        // knitr classification; the languageId path is authoritative for
+        // untitled Markdown buffers and ordinary Markdown paths.
+        const path_kind = classify_chunk_document(document.uri.fsPath || document.uri.path);
+        return path_kind === 'rmd' ? 'rmd' : 'markdown';
+    }
     return classify_chunk_document(document.uri.fsPath || document.uri.path);
 }
 
@@ -195,7 +222,9 @@ function eval_false_from_options(options: Record<string, string>): boolean {
  * `kind` controls which form to look for (caller decides via `classify_chunk_document`).
  */
 export function detect_chunks(lines: string[], kind: DocumentKind): Chunk[] {
-    return kind === 'rmd' ? detect_rmd_chunks(lines) : detect_r_cells(lines);
+    if (kind === 'rmd') return detect_rmd_chunks(lines);
+    if (kind === 'markdown') return detect_markdown_chunks(lines);
+    return detect_r_cells(lines);
 }
 
 function detect_rmd_chunks(lines: string[]): Chunk[] {
@@ -236,6 +265,62 @@ function detect_rmd_chunks(lines: string[]): Chunk[] {
         i = closing_line !== null ? closing_line + 1 : lines.length;
     }
     return chunks;
+}
+
+/**
+ * Detect ordinary Markdown fenced code blocks from their first info-string
+ * token. Unlike knitr chunks, these use a bare language tag (` ```r ` rather
+ * than ` ```{r} `) and carry no Raven-interpreted chunk options.
+ *
+ * `markdown-it` supplies CommonMark-compatible block parsing and source maps,
+ * so fences inside containers and raw HTML follow the same core block parsing
+ * used by VS Code's Markdown rendering. The CodeLens provider later filters
+ * the returned fence tokens through `is_runnable_chunk`.
+ */
+function detect_markdown_chunks(lines: string[]): Chunk[] {
+    const chunks: Chunk[] = [];
+    const parse_lines = mask_markdown_frontmatter(lines);
+    for (const token of markdown_parser.parse(parse_lines.join('\n'), {})) {
+        if (token.type !== 'fence' || token.map === null) continue;
+        const [header_line, block_end] = token.map;
+        const raw_info = token.info.trim();
+        const language = (raw_info.split(/[ \t]/, 1)[0] ?? '').toLowerCase();
+        const executable_code = token.content.endsWith('\n')
+            ? token.content.slice(0, -1)
+            : token.content;
+        const content_line_count = executable_code.length === 0
+            ? 0
+            : executable_code.split('\n').length;
+        const closing_fence_line = block_end > header_line + content_line_count + 1
+            ? block_end - 1
+            : null;
+        chunks.push({
+            header_line,
+            end_line: content_line_count === 0 ? header_line : header_line + content_line_count,
+            closing_fence_line,
+            language,
+            label: null,
+            options: {},
+            is_eval_false: false,
+            kind: 'markdown',
+            executable_code,
+        });
+    }
+    return chunks;
+}
+
+/** Blank terminated leading YAML front matter while preserving source lines. */
+function mask_markdown_frontmatter(lines: string[]): string[] {
+    if (lines.length === 0 || !/^---[ \t]*$/.test(lines[0].replace(/^\uFEFF/, ''))) {
+        return lines;
+    }
+    for (let i = 1; i < lines.length; i++) {
+        if (!/^(?:---|\.\.\.)[ \t]*$/.test(lines[i])) continue;
+        const masked = lines.slice();
+        for (let j = 0; j <= i; j++) masked[j] = '';
+        return masked;
+    }
+    return lines;
 }
 
 function detect_r_cells(lines: string[]): Chunk[] {
@@ -286,8 +371,8 @@ function detect_r_cells(lines: string[]): Chunk[] {
 
 /**
  * Find the chunk that contains a given 0-based line index, or `null` if the line
- * is outside any chunk. The header line and (for Rmd) the closing fence line are
- * considered "inside" the chunk.
+ * is outside any chunk. The header and closing-fence lines are considered
+ * "inside" fenced chunks.
  */
 export function find_chunk_at_line(chunks: Chunk[], line: number): Chunk | null {
     for (const c of chunks) {
@@ -359,6 +444,9 @@ export function next_runnable_chunk(chunks: Chunk[], line: number): Chunk | null
  * Excludes the header/fence lines.
  */
 export function extract_chunk_code(lines: string[], chunk: Chunk): string {
+    if (chunk.kind === 'markdown' && chunk.executable_code !== undefined) {
+        return chunk.executable_code;
+    }
     const start = chunk.header_line + 1;
     const end = chunk.end_line;
     if (start > end) return '';
