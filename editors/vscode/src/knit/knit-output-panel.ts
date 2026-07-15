@@ -739,9 +739,12 @@ export class KnitOutputPanel {
     }): void {
         this.sourceUri = args.sourceUri;
         this.outputPath = args.outputPath;
-        if (args.knitRootDir !== undefined) {
-            this.knitRootDir = args.knitRootDir;
-        }
+        // Always adopt the caller's base, even when undefined: every
+        // caller (fresh knit, re-knit, create, serializer restore) passes
+        // the value it intends, so a re-knit that switched to a mode with
+        // no concrete base must clear a stale one rather than keep it.
+        // `undefined` then falls back to the source dir at use time.
+        this.knitRootDir = args.knitRootDir;
         const nonce = crypto.randomBytes(16).toString('base64');
         // Read the rendered HTML from disk; inlining via `srcdoc`
         // bypasses the nested-iframe navigation issue (see

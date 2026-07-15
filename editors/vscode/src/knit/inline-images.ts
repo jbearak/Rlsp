@@ -400,7 +400,6 @@ function decodeHtmlEntities(s: string): string {
 }
 
 /**
-/**
  * `realpath`-resolve each root once, dropping any that don't exist and
  * de-duplicating the results (callers routinely pass the same directory
  * twice — e.g. in `project` mode the workspace folder and the knit

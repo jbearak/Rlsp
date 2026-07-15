@@ -282,10 +282,13 @@ when an R Markdown file is open.
     only. The on-disk `.html` keeps the original `<img>` paths, so
     **Open in Browser** stays small; only the in-memory copy handed to
     the iframe is rewritten. (A consequence: a relative
-    `include_graphics` path rooted at `root.dir` renders in the panel
-    but not via **Open in Browser**, whose browser resolves it against
-    the `.html` location — use an absolute path or keep the image beside
-    the document if you need both.)
+    `include_graphics` path rooted at `root.dir` renders in the panel but
+    not via **Open in Browser** — the on-disk `.html` lives in Raven's
+    temp preview directory, so a browser resolves the relative path under
+    *that* directory, where the image isn't. Reference the image by
+    absolute path if you need it in both surfaces. Generated `figure/`
+    plots are unaffected because knitr writes them into the preview
+    directory next to the `.html`.)
 
     Intra-document anchor links (`#section`) work; clicking an
     external `<a>` does nothing (use **Open in Browser** for full
