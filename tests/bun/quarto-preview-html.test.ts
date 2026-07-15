@@ -16,6 +16,11 @@ function args(state: QuartoPreviewViewState): QuartoPreviewShellHtmlArgs {
 }
 
 describe('buildQuartoPreviewShellHtml', () => {
+    test('resets host body spacing so the shell fills the webview', () => {
+        const html = buildQuartoPreviewShellHtml(args({ kind: 'starting' }));
+        expect(html).toMatch(/body\s*\{[^}]*margin:\s*0;[^}]*padding:\s*0;/);
+    });
+
     test('serving state pins frame-src to the mapped origin', () => {
         const html = buildQuartoPreviewShellHtml(
             args({ kind: 'serving', externalUrl: 'https://mapped.example.test/preview/?x=1' }),
@@ -134,6 +139,14 @@ describe('buildQuartoPreviewShellHtml', () => {
         expect(html).toContain('currentTheme = { ...currentTheme, enabled: themeEnabled }');
         expect(html).toContain("vscode.postMessage({ type: 'theme-changed', applied: themeEnabled })");
         expect(html).toContain('themeEnabled = currentTheme.enabled');
+    });
+
+    test('reports the live VS Code code-block background', () => {
+        const html = buildQuartoPreviewShellHtml(
+            args({ kind: 'serving', externalUrl: 'http://127.0.0.1:4000/' }),
+        );
+        expect(html).toContain('--vscode-textCodeBlock-background');
+        expect(html).toContain('codeBackground');
     });
 
     test('persists only sourceFsPath and installs a recoverable timeout banner', () => {
@@ -392,6 +405,7 @@ function themePayload() {
     return {
         enabled: true,
         background: '#1e1e1e',
+        codeBackground: 'rgba(10, 10, 10, 0.4)',
         foreground: '#d4d4d4',
         roles: {
             keyword: '#c586c0',

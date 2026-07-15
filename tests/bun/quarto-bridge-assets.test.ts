@@ -82,6 +82,7 @@ describe('packaged Quarto theme bridge sources', () => {
         // Static custom properties are set by literal name.
         for (const variable of [
             '--raven-bg',
+            '--raven-code-bg',
             '--raven-fg',
             '--raven-font-text',
             '--raven-font-mono',
@@ -106,7 +107,8 @@ describe('packaged Quarto theme bridge sources', () => {
         const css = readFileSync(join(BRIDGE_DIR, 'bridge.css'), 'utf8');
         expect(css).toContain('html.raven-vscode-theme');
         for (const variable of [
-            '--raven-bg', '--raven-fg', '--raven-c-keyword', '--raven-c-string',
+            '--raven-bg', '--raven-code-bg', '--raven-fg',
+            '--raven-c-keyword', '--raven-c-string',
             '--raven-c-number', '--raven-c-comment', '--raven-c-function',
             '--raven-c-type', '--raven-c-variable', '--raven-c-operator',
             '--raven-c-punctuation', '--raven-c-constant', '--raven-font-text',
@@ -117,6 +119,26 @@ describe('packaged Quarto theme bridge sources', () => {
         for (const surface of ['.navbar', '#quarto-sidebar', '#TOC', '.callout', '.card', 'table']) {
             expect(css).toContain(surface);
         }
+    });
+
+    test('overrides Quarto normal syntax color on Pandoc line wrappers', () => {
+        const css = readFileSync(join(BRIDGE_DIR, 'bridge.css'), 'utf8');
+        expect(css).toMatch(
+            /html\.raven-vscode-theme code\.sourceCode > span\s*\{[^}]*color:\s*var\(--raven-fg\)\s*!important;/s,
+        );
+    });
+
+    test('paints code surfaces once with the VS Code code-block background', () => {
+        const css = readFileSync(join(BRIDGE_DIR, 'bridge.css'), 'utf8');
+        expect(css).toMatch(
+            /html\.raven-vscode-theme pre\s*\{[^}]*background-color:\s*var\(--raven-code-bg\)\s*!important;/s,
+        );
+        expect(css).toMatch(
+            /html\.raven-vscode-theme pre code\s*\{[^}]*background-color:\s*transparent\s*!important;/s,
+        );
+        expect(css).toMatch(
+            /html\.raven-vscode-theme \.cell-output pre\s*\{[^}]*background-color:\s*var\(--raven-bg\)\s*!important;/s,
+        );
     });
 });
 

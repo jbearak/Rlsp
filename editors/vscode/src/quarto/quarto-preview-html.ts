@@ -98,6 +98,7 @@ export function buildQuartoPreviewShellHtml(args: QuartoPreviewShellHtmlArgs): s
         html, body { height: 100%; }
         body {
             margin: 0;
+            padding: 0;
             display: flex;
             flex-direction: column;
             color: var(--vscode-foreground);
@@ -221,7 +222,7 @@ export function buildQuartoPreviewShellHtml(args: QuartoPreviewShellHtmlArgs): s
                 'type', 'variable', 'operator', 'punctuation', 'constant'
             ];
             const payloadKeys = [
-                'background', 'enabled', 'fontMono', 'fontText',
+                'background', 'codeBackground', 'enabled', 'fontMono', 'fontText',
                 'foreground', 'roles'
             ];
             const roleSchemaKeys = roleKeys.slice().sort();
@@ -239,7 +240,8 @@ export function buildQuartoPreviewShellHtml(args: QuartoPreviewShellHtmlArgs): s
             function isThemePayload(value) {
                 if (!isRecord(value) || !hasExactKeys(value, payloadKeys)) return false;
                 if (typeof value.enabled !== 'boolean') return false;
-                if (!isColor(value.background) || !isColor(value.foreground)) return false;
+                if (!isColor(value.background) || !isColor(value.codeBackground)
+                        || !isColor(value.foreground)) return false;
                 if (!isSafeFont(value.fontText) || !isSafeFont(value.fontMono)) return false;
                 if (!isRecord(value.roles) || !hasExactKeys(value.roles, roleSchemaKeys)) return false;
                 for (let i = 0; i < roleKeys.length; i++) {
@@ -301,7 +303,15 @@ export function buildQuartoPreviewShellHtml(args: QuartoPreviewShellHtmlArgs): s
                         || ''
                     ).trim();
                     if (background) {
-                        vscode.postMessage({ type: 'theme-context', background });
+                        const codeBackground = (
+                            rootStyle.getPropertyValue('--vscode-textCodeBlock-background')
+                            || background
+                        ).trim();
+                        vscode.postMessage({
+                            type: 'theme-context',
+                            background,
+                            codeBackground
+                        });
                     }
                 } catch (_) { /* host falls back to the first candidate */ }
             }

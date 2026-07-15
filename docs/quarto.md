@@ -185,7 +185,9 @@ The color mapping is intentionally coarse. Raven maps syntax spans into ten
 broad roles such as keyword, string, comment, and function, and covers common
 Quarto, Pandoc, and Bootstrap surfaces. It aims to make the preview feel at home
 in the editor, not to reproduce VS Code's tokenization or every custom Quarto
-theme rule exactly.
+theme rule exactly. The document surface follows `editor.background`, while
+inline and block code use `textCodeBlock.background`, matching VS Code's own
+Markdown preview and preserving themes that give code a distinct tint.
 
 At a high level, Raven places a loopback proxy in front of Quarto's local
 preview server and injects a small theme bridge into eligible HTML responses.
