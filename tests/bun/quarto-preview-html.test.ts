@@ -136,11 +136,14 @@ describe('buildQuartoPreviewShellHtml', () => {
         expect(html).toContain('themeEnabled = currentTheme.enabled');
     });
 
-    test('persists only sourceFsPath and installs the honest timeout banner', () => {
+    test('persists only sourceFsPath and installs a recoverable timeout banner', () => {
         const html = buildQuartoPreviewShellHtml(args({ kind: 'serving', externalUrl: 'http://localhost:9/' }));
         expect(html).toContain('vscode.setState({ sourceFsPath: initial.sourceFsPath })');
         expect(html).toContain('If the preview looks blank, try Open in Browser.');
         expect(html).toContain("vscode.postMessage({ type: 'load-timeout' })");
+        expect(html).toContain('clearBlankAdvisory();');
+        expect(html).toContain("banner.textContent = ''");
+        expect(html).toContain('banner.hidden = true');
         expect(html).toContain('}, 8000)');
     });
 
@@ -153,7 +156,7 @@ describe('buildQuartoPreviewShellHtml', () => {
         expect(html).toContain('armBridgeTimeout();');
         expect(html).toContain('postBridgePing();');
         expect(html).toContain("type: 'raven-quarto-theme-ping'");
-        expect(html).not.toContain('window.clearTimeout(blankTimer)');
+        expect(html).toContain('window.clearTimeout(blankTimer)');
         expect(html).toContain("vscode.postMessage({ type: 'theme-bridge-status', available: false })");
         expect(html).toContain("VS Code theme can't apply to this page");
         expect(html).not.toContain('themeButton.disabled = bridgeAvailable === false');
@@ -315,6 +318,16 @@ describe('buildQuartoPreviewShellHtml', () => {
             const themeButton = window.document.getElementById(
                 'raven-quarto-theme',
             ) as HTMLButtonElement;
+            const banner = window.document.getElementById('raven-quarto-load-banner')!;
+
+            // The advisory may win a slow-load race, but a later trusted
+            // bridge handshake must dismiss it and keep it dismissed.
+            const blank = timers.find((timer) => timer.delay === 8000);
+            expect(blank).toBeDefined();
+            blank!.callback();
+            blank!.active = false;
+            expect(banner.hidden).toBe(false);
+            expect(banner.textContent).toContain('try Open in Browser');
 
             frame.dispatchEvent(new window.Event('load'));
             expect(frameMessages.at(-1)).toEqual({ type: 'raven-quarto-theme-ping' });
@@ -323,6 +336,8 @@ describe('buildQuartoPreviewShellHtml', () => {
                 source: frame.contentWindow,
                 data: { type: 'raven-quarto-theme-ready' },
             }));
+            expect(banner.hidden).toBe(true);
+            expect(banner.textContent).toBe('');
 
             // A subsequent CSP-blocked/non-HTML navigation never answers its
             // load-triggered ping, but the global preference remains editable.
@@ -366,12 +381,7 @@ describe('buildQuartoPreviewShellHtml', () => {
                 (message as { type?: unknown }).type === 'raven-quarto-theme-ping'
             )).toHaveLength(3);
 
-            const blank = timers.find((timer) => timer.delay === 8000);
-            expect(blank).toBeDefined();
-            blank!.callback();
-            const banner = window.document.getElementById('raven-quarto-load-banner')!;
-            expect(banner.hidden).toBe(false);
-            expect(banner.textContent).toContain('try Open in Browser');
+            expect(banner.hidden).toBe(true);
         } finally {
             dom.window.close();
         }
