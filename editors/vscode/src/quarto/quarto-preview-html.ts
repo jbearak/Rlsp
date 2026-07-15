@@ -98,6 +98,7 @@ export function buildQuartoPreviewShellHtml(args: QuartoPreviewShellHtmlArgs): s
         html, body { height: 100%; }
         body {
             margin: 0;
+            padding: 0;
             display: flex;
             flex-direction: column;
             color: var(--vscode-foreground);
