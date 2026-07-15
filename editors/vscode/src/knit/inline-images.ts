@@ -70,6 +70,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { escapeHtml } from './code-highlighter';
 
 /**
  * The minimum surface a logging sink needs to receive an inlining
@@ -219,8 +220,9 @@ export function inlineLocalImagesAsDataUrls(
         const relativeBases = [docDir, ...(options.resolveBases ?? [])];
 
         let realResolved: string | null = null;
-        // The logical (pre-realpath) resolved path that MATCHED, used for
-        // the figure-plot marker and the data-URL MIME.
+        // The logical (pre-realpath) resolved path that MATCHED — used
+        // only for the figure-plot marker (relative to docDir). The
+        // data-URL MIME is derived separately from the CANONICAL file.
         let logicalResolved: string | null = null;
         let mime: string | null = null;
         // Every path we resolved and tried to canonicalize, so a failure
@@ -228,18 +230,25 @@ export function inlineLocalImagesAsDataUrls(
         // root.dir) rather than only the first.
         const attempted: string[] = [];
         let sawKnownExt = false;
+        // BASE is the outer loop so `docDir` is exhausted (both path
+        // spellings) before `root.dir` — the documented docDir-first
+        // precedence. SPELLING is inner so within a base the decoded
+        // form wins over the literal percent-encoded twin. Absolute
+        // paths ignore the bases (resolve as-is). Abs-ness is taken from
+        // the literal `srcPath`; even if percent-decoding a candidate
+        // produced a leading `/`, `path.resolve(base, "/abs")` still
+        // yields the absolute path, so the classification is harmless.
+        const isAbsolute = path.isAbsolute(srcPath);
+        const bases = isAbsolute ? [undefined] : relativeBases;
         outer:
-        for (const cand of pathCandidates) {
-            const candMime = mimeForImageExtension(path.extname(cand).toLowerCase());
-            // Unknown extensions are passed through; we don't read
-            // arbitrary file types off disk.
-            if (!candMime) continue;
-            sawKnownExt = true;
-            const isAbsolute = path.isAbsolute(cand);
-            const cleaned = isAbsolute ? cand : cand.replace(/^\.\//, '');
-            // Absolute → a single as-is resolution; relative → one per base.
-            const bases = isAbsolute ? [undefined] : relativeBases;
-            for (const base of bases) {
+        for (const base of bases) {
+            for (const cand of pathCandidates) {
+                const candMime = mimeForImageExtension(path.extname(cand).toLowerCase());
+                // Unknown extensions are passed through; we don't read
+                // arbitrary file types off disk.
+                if (!candMime) continue;
+                sawKnownExt = true;
+                const cleaned = isAbsolute ? cand : cand.replace(/^\.\//, '');
                 const resolved = base === undefined
                     ? path.resolve(cleaned)
                     : path.resolve(base, cleaned);
@@ -284,7 +293,6 @@ export function inlineLocalImagesAsDataUrls(
         // (its logical, pre-realpath form), so it only ever matches the
         // preview-generated `docDir/figure/*` tree, not workspace images.
         const normalizedRelative = path.relative(path.resolve(docDir), logicalResolved);
-        const ext = path.extname(logicalResolved).toLowerCase();
 
         let bytes: Buffer;
         try {
@@ -308,9 +316,13 @@ export function inlineLocalImagesAsDataUrls(
         // is a no-op for them.)
         const dataUrl = `data:${mime};base64,${bytes.toString('base64')}${srcSuffix}`;
         const rewrittenAttrs = attrs.slice(0, srcAttr.start)
-            + `src="${escapeHtmlAttributeValue(dataUrl)}"`
+            + `src="${escapeHtml(dataUrl)}"`
             + attrs.slice(srcAttr.end);
-        const finalAttrs = options.markSvgPlots && ext === '.svg' && isKnitFigurePath(normalizedRelative)
+        // Key the SVG-plot marker off the resolved MIME (canonical file),
+        // consistent with the data URL — so a figure that is actually SVG
+        // is themed even if reached through a differently-suffixed name.
+        const finalAttrs = options.markSvgPlots && mime === 'image/svg+xml'
+            && isKnitFigurePath(normalizedRelative)
             ? withImgAttribute(rewrittenAttrs, 'data-raven-plot-svg', 'true')
             : rewrittenAttrs;
         return `<img${finalAttrs}>`;
@@ -403,18 +415,6 @@ const NAMED_ENTITIES: Readonly<Record<string, string>> = {
  * rather than `<`. An out-of-range or malformed numeric reference is
  * left verbatim.
  */
-/**
- * Escape a string for use inside a double-quoted HTML attribute value.
- * `&` first so we don't double-escape the entities we introduce.
- */
-function escapeHtmlAttributeValue(s: string): string {
-    return s
-        .replace(/&/g, '&amp;')
-        .replace(/"/g, '&quot;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-}
-
 function decodeHtmlEntities(s: string): string {
     return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, body: string) => {
         if (body[0] === '#') {

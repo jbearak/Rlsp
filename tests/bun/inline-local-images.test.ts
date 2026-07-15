@@ -522,6 +522,26 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
+    test('docDir wins across BOTH spellings before a resolveBase is tried', () => {
+        withTempDir((project) => {
+            const docDir = path.join(project, '.raven_output');
+            fs.mkdirSync(docDir, { recursive: true });
+            // docDir has only the LITERAL percent name; the resolveBase
+            // has the DECODED name. docDir must win (documented
+            // docDir-first precedence), so the literal file is inlined.
+            const docBytes = TINY_PNG;
+            const baseBytes = Buffer.from('distinct-not-really-png');
+            fs.writeFileSync(path.join(docDir, 'a%20b.png'), docBytes);
+            fs.writeFileSync(path.join(project, 'a b.png'), baseBytes);
+            const html = '<img src="a%20b.png">';
+            const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                resolveBases: [project],
+            });
+            expect(out).toContain(`data:image/png;base64,${docBytes.toString('base64')}`);
+            expect(out).not.toContain(baseBytes.toString('base64'));
+        });
+    });
+
     test('still resolves a filename that literally contains a percent', () => {
         withTempDir((dir) => {
             // Raw passthrough <img> whose file is literally named with `%`
