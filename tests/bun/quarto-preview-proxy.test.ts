@@ -880,15 +880,18 @@ describe('QuartoPreviewProxy HTTP passthrough', () => {
     });
 
     it('forwards requests to a bracketed IPv6 loopback upstream', async () => {
+        let seenUrl = '';
         const upstream = http.createServer((request, response) => {
-            response.end(`ipv6:${request.url ?? ''}`);
+            seenUrl = request.url ?? '';
+            response.end('ipv6-ok');
         });
         const upstreamOrigin = await listen(upstream, '::1');
         const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
         try {
             const result = await rawRequest(`${(await proxy.start()).origin}/ipv6`);
             expect(result.statusCode).toBe(200);
-            expect(result.body.toString()).toBe('ipv6:/ipv6');
+            expect(seenUrl).toBe('/ipv6');
+            expect(result.body.toString()).toBe('ipv6-ok');
         } finally {
             await proxy.close();
             await closeServer(upstream);

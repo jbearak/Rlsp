@@ -107,10 +107,10 @@ describe('buildQuartoPreviewShellHtml', () => {
             args({ kind: 'serving', externalUrl: 'http://127.0.0.1:4000/' }),
         );
         const colorLiteral = html.match(
-            /const colorPattern = new RegExp\(((?:"(?:\\.|[^"])*)")?, 'i'\)/,
+            /const colorPattern = new RegExp\(("(?:[^"\\]|\\.)*")?, 'i'\)/,
         )?.[1];
         const fontLiteral = html.match(
-            /const fontPattern = new RegExp\(((?:"(?:\\.|[^"])*)")?\)/,
+            /const fontPattern = new RegExp\(("(?:[^"\\]|\\.)*")?\)/,
         )?.[1];
         expect(colorLiteral).toBeDefined();
         expect(fontLiteral).toBeDefined();
