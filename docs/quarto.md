@@ -14,10 +14,12 @@ uses the public Quarto CLI rather than the Quarto VS Code extension:
 
 Quarto commands are available from the Command Palette and, for `.qmd` files,
 inside the editor-title **Send to R** ($(play)) menu. A dedicated $(preview)
-button in the editor title bar starts Quarto Preview directly. The same button
-appears for `.Rmd` / `.Rmarkdown` files and runs Knit Preview there, providing
-one consistent preview action across both formats. You can right-click the
-editor toolbar and choose **Hide** if you do not want the button.
+button in the editor title bar starts Quarto Preview directly. Press
+`Shift+Cmd+Enter` on macOS or `Shift+Ctrl+Enter` on Windows/Linux for the same
+action. The button and shortcut run Knit Preview for `.Rmd` / `.Rmarkdown`
+files instead, providing one consistent preview action across both formats.
+You can right-click the editor toolbar and choose **Hide** if you do not want
+the button.
 
 The direct Quarto Preview button and palette commands do not depend on Raven's
 R console or on the `quarto.quarto` extension. The **Send to R** menu itself is

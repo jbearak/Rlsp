@@ -82,7 +82,7 @@ plain `.R` file.
 | Mac | Windows/Linux | Action |
 |-----|---------------|--------|
 | `Cmd+Enter` | `Ctrl+Enter` | Run Line or Selection |
-| `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` | Source File (`.R`) / Knit (`.Rmd`, `.Rmarkdown`) |
+| `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` | Source File (`.R`) / Knit Preview (`.Rmd`, `.Rmarkdown`) / Quarto Preview (`.qmd`) |
 | `Cmd+Alt+Enter` | `Ctrl+Alt+Enter` | Run Current Chunk |
 | `Cmd+Alt+Shift+Enter` | `Ctrl+Alt+Shift+Enter` | Run Current Chunk and Move |
 | `Cmd+Alt+P` | `Ctrl+Alt+P` | Run Previous Chunk |
