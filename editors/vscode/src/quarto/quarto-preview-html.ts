@@ -7,6 +7,8 @@
  * frame one exact, origin-pinned ready-handshake shape and returns for every
  * other frame message. A disjoint branch accepts host delivery only from the
  * empty/webview-host origin and mirrors the host protocol's exact-key guards.
+ * Because iframe `load` is not proof of success, only that ready handshake
+ * cancels or dismisses the conservative blank-preview advisory.
  * Serving CSP is derived from the same mapped URL installed in the frame;
  * non-serving states have neither a `frame-src` directive nor an iframe.
  *
@@ -313,7 +315,18 @@ export function buildQuartoPreviewShellHtml(args: QuartoPreviewShellHtmlArgs): s
                 } catch (_) { /* host falls back to the first candidate */ }
             }
 
+            function clearBlankAdvisory() {
+                if (blankTimer !== null) window.clearTimeout(blankTimer);
+                blankTimer = null;
+                banner.textContent = '';
+                banner.hidden = true;
+            }
+
             function markBridgeAvailable() {
+                // Unlike iframe load, this origin-pinned handshake proves that
+                // the framed HTML is alive. It is therefore safe to cancel or
+                // dismiss the otherwise deliberately conservative advisory.
+                clearBlankAdvisory();
                 if (bridgeTimer !== null) window.clearTimeout(bridgeTimer);
                 bridgeTimer = null;
                 if (bridgeAvailable !== true) {

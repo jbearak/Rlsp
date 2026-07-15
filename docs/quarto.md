@@ -304,9 +304,11 @@ path on your local machine is not visible to the remote extension host.
 ### The preview panel is blank
 
 Raven cannot reliably inspect a cross-origin frame to tell whether it rendered
-correctly. Eight seconds after installing the frame, the panel shows the
-advisory **If the preview looks blank, try Open in Browser.** This banner does
-not prove that loading failed; it is an honest fallback for an opaque iframe.
+correctly. If the injected theme bridge has not confirmed a responsive HTML
+page after eight seconds, the panel shows the advisory **If the preview looks
+blank, try Open in Browser.** This banner does not prove that loading failed;
+it is an honest fallback for an opaque iframe. A later response from the page
+dismisses the advisory automatically.
 
 Use **Open in Browser** to open the validated loopback URL through VS Code. For
 Remote SSH, Quarto and the readiness probe run remotely, while VS Code maps the
