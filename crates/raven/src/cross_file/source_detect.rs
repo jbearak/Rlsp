@@ -68,7 +68,9 @@ pub struct LibraryCall {
     /// Whether the call *attaches* the package to the search path so its exports
     /// become available as bare names: `true` for `library()` / `require()`,
     /// `false` for `loadNamespace()` (which loads the namespace for qualified
-    /// `pkg::fn` access only).
+    /// `pkg::fn` access only). Packages recognized from a {targets}
+    /// `tar_option_set(packages = ...)` call are also `true` — targets attaches
+    /// them before running each target, so downstream scripts use bare names.
     ///
     /// Consumers must require `attaches` only when they gate on a *bare function*
     /// being resolvable — e.g. Shiny deferred-helper recognition
@@ -840,8 +842,9 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 // ============================================================================
 
 /// Detects package loads in the file: direct `library()`/`require()`/`loadNamespace()`
-/// calls, plus apply-family calls whose FUN argument is a bare reference to
-/// `library` or `require`.
+/// calls, apply-family calls whose FUN argument is a bare reference to
+/// `library` or `require`, and {targets} `tar_option_set(packages = ...)`
+/// calls (see `try_parse_tar_option_set_call`).
 ///
 /// For direct calls, the package must be a bare identifier (`library(dplyr)`)
 /// or a string literal (`library("dplyr")`); direct calls with
@@ -855,6 +858,12 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 /// Each apply emits one `LibraryCall` per package, all sharing the apply
 /// call's end position.
 ///
+/// For `tar_option_set(packages = ...)` calls, the bare spelling is honored
+/// only when the same file also attaches targets (`library(targets)` /
+/// `require(targets)` anywhere in the file); `targets::` / `targets:::`
+/// qualified spellings are honored unconditionally. See
+/// `append_gated_tar_option_set_calls` for the gate.
+///
 /// # Examples
 ///
 /// ```
@@ -862,18 +871,28 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 ///
 /// let mut parser = tree_sitter::Parser::new();
 /// parser.set_language(&tree_sitter_r::LANGUAGE.into()).unwrap();
-/// let source = r#"library(dplyr)"#;
+/// let source = "library(targets)\ntar_option_set(packages = c(\"dplyr\"))";
 /// let tree = parser.parse(source, None).unwrap();
 /// let calls = detect_library_calls(&tree, source);
-/// assert_eq!(calls.len(), 1);
-/// assert_eq!(calls[0].package, "dplyr");
+/// assert_eq!(calls.len(), 2);
+/// assert_eq!(calls[0].package, "targets");
+/// assert_eq!(calls[1].package, "dplyr");
+/// assert!(calls[1].attaches);
 /// ```
 pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
     log::trace!("Starting tree-sitter parsing for library() call detection");
     let mut library_calls = Vec::new();
+    let mut tar_candidates = Vec::new();
     let root = tree.root_node();
     let var_lookup = collect_var_bindings(root, content);
-    visit_node_for_library(root, content, &var_lookup, &mut library_calls);
+    visit_node_for_library(
+        root,
+        content,
+        &var_lookup,
+        &mut library_calls,
+        &mut tar_candidates,
+    );
+    append_gated_tar_option_set_calls(&mut library_calls, tar_candidates);
     log::trace!(
         "Completed library() call detection, found {} calls",
         library_calls.len()
@@ -912,6 +931,12 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
 /// `requireNamespace()` is NOT a match (it isn't a `library`/`require`/
 /// `loadNamespace` call), so it never attaches here.
 ///
+/// Top-level {targets} `tar_option_set(packages = ...)` calls also attach
+/// (targets attaches the listed packages before running each target); the bare
+/// spelling requires a top-level `library(targets)`/`require(targets)` in the
+/// same text, while `targets::`/`targets:::` qualified spellings do not — see
+/// `append_gated_tar_option_set_calls`.
+///
 /// Returns an empty set when the text cannot be parsed.
 ///
 /// # Examples
@@ -942,7 +967,17 @@ pub fn extract_attached_packages(text: &str) -> std::collections::BTreeSet<Strin
     let root = tree.root_node();
     let var_lookup = collect_var_bindings(root, text);
     let mut calls = Vec::new();
-    visit_node_for_top_level_library(root, text, &var_lookup, false, false, &mut calls);
+    let mut tar_candidates = Vec::new();
+    visit_node_for_top_level_library(
+        root,
+        text,
+        &var_lookup,
+        false,
+        false,
+        &mut calls,
+        &mut tar_candidates,
+    );
+    append_gated_tar_option_set_calls(&mut calls, tar_candidates);
     calls
         .into_iter()
         .filter(|call| call.attaches && !call.package.is_empty())
@@ -959,6 +994,11 @@ pub fn extract_attached_packages(text: &str) -> std::collections::BTreeSet<Strin
 /// code (`local({ ... })` blocks DO attach — they evaluate immediately).
 /// `inside_fn` latches once an ancestor `function_definition` is entered;
 /// `inside_quote` latches once an ancestor quoting call is entered.
+///
+/// `tar_option_set(packages = ...)` candidates found at the top level are
+/// pushed into `tar_candidates` rather than `library_calls`; the caller
+/// applies the targets-in-play gate afterwards via
+/// [`append_gated_tar_option_set_calls`].
 fn visit_node_for_top_level_library(
     node: Node,
     content: &str,
@@ -966,6 +1006,7 @@ fn visit_node_for_top_level_library(
     inside_fn: bool,
     inside_quote: bool,
     library_calls: &mut Vec<LibraryCall>,
+    tar_candidates: &mut Vec<TarOptionSetCandidate>,
 ) {
     // Identifier nodes have no children and cannot be calls.
     if node.kind() == "identifier" {
@@ -982,7 +1023,10 @@ fn visit_node_for_top_level_library(
         if let Some(lib_call) = try_parse_library_call(node, content) {
             library_calls.push(lib_call);
         } else {
+            // The apply-family and tar_option_set callee name-sets are
+            // disjoint, so at most one of these can match.
             library_calls.extend(try_parse_apply_library_call(node, content, var_lookup));
+            collect_tar_option_set_candidates(node, content, var_lookup, tar_candidates);
         }
     }
     for child in node.children(&mut node.walk()) {
@@ -993,6 +1037,7 @@ fn visit_node_for_top_level_library(
             inside_fn,
             inside_quote,
             library_calls,
+            tar_candidates,
         );
     }
 }
@@ -1037,20 +1082,25 @@ pub(crate) fn is_nonevaluating_quote_call(node: Node, content: &str) -> bool {
 }
 
 /// Recursively traverses an AST subtree and collects statically determinable
-/// package loads — both direct `library`/`require`/`loadNamespace` calls and
+/// package loads — direct `library`/`require`/`loadNamespace` calls and
 /// apply-family calls whose FUN is `library`/`require`. Direct calls push at
 /// most one `LibraryCall`; apply calls may push one entry per package, all
-/// sharing the apply call's end position.
+/// sharing the apply call's end position. {targets}
+/// `tar_option_set(packages = ...)` calls are collected separately into
+/// `tar_candidates` so the caller can apply the targets-in-play gate after
+/// the walk via [`append_gated_tar_option_set_calls`].
 ///
 /// # Parameters
 ///
 /// - `node`: the current AST node to visit (will recurse into its children).
 /// - `content`: source text for extracting node-local values when parsing calls.
 /// - `var_lookup`: name→binding map (built once via [`collect_var_bindings`])
-///   used by apply detection to resolve same-file variable references like
-///   `libs <- c(...); sapply(libs, library, character.only = TRUE)`.
+///   used by apply and tar_option_set detection to resolve same-file variable
+///   references like `libs <- c(...); sapply(libs, library, character.only = TRUE)`.
 /// - `library_calls`: mutable collector that receives discovered `LibraryCall`
 ///   entries in document order.
+/// - `tar_candidates`: mutable collector for gate-pending
+///   `tar_option_set(packages = ...)` package attachments.
 ///
 /// # Examples
 ///
@@ -1058,9 +1108,10 @@ pub(crate) fn is_nonevaluating_quote_call(node: Node, content: &str) -> bool {
 ///
 /// ```text
 /// let mut library_calls = Vec::new();
+/// let mut tar_candidates = Vec::new();
 /// let root = tree.root_node();
 /// let var_lookup = collect_var_bindings(root, source_text);
-/// visit_node_for_library(root, source_text, &var_lookup, &mut library_calls);
+/// visit_node_for_library(root, source_text, &var_lookup, &mut library_calls, &mut tar_candidates);
 /// assert!(library_calls.iter().all(|c| !c.package.is_empty()));
 /// ```
 fn visit_node_for_library(
@@ -1068,6 +1119,7 @@ fn visit_node_for_library(
     content: &str,
     var_lookup: &HashMap<String, VarBinding>,
     library_calls: &mut Vec<LibraryCall>,
+    tar_candidates: &mut Vec<TarOptionSetCandidate>,
 ) {
     // Skip identifier nodes - they have no children
     if node.kind() == "identifier" {
@@ -1078,13 +1130,16 @@ fn visit_node_for_library(
             library_calls.push(lib_call);
         } else {
             // Not a direct library/require/loadNamespace call; try the
-            // apply-family form (sapply/map/etc. of bare library/require).
+            // apply-family form (sapply/map/etc. of bare library/require) and
+            // the tar_option_set form. The two callee name-sets are disjoint,
+            // so at most one of these can match.
             library_calls.extend(try_parse_apply_library_call(node, content, var_lookup));
+            collect_tar_option_set_candidates(node, content, var_lookup, tar_candidates);
         }
     }
 
     for child in node.children(&mut node.walk()) {
-        visit_node_for_library(child, content, var_lookup, library_calls);
+        visit_node_for_library(child, content, var_lookup, library_calls, tar_candidates);
     }
 }
 
@@ -1638,6 +1693,18 @@ fn apply_arg_positions(func_node: Node, content: &str) -> Option<(usize, usize)>
 /// non-string element, named argument, or empty `c()` — anything but a fully
 /// static character vector is treated as dynamic.
 fn extract_c_strings_strict(node: Node, content: &str) -> Option<Vec<String>> {
+    extract_c_string_nodes_strict(node, content)
+        .map(|pairs| pairs.into_iter().map(|(s, _)| s).collect())
+}
+
+/// Like [`extract_c_strings_strict`], but pairs each extracted string with its
+/// own string-literal `Node` so callers can anchor per-package positions (see
+/// `try_parse_tar_option_set_call`). This is the single implementation; the
+/// string-only variant delegates here.
+fn extract_c_string_nodes_strict<'tree>(
+    node: Node<'tree>,
+    content: &str,
+) -> Option<Vec<(String, Node<'tree>)>> {
     if !is_c_call(node, content) {
         return None;
     }
@@ -1659,7 +1726,7 @@ fn extract_c_strings_strict(node: Node, content: &str) -> Option<Vec<String>> {
             return None;
         }
         let s = extract_string_literal(value_node, content)?;
-        strings.push(s);
+        strings.push((s, value_node));
     }
     if strings.is_empty() {
         None
@@ -1773,6 +1840,224 @@ fn try_parse_apply_library_call(
             attaches: true,
         })
         .collect()
+}
+
+// ============================================================================
+// targets::tar_option_set Package Detection (issue #637)
+// ============================================================================
+
+/// A package attachment extracted from a {targets}
+/// `tar_option_set(packages = ...)` call during a library-detection walk,
+/// tagged with whether the callee was the bare spelling (`tar_option_set`)
+/// rather than the qualified `targets::tar_option_set` /
+/// `targets:::tar_option_set`.
+///
+/// Bare candidates are subject to the targets-in-play gate applied after the
+/// walk — see [`append_gated_tar_option_set_calls`].
+struct TarOptionSetCandidate {
+    call: LibraryCall,
+    bare: bool,
+}
+
+/// Whether `func_node` (a call's `function` child) names {targets}'
+/// `tar_option_set`: the bare identifier `tar_option_set`, or the qualified
+/// `targets::tar_option_set` / `targets:::tar_option_set`.
+fn is_tar_option_set_callee(func_node: Node, content: &str) -> bool {
+    match func_node.kind() {
+        "identifier" => node_text(func_node, content) == "tar_option_set",
+        "namespace_operator" => {
+            let Some(lhs) = func_node.child_by_field_name("lhs") else {
+                return false;
+            };
+            let Some(rhs) = func_node.child_by_field_name("rhs") else {
+                return false;
+            };
+            lhs.kind() == "identifier"
+                && rhs.kind() == "identifier"
+                && node_text(lhs, content) == "targets"
+                && node_text(rhs, content) == "tar_option_set"
+        }
+        _ => false,
+    }
+}
+
+/// If `node` is a `tar_option_set(...)` call whose callee matches
+/// [`is_tar_option_set_callee`], parse it via
+/// [`try_parse_tar_option_set_call`] and push one gate-pending candidate per
+/// package, tagged with whether the callee was the bare spelling.
+fn collect_tar_option_set_candidates(
+    node: Node,
+    content: &str,
+    var_lookup: &HashMap<String, VarBinding>,
+    tar_candidates: &mut Vec<TarOptionSetCandidate>,
+) {
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return;
+    };
+    if !is_tar_option_set_callee(func_node, content) {
+        return;
+    }
+    let bare = func_node.kind() == "identifier";
+    tar_candidates.extend(
+        try_parse_tar_option_set_call(node, content, var_lookup)
+            .into_iter()
+            .map(|call| TarOptionSetCandidate { call, bare }),
+    );
+}
+
+/// Append gate-filtered `tar_option_set(packages = ...)` attachments to
+/// `library_calls`.
+///
+/// The targets-in-play gate: a QUALIFIED callee (`targets::tar_option_set` /
+/// `targets:::tar_option_set`) is accepted unconditionally — the author has
+/// unambiguously named the {targets} package. A BARE `tar_option_set` callee
+/// is accepted only when the same walk already found an attaching load of
+/// targets (`library(targets)` / `require(targets)`), so that an unrelated
+/// user function that happens to be called `tar_option_set` doesn't silently
+/// attach packages. This mirrors the `shiny_in_play` gate precedent in
+/// `scope.rs`'s `push_shiny_deferred_scopes`. The gate is position-independent
+/// within the file: a `library(targets)` anywhere the walk visited counts,
+/// regardless of whether it appears before or after the `tar_option_set` call.
+///
+/// Must be called after the walk completes (the gate inspects the walk's
+/// collected `library_calls`), and must stay the single shared post-filter for
+/// both `detect_library_calls` and `extract_attached_packages` so the two
+/// walkers cannot drift.
+fn append_gated_tar_option_set_calls(
+    library_calls: &mut Vec<LibraryCall>,
+    tar_candidates: Vec<TarOptionSetCandidate>,
+) {
+    let targets_attached = library_calls
+        .iter()
+        .any(|call| call.attaches && call.package == "targets");
+    library_calls.extend(
+        tar_candidates
+            .into_iter()
+            .filter(|candidate| !candidate.bare || targets_attached)
+            .map(|candidate| candidate.call),
+    );
+}
+
+/// Try to interpret `node` as a {targets} `tar_option_set(packages = ...)`
+/// call and return one `LibraryCall` per statically determinable package,
+/// each with `attaches: true` — targets attaches these packages before
+/// running each target, so scripts sourced by `_targets.R` use their exports
+/// as bare names.
+///
+/// Only the NAMED `packages =` argument is honored. This is an intentional
+/// limitation: `tar_option_set`'s first formal is `tidy_eval`, not `packages`,
+/// so positional matching (`tar_option_set(TRUE, c("dplyr"))`) would require
+/// modeling the full formals list and is deliberately not attempted. Accepted
+/// value shapes:
+///
+/// - a single string literal: `packages = "dplyr"`
+/// - a strict `c()` of positional string literals:
+///   `packages = c("dplyr", "tidyr")`
+/// - an identifier resolving to a same-file, assigned-exactly-once static
+///   `c()` of string literals bound before this call (the same
+///   `VarBinding::resolved_before` machinery apply-family detection uses)
+///
+/// Anything else (dynamic calls, `character(0)`, empty `c()`) yields nothing.
+///
+/// Position anchoring: `tar_option_set()` calls routinely span 10–30 lines,
+/// and the missing-package diagnostic builds its range from a `LibraryCall`'s
+/// line/column while `# nolint` suppression is line-keyed — so for the
+/// string-literal and `c()`-of-literals shapes, each package's `LibraryCall`
+/// carries the end position of ITS OWN string-literal node (not the call's
+/// closing paren). The variable-resolved shape has no literal at the call
+/// site, so it falls back to the call's end position, mirroring the
+/// apply-family pattern.
+///
+/// Union leniency: multiple `tar_option_set` calls in one file union their
+/// packages. targets' real runtime semantics are last-call-wins for
+/// `packages =`, but raven deliberately favors false negatives (a package
+/// wrongly considered available) over false positives (flagging a defined
+/// verb as undefined) — do not "fix" this to last-call-wins.
+///
+/// The caller is responsible for the bare-vs-qualified targets-in-play gate
+/// (see [`append_gated_tar_option_set_calls`]); this function parses any
+/// callee matching [`is_tar_option_set_callee`].
+fn try_parse_tar_option_set_call(
+    node: Node,
+    content: &str,
+    var_lookup: &HashMap<String, VarBinding>,
+) -> Vec<LibraryCall> {
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    if !is_tar_option_set_callee(func_node, content) {
+        return Vec::new();
+    }
+    let Some(args_node) = node.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    if args_node.has_error() {
+        return Vec::new();
+    }
+
+    // Find the named `packages =` argument (exact name only). A duplicate
+    // named `packages` argument would make the call itself error in R, so
+    // treat that as no match.
+    let mut packages_values: Vec<Node> = Vec::new();
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() == "argument"
+            && let Some(name_node) = child.child_by_field_name("name")
+            && node_text(name_node, content) == "packages"
+            && let Some(value_node) = child.child_by_field_name("value")
+        {
+            packages_values.push(value_node);
+        }
+    }
+    let [value_node] = packages_values.as_slice() else {
+        return Vec::new();
+    };
+
+    // Build a LibraryCall anchored at `anchor`'s end position (line + UTF-16
+    // column), matching how the other detectors in this file anchor.
+    let call_at = |package: String, anchor: Node| -> LibraryCall {
+        let end = anchor.end_position();
+        let line_text = content.lines().nth(end.row).unwrap_or("");
+        LibraryCall {
+            package,
+            line: end.row as u32,
+            column: byte_offset_to_utf16_column(line_text, end.column),
+            function_scope: None,
+            attaches: true,
+        }
+    };
+
+    match value_node.kind() {
+        // `packages = "dplyr"` — anchored at the literal itself.
+        "string" => match extract_string_literal(*value_node, content) {
+            Some(package) => vec![call_at(package, *value_node)],
+            None => Vec::new(),
+        },
+        // `pkgs <- c("a", "b"); tar_option_set(packages = pkgs)` — no literal
+        // at the call site, so anchor at the call's end position.
+        "identifier" => {
+            let text = node_text(*value_node, content);
+            match var_lookup
+                .get(text)
+                .and_then(|b| b.resolved_before(node.start_byte()))
+            {
+                Some(pkgs) => pkgs
+                    .iter()
+                    .map(|package| call_at(package.clone(), node))
+                    .collect(),
+                None => Vec::new(),
+            }
+        }
+        // `packages = c("dplyr", "tidyr")` — one call per package, each
+        // anchored at its own string-literal node.
+        _ => match extract_c_string_nodes_strict(*value_node, content) {
+            Some(pairs) => pairs
+                .into_iter()
+                .map(|(package, literal)| call_at(package, literal))
+                .collect(),
+            None => Vec::new(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -3456,6 +3741,200 @@ library(ggplot2)"#;
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
+    }
+
+    // ==================== tar_option_set package detection (#637) ====================
+
+    /// Convenience: the detected calls minus the `targets` load itself.
+    fn tar_calls(code: &str) -> Vec<LibraryCall> {
+        let tree = parse_r(code);
+        detect_library_calls(&tree, code)
+            .into_iter()
+            .filter(|c| c.package != "targets")
+            .collect()
+    }
+
+    #[test]
+    fn test_tar_option_set_inline_c_with_library_targets() {
+        let code = "library(targets)\ntar_option_set(packages = c(\"dplyr\", \"tidyr\"))";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 2, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+        assert_eq!(calls[1].package, "tidyr");
+        assert!(calls[0].attaches);
+        assert!(calls[1].attaches);
+        // Each package is anchored at its OWN string literal, not the call end.
+        assert_eq!(calls[0].line, 1);
+        assert_eq!(calls[1].line, 1);
+        assert_ne!(
+            calls[0].column, calls[1].column,
+            "per-literal anchoring: distinct literals have distinct columns"
+        );
+        assert!(calls[0].column < calls[1].column);
+        assert!(calls[0].function_scope.is_none());
+    }
+
+    #[test]
+    fn test_tar_option_set_single_string_literal() {
+        let code = "library(targets)\ntar_option_set(packages = \"dplyr\")";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 1, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+        assert!(calls[0].attaches);
+        assert_eq!(calls[0].line, 1);
+    }
+
+    #[test]
+    fn test_tar_option_set_qualified_without_library_targets() {
+        // Qualified spellings are accepted unconditionally — no library(targets)
+        // needed.
+        let code = "targets::tar_option_set(packages = c(\"dplyr\"))";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert_eq!(calls.len(), 1, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+
+        let code = "targets:::tar_option_set(packages = c(\"dplyr\"))";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert_eq!(calls.len(), 1, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+    }
+
+    #[test]
+    fn test_tar_option_set_bare_without_library_targets_skipped() {
+        // The bare spelling requires targets to be attached somewhere in the
+        // file (targets-in-play gate).
+        let code = "tar_option_set(packages = c(\"dplyr\"))";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert_eq!(calls.len(), 0, "got: {calls:?}");
+    }
+
+    #[test]
+    fn test_tar_option_set_bare_gate_is_position_independent() {
+        // library(targets) AFTER the call still satisfies the gate.
+        let code = "tar_option_set(packages = \"dplyr\")\nlibrary(targets)";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 1, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+    }
+
+    #[test]
+    fn test_tar_option_set_bare_loadnamespace_targets_does_not_satisfy_gate() {
+        // loadNamespace("targets") does not attach, so it does not enable the
+        // bare spelling.
+        let code = "loadNamespace(\"targets\")\ntar_option_set(packages = c(\"dplyr\"))";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 0, "got: {calls:?}");
+    }
+
+    #[test]
+    fn test_tar_option_set_var_resolved_anchored_at_call_end() {
+        let code =
+            "library(targets)\npkgs <- c(\"dplyr\", \"tidyr\")\ntar_option_set(packages = pkgs)";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 2, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+        assert_eq!(calls[1].package, "tidyr");
+        // No literal at the call site — both share the call's end position.
+        assert_eq!(calls[0].line, 2);
+        assert_eq!(calls[1].line, 2);
+        assert_eq!(calls[0].column, calls[1].column);
+        let call_len = "tar_option_set(packages = pkgs)".len() as u32;
+        assert_eq!(calls[0].column, call_len);
+    }
+
+    #[test]
+    fn test_tar_option_set_positional_packages_skipped() {
+        // tar_option_set's first formal is tidy_eval, so positional matching
+        // is not attempted (documented limitation).
+        let code = "library(targets)\ntar_option_set(TRUE, c(\"dplyr\"))";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 0, "got: {calls:?}");
+    }
+
+    #[test]
+    fn test_tar_option_set_dynamic_value_skipped() {
+        let code = "library(targets)\ntar_option_set(packages = getOption(\"my.pkgs\"))";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 0, "got: {calls:?}");
+    }
+
+    #[test]
+    fn test_tar_option_set_no_packages_arg_skipped() {
+        let code = "library(targets)\ntar_option_set(format = \"qs\")";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 0, "got: {calls:?}");
+    }
+
+    #[test]
+    fn test_tar_option_set_character0_and_empty_c_skipped() {
+        let code = "library(targets)\ntar_option_set(packages = character(0))";
+        assert_eq!(tar_calls(code).len(), 0);
+        let code = "library(targets)\ntar_option_set(packages = c())";
+        assert_eq!(tar_calls(code).len(), 0);
+    }
+
+    #[test]
+    fn test_tar_option_set_unrelated_named_args_still_detected() {
+        let code = "library(targets)\ntar_option_set(packages = c(\"dplyr\"), format = \"qs\", memory = \"transient\")";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 1, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+    }
+
+    #[test]
+    fn test_tar_option_set_multiple_calls_union() {
+        // targets' runtime is last-call-wins, but raven deliberately unions
+        // (favoring false negatives) — see try_parse_tar_option_set_call.
+        let code = "library(targets)\ntar_option_set(packages = c(\"dplyr\"))\ntar_option_set(packages = c(\"tidyr\"))";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 2, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+        assert_eq!(calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_tar_option_set_multiline_anchors_at_literal_line() {
+        // The diagnostic range is built from LibraryCall.line, and `# nolint`
+        // suppression is line-keyed, so each package must anchor at its own
+        // literal's line — not the closing paren's.
+        let code = "library(targets)\ntar_option_set(\n  packages = c(\n    \"dplyr\",\n    \"tidyr\"\n  ),\n  format = \"qs\"\n)";
+        let calls = tar_calls(code);
+        assert_eq!(calls.len(), 2, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+        assert_eq!(calls[0].line, 3, "anchored at its own literal's line");
+        assert_eq!(calls[1].package, "tidyr");
+        assert_eq!(calls[1].line, 4, "anchored at its own literal's line");
+    }
+
+    #[test]
+    fn extract_attached_packages_includes_top_level_tar_option_set() {
+        let pkgs =
+            extract_attached_packages("library(targets)\ntar_option_set(packages = c(\"dplyr\"))");
+        assert!(pkgs.contains("targets"));
+        assert!(pkgs.contains("dplyr"));
+
+        // Qualified spelling needs no library(targets).
+        let pkgs = extract_attached_packages("targets::tar_option_set(packages = \"dplyr\")");
+        assert!(pkgs.contains("dplyr"));
+    }
+
+    #[test]
+    fn extract_attached_packages_excludes_function_body_tar_option_set() {
+        let pkgs = extract_attached_packages(
+            "library(targets)\nf <- function() tar_option_set(packages = c(\"dplyr\"))",
+        );
+        assert!(!pkgs.contains("dplyr"), "got: {pkgs:?}");
+    }
+
+    #[test]
+    fn extract_attached_packages_excludes_quote_wrapped_tar_option_set() {
+        let pkgs = extract_attached_packages(
+            "library(targets)\nq <- quote(tar_option_set(packages = c(\"dplyr\")))",
+        );
+        assert!(!pkgs.contains("dplyr"), "got: {pkgs:?}");
     }
 
     // ==================== system.file() detection in source() ====================

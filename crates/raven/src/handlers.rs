@@ -54068,6 +54068,139 @@ result <- helper_with_spaces(42)"#;
         assert!(diagnostics[1].message.contains("__missing_pkg2__"));
     }
 
+    /// Issue #637: a package listed in `tar_option_set(packages = ...)` gets
+    /// the same missing-package diagnostic as a `library()` call. Mirrors
+    /// `test_missing_package_diagnostic_emitted`. Assertions filter to the
+    /// probe package so the test doesn't depend on whether {targets} itself is
+    /// installed on the machine.
+    #[test]
+    fn test_missing_package_diagnostic_emitted_for_tar_option_set() {
+        let code = "library(targets)\ntar_option_set(packages = \"__nonexistent_package_xyz__\")";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
+
+        let mut state = WorldState::new();
+        state.package_library_ready = true;
+        let Some(r_subprocess) = crate::r_subprocess::RSubprocess::new(None) else {
+            return;
+        };
+        state.package_library = std::sync::Arc::new(
+            crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
+        );
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
+
+        let probe: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("__nonexistent_package_xyz__"))
+            .collect();
+        assert_eq!(
+            probe.len(),
+            1,
+            "should emit one diagnostic for the tar_option_set package; got {diagnostics:?}"
+        );
+        assert!(probe[0].message.contains("No installed package"));
+        assert_eq!(probe[0].severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    /// Issue #637: every package in a `tar_option_set(packages = c(...))`
+    /// vector is checked. Mirrors
+    /// `test_missing_package_diagnostic_multiple_packages`.
+    #[test]
+    fn test_missing_package_diagnostic_multiple_packages_tar_option_set() {
+        let code = "library(targets)\ntar_option_set(packages = c(\"__missing_pkg1__\", \"__missing_pkg2__\"))";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
+
+        let mut state = WorldState::new();
+        state.package_library_ready = true;
+        let Some(r_subprocess) = crate::r_subprocess::RSubprocess::new(None) else {
+            return;
+        };
+        state.package_library = std::sync::Arc::new(
+            crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
+        );
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.message.contains("__missing_pkg1__"))
+                .count(),
+            1,
+            "should emit a diagnostic for the first tar_option_set package; got {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.message.contains("__missing_pkg2__"))
+                .count(),
+            1,
+            "should emit a diagnostic for the second tar_option_set package; got {diagnostics:?}"
+        );
+    }
+
+    /// Issue #637 per-literal anchoring: in a multi-line `tar_option_set()`
+    /// call, the missing-package diagnostic lands on the packages-literal's
+    /// line (so `# nolint` on that line suppresses it), not the closing
+    /// paren's line.
+    #[test]
+    fn test_missing_package_diagnostic_tar_option_set_multiline_anchors_literal_line() {
+        let code = "library(targets)\n\
+                    tar_option_set(\n\
+                    \x20 packages = c(\n\
+                    \x20   \"__missing_pkg1__\"\n\
+                    \x20 ),\n\
+                    \x20 format = \"qs\"\n\
+                    )";
+        let main_url = Url::parse("file:///workspace/main.R").unwrap();
+
+        let mut state = WorldState::new();
+        state.package_library_ready = true;
+        let Some(r_subprocess) = crate::r_subprocess::RSubprocess::new(None) else {
+            return;
+        };
+        state.package_library = std::sync::Arc::new(
+            crate::package_library::PackageLibrary::with_subprocess(Some(r_subprocess)),
+        );
+        state
+            .documents
+            .insert(main_url.clone(), Document::new(code, None));
+
+        let snapshot =
+            DiagnosticsSnapshot::build(&state, &main_url).expect("snapshot built for main.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
+
+        let probe: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("__missing_pkg1__"))
+            .collect();
+        assert_eq!(
+            probe.len(),
+            1,
+            "should emit one diagnostic for the tar_option_set package; got {diagnostics:?}"
+        );
+        assert_eq!(
+            probe[0].range.start.line, 3,
+            "diagnostic must anchor at the package literal's line (3), not the \
+             closing paren's line (6); got {:?}",
+            probe[0].range
+        );
+        assert_eq!(probe[0].range.end.line, 3);
+    }
+
     #[test]
     fn test_missing_package_diagnostic_suppressed_while_package_library_not_ready() {
         let code = "library(__nonexistent_package_xyz__)";
@@ -63352,6 +63485,34 @@ my_func <- function(a = default_value) {
             !messages.iter().any(|m| m.contains("inner")),
             "loadNamespace(shiny) must not enable Shiny deferred-scope isolation; \
              got {messages:?}"
+        );
+    }
+
+    /// Issue #637: `tar_option_set(packages = c("shiny"))` attaches shiny
+    /// (targets attaches the listed packages before running each target), so
+    /// it flips `shiny_in_play` and deferred scopes isolate exactly as with
+    /// `library(shiny)`.
+    #[test]
+    fn nse_shiny_tar_option_set_enables_deferred_scope_end_to_end() {
+        let messages = collect_undefined_messages(
+            "library(targets)\n\
+             tar_option_set(packages = c(\"shiny\"))\n\
+             server <- function(input, output, session) {\n\
+               output$plot <- renderPlot({\n\
+                 inner <- 1\n\
+                 inner\n\
+               })\n\
+               print(inner)\n\
+             }\n",
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.as_str() == "inner is not defined")
+                .count(),
+            1,
+            "shiny attached via tar_option_set must enable deferred-scope \
+             isolation like library(shiny); got {messages:?}"
         );
     }
 
