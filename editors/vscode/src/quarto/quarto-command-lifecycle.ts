@@ -7,14 +7,11 @@
  * new command bodies and waits for a snapshot under a cancelable global bound.
  */
 
-export interface QuartoCommandCancelableDelay {
-    promise: Promise<void>;
-    cancel(): void;
-}
+import { cancelableDelay, QuartoCancelableDelay } from './quarto-cancelable-delay';
 
 export interface QuartoCommandLifecycleOptions {
     shutdownTimeoutMs?: number;
-    delay?: (ms: number) => QuartoCommandCancelableDelay;
+    delay?: (ms: number) => QuartoCancelableDelay;
 }
 
 export class QuartoCommandLifecycle {
@@ -49,21 +46,4 @@ export class QuartoCommandLifecycle {
             .finally(() => bound.cancel());
         return this.shutdownPromise;
     }
-}
-
-function cancelableDelay(ms: number): QuartoCommandCancelableDelay {
-    let timer: NodeJS.Timeout | null = null;
-    const promise = new Promise<void>((resolve) => {
-        timer = setTimeout(() => {
-            timer = null;
-            resolve();
-        }, ms);
-    });
-    return {
-        promise,
-        cancel: () => {
-            if (timer) clearTimeout(timer);
-            timer = null;
-        },
-    };
 }

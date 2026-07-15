@@ -300,9 +300,10 @@ suite('Quarto command preflight', () => {
                 return { kind: 'superseded' as const, generation: 1 };
             },
             stopByLookup: async () => {
-                const stopped = pendingActive;
+                const wasPending = pendingActive;
                 pendingActive = false;
-                return stopped ? 'stopped' as const : 'none' as const;
+                // A pending-only cancel is 'cancelled-pending', never 'stopped'.
+                return wasPending ? 'cancelled-pending' as const : 'none' as const;
             },
         };
         (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
@@ -341,6 +342,246 @@ suite('Quarto command preflight', () => {
             finishResolve.resolve('quarto');
             (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
         }
+    });
+
+    test('Stop cancels a pending intent and still stops a running project preview', async () => {
+        // Regression: cancelling a source-level pending intent used to short-
+        // circuit the project-key fallback, so Stop reported success while a
+        // preview owned under the project key kept running. Stop must consult
+        // the project key whenever no session was stopped by the lexical key.
+        const messages: string[] = [];
+        const lookups: string[] = [];
+        const original = vscode.window.showInformationMessage;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            messages.push(message);
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/project/chapter.qmd');
+            const deps = fakeDeps({
+                resolveContext: async () => ({
+                    key: '/project',
+                    cwd: '/project',
+                    projectRoot: '/project',
+                }),
+                runtime: {
+                    registerPendingStart: () => { throw new Error('register must not run'); },
+                    reconcilePendingStart: () => { throw new Error('reconcile must not run'); },
+                    consumePendingStart: () => { throw new Error('consume must not run'); },
+                    releasePendingStart: () => { throw new Error('release must not run'); },
+                    startOrRestart: async () => { throw new Error('start must not run'); },
+                    stopByLookup: async (key) => {
+                        lookups.push(key);
+                        // Lexical key: only a preflight intent is cancelled.
+                        if (key === '/project/chapter.qmd') return 'cancelled-pending';
+                        // Project key: the actually-running project preview.
+                        if (key === '/project') return 'stopped';
+                        return 'none';
+                    },
+                } as QuartoCommandDeps['runtime'],
+            });
+            await runQuartoStopForTesting(uri, deps);
+
+            assert.deepStrictEqual(lookups, ['/project/chapter.qmd', '/project']);
+            assert.ok(messages.includes('Quarto preview stopped.'));
+        } finally {
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('Stop that stops a session still records the project key while an intent is pending', async () => {
+        // Regression: an alias-resolved Stop that succeeds under a stale session
+        // key used to skip the project-key phase, so a sibling pending Preview
+        // for the current project (its key changed since the session started)
+        // was never abandoned and relaunched after Stop. With an intent pending,
+        // the project key must be consulted even on a 'stopped' lexical result.
+        const lookups: string[] = [];
+        const original = vscode.window.showInformationMessage;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            void message;
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/project/a.qmd');
+            const deps = fakeDeps({
+                resolveContext: async () => ({
+                    key: '/project',
+                    cwd: '/project',
+                    projectRoot: '/project',
+                }),
+                runtime: {
+                    registerPendingStart: () => { throw new Error('register must not run'); },
+                    reconcilePendingStart: () => { throw new Error('reconcile must not run'); },
+                    consumePendingStart: () => { throw new Error('consume must not run'); },
+                    releasePendingStart: () => { throw new Error('release must not run'); },
+                    startOrRestart: async () => { throw new Error('start must not run'); },
+                    beginStop: () => 7,
+                    hasPendingStarts: () => true,
+                    stopByLookup: async (key) => {
+                        lookups.push(key);
+                        return key === '/project/a.qmd' ? 'stopped' : 'none';
+                    },
+                } as QuartoCommandDeps['runtime'],
+            });
+            await runQuartoStopForTesting(uri, deps);
+
+            assert.deepStrictEqual(lookups, ['/project/a.qmd', '/project']);
+        } finally {
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('Stop confirms a cancelled intent even when project discovery fails', async () => {
+        // Regression: routing a pending-cancel through the project-key phase must
+        // not let a failing/hung project discovery swallow the confirmation for
+        // work already done.
+        const messages: string[] = [];
+        const original = vscode.window.showInformationMessage;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            messages.push(message);
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/project/a.qmd');
+            const deps = fakeDeps({
+                resolveContext: async () => { throw new Error('remote filesystem hung'); },
+                runtime: {
+                    registerPendingStart: () => { throw new Error('register must not run'); },
+                    reconcilePendingStart: () => { throw new Error('reconcile must not run'); },
+                    consumePendingStart: () => { throw new Error('consume must not run'); },
+                    releasePendingStart: () => { throw new Error('release must not run'); },
+                    startOrRestart: async () => { throw new Error('start must not run'); },
+                    beginStop: () => 3,
+                    hasPendingStarts: () => false,
+                    stopByLookup: async () => 'cancelled-pending',
+                } as QuartoCommandDeps['runtime'],
+            });
+
+            // Must resolve (not reject) and still confirm the cancellation.
+            await runQuartoStopForTesting(uri, deps);
+            assert.ok(messages.includes('Quarto preview stopped.'));
+        } finally {
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('a second Stop during teardown stays silent, not "no preview running"', async () => {
+        // Regression: a lexical 'already-stopping' (a prior Stop still draining)
+        // must not be downgraded to 'none' by a project-key fallback that finds
+        // nothing, which would show a misleading "No Quarto preview is running".
+        const messages: string[] = [];
+        const original = vscode.window.showInformationMessage;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            messages.push(message);
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/project/a.qmd');
+            const deps = fakeDeps({
+                resolveContext: async () => ({
+                    key: '/project',
+                    cwd: '/project',
+                    projectRoot: '/project',
+                }),
+                runtime: {
+                    registerPendingStart: () => { throw new Error('register must not run'); },
+                    reconcilePendingStart: () => { throw new Error('reconcile must not run'); },
+                    consumePendingStart: () => { throw new Error('consume must not run'); },
+                    releasePendingStart: () => { throw new Error('release must not run'); },
+                    startOrRestart: async () => { throw new Error('start must not run'); },
+                    beginStop: () => 5,
+                    hasPendingStarts: () => false,
+                    stopByLookup: async (key) =>
+                        key === '/project/a.qmd' ? 'already-stopping' : 'none',
+                } as QuartoCommandDeps['runtime'],
+            });
+            await runQuartoStopForTesting(uri, deps);
+
+            assert.ok(
+                !messages.includes('No Quarto preview is running for this document.'),
+                'already-stopping must not surface a "no preview" message',
+            );
+            assert.ok(!messages.includes('Quarto preview stopped.'));
+        } finally {
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('Stop stays bounded and confirms a cancel when project discovery hangs', async () => {
+        // Regression: a wedged remote filesystem could hang project discovery
+        // forever, leaving Stop pending and holding deactivation. Discovery is
+        // now bounded; on timeout the completed pending-cancel still confirms.
+        const messages: string[] = [];
+        const original = vscode.window.showInformationMessage;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            messages.push(message);
+            return Promise.resolve(undefined);
+        };
+        try {
+            const uri = vscode.Uri.file('/project/a.qmd');
+            const deps = fakeDeps({
+                contextTimeoutMs: 20,
+                resolveContext: () => new Promise<never>(() => { /* never settles */ }),
+                runtime: {
+                    registerPendingStart: () => { throw new Error('register must not run'); },
+                    reconcilePendingStart: () => { throw new Error('reconcile must not run'); },
+                    consumePendingStart: () => { throw new Error('consume must not run'); },
+                    releasePendingStart: () => { throw new Error('release must not run'); },
+                    startOrRestart: async () => { throw new Error('start must not run'); },
+                    beginStop: () => 4,
+                    hasPendingStarts: () => false,
+                    stopByLookup: async () => 'cancelled-pending',
+                } as QuartoCommandDeps['runtime'],
+            });
+
+            // Must resolve (bounded), not hang, and still confirm the cancel.
+            await runQuartoStopForTesting(uri, deps);
+            assert.ok(messages.includes('Quarto preview stopped.'));
+        } finally {
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('a Preview whose project discovery hangs releases its pending intent', async () => {
+        // Regression: an indefinitely-hung Preview preflight would pin a pending
+        // intent forever, which (a) never launches and (b) keeps the runtime's
+        // stop-epoch map from ever pruning. Bounded discovery makes the hang a
+        // rejection, and the finally releases the intent.
+        let registered = 0;
+        let released = 0;
+        const runtime = {
+            registerPendingStart: (sourceFsPath: string) => {
+                registered++;
+                return { id: 1, sourceFsPath };
+            },
+            reconcilePendingStart: () => { throw new Error('reconcile must not run'); },
+            consumePendingStart: () => { throw new Error('consume must not run'); },
+            releasePendingStart: () => { released++; },
+            startOrRestart: async () => { throw new Error('start must not run'); },
+            stopByLookup: async () => 'none' as const,
+        };
+        const deps = fakeDeps({
+            contextTimeoutMs: 20,
+            resolveContext: () => new Promise<never>(() => { /* never settles */ }),
+            runtime: runtime as unknown as QuartoCommandDeps['runtime'],
+        });
+        const runPreview = createQuartoPreviewRunnerForTesting(deps);
+
+        // The hung discovery rejects via the bound; the Preview must not leak
+        // its intent.
+        await runPreview(vscode.Uri.file('/project/a.qmd')).catch(() => undefined);
+        assert.strictEqual(registered, 1);
+        assert.strictEqual(released, 1);
     });
 
     test('deactivation Preview rejection and disposed output stay silent', async () => {

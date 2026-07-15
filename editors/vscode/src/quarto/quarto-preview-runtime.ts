@@ -47,6 +47,7 @@
  */
 
 import { canonicalOpKey } from '../knit/raven-knit-paths';
+import { cancelableDelay, QuartoCancelableDelay } from './quarto-cancelable-delay';
 import type { QuartoPreviewViewState } from './quarto-messages';
 import type {
     QuartoPreviewProcessLike,
@@ -82,10 +83,7 @@ export interface QuartoRuntimeDeps {
     shutdownDelay?: (ms: number) => QuartoCancelableDelay;
 }
 
-export interface QuartoCancelableDelay {
-    promise: Promise<void>;
-    cancel(): void;
-}
+export type { QuartoCancelableDelay };
 
 export interface QuartoStartArgs {
     key: string;
@@ -99,7 +97,11 @@ export type QuartoStartResult =
     | { kind: 'superseded'; generation: number }
     | { kind: 'failed'; generation: number; error: Error };
 
-export type QuartoStopResult = 'stopped' | 'already-stopping' | 'none';
+export type QuartoStopResult =
+    | 'stopped'
+    | 'cancelled-pending'
+    | 'already-stopping'
+    | 'none';
 
 /** Opaque command-to-runtime ownership for a Preview still in preflight. */
 export interface QuartoPendingStart {
@@ -111,6 +113,15 @@ interface PendingStartRecord {
     readonly token: QuartoPendingStart;
     readonly sourceKey: string;
     key: string | null;
+    /**
+     * Stop-sequence value observed when this intent was registered. A later
+     * Stop targeting the intent's (eventually reconciled) key records a
+     * strictly higher sequence, letting `reconcilePendingStart` detect a Stop
+     * that landed during the register→reconcile window — before the intent's
+     * project key was known and thus before `cancelPendingStarts` could match
+     * it by key.
+     */
+    readonly registeredSeq: number;
 }
 
 /** One generation-tagged process slot. */
@@ -216,6 +227,10 @@ export class QuartoRuntime {
     private readonly pendingStarts = new Map<number, PendingStartRecord>();
     private nextPendingStartId = 0;
     private nextGeneration = 0;
+    /** Monotonic clock for ordering pending-start registration against Stops. */
+    private stopSeq = 0;
+    /** Most recent `stopSeq` at which a Stop targeted each key. */
+    private readonly stoppedKeyAt = new Map<string, number>();
     private deactivating = false;
     private shutdownPromise: Promise<void> | null = null;
 
@@ -232,15 +247,30 @@ export class QuartoRuntime {
                 token,
                 sourceKey: canonicalOpKey({ fsPath: sourceFsPath }),
                 key: null,
+                registeredSeq: this.stopSeq,
             });
         }
         return token;
     }
 
-    /** Add the final project key while retaining the original source alias. */
+    /**
+     * Add the final project key while retaining the original source alias.
+     *
+     * Returns false — abandoning the intent — when a Stop targeting this key
+     * arrived during the register→reconcile window. Until now the intent's key
+     * was `null`, so `cancelPendingStarts` could not match it; the recorded
+     * stop epoch closes that gap so a Stop can never be silently outrun by a
+     * preview whose project key was still being discovered.
+     */
     reconcilePendingStart(token: QuartoPendingStart, key: string): boolean {
         const pending = this.pendingStarts.get(token.id);
         if (!pending || this.deactivating) return false;
+        const stoppedAt = this.stoppedKeyAt.get(key);
+        if (stoppedAt !== undefined && stoppedAt > pending.registeredSeq) {
+            this.pendingStarts.delete(token.id);
+            this.pruneStopEpochs();
+            return false;
+        }
         pending.key = key;
         return true;
     }
@@ -250,12 +280,13 @@ export class QuartoRuntime {
         const pending = this.pendingStarts.get(token.id);
         if (!pending || this.deactivating) return false;
         this.pendingStarts.delete(token.id);
+        this.pruneStopEpochs();
         return true;
     }
 
     /** Release intent after any preflight/resolve early return. */
     releasePendingStart(token: QuartoPendingStart): void {
-        this.pendingStarts.delete(token.id);
+        if (this.pendingStarts.delete(token.id)) this.pruneStopEpochs();
     }
 
     /**
@@ -383,27 +414,73 @@ export class QuartoRuntime {
         }
     }
 
-    /** Stop only when the panel's generation still owns the key. */
+    /**
+     * Stop only when the panel's generation still owns the key.
+     *
+     * Panel disposal must not touch pending starts. Any intent still pending
+     * once a session exists under this key belongs to a strictly newer start
+     * attempt (its own intent was consumed before `startOrRestart` claimed the
+     * generation), so cancelling here — especially from a stale/restored
+     * generation that no longer owns the key — would silently kill a fresh
+     * Preview. Only the explicit Stop command (`stopByLookup`) cancels intents.
+     */
     async stopGeneration(key: string, generation: number): Promise<QuartoStopResult> {
-        const cancelledPending = this.cancelPendingStarts(key);
         const session = this.current(key, generation);
-        if (!session) return cancelledPending ? 'stopped' : 'none';
+        if (!session) return 'none';
         return this.stopSession(session);
+    }
+
+    /**
+     * Allocate the stop epoch for one logical Stop, synchronously at issue
+     * time. A multi-phase Stop (lexical key, then project-key fallback across
+     * an async project-discovery gap) must pass this one value to every
+     * `stopByLookup` call so an intent registered *after* the user's Stop —
+     * but before the delayed project-key phase records its epoch — is not
+     * mistaken for one that predated the Stop and falsely abandoned.
+     */
+    beginStop(): number {
+        return ++this.stopSeq;
     }
 
     /**
      * Stop lookup has no preflight contract: callers pass a freshly-computed
      * key and source path, and this method also consults the historical alias.
+     *
+     * `stopEpoch` ties every phase of one logical Stop to a single issue-time
+     * sequence value; omit it for a standalone Stop and a fresh epoch is
+     * allocated for this call alone.
      */
-    async stopByLookup(key: string, sourceFsPath: string): Promise<QuartoStopResult> {
-        const cancelledPending = this.cancelPendingStarts(key, sourceFsPath);
+    async stopByLookup(
+        key: string,
+        sourceFsPath: string,
+        stopEpoch: number = ++this.stopSeq,
+    ): Promise<QuartoStopResult> {
+        let cancelledPending = this.cancelPendingStarts(key, sourceFsPath, stopEpoch);
         let session = this.sessions.get(key) ?? null;
         if (!session) {
             const alias = this.sourceAliases.get(canonicalOpKey({ fsPath: sourceFsPath }));
             if (alias) session = this.current(alias.key, alias.generation);
         }
-        if (!session) return cancelledPending ? 'stopped' : 'none';
-        return this.stopSession(session);
+        // A cancelled intent must stay distinct from a stopped session: the
+        // command layer runs its project-key fallback whenever no *session*
+        // was stopped, so reporting a bare intent-cancel as 'stopped' here
+        // would leave a running project preview (owned under a different key)
+        // untouched while telling the user it stopped.
+        if (!session) return cancelledPending ? 'cancelled-pending' : 'none';
+        // Stopping a live session also targets its own project key, not just
+        // the caller's lookup key: when the session was found by source alias
+        // the lookup key is the lexical source key, so a sibling pending
+        // Preview for the same project would otherwise evade the stop epoch and
+        // relaunch the preview the moment this Stop reports success.
+        if (this.cancelPendingStarts(session.key, undefined, stopEpoch)) {
+            cancelledPending = true;
+        }
+        const result = await this.stopSession(session);
+        // A cancelled intent is a user-visible success; an already-stopping
+        // session (a prior Stop still draining) must not downgrade it to a
+        // silent no-op.
+        if (result === 'already-stopping' && cancelledPending) return 'cancelled-pending';
+        return result;
     }
 
     hasSession(key: string, sourceFsPath: string): boolean {
@@ -422,6 +499,7 @@ export class QuartoRuntime {
         this.sessions.clear();
         this.sourceAliases.clear();
         this.pendingStarts.clear();
+        this.stoppedKeyAt.clear();
         const all = Promise.allSettled(snapshot.map((session) => session.shutdown()));
         const bound = (this.deps.shutdownDelay ?? cancelableDelay)(
             this.deps.shutdownGlobalTimeoutMs ?? 7_000,
@@ -538,12 +616,36 @@ export class QuartoRuntime {
         }
     }
 
-    private cancelPendingStarts(key: string, sourceFsPath?: string): boolean {
+    private cancelPendingStarts(
+        key: string,
+        sourceFsPath: string | undefined,
+        stopEpoch: number,
+    ): boolean {
         const sourceKey = sourceFsPath === undefined
             ? null
             : canonicalOpKey({ fsPath: sourceFsPath });
+        // Record this Stop against every key it targets, even when no live
+        // intent matches yet: an intent registered before this Stop but not
+        // yet reconciled to `key` will consult this epoch when its project key
+        // finally resolves (see `reconcilePendingStart`). The epoch is the
+        // Stop's issue-time sequence — shared across a multi-phase Stop — so a
+        // later phase cannot record a fresher epoch than the Stop truly had.
+        //
+        // The write is monotonic (max), never a plain overwrite: two Stops for
+        // the same key can complete out of issue order (an older Stop stalled
+        // in its async project-key phase resuming after a newer Stop finished),
+        // and a stale lower epoch must never regress a newer Stop's record —
+        // that would resurrect a pending intent the newer Stop meant to abandon.
+        this.recordStopEpoch(key, stopEpoch);
+        if (sourceKey !== null) this.recordStopEpoch(sourceKey, stopEpoch);
         let cancelled = false;
         for (const [id, pending] of this.pendingStarts) {
+            // Only cancel intents that predated this Stop. An intent registered
+            // after the Stop was issued (`registeredSeq >= stopEpoch`) is a
+            // strictly newer request — a user starting a Preview after clicking
+            // Stop — and a delayed phase of the older Stop must not delete it
+            // even once it reconciles to a matching key.
+            if (pending.registeredSeq >= stopEpoch) continue;
             if (
                 pending.key === key
                 || pending.sourceKey === key
@@ -553,7 +655,43 @@ export class QuartoRuntime {
                 cancelled = true;
             }
         }
+        this.pruneStopEpochs();
         return cancelled;
+    }
+
+    /** True while any Preview intent is still in preflight. */
+    hasPendingStarts(): boolean {
+        return this.pendingStarts.size > 0;
+    }
+
+    /**
+     * Drop stop epochs that can no longer abandon any intent. An epoch at or
+     * below every live intent's `registeredSeq` predates them all, so it can
+     * never satisfy the strict `stoppedAt > registeredSeq` abandon test — for
+     * current intents or for any future one (which registers at an even higher
+     * `stopSeq`). Clearing them bounds `stoppedKeyAt` even when a Preview
+     * preflight stalls indefinitely and keeps the map non-empty.
+     */
+    private pruneStopEpochs(): void {
+        if (this.pendingStarts.size === 0) {
+            this.stoppedKeyAt.clear();
+            return;
+        }
+        let minRegisteredSeq = Infinity;
+        for (const pending of this.pendingStarts.values()) {
+            if (pending.registeredSeq < minRegisteredSeq) {
+                minRegisteredSeq = pending.registeredSeq;
+            }
+        }
+        for (const [key, epoch] of this.stoppedKeyAt) {
+            if (epoch <= minRegisteredSeq) this.stoppedKeyAt.delete(key);
+        }
+    }
+
+    /** Monotonically advance a key's stop epoch; never regress it. */
+    private recordStopEpoch(key: string, stopEpoch: number): void {
+        const previous = this.stoppedKeyAt.get(key) ?? 0;
+        if (stopEpoch > previous) this.stoppedKeyAt.set(key, stopEpoch);
     }
 }
 
@@ -566,19 +704,3 @@ function errorMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
 
-function cancelableDelay(ms: number): QuartoCancelableDelay {
-    let timer: NodeJS.Timeout | null = null;
-    const promise = new Promise<void>((resolve) => {
-        timer = setTimeout(() => {
-            timer = null;
-            resolve();
-        }, ms);
-    });
-    return {
-        promise,
-        cancel: () => {
-            if (timer) clearTimeout(timer);
-            timer = null;
-        },
-    };
-}

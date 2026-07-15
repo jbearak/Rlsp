@@ -617,8 +617,13 @@ Brief orientation for modules outside the cross-file and package-library subsyst
 
 The VS Code extension's Quarto implementation lives under
 `editors/vscode/src/quarto/`. One activation-scoped lifecycle owns the
-`QuartoRuntime`, `QuartoRenderEngine`, preview panels, and shared **Raven:
-Quarto** output channel in that extension-host window. The render engine
+`QuartoCommandLifecycle`, `QuartoRuntime`, `QuartoRenderEngine`, preview panels,
+and shared **Raven: Quarto** output channel in that extension-host window. The
+`QuartoCommandLifecycle` owns each command's asynchronous continuation
+(preview, render, and stop): `run` invokes the body synchronously — so Preview
+can register its pending-start intent before yielding — then retains the
+promise through preflight, binary discovery, subprocess work, and outcome
+handling, rejecting new bodies once shutdown begins. The render engine
 registers every child synchronously when it spawns and rejects new renders as
 soon as lifecycle shutdown begins. Render stdout/stderr still stream in full,
 but only a bounded tail is retained for result parsing and failure context.
@@ -674,10 +679,12 @@ panels and clears their static registry; otherwise a disable/enable cycle would
 retain callbacks and generation counters from the disposed runtime.
 
 Extension deactivation awaits `stopAllQuartoForDeactivation()`. That one
-thenable starts preview and render shutdown before disposing panels, so panel
-callbacks cannot start a second graceful ladder. It waits for both bounded
-aggregates and disposes the shared output channel last; `context.subscriptions`
-disposal alone is not the awaited process-kill mechanism. For debugging, run
+thenable rejects new command bodies and starts preview and render shutdown
+before disposing panels, so panel callbacks cannot start a second graceful
+ladder. It waits for all three bounded aggregates — command lifecycle, preview
+runtime, and render engine — and disposes the shared output channel last;
+`context.subscriptions` disposal alone is not the awaited process-kill
+mechanism. For debugging, run
 **Raven: Show Quarto Output** and inspect the **Raven: Quarto** output channel.
 
 ### Judge-backed Tier 2 indentation (#611)
