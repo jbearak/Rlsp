@@ -363,7 +363,7 @@
         "command": "raven.quarto.preview",
         "key": "ctrl+shift+enter",
         "mac": "cmd+shift+enter",
-        "when": "editorTextFocus && isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i"
+        "when": "editorTextFocus && raven.rConsoleEnabled && isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i"
       },
       {
         "command": "raven.runCurrentChunk",
@@ -492,11 +492,11 @@
         },
         {
           "command": "raven.quarto.preview",
-          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i"
+          "when": "raven.rConsoleEnabled && isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i"
         },
         {
           "command": "raven.quarto.render",
-          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i"
+          "when": "raven.rConsoleEnabled && isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i"
         },
         {
           "command": "raven.quarto.stopPreview",
@@ -531,7 +531,7 @@
         },
         {
           "command": "raven.quarto.preview",
-          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
+          "when": "raven.rConsoleEnabled && isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
           "group": "navigation@5"
         },
         {
@@ -633,12 +633,12 @@
         },
         {
           "command": "raven.quarto.preview",
-          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
+          "when": "raven.rConsoleEnabled && isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
           "group": "5_quarto@1"
         },
         {
           "command": "raven.quarto.render",
-          "when": "isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
+          "when": "raven.rConsoleEnabled && isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i",
           "group": "5_quarto@2"
         },
         {

@@ -4,7 +4,7 @@ Raven's VS Code extension includes both a **language server** (completions, diag
 
 ## The `raven.rConsole.activation` setting
 
-The `raven.rConsole.activation` setting (default: `"auto"`) controls whether Raven's R console — and therefore its plot and data viewers, chunk run commands, and Knit Preview — activates:
+The `raven.rConsole.activation` setting (default: `"auto"`) controls whether Raven's R console — and therefore its plot and data viewers, chunk run commands, Knit Preview, and Quarto Preview/Render — activates:
 
 - **`"auto"`** (default) — Raven's R-session features activate *unless* the REditorSupport extension is enabled or VS Code is running as Positron. This keeps Raven out of the way when you already have R-session integration.
 - **`"enabled"`** — Always activate Raven's R console, plot viewer, and data viewer, even when another R extension is present. With REditorSupport also enabled, both extensions' R consoles are available; `Cmd+Enter` / `Ctrl+Enter` can only be bound to one extension's send command, and VS Code's keybinding editor lets you rebind either.
@@ -26,6 +26,7 @@ Several editor surfaces that overlap with REditorSupport's R Markdown / Quarto t
 - **`.R` cell mode** support: `# %%` cell markers and RStudio-style `# Section ----` dividers used for chunk navigation / highlighting in plain `.R` files.
 - **R-language snippets in `.Rmd` / `.Rmarkdown` / `.qmd` fenced chunks** — Raven's `r.json` snippets (`if`, `fun`, `for`, etc.) are registered for `rmd` / `quarto` only when Raven's R console is active. R-Markdown- and Quarto-specific snippets that scaffold new chunks (`rchunk`, `setupchunk`, ...) always register, since REditorSupport doesn't ship equivalents.
 - **Knit Preview** keybinding (`Shift+Cmd+Enter` / `Shift+Ctrl+Enter`) and the `Raven: Knit Preview` command — gated on the R-console switch together with the `raven.rmdKnit.enabled` flag.
+- **Quarto Preview and Render** commands, editor-title button, and Preview keybinding — gated on the R-console switch. **Stop Quarto Preview** stays available from the Command Palette so a running process can always be cleaned up.
 
 ## Who benefits from Raven's R console?
 

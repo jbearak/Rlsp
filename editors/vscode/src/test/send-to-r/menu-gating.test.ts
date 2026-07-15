@@ -345,8 +345,8 @@ suite('File-level Shift+Enter chord', () => {
             `raven.quarto.preview keybinding must be restricted to .qmd files, got: ${when}`,
         );
         assert.ok(
-            !when.includes('raven.rConsoleEnabled'),
-            `raven.quarto.preview keybinding must not depend on the R console, got: ${when}`,
+            when.includes('raven.rConsoleEnabled'),
+            `raven.quarto.preview keybinding must require R-console activation, got: ${when}`,
         );
     });
 

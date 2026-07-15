@@ -1,7 +1,8 @@
 /**
  * Quarto Preview / Render / Stop command policy.
  *
- * Preview and Render share URI, trust, save, and frontmatter policy. Render
+ * Preview and Render share R-console activation, URI, trust, save, and
+ * frontmatter policy. Render
  * performs its non-mutating async project-context lookup before open/save so
  * it can reserve the physical guard key before those side effects; Preview
  * discovers context within preflight. Stop intentionally bypasses the mutating
@@ -32,6 +33,10 @@ import { openExportedFile, type ExportFormat } from '../knit/open-exported-file'
 import { parseRenderedOutputPath } from '../knit/output-path';
 import { canonicalOpKey } from '../knit/raven-knit-paths';
 import { extractFrontmatter, parseFrontmatter } from '../knit/yaml-frontmatter';
+import {
+    resolveRConsoleActivation,
+    type RConsoleResolved,
+} from '../r-console-activation';
 import { cancelableDelay } from './quarto-cancelable-delay';
 import { QuartoNotFoundError, type QuartoResolver } from './quarto-detect';
 import { QuartoCommandLifecycle } from './quarto-command-lifecycle';
@@ -72,6 +77,8 @@ export interface QuartoCommandDeps {
     output: vscode.OutputChannel;
     runRender: (opts: QuartoRenderOptions) => Promise<KnitEngineResult>;
     resolveContext?: (sourceFsPath: string) => Promise<QuartoContext>;
+    /** Live R-console gate resolver; overridden only by command-policy tests. */
+    resolveRConsoleActivation?: () => RConsoleResolved;
     isWorkspaceTrusted?: () => boolean;
     openTextDocument?: (uri: vscode.Uri) => Thenable<vscode.TextDocument>;
     /** Dependency-injected clock for render-output freshness tests. */
@@ -215,8 +222,25 @@ async function runPreflight(
         );
         return null;
     }
+    if (!await ensureRConsoleEnabled(label, deps)) return null;
     if (!await validateQuartoRunUri(uri, label)) return null;
     return runPreflightForValidatedUri(uri, label, deps);
+}
+
+async function ensureRConsoleEnabled(
+    label: 'Preview' | 'Render',
+    deps: QuartoCommandDeps,
+): Promise<boolean> {
+    const resolved = deps.resolveRConsoleActivation?.()
+        ?? resolveRConsoleActivation();
+    if (resolved === 'enabled') return true;
+
+    await vscode.window.showInformationMessage(
+        `Raven: Quarto ${label} is disabled by your ` +
+        '`raven.rConsole.activation` setting (or because REditorSupport / ' +
+        'Positron is active).',
+    );
+    return false;
 }
 
 async function validateQuartoRunUri(
@@ -408,6 +432,7 @@ function createQuartoRenderRunner(deps: QuartoCommandDeps): QuartoRenderRunner {
             await runPreflight(undefined, 'Render', deps);
             return;
         }
+        if (!await ensureRConsoleEnabled('Render', deps)) return;
         if (!await validateQuartoRunUri(uri, 'Render')) return;
 
         const context = await resolveContextForSource(uri.fsPath, deps);
