@@ -21,12 +21,15 @@ Preview, providing one consistent preview action across both formats. You can
 right-click the editor toolbar and choose **Hide** if you do not want the
 button.
 
-The direct Quarto Preview button and palette commands do not depend on Raven's
-R console or on the `quarto.quarto` extension. The **Send to R** menu itself is
-shown only when Raven's R console is enabled, so Render and Stop remain
-palette-accessible when that console is off. Preview and Render execute the
-document through Quarto and therefore require a trusted workspace. Stop remains
-available in Restricted Mode so you can terminate an existing preview.
+Quarto Preview and Render follow Raven's R-console activation gate across the
+Command Palette, editor-title button, **Send to R** menu, and keyboard shortcut.
+They appear only when `raven.rConsole.activation` resolves to enabled, and their
+handlers re-check that live setting when invoked through a command link or
+custom keybinding. They do not depend on the `quarto.quarto` extension. Preview
+and Render execute the document through Quarto and therefore also require a
+trusted workspace. Stop remains palette-accessible when the R-console gate is
+closed and available in Restricted Mode so you can terminate an existing
+preview.
 
 Raven's [Knit Preview](knit.md) remains a separate pipeline for `.Rmd` and
 `.Rmarkdown` files. Knit Preview does not handle `.qmd`, and Quarto Preview does

@@ -478,10 +478,10 @@ export function activate(context: vscode.ExtensionContext): RavenExtensionApi {
     // command-palette entry.
     registerKnit(context, r_console_resolved === 'enabled', () => client);
 
-    // Quarto Preview / Render is an independent CLI-backed workflow. It is
-    // registered unconditionally and performs its own trust + CLI preflight;
-    // unlike chunk execution and Knit Preview it is not part of the R-console
-    // activation gate.
+    // Quarto Preview / Render registers unconditionally so command links and
+    // Stop remain available. Preview and Render re-check the live R-console
+    // activation gate at invocation before their trust + CLI preflight; Stop
+    // intentionally stays available so an existing process can be cleaned up.
     registerQuarto(context);
 
     // Register restart command — re-reads trace config so changed settings take effect.

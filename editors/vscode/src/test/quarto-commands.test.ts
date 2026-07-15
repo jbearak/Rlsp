@@ -79,6 +79,58 @@ suite('Quarto command preflight', () => {
         }
     });
 
+    test('closed R-console gate blocks Preview before trust or document work', async () => {
+        const messages: string[] = [];
+        const original = vscode.window.showInformationMessage;
+        (vscode.window as { showInformationMessage: unknown }).showInformationMessage = (
+            message: string,
+        ): Thenable<string | undefined> => {
+            messages.push(message);
+            return Promise.resolve(undefined);
+        };
+        try {
+            const result = await runQuartoPreflightForTesting(
+                vscode.Uri.file('/tmp/gated-preview.qmd'),
+                'Preview',
+                fakeDeps({
+                    resolveRConsoleActivation: () => 'disabled',
+                    isWorkspaceTrusted: () => { throw new Error('trust must not run'); },
+                    openTextDocument: async () => { throw new Error('open must not run'); },
+                }),
+            );
+
+            assert.strictEqual(result, null);
+            assert.deepStrictEqual(messages, [
+                'Raven: Quarto Preview is disabled by your ' +
+                '`raven.rConsole.activation` setting (or because REditorSupport / ' +
+                'Positron is active).',
+            ]);
+        } finally {
+            (vscode.window as { showInformationMessage: unknown }).showInformationMessage = original;
+        }
+    });
+
+    test('closed R-console gate blocks Render before project discovery', async () => {
+        let contextResolved = false;
+        let rendered = false;
+        const runRender = createQuartoRenderRunnerForTesting(fakeDeps({
+            resolveRConsoleActivation: () => 'disabled',
+            resolveContext: async () => {
+                contextResolved = true;
+                throw new Error('context must not resolve');
+            },
+            runRender: async () => {
+                rendered = true;
+                throw new Error('render must not run');
+            },
+        }));
+
+        await runRender(vscode.Uri.file('/tmp/gated-render.qmd'));
+
+        assert.strictEqual(contextResolved, false);
+        assert.strictEqual(rendered, false);
+    });
+
     test('non-file qmd URI is rejected before any document code can run', async () => {
         const messages: string[] = [];
         let opened = false;
@@ -211,6 +263,9 @@ suite('Quarto command preflight', () => {
             await runQuartoStopForTesting(
                 vscode.Uri.file('/tmp/stopped.qmd'),
                 fakeDeps({
+                    resolveRConsoleActivation: () => {
+                        throw new Error('R-console gate must not run');
+                    },
                     isWorkspaceTrusted: () => { throw new Error('trust must not run'); },
                     openTextDocument: async () => { throw new Error('open must not run'); },
                     runtime: {
@@ -912,6 +967,7 @@ suite('Quarto command preflight', () => {
                 cwd: path.dirname(sourceFsPath),
                 projectRoot: null,
             }),
+            resolveRConsoleActivation: () => 'enabled',
             openTextDocument: async (uri) => fakeDocument(uri, '# document'),
             ...overrides,
         };

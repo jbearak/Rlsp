@@ -38,7 +38,8 @@ function normalizedWhen(entry: MenuEntry | undefined): string | undefined {
     return entry?.when?.replace(/\s+/g, ' ').trim();
 }
 
-const QMD_TRUST_GATE = 'isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i';
+const QMD_TRUST_GATE =
+    'raven.rConsoleEnabled && isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i';
 const QMD_GATE = 'resourceExtname =~ /\\.qmd$/i';
 const RMD_KNIT_GATE =
     'raven.rmdKnit.enabled && resourceExtname =~ ' +
@@ -67,7 +68,7 @@ suite('Quarto menu gating', () => {
 
         assert.strictEqual(normalizedWhen(quarto), QMD_TRUST_GATE);
         assert.strictEqual(quarto?.group, 'navigation@5');
-        assert.ok(!normalizedWhen(quarto)?.includes('raven.rConsoleEnabled'));
+        assert.ok(normalizedWhen(quarto)?.includes('raven.rConsoleEnabled'));
         assert.ok(!normalizedWhen(quarto)?.includes('quarto.quarto'));
         assert.strictEqual(normalizedWhen(knit), RMD_KNIT_GATE);
         assert.strictEqual(knit?.group, 'navigation@5');
@@ -97,7 +98,7 @@ suite('Quarto menu gating', () => {
         }
     });
 
-    test('command palette mirrors qmd and trust gates; output stays ungated', () => {
+    test('command palette mirrors R-console, qmd, and trust gates; output stays ungated', () => {
         const pkg = loadPackageJson();
         const entries = pkg.contributes.menus.commandPalette;
         for (const command of ['raven.quarto.preview', 'raven.quarto.render']) {
