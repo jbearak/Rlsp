@@ -401,20 +401,22 @@ function decodeHtmlEntities(s: string): string {
 
 /**
 /**
- * `realpath`-resolve each root once, dropping any that don't exist.
- * Hoisted out of the per-image loop so containment is O(N + R), not
- * O(N×R), synchronous `realpath` calls.
+ * `realpath`-resolve each root once, dropping any that don't exist and
+ * de-duplicating the results (callers routinely pass the same directory
+ * twice — e.g. in `project` mode the workspace folder and the knit
+ * `root.dir` are identical). Hoisted out of the per-image loop so
+ * containment is O(N + R), not O(N×R), synchronous `realpath` calls.
  */
 function canonicalizeRoots(roots: string[]): string[] {
-    const out: string[] = [];
+    const seen = new Set<string>();
     for (const root of roots) {
         try {
-            out.push(fs.realpathSync(root));
+            seen.add(fs.realpathSync(root));
         } catch {
             // A root that doesn't exist can contain nothing — skip it.
         }
     }
-    return out;
+    return [...seen];
 }
 
 /**

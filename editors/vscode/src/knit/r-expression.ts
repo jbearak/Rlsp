@@ -314,18 +314,7 @@ export function buildKnitExpression(input: KnitExpressionInput): string {
         // `__` was unsuccessfully trying to be.
         ` if (!isTRUE(file.rename(.raven_tmp_output, .raven_output)))`,
         ` stop('Failed to rename ', .raven_tmp_output, ' to ', .raven_output);`,
-        ` cat('Output created: ', .raven_output, '\\n', sep = '');`,
-        // Report the EFFECTIVE knit root directory so the panel's image
-        // inliner can resolve a relative `include_graphics("images/x.png")`
-        // against the same base knitr used. This is read AFTER knit so a
-        // document that overrides it in a setup chunk
-        // (`knitr::opts_knit$set(root.dir = …)`) is reflected — a static
-        // guess from the working-directory mode cannot see that. Falls
-        // back to `getwd()` when `root.dir` is unset. `mustWork = FALSE`
-        // keeps a non-existent path from erroring the whole knit.
-        ` .raven_root <- knitr::opts_knit$get('root.dir');`,
-        ` if (is.null(.raven_root)) .raven_root <- getwd();`,
-        ` cat('Raven-knit-root: ', normalizePath(.raven_root, mustWork = FALSE), '\\n', sep = '')`,
+        ` cat('Output created: ', .raven_output, '\\n', sep = '')`,
         ' })',
     ].join('');
 }

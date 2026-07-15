@@ -759,12 +759,15 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         sourceUri: ctx.sourceUri,
         outputPath: htmlPath,
         output: ctx.output,
-        // Base for resolving relative `include_graphics` image paths.
-        // Prefer the effective `root.dir` the subprocess REPORTED (it
-        // reflects a runtime `opts_knit$set(root.dir=…)` override a
-        // setup chunk may have applied); fall back to the statically
-        // resolved value, then the subprocess cwd.
-        knitRootDir: outcome.rootDir ?? ctx.knitRootDir ?? ctx.cwd,
+        // Base for resolving relative `include_graphics` image paths:
+        // the knit `root.dir` (or the subprocess cwd when none was
+        // pinned). This is the directory Raven itself configured, so no
+        // round-trip to R is needed. A runtime `opts_knit$set(root.dir=…)`
+        // override in a setup chunk is NOT reflected here (knitr restores
+        // its option snapshot when `knit()` returns) — such documents
+        // should reference images by absolute path, as issue #627's own
+        // example does; see docs/knit.md.
+        knitRootDir: ctx.knitRootDir ?? ctx.cwd,
     });
     if (!panelResult.ok) {
         ctx.output.appendLine(`[panel] ${panelResult.error}`);

@@ -201,18 +201,7 @@ export type KnitOutcome =
     | { kind: 'timedOut'; timeoutMs?: number }
     | { kind: 'failed'; exitCode: number | null }
     | { kind: 'noOutput' }
-    | {
-        kind: 'ok';
-        parsedOutputs: string[];
-        cwd: string | undefined;
-        /**
-         * Effective knit `root.dir` the subprocess reported (captures a
-         * runtime `opts_knit$set(root.dir=…)` override), or `null` if
-         * the line was absent. The panel uses it as the base for
-         * relative `include_graphics` image resolution.
-         */
-        rootDir: string | null;
-    };
+    | { kind: 'ok'; parsedOutputs: string[]; cwd: string | undefined };
 
 /** Minimal subset of `runKnit`'s return value classify needs. */
 export interface ClassifyInput {
@@ -237,9 +226,9 @@ export function classify(
     if (result.cancelled) return { kind: 'cancelled' };
     if (result.timedOut) return { kind: 'timedOut' };
     if (result.exitCode !== 0) return { kind: 'failed', exitCode: result.exitCode };
-    const parsed = parseRenderedOutputPath(result.stdout + '\n' + result.stderr);
-    if (parsed.paths.length === 0) return { kind: 'noOutput' };
-    return { kind: 'ok', parsedOutputs: parsed.paths, cwd: ctx.cwd, rootDir: parsed.rootDir };
+    const parsed = parseRenderedOutputPath(result.stdout + '\n' + result.stderr).paths;
+    if (parsed.length === 0) return { kind: 'noOutput' };
+    return { kind: 'ok', parsedOutputs: parsed, cwd: ctx.cwd };
 }
 
 /**

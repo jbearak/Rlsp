@@ -84,32 +84,4 @@ describe('parseRenderedOutputPath', () => {
         expect(parseRenderedOutputPath(readFixture('all.txt')).paths)
             .toEqual(['example.html', 'example.pdf', 'example.docx']);
     });
-
-    test('parses the reported knit root directory', () => {
-        const stdout = [
-            'Output created: /proj/reports/.raven_output/report.md',
-            'Raven-knit-root: /proj',
-        ].join('\n');
-        const result = parseRenderedOutputPath(stdout);
-        expect(result.paths).toEqual(['/proj/reports/.raven_output/report.md']);
-        expect(result.rootDir).toBe('/proj');
-    });
-
-    test('rootDir is null when the root line is absent', () => {
-        expect(parseRenderedOutputPath('Output created: foo.md\n').rootDir).toBeNull();
-    });
-
-    test('the last reported root wins (matches R\'s last write)', () => {
-        const stdout = [
-            'Raven-knit-root: /first',
-            'Output created: foo.md',
-            'Raven-knit-root: /proj/override',
-        ].join('\n');
-        expect(parseRenderedOutputPath(stdout).rootDir).toBe('/proj/override');
-    });
-
-    test('parses a root path containing spaces', () => {
-        const stdout = 'Raven-knit-root: /Users/me/My Project\n';
-        expect(parseRenderedOutputPath(stdout).rootDir).toBe('/Users/me/My Project');
-    });
 });

@@ -44,25 +44,6 @@ describe('buildKnitExpression with chunk opts', () => {
         expect(expr).toContain("opts_chunk$set(fig.path = 'figure/')");
     });
 
-    it('emits the effective root.dir after knit for the image inliner', () => {
-        const expr = buildKnitExpression({
-            filePath: '/p/foo.Rmd',
-            outputPath: '/tmp/foo.md',
-            format: 'html_document',
-            knitRootDir: '/p',
-            baseDir: '/tmp/preview',
-            figPath: 'figure/',
-            chunkOpts: noChunkOpts,
-        });
-        // Reads opts_knit$get('root.dir') (reflecting any chunk override),
-        // falls back to getwd(), and reports it on its own line AFTER the
-        // knit so parseRenderedOutputPath can recover it.
-        expect(expr).toContain("knitr::opts_knit$get('root.dir')");
-        expect(expr).toContain('getwd()');
-        expect(expr).toContain("cat('Raven-knit-root: '");
-        expect(expr.indexOf('knitr::knit(')).toBeLessThan(expr.indexOf('Raven-knit-root:'));
-    });
-
     it('omits the YAML opts_chunk$set call when chunkOpts is empty', () => {
         const expr = buildKnitExpression({
             filePath: '/p/foo.Rmd',

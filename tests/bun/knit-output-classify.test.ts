@@ -92,30 +92,4 @@ describe('classify', () => {
         expect(outcome.kind).toBe('ok');
         if (outcome.kind === 'ok') expect(outcome.cwd).toBeUndefined();
     });
-
-    test('ok outcome carries the reported knit root directory', () => {
-        const outcome = classify({
-            spawnError: null,
-            cancelled: false,
-            timedOut: false,
-            exitCode: 0,
-            stdout: 'Output created: out.md\nRaven-knit-root: /proj\n',
-            stderr: '',
-        }, { cwd: '/wd' });
-        expect(outcome.kind).toBe('ok');
-        if (outcome.kind === 'ok') expect(outcome.rootDir).toBe('/proj');
-    });
-
-    test('ok outcome rootDir is null when the root line is absent', () => {
-        const outcome = classify({
-            spawnError: null,
-            cancelled: false,
-            timedOut: false,
-            exitCode: 0,
-            stdout: 'Output created: out.md\n',
-            stderr: '',
-        }, { cwd: '/wd' });
-        expect(outcome.kind).toBe('ok');
-        if (outcome.kind === 'ok') expect(outcome.rootDir).toBeNull();
-    });
 });
