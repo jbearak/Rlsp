@@ -227,9 +227,11 @@ export function inlineLocalImagesAsDataUrls(
         let mime: string | null = null;
         // Every path we resolved and tried to canonicalize, so a failure
         // diagnostic can name all the bases attempted (docDir AND
-        // root.dir) rather than only the first.
+        // root.dir) rather than only the first. A non-empty `attempted`
+        // also doubles as "at least one candidate had a known image
+        // extension" (both happen on the same branch past the `candMime`
+        // guard below), so no separate flag is needed.
         const attempted: string[] = [];
-        let sawKnownExt = false;
         // BASE is the outer loop so `docDir` is exhausted (both path
         // spellings) before `root.dir` — the documented docDir-first
         // precedence. SPELLING is inner so within a base the decoded
@@ -247,7 +249,6 @@ export function inlineLocalImagesAsDataUrls(
                 // Unknown extensions are passed through; we don't read
                 // arbitrary file types off disk.
                 if (!candMime) continue;
-                sawKnownExt = true;
                 const cleaned = isAbsolute ? cand : cand.replace(/^\.\//, '');
                 const resolved = base === undefined
                     ? path.resolve(cleaned)
@@ -274,7 +275,7 @@ export function inlineLocalImagesAsDataUrls(
             }
         }
         // No candidate had a known image extension — leave the tag alone.
-        if (!sawKnownExt) return match;
+        if (attempted.length === 0) return match;
         if (realResolved === null || logicalResolved === null || mime === null) {
             // The path looked inlinable but didn't resolve inside an
             // allowed root (missing, unreadable, or outside the
