@@ -357,6 +357,55 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
+    test('treats a resolveBase as an allowed root without a duplicate additionalRoots entry', () => {
+        withTempDir((project) => {
+            const docDir = path.join(project, 'reports', '.raven_output');
+            const imgDir = path.join(project, 'images');
+            fs.mkdirSync(docDir, { recursive: true });
+            fs.mkdirSync(imgDir, { recursive: true });
+            fs.writeFileSync(path.join(imgDir, 'logo.png'), TINY_PNG);
+            // Only resolveBases is given (no additionalRoots): the base
+            // must still be allowed for containment, or resolution would
+            // succeed but every result be rejected.
+            const html = '<img src="images/logo.png">';
+            const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                resolveBases: [project],
+            });
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('re-escapes a decoded #fragment so it cannot break out of the src attribute', () => {
+        withTempDir((dir) => {
+            const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
+            fs.writeFileSync(path.join(dir, 'x.svg'), svg);
+            // The source fragment contains an entity-encoded quote; after
+            // entity-decoding it would be a raw `"` that must be
+            // re-escaped when spliced back into src="…".
+            const html = '<img src="x.svg#a&quot;b">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/svg+xml;base64,');
+            // The quote rides along re-escaped, not raw.
+            expect(out).toContain('#a&quot;b');
+            // Exactly one src attribute — the tag wasn't corrupted into two.
+            expect(out.match(/\bsrc=/g)?.length).toBe(1);
+        });
+    });
+
+    test.skipIf(!SYMLINKS_SUPPORTED)('labels a symlinked image by its target type, not the link name', () => {
+        withTempDir((dir) => {
+            const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>';
+            fs.writeFileSync(path.join(dir, 'real.svg'), svg);
+            // `logo.png` is a symlink to an SVG; the data URL MIME must
+            // match the bytes actually read (svg), not the .png link name.
+            fs.symlinkSync(path.join(dir, 'real.svg'), path.join(dir, 'logo.png'));
+            const html = '<img src="logo.png">';
+            const out = inlineLocalImagesAsDataUrls(html, dir);
+            expect(out).toContain('src="data:image/svg+xml;base64,');
+            expect(out).not.toContain('data:image/png;base64,');
+        });
+    });
+
     test('blocks an absolute path outside every allowed root', () => {
         withTempDir((workspace) => {
             const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-outside-'));

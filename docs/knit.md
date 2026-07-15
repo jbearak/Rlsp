@@ -272,10 +272,11 @@ when an R Markdown file is open.
     or the knit `root.dir`. A path outside every root is left untouched.
     The `root.dir` used here is the one Raven configures from
     `raven.knit.workingDirectory` (document dir / project root / current
-    dir); a document that overrides it at runtime with
-    `knitr::opts_knit$set(root.dir = …)` in a setup chunk is not tracked
-    for *relative* images — reference those by absolute path (e.g.
-    `normalizePath(...)`, as an existing-image workflow typically does).
+    dir); if R changes its effective directory at runtime — a setup
+    chunk's `knitr::opts_knit$set(root.dir = …)` or an `.Rprofile`
+    `setwd()` — that is not tracked for *relative* images. Reference
+    those by absolute path (e.g. `normalizePath(...)`, as an
+    existing-image workflow typically does).
     To keep `include_graphics()` from failing the knit by relativizing
     an absolute path against `root.dir`, Raven sets
     `options(knitr.graphics.rel_path = FALSE)` for its knit subprocess

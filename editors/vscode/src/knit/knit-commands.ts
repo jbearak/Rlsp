@@ -766,11 +766,12 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         // (`resolveKnitDir` leaves `cwd` undefined there, and
         // `child_process` then inherits the parent cwd). This is the
         // directory Raven itself configured or knows, so no round-trip
-        // to R is needed. A runtime `opts_knit$set(root.dir=…)` override
-        // in a setup chunk is NOT reflected here (knitr restores its
-        // option snapshot when `knit()` returns) — such documents should
-        // reference images by absolute path, as issue #627's own example
-        // does; see docs/knit.md.
+        // to R is needed. What this static base does NOT see is R
+        // changing its effective directory at runtime — a setup chunk's
+        // `opts_knit$set(root.dir=…)` (knitr restores the snapshot when
+        // `knit()` returns) or an `.Rprofile` `setwd()`. Documents that
+        // do either should reference images by absolute path, as issue
+        // #627's own example does; see docs/knit.md.
         knitRootDir: ctx.knitRootDir ?? ctx.cwd ?? process.cwd(),
     });
     if (!panelResult.ok) {

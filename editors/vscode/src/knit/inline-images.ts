@@ -107,8 +107,10 @@ export interface InlineImagesOptions {
      * to the preview output dir (`docDir`), while an author's
      * `knitr::include_graphics("images/logo.png")` is relative to the
      * knit working directory (`root.dir`). The panel passes `root.dir`
-     * here so both resolve; each candidate is still `realpath`-gated by
-     * `additionalRoots`. Bases are tried in order, `docDir` first.
+     * here so both resolve; bases are tried in order, `docDir` first.
+     * Every base is automatically also an allowed containment root (a
+     * base you can resolve against but not read from would be useless),
+     * so callers need not repeat it in `additionalRoots`.
      */
     resolveBases?: string[];
 }
@@ -122,8 +124,14 @@ export function inlineLocalImagesAsDataUrls(
     // Canonicalize the allowed roots ONCE (not per image): a document
     // with N images and R roots would otherwise do O(N×R) synchronous
     // `realpath` calls on the extension host. Non-existent roots drop
-    // out here.
-    const canonicalRoots = canonicalizeRoots([docDir, ...(options.additionalRoots ?? [])]);
+    // out here. Every `resolveBases` entry is also an allowed root — a
+    // base you resolve against but can't read from would be useless, and
+    // requiring callers to repeat it in `additionalRoots` is a trap.
+    const canonicalRoots = canonicalizeRoots([
+        docDir,
+        ...(options.additionalRoots ?? []),
+        ...(options.resolveBases ?? []),
+    ]);
     // Quote-aware `<img>` matcher: the attribute run is a sequence of
     // double-quoted strings, single-quoted strings, or non-quote /
     // non-`>` characters, so a literal `>` inside an attribute value
@@ -245,7 +253,13 @@ export function inlineLocalImagesAsDataUrls(
                 if (real !== null) {
                     realResolved = real;
                     logicalResolved = resolved;
-                    mime = candMime;
+                    // MIME must match the bytes we actually read, which
+                    // come from the canonical (realpath) file — a symlink
+                    // `logo.png` → `logo.svg` must be labeled
+                    // `image/svg+xml`, not `image/png`. Fall back to the
+                    // requested extension's type when the canonical file
+                    // has no / an unknown extension.
+                    mime = mimeForImageExtension(path.extname(real).toLowerCase()) ?? candMime;
                     break outer;
                 }
             }
@@ -284,9 +298,17 @@ export function inlineLocalImagesAsDataUrls(
             return match;
         }
 
+        // `srcSuffix` (the `#fragment`) was HTML-entity-DECODED with the
+        // rest of `src`, so it can now contain a raw `"` or `&` (e.g.
+        // from `&quot;`/`&amp;` in the source). Re-escape for the
+        // double-quoted attribute context before splicing it back, or a
+        // decoded `"` would break out of the `src="…"` attribute and
+        // corrupt the tag. (The `data:…;base64,` prefix and the base64
+        // payload contain no attribute-special characters, so escaping
+        // is a no-op for them.)
         const dataUrl = `data:${mime};base64,${bytes.toString('base64')}${srcSuffix}`;
         const rewrittenAttrs = attrs.slice(0, srcAttr.start)
-            + `src="${dataUrl}"`
+            + `src="${escapeHtmlAttributeValue(dataUrl)}"`
             + attrs.slice(srcAttr.end);
         const finalAttrs = options.markSvgPlots && ext === '.svg' && isKnitFigurePath(normalizedRelative)
             ? withImgAttribute(rewrittenAttrs, 'data-raven-plot-svg', 'true')
@@ -381,6 +403,18 @@ const NAMED_ENTITIES: Readonly<Record<string, string>> = {
  * rather than `<`. An out-of-range or malformed numeric reference is
  * left verbatim.
  */
+/**
+ * Escape a string for use inside a double-quoted HTML attribute value.
+ * `&` first so we don't double-escape the entities we introduce.
+ */
+function escapeHtmlAttributeValue(s: string): string {
+    return s
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
 function decodeHtmlEntities(s: string): string {
     return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, body: string) => {
         if (body[0] === '#') {

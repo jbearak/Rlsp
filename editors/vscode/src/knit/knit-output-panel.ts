@@ -790,8 +790,9 @@ export class KnitOutputPanel {
         //     which is `root.dir` in the default `document` mode and a
         //     sensible guess on a serializer restore with no re-knit).
         //   - `additionalRoots`: the containment allow-list — the
-        //     workspace folder containing the source, plus `root.dir`
-        //     itself in case it sits outside that folder.
+        //     workspace folder containing the source. (`rootBase` is
+        //     allowed automatically: the inliner treats every
+        //     `resolveBases` entry as an allowed root too.)
         // Scoping to the containing workspace folder (not every open
         // folder) keeps the boundary to the project being previewed; the
         // inliner still `realpath`-guards containment.
@@ -802,7 +803,7 @@ export class KnitOutputPanel {
         htmlContent = inlineLocalImagesAsDataUrls(htmlContent, docDir, this.output, {
             markSvgPlots: true,
             resolveBases: [rootBase],
-            additionalRoots: [workspaceRoot, rootBase],
+            additionalRoots: [workspaceRoot],
         });
         this.panel.webview.html = buildShellHtml({
             htmlContent,
