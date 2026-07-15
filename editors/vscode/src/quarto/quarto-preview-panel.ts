@@ -412,20 +412,23 @@ export class QuartoPreviewPanel {
     }
 
     private createThemeController(): QuartoThemeController {
-        let cachedLanguageId = 'quarto';
+        // Scope the cached languageId per source file: when the panel is
+        // retargeted to a source whose document is not open, it must fall back
+        // to the default rather than inherit the previous source's language.
+        const cachedLanguageIds = new Map<string, string>();
         const sourceScope = (sourceFsPath: string): {
             uri: vscode.Uri;
             languageId: string;
         } => {
             for (const document of vscode.workspace.textDocuments) {
                 if (document.uri.fsPath === sourceFsPath) {
-                    cachedLanguageId = document.languageId;
+                    cachedLanguageIds.set(sourceFsPath, document.languageId);
                     break;
                 }
             }
             return {
                 uri: vscode.Uri.file(sourceFsPath),
-                languageId: cachedLanguageId,
+                languageId: cachedLanguageIds.get(sourceFsPath) ?? 'quarto',
             };
         };
 

@@ -268,6 +268,34 @@ describe('QuartoPreviewProxy HTTP passthrough', () => {
         }
     });
 
+    it('rejects a WebSocket Origin from a different loopback port', async () => {
+        // A page served from another localhost origin must not be able to open
+        // the proxied live-reload socket, even though its Origin is loopback.
+        let upgradeReached = false;
+        const upstream = http.createServer();
+        upstream.on('upgrade', (_request, socket) => {
+            upgradeReached = true;
+            socket.destroy();
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const ready = await proxy.start();
+            const response = await rawSocketRequest(
+                ready.origin,
+                'GET /live-reload HTTP/1.1\r\n' +
+                `Host: ${new URL(ready.origin).host}\r\n` +
+                'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+                'Origin: http://127.0.0.1:1\r\n\r\n',
+            );
+            expect(upgradeReached).toBe(false);
+            expect(response.toString()).not.toContain('101');
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
     it('rejects a WebSocket upgrade carrying a cross-site Origin when enforcing', async () => {
         // The proxy contacts the upstream only after the Host/Origin check
         // passes, so a rejected handshake never reaches the upstream's upgrade

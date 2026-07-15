@@ -200,21 +200,28 @@ export class QuartoPreviewProxy implements QuartoPreviewProxyLike {
         }
     }
 
+    /**
+     * Whether a request's `Origin` is safe to relay to the loopback upstream.
+     * A browser sends `Origin` on every cross-origin fetch/WebSocket, so an
+     * absent `Origin` is a non-browser client, not the hijacking vector. A
+     * present `Origin` must be **exactly** this proxy's own loopback origin or
+     * the browser-facing origin it was mapped to — NOT merely some loopback
+     * host: a page served from a different `localhost`/`127.0.0.1` port is a
+     * distinct origin and must not be able to open the proxied WebSocket
+     * (whose hostile `Origin` would otherwise be rewritten to the trusted
+     * upstream). Userinfo (`@`) is rejected because `.origin` discards it.
+     */
     private isAllowedOrigin(origin: string | undefined): boolean {
-        if (isLoopbackOrigin(origin)) return true;
-        if (this.browserFacingOrigin === null ||
-            origin === undefined || origin.includes('@')) {
-            // Mirror the Host branch's `@` guard: any userinfo (`user@`, bare
-            // `@`, `:@`) is rejected, since `.origin` would discard it and let
-            // `https://x@browser-facing-host` match. A real browser Origin never
-            // carries userinfo.
-            return false;
-        }
+        if (origin === undefined) return true;
+        if (origin.includes('@')) return false;
+        let parsed: string;
         try {
-            return new URL(origin).origin === this.browserFacingOrigin;
+            parsed = new URL(origin).origin;
         } catch {
             return false;
         }
+        return parsed === this.ready?.origin ||
+            (this.browserFacingOrigin !== null && parsed === this.browserFacingOrigin);
     }
 
     private forwardHttp(
@@ -667,27 +674,6 @@ function isLoopbackHostHeader(host: string | undefined): boolean {
     let url: URL;
     try {
         url = new URL(`http://${host}`);
-    } catch {
-        return false;
-    }
-    return isLoopbackUrl(url);
-}
-
-/**
- * Whether a WebSocket upgrade's `Origin` is safe to relay to the loopback
- * upstream. A browser sends `Origin` on every WebSocket handshake, so a
- * loopback-only rule blocks cross-site WebSocket hijacking of the live-reload
- * socket by a page on another origin (whose `Origin` would otherwise be
- * overwritten with the trusted upstream one). An absent `Origin` is a
- * non-browser client (not the hijacking vector); `null` and any other origin
- * are rejected.
- */
-function isLoopbackOrigin(origin: string | undefined): boolean {
-    if (origin === undefined) return true;
-    if (origin.includes('@')) return false;
-    let url: URL;
-    try {
-        url = new URL(origin);
     } catch {
         return false;
     }
