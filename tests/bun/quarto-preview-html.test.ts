@@ -16,6 +16,11 @@ function args(state: QuartoPreviewViewState): QuartoPreviewShellHtmlArgs {
 }
 
 describe('buildQuartoPreviewShellHtml', () => {
+    test('resets host body spacing so the shell fills the webview', () => {
+        const html = buildQuartoPreviewShellHtml(args({ kind: 'starting' }));
+        expect(html).toMatch(/body\s*\{[^}]*margin:\s*0;[^}]*padding:\s*0;/);
+    });
+
     test('serving state pins frame-src to the mapped origin', () => {
         const html = buildQuartoPreviewShellHtml(
             args({ kind: 'serving', externalUrl: 'https://mapped.example.test/preview/?x=1' }),
