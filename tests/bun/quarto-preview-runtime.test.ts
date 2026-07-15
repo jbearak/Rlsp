@@ -164,26 +164,173 @@ describe('QuartoRuntime generation discipline', () => {
         expect((await second).generation).toBe(2);
     });
 
-    it('Stop cancels pending Preview intent before a session exists', async () => {
+    it('Stop reports cancelled-pending (not stopped) when it only cancels an intent', async () => {
         const h = harness();
         const source = '/project/pending.qmd';
         const pending = h.runtime.registerPendingStart(source);
 
-        expect(await h.runtime.stopByLookup('/project', source)).toBe('stopped');
+        // No session exists — only a preflight intent is cancelled. That must
+        // stay distinct from 'stopped' so the command layer still runs its
+        // project-key fallback for a preview owned under a different key.
+        expect(await h.runtime.stopByLookup('/project', source)).toBe('cancelled-pending');
         expect(h.runtime.reconcilePendingStart(pending, '/project')).toBe(false);
         expect(h.runtime.consumePendingStart(pending)).toBe(false);
         expect(h.processes).toHaveLength(0);
         expect(await h.runtime.stopByLookup('/project', source)).toBe('none');
     });
 
-    it('generation Stop cancels a reconciled pending Preview intent', async () => {
+    it('panel-dispose Stop from a non-owning generation leaves a pending Preview intact', async () => {
         const h = harness();
         const pending = h.runtime.registerPendingStart('/project/pending.qmd');
         expect(h.runtime.reconcilePendingStart(pending, '/project')).toBe(true);
 
-        expect(await h.runtime.stopGeneration('/project', 99)).toBe('stopped');
+        // A stale or restored panel whose generation owns no live session must
+        // not cancel a fresh pending Preview for the same key: panel disposal
+        // is generation-scoped, and a pending intent is a strictly newer start.
+        expect(await h.runtime.stopGeneration('/project', 99)).toBe('none');
+        expect(h.runtime.consumePendingStart(pending)).toBe(true);
+        expect(h.processes).toHaveLength(0);
+    });
+
+    it('abandons a pending Preview whose key was Stopped during context discovery', async () => {
+        const h = harness();
+        // A registers a pending Preview; its project key is not yet known.
+        const pending = h.runtime.registerPendingStart('/project/a.qmd');
+
+        // A sibling Stop targets the project key while A is still in preflight
+        // discovery. cancelPendingStarts cannot match A by key (still null),
+        // so it records the stop epoch instead of cancelling A directly.
+        expect(await h.runtime.stopByLookup('/project', '/project/b.qmd')).toBe('none');
+
+        // When A finally learns its project key, reconcile detects the Stop
+        // that landed in the register→reconcile window and abandons the intent,
+        // so the preview cannot launch after the user's Stop reported nothing.
+        expect(h.runtime.reconcilePendingStart(pending, '/project')).toBe(false);
         expect(h.runtime.consumePendingStart(pending)).toBe(false);
         expect(h.processes).toHaveLength(0);
+    });
+
+    it('a shared stop epoch spares a sibling Preview registered mid-Stop', async () => {
+        const h = harness();
+        // A multi-phase Stop for doc A allocates ONE epoch up front, then runs
+        // its lexical-key phase (finds nothing).
+        const stopEpoch = h.runtime.beginStop();
+        expect(
+            await h.runtime.stopByLookup('/project/a.qmd', '/project/a.qmd', stopEpoch),
+        ).toBe('none');
+
+        // A sibling Preview for B is launched *after* the Stop was issued, in
+        // the gap before the Stop's project-key phase resolves.
+        const pendingB = h.runtime.registerPendingStart('/project/b.qmd');
+
+        // The Stop's project-key fallback records the SAME issue-time epoch, so
+        // B — registered after the Stop began — must not be mistaken for an
+        // intent that predated it. (A per-phase epoch bump would abandon B.)
+        expect(
+            await h.runtime.stopByLookup('/project', '/project/a.qmd', stopEpoch),
+        ).toBe('none');
+        expect(h.runtime.reconcilePendingStart(pendingB, '/project')).toBe(true);
+        expect(h.runtime.consumePendingStart(pendingB)).toBe(true);
+    });
+
+    it('a delayed Stop phase does not delete a sibling Preview registered after the Stop', async () => {
+        const h = harness();
+        // Stop is issued first (epoch allocated), then a sibling Preview for the
+        // same project is launched and even reconciles to the project key.
+        const stopEpoch = h.runtime.beginStop();
+        const pendingB = h.runtime.registerPendingStart('/project/b.qmd');
+        expect(h.runtime.reconcilePendingStart(pendingB, '/project')).toBe(true);
+
+        // The Stop's delayed project-key phase directly matches key '/project',
+        // but B registered *after* the Stop was issued, so the epoch-gated
+        // direct cancel must skip it — a newer request, not one the Stop meant
+        // to abandon.
+        expect(
+            await h.runtime.stopByLookup('/project', '/project/a.qmd', stopEpoch),
+        ).toBe('none');
+        expect(h.runtime.consumePendingStart(pendingB)).toBe(true);
+    });
+
+    it('Stop via source alias abandons a sibling pending Preview for the same project', async () => {
+        const h = harness();
+        // A project preview runs from doc.qmd: session keyed by project root
+        // '/project', reachable through the doc.qmd source alias.
+        const started = h.runtime.startOrRestart(startArgs);
+        await waitForProcessCount(h.processes, 1);
+        h.processes[0].process.ready.resolve({
+            rawUrl: 'http://127.0.0.1:1/',
+            origin: 'http://127.0.0.1:1',
+            statusCode: 200,
+        });
+        await started;
+
+        // A sibling Preview for another file in the same project is mid-
+        // discovery — pending, project key not yet known.
+        const pendingB = h.runtime.registerPendingStart('/project/chapter.qmd');
+
+        // Stop from doc.qmd resolves the session by its source alias, so the
+        // lookup key ('/project/doc.qmd') differs from the session key
+        // ('/project'). The stop epoch must still be recorded for '/project'.
+        const stopEpoch = h.runtime.beginStop();
+        expect(
+            await h.runtime.stopByLookup('/project/doc.qmd', '/project/doc.qmd', stopEpoch),
+        ).toBe('stopped');
+
+        // The sibling must not relaunch the preview the instant Stop succeeds.
+        expect(h.runtime.reconcilePendingStart(pendingB, '/project')).toBe(false);
+        expect(h.runtime.consumePendingStart(pendingB)).toBe(false);
+    });
+
+    it('a cancelled intent outranks an already-stopping session in the stop result', async () => {
+        const h = harness();
+        const started = h.runtime.startOrRestart(startArgs);
+        await waitForProcessCount(h.processes, 1);
+        const proc = h.processes[0].process;
+        proc.ready.resolve({
+            rawUrl: 'http://127.0.0.1:1/',
+            origin: 'http://127.0.0.1:1',
+            statusCode: 200,
+        });
+        await started;
+
+        // Begin stopping the session, holding its teardown so it stays
+        // 'stopping', then register and cancel a fresh pending for the same
+        // key with a second Stop while the first is still draining.
+        proc.stopDeferred = new Deferred<void>();
+        const firstStop = h.runtime.stopByLookup('/project', '/project/doc.qmd');
+        const pending = h.runtime.registerPendingStart('/project/doc.qmd');
+        expect(h.runtime.reconcilePendingStart(pending, '/project')).toBe(true);
+
+        // The second Stop cancelled a real intent; that success must not be
+        // downgraded to a silent 'already-stopping' no-op.
+        expect(await h.runtime.stopByLookup('/project', '/project/doc.qmd')).toBe('cancelled-pending');
+
+        proc.stopDeferred.resolve();
+        expect(await firstStop).toBe('stopped');
+    });
+
+    it('an older Stop resolving late does not un-abandon what a newer Stop caught', async () => {
+        const h = harness();
+        // Stop A is issued first (epoch 1) but stalls before its project-key
+        // phase runs.
+        const epochA = h.runtime.beginStop();
+
+        // A sibling Preview registers while Stop A is stalled.
+        const pending = h.runtime.registerPendingStart('/project/chapter.qmd');
+
+        // Stop B is issued later (epoch 2) and completes its project-key phase
+        // first, arming the epoch that should abandon the sibling intent.
+        const epochB = h.runtime.beginStop();
+        expect(epochB).toBeGreaterThan(epochA);
+        expect(await h.runtime.stopByLookup('/project', '/project/b.qmd', epochB)).toBe('none');
+
+        // Stop A's delayed project-key phase now resolves with its older epoch.
+        // A plain overwrite would regress the key's epoch below B's and let the
+        // sibling survive; the monotonic record must keep B's higher epoch.
+        expect(await h.runtime.stopByLookup('/project', '/project/a.qmd', epochA)).toBe('none');
+
+        expect(h.runtime.reconcilePendingStart(pending, '/project')).toBe(false);
+        expect(h.runtime.consumePendingStart(pending)).toBe(false);
     });
 
     it('simultaneous Start/Start claims generation 2 before generation 1 can finish', async () => {

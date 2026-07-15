@@ -32,6 +32,7 @@ import { openExportedFile, type ExportFormat } from '../knit/open-exported-file'
 import { parseRenderedOutputPath } from '../knit/output-path';
 import { canonicalOpKey } from '../knit/raven-knit-paths';
 import { extractFrontmatter, parseFrontmatter } from '../knit/yaml-frontmatter';
+import { cancelableDelay } from './quarto-cancelable-delay';
 import { QuartoNotFoundError, type QuartoResolver } from './quarto-detect';
 import { QuartoCommandLifecycle } from './quarto-command-lifecycle';
 import { isShinyServerDocument } from './quarto-frontmatter';
@@ -44,6 +45,7 @@ import { isQuartoProjectMarkerFile } from './quarto-project-fs';
 import type {
     QuartoPendingStart,
     QuartoRuntime,
+    QuartoStopResult,
 } from './quarto-preview-runtime';
 import {
     classifyQuartoRenderResult,
@@ -63,7 +65,10 @@ export interface QuartoCommandDeps {
         | 'reconcilePendingStart'
         | 'consumePendingStart'
         | 'releasePendingStart'
-    >;
+    >
+        // Optional so command-policy test fakes need not stub them; the
+        // production runtime always provides both.
+        & Partial<Pick<QuartoRuntime, 'beginStop' | 'hasPendingStarts'>>;
     output: vscode.OutputChannel;
     runRender: (opts: QuartoRenderOptions) => Promise<KnitEngineResult>;
     resolveContext?: (sourceFsPath: string) => Promise<QuartoContext>;
@@ -71,6 +76,8 @@ export interface QuartoCommandDeps {
     openTextDocument?: (uri: vscode.Uri) => Thenable<vscode.TextDocument>;
     /** Dependency-injected clock for render-output freshness tests. */
     now?: () => number;
+    /** Project-discovery timeout override; tests use a tiny bound. */
+    contextTimeoutMs?: number;
 }
 
 export interface QuartoPreflight {
@@ -105,9 +112,8 @@ export function registerQuartoCommands(
             commandLifecycle.run(() => runPreviewCommand(uri, deps))),
         vscode.commands.registerCommand('raven.quarto.render', (uri?: vscode.Uri) =>
             commandLifecycle.run(() => runGuardedRender(uri))),
-        vscode.commands.registerCommand('raven.quarto.stopPreview', async (uri?: vscode.Uri) => {
-            await runStopCommand(uri, deps);
-        }),
+        vscode.commands.registerCommand('raven.quarto.stopPreview', (uri?: vscode.Uri) =>
+            commandLifecycle.run(() => runStopCommand(uri, deps))),
         vscode.commands.registerCommand('raven.quarto.openOutputChannel', () => {
             deps.output.show(true);
         }),
@@ -317,21 +323,55 @@ async function runStopCommand(
         );
         return;
     }
-    // Preserve pending-start cancellation without waiting for remote-fs
-    // discovery. A running project preview is normally found by source alias;
-    // only a different physical alias needs the async project-key fallback.
+    // Take the fast lexical/source-alias path first and avoid remote-fs project
+    // discovery on the common case. Allocate one stop epoch synchronously,
+    // before any await, and share it across both phases: this stamps the Stop at
+    // its issue time so a Preview for a sibling file launched *after* this click
+    // is not abandoned by the (later) project-key phase's epoch record.
+    const stopEpoch = deps.runtime.beginStop?.();
     const lexicalKey = canonicalOpKey(uri);
-    let outcome = await deps.runtime.stopByLookup(lexicalKey, uri.fsPath);
-    if (outcome === 'none') {
-        const quartoContext = await resolveContextForSource(uri.fsPath, deps);
-        if (quartoContext.key !== lexicalKey) {
-            outcome = await deps.runtime.stopByLookup(
-                quartoContext.key,
-                uri.fsPath,
-            );
+    let outcome = await deps.runtime.stopByLookup(lexicalKey, uri.fsPath, stopEpoch);
+    const stoppedSession = outcome === 'stopped';
+    // Whether the fast lexical phase already found something (a stopped session,
+    // a cancelled intent, or an in-progress stop). Used to decide the outcome
+    // floor and whether a failed project-discovery phase is worth surfacing.
+    const lexicalFoundSomething = outcome !== 'none';
+    // Run the async project-key phase when either:
+    //  - no session was stopped lexically (a project preview may still run under
+    //    the discovered project key), or
+    //  - a session WAS stopped but an intent is still pending — the stopped
+    //    session's key can differ from the current project key (project markers
+    //    changed since it started), so the project key needs its stop epoch
+    //    recorded to abandon a sibling intent that predates this Stop.
+    const needProjectPhase =
+        !stoppedSession || (deps.runtime.hasPendingStarts?.() ?? false);
+    if (needProjectPhase) {
+        try {
+            const quartoContext = await resolveContextForSource(uri.fsPath, deps);
+            if (quartoContext.key !== lexicalKey) {
+                const fallback = await deps.runtime.stopByLookup(
+                    quartoContext.key,
+                    uri.fsPath,
+                    stopEpoch,
+                );
+                // Keep the strongest result of the two phases. This preserves a
+                // lexical 'stopped'/'cancelled-pending'/'already-stopping' as a
+                // floor so a weaker fallback cannot downgrade it — e.g. a second
+                // Stop during teardown ('already-stopping') must not become a
+                // misleading "no preview running" ('none') just because the
+                // project-key lookup found nothing.
+                outcome = strongerStopResult(outcome, fallback);
+            }
+        } catch (err) {
+            // Project discovery can fail or hang (a wedged remote filesystem).
+            // It must not discard work the lexical phase already did — a stopped
+            // session, a cancelled intent, or an already-stopping session are
+            // all "found something", and the project-key phase is best-effort.
+            // Only surface the error when the Stop had otherwise found nothing.
+            if (!lexicalFoundSomething) throw err;
         }
     }
-    if (outcome === 'stopped') {
+    if (outcome === 'stopped' || outcome === 'cancelled-pending') {
         await vscode.window.showInformationMessage('Quarto preview stopped.');
     } else if (outcome === 'none') {
         await vscode.window.showInformationMessage(
@@ -339,6 +379,25 @@ async function runStopCommand(
         );
     }
     // already-stopping is intentionally a silent no-op.
+}
+
+/**
+ * Merge two Stop phases' results, keeping the more meaningful one so a weaker
+ * later phase never masks work an earlier phase already reported. Ranked:
+ * stopped a session > cancelled a pending intent > a stop already in progress
+ * > nothing found.
+ */
+function strongerStopResult(
+    a: QuartoStopResult,
+    b: QuartoStopResult,
+): QuartoStopResult {
+    const rank: Record<QuartoStopResult, number> = {
+        stopped: 3,
+        'cancelled-pending': 2,
+        'already-stopping': 1,
+        none: 0,
+    };
+    return rank[a] >= rank[b] ? a : b;
 }
 
 function createQuartoRenderRunner(deps: QuartoCommandDeps): QuartoRenderRunner {
@@ -403,6 +462,26 @@ function renderGuardKey(
     return `${kind}:${context.key}`;
 }
 
+/**
+ * Hard bound on project-context discovery. `realpath` and the ancestor
+ * marker-file walk are ordinary filesystem calls that return in microseconds
+ * on a local disk, but can wedge indefinitely on an unavailable network mount.
+ * A hang here would otherwise stall Stop (holding deactivation up to its bound)
+ * and pin a Preview intent in preflight forever; the timeout turns that
+ * un-catchable hang into a rejection every caller already handles.
+ */
+export const QUARTO_CONTEXT_TIMEOUT_MS = 10_000;
+
+class QuartoContextTimeoutError extends Error {
+    constructor(sourceFsPath: string, timeoutMs: number) {
+        super(
+            `Quarto project discovery for ${sourceFsPath} timed out after ` +
+            `${timeoutMs}ms (filesystem slow or unavailable).`,
+        );
+        this.name = 'QuartoContextTimeoutError';
+    }
+}
+
 async function resolveContextForSource(
     sourceFsPath: string,
     deps: QuartoCommandDeps,
@@ -412,7 +491,20 @@ async function resolveContextForSource(
             realpath: fs.promises.realpath,
             isProjectMarkerFile: isQuartoProjectMarkerFile,
         }));
-    return await resolveContext(sourceFsPath);
+    const timeoutMs = deps.contextTimeoutMs ?? QUARTO_CONTEXT_TIMEOUT_MS;
+    const bound = cancelableDelay(timeoutMs);
+    try {
+        const result = await Promise.race([
+            resolveContext(sourceFsPath).then((ctx) => ({ ok: true as const, ctx })),
+            bound.promise.then(() => ({ ok: false as const })),
+        ]);
+        if (!result.ok) {
+            throw new QuartoContextTimeoutError(sourceFsPath, timeoutMs);
+        }
+        return result.ctx;
+    } finally {
+        bound.cancel();
+    }
 }
 
 async function runRenderProcess(
