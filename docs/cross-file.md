@@ -183,6 +183,9 @@ Packages loaded in child files do NOT propagate back to parents (forward-only).
 | `sapply(libs, library, character.only = TRUE)` where `libs <- c("a","b")` | Yes (same-file variable) |
 | `purrr::map(c("a","b"), library, character.only = TRUE)` | Yes (purrr family) |
 | `sapply(paste0(...), library, character.only = TRUE)` | No (dynamic vector) |
+| `tar_option_set(packages = c("a","b"))` | Yes, when the file also attaches targets (see below) |
+| `targets::tar_option_set(packages = "a")` | Yes (qualified — no `library(targets)` needed) |
+| `tar_option_set(TRUE, c("a"))` | No (positional `packages` is not matched) |
 
 ### Apply-Family Loads
 
@@ -202,6 +205,50 @@ a literal vector. `character.only = TRUE` must be present (without it, R
 itself would not load the strings as packages). Dynamic constructions such as
 `paste0(...)`, `tolower(x)`, `c(libs1, libs2)`, function-parameter origins,
 or values defined in another file are silently ignored.
+
+### targets::tar_option_set() Loads
+
+Raven treats a [{targets}](https://docs.ropensci.org/targets/)
+`tar_option_set(packages = ...)` call as a package attachment — targets
+attaches the listed packages before running each target, so scripts sourced by
+`_targets.R` use their exports as bare names:
+
+```r
+# _targets.R
+library(targets)
+tar_option_set(packages = c("dplyr", "tidyr"))
+source("R/functions.R")  # dplyr and tidyr verbs resolve in functions.R
+```
+
+Details:
+
+- **Bare vs. qualified callee.** The qualified spellings
+  `targets::tar_option_set(...)` / `targets:::tar_option_set(...)` are
+  recognized unconditionally. The bare spelling `tar_option_set(...)` is
+  recognized only when the same file also attaches targets via
+  `library(targets)` / `require(targets)` — anywhere in the file, before or
+  after the call — so an unrelated user function named `tar_option_set`
+  doesn't silently attach packages.
+- **Named `packages =` only.** `tar_option_set`'s first formal is
+  `tidy_eval`, not `packages`, so positional forms like
+  `tar_option_set(TRUE, c("dplyr"))` are deliberately not matched.
+- **Accepted value shapes.** A single string literal
+  (`packages = "dplyr"`), an inline `c("a", "b", ...)` of string literals, or
+  a same-file variable assigned exactly once to such a literal vector (the
+  same rule as apply-family loads). Dynamic values, `character(0)`, and empty
+  `c()` are ignored.
+- **Per-literal anchoring.** `tar_option_set()` calls routinely span many
+  lines, so each package's missing-package diagnostic is anchored at that
+  package's own string literal — a `# nolint` on the literal's line suppresses
+  it. The variable-resolved shape anchors at the call's end instead.
+- **Union across calls.** Multiple `tar_option_set()` calls in one file union
+  their `packages =` vectors. targets' real runtime semantics are
+  last-call-wins, but raven deliberately favors false negatives here.
+- **Limitation: no `tar_source()`.** Raven only follows `source()` calls and
+  forward directives, so projects that load their function scripts via
+  `tar_source()` don't inherit the `tar_option_set` packages in those scripts
+  yet. A `# raven: source R/functions.R` directive (or a plain `source()`
+  call) in `_targets.R` restores the link.
 
 ### Keeping Packages in Sync
 

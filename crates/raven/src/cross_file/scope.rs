@@ -19295,6 +19295,93 @@ x <- 1"#;
     }
 
     #[test]
+    fn test_package_propagation_tar_option_set_parent_packages_in_child() {
+        // Issue #637: a `_targets.R`-style parent that attaches packages via
+        // `tar_option_set(packages = ...)` propagates them to sourced children,
+        // exactly like `library()` — mirrors
+        // `test_package_propagation_child_packages_in_parent` wiring.
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+
+        // Parent (_targets.R shape): library(targets), tar_option_set, then
+        // source("child.R") at line 2.
+        let parent_code =
+            "library(targets)\ntar_option_set(packages = c(\"dplyr\"))\nsource(\"child.R\")";
+        let parent_tree = parse_r(parent_code);
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let parent_artifacts = compute_artifacts(&parent_uri, &parent_tree, parent_code);
+
+        // Child file: uses a dplyr verb.
+        let child_code = "mutate(df, y = 1)";
+        let child_tree = parse_r(child_code);
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_artifacts = compute_artifacts(&child_uri, &child_tree, child_code);
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+
+        let mut graph = DependencyGraph::new();
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 2,
+                column: 0,
+                is_directive: false,
+                local: false,
+                chdir: false,
+                is_sys_source: false,
+                sys_source_global_env: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+
+        let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+
+        let get_metadata = |uri: &Url| -> Option<std::sync::Arc<CrossFileMetadata>> {
+            if uri == &parent_uri {
+                Some(std::sync::Arc::new(parent_meta.clone()))
+            } else {
+                None
+            }
+        };
+
+        // Query the child's scope: dplyr comes from the parent's
+        // tar_option_set(), which precedes the source() call.
+        let child_scope = scope_at_position_with_graph(
+            &child_uri,
+            0,
+            0,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+
+        assert!(
+            child_scope.inherited_packages.contains("dplyr"),
+            "child sourced by a _targets.R-style parent should inherit dplyr from \
+             tar_option_set(packages = ...); inherited: {:?}",
+            child_scope.inherited_packages,
+        );
+    }
+
+    #[test]
     fn test_package_propagation_child_symbols_and_packages_in_parent() {
         // Symbols from child files are merged into parent scope, and packages
         // loaded in child files should be available after source().
