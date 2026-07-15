@@ -54153,8 +54153,10 @@ result <- helper_with_spaces(42)"#;
 
     /// Issue #637 per-literal anchoring: in a multi-line `tar_option_set()`
     /// call, the missing-package diagnostic lands on the packages-literal's
-    /// line (so `# nolint` on that line suppresses it), not the closing
-    /// paren's line.
+    /// line, not the closing paren's line — so a line-keyed `# raven: ignore`
+    /// trailing the literal suppresses it (asserted below; `# nolint` belongs
+    /// to the opt-in lint pipeline and does NOT suppress diagnostics — see
+    /// `nolint_does_not_suppress_diagnostic`).
     #[test]
     fn test_missing_package_diagnostic_tar_option_set_multiline_anchors_literal_line() {
         let code = "library(targets)\n\
@@ -54199,6 +54201,31 @@ result <- helper_with_spaces(42)"#;
             probe[0].range
         );
         assert_eq!(probe[0].range.end.line, 3);
+
+        // Because the diagnostic anchors at the literal's line, a line-keyed
+        // `# raven: ignore` trailing that literal suppresses it.
+        let suppressed_code = "library(targets)\n\
+                               tar_option_set(\n\
+                               \x20 packages = c(\n\
+                               \x20   \"__missing_pkg1__\" # raven: ignore\n\
+                               \x20 ),\n\
+                               \x20 format = \"qs\"\n\
+                               )";
+        let suppressed_url = Url::parse("file:///workspace/main2.R").unwrap();
+        state
+            .documents
+            .insert(suppressed_url.clone(), Document::new(suppressed_code, None));
+        let snapshot = DiagnosticsSnapshot::build(&state, &suppressed_url)
+            .expect("snapshot built for main2.R");
+        let mut diagnostics = Vec::new();
+        collect_missing_package_diagnostics_from_snapshot(&snapshot, &mut diagnostics, None);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("__missing_pkg1__")),
+            "`# raven: ignore` on the literal's line must suppress the \
+             missing-package diagnostic; got {diagnostics:?}"
+        );
     }
 
     #[test]

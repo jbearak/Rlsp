@@ -862,7 +862,13 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 /// only when the same file also attaches targets (`library(targets)` /
 /// `require(targets)` anywhere in the file); `targets::` / `targets:::`
 /// qualified spellings are honored unconditionally. See
-/// `append_gated_tar_option_set_calls` for the gate.
+/// `append_gated_tar_option_set_calls` for the gate. A `tar_option_set()`
+/// nested inside a non-evaluating quoting wrapper (`quote(...)`, rlang's
+/// `expr(...)`, …) is NOT detected — it never evaluates — while a quoted
+/// `library()`/`require()` still is (pre-existing leniency; see the gate
+/// note in `visit_node_for_library`).
+///
+/// The returned Vec is sorted in document order by `(line, column)`.
 ///
 /// # Examples
 ///
@@ -889,10 +895,16 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
         root,
         content,
         &var_lookup,
+        false,
         &mut library_calls,
         &mut tar_candidates,
     );
     append_gated_tar_option_set_calls(&mut library_calls, tar_candidates);
+    // Restore document order: gated tar_option_set entries are appended after
+    // the walk, so sort by position. The sort is stable, keeping same-position
+    // entries (an apply-family call's per-package fan-out all shares the apply
+    // call's end position) in emission order.
+    library_calls.sort_by_key(|call| (call.line, call.column));
     log::trace!(
         "Completed library() call detection, found {} calls",
         library_calls.len()
@@ -1097,6 +1109,9 @@ pub(crate) fn is_nonevaluating_quote_call(node: Node, content: &str) -> bool {
 /// - `var_lookup`: name→binding map (built once via [`collect_var_bindings`])
 ///   used by apply and tar_option_set detection to resolve same-file variable
 ///   references like `libs <- c(...); sapply(libs, library, character.only = TRUE)`.
+/// - `inside_quote`: latched to `true` once an ancestor non-evaluating quoting
+///   call (see [`is_nonevaluating_quote_call`]) is entered; gates ONLY the
+///   tar_option_set candidate collection below.
 /// - `library_calls`: mutable collector that receives discovered `LibraryCall`
 ///   entries in document order.
 /// - `tar_candidates`: mutable collector for gate-pending
@@ -1111,13 +1126,14 @@ pub(crate) fn is_nonevaluating_quote_call(node: Node, content: &str) -> bool {
 /// let mut tar_candidates = Vec::new();
 /// let root = tree.root_node();
 /// let var_lookup = collect_var_bindings(root, source_text);
-/// visit_node_for_library(root, source_text, &var_lookup, &mut library_calls, &mut tar_candidates);
+/// visit_node_for_library(root, source_text, &var_lookup, false, &mut library_calls, &mut tar_candidates);
 /// assert!(library_calls.iter().all(|c| !c.package.is_empty()));
 /// ```
 fn visit_node_for_library(
     node: Node,
     content: &str,
     var_lookup: &HashMap<String, VarBinding>,
+    inside_quote: bool,
     library_calls: &mut Vec<LibraryCall>,
     tar_candidates: &mut Vec<TarOptionSetCandidate>,
 ) {
@@ -1125,6 +1141,9 @@ fn visit_node_for_library(
     if node.kind() == "identifier" {
         return;
     }
+    // A call nested inside a quoting wrapper (e.g. `quote(...)`) is captured
+    // as unevaluated code; latch so all descendants see `inside_quote`.
+    let inside_quote = inside_quote || is_nonevaluating_quote_call(node, content);
     if node.kind() == "call" {
         if let Some(lib_call) = try_parse_library_call(node, content) {
             library_calls.push(lib_call);
@@ -1134,12 +1153,27 @@ fn visit_node_for_library(
             // the tar_option_set form. The two callee name-sets are disjoint,
             // so at most one of these can match.
             library_calls.extend(try_parse_apply_library_call(node, content, var_lookup));
-            collect_tar_option_set_candidates(node, content, var_lookup, tar_candidates);
+            // Deliberate asymmetry: only tar_option_set is quote-gated on
+            // this position-aware path. `library()`/`require()` and
+            // apply-family calls inside `quote()` are still recorded here —
+            // that leniency predates tar_option_set detection and changing
+            // it is out of scope. A quoted `tar_option_set()` never
+            // evaluates, so it must not record attachments.
+            if !inside_quote {
+                collect_tar_option_set_candidates(node, content, var_lookup, tar_candidates);
+            }
         }
     }
 
     for child in node.children(&mut node.walk()) {
-        visit_node_for_library(child, content, var_lookup, library_calls, tar_candidates);
+        visit_node_for_library(
+            child,
+            content,
+            var_lookup,
+            inside_quote,
+            library_calls,
+            tar_candidates,
+        );
     }
 }
 
@@ -1918,6 +1952,11 @@ fn collect_tar_option_set_candidates(
 /// `scope.rs`'s `push_shiny_deferred_scopes`. The gate is position-independent
 /// within the file: a `library(targets)` anywhere the walk visited counts,
 /// regardless of whether it appears before or after the `tar_option_set` call.
+/// On the position-aware path (`detect_library_calls`) the gate is also
+/// file-wide and scope-blind by design — an attaching `library(targets)`
+/// inside a function body satisfies it (the top-level walker naturally
+/// excludes those); it limits name-collision false attaches and is not a
+/// correctness guarantee.
 ///
 /// Must be called after the walk completes (the gate inspects the walk's
 /// collected `library_calls`), and must stay the single shared post-filter for
@@ -1957,11 +1996,16 @@ fn append_gated_tar_option_set_calls(
 ///   `c()` of string literals bound before this call (the same
 ///   `VarBinding::resolved_before` machinery apply-family detection uses)
 ///
+/// The variable resolution is lexical-scope-blind — inherited from the
+/// apply-family `VarBinding` heuristic — so an assignment inside an unrelated
+/// function body can satisfy it; this is deliberate and favors false negatives
+/// in diagnostics.
+///
 /// Anything else (dynamic calls, `character(0)`, empty `c()`) yields nothing.
 ///
 /// Position anchoring: `tar_option_set()` calls routinely span 10–30 lines,
 /// and the missing-package diagnostic builds its range from a `LibraryCall`'s
-/// line/column while `# nolint` suppression is line-keyed — so for the
+/// line/column while `# raven: ignore` suppression is line-keyed — so for the
 /// string-literal and `c()`-of-literals shapes, each package's `LibraryCall`
 /// carries the end position of ITS OWN string-literal node (not the call's
 /// closing paren). The variable-resolved shape has no literal at the call
@@ -3897,9 +3941,9 @@ library(ggplot2)"#;
 
     #[test]
     fn test_tar_option_set_multiline_anchors_at_literal_line() {
-        // The diagnostic range is built from LibraryCall.line, and `# nolint`
-        // suppression is line-keyed, so each package must anchor at its own
-        // literal's line — not the closing paren's.
+        // The diagnostic range is built from LibraryCall.line, and
+        // `# raven: ignore` suppression is line-keyed, so each package must
+        // anchor at its own literal's line — not the closing paren's.
         let code = "library(targets)\ntar_option_set(\n  packages = c(\n    \"dplyr\",\n    \"tidyr\"\n  ),\n  format = \"qs\"\n)";
         let calls = tar_calls(code);
         assert_eq!(calls.len(), 2, "got: {calls:?}");
@@ -3935,6 +3979,51 @@ library(ggplot2)"#;
             "library(targets)\nq <- quote(tar_option_set(packages = c(\"dplyr\")))",
         );
         assert!(!pkgs.contains("dplyr"), "got: {pkgs:?}");
+    }
+
+    #[test]
+    fn test_tar_option_set_quote_wrapped_skipped_on_position_aware_path() {
+        // A quoted tar_option_set() captures code without evaluating it, so
+        // detect_library_calls must not record attachments — even for the
+        // unconditionally-honored qualified spelling.
+        let code = "q <- quote(targets::tar_option_set(packages = \"dplyr\"))";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert_eq!(calls.len(), 0, "got: {calls:?}");
+
+        // Bare spelling under quote() with targets attached: only the
+        // library(targets) itself is recorded.
+        let code = "library(targets)\nq <- quote(tar_option_set(packages = \"dplyr\"))";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert_eq!(calls.len(), 1, "got: {calls:?}");
+        assert_eq!(calls[0].package, "targets");
+
+        // Deliberate asymmetry (locked here): a plain library() inside
+        // quote() IS still recorded on this position-aware path — that
+        // leniency predates tar_option_set detection and is out of scope.
+        // (The top-level walker behind extract_attached_packages excludes
+        // it; see extract_attached_packages_excludes_quote_wrapper.)
+        let code = "q <- quote(library(dplyr))";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert_eq!(calls.len(), 1, "got: {calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+    }
+
+    #[test]
+    fn test_detect_library_calls_sorted_after_tar_append() {
+        // tar_option_set entries are appended after the walk; the final Vec
+        // must still come back in document order by (line, column).
+        let code = "tar_option_set(packages = c(\"aaa\", \"bbb\"))\nlibrary(targets)\nlibrary(zzz)";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        let positions: Vec<(u32, u32)> = calls.iter().map(|c| (c.line, c.column)).collect();
+        let mut sorted = positions.clone();
+        sorted.sort();
+        assert_eq!(positions, sorted, "got: {calls:?}");
+        let packages: Vec<&str> = calls.iter().map(|c| c.package.as_str()).collect();
+        assert_eq!(packages, vec!["aaa", "bbb", "targets", "zzz"]);
     }
 
     // ==================== system.file() detection in source() ====================
