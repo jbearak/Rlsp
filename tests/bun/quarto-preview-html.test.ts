@@ -141,6 +141,14 @@ describe('buildQuartoPreviewShellHtml', () => {
         expect(html).toContain('themeEnabled = currentTheme.enabled');
     });
 
+    test('reports the live VS Code code-block background', () => {
+        const html = buildQuartoPreviewShellHtml(
+            args({ kind: 'serving', externalUrl: 'http://127.0.0.1:4000/' }),
+        );
+        expect(html).toContain('--vscode-textCodeBlock-background');
+        expect(html).toContain('codeBackground');
+    });
+
     test('persists only sourceFsPath and installs a recoverable timeout banner', () => {
         const html = buildQuartoPreviewShellHtml(args({ kind: 'serving', externalUrl: 'http://localhost:9/' }));
         expect(html).toContain('vscode.setState({ sourceFsPath: initial.sourceFsPath })');
@@ -397,6 +405,7 @@ function themePayload() {
     return {
         enabled: true,
         background: '#1e1e1e',
+        codeBackground: 'rgba(10, 10, 10, 0.4)',
         foreground: '#d4d4d4',
         roles: {
             keyword: '#c586c0',

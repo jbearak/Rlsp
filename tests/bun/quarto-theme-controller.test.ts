@@ -111,6 +111,7 @@ describe('QuartoThemeController', () => {
             expect(h.posted).toEqual([{
                 enabled: false,
                 background: fakePalette.background,
+                codeBackground: fakePalette.background,
                 foreground: fakePalette.foreground,
                 roles: fakePalette.roles,
                 fontText: 'Inter, sans-serif',
@@ -152,6 +153,18 @@ describe('QuartoThemeController', () => {
             await h.controller.push();
             expect(h.posted.at(-1)?.background).toBe('#202020');
             expect(h.posted.at(-1)?.foreground).toBe('rgb(240, 240, 240)');
+        } finally {
+            h.controller.dispose();
+        }
+    });
+
+    test('uses the live VS Code text-code-block background', async () => {
+        const h = harness();
+        try {
+            h.controller.setThemeContext('#101010', 'rgba(255, 255, 255, 0.08)');
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(h.posted.at(-1)?.codeBackground)
+                .toBe('rgba(255, 255, 255, 0.08)');
         } finally {
             h.controller.dispose();
         }

@@ -14,6 +14,7 @@ function themePayload(): QuartoThemePayload {
     return {
         enabled: true,
         background: '#1e1e1e',
+        codeBackground: 'rgba(10, 10, 10, 0.4)',
         foreground: 'rgb(212, 212, 212)',
         roles: {
             keyword: '#c586c0',
@@ -103,6 +104,7 @@ describe('Quarto preview message validators', () => {
         expect(isPreviewToExtensionMessage({
             type: 'theme-context',
             background: '#1e1e1e',
+            codeBackground: 'rgba(10, 10, 10, 0.4)',
         })).toBe(true);
         expect(isPreviewToExtensionMessage({ type: 'theme-changed', applied: true })).toBe(true);
         expect(isPreviewToExtensionMessage({
@@ -123,6 +125,12 @@ describe('Quarto preview message validators', () => {
         expect(isPreviewToExtensionMessage({
             type: 'theme-context',
             background: 12,
+            codeBackground: '#181818',
+        })).toBe(false);
+        expect(isPreviewToExtensionMessage({
+            type: 'theme-context',
+            background: '#1e1e1e',
+            codeBackground: 12,
         })).toBe(false);
         expect(isPreviewToExtensionMessage({
             type: 'theme-changed',
@@ -157,6 +165,10 @@ describe('Quarto theme payload validators', () => {
         expect(isQuartoThemePayload({
             ...themePayload(),
             background: 'red; background:url(evil)',
+        })).toBe(false);
+        expect(isQuartoThemePayload({
+            ...themePayload(),
+            codeBackground: 'red; background:url(evil)',
         })).toBe(false);
         expect(isQuartoThemePayload({
             ...themePayload(),
