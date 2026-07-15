@@ -360,6 +360,12 @@
         "when": "editorTextFocus && raven.rConsoleEnabled && raven.rmdKnit.enabled && (editorLangId == rmd || editorLangId == r) && resourceExtname =~ /\\.(rmd|Rmd|RMD|rmarkdown|Rmarkdown|RMARKDOWN)$/"
       },
       {
+        "command": "raven.quarto.preview",
+        "key": "ctrl+shift+enter",
+        "mac": "cmd+shift+enter",
+        "when": "editorTextFocus && isWorkspaceTrusted && resourceExtname =~ /\\.qmd$/i"
+      },
+      {
         "command": "raven.runCurrentChunk",
         "key": "ctrl+alt+enter",
         "mac": "cmd+alt+enter",

@@ -39,6 +39,7 @@ function loadPackageJson(): PackageJson {
 // stay locked to a single source of truth.
 const RMD_QMD_EXT = /\\\.\(rmd\|Rmd\|RMD\|rmarkdown\|Rmarkdown\|RMARKDOWN\|qmd\|Qmd\|QMD\)\$/;
 const RMD_ONLY_EXT = /\\\.\(rmd\|Rmd\|RMD\|rmarkdown\|Rmarkdown\|RMARKDOWN\)\$/;
+const QMD_ONLY_EXT = /\\\.qmd\$\/i/;
 
 function findCommand(entries: MenuEntry[], command: string): MenuEntry | undefined {
     return entries.find((entry) => entry.command === command);
@@ -247,7 +248,7 @@ suite('Send to R → Terminal submenu: editor-title gating', () => {
     });
 });
 
-suite('Send to R: shift+enter chord on chunk-based documents', () => {
+suite('File-level Shift+Enter chord', () => {
     test('Knit takes Shift+Enter on R Markdown files when the rmdKnit feature flag is on', () => {
         // The .R Shift+Enter shortcut runs `source()`. Knit is the closest
         // equivalent for an R Markdown document, so the chord is repurposed there
@@ -317,32 +318,65 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
         );
     });
 
-    test('Shift+Enter chord is bound to exactly one command on chunk-based docs', () => {
-        // Only Knit holds the chord on chunk-based documents; no other Send
-        // to R command may share it, otherwise VS Code annotates multiple
-        // menu entries with the same shortcut and the UI is ambiguous.
+    test('Quarto Preview takes Shift+Enter on qmd files', () => {
         const pkg = loadPackageJson();
         const bindings = pkg.contributes.keybindings ?? [];
-        const sharers = bindings.filter(
+        const entry = bindings.find(
             (b) =>
-                b.command !== 'raven.sourceFile'
-                && b.command !== 'raven.knit'
-                && (b.key === 'ctrl+shift+enter' || b.mac === 'cmd+shift+enter'),
+                b.command === 'raven.quarto.preview'
+                && b.key === 'ctrl+shift+enter'
+                && b.mac === 'cmd+shift+enter',
         );
+        assert.ok(
+            entry,
+            'expected a raven.quarto.preview keybinding bound to ctrl+shift+enter / cmd+shift+enter',
+        );
+        const when = entry.when ?? '';
+        assert.ok(
+            when.includes('editorTextFocus'),
+            `raven.quarto.preview keybinding must require editor text focus, got: ${when}`,
+        );
+        assert.ok(
+            when.includes('isWorkspaceTrusted'),
+            `raven.quarto.preview keybinding must require workspace trust, got: ${when}`,
+        );
+        assert.ok(
+            QMD_ONLY_EXT.test(when),
+            `raven.quarto.preview keybinding must be restricted to .qmd files, got: ${when}`,
+        );
+        assert.ok(
+            !when.includes('raven.rConsoleEnabled'),
+            `raven.quarto.preview keybinding must not depend on the R console, got: ${when}`,
+        );
+    });
+
+    test('Shift+Enter chord is shared only by the three file-level actions', () => {
+        // Source File, Knit Preview, and Quarto Preview have mutually exclusive
+        // file-extension gates, so the chord dispatches by document type.
+        const pkg = loadPackageJson();
+        const bindings = pkg.contributes.keybindings ?? [];
+        const sharers = bindings
+            .filter(
+                (b) =>
+                    b.key === 'ctrl+shift+enter'
+                    || b.key === 'shift+ctrl+enter'
+                    || b.mac === 'cmd+shift+enter'
+                    || b.mac === 'shift+cmd+enter',
+            )
+            .map((b) => b.command)
+            .sort();
         assert.deepStrictEqual(
             sharers,
-            [],
-            `no other command may bind the Shift+Enter chord — Knit owns it on chunk-based docs, Source File on plain .R. Sharing: ${sharers
-                .map((b) => b.command)
-                .join(', ')}`,
+            ['raven.knit', 'raven.quarto.preview', 'raven.sourceFile'],
+            'only Source File, Knit Preview, and Quarto Preview may share the Shift+Enter chord',
         );
     });
 
     test('Source File keybinding stays restricted to plain .R', () => {
         // Pin the existing Source File gating so it can coexist with the
         // new Knit binding on the same chord without double-firing.
-        // On .qmd and R Markdown files with Knit disabled the chord is intentionally
-        // unbound — Run All Chunks is reachable via the toolbar or palette.
+        // On R Markdown files with Knit disabled the chord is intentionally
+        // unbound. Quarto Preview owns the chord on .qmd files.
         const pkg = loadPackageJson();
         const bindings = pkg.contributes.keybindings ?? [];
         const entry = bindings.find((b) => b.command === 'raven.sourceFile');
@@ -376,7 +410,7 @@ suite('Send to R: shift+enter chord on chunk-based documents', () => {
         assert.strictEqual(
             conflict,
             undefined,
-            'raven.runCurrentChunk must not hold the Shift+Enter chord — that chord now belongs to Knit or Run All Chunks for .Rmd / .Rmarkdown / .qmd',
+            'raven.runCurrentChunk must not hold the Shift+Enter chord — that chord belongs to Source File, Knit Preview, or Quarto Preview according to file type',
         );
     });
 });
