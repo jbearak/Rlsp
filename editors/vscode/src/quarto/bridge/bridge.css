@@ -24,7 +24,7 @@ html.raven-vscode-theme [class*="border-"] {
 }
 
 html.raven-vscode-theme :not(pre) > code {
-    background-color: var(--raven-bg) !important;
+    background-color: var(--raven-code-bg) !important;
     color: var(--raven-c-string) !important;
     border: 1px solid var(--raven-c-punctuation) !important;
     font-family: var(--raven-font-mono) !important;
@@ -32,12 +32,42 @@ html.raven-vscode-theme :not(pre) > code {
 
 html.raven-vscode-theme pre,
 html.raven-vscode-theme div.sourceCode,
-html.raven-vscode-theme pre.sourceCode,
 html.raven-vscode-theme pre code {
-    background-color: var(--raven-bg) !important;
     color: var(--raven-fg) !important;
     border-color: var(--raven-c-punctuation) !important;
     font-family: var(--raven-font-mono) !important;
+}
+
+html.raven-vscode-theme div.sourceCode {
+    background-color: var(--raven-bg) !important;
+}
+
+/*
+ * Match VS Code's Markdown preview by painting every block-code pre surface
+ * with textCodeBlock.background, including Pandoc's unclassified <pre><code>
+ * shape. The code child stays transparent so rgba colors are applied once.
+ */
+html.raven-vscode-theme pre {
+    background-color: var(--raven-code-bg) !important;
+}
+
+html.raven-vscode-theme pre code {
+    background-color: transparent !important;
+}
+
+/* Executed cell output is console text, not an input code block. */
+html.raven-vscode-theme .cell-output pre {
+    background-color: var(--raven-bg) !important;
+}
+
+/*
+ * Quarto assigns its "Normal" syntax color directly to each Pandoc line
+ * wrapper (`code.sourceCode > span`). Recoloring the code element alone
+ * therefore cannot change bare identifiers and punctuation, which inherit
+ * from that wrapper rather than from `code`.
+ */
+html.raven-vscode-theme code.sourceCode > span {
+    color: var(--raven-fg) !important;
 }
 
 html.raven-vscode-theme .sourceCode .kw,

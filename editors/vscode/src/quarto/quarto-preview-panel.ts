@@ -344,7 +344,10 @@ export class QuartoPreviewPanel {
                 this.deps.output.appendLine(`[panel] webview error: ${message.message}`);
                 return;
             case 'theme-context':
-                this.themeController.setEditorBackground(message.background);
+                this.themeController.setThemeContext(
+                    message.background,
+                    message.codeBackground,
+                );
                 return;
             case 'theme-changed':
                 await this.themeController.setEnabled(message.applied);

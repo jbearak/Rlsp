@@ -16,6 +16,7 @@
     var payloadKeys = [
         '__ravenQuartoTheme',
         'background',
+        'codeBackground',
         'enabled',
         'fontMono',
         'fontText',
@@ -48,7 +49,8 @@
     function isThemeMessage(value) {
         if (!isRecord(value) || !hasExactKeys(value, payloadKeys)) return false;
         if (value.__ravenQuartoTheme !== true || typeof value.enabled !== 'boolean') return false;
-        if (!isColor(value.background) || !isColor(value.foreground)) return false;
+        if (!isColor(value.background) || !isColor(value.codeBackground)
+                || !isColor(value.foreground)) return false;
         if (typeof value.fontText !== 'string' || !fontPattern.test(value.fontText)) return false;
         if (typeof value.fontMono !== 'string' || !fontPattern.test(value.fontMono)) return false;
         if (!isRecord(value.roles) || !hasExactKeys(value.roles, roleSchemaKeys)) return false;
@@ -71,6 +73,7 @@
     function applyTheme(payload) {
         var root = document.documentElement;
         root.style.setProperty('--raven-bg', payload.background);
+        root.style.setProperty('--raven-code-bg', payload.codeBackground);
         root.style.setProperty('--raven-fg', payload.foreground);
         for (var index = 0; index < roleKeys.length; index += 1) {
             var role = roleKeys[index];
