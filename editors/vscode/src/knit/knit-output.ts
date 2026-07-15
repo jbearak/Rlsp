@@ -1,3 +1,22 @@
+/**
+ * Knit Output panel plumbing: the pure pieces the `KnitOutputPanel`
+ * (`knit-output-panel.ts`) is built from.
+ *
+ * Responsibilities:
+ *   - `classify` maps the R subprocess's raw result onto a `KnitOutcome`
+ *     (spawnError / cancelled / timedOut / failed / noOutput / ok),
+ *     parsing the `Output created:` line via `parseRenderedOutputPath`.
+ *   - `buildShellHtml` renders the sandboxed webview shell that wraps the
+ *     rendered document in a nested `<iframe srcdoc>` and defines the
+ *     host⇄webview message protocol (`KnitOutputMessage`).
+ *   - Restore-state contract: the shell persists a `{ sourceFsPath,
+ *     outputPath, knitRootDir }` record via `setState` so the
+ *     `WebviewPanelSerializer` can rebuild the panel after a window
+ *     reload. `knitRootDir` is Raven's CONFIGURED knit base (from
+ *     `raven.knit.workingDirectory`), NOT any runtime chunk override —
+ *     it must stay in lockstep with `KnitOutputPanel.restore`, which
+ *     reads it back and threads it to the image inliner.
+ */
 import * as path from 'path';
 import { parseRenderedOutputPath } from './output-path';
 import { githubDark, githubLight, type GithubPalette } from './github-colors';
@@ -366,6 +385,18 @@ export function buildShellHtml(args: {
      */
     sourceFsPath?: string;
     /**
+     * Raven's configured knit `root.dir` for this preview, persisted
+     * into `setState` alongside `sourceFsPath` so a serializer restore
+     * after a window reload can resolve relative `include_graphics`
+     * images against the same base — otherwise restore would fall back
+     * to the source directory, which is wrong in `project` mode (root is
+     * the workspace folder, not the document's dir). This is the STATIC
+     * base from `raven.knit.workingDirectory`; a chunk-level
+     * `opts_knit$set(root.dir=…)` override is deliberately NOT tracked
+     * (see `docs/knit.md`). Omitted/empty when unknown.
+     */
+    knitRootDir?: string;
+    /**
      * Persisted theme-toggle state. Caller reads it from
      * `context.globalState` so the choice survives panel disposal /
      * recreation between knits.
@@ -414,6 +445,7 @@ export function buildShellHtml(args: {
         outputPath,
         nonce,
         sourceFsPath = '',
+        knitRootDir = '',
         initialThemeApplied,
         vscodeThemePaletteCss,
         vscodeFontFamiliesCss,
@@ -725,6 +757,7 @@ export function buildShellHtml(args: {
       var ravenRestoreState = {
         sourceFsPath: ${jsonForScript(sourceFsPath)},
         outputPath: ${jsonForScript(outputPath)},
+        knitRootDir: ${jsonForScript(knitRootDir)},
       };
       if (ravenRestoreState.sourceFsPath) {
         try { vscode.setState(ravenRestoreState); } catch (e) { /* setState unavailable */ }

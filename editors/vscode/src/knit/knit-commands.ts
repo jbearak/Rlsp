@@ -576,6 +576,7 @@ async function runKnitCommand(
             sourceUri: docUri,
             sourceLanguageId,
             cwd,
+            knitRootDir,
             output,
             rBinary,
             timeoutMs,
@@ -607,6 +608,8 @@ interface RenderOutcomeCtx {
     sourceUri: vscode.Uri;
     sourceLanguageId: string;
     cwd: string | undefined;
+    /** Chunk working directory (`root.dir`); null = inherit subprocess cwd. */
+    knitRootDir: string | null;
     output: vscode.OutputChannel;
     rBinary: string;
     timeoutMs: number;
@@ -756,6 +759,19 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         sourceUri: ctx.sourceUri,
         outputPath: htmlPath,
         output: ctx.output,
+        // Base for resolving relative `include_graphics` image paths:
+        // the knit `root.dir`, else the effective subprocess cwd
+        // (snapshotted once by `resolveKnitDir` — in `current` mode with
+        // no workspace that's the `process.cwd()` the subprocess
+        // inherits at spawn). This is the directory Raven itself
+        // configured or knows, so no round-trip to R is needed. What this
+        // static base does NOT see is R changing its effective directory
+        // at runtime — a setup chunk's `opts_knit$set(root.dir=…)` (knitr
+        // restores the snapshot when `knit()` returns) or an `.Rprofile`
+        // `setwd()`. Documents that do either should reference images by
+        // absolute path, as issue #627's own example does; see
+        // docs/knit.md.
+        knitRootDir: ctx.knitRootDir ?? ctx.cwd,
     });
     if (!panelResult.ok) {
         ctx.output.appendLine(`[panel] ${panelResult.error}`);
@@ -827,10 +843,12 @@ type KnitDirResult = KnitDirOk | KnitDirErr;
  *     Refuses if the document is outside every workspace folder.
  *   - `current`: omit `knit_root_dir`. When a workspace is open, use the
  *     first workspace folder as cwd (matches VS Code's convention that
- *     R-started-from-the-workspace inherits the workspace root). When
- *     no workspace is open, inherit Node's `process.cwd()` so we don't
- *     pretend the document directory is "R's startup wd" — the spec is
- *     specifically about not pinning a directory in this mode.
+ *     R-started-from-the-workspace inherits the workspace root). When no
+ *     workspace is open, snapshot Node's `process.cwd()` HERE (the value
+ *     the subprocess will inherit) rather than pretending the document
+ *     directory is "R's startup wd" — capturing it once, synchronously,
+ *     also means the base can't drift if `process.cwd()` changes during
+ *     the async knit.
  */
 function resolveKnitDir(
     docUri: vscode.Uri,
@@ -856,7 +874,9 @@ function resolveKnitDir(
     return {
         ok: true,
         knitRootDir: null,
-        cwd: workspaceRoot,
+        // Snapshot the effective cwd once: the workspace folder, else the
+        // process cwd the subprocess inherits at spawn.
+        cwd: workspaceRoot ?? process.cwd(),
     };
 }
 

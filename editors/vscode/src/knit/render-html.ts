@@ -776,6 +776,21 @@ code {
   font-family: var(--raven-font-mono);
   color: var(--raven-fg);
 }
+/*
+ * Keep ordinary raster images (and any other bare img, e.g. a PNG
+ * from knitr::include_graphics()) inside the content width instead of
+ * overflowing the preview pane (issue #629). We use max-width rather
+ * than width so a naturally small image is never enlarged, and
+ * height:auto preserves the aspect ratio even when an HTML width or
+ * height attribute is present. The underlying pixels are untouched, so
+ * a high-DPI figure keeps its full resolution -- only its display size
+ * is capped. Extracted SVG plots are handled separately by the
+ * .raven-knit-plot-host rules below and are unaffected.
+ */
+img {
+  max-width: 100%;
+  height: auto;
+}
 .raven-knit-plot-host {
   display: inline-flex;
   max-width: 100%;

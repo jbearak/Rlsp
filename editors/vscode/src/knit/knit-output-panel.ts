@@ -238,6 +238,13 @@ export class KnitOutputPanel {
             sourceUri: vscode.Uri;
             outputPath: string;
             output: vscode.OutputChannel;
+            /**
+             * The knit working directory (`root.dir`). Relative
+             * `include_graphics` image paths resolve against it, so the
+             * inliner can reach a workspace image the author referenced
+             * relative to the project root rather than the preview dir.
+             */
+            knitRootDir?: string;
         },
     ): Promise<{ ok: true } | { ok: false; error: string }> {
         try {
@@ -251,7 +258,11 @@ export class KnitOutputPanel {
         const existing = KnitOutputPanel.instances.get(key);
 
         if (existing && existing.rootDir === rootDir) {
-            existing.updateContent({ sourceUri: args.sourceUri, outputPath: args.outputPath });
+            existing.updateContent({
+                sourceUri: args.sourceUri,
+                outputPath: args.outputPath,
+                knitRootDir: args.knitRootDir,
+            });
             // Prefer the panel's *current* column; fall back to the
             // last-known column so re-knitting a hidden panel does
             // not relocate it to `Beside` (which moves the panel
@@ -372,6 +383,7 @@ export class KnitOutputPanel {
             sourceUri: vscode.Uri;
             outputPath: string;
             output: vscode.OutputChannel;
+            knitRootDir?: string;
         },
         rootDir: string,
         column: vscode.ViewColumn,
@@ -392,8 +404,10 @@ export class KnitOutputPanel {
 
     /**
      * Rebuild a panel that VS Code is restoring after a window
-     * reload/restart, from the `{ sourceFsPath, outputPath }` record the
-     * shell's `setState` persisted. Called by the
+     * reload/restart, from the `{ sourceFsPath, outputPath, knitRootDir }`
+     * record the shell's `setState` persisted (`knitRootDir` is the
+     * relative-image resolution base; absent/empty in pre-field records,
+     * which then fall back to the source directory). Called by the
      * `WebviewPanelSerializer` registered in `knit/index.ts` (which has
      * already confirmed `raven.knit.persistPreview` is enabled — when it
      * isn't, the serializer disposes the panel instead of calling here).
@@ -418,9 +432,19 @@ export class KnitOutputPanel {
         state: unknown,
         output: vscode.OutputChannel,
     ): Promise<void> {
-        const s = (state ?? {}) as { sourceFsPath?: unknown; outputPath?: unknown };
+        const s = (state ?? {}) as {
+            sourceFsPath?: unknown;
+            outputPath?: unknown;
+            knitRootDir?: unknown;
+        };
         const sourceFsPath = typeof s.sourceFsPath === 'string' ? s.sourceFsPath : '';
         const persistedOutputPath = typeof s.outputPath === 'string' ? s.outputPath : '';
+        // Recover the persisted resolution base; empty string means the
+        // record predates this field, so `updateContent` falls back to
+        // the source directory.
+        const persistedKnitRootDir = typeof s.knitRootDir === 'string' && s.knitRootDir.length > 0
+            ? s.knitRootDir
+            : undefined;
         if (sourceFsPath.length === 0) {
             // No source recorded — nothing actionable to restore.
             panel.dispose();
@@ -472,7 +496,7 @@ export class KnitOutputPanel {
         KnitOutputPanel.wireAndRegister(
             context,
             panel,
-            { sourceUri, outputPath: htmlPath, output },
+            { sourceUri, outputPath: htmlPath, output, knitRootDir: persistedKnitRootDir },
             rootDir,
         );
     }
@@ -492,6 +516,7 @@ export class KnitOutputPanel {
             sourceUri: vscode.Uri;
             outputPath: string;
             output: vscode.OutputChannel;
+            knitRootDir?: string;
         },
         rootDir: string,
     ): KnitOutputPanel {
@@ -626,7 +651,11 @@ export class KnitOutputPanel {
         });
         instance.perPanelDisposables.push(onTheme, onConfig);
 
-        instance.updateContent({ sourceUri: args.sourceUri, outputPath: args.outputPath });
+        instance.updateContent({
+            sourceUri: args.sourceUri,
+            outputPath: args.outputPath,
+            knitRootDir: args.knitRootDir,
+        });
         return instance;
     }
 
@@ -697,7 +726,11 @@ export class KnitOutputPanel {
         this.panel.webview.onDidReceiveMessage((msg: unknown) => this.handleMessage(msg));
     }
 
-    private updateContent(args: { sourceUri: vscode.Uri; outputPath: string }): void {
+    private updateContent(args: {
+        sourceUri: vscode.Uri;
+        outputPath: string;
+        knitRootDir?: string;
+    }): void {
         this.sourceUri = args.sourceUri;
         this.outputPath = args.outputPath;
         const nonce = crypto.randomBytes(16).toString('base64');
@@ -747,8 +780,30 @@ export class KnitOutputPanel {
         // "Open in Browser" stays self-contained without an inflated
         // base64 payload. The mutation only touches the in-memory
         // copy handed to the iframe.
+        // `include_graphics()` can reference an image that already
+        // lives elsewhere in the workspace (issue #627). Two things let
+        // the inliner reach it:
+        //   - `resolveBases`: an author's relative
+        //     `include_graphics("images/logo.png")` is relative to the
+        //     knit `root.dir`, not the preview output dir, so pass that
+        //     base (falling back to the source document's own directory,
+        //     which is `root.dir` in the default `document` mode and a
+        //     sensible guess on a serializer restore with no re-knit).
+        //   - `additionalRoots`: the containment allow-list — the
+        //     workspace folder containing the source. (`rootBase` is
+        //     allowed automatically: the inliner treats every
+        //     `resolveBases` entry as an allowed root too.)
+        // Scoping to the containing workspace folder (not every open
+        // folder) keeps the boundary to the project being previewed; the
+        // inliner still `realpath`-guards containment.
+        const sourceDir = path.dirname(this.sourceUri.fsPath);
+        const rootBase = args.knitRootDir ?? sourceDir;
+        const workspaceRoot = vscode.workspace.getWorkspaceFolder(this.sourceUri)?.uri.fsPath
+            ?? sourceDir;
         htmlContent = inlineLocalImagesAsDataUrls(htmlContent, docDir, this.output, {
             markSvgPlots: true,
+            resolveBases: [rootBase],
+            additionalRoots: [workspaceRoot],
         });
         this.panel.webview.html = buildShellHtml({
             htmlContent,
@@ -758,6 +813,10 @@ export class KnitOutputPanel {
             nonce,
             // Persisted into webview state for the serializer restore path.
             sourceFsPath: this.sourceUri.fsPath,
+            // Persist the resolution base so a post-reload restore (which
+            // has no knit to re-derive it) resolves relative
+            // `include_graphics` images against the same directory.
+            knitRootDir: args.knitRootDir,
             initialThemeApplied: KnitOutputPanel.readThemePreference(this.context),
             // Resolved palette is delivered out-of-band via
             // postMessage from `pushVscodeThemePalette` — the

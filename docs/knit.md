@@ -256,6 +256,42 @@ when an R Markdown file is open.
     does not intercept nested-frame navigations); a `<base href>`
     injected at the top of the inlined HTML lets relative images,
     CSS, and fonts resolve through the webview's resource handler.
+
+    Local `<img>` sources are additionally read off disk and inlined
+    as `data:` URLs before the HTML reaches the iframe, because a
+    nested `<iframe srcdoc>` cannot fetch webview subresources. This
+    covers both knitr's generated `figure/` plots and pre-existing
+    workspace images referenced with `knitr::include_graphics()`. A
+    relative source is resolved against the preview output directory
+    first (where the generated `figure/` plots live) and then against
+    the knit `root.dir` (where an author's
+    `include_graphics("images/logo.png")` is rooted); an absolute source
+    resolves as-is. Either way the file is inlined only if it resolves
+    (after `realpath`, so symlinks cannot escape) inside an allowed
+    root: the temp preview directory, the workspace folder containing
+    the source document (its own directory when no workspace is open),
+    or the knit `root.dir`. A path outside every root is left untouched.
+    The `root.dir` used here is the one Raven configures from
+    `raven.knit.workingDirectory` (document dir / project root / current
+    dir); if R changes its effective directory at runtime — a setup
+    chunk's `knitr::opts_knit$set(root.dir = …)` or an `.Rprofile`
+    `setwd()` — that is not tracked for *relative* images. Reference
+    those by absolute path (e.g. `normalizePath(...)`, as an
+    existing-image workflow typically does).
+    To keep `include_graphics()` from failing the knit by relativizing
+    an absolute path against `root.dir`, Raven sets
+    `options(knitr.graphics.rel_path = FALSE)` for its knit subprocess
+    only. The on-disk `.html` keeps the original `<img>` paths, so
+    **Open in Browser** stays small; only the in-memory copy handed to
+    the iframe is rewritten. (A consequence: a relative
+    `include_graphics` path rooted at `root.dir` renders in the panel but
+    not via **Open in Browser** — the on-disk `.html` lives in Raven's
+    temp preview directory, so a browser resolves the relative path under
+    *that* directory, where the image isn't. Reference the image by
+    absolute path if you need it in both surfaces. Generated `figure/`
+    plots are unaffected because knitr writes them into the preview
+    directory next to the `.html`.)
+
     Intra-document anchor links (`#section`) work; clicking an
     external `<a>` does nothing (use **Open in Browser** for full
     interactivity, including htmlwidgets). When the output-path
