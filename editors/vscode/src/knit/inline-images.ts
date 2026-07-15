@@ -408,7 +408,10 @@ function decodeHtmlEntities(s: string): string {
  */
 function canonicalizeRoots(roots: string[]): string[] {
     const seen = new Set<string>();
-    for (const root of roots) {
+    // De-duplicate the INPUT strings first (callers routinely pass the
+    // same directory twice — e.g. `project` mode's workspace folder and
+    // knit `root.dir` are identical) so we don't `realpath` it twice.
+    for (const root of new Set(roots)) {
         try {
             seen.add(fs.realpathSync(root));
         } catch {
