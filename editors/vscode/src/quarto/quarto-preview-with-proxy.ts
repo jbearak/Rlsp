@@ -68,6 +68,10 @@ export class QuartoPreviewWithProxyProcess implements QuartoPreviewProcessLike {
         return this.beginTeardown('shutdown');
     }
 
+    setBrowserFacingOrigin(externalUrl: string): void {
+        this.proxy?.setBrowserFacingOrigin(externalUrl);
+    }
+
     private async startInner(): Promise<QuartoPreviewReady> {
         const quartoReady = await this.inner.start();
         this.throwIfStopping();

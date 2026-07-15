@@ -13,18 +13,6 @@
         'punctuation',
         'constant',
     ];
-    var roleVariables = {
-        keyword: '--raven-c-keyword',
-        string: '--raven-c-string',
-        number: '--raven-c-number',
-        comment: '--raven-c-comment',
-        function: '--raven-c-function',
-        type: '--raven-c-type',
-        variable: '--raven-c-variable',
-        operator: '--raven-c-operator',
-        punctuation: '--raven-c-punctuation',
-        constant: '--raven-c-constant',
-    };
     var payloadKeys = [
         '__ravenQuartoTheme',
         'background',
@@ -86,7 +74,7 @@
         root.style.setProperty('--raven-fg', payload.foreground);
         for (var index = 0; index < roleKeys.length; index += 1) {
             var role = roleKeys[index];
-            root.style.setProperty(roleVariables[role], payload.roles[role]);
+            root.style.setProperty('--raven-c-' + role, payload.roles[role]);
         }
         root.style.setProperty('--raven-font-text', payload.fontText);
         root.style.setProperty('--raven-font-mono', payload.fontMono);

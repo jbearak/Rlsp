@@ -117,7 +117,7 @@ describe('QuartoPreviewProxy HTTP passthrough', () => {
         }
     });
 
-    it('ignores absolute-form authority and foreign Host for upstream selection', async () => {
+    it('ignores absolute-form authority for upstream selection', async () => {
         let seenUrl = '';
         let seenHost = '';
         const upstream = http.createServer((request, response) => {
@@ -132,11 +132,192 @@ describe('QuartoPreviewProxy HTTP passthrough', () => {
             const response = await rawSocketRequest(
                 ready.origin,
                 'GET http://example.invalid/foreign/path?q=1 HTTP/1.1\r\n' +
-                'Host: attacker.invalid:9999\r\nConnection: close\r\n\r\n',
+                `Host: ${new URL(ready.origin).host}\r\nConnection: close\r\n\r\n`,
             );
             expect(response.toString()).toContain('fixed-upstream');
             expect(seenUrl).toBe('/foreign/path?q=1');
             expect(seenHost).toBe(new URL(upstreamOrigin).host);
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('rejects a non-loopback Host header when enforcing (the default)', async () => {
+        let upstreamHit = false;
+        const upstream = http.createServer((_request, response) => {
+            upstreamHit = true;
+            response.end('fixed-upstream');
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const ready = await proxy.start();
+            const response = await rawSocketRequest(
+                ready.origin,
+                'GET /page/ HTTP/1.1\r\n' +
+                'Host: attacker.invalid:9999\r\nConnection: close\r\n\r\n',
+            );
+            expect(response.toString()).toContain('403 Forbidden');
+            expect(upstreamHit).toBe(false);
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('admits the browser-facing host from asExternalUri but still rejects others', async () => {
+        let seenHost = '';
+        const upstream = http.createServer((request, response) => {
+            seenHost = request.headers.host ?? '';
+            response.end('fixed-upstream');
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const ready = await proxy.start();
+            // Simulate a gateway mapping (e.g. Codespaces in the browser).
+            proxy.setBrowserFacingOrigin('https://preview.example.dev/page/');
+
+            const allowed = await rawSocketRequest(
+                ready.origin,
+                'GET /page/ HTTP/1.1\r\n' +
+                'Host: preview.example.dev\r\nConnection: close\r\n\r\n',
+            );
+            expect(allowed.toString()).toContain('fixed-upstream');
+            expect(seenHost).toBe(new URL(upstreamOrigin).host);
+
+            const rejected = await rawSocketRequest(
+                ready.origin,
+                'GET /page/ HTTP/1.1\r\n' +
+                'Host: attacker.invalid:9999\r\nConnection: close\r\n\r\n',
+            );
+            expect(rejected.toString()).toContain('403 Forbidden');
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('rejects a Host that hides a non-loopback label behind userinfo', async () => {
+        let upstreamHit = false;
+        const upstream = http.createServer((_request, response) => {
+            upstreamHit = true;
+            response.end('fixed-upstream');
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const ready = await proxy.start();
+            const response = await rawSocketRequest(
+                ready.origin,
+                'GET /page/ HTTP/1.1\r\n' +
+                'Host: attacker.invalid@localhost\r\nConnection: close\r\n\r\n',
+            );
+            expect(response.toString()).toContain('403 Forbidden');
+            expect(upstreamHit).toBe(false);
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('rejects an HTTP request carrying a cross-site Origin even on a loopback Host', async () => {
+        let upstreamHit = false;
+        const upstream = http.createServer((_request, response) => {
+            upstreamHit = true;
+            response.end('fixed-upstream');
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const ready = await proxy.start();
+            const response = await rawSocketRequest(
+                ready.origin,
+                'POST /submit HTTP/1.1\r\n' +
+                `Host: ${new URL(ready.origin).host}\r\n` +
+                'Origin: https://evil.example\r\n' +
+                'Content-Length: 0\r\nConnection: close\r\n\r\n',
+            );
+            expect(response.toString()).toContain('403 Forbidden');
+            expect(upstreamHit).toBe(false);
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('does not crash on a request target that is accepted but is not a valid URL', async () => {
+        const upstream = http.createServer((_request, response) => response.end('ok'));
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const ready = await proxy.start();
+            const host = new URL(ready.origin).host;
+            const malformed = await rawSocketRequest(
+                ready.origin,
+                `GET //[ HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
+            );
+            expect(malformed.toString()).toContain('HTTP/1.1');
+            // The proxy is still alive and serving after the odd request.
+            const ok = await rawRequest(ready.url);
+            expect(ok.statusCode).toBe(200);
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('rejects a WebSocket upgrade carrying a cross-site Origin when enforcing', async () => {
+        // The proxy contacts the upstream only after the Host/Origin check
+        // passes, so a rejected handshake never reaches the upstream's upgrade
+        // handler; the client socket is closed rather than relayed.
+        let upgradeReached = false;
+        const upstream = http.createServer();
+        upstream.on('upgrade', (_request, socket) => {
+            upgradeReached = true;
+            socket.destroy();
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const ready = await proxy.start();
+            const response = await rawSocketRequest(
+                ready.origin,
+                'GET /live-reload HTTP/1.1\r\n' +
+                `Host: ${new URL(ready.origin).host}\r\n` +
+                'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+                'Origin: https://evil.example\r\n\r\n',
+            );
+            expect(upgradeReached).toBe(false);
+            expect(response.toString()).not.toContain('101');
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('rejects a WebSocket Origin that hides a foreign label behind userinfo', async () => {
+        let upgradeReached = false;
+        const upstream = http.createServer();
+        upstream.on('upgrade', (_request, socket) => {
+            upgradeReached = true;
+            socket.destroy();
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const ready = await proxy.start();
+            proxy.setBrowserFacingOrigin('https://preview.example.dev/page/');
+            const response = await rawSocketRequest(
+                ready.origin,
+                'GET /live-reload HTTP/1.1\r\n' +
+                'Host: preview.example.dev\r\n' +
+                'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+                'Origin: https://attacker.invalid@preview.example.dev\r\n\r\n',
+            );
+            expect(upgradeReached).toBe(false);
+            expect(response.toString()).not.toContain('101');
         } finally {
             await proxy.close();
             await closeServer(upstream);
@@ -187,6 +368,82 @@ describe('QuartoPreviewProxy HTTP passthrough', () => {
             const result = await rawRequest((await proxy.start()).url);
             expect(result.body.toString()).toBe(
                 '<html><body><script>const marker = "</body>";</script>' +
+                `<main>real body</main>${INJECTION}</body></html>`,
+            );
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('keeps scanning past a </script> that is script-data double-escaped', async () => {
+        // The inner </script> sits in the script-data escaped span opened by
+        // <!-- and closed by -->, so it does not end the element; the </body>
+        // inside the string must not be treated as the document's body close.
+        const upstream = http.createServer((_request, response) => {
+            response.writeHead(200, { 'Content-Type': 'text/html' });
+            response.end(
+                '<html><body>' +
+                '<script>var t = "<!--<script></script></body>-->";</script>' +
+                '<main>real body</main></body></html>',
+            );
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const result = await rawRequest((await proxy.start()).url);
+            expect(result.body.toString()).toBe(
+                '<html><body>' +
+                '<script>var t = "<!--<script></script></body>-->";</script>' +
+                `<main>real body</main>${INJECTION}</body></html>`,
+            );
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('never mis-injects inside script data with an unmatched <!-- (defers to EOF)', async () => {
+        // Conservative fallback: an escaped span opened by <!-- with no closing
+        // --> keeps the scanner in script data to end-of-stream, so the bridge
+        // is appended (never injected inside the script string, which would
+        // corrupt the JavaScript). The whole document body is preserved intact.
+        const body =
+            '<html><body>' +
+            '<script>const marker = "<!--<script></script></body>";</script>' +
+            '<main>real body</main></body></html>';
+        const upstream = http.createServer((_request, response) => {
+            response.writeHead(200, { 'Content-Type': 'text/html' });
+            response.end(body);
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const result = await rawRequest((await proxy.start()).url);
+            expect(result.body.toString()).toBe(`${body}${INJECTION}`);
+        } finally {
+            await proxy.close();
+            await closeServer(upstream);
+        }
+    });
+
+    it('closes a script normally after a balanced legacy <!-- ... //--> comment', async () => {
+        // The classic comment hack: <!-- ... //--> clears the escaped span, so
+        // the following </script> closes the element and injection lands at the
+        // real body close.
+        const upstream = http.createServer((_request, response) => {
+            response.writeHead(200, { 'Content-Type': 'text/html' });
+            response.end(
+                '<html><body><script><!--\nvar x = 1;\n//--></script>' +
+                '<main>real body</main></body></html>',
+            );
+        });
+        const upstreamOrigin = await listen(upstream);
+        const proxy = new QuartoPreviewProxy(upstreamOrigin, BRIDGE_ASSETS);
+        try {
+            const result = await rawRequest((await proxy.start()).url);
+            expect(result.body.toString()).toBe(
+                '<html><body><script><!--\nvar x = 1;\n//--></script>' +
                 `<main>real body</main>${INJECTION}</body></html>`,
             );
         } finally {

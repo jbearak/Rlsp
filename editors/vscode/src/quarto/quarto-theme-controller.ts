@@ -116,13 +116,14 @@ export class QuartoThemeController implements DisposableLike {
     async resolvePayload(): Promise<QuartoThemePayload> {
         const kind = this.deps.activeThemeKind();
         const isLight = kind === 'light' || kind === 'high-contrast-light';
+        const candidateThemeIds = this.candidateThemeIds(isLight);
         let palette: GithubPalette;
         let resolvedThemeId: string | undefined;
         try {
             const resolve = this.deps.resolvePalette ?? resolveActiveThemePalette;
             const outcome = await resolve({
                 ...this.deps.themeResolverInputs(),
-                candidateThemeIds: this.candidateThemeIds(isLight),
+                candidateThemeIds,
                 activeEditorBackground: this.latestEditorBackground,
                 isLight,
             });
@@ -148,7 +149,7 @@ export class QuartoThemeController implements DisposableLike {
 
         const colorOverrides = resolveWorkbenchColorOverrides(
             this.deps.getConfiguration<unknown>('workbench.colorCustomizations'),
-            resolvedThemeId ?? this.candidateThemeIds(isLight)[0],
+            resolvedThemeId ?? candidateThemeIds[0],
         );
         return {
             enabled: this.enabled,

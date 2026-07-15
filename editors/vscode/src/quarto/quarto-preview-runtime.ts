@@ -386,6 +386,13 @@ export class QuartoRuntime {
                 return { kind: 'superseded', generation };
             }
 
+            // Tell a response-transforming proxy the browser-facing origin so
+            // its request allowlist admits that host/origin. Done before the
+            // webview loads the external URL, so the first browser request the
+            // proxy sees already matches; only the loopback readiness probe ran
+            // earlier.
+            process.setBrowserFacingOrigin?.(externalUrl);
+
             this.emitReady(session, ready, externalUrl);
             return {
                 kind: 'ready',

@@ -97,6 +97,12 @@ export interface QuartoPreviewProcessLike {
     start(): Promise<QuartoPreviewReady>;
     stop(): Promise<void>;
     shutdown(): Promise<void>;
+    /**
+     * Optionally record the browser-facing URL (`asExternalUri` mapping of the
+     * ready origin) once known, so a response-transforming proxy can extend its
+     * request allowlist to that host/origin. A no-op for plain processes.
+     */
+    setBrowserFacingOrigin?(externalUrl: string): void;
 }
 
 export class QuartoPreviewProcess implements QuartoPreviewProcessLike {

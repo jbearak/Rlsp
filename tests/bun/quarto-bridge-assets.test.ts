@@ -79,24 +79,18 @@ describe('packaged Quarto theme bridge sources', () => {
 
     test('sets every bridge CSS variable', () => {
         const source = readFileSync(join(BRIDGE_DIR, 'bridge.js'), 'utf8');
+        // Static custom properties are set by literal name.
         for (const variable of [
             '--raven-bg',
             '--raven-fg',
-            '--raven-c-keyword',
-            '--raven-c-string',
-            '--raven-c-number',
-            '--raven-c-comment',
-            '--raven-c-function',
-            '--raven-c-type',
-            '--raven-c-variable',
-            '--raven-c-operator',
-            '--raven-c-punctuation',
-            '--raven-c-constant',
             '--raven-font-text',
             '--raven-font-mono',
         ]) {
             expect(source).toContain(variable);
         }
+        // Per-role custom properties are derived from the role key, whose set is
+        // pinned to the shared protocol by the first test in this suite.
+        expect(source).toContain("'--raven-c-' + role");
     });
 
     test('font validator accepts sanitizer-emitted C0 characters', () => {

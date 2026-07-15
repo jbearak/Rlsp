@@ -48,6 +48,12 @@ export interface QuartoPreviewProxyReady {
 export interface QuartoPreviewProxyLike {
     start(): Promise<QuartoPreviewProxyReady>;
     close(): Promise<void>;
+    /**
+     * Record the browser-facing URL that `vscode.env.asExternalUri` mapped this
+     * proxy's origin to, so its host/origin joins the request allowlist. See
+     * {@link QuartoPreviewProxy.setBrowserFacingOrigin}.
+     */
+    setBrowserFacingOrigin(externalUrl: string): void;
 }
 
 export class QuartoPreviewProxy implements QuartoPreviewProxyLike {
@@ -62,8 +68,17 @@ export class QuartoPreviewProxy implements QuartoPreviewProxyLike {
 
     private readonly bridgeJavaScript: Buffer | null;
     private readonly bridgeCss: Buffer | null;
+    // The host/origin that `asExternalUri` maps this proxy to in the browser,
+    // learned after start via setBrowserFacingOrigin. null until then, so the
+    // request allowlist is loopback-only during startup (only the loopback
+    // readiness probe runs before the webview — and thus this call — loads).
+    private browserFacingHostname: string | null = null;
+    private browserFacingOrigin: string | null = null;
 
-    constructor(upstreamOrigin: string, bridgeAssets?: QuartoPreviewBridgeAssets) {
+    constructor(
+        upstreamOrigin: string,
+        bridgeAssets?: QuartoPreviewBridgeAssets,
+    ) {
         const validated = validatePreviewUrl(`${upstreamOrigin.replace(/\/$/, '')}/`);
         if (!validated || validated.origin !== upstreamOrigin.replace(/\/$/, '')) {
             throw new Error('Quarto preview proxy requires a validated loopback origin.');
@@ -148,6 +163,60 @@ export class QuartoPreviewProxy implements QuartoPreviewProxyLike {
         return this.closePromise;
     }
 
+    /**
+     * Record the browser-facing URL that `vscode.env.asExternalUri` mapped this
+     * proxy to, adding its host/origin to the request allowlist.
+     *
+     * Every request that a legitimate browser sends carries the `Host` (and,
+     * for WebSocket handshakes, the `Origin`) of the URL the iframe was loaded
+     * from — the mapped external URL, not the raw loopback origin. Allowing that
+     * host/origin alongside loopback lets the proxy always enforce the allowlist
+     * (blocking DNS-rebinding and cross-site WebSocket reads in every topology)
+     * without guessing whether it is reached over loopback or an authenticated
+     * gateway: a rebound attacker domain matches neither and is rejected.
+     * A non-URL value leaves the proxy loopback-only.
+     */
+    setBrowserFacingOrigin(externalUrl: string): void {
+        try {
+            const url = new URL(externalUrl);
+            this.browserFacingHostname = normalizeHostname(url.hostname);
+            this.browserFacingOrigin = url.origin;
+        } catch {
+            // Leave the allowlist loopback-only.
+        }
+    }
+
+    private isAllowedHost(host: string | undefined): boolean {
+        if (isLoopbackHostHeader(host)) return true;
+        if (this.browserFacingHostname === null ||
+            host === undefined || host.includes('@')) {
+            return false;
+        }
+        try {
+            return normalizeHostname(new URL(`http://${host}`).hostname) ===
+                this.browserFacingHostname;
+        } catch {
+            return false;
+        }
+    }
+
+    private isAllowedOrigin(origin: string | undefined): boolean {
+        if (isLoopbackOrigin(origin)) return true;
+        if (this.browserFacingOrigin === null ||
+            origin === undefined || origin.includes('@')) {
+            // Mirror the Host branch's `@` guard: any userinfo (`user@`, bare
+            // `@`, `:@`) is rejected, since `.origin` would discard it and let
+            // `https://x@browser-facing-host` match. A real browser Origin never
+            // carries userinfo.
+            return false;
+        }
+        try {
+            return new URL(origin).origin === this.browserFacingOrigin;
+        } catch {
+            return false;
+        }
+    }
+
     private forwardHttp(
         request: http.IncomingMessage,
         response: http.ServerResponse,
@@ -155,6 +224,12 @@ export class QuartoPreviewProxy implements QuartoPreviewProxyLike {
         if (request.method?.toUpperCase() === 'CONNECT') {
             response.writeHead(405, { Connection: 'close' });
             response.end('CONNECT is not supported');
+            return;
+        }
+        if (!this.isAllowedHost(request.headers.host) ||
+            !this.isAllowedOrigin(request.headers.origin)) {
+            response.writeHead(403, { Connection: 'close' });
+            response.end('Forbidden');
             return;
         }
 
@@ -285,6 +360,11 @@ export class QuartoPreviewProxy implements QuartoPreviewProxyLike {
             rejectSocket(clientSocket, 400, 'WebSocket upgrade required');
             return;
         }
+        if (!this.isAllowedHost(request.headers.host) ||
+            !this.isAllowedOrigin(request.headers.origin)) {
+            rejectSocket(clientSocket, 403, 'Forbidden');
+            return;
+        }
 
         let path: string;
         try {
@@ -368,7 +448,15 @@ function reservedBridgePath(
     // This accepted, astronomically unlikely route collision keeps packaged
     // assets local; authority-based forwarding does not affect path matching.
     if (path === '*') return null;
-    const pathname = new URL(path, 'http://proxy.invalid').pathname;
+    // A request target such as `//[` is accepted as origin-form by `fixedUpstreamPath`
+    // but is not a valid URL; treat any unparseable target as a non-reserved path
+    // (forwarded upstream) rather than letting the throw escape the request handler.
+    let pathname: string;
+    try {
+        pathname = new URL(path, 'http://proxy.invalid').pathname;
+    } catch {
+        return null;
+    }
     if (pathname === BRIDGE_JS_PATH || pathname === BRIDGE_CSS_PATH) return pathname;
     return null;
 }
@@ -379,7 +467,9 @@ function unbracketIpv6Hostname(hostname: string): string {
         : hostname;
 }
 
-const HOP_BY_HOP_REQUEST_HEADERS = new Set([
+// RFC 7230 §6.1 hop-by-hop headers. The request and response filters differ in
+// shape (header object vs. rawHeaders array) but strip the same token set.
+const HOP_BY_HOP_HEADERS = new Set([
     'connection',
     'keep-alive',
     'proxy-authenticate',
@@ -393,7 +483,7 @@ const HOP_BY_HOP_REQUEST_HEADERS = new Set([
 export function filteredRequestHeaders(
     incoming: http.IncomingHttpHeaders,
 ): http.OutgoingHttpHeaders {
-    const stripped = new Set(HOP_BY_HOP_REQUEST_HEADERS);
+    const stripped = new Set(HOP_BY_HOP_HEADERS);
     for (const token of incoming.connection?.split(',') ?? []) {
         const normalized = token.trim().toLowerCase();
         if (normalized !== '') stripped.add(normalized);
@@ -471,17 +561,6 @@ interface ResponseHeaderOptions {
     upstream: URL;
 }
 
-const HOP_BY_HOP_RESPONSE_HEADERS = new Set([
-    'connection',
-    'keep-alive',
-    'proxy-authenticate',
-    'proxy-authorization',
-    'te',
-    'trailer',
-    'transfer-encoding',
-    'upgrade',
-]);
-
 const CHANGED_ENTITY_HEADERS = new Set([
     'content-length',
     'etag',
@@ -493,7 +572,7 @@ function filteredResponseHeaders(
     rawHeaders: readonly string[],
     options: ResponseHeaderOptions,
 ): string[] {
-    const stripped = new Set(HOP_BY_HOP_RESPONSE_HEADERS);
+    const stripped = new Set(HOP_BY_HOP_HEADERS);
     for (let index = 0; index < rawHeaders.length; index += 2) {
         if (rawHeaders[index].toLowerCase() !== 'connection') continue;
         for (const token of rawHeaders[index + 1].split(',')) {
@@ -563,12 +642,76 @@ function normalizeHostname(hostname: string): string {
     return unbracketIpv6Hostname(hostname).toLowerCase();
 }
 
+/**
+ * Whether a parsed authority names a loopback host with no userinfo. Userinfo
+ * is rejected because a real `Host`/`Origin` never carries it, yet the WHATWG
+ * parser would read `attacker.invalid@localhost` as host `localhost` — letting
+ * a crafted authority slip a non-loopback label past the hostname check.
+ */
+function isLoopbackUrl(url: URL): boolean {
+    if (url.username !== '' || url.password !== '') return false;
+    return LOOPBACK_HOSTNAMES.has(normalizeHostname(url.hostname));
+}
+
+/**
+ * Whether a request's `Host` header is safe for a directly-reachable loopback
+ * listener. An absent `Host` is allowed: a browser same-origin fetch always
+ * sends one, so its absence means the request is not the DNS-rebinding vector
+ * this guards against. A present `Host` must name `127.0.0.1`, `localhost`, or
+ * `[::1]` (port-agnostic) with no userinfo; anything else — including a rebound
+ * attacker domain — is rejected. An unparseable value is treated as unsafe.
+ */
+function isLoopbackHostHeader(host: string | undefined): boolean {
+    if (host === undefined) return true;
+    if (host.includes('@')) return false;
+    let url: URL;
+    try {
+        url = new URL(`http://${host}`);
+    } catch {
+        return false;
+    }
+    return isLoopbackUrl(url);
+}
+
+/**
+ * Whether a WebSocket upgrade's `Origin` is safe to relay to the loopback
+ * upstream. A browser sends `Origin` on every WebSocket handshake, so a
+ * loopback-only rule blocks cross-site WebSocket hijacking of the live-reload
+ * socket by a page on another origin (whose `Origin` would otherwise be
+ * overwritten with the trusted upstream one). An absent `Origin` is a
+ * non-browser client (not the hijacking vector); `null` and any other origin
+ * are rejected.
+ */
+function isLoopbackOrigin(origin: string | undefined): boolean {
+    if (origin === undefined) return true;
+    if (origin.includes('@')) return false;
+    let url: URL;
+    try {
+        url = new URL(origin);
+    } catch {
+        return false;
+    }
+    return isLoopbackUrl(url);
+}
+
 class HtmlBridgeInjectionTransform extends Transform {
     private context: HtmlScannerContext = 'normal';
     private tag: { after: HtmlScannerContext; quote: number | null } | null = null;
     private readonly candidate: number[] = [];
     private commentTail = 0;
     private injected = false;
+    // Within a `<script>` element, `</script>` closes the element unless it sits
+    // in HTML5's script-data (double-)escaped span — the span opened by `<!--`
+    // and closed by `-->`. We model that span conservatively: while `scriptEscaped`
+    // is set, a `</script>` is treated as script data, not the element's end tag.
+    // This is correct for the realistic cases (the legacy `<!-- ... //-->` comment
+    // hack and `<!--<script>...</script>...` double-escaping) and fails safe for
+    // pathological unbalanced input — an unmatched `<!--` merely defers injection
+    // to end-of-stream (`_flush`) rather than mis-injecting inside script text.
+    private scriptEscaped = false;
+    // Rolling window of the last up-to-4 bytes emitted as script data, used to
+    // detect the `<!--` / `-->` span delimiters.
+    private scriptDataTail = 0;
 
     constructor(private readonly injection: Buffer) {
         super();
@@ -590,6 +733,7 @@ class HtmlBridgeInjectionTransform extends Transform {
             let output = Buffer.allocUnsafe(bytes.length + 16);
             let outputLength = 0;
             const emit = (byte: number): void => {
+                this.trackScriptData(byte);
                 output[outputLength++] = byte;
             };
             const flushOutput = (): void => {
@@ -639,7 +783,7 @@ class HtmlBridgeInjectionTransform extends Transform {
             if (byte === BYTE_DOUBLE_QUOTE || byte === BYTE_SINGLE_QUOTE) {
                 this.tag.quote = byte;
             } else if (byte === BYTE_GREATER_THAN) {
-                this.context = this.tag.after;
+                this.enterContext(this.tag.after);
                 this.tag = null;
             }
             return;
@@ -691,7 +835,7 @@ class HtmlBridgeInjectionTransform extends Transform {
         if (raw?.kind === 'matched') {
             this.emitCandidate(emit);
             if (raw.boundary === BYTE_GREATER_THAN) {
-                this.context = raw.context;
+                this.enterContext(raw.context);
             } else {
                 this.tag = { after: raw.context, quote: null };
             }
@@ -725,6 +869,13 @@ class HtmlBridgeInjectionTransform extends Transform {
         if (this.candidate.length === target.length + 1 &&
             asciiEqual(this.candidate.slice(0, -1), target) &&
             isTagBoundary(lastByte)) {
+            if (context === 'script' && this.scriptEscaped) {
+                // Inside the script-data escaped span (opened by `<!--`): this
+                // `</script>` is script data, not the element's end tag, so
+                // consume it and remain in script context.
+                this.emitCandidate(emit);
+                return;
+            }
             const boundary = lastByte;
             this.emitCandidate(emit);
             if (boundary === BYTE_GREATER_THAN) this.context = 'normal';
@@ -749,6 +900,27 @@ class HtmlBridgeInjectionTransform extends Transform {
         for (const byte of this.candidate) emit(byte);
         this.candidate.length = 0;
     }
+
+    private enterContext(context: HtmlScannerContext): void {
+        this.context = context;
+        if (context === 'script') {
+            this.scriptEscaped = false;
+            this.scriptDataTail = 0;
+        }
+    }
+
+    // Track the `<!--` / `-->` script-data escaped span over emitted script
+    // bytes. Called for every byte written to output while in script context,
+    // so it follows the true output order regardless of candidate rescans.
+    private trackScriptData(byte: number): void {
+        if (this.context !== 'script') return;
+        this.scriptDataTail = ((this.scriptDataTail << 8) | byte) >>> 0;
+        if (this.scriptDataTail === SCRIPT_ESCAPE_OPEN) {
+            this.scriptEscaped = true;
+        } else if ((this.scriptDataTail & 0xFFFFFF) === COMMENT_END) {
+            this.scriptEscaped = false;
+        }
+    }
 }
 
 type HtmlScannerContext =
@@ -765,6 +937,8 @@ const BYTE_GREATER_THAN = 0x3E;
 const BYTE_SINGLE_QUOTE = 0x27;
 const BYTE_DOUBLE_QUOTE = 0x22;
 const COMMENT_END = 0x2D2D3E;
+// `<!--` and `-->` as packed big-endian bytes, for the script-data escaped span.
+const SCRIPT_ESCAPE_OPEN = 0x3C212D2D;
 const BODY_CLOSE = asciiBytes('</body>');
 const COMMENT_START = asciiBytes('<!--');
 const SCRIPT_OPEN = asciiBytes('<script');
@@ -866,6 +1040,11 @@ function pipeSockets(clientSocket: net.Socket, upstreamSocket: net.Socket): void
 
 function rejectSocket(socket: net.Socket, status: number, message: string): void {
     if (socket.destroyed) return;
+    // These raw upgrade/CONNECT sockets carry no error listener (Node removes
+    // its internal one before emitting `upgrade`/`connect`), so a client RST
+    // racing this write would emit an unhandled `error` (EPIPE/ECONNRESET) and
+    // crash the extension host. Swallow it and destroy the socket instead.
+    socket.on('error', () => socket.destroy());
     socket.end(
         `HTTP/1.1 ${status} ${message}\r\n` +
         'Connection: close\r\n' +

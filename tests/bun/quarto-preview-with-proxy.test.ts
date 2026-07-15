@@ -58,6 +58,10 @@ class FakeProxy implements QuartoPreviewProxyLike {
     async close(): Promise<void> {
         this.events.push('proxy:close');
     }
+
+    setBrowserFacingOrigin(externalUrl: string): void {
+        this.events.push(`proxy:origin:${externalUrl}`);
+    }
 }
 
 describe('QuartoPreviewWithProxyProcess', () => {
