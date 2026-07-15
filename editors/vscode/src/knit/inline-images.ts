@@ -211,17 +211,22 @@ export function inlineLocalImagesAsDataUrls(
         const relativeBases = [docDir, ...(options.resolveBases ?? [])];
 
         let realResolved: string | null = null;
-        // The logical (pre-realpath) resolved path of the first
-        // image-extensioned candidate, used for the figure-plot marker,
-        // the data-URL MIME, and the diagnostic log line.
+        // The logical (pre-realpath) resolved path that MATCHED, used for
+        // the figure-plot marker and the data-URL MIME.
         let logicalResolved: string | null = null;
         let mime: string | null = null;
+        // Every path we resolved and tried to canonicalize, so a failure
+        // diagnostic can name all the bases attempted (docDir AND
+        // root.dir) rather than only the first.
+        const attempted: string[] = [];
+        let sawKnownExt = false;
         outer:
         for (const cand of pathCandidates) {
             const candMime = mimeForImageExtension(path.extname(cand).toLowerCase());
             // Unknown extensions are passed through; we don't read
             // arbitrary file types off disk.
             if (!candMime) continue;
+            sawKnownExt = true;
             const isAbsolute = path.isAbsolute(cand);
             const cleaned = isAbsolute ? cand : cand.replace(/^\.\//, '');
             // Absolute → a single as-is resolution; relative → one per base.
@@ -230,7 +235,7 @@ export function inlineLocalImagesAsDataUrls(
                 const resolved = base === undefined
                     ? path.resolve(cleaned)
                     : path.resolve(base, cleaned);
-                if (logicalResolved === null) logicalResolved = resolved;
+                attempted.push(resolved);
                 // Canonicalize the candidate against the allowed roots
                 // with `realpath` (so a symlink can't escape a root) and
                 // require containment. Fails closed: a missing file, a
@@ -246,15 +251,17 @@ export function inlineLocalImagesAsDataUrls(
             }
         }
         // No candidate had a known image extension — leave the tag alone.
-        if (logicalResolved === null) return match;
-        if (realResolved === null || mime === null) {
+        if (!sawKnownExt) return match;
+        if (realResolved === null || logicalResolved === null || mime === null) {
             // The path looked inlinable but didn't resolve inside an
             // allowed root (missing, unreadable, or outside the
-            // workspace). Surface it so a broken image in the preview
-            // has a matching line in the Raven Knit output channel.
+            // workspace). Surface every base tried so a broken image in
+            // the preview has a matching line in the Raven Knit output
+            // channel that names the paths the author can actually fix.
             output?.appendLine(
-                `[panel] not inlining image ${logicalResolved} `
-                + '(missing, unreadable, or outside the preview/workspace roots)',
+                `[panel] not inlining image ${JSON.stringify(src)} `
+                + '(missing, unreadable, or outside the preview/workspace roots); tried: '
+                + attempted.join(', '),
             );
             return match;
         }

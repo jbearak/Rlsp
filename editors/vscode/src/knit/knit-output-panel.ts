@@ -438,9 +438,19 @@ export class KnitOutputPanel {
         state: unknown,
         output: vscode.OutputChannel,
     ): Promise<void> {
-        const s = (state ?? {}) as { sourceFsPath?: unknown; outputPath?: unknown };
+        const s = (state ?? {}) as {
+            sourceFsPath?: unknown;
+            outputPath?: unknown;
+            knitRootDir?: unknown;
+        };
         const sourceFsPath = typeof s.sourceFsPath === 'string' ? s.sourceFsPath : '';
         const persistedOutputPath = typeof s.outputPath === 'string' ? s.outputPath : '';
+        // Recover the persisted resolution base; empty string means the
+        // record predates this field, so `updateContent` falls back to
+        // the source directory.
+        const persistedKnitRootDir = typeof s.knitRootDir === 'string' && s.knitRootDir.length > 0
+            ? s.knitRootDir
+            : undefined;
         if (sourceFsPath.length === 0) {
             // No source recorded — nothing actionable to restore.
             panel.dispose();
@@ -492,7 +502,7 @@ export class KnitOutputPanel {
         KnitOutputPanel.wireAndRegister(
             context,
             panel,
-            { sourceUri, outputPath: htmlPath, output },
+            { sourceUri, outputPath: htmlPath, output, knitRootDir: persistedKnitRootDir },
             rootDir,
         );
     }
@@ -811,6 +821,10 @@ export class KnitOutputPanel {
             nonce,
             // Persisted into webview state for the serializer restore path.
             sourceFsPath: this.sourceUri.fsPath,
+            // Persist the resolution base so a post-reload restore (which
+            // has no knit to re-derive it) resolves relative
+            // `include_graphics` images against the same directory.
+            knitRootDir: this.knitRootDir,
             initialThemeApplied: KnitOutputPanel.readThemePreference(this.context),
             // Resolved palette is delivered out-of-band via
             // postMessage from `pushVscodeThemePalette` — the

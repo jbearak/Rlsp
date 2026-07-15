@@ -514,6 +514,27 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
+    test('the diagnostic names every base tried, including the root.dir base', () => {
+        withTempDir((project) => {
+            const docDir = path.join(project, 'reports', '.raven_output');
+            fs.mkdirSync(docDir, { recursive: true });
+            const lines: string[] = [];
+            const sink = { appendLine: (l: string) => lines.push(l) };
+            // Missing under both docDir and the root.dir base (project).
+            const out = inlineLocalImagesAsDataUrls('<img src="images/missing.png">', docDir, sink, {
+                resolveBases: [project],
+                additionalRoots: [project],
+            });
+            expect(out).toContain('<img src="images/missing.png">');
+            const line = lines.find((l) => l.includes('not inlining image'));
+            expect(line).toBeDefined();
+            // Both the docDir attempt and the project (root.dir) attempt
+            // are reported so the author sees the real paths to fix.
+            expect(line).toContain(path.join(docDir, 'images', 'missing.png'));
+            expect(line).toContain(path.join(project, 'images', 'missing.png'));
+        });
+    });
+
     test('does not log for images that inline successfully', () => {
         withTempDir((dir) => {
             fs.mkdirSync(path.join(dir, 'figure'));

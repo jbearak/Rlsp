@@ -759,10 +759,12 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         sourceUri: ctx.sourceUri,
         outputPath: htmlPath,
         output: ctx.output,
-        // Effective chunk working directory: the explicit `root.dir`, or
-        // the subprocess cwd when none was pinned. Relative
-        // `include_graphics` image paths resolve against this.
-        knitRootDir: ctx.knitRootDir ?? ctx.cwd,
+        // Base for resolving relative `include_graphics` image paths.
+        // Prefer the effective `root.dir` the subprocess REPORTED (it
+        // reflects a runtime `opts_knit$set(root.dir=…)` override a
+        // setup chunk may have applied); fall back to the statically
+        // resolved value, then the subprocess cwd.
+        knitRootDir: outcome.rootDir ?? ctx.knitRootDir ?? ctx.cwd,
     });
     if (!panelResult.ok) {
         ctx.output.appendLine(`[panel] ${panelResult.error}`);
