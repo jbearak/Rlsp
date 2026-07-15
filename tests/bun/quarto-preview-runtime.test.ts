@@ -134,6 +134,30 @@ const startArgs = {
 };
 
 describe('QuartoRuntime generation discipline', () => {
+    it('threads a distinct browser URL and defaults it to the framed raw URL', async () => {
+        const h = harness();
+        const first = h.runtime.startOrRestart(startArgs);
+        await waitForProcessCount(h.processes, 1);
+        h.processes[0].process.ready.resolve({
+            rawUrl: 'http://127.0.0.1:4900/proxy/',
+            browserUrl: 'http://127.0.0.1:4800/quarto/',
+            origin: 'http://127.0.0.1:4900',
+            statusCode: 200,
+        });
+        await first;
+        expect(h.updates.at(-1)?.browserUrl).toBe('http://127.0.0.1:4800/quarto/');
+
+        const second = h.runtime.startOrRestart(startArgs);
+        await waitForProcessCount(h.processes, 2);
+        h.processes[1].process.ready.resolve({
+            rawUrl: 'http://127.0.0.1:4700/direct/',
+            origin: 'http://127.0.0.1:4700',
+            statusCode: 200,
+        });
+        await second;
+        expect(h.updates.at(-1)?.browserUrl).toBe('http://127.0.0.1:4700/direct/');
+    });
+
     it('uses one monotonic generation counter across distinct keys', async () => {
         const h = harness();
         const first = h.runtime.startOrRestart({

@@ -25,5 +25,13 @@ test("VSIX package keeps runtime assets and excludes development-only files", ()
   expect(ignore.has("icon.svg")).toBe(true);
   expect(ignore.has("icon.png")).toBe(false);
   expect(ignore.has("dist/knit/**")).toBe(true);
+  expect(ignore.has("dist/quarto-theme-bridge/**")).toBe(false);
   expect(ignore.has("test-fixtures/**")).toBe(true);
+
+  const buildScript = readFileSync(
+    path.join(vscodeRoot, "scripts", "build.js"),
+    "utf8",
+  );
+  expect(buildScript).toContain("copyQuartoThemeBridge()");
+  expect(buildScript).toContain("path.join(dist, 'quarto-theme-bridge')");
 });

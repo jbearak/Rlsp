@@ -68,8 +68,10 @@ export interface QuartoRuntimeViewUpdate {
     generation: number;
     sourceFsPath: string;
     state: QuartoPreviewViewState;
-    /** Raw validated loopback URL, used only for Open in Browser. */
+    /** Raw validated loopback URL framed after external-URI mapping. */
     rawUrl?: string;
+    /** Original Quarto URL for Open in Browser; defaults to `rawUrl`. */
+    browserUrl?: string;
 }
 
 export interface QuartoRuntimeDeps {
@@ -384,6 +386,13 @@ export class QuartoRuntime {
                 return { kind: 'superseded', generation };
             }
 
+            // Tell a response-transforming proxy the browser-facing origin so
+            // its request allowlist admits that host/origin. Done before the
+            // webview loads the external URL, so the first browser request the
+            // proxy sees already matches; only the loopback readiness probe ran
+            // earlier.
+            process.setBrowserFacingOrigin?.(externalUrl);
+
             this.emitReady(session, ready, externalUrl);
             return {
                 kind: 'ready',
@@ -585,6 +594,7 @@ export class QuartoRuntime {
             generation: session.generation,
             sourceFsPath: session.sourceFsPath,
             rawUrl: ready.rawUrl,
+            browserUrl: ready.browserUrl ?? ready.rawUrl,
             state: { kind: 'serving', externalUrl },
         });
     }
@@ -703,4 +713,3 @@ function readStartupTail(error: Error): string {
 function errorMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
-

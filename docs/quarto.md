@@ -160,6 +160,59 @@ startup, Quarto stdout/stderr, frontmatter parse fallbacks, render output, and
 panel advisories are logged there. The command is always available from the
 Command Palette.
 
+## Apply VS Code theme
+
+The preview toolbar's **Apply VS Code theme** toggle recolors the live Quarto
+page to match the active VS Code theme and preview fonts. Switching the toggle,
+changing either font setting, or changing the active color theme updates the
+open preview without reloading the page or re-rendering the document. The
+preference is per-user, is shared by all open Quarto preview panels, and is
+persisted across VS Code sessions.
+
+The overlay works with standard Quarto HTML documents, websites, and books.
+Raven reapplies it after Quarto's live re-render and as you follow cross-page
+navigation within a website or book. Turning the toggle off removes Raven's
+overlay and restores the appearance authored by the Quarto document and its
+theme. It does not modify the source, generated output, or the page opened by
+**Open in Browser**.
+
+The color mapping is intentionally coarse. Raven maps syntax spans into ten
+broad roles such as keyword, string, comment, and function, and covers common
+Quarto, Pandoc, and Bootstrap surfaces. It aims to make the preview feel at home
+in the editor, not to reproduce VS Code's tokenization or every custom Quarto
+theme rule exactly.
+
+At a high level, Raven places a loopback proxy in front of Quarto's local
+preview server and injects a small theme bridge into eligible HTML responses.
+The preview remains a sandboxed, cross-origin iframe. Only validated,
+non-sensitive presentation data—the enabled state, colors, and sanitized font
+families—crosses the boundary. If Raven cannot start or probe the proxy, it
+falls back to the ordinary unthemed Quarto preview instead of failing the
+preview.
+
+### Fonts
+
+The two Quarto font settings accept the same comma-separated form as CSS
+`font-family`; quoted names with spaces are valid, for example
+`"JetBrains Mono", "Fira Code", monospace`.
+
+When **Apply VS Code theme** is on, Raven resolves each font slot in this order:
+
+1. `raven.quarto.fontFamily` for body/prose or
+   `raven.quarto.monospaceFontFamily` for code, when non-empty.
+2. `markdown.preview.fontFamily` for body/prose or `editor.fontFamily` for
+   code. The monospace fallback honors `[quarto]` language-scoped
+   `editor.fontFamily` overrides.
+3. A built-in sans-serif or monospace fallback if the configured values are
+   invalid.
+
+Both Raven settings are resource-scoped, so folders in a multi-root workspace
+can choose different fonts. Changes to either Raven setting or either VS Code
+fallback update an open preview live. Raven sanitizes the values before sending
+them to the bridge and appends a generic family when needed; invalid CSS-wide
+keywords, unsafe characters, unbalanced quotes, and bare parentheses fall
+through to the next value in the chain.
+
 ## Preview ownership and keying
 
 Raven keys a preview by Quarto project when it finds one, otherwise by source
@@ -197,20 +250,26 @@ For Preview, Raven starts Quarto with `--host 127.0.0.1` and accepts only an
 `http:` URL whose host is exactly `127.0.0.1`, `localhost`, or `[::1]`. URLs
 with credentials, non-loopback hosts, malformed ports, or another scheme are
 rejected. This matters because document code can write text that resembles
-Quarto's own startup messages.
+Quarto's own startup messages. Raven then starts its own loopback-only proxy,
+fixed to that validated Quarto origin; it cannot be used as an open proxy. The
+iframe frames the VS Code-mapped proxy URL, and the proxy forwards HTTP and
+live-reload WebSocket traffic to Quarto. If proxy startup fails, Raven falls
+back to framing the validated Quarto URL directly without the theme bridge.
 
 The rendered document can contain JavaScript. Raven runs it in a sandboxed,
 cross-origin iframe rather than in the Raven-controlled webview document. The
 frame permits the capabilities ordinary Quarto output needs, including
 scripts, forms, downloads, and same-origin access to its own resources, while
 denying capabilities such as top-level navigation and popups. It cannot reach
-the outer webview DOM or VS Code API.
+the outer webview DOM or VS Code API. The injected bridge does not change that
+boundary: it accepts an exact, parent-source-checked theme message from the outer
+shell and applies only validated colors and sanitized font families.
 
-VS Code maps the validated loopback URL for each new iframe installation,
+VS Code maps the validated loopback proxy URL for each new iframe installation,
 which also enables remote port forwarding where supported. Raven does not
 cache that mapping and never opens a browser on its own. **Open in Browser** is
-the explicit escape hatch when a widget, browser policy, or remote tunnel does
-not work inside the sandboxed panel.
+the explicit escape hatch to Quarto's original URL when a widget, browser
+policy, or remote tunnel does not work inside the sandboxed panel.
 
 ## Settings
 
@@ -219,6 +278,8 @@ not work inside the sandboxed panel.
 | `raven.quarto.path` | `""` | Absolute path to a Quarto CLI executable. Leave empty to search `PATH` and the standard platform locations listed above. |
 | `raven.quarto.viewerColumn` | `"beside"` | Column for newly created preview panels: `"active"` or `"beside"`. It does not move an existing panel. |
 | `raven.quarto.render.timeoutMs` | `600000` | Hard timeout in milliseconds for a one-shot Quarto render. Cancellation and timeout stop the process tree with escalating signals. |
+| `raven.quarto.fontFamily` | `""` | Body/prose font for the live-themed preview. Empty inherits `markdown.preview.fontFamily`. |
+| `raven.quarto.monospaceFontFamily` | `""` | Monospace font for code in the live-themed preview. Empty inherits `editor.fontFamily`. |
 
 See the [settings reference](settings-reference.md) for the generated schema
 summary.
@@ -268,6 +329,18 @@ from the success notification.
   invokes Quarto. Shiny requires the separate `quarto serve` lifecycle.
 - Browser preview depends on the output format. Non-browser-previewable
   formats such as DOCX and PPTX fail preview with a 404 message; use Render.
+- A page with a restrictive `script-src` or `style-src` Content Security
+  Policy that permits scripts or styles only by nonce or hash can block the
+  injected bridge. The toggle then reports **Theme bridge unavailable on this
+  page**.
+- RevealJS presentations, heavily customized SCSS, and author-provided
+  light/dark theme toggles are themed on a best-effort, coarse basis. Raven
+  does not promise exact tokenization or full custom-theme fidelity.
+- A remote tunnel mounted under a URL path prefix, rather than mapped by
+  authority and port, is a known caveat for redirects. VS Code's usual Remote
+  SSH, WSL, and Dev Container port mappings are authority-based.
+- PDF and other non-HTML previews are unaffected by **Apply VS Code theme**;
+  Raven does not inject or theme those responses.
 - Quarto processes are window-owned. Preview and in-flight one-shot render
   processes do not continue through extension deactivation or window reload,
   and Stop does not reach previews owned by another VS Code window.

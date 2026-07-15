@@ -107,6 +107,17 @@ function copyOnigWasm() {
     console.log(`Copied ${path.relative(root, src)} -> ${path.relative(root, dest)}`);
 }
 
+/** Copy the injected Quarto bridge into the shipped runtime-only dist tree. */
+function copyQuartoThemeBridge() {
+    const src = path.join(root, 'src', 'quarto', 'bridge');
+    const dest = path.join(dist, 'quarto-theme-bridge');
+    fs.mkdirSync(dest, { recursive: true });
+    for (const asset of ['bridge.js', 'bridge.css']) {
+        fs.copyFileSync(path.join(src, asset), path.join(dest, asset));
+    }
+    console.log('Copied src/quarto/bridge -> dist/quarto-theme-bridge');
+}
+
 (async () => {
     try {
         await Promise.all([
@@ -125,6 +136,7 @@ function copyOnigWasm() {
             ),
         ]);
         copyOnigWasm();
+        copyQuartoThemeBridge();
     } catch (err) {
         console.error(err);
         process.exit(1);

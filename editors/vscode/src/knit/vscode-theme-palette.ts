@@ -70,6 +70,8 @@ export interface ThemePaletteSuccess {
     palette: GithubPalette;
     /** The matched theme id (or label fallback). */
     themeId: string;
+    /** Display label used by VS Code's per-theme customization keys. */
+    themeLabel?: string;
     /** Whether the theme is light. From the caller's ColorThemeKind. */
     isLight: boolean;
     /**
@@ -503,6 +505,7 @@ export async function resolveActiveThemePalette(
         ok: true,
         palette,
         themeId: located.id,
+        themeLabel: located.label,
         isLight: args.isLight,
         candidateFailures,
     };

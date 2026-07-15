@@ -58,7 +58,10 @@ const SIGNAL_GRACE_MS = 5_000;
 const SHUTDOWN_TERM_GRACE_MS = 2_000;
 
 export interface QuartoPreviewReady {
+    /** URL framed by the preview runtime (the proxy URL when bridged). */
     rawUrl: string;
+    /** Original Quarto URL for Open in Browser; defaults to `rawUrl`. */
+    browserUrl?: string;
     origin: string;
     statusCode: number;
 }
@@ -94,6 +97,12 @@ export interface QuartoPreviewProcessLike {
     start(): Promise<QuartoPreviewReady>;
     stop(): Promise<void>;
     shutdown(): Promise<void>;
+    /**
+     * Optionally record the browser-facing URL (`asExternalUri` mapping of the
+     * ready origin) once known, so a response-transforming proxy can extend its
+     * request allowlist to that host/origin. A no-op for plain processes.
+     */
+    setBrowserFacingOrigin?(externalUrl: string): void;
 }
 
 export class QuartoPreviewProcess implements QuartoPreviewProcessLike {
