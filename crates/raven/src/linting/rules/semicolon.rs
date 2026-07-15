@@ -3,10 +3,13 @@
 //! Mirrors `lintr::semicolon_linter`. Tree-sitter-r does not emit `;` as a
 //! named or anonymous node — it's simply a separator the parser consumes
 //! between statements. To find them we scan the raw source byte-by-byte while
-//! using the tree to skip every leaf-token range: a separator `;` always lies
-//! in the gaps *between* tokens, so any `;` inside a token span (a string,
-//! comment, backtick-quoted identifier like `` `a;b` ``, or user infix
-//! operator like `%;%`) is part of that token, never a separator.
+//! using the tree to skip complete string ranges and every other leaf-token
+//! range. Strings need explicit whole-node handling because escape sequences
+//! are child nodes, leaving the surrounding string content outside the leaf
+//! ranges. A separator `;` always lies in the gaps *between* tokens, so any
+//! `;` inside an excluded span (a string, comment, backtick-quoted identifier
+//! like `` `a;b` ``, or user infix operator like `%;%`) is part of that token,
+//! never a separator.
 //!
 //! Diagnostic anchor: the column of the `;` character itself, on the line it
 //! appears on. We emit one diagnostic per `;` so a line with two semicolons
@@ -31,9 +34,9 @@ pub(crate) fn collect(
     scan(text, &exclusions, severity, suppressions, out);
 }
 
-/// Sorted, non-overlapping byte ranges of leaf tokens — places where a `;` is
-/// part of a token (string, comment, backticked identifier, `%…%` operator),
-/// not a statement separator.
+/// Sorted, non-overlapping byte ranges of complete strings and other leaf
+/// tokens — places where a `;` is part of a token (string, comment, backticked
+/// identifier, `%…%` operator), not a statement separator.
 fn collect_exclusions(root: Node<'_>) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     walk(root, &mut out);
@@ -42,6 +45,12 @@ fn collect_exclusions(root: Node<'_>) -> Vec<(usize, usize)> {
 }
 
 fn walk(node: Node<'_>, out: &mut Vec<(usize, usize)>) {
+    // Escapes make `string` a non-leaf node. Exclude the complete literal so
+    // the un-noded content around an escape cannot be mistaken for source.
+    if node.kind() == "string" {
+        out.push((node.start_byte(), node.end_byte()));
+        return;
+    }
     if node.child_count() == 0 {
         if node.end_byte() > node.start_byte() {
             out.push((node.start_byte(), node.end_byte()));
