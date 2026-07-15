@@ -21,6 +21,8 @@ suite('QuartoPreviewPanel integration', () => {
     let output: vscode.OutputChannel;
     let stops: Array<{ key: string; generation: number }>;
     let deps: QuartoPreviewPanelDeps;
+    let posted: unknown[];
+    let stored: Map<string, unknown>;
 
     suiteSetup(async () => {
         await activate();
@@ -29,12 +31,27 @@ suite('QuartoPreviewPanel integration', () => {
 
     setup(() => {
         stops = [];
+        posted = [];
+        stored = new Map();
+        const globalState = {
+            get: <T>(key: string) => stored.get(key) as T | undefined,
+            update: async (key: string, value: unknown) => { stored.set(key, value); },
+            keys: () => [...stored.keys()],
+        } as unknown as vscode.Memento;
         deps = {
+            context: {
+                subscriptions: [],
+                globalState,
+            } as unknown as vscode.ExtensionContext,
             output,
             stopGeneration: async (key, generation) => {
                 stops.push({ key, generation });
             },
             keyForSource: async (sourceFsPath) => sourceFsPath,
+            postWebviewMessage: (_webview, message) => {
+                posted.push(message);
+                return true;
+            },
         };
     });
 
@@ -281,9 +298,15 @@ suite('QuartoPreviewPanel integration', () => {
     test('Open in Browser false result warns and logs the copyable URL', async () => {
         const lines: string[] = [];
         const warnings: string[] = [];
+        const openedUrls: string[] = [];
         const originalOpenExternal = vscode.env.openExternal;
         const originalShowWarning = vscode.window.showWarningMessage;
-        (vscode.env as { openExternal: unknown }).openExternal = async () => false;
+        (vscode.env as { openExternal: unknown }).openExternal = async (
+            uri: vscode.Uri,
+        ) => {
+            openedUrls.push(uri.toString());
+            return false;
+        };
         (vscode.window as { showWarningMessage: unknown }).showWarningMessage = (
             message: string,
         ): Thenable<string | undefined> => {
@@ -297,7 +320,8 @@ suite('QuartoPreviewPanel integration', () => {
                     appendLine: (line: string) => { lines.push(line); },
                 } as unknown as vscode.OutputChannel,
             };
-            const rawUrl = 'http://127.0.0.1:4555/chapter/';
+            const rawUrl = 'http://127.0.0.1:4555/proxy/chapter/';
+            const browserUrl = 'http://127.0.0.1:4444/chapter/';
             const instance = QuartoPreviewPanel.applyRuntimeUpdate({
                 key: '/project',
                 generation: 1,
@@ -310,12 +334,17 @@ suite('QuartoPreviewPanel integration', () => {
                 generation: 1,
                 sourceFsPath: '/project/a.qmd',
                 rawUrl,
+                browserUrl,
                 state: { kind: 'serving', externalUrl: rawUrl },
             }, browserDeps);
 
             await instance.handleMessageForTesting({ type: 'open-in-browser' });
 
-            assert.deepStrictEqual(lines, [`[panel] Open in Browser failed: ${rawUrl}`]);
+            assert.ok(
+                lines.includes(`[panel] Open in Browser failed: ${browserUrl}`),
+                'browser failure remains copyable alongside theme diagnostics',
+            );
+            assert.deepStrictEqual(openedUrls, [browserUrl]);
             assert.deepStrictEqual(warnings, [
                 'VS Code could not open the Quarto preview in a browser. ' +
                 'The URL was written to Raven: Quarto output.',
@@ -366,4 +395,112 @@ suite('QuartoPreviewPanel integration', () => {
         assert.strictEqual(restored, null);
         assert.strictEqual(stops.length, 0);
     });
+
+    test('serving posts a theme update and installs handshake/load handling', async () => {
+        const instance = QuartoPreviewPanel.applyRuntimeUpdate({
+            key: '/theme-project',
+            generation: 1,
+            sourceFsPath: '/theme-project/a.qmd',
+            state: { kind: 'serving', externalUrl: 'http://127.0.0.1:4555/' },
+        }, deps);
+        assert.ok(instance);
+        await waitUntil(() => posted.some(isThemeUpdate));
+        const html = instance.getPanelForTesting().webview.html;
+        assert.ok(html.includes('event.origin === frameOrigin && isThemeReady(message)'));
+        assert.ok(html.includes("frame.addEventListener('load', function ()"));
+        assert.ok(html.includes('postThemeToFrame();'));
+        const readyStart = html.indexOf(
+            'if (event.origin === frameOrigin && isThemeReady(message))',
+        );
+        const readyEnd = html.indexOf('\n                    return;', readyStart);
+        assert.ok(!html.slice(readyStart, readyEnd).includes('postThemeToFrame();'));
+    });
+
+    test('toggle persists and broadcasts authoritative theme updates to two panels', async () => {
+        const first = QuartoPreviewPanel.applyRuntimeUpdate({
+            key: '/theme-a',
+            generation: 1,
+            sourceFsPath: '/theme-a/a.qmd',
+            state: { kind: 'starting' },
+        }, deps);
+        const second = QuartoPreviewPanel.applyRuntimeUpdate({
+            key: '/theme-b',
+            generation: 1,
+            sourceFsPath: '/theme-b/b.qmd',
+            state: { kind: 'starting' },
+        }, deps);
+        assert.ok(first);
+        assert.ok(second);
+
+        await first.handleMessageForTesting({ type: 'theme-changed', applied: true });
+
+        assert.strictEqual(stored.get('raven.quarto.applyVSCodeTheme'), true);
+        const enabledUpdates = posted.filter((message): message is {
+            type: 'theme-update';
+            payload: { enabled: boolean };
+        } => isThemeUpdate(message) && message.payload.enabled === true);
+        assert.ok(enabledUpdates.length >= 2, 'both panels receive enabled=true');
+    });
+
+    test('visible resend and same-kind theme refresh re-request context and theme', async () => {
+        const instance = QuartoPreviewPanel.applyRuntimeUpdate({
+            key: '/theme-visible',
+            generation: 1,
+            sourceFsPath: '/theme-visible/a.qmd',
+            state: { kind: 'serving', externalUrl: 'http://127.0.0.1:4556/' },
+        }, deps);
+        assert.ok(instance);
+        await waitUntil(() => posted.some(isThemeUpdate));
+        const beforeTheme = posted.filter(isThemeUpdate).length;
+
+        instance.handleActiveThemeChangeForTesting();
+        await waitUntil(() => posted.some(isThemeContextRequest));
+        await waitUntil(() => posted.filter(isThemeUpdate).length > beforeTheme);
+
+        const cover = vscode.window.createWebviewPanel(
+            'raven.quartoPreview.test.cover',
+            'Cover',
+            instance.getPanelForTesting().viewColumn ?? vscode.ViewColumn.One,
+            {},
+        );
+        try {
+            const beforeVisible = posted.filter(isThemeUpdate).length;
+            const beforeVisibleContext = posted.filter(isThemeContextRequest).length;
+            instance.getPanelForTesting().reveal(
+                instance.getPanelForTesting().viewColumn ?? vscode.ViewColumn.One,
+                false,
+            );
+            await waitUntil(() => posted.filter(isThemeUpdate).length > beforeVisible);
+            await waitUntil(() =>
+                posted.filter(isThemeContextRequest).length > beforeVisibleContext
+            );
+        } finally {
+            cover.dispose();
+        }
+    });
 });
+
+function isThemeUpdate(message: unknown): message is {
+    type: 'theme-update';
+    payload: { enabled: boolean };
+} {
+    return message !== null
+        && typeof message === 'object'
+        && (message as { type?: unknown }).type === 'theme-update';
+}
+
+function isThemeContextRequest(message: unknown): boolean {
+    return message !== null
+        && typeof message === 'object'
+        && (message as { type?: unknown }).type === 'theme-context-request';
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+    const started = Date.now();
+    while (!predicate()) {
+        if (Date.now() - started > timeoutMs) {
+            throw new Error('timed out waiting for Quarto panel theme event');
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+}

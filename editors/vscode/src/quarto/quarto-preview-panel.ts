@@ -35,19 +35,31 @@
  */
 
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { canonicalOpKey } from '../knit/raven-knit-paths';
+import { resolveFontFamilies } from '../knit/render-html';
+import { getKnitGrammarRegistry } from '../knit/post-knit-renderer';
 import { applyViewerTabIcon } from '../viewer-tab-icon';
-import type { QuartoPreviewViewState } from './quarto-messages';
+import type { QuartoPreviewViewState, QuartoThemePayload } from './quarto-messages';
 import { isPreviewToExtensionMessage } from './quarto-messages';
 import { buildQuartoPreviewShellHtml } from './quarto-preview-html';
 import type { QuartoRuntimeViewUpdate } from './quarto-preview-runtime';
+import {
+    QuartoThemeController,
+    type QuartoThemeKind,
+} from './quarto-theme-controller';
 
 export interface QuartoPreviewPanelDeps {
+    context: vscode.ExtensionContext;
     output: vscode.OutputChannel;
     stopGeneration(key: string, generation: number): Promise<unknown>;
     keyForSource(sourceFsPath: string): Promise<string>;
+    postWebviewMessage?(
+        webview: vscode.Webview,
+        message: unknown,
+    ): PromiseLike<boolean> | boolean;
 }
 
 type ViewerColumnSetting = 'active' | 'beside';
@@ -58,9 +70,11 @@ export class QuartoPreviewPanel {
     private generation: number;
     private sourceFsPath: string;
     private state: QuartoPreviewViewState;
-    private rawUrl: string | undefined;
+    private browserUrl: string | undefined;
     private frameInstalled = false;
     private disposed = false;
+    private bridgeAvailable: boolean | undefined;
+    private readonly themeController: QuartoThemeController;
 
     private constructor(
         private readonly panel: vscode.WebviewPanel,
@@ -73,6 +87,7 @@ export class QuartoPreviewPanel {
         this.generation = generation;
         this.sourceFsPath = sourceFsPath;
         this.state = state;
+        this.themeController = this.createThemeController();
         this.wire();
         this.rebuildHtml();
     }
@@ -137,10 +152,10 @@ export class QuartoPreviewPanel {
             update.state,
             deps,
         );
-        instance.rawUrl = update.rawUrl;
+        instance.browserUrl = update.browserUrl ?? update.rawUrl;
         this.instances.set(update.key, instance);
-        // The constructor rendered before rawUrl assignment, but rawUrl does
-        // not enter HTML; it is retained only for Open in Browser.
+        // The constructor rendered before browserUrl assignment, but that URL
+        // does not enter HTML; it is retained only for Open in Browser.
         return instance;
     }
 
@@ -211,6 +226,11 @@ export class QuartoPreviewPanel {
         await this.handleMessage(message);
     }
 
+    /** Test-only same-kind theme-change trigger. */
+    handleActiveThemeChangeForTesting(): void {
+        this.themeController.handleActiveThemeChangeForTesting();
+    }
+
     private applyUpdate(update: QuartoRuntimeViewUpdate): boolean {
         if (update.generation < this.generation || this.disposed) return false;
         let sourceChanged = false;
@@ -218,10 +238,12 @@ export class QuartoPreviewPanel {
             this.generation = update.generation;
             sourceChanged = this.sourceFsPath !== update.sourceFsPath;
             this.sourceFsPath = update.sourceFsPath;
-            this.rawUrl = undefined;
+            if (sourceChanged) this.themeController.updateSource(update.sourceFsPath);
+            this.browserUrl = undefined;
             this.panel.title = `Quarto Preview: ${path.basename(update.sourceFsPath)}`;
         }
-        if (update.rawUrl !== undefined) this.rawUrl = update.rawUrl;
+        if (update.browserUrl !== undefined) this.browserUrl = update.browserUrl;
+        else if (update.rawUrl !== undefined) this.browserUrl = update.rawUrl;
 
         const next = update.state;
         const rebuild = sourceChanged
@@ -238,7 +260,8 @@ export class QuartoPreviewPanel {
         this.key = update.key;
         this.generation = update.generation;
         this.sourceFsPath = update.sourceFsPath;
-        this.rawUrl = update.rawUrl;
+        this.themeController.updateSource(update.sourceFsPath);
+        this.browserUrl = update.browserUrl ?? update.rawUrl;
         this.state = update.state;
         this.panel.title = `Quarto Preview: ${path.basename(update.sourceFsPath)}`;
         this.rebuildHtml();
@@ -253,11 +276,16 @@ export class QuartoPreviewPanel {
             });
         });
         this.panel.onDidChangeViewState((event) => {
-            if (event.webviewPanel.visible) this.postState();
+            if (event.webviewPanel.visible) {
+                this.postState();
+                void this.requestThemeContext();
+                void this.themeController.push();
+            }
         });
         this.panel.onDidDispose(() => {
             if (this.disposed) return;
             this.disposed = true;
+            this.themeController.dispose();
             if (QuartoPreviewPanel.instances.get(this.key) === this) {
                 QuartoPreviewPanel.instances.delete(this.key);
             }
@@ -277,15 +305,16 @@ export class QuartoPreviewPanel {
         switch (message.type) {
             case 'webview-ready':
                 this.postState();
+                void this.themeController.push();
                 return;
             case 'open-in-browser':
-                if (this.rawUrl) {
+                if (this.browserUrl) {
                     const opened = await vscode.env.openExternal(
-                        vscode.Uri.parse(this.rawUrl),
+                        vscode.Uri.parse(this.browserUrl),
                     );
                     if (!opened) {
                         this.deps.output.appendLine(
-                            `[panel] Open in Browser failed: ${this.rawUrl}`,
+                            `[panel] Open in Browser failed: ${this.browserUrl}`,
                         );
                         await vscode.window.showWarningMessage(
                             'VS Code could not open the Quarto preview in a browser. ' +
@@ -314,6 +343,21 @@ export class QuartoPreviewPanel {
             case 'report-error':
                 this.deps.output.appendLine(`[panel] webview error: ${message.message}`);
                 return;
+            case 'theme-context':
+                this.themeController.setEditorBackground(message.background);
+                return;
+            case 'theme-changed':
+                await this.themeController.setEnabled(message.applied);
+                return;
+            case 'theme-bridge-status':
+                if (this.bridgeAvailable !== message.available) {
+                    this.bridgeAvailable = message.available;
+                    this.deps.output.appendLine(
+                        `[theme] bridge ${message.available ? 'available' : 'unavailable'} ` +
+                        `for ${this.sourceFsPath}`,
+                    );
+                }
+                return;
         }
     }
 
@@ -324,18 +368,124 @@ export class QuartoPreviewPanel {
             nonce: crypto.randomBytes(16).toString('base64'),
             sourceFsPath: this.sourceFsPath,
             state: this.state,
+            themeEnabled: this.themeController.isEnabled,
         });
+        if (this.state.kind === 'serving') void this.themeController.push();
     }
 
     private postState(): void {
         if (this.disposed) return;
-        void Promise.resolve(this.panel.webview.postMessage({
+        void this.postWebviewMessage({
             type: 'state-update',
             payload: this.state,
-        })).catch(() => {
+        }).catch(() => {
             // Hidden/disposed webviews can drop or reject delivery. Host state
             // remains authoritative and will be sent again when visible/ready.
         });
+    }
+
+    private postThemeUpdate(payload: QuartoThemePayload): Promise<boolean> {
+        if (this.disposed) return Promise.resolve(false);
+        return this.postWebviewMessage({
+            type: 'theme-update',
+            payload,
+        });
+    }
+
+    private requestThemeContext(): Promise<boolean> {
+        if (this.disposed) return Promise.resolve(false);
+        return this.postWebviewMessage({
+            type: 'theme-context-request',
+        });
+    }
+
+    private postWebviewMessage(message: unknown): Promise<boolean> {
+        if (this.disposed) return Promise.resolve(false);
+        try {
+            const delivered = this.deps.postWebviewMessage
+                ? this.deps.postWebviewMessage(this.panel.webview, message)
+                : this.panel.webview.postMessage(message);
+            return Promise.resolve(delivered).catch(() => false);
+        } catch {
+            return Promise.resolve(false);
+        }
+    }
+
+    private createThemeController(): QuartoThemeController {
+        let cachedLanguageId = 'quarto';
+        const sourceScope = (sourceFsPath: string): {
+            uri: vscode.Uri;
+            languageId: string;
+        } => {
+            for (const document of vscode.workspace.textDocuments) {
+                if (document.uri.fsPath === sourceFsPath) {
+                    cachedLanguageId = document.languageId;
+                    break;
+                }
+            }
+            return {
+                uri: vscode.Uri.file(sourceFsPath),
+                languageId: cachedLanguageId,
+            };
+        };
+
+        return new QuartoThemeController({
+            context: this.deps.context,
+            output: this.deps.output,
+            sourceFsPath: this.sourceFsPath,
+            postThemeUpdate: (payload) => this.postThemeUpdate(payload),
+            requestThemeContext: () => this.requestThemeContext(),
+            activeThemeKind: () => colorThemeKind(vscode.window.activeColorTheme.kind),
+            getConfiguration: <T>(section: string, defaultValue?: T): T | undefined =>
+                vscode.workspace.getConfiguration().get<T>(section, defaultValue as T),
+            themeResolverInputs: () => {
+                const editor = vscode.workspace.getConfiguration('editor');
+                return {
+                    extensions: vscode.extensions.all.map((extension) => ({
+                        id: extension.id,
+                        extensionPath: extension.extensionPath,
+                        packageJSON: extension.packageJSON,
+                    })),
+                    tokenColorCustomizations: editor.get('tokenColorCustomizations'),
+                    semanticTokenColorCustomizations:
+                        editor.get('semanticTokenColorCustomizations'),
+                    registry: getKnitGrammarRegistry(this.deps.context),
+                    readFile: (absolutePath) => fs.promises.readFile(absolutePath, 'utf-8'),
+                    realPath: (absolutePath) => fs.promises.realpath(absolutePath),
+                };
+            },
+            resolveFonts: (sourceFsPath) => {
+                const scope = sourceScope(sourceFsPath);
+                const uri = scope.uri;
+                const quarto = vscode.workspace.getConfiguration('raven.quarto', uri);
+                const markdown = vscode.workspace.getConfiguration('markdown.preview', uri);
+                const editor = vscode.workspace.getConfiguration('editor', scope);
+                return resolveFontFamilies(
+                    quarto.get<string>('fontFamily', ''),
+                    quarto.get<string>('monospaceFontFamily', ''),
+                    markdown.get<string>('fontFamily', ''),
+                    editor.get<string>('fontFamily', ''),
+                );
+            },
+            sourceConfigurationScope: sourceScope,
+            onDidChangeActiveColorTheme: (listener) =>
+                vscode.window.onDidChangeActiveColorTheme(listener),
+            onDidChangeConfiguration: (listener) =>
+                vscode.workspace.onDidChangeConfiguration(listener),
+        });
+    }
+}
+
+function colorThemeKind(kind: vscode.ColorThemeKind): QuartoThemeKind {
+    switch (kind) {
+        case vscode.ColorThemeKind.Light:
+            return 'light';
+        case vscode.ColorThemeKind.HighContrast:
+            return 'high-contrast';
+        case vscode.ColorThemeKind.HighContrastLight:
+            return 'high-contrast-light';
+        default:
+            return 'dark';
     }
 }
 

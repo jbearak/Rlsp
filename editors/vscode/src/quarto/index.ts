@@ -15,11 +15,13 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { registerQuartoCommands } from './quarto-commands';
+import { loadQuartoPreviewBridgeAssets } from './quarto-bridge-assets';
 import type { QuartoCommandLifecycle } from './quarto-command-lifecycle';
 import { probeQuartoBinary, QuartoResolver } from './quarto-detect';
 import { QuartoPreviewProcess } from './quarto-preview-engine';
 import { QuartoPreviewPanel, type QuartoPreviewPanelDeps } from './quarto-preview-panel';
 import { QuartoRuntime } from './quarto-preview-runtime';
+import { QuartoPreviewWithProxyProcess } from './quarto-preview-with-proxy';
 import { resolveQuartoContext } from './quarto-project';
 import { isQuartoProjectMarkerFile } from './quarto-project-fs';
 import { QuartoRenderEngine } from './quarto-render-engine';
@@ -48,9 +50,14 @@ export function registerQuarto(context: vscode.ExtensionContext): void {
         probe: probeQuartoBinary,
     });
     const renderEngine = new QuartoRenderEngine();
+    const bridgeAssets = loadQuartoPreviewBridgeAssets(
+        context.extensionUri.fsPath,
+        output,
+    );
 
     let runtime!: QuartoRuntime;
     const panelDeps: QuartoPreviewPanelDeps = {
+        context,
         output,
         stopGeneration: (key, generation) => runtime.stopGeneration(key, generation),
         keyForSource: async (sourceFsPath) => (
@@ -61,12 +68,17 @@ export function registerQuarto(context: vscode.ExtensionContext): void {
         ).key,
     };
     runtime = new QuartoRuntime({
-        processFactory: (args) => new QuartoPreviewProcess({
-            quartoPath: args.quartoPath,
-            sourceFsPath: args.sourceFsPath,
-            cwd: args.cwd,
+        processFactory: (args) => new QuartoPreviewWithProxyProcess({
             output,
+            bridgeAssets,
             onUnexpectedExit: args.onUnexpectedExit,
+            createInner: (onUnexpectedExit) => new QuartoPreviewProcess({
+                quartoPath: args.quartoPath,
+                sourceFsPath: args.sourceFsPath,
+                cwd: args.cwd,
+                output,
+                onUnexpectedExit,
+            }),
         }),
         asExternalUri: async (rawUrl) => (
             await vscode.env.asExternalUri(vscode.Uri.parse(rawUrl))

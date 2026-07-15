@@ -1611,6 +1611,24 @@
           "maximum": 2147483647,
           "description": "Hard timeout (milliseconds) for the Quarto render subprocess. Cancellation and timeout use the SIGINT → SIGTERM → SIGKILL process-tree ladder."
         },
+        "raven.quarto.fontFamily": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "maxLength": 500,
+          "pattern": "^[^;{}<>\\\\\\n\\r\\t\\f\\v\\u0000]*$",
+          "patternErrorMessage": "Cannot contain ; { } < > \\ or whitespace control characters.",
+          "description": "Body/prose font for the live-themed Quarto Preview. Accepts the same comma-separated form as CSS `font-family` (quoted names with spaces or parens are fine — e.g. `\"Aptos (Body)\", sans-serif`). Leave empty to inherit `markdown.preview.fontFamily`. The open preview panel updates live when this setting changes. Bare parens, unbalanced quotes, and CSS-wide keywords (`inherit`, `initial`, …) are rejected at preview time and the next layer of the fallback chain is used."
+        },
+        "raven.quarto.monospaceFontFamily": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "maxLength": 500,
+          "pattern": "^[^;{}<>\\\\\\n\\r\\t\\f\\v\\u0000]*$",
+          "patternErrorMessage": "Cannot contain ; { } < > \\ or whitespace control characters.",
+          "description": "Monospace font for code in the live-themed Quarto Preview. Accepts the same comma-separated form as CSS `font-family` (quoted names with spaces or parens are fine). Leave empty to inherit `editor.fontFamily` (honors `[quarto]` language-scoped overrides). The open preview panel updates live when this setting changes. Bare parens, unbalanced quotes, and CSS-wide keywords are rejected at preview time and the next layer of the fallback chain is used."
+        },
         "raven.knit.fontFamily": {
           "type": "string",
           "default": "",

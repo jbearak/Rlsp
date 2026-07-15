@@ -1,0 +1,104 @@
+/*
+ * Raven's overlay is intentionally scoped and targeted. Author-provided
+ * light/dark toggles and heavily customized SCSS remain best-effort because
+ * overriding every authored selector would destroy the document's semantics.
+ */
+html.raven-vscode-theme,
+html.raven-vscode-theme body,
+html.raven-vscode-theme #quarto-content,
+html.raven-vscode-theme #quarto-document-content {
+    background-color: var(--raven-bg) !important;
+    color: var(--raven-fg) !important;
+    font-family: var(--raven-font-text) !important;
+}
+
+html.raven-vscode-theme a,
+html.raven-vscode-theme a:visited {
+    color: var(--raven-c-function) !important;
+}
+
+html.raven-vscode-theme hr,
+html.raven-vscode-theme .border,
+html.raven-vscode-theme [class*="border-"] {
+    border-color: var(--raven-c-punctuation) !important;
+}
+
+html.raven-vscode-theme :not(pre) > code {
+    background-color: var(--raven-bg) !important;
+    color: var(--raven-c-string) !important;
+    border: 1px solid var(--raven-c-punctuation) !important;
+    font-family: var(--raven-font-mono) !important;
+}
+
+html.raven-vscode-theme pre,
+html.raven-vscode-theme div.sourceCode,
+html.raven-vscode-theme pre.sourceCode,
+html.raven-vscode-theme pre code {
+    background-color: var(--raven-bg) !important;
+    color: var(--raven-fg) !important;
+    border-color: var(--raven-c-punctuation) !important;
+    font-family: var(--raven-font-mono) !important;
+}
+
+html.raven-vscode-theme .sourceCode .kw,
+html.raven-vscode-theme .sourceCode .cf,
+html.raven-vscode-theme .sourceCode .im { color: var(--raven-c-keyword) !important; }
+html.raven-vscode-theme .sourceCode .st,
+html.raven-vscode-theme .sourceCode .ch,
+html.raven-vscode-theme .sourceCode .ss,
+html.raven-vscode-theme .sourceCode .vs { color: var(--raven-c-string) !important; }
+html.raven-vscode-theme .sourceCode .dv,
+html.raven-vscode-theme .sourceCode .bn,
+html.raven-vscode-theme .sourceCode .fl { color: var(--raven-c-number) !important; }
+html.raven-vscode-theme .sourceCode .co,
+html.raven-vscode-theme .sourceCode .cv,
+html.raven-vscode-theme .sourceCode .do,
+html.raven-vscode-theme .sourceCode .an { color: var(--raven-c-comment) !important; }
+html.raven-vscode-theme .sourceCode .fu,
+html.raven-vscode-theme .sourceCode .bu { color: var(--raven-c-function) !important; }
+html.raven-vscode-theme .sourceCode .dt { color: var(--raven-c-type) !important; }
+html.raven-vscode-theme .sourceCode .va,
+html.raven-vscode-theme .sourceCode .at { color: var(--raven-c-variable) !important; }
+html.raven-vscode-theme .sourceCode .op { color: var(--raven-c-operator) !important; }
+html.raven-vscode-theme .sourceCode .sc,
+html.raven-vscode-theme .sourceCode .pp { color: var(--raven-c-punctuation) !important; }
+html.raven-vscode-theme .sourceCode .cn,
+html.raven-vscode-theme .sourceCode .ot { color: var(--raven-c-constant) !important; }
+
+html.raven-vscode-theme .navbar,
+html.raven-vscode-theme .navbar .dropdown-menu,
+html.raven-vscode-theme #quarto-sidebar,
+html.raven-vscode-theme #TOC,
+html.raven-vscode-theme .sidebar {
+    background-color: var(--raven-bg) !important;
+    color: var(--raven-fg) !important;
+    border-color: var(--raven-c-punctuation) !important;
+}
+
+html.raven-vscode-theme .navbar a,
+html.raven-vscode-theme #quarto-sidebar a,
+html.raven-vscode-theme #TOC a,
+html.raven-vscode-theme .sidebar a {
+    color: var(--raven-fg) !important;
+}
+
+html.raven-vscode-theme .callout,
+html.raven-vscode-theme .callout-header,
+html.raven-vscode-theme .callout-body,
+html.raven-vscode-theme .card,
+html.raven-vscode-theme .card-header,
+html.raven-vscode-theme .card-body {
+    background-color: var(--raven-bg) !important;
+    color: var(--raven-fg) !important;
+    border-color: var(--raven-c-punctuation) !important;
+}
+
+html.raven-vscode-theme table,
+html.raven-vscode-theme table th,
+html.raven-vscode-theme table td,
+html.raven-vscode-theme .table,
+html.raven-vscode-theme .table > :not(caption) > * > * {
+    background-color: var(--raven-bg) !important;
+    color: var(--raven-fg) !important;
+    border-color: var(--raven-c-punctuation) !important;
+}

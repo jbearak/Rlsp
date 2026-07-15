@@ -44,6 +44,17 @@ function projectScopedLintingSchemaKeys(): string[] {
     .sort();
 }
 
+function configurationProperties(): Record<string, Record<string, unknown>> {
+  const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+    contributes?: {
+      configuration?: {
+        properties?: Record<string, Record<string, unknown>>;
+      };
+    };
+  };
+  return packageJson.contributes?.configuration?.properties ?? {};
+}
+
 function rustKnownLintingKeys(): string[] {
   const source = readFileSync(tomlLoaderPath, "utf8");
   const match = source.match(/const KNOWN_LINTING_KEYS:[\s\S]*?= &\[([\s\S]*?)\];/);
@@ -69,6 +80,33 @@ test("docs/settings-reference.md matches the generator output", () => {
         `  bun editors/vscode/scripts/generate-settings-reference.mjs\n\n` +
         `Generator stderr:\n${stderr}${stdout}`,
     );
+  }
+});
+
+test("Quarto font schemas mirror Knit validation constraints", () => {
+  const properties = configurationProperties();
+  const validationKeys = [
+    "type",
+    "default",
+    "scope",
+    "maxLength",
+    "pattern",
+    "patternErrorMessage",
+  ];
+
+  for (const suffix of ["fontFamily", "monospaceFontFamily"]) {
+    const quarto = properties[`raven.quarto.${suffix}`];
+    const knit = properties[`raven.knit.${suffix}`];
+    if (!quarto || !knit) {
+      throw new Error(`Missing Quarto or Knit ${suffix} schema`);
+    }
+    for (const key of validationKeys) {
+      if (quarto[key] !== knit[key]) {
+        throw new Error(
+          `raven.quarto.${suffix}.${key} must mirror raven.knit.${suffix}.${key}`,
+        );
+      }
+    }
   }
 });
 

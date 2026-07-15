@@ -106,6 +106,8 @@ The **`raven.toml` path** column shows where to set a key in a project's `raven.
 | `raven.pandoc.path` | `""` | string | — | [knit](knit.md) | Absolute path to a Pandoc binary; leave empty to search PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled pandoc, etc.). |
 | `raven.pandoc.pdfEngine` | `"xelatex"` | `"xelatex"` \| `"pdflatex"` \| `"lualatex"` \| `"tectonic"` \| `"wkhtmltopdf"` | — | [knit](knit.md) | PDF engine used by Pandoc when exporting to PDF. |
 | `raven.plot.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [plot-viewer](plot-viewer.md) | Initial editor column when the plot viewer first opens. |
+| `raven.quarto.fontFamily` | `""` | string | — | [quarto](quarto.md) | Body/prose font for the live-themed Quarto Preview. |
+| `raven.quarto.monospaceFontFamily` | `""` | string | — | [quarto](quarto.md) | Monospace font for code in the live-themed Quarto Preview. |
 | `raven.quarto.path` | `""` | string | — | [quarto](quarto.md) | Absolute path to a Quarto CLI binary; leave empty to search PATH and standard install locations (Homebrew, /usr/local/bin, RStudio's bundled Quarto, etc.). |
 | `raven.quarto.render.timeoutMs` | `600000` | integer (1–2147483647) | — | [quarto](quarto.md) | Hard timeout (milliseconds) for the Quarto render subprocess. |
 | `raven.quarto.viewerColumn` | `"beside"` | `"active"` \| `"beside"` | — | [quarto](quarto.md) | Editor column used for newly-created Quarto preview panels. |

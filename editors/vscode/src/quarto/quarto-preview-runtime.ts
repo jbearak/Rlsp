@@ -68,8 +68,10 @@ export interface QuartoRuntimeViewUpdate {
     generation: number;
     sourceFsPath: string;
     state: QuartoPreviewViewState;
-    /** Raw validated loopback URL, used only for Open in Browser. */
+    /** Raw validated loopback URL framed after external-URI mapping. */
     rawUrl?: string;
+    /** Original Quarto URL for Open in Browser; defaults to `rawUrl`. */
+    browserUrl?: string;
 }
 
 export interface QuartoRuntimeDeps {
@@ -585,6 +587,7 @@ export class QuartoRuntime {
             generation: session.generation,
             sourceFsPath: session.sourceFsPath,
             rawUrl: ready.rawUrl,
+            browserUrl: ready.browserUrl ?? ready.rawUrl,
             state: { kind: 'serving', externalUrl },
         });
     }
@@ -703,4 +706,3 @@ function readStartupTail(error: Error): string {
 function errorMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
-
