@@ -36,9 +36,9 @@
 //!   message). Named arguments, formal parameters, `$` / `@` field names,
 //!   formula terms, subscripted uses, and callees are exempt.
 //! * `semicolon` — flag `;` statement separators in source. Unlike the other
-//!   rules, this one byte-scans the raw source (skipping every leaf-token
-//!   range: strings, comments, backticked identifiers, `%…%` operators)
-//!   because tree-sitter-r does not emit `;` as a node.
+//!   rules, this one byte-scans the raw source (skipping complete strings and
+//!   every other leaf-token range: comments, backticked identifiers, `%…%`
+//!   operators) because tree-sitter-r does not emit `;` as a node.
 //! * `equals_na` — flag `x == NA`, `x != NA`, and the typed `NA_*` variants
 //!   on either side, plus `x %in% NA`.
 //! * `object_length` — flag identifier names longer than the configured
@@ -2018,6 +2018,17 @@ print.data.frame <- function(x, ...) NULL
         // `;` inside a string or comment is not a separator.
         let diags = lint("x <- \"a;b\"\ny <- 1 # ;\n", &config);
         assert!(diags.is_empty(), "got {:?}", diags);
+    }
+
+    #[test]
+    fn semicolon_ignores_escaped_newline_inside_string() {
+        let config = semicolon_only_config();
+        let diags = lint("x <- \"line one\\nsecond; part\"\n", &config);
+        assert!(diags.is_empty(), "got {:?}", diags);
+
+        let diags = lint("x <- \"line one\\nsecond; part\"; y <- 1\n", &config);
+        assert_eq!(diags.len(), 1, "got {:?}", diags);
+        assert_eq!(diags[0].range.start.character, 29);
     }
 
     // ------------------------------------------------------------------
