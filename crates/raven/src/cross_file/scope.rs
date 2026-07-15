@@ -1472,7 +1472,12 @@ where
             .and_then(|m| {
                 super::path_resolve::PathContext::from_metadata(child_uri, &m, workspace_root)
             })
-            .or_else(|| super::path_resolve::PathContext::new(child_uri, workspace_root))
+            .or_else(|| {
+                super::path_resolve::PathContext::forward_without_metadata(
+                    child_uri,
+                    workspace_root,
+                )
+            })
     } else {
         let ctx = parent_ctx?;
         // Start from the child's own context: its metadata when indexed, else a
@@ -1483,7 +1488,10 @@ where
             Some(cm) => {
                 super::path_resolve::PathContext::from_metadata(child_uri, &cm, workspace_root)?
             }
-            None => super::path_resolve::PathContext::new(child_uri, workspace_root)?,
+            None => super::path_resolve::PathContext::forward_without_metadata(
+                child_uri,
+                workspace_root,
+            )?,
         };
         // Decide the inherited working directory via the shared seam that the
         // on-demand index walk (`index_forward_chain`) also uses, so the live scope
@@ -5235,7 +5243,9 @@ where
     let path_ctx = meta
         .as_ref()
         .and_then(|m| super::path_resolve::PathContext::from_metadata(uri, m, workspace_root))
-        .or_else(|| super::path_resolve::PathContext::new(uri, workspace_root));
+        .or_else(|| {
+            super::path_resolve::PathContext::forward_without_metadata(uri, workspace_root)
+        });
 
     let empty_packages = HashSet::new();
     let forward_child_memo = std::cell::RefCell::new(ForwardChildMemo::default());
@@ -5547,7 +5557,9 @@ where
     let path_ctx = meta
         .as_ref()
         .and_then(|m| super::path_resolve::PathContext::from_metadata(uri, m, workspace_root))
-        .or_else(|| super::path_resolve::PathContext::new(uri, workspace_root));
+        .or_else(|| {
+            super::path_resolve::PathContext::forward_without_metadata(uri, workspace_root)
+        });
 
     // Hand the precomputed prefix to the recursive function so STEP 1 is
     // skipped at depth 0; STEP 2 runs as usual.
@@ -5838,7 +5850,12 @@ where
             .and_then(|m| {
                 super::path_resolve::PathContext::from_metadata(&edge.from, m, workspace_root)
             })
-            .or_else(|| super::path_resolve::PathContext::new(&edge.from, workspace_root));
+            .or_else(|| {
+                super::path_resolve::PathContext::forward_without_metadata(
+                    &edge.from,
+                    workspace_root,
+                )
+            });
 
         // Get parent's scope at the call site (or EOF when hoisting from inside a function).
         // When the child query is inside a function body, R's late-binding means we need
@@ -8000,7 +8017,12 @@ where
             .and_then(|m| {
                 super::path_resolve::PathContext::from_metadata(queried_uri, m, workspace_root)
             })
-            .or_else(|| super::path_resolve::PathContext::new(queried_uri, workspace_root));
+            .or_else(|| {
+                super::path_resolve::PathContext::forward_without_metadata(
+                    queried_uri,
+                    workspace_root,
+                )
+            });
 
         // Pre-compute the names the package contribution would inject for
         // `queried_uri`. Doing it once at construction keeps

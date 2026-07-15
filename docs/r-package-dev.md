@@ -107,6 +107,22 @@ files matching `^setup.*\.[Rr]$` the same way. Raven mirrors this:
   are NOT treated as helpers here either.
 - Helper/setup defs never propagate into `R/` (the one-way visibility into
   `R/` stays asymmetric).
+- A helper's own `source()` calls are followed (issue #638): top-level
+  definitions and `library()` attaches in files the preamble transitively
+  sources — including via a computed path like
+  `source(file.path(repo_root, "scripts/helpers.R"))` after
+  `repo_root <- normalizePath(file.path("..", ".."))` — become visible to
+  sibling test files the same way the helper's own defs do. Relative paths
+  anchor at `tests/testthat/` (the [implicit testthat working
+  directory](cross-file.md#implicit-testthat-testit-working-directory)), and
+  the scan refreshes when the helper or a sourced file changes on disk
+  (unsaved edits to the helper's `source()` lines take effect on save).
+
+Note the gating difference: the helper-visibility machinery on this page
+requires package mode (a `DESCRIPTION` with a `Package:` field), while the
+implicit testthat working directory and computed-path folding in
+[cross-file.md](cross-file.md) are layout-only and apply to any workspace with
+a `tests/testthat/` directory.
 
 A preamble file's top-level `library()` / `require()` calls **attach** their
 packages for sibling test files too, mirroring the same sourcing semantics. A

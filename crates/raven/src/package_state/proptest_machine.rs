@@ -155,6 +155,9 @@ fn initial_inputs() -> PackageInputs {
         rprofile_symbols: BTreeSet::new(),
         rprofile_attached_packages: BTreeSet::new(),
         rprofile_sourced_files: BTreeSet::new(),
+        preamble_sourced_symbols: BTreeMap::new(),
+        preamble_sourced_attached_packages: BTreeMap::new(),
+        preamble_sourced_files: BTreeSet::new(),
     }
 }
 

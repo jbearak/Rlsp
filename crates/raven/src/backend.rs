@@ -3275,6 +3275,10 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
     state.recompute_open_neighborhood_pins();
 }
 
+// Internal seeding chokepoint deliberately taking each precomputed scan as its
+// own argument (callers precompute different subsets off-lock); a params
+// struct would obscure which callers precompute what.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     state: &mut WorldState,
     root: std::path::PathBuf,
@@ -3282,6 +3286,7 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     ns_text: Option<Arc<str>>,
     disk_r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
     precomputed_rprofile_scan: Option<crate::package_state::rprofile::RprofileScan>,
+    precomputed_preamble_scan: Option<crate::package_state::preamble::PreambleScan>,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) {
     state.package_inputs.workspace_root = Some(root.clone());
@@ -3338,6 +3343,25 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
         state.package_inputs.rprofile_attached_packages = rprofile_scan.attached_packages;
         state.package_inputs.rprofile_sourced_files = rprofile_scan.sourced_files;
     }
+
+    // Testthat preamble sourced-closure scan (issue #638). Same locking
+    // discipline as the `.Rprofile` scan: contended LSP callers precompute it
+    // OFF-lock and pass it in; `raven check` / unit tests pass `None` and let
+    // it scan inline. Gated on package mode — the harvested sets are only
+    // consumed by the (package-mode-gated) scope contribution.
+    let preamble_scan =
+        if state.package_inputs.package_mode != crate::cross_file::config::PackageMode::Disabled {
+            precomputed_preamble_scan.unwrap_or_else(|| {
+                crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                    &root, exclusions,
+                )
+            })
+        } else {
+            crate::package_state::preamble::PreambleScan::default()
+        };
+    state.package_inputs.preamble_sourced_symbols = preamble_scan.symbols;
+    state.package_inputs.preamble_sourced_attached_packages = preamble_scan.attached_packages;
+    state.package_inputs.preamble_sourced_files = preamble_scan.sourced_files;
 
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
@@ -4690,6 +4714,7 @@ async fn apply_watched_r_file_package_input_events(
     let root_for_check = state.package_inputs.workspace_root.clone();
     let model_rprofile = state.package_inputs.model_rprofile;
     let rprofile_sourced = &state.package_inputs.rprofile_sourced_files;
+    let preamble_sourced = &state.package_inputs.preamble_sourced_files;
     let has_pkg_files = root_for_check.as_ref().is_some_and(|root| {
         package_events.iter().any(|event| {
             event.uri.to_file_path().ok().is_some_and(|p| {
@@ -4706,6 +4731,11 @@ async fn apply_watched_r_file_package_input_events(
                     // re-scanned and its symbols/packages reach open
                     // `scripts/` files (Task 12).
                     || (model_rprofile && path_in_rprofile_sourced_set(&p, rprofile_sourced))
+                    // Same for a helper that a testthat preamble transitively
+                    // source()s (issue #638): editing scripts/helpers.R must
+                    // reach translate() so the preamble closure is re-scanned
+                    // and its symbols reach open test files.
+                    || path_in_rprofile_sourced_set(&p, preamble_sourced)
             })
         })
     });
@@ -5749,7 +5779,9 @@ impl LanguageServer for Backend {
                         // OFF the write lock — it follows transitive source()
                         // chains and must not run under the lock (see
                         // `initialize_package_inputs_from_state_with_exclusions`).
-                        let (desc_text, ns_text, rprofile_scan) = if let Some(ref root) =
+                        let (desc_text, ns_text, rprofile_scan, preamble_scan) = if let Some(
+                            ref root,
+                        ) =
                             root_for_pkg_inputs
                         {
                             let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
@@ -5762,9 +5794,13 @@ impl LanguageServer for Backend {
                                     root,
                                     &workspace_exclusions,
                                 );
-                            (desc, ns, Some(scan))
+                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                                root,
+                                &workspace_exclusions,
+                            );
+                            (desc, ns, Some(scan), Some(pre))
                         } else {
-                            (None, None, None)
+                            (None, None, None, None)
                         };
 
                         // Apply index and snapshot trigger versions under a single write lock
@@ -5787,6 +5823,7 @@ impl LanguageServer for Backend {
                                     ns_text,
                                     Default::default(),
                                     rprofile_scan,
+                                    preamble_scan,
                                     &workspace_exclusions,
                                 );
                             } else {
@@ -5900,12 +5937,20 @@ impl LanguageServer for Backend {
                                 &root_clone,
                                 &scan_exclusions,
                             );
-                        (desc, ns, disk_r_files, rprofile_scan)
+                        // Precompute the testthat preamble sourced-closure scan
+                        // OFF the lock too (issue #638, same discipline).
+                        let preamble_scan =
+                            crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                                &root_clone,
+                                &scan_exclusions,
+                            );
+                        (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
                     })
                     .await
                     .unwrap_or((
                         None,
                         None,
+                        Default::default(),
                         Default::default(),
                         Default::default(),
                     )),
@@ -5922,7 +5967,7 @@ impl LanguageServer for Backend {
             if let Some((
                 root,
                 package_exclusions,
-                (desc_text, ns_text, disk_r_files, rprofile_scan),
+                (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan),
             )) = package_seed
             {
                 initialize_package_inputs_from_state_with_exclusions(
@@ -5932,6 +5977,7 @@ impl LanguageServer for Backend {
                     ns_text,
                     disk_r_files,
                     Some(rprofile_scan),
+                    Some(preamble_scan),
                     &package_exclusions,
                 );
             }
@@ -9815,7 +9861,9 @@ impl Backend {
 
                 match scan_result {
                     Ok((index, cross_file_entries, new_index_entries)) => {
-                        let (desc_text, ns_text, rprofile_scan) = if let Some(ref root) =
+                        let (desc_text, ns_text, rprofile_scan, preamble_scan) = if let Some(
+                            ref root,
+                        ) =
                             root_for_pkg_inputs
                         {
                             let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
@@ -9828,9 +9876,13 @@ impl Backend {
                                     root,
                                     &workspace_exclusions,
                                 );
-                            (desc, ns, Some(scan))
+                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                                root,
+                                &workspace_exclusions,
+                            );
+                            (desc, ns, Some(scan), Some(pre))
                         } else {
-                            (None, None, None)
+                            (None, None, None, None)
                         };
 
                         let (package_library, packages_enabled) = {
@@ -9849,6 +9901,7 @@ impl Backend {
                                     ns_text,
                                     Default::default(),
                                     rprofile_scan,
+                                    preamble_scan,
                                     &workspace_exclusions,
                                 );
                                 package_inputs_initialized_by_exclusion_reload = true;
@@ -9886,7 +9939,7 @@ impl Backend {
             {
                 let root_clone = root.clone();
                 let scan_exclusions = workspace_exclusions.clone();
-                let (desc_text, ns_text, disk_r_files, rprofile_scan) =
+                let (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan) =
                     tokio::task::spawn_blocking(move || {
                         let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
                             .ok()
@@ -9903,12 +9956,20 @@ impl Backend {
                                 &root_clone,
                                 &scan_exclusions,
                             );
-                        (desc, ns, disk_r_files, rprofile_scan)
+                        // Precompute the testthat preamble sourced-closure scan
+                        // OFF the lock too (issue #638, same discipline).
+                        let preamble_scan =
+                            crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                                &root_clone,
+                                &scan_exclusions,
+                            );
+                        (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
                     })
                     .await
                     .unwrap_or((
                         None,
                         None,
+                        Default::default(),
                         Default::default(),
                         Default::default(),
                     ));
@@ -9921,6 +9982,7 @@ impl Backend {
                     ns_text,
                     disk_r_files,
                     Some(rprofile_scan),
+                    Some(preamble_scan),
                     &workspace_exclusions,
                 );
                 package_inputs_initialized_by_exclusion_reload = true;
@@ -9937,7 +9999,7 @@ impl Backend {
             let root_clone = root.clone();
             let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
             let scan_exclusions = workspace_exclusions.clone();
-            let (desc_text, ns_text, disk_r_files, rprofile_scan) =
+            let (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan) =
                 tokio::task::spawn_blocking(move || {
                     let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
                         .ok()
@@ -9957,10 +10019,23 @@ impl Backend {
                             &root_clone,
                             &scan_exclusions,
                         );
-                    (desc, ns, disk_r_files, rprofile_scan)
+                    // Precompute the testthat preamble sourced-closure scan
+                    // OFF the lock too (issue #638, same discipline).
+                    let preamble_scan =
+                        crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                            &root_clone,
+                            &scan_exclusions,
+                        );
+                    (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
                 })
                 .await
-                .unwrap_or((None, None, Default::default(), Default::default()));
+                .unwrap_or((
+                    None,
+                    None,
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                ));
 
             // Re-acquire write lock to apply results. Route through the same
             // seeding helper the startup paths use, so config-reload and startup
@@ -9979,6 +10054,7 @@ impl Backend {
                 ns_text,
                 disk_r_files,
                 Some(rprofile_scan),
+                Some(preamble_scan),
                 &workspace_exclusions,
             );
             log::info!("Rebuilt package state after packageMode change (event-driven)");
@@ -14106,6 +14182,7 @@ mod tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
 
@@ -14150,6 +14227,7 @@ mod tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
 
@@ -14185,6 +14263,7 @@ mod tests {
                 None,
                 Default::default(),
                 Some(precomputed),
+                None,
                 &exclusions,
             );
             assert!(
@@ -19594,6 +19673,7 @@ mod project_config_initialize_tests {
                 None,
                 disk_r_files,
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -20037,6 +20117,7 @@ mod project_config_initialize_tests {
                 None,
                 Default::default(),
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -20092,6 +20173,7 @@ mod project_config_initialize_tests {
                 Some(crate::package_state::rprofile::scan_workspace_rprofile(
                     &root_path,
                 )),
+                None,
                 &exclusions,
             );
             assert!(
@@ -20145,6 +20227,7 @@ mod project_config_initialize_tests {
                 None,
                 None,
                 Default::default(),
+                None,
                 None,
                 &exclusions,
             );
@@ -22237,6 +22320,7 @@ mod project_config_initialize_tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -22311,6 +22395,7 @@ mod project_config_initialize_tests {
                 Some("Package: pkg\n".into()),
                 None,
                 disk_seed,
+                None,
                 None,
                 &exclusions,
             );
@@ -22399,6 +22484,7 @@ mod project_config_initialize_tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -22486,6 +22572,7 @@ mod project_config_initialize_tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -22553,6 +22640,7 @@ mod project_config_initialize_tests {
                 Some("Package: pkg\n".into()),
                 None,
                 disk_seed,
+                None,
                 None,
                 &exclusions,
             );
@@ -22651,6 +22739,7 @@ mod project_config_initialize_tests {
                 Some(disk_description.into()),
                 None,
                 disk_seed,
+                None,
                 None,
                 &exclusions,
             );

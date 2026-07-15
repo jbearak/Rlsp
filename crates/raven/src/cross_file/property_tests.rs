@@ -248,6 +248,7 @@ proptest! {
             working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(workspace_root.clone()),
+            implicit_test_working_directory: None,
         };
 
         let path_str = format!("/{}", subpath);
@@ -271,6 +272,7 @@ proptest! {
             working_directory: None,
             inherited_working_directory: None,
             workspace_root: None,
+            implicit_test_working_directory: None,
         };
 
         let path_str = format!("/{}", subpath);
@@ -299,6 +301,7 @@ proptest! {
             working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(PathBuf::from("/project")),
+            implicit_test_working_directory: None,
         };
 
         let resolved = resolve_working_directory(&subpath, &ctx);
@@ -323,6 +326,7 @@ proptest! {
             working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(PathBuf::from("/project")),
+            implicit_test_working_directory: None,
         };
 
         let prefix = "../".repeat(parents);
@@ -763,6 +767,7 @@ proptest! {
             working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(workspace_root),
+            implicit_test_working_directory: None,
         };
 
         let relative_path = format!("../{}/{}.R", dir_d, file_e);
@@ -792,6 +797,7 @@ proptest! {
             working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(workspace_root),
+            implicit_test_working_directory: None,
         };
 
         // Go up two levels
@@ -833,6 +839,7 @@ proptest! {
             working_directory: Some(working_dir.clone()),
             inherited_working_directory: None,
             workspace_root: Some(workspace_root.clone()),
+            implicit_test_working_directory: None,
         };
 
         // File B inherits from A (via child_context)
@@ -864,6 +871,7 @@ proptest! {
             working_directory: Some(working_dir.clone()),
             inherited_working_directory: None,
             workspace_root: Some(workspace_root.clone()),
+            implicit_test_working_directory: None,
         };
 
         // Child with chdir=TRUE gets its own directory as working directory
@@ -898,6 +906,7 @@ proptest! {
             working_directory: None,
             inherited_working_directory: None,
             workspace_root: Some(PathBuf::from(format!("/{}", dir_a))),
+            implicit_test_working_directory: None,
         };
 
         let expected = PathBuf::from(format!("/{}/{}", dir_a, dir_b));
@@ -919,6 +928,7 @@ proptest! {
             working_directory: Some(explicit_working_dir.clone()),
             inherited_working_directory: Some(PathBuf::from(format!("/{}/inherited", dir_a))),
             workspace_root: Some(PathBuf::from(format!("/{}", dir_a))),
+            implicit_test_working_directory: None,
         };
 
         // Explicit should take precedence over inherited
@@ -940,6 +950,7 @@ proptest! {
             working_directory: None,
             inherited_working_directory: Some(inherited_working_dir.clone()),
             workspace_root: Some(PathBuf::from(format!("/{}", dir_a))),
+            implicit_test_working_directory: None,
         };
 
         // Inherited should take precedence over default (file's directory)

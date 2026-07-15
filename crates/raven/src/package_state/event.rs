@@ -165,29 +165,101 @@ pub(crate) fn apply_rprofile_scan(
     Some(PackageInputDelta::RProfileChanged)
 }
 
+/// Apply a (possibly precomputed) testthat preamble-source scan (issue #638).
+///
+/// Pure in-memory (no disk I/O), mirroring [`apply_rprofile_scan`]: `Some` to
+/// install a fresh scan, `None` to clear. Gated on package mode — when
+/// disabled, the inputs are cleared regardless. Returns
+/// `PreambleSourcesChanged`, or `None` when disabled AND nothing needed
+/// clearing.
+pub(crate) fn apply_preamble_scan(
+    inputs: &mut PackageInputs,
+    scan: Option<super::preamble::PreambleScan>,
+) -> Option<PackageInputDelta> {
+    if inputs.package_mode == super::PackageMode::Disabled {
+        let had = !inputs.preamble_sourced_symbols.is_empty()
+            || !inputs.preamble_sourced_attached_packages.is_empty()
+            || !inputs.preamble_sourced_files.is_empty();
+        inputs.preamble_sourced_symbols.clear();
+        inputs.preamble_sourced_attached_packages.clear();
+        inputs.preamble_sourced_files.clear();
+        return had.then_some(PackageInputDelta::PreambleSourcesChanged);
+    }
+    match scan {
+        Some(scan) => {
+            inputs.preamble_sourced_symbols = scan.symbols;
+            inputs.preamble_sourced_attached_packages = scan.attached_packages;
+            inputs.preamble_sourced_files = scan.sourced_files;
+        }
+        None => {
+            inputs.preamble_sourced_symbols.clear();
+            inputs.preamble_sourced_attached_packages.clear();
+            inputs.preamble_sourced_files.clear();
+        }
+    }
+    Some(PackageInputDelta::PreambleSourcesChanged)
+}
+
+/// `true` when a watched change to `path` must refresh the testthat
+/// preamble-source scan (issue #638): the file IS a preamble scan root
+/// (direct `tests/testthat/` child named `helper*`/`setup*` — its `source()`
+/// set may have changed), or it is one of the files a preamble transitively
+/// `source()`s (`preamble_sourced_files`, canonical).
+fn preamble_rescan_needed(
+    inputs: &PackageInputs,
+    root: &Path,
+    path: &Path,
+    canonical_path: &Path,
+) -> bool {
+    if inputs.package_mode == super::PackageMode::Disabled {
+        return false;
+    }
+    if inputs.preamble_sourced_files.contains(canonical_path) {
+        return true;
+    }
+    let preamble_dir = root.join("tests").join("testthat");
+    path.parent() == Some(preamble_dir.as_path())
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(super::is_test_preamble_filename)
+            .unwrap_or(false)
+}
+
 /// If `canonical_path` is a file that `.Rprofile` transitively `source()`s (and
-/// modeling is on), rescan the prelude and combine it with `base` as a `Batch`;
-/// otherwise return `base` unchanged. Used by the terminal `translate_watched`
-/// arms (R-source, `data/`, `data-raw/`) so a watched file that is BOTH a
-/// package input AND a sourced helper refreshes both concerns — never one at the
-/// expense of the other. (Like the surrounding arms, the rescan is a bounded
-/// disk read in the `WatchedFileChanged` path, which `translate` sanctions.)
+/// modeling is on), rescan the prelude; if it is a testthat preamble file or a
+/// file a preamble transitively `source()`s (issue #638), rescan the preamble
+/// closure. Any triggered rescans are combined with `base` as a `Batch`;
+/// otherwise `base` is returned unchanged. Used by the terminal
+/// `translate_watched` arms (R-source, `data/`, `data-raw/`) so a watched file
+/// that is BOTH a package input AND a sourced helper refreshes both concerns —
+/// never one at the expense of the other. (Like the surrounding arms, the
+/// rescans are bounded disk reads in the `WatchedFileChanged` path, which
+/// `translate` sanctions.)
 fn fold_prelude_rescan(
     inputs: &mut PackageInputs,
     root: &Path,
+    path: &Path,
     canonical_path: &Path,
     base: PackageInputDelta,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> Option<PackageInputDelta> {
+    let mut deltas = vec![base];
     if inputs.model_rprofile && inputs.rprofile_sourced_files.contains(canonical_path) {
         let scan = super::rprofile::scan_workspace_rprofile_with_exclusions(root, exclusions);
         apply_rprofile_scan(inputs, Some(scan));
-        Some(PackageInputDelta::Batch(vec![
-            base,
-            PackageInputDelta::RProfileChanged,
-        ]))
+        deltas.push(PackageInputDelta::RProfileChanged);
+    }
+    if preamble_rescan_needed(inputs, root, path, canonical_path) {
+        let scan = super::preamble::scan_testthat_preambles_with_exclusions(root, exclusions);
+        if let Some(delta) = apply_preamble_scan(inputs, Some(scan)) {
+            deltas.push(delta);
+        }
+    }
+    if deltas.len() == 1 {
+        deltas.pop()
     } else {
-        Some(base)
+        Some(PackageInputDelta::Batch(deltas))
     }
 }
 
@@ -306,7 +378,7 @@ fn translate_watched(
         // and `canonical_path` is canonicalized the same way at the top of this fn.
         // A package source file can ALSO be a `.Rprofile` helper — fold the
         // prelude rescan in as a Batch when so.
-        return fold_prelude_rescan(inputs, root, &canonical_path, base, exclusions);
+        return fold_prelude_rescan(inputs, root, &path, &canonical_path, base, exclusions);
     }
 
     // data/ directory file changes: rescan dataset names. A `data/` file can
@@ -319,6 +391,7 @@ fn translate_watched(
         return fold_prelude_rescan(
             inputs,
             root,
+            &path,
             &canonical_path,
             PackageInputDelta::DataDirChanged,
             exclusions,
@@ -334,22 +407,40 @@ fn translate_watched(
         return fold_prelude_rescan(
             inputs,
             root,
+            &path,
             &canonical_path,
             PackageInputDelta::DataDirChanged,
             exclusions,
         );
     }
 
-    // A `.Rprofile` may `source()` a helper that lives OUTSIDE every tracked
-    // package input dir (e.g. `scripts/setup.R`, plain `inst/foo.R`). Such a
-    // helper is not an `is_r_source_path`, not a `data*/` file, and not a
-    // tracked package dir, so none of the arms above fire — but editing it must
-    // still re-scan the prelude (Task 12). This arm is LAST among the file arms
+    // A `.Rprofile` OR a testthat preamble may `source()` a helper that lives
+    // OUTSIDE every tracked package input dir (e.g. `scripts/setup.R`, plain
+    // `inst/foo.R`). Such a helper is not an `is_r_source_path`, not a
+    // `data*/` file, and not a tracked package dir, so none of the arms above
+    // fire — but editing it must still re-scan the prelude (Task 12) and/or
+    // the preamble closure (issue #638). This arm is LAST among the file arms
     // so the dual-concern folds above take precedence. Membership uses
-    // `canonical_path` to match the canonical paths the scanner records.
-    if inputs.model_rprofile && inputs.rprofile_sourced_files.contains(&canonical_path) {
-        let scan = super::rprofile::scan_workspace_rprofile_with_exclusions(root, exclusions);
-        return apply_rprofile_scan(inputs, Some(scan));
+    // `canonical_path` to match the canonical paths the scanners record.
+    {
+        let mut deltas = Vec::new();
+        if inputs.model_rprofile && inputs.rprofile_sourced_files.contains(&canonical_path) {
+            let scan = super::rprofile::scan_workspace_rprofile_with_exclusions(root, exclusions);
+            if let Some(delta) = apply_rprofile_scan(inputs, Some(scan)) {
+                deltas.push(delta);
+            }
+        }
+        if preamble_rescan_needed(inputs, root, &path, &canonical_path) {
+            let scan = super::preamble::scan_testthat_preambles_with_exclusions(root, exclusions);
+            if let Some(delta) = apply_preamble_scan(inputs, Some(scan)) {
+                deltas.push(delta);
+            }
+        }
+        match deltas.len() {
+            0 => {}
+            1 => return deltas.pop(),
+            _ => return Some(PackageInputDelta::Batch(deltas)),
+        }
     }
 
     translate_watched_directory(inputs, root, &path, deleted, exclusions)
@@ -1298,6 +1389,138 @@ mod tests {
             "rescan must drop the old helper symbol, got {:?}",
             inputs.rprofile_symbols
         );
+    }
+
+    #[test]
+    fn editing_a_preamble_sourced_helper_rescans_the_preamble_closure() {
+        // tests/testthat/helper-project.R sources scripts/helpers.R via the
+        // issue #638 computed-path idiom. scripts/helpers.R is NOT a tracked
+        // package R-source file, so only the dedicated preamble-sourced arm
+        // can refresh the harvested symbols when it changes on disk.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        let helper = root.join("scripts/helpers.R");
+        let preamble = root.join("tests/testthat/helper-project.R");
+        std::fs::write(
+            &preamble,
+            "repo_root <- normalizePath(file.path(\"..\", \"..\"))\nsource(file.path(repo_root, \"scripts/helpers.R\"))\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "old_def <- function() 1\n").unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+
+        // Seed the preamble scan (records the sourced helper + harvests old_def).
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let scan = super::preamble::scan_testthat_preambles_with_exclusions(root, &exclusions);
+        inputs.preamble_sourced_symbols = scan.symbols;
+        inputs.preamble_sourced_attached_packages = scan.attached_packages;
+        inputs.preamble_sourced_files = scan.sourced_files;
+        assert!(
+            inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|s| s.contains("old_def")),
+            "precondition: scan harvests old_def, got {:?}",
+            inputs.preamble_sourced_symbols
+        );
+        assert!(is_r_source_path(&helper, root).is_none());
+
+        // Edit the sourced helper to define a different symbol.
+        std::fs::write(&helper, "new_def <- function() 1\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert_eq!(
+            delta,
+            Some(PackageInputDelta::PreambleSourcesChanged),
+            "scripts/ helper edit must emit PreambleSourcesChanged, got {delta:?}"
+        );
+        let symbols = inputs.preamble_sourced_symbols.get(&preamble).unwrap();
+        assert!(symbols.contains("new_def"), "got {symbols:?}");
+        assert!(!symbols.contains("old_def"), "got {symbols:?}");
+    }
+
+    #[test]
+    fn editing_a_preamble_file_rescans_its_source_closure() {
+        // Changing which files the preamble sources (a watched on-disk edit to
+        // the preamble itself, which IS an is_r_source_path Test file) must
+        // fold a preamble rescan into the RFileChanged delta.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join("scripts/a.R"), "a_def <- 1\n").unwrap();
+        std::fs::write(root.join("scripts/b.R"), "b_def <- 1\n").unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        std::fs::write(&preamble, "source(\"../../scripts/a.R\")\n").unwrap();
+
+        let mut inputs = PackageInputs::default();
+        inputs.workspace_root = Some(root.to_path_buf());
+        inputs.package_mode = PackageMode::Auto;
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let scan = super::preamble::scan_testthat_preambles_with_exclusions(root, &exclusions);
+        inputs.preamble_sourced_symbols = scan.symbols;
+        inputs.preamble_sourced_files = scan.sourced_files;
+
+        // Repoint the preamble at scripts/b.R and translate the watched edit.
+        std::fs::write(&preamble, "source(\"../../scripts/b.R\")\n").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&preamble).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri,
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        // Batch of the base RFileChanged plus the preamble rescan.
+        match delta {
+            Some(PackageInputDelta::Batch(ref deltas)) => {
+                assert!(
+                    deltas.contains(&PackageInputDelta::PreambleSourcesChanged),
+                    "batch must carry PreambleSourcesChanged, got {deltas:?}"
+                );
+            }
+            other => panic!("expected Batch with PreambleSourcesChanged, got {other:?}"),
+        }
+        let symbols = inputs.preamble_sourced_symbols.get(&preamble).unwrap();
+        assert!(symbols.contains("b_def"), "got {symbols:?}");
+        assert!(!symbols.contains("a_def"), "got {symbols:?}");
+    }
+
+    #[test]
+    fn apply_preamble_scan_clears_when_package_mode_disabled() {
+        let mut inputs = PackageInputs::default();
+        inputs.package_mode = PackageMode::Disabled;
+        inputs.preamble_sourced_symbols.insert(
+            "x".into(),
+            std::collections::BTreeSet::from(["s".to_string()]),
+        );
+        inputs
+            .preamble_sourced_files
+            .insert(std::path::PathBuf::from("/w/scripts/h.R"));
+
+        let delta = apply_preamble_scan(&mut inputs, None);
+        assert_eq!(delta, Some(PackageInputDelta::PreambleSourcesChanged));
+        assert!(inputs.preamble_sourced_symbols.is_empty());
+        assert!(inputs.preamble_sourced_attached_packages.is_empty());
+        assert!(inputs.preamble_sourced_files.is_empty());
+
+        // Second application: nothing to clear → no delta.
+        assert_eq!(apply_preamble_scan(&mut inputs, None), None);
     }
 
     #[test]

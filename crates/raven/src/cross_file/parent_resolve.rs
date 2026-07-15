@@ -132,6 +132,17 @@ y <- 2"#;
     }
 
     #[test]
+    fn test_infer_call_site_matches_computed_file_path_parent() {
+        // A parent using the computed-path idiom (issue #638): the child
+        // filename still appears as a quoted segment on the call line, so the
+        // text scan must find the call site.
+        let parent_content = r#"repo_root <- normalizePath(file.path("..", ".."))
+source(file.path(repo_root, "scripts/helpers.R"))"#;
+        let result = infer_call_site_from_parent(parent_content, "scripts/helpers.R");
+        assert_eq!(result, Some((1, 0)));
+    }
+
+    #[test]
     fn test_resolve_match_pattern_fallback() {
         let parent_content = r#"# source( comment
 x <- 1

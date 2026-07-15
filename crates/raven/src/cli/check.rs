@@ -501,6 +501,7 @@ fn build_indexed_state(
         // it lets the helper scan `.Rprofile` inline (no off-lock precompute
         // needed). See `initialize_package_inputs_from_state_with_exclusions`.
         None,
+        None,
         &workspace_exclusions,
     );
 

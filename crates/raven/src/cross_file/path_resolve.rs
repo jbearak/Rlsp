@@ -44,6 +44,25 @@ pub struct PathContext {
     pub inherited_working_directory: Option<PathBuf>,
     /// Workspace root
     pub workspace_root: Option<PathBuf>,
+    /// Implicit testthat/testit working-directory default (issue #638),
+    /// layout-only gated: populated only by [`Self::from_metadata`] (never
+    /// [`Self::new`] — backward directives are unaffected by construction),
+    /// only when the file lies under `<workspace_root>/tests/testthat/` or
+    /// `tests/testit/` (any nesting depth; the anchor is always that
+    /// two-component directory, matching the runner's `chdir` into it), and
+    /// only when no explicit or inherited `# raven: cd` is present. No
+    /// DESCRIPTION/package-mode requirement.
+    ///
+    /// This is a SOFT default, deliberately weaker than a `# raven: cd`:
+    /// - consulted only by [`Self::effective_working_directory`], at the
+    ///   LOWEST priority (below explicit and inherited cd);
+    /// - excluded from [`Self::cd_in_effect`], so the workspace-root fallback
+    ///   stays active and [`Self::forward_child_inherited_wd`] never
+    ///   propagates it into forward-sourced children;
+    /// - complemented by a file-directory compatibility fallback in
+    ///   `resolve_path_rich` (see `implicit_wd_file_dir_fallback`) so
+    ///   files nested below the anchor keep their file-relative resolution.
+    pub implicit_test_working_directory: Option<PathBuf>,
 }
 
 impl PathContext {
@@ -66,7 +85,23 @@ impl PathContext {
             working_directory: None,
             inherited_working_directory: None,
             workspace_root,
+            implicit_test_working_directory: None,
         })
+    }
+
+    /// Create a context for FORWARD resolution (`source()` calls, forward
+    /// directives) when no `CrossFileMetadata` is available for the file.
+    ///
+    /// Equivalent to [`Self::from_metadata`] with empty metadata: no explicit
+    /// or inherited `# raven: cd`, but the implicit testthat/testit working
+    /// directory (issue #638) is still derived from the file's location, so
+    /// metadata-less forward call sites resolve uniformly with metadata-aware
+    /// ones. Do NOT use for backward directives — use [`Self::new`].
+    pub fn forward_without_metadata(file_uri: &Url, workspace_root: Option<&Url>) -> Option<Self> {
+        let mut ctx = Self::new(file_uri, workspace_root)?;
+        ctx.implicit_test_working_directory =
+            implicit_test_working_directory(&ctx.file_path, ctx.workspace_root.as_deref());
+        Some(ctx)
     }
 
     /// Create a context from a file URI and its metadata WITH working directory support.
@@ -114,21 +149,51 @@ impl PathContext {
             }
         }
 
+        // Implicit testthat/testit working directory (issue #638): only when
+        // neither an explicit nor an inherited `# raven: cd` applies.
+        if ctx.working_directory.is_none() && ctx.inherited_working_directory.is_none() {
+            ctx.implicit_test_working_directory =
+                implicit_test_working_directory(&ctx.file_path, ctx.workspace_root.as_deref());
+        }
+
         Some(ctx)
     }
 
     /// Get the effective working directory for path resolution
     pub fn effective_working_directory(&self) -> PathBuf {
-        // Priority: explicit > inherited > file's directory
+        // Priority: explicit > inherited > implicit testthat/testit (issue
+        // #638) > file's directory
         self.working_directory
             .clone()
             .or_else(|| self.inherited_working_directory.clone())
+            .or_else(|| self.implicit_test_working_directory.clone())
             .unwrap_or_else(|| {
                 self.file_path
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| self.file_path.clone())
             })
+    }
+
+    /// The file's own directory as a compatibility resolution base, `Some`
+    /// only when the implicit testthat/testit working directory (issue #638)
+    /// is what `effective_working_directory()` returns AND the file's own
+    /// directory differs from that anchor (i.e. the file is nested below it).
+    ///
+    /// `resolve_path_rich` tries this base after the implicit anchor and
+    /// before the workspace-root fallback, so a file in
+    /// `tests/testthat/fixtures/` sourcing `"local.R"` file-relatively (which
+    /// worked before #638) keeps resolving. For files directly in the anchor
+    /// directory the two bases coincide and this returns `None`.
+    fn implicit_wd_file_dir_fallback(&self) -> Option<PathBuf> {
+        // Explicit/inherited cd wins outright; from_metadata never sets the
+        // implicit field alongside them, but guard anyway.
+        if self.working_directory.is_some() || self.inherited_working_directory.is_some() {
+            return None;
+        }
+        let anchor = self.implicit_test_working_directory.as_ref()?;
+        let file_dir = self.file_path.parent()?;
+        (file_dir != anchor.as_path()).then(|| file_dir.to_path_buf())
     }
 
     /// Create a child context for a sourced file with chdir=TRUE
@@ -142,6 +207,7 @@ impl PathContext {
             working_directory: None,
             inherited_working_directory: Some(child_dir),
             workspace_root: self.workspace_root.clone(),
+            implicit_test_working_directory: None,
         }
     }
 
@@ -152,6 +218,7 @@ impl PathContext {
             working_directory: None,
             inherited_working_directory: Some(self.effective_working_directory()),
             workspace_root: self.workspace_root.clone(),
+            implicit_test_working_directory: None,
         }
     }
 
@@ -176,6 +243,11 @@ impl PathContext {
     /// This is the precondition that keeps a directory pinned across a forward
     /// `source()` hop and that disables the workspace-root fallback in
     /// [`resolve_path_with_workspace_fallback`]; see [`Self::forward_child_inherited_wd`].
+    ///
+    /// Deliberately EXCLUDES the implicit testthat/testit working directory
+    /// (issue #638): that soft default anchors a test file's own relative
+    /// paths but must neither suppress the workspace-root fallback nor
+    /// propagate into forward-sourced children.
     pub fn cd_in_effect(&self) -> bool {
         self.working_directory.is_some() || self.inherited_working_directory.is_some()
     }
@@ -335,6 +407,34 @@ pub fn resolve_backward_path_rich(path: &str, context: &PathContext) -> ResolveO
     resolve_path_rich(path, context, false)
 }
 
+/// The implicit testthat/testit working-directory anchor for `file_path`
+/// (issue #638): `<root>/tests/testthat` or `<root>/tests/testit` when the
+/// file lies under one of those directories (any nesting depth), else `None`.
+///
+/// Layout-only gating — no DESCRIPTION or package-mode requirement — because
+/// testthat's `test_dir()`/`test_local()` (and testit's `test_dir()`) chdir
+/// into that directory before sourcing helpers and running tests regardless
+/// of package structure. Reuses `package_state::is_testthat_or_testit_test`
+/// as the single source of truth for "is this file testthat/testit-managed"
+/// so the two checks cannot drift. O(1) path-component work, no filesystem
+/// I/O.
+fn implicit_test_working_directory(
+    file_path: &Path,
+    workspace_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let root = workspace_root?;
+    if !crate::package_state::is_testthat_or_testit_test(file_path, root) {
+        return None;
+    }
+    // is_testthat_or_testit_test guarantees the first two components below
+    // root are `tests` then `testthat`|`testit`; the anchor is exactly those.
+    let rel = file_path.strip_prefix(root).ok()?;
+    let mut comps = rel.components();
+    let tests = comps.next()?;
+    let runner_dir = comps.next()?;
+    Some(root.join(tests).join(runner_dir))
+}
+
 /// The trusted directory prefix to case-correct `canonical` beneath: the file's
 /// own `base` when the normalized candidate stays under it, otherwise the
 /// workspace root for a parent-relative path (`../foo`) that escapes `base` but
@@ -476,6 +576,28 @@ fn resolve_path_rich(
             CaseMismatchRegime::CaseInsensitiveFs,
         );
         return ResolveOutcome::resolved(corrected, mismatch);
+    }
+
+    // Step 1b: file-directory compatibility fallback for the implicit
+    // testthat/testit working directory (issue #638). Only reachable when the
+    // implicit anchor is the effective base and the file is nested below it
+    // (see `implicit_wd_file_dir_fallback`); keeps pre-#638 file-relative
+    // resolution working for files in tests/testthat subdirectories. Exact
+    // match only — the case leniencies below still operate on the
+    // anchor-based candidate.
+    if let Some(file_dir) = context.implicit_wd_file_dir_fallback() {
+        let fallback_resolved = file_dir.join(path);
+        if let Some(fallback_canonical) = normalize_path(&fallback_resolved)
+            && fallback_canonical.exists()
+        {
+            let corrected = canonicalize_case_below(&file_dir, &fallback_canonical);
+            let mismatch = case_mismatch_if_corrected(
+                &fallback_canonical,
+                &corrected,
+                CaseMismatchRegime::CaseInsensitiveFs,
+            );
+            return ResolveOutcome::resolved(corrected, mismatch);
+        }
     }
 
     // The workspace-root fallback applies only to forward source()/directives
@@ -1304,6 +1426,7 @@ mod tests {
             working_directory: None,
             inherited_working_directory: None,
             workspace_root: workspace.map(PathBuf::from),
+            implicit_test_working_directory: None,
         }
     }
 
@@ -1345,6 +1468,203 @@ mod tests {
                 &lib,
             ),
             Some(PathBuf::from("/ws/inst/extdata/x.R"))
+        );
+    }
+
+    /// from_metadata for a file under tests/testthat with no cd: implicit
+    /// anchor set, effective WD is the anchor, and cd_in_effect stays false
+    /// (issue #638 soft-default semantics).
+    #[test]
+    fn implicit_testthat_wd_set_for_testthat_file() {
+        let uri = Url::from_file_path("/proj/tests/testthat/helper-x.R").unwrap();
+        let root = Url::from_file_path("/proj").unwrap();
+        let ctx =
+            PathContext::from_metadata(&uri, &CrossFileMetadata::default(), Some(&root)).unwrap();
+        assert_eq!(
+            ctx.implicit_test_working_directory,
+            Some(PathBuf::from("/proj/tests/testthat"))
+        );
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/proj/tests/testthat")
+        );
+        assert!(!ctx.cd_in_effect());
+    }
+
+    /// A file nested below the anchor still anchors at tests/testthat (not
+    /// its own subdirectory), and exposes the file-dir compat fallback.
+    #[test]
+    fn implicit_testthat_wd_nested_file_anchors_at_testthat() {
+        let uri = Url::from_file_path("/proj/tests/testthat/fixtures/helper.R").unwrap();
+        let root = Url::from_file_path("/proj").unwrap();
+        let ctx =
+            PathContext::from_metadata(&uri, &CrossFileMetadata::default(), Some(&root)).unwrap();
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/proj/tests/testthat")
+        );
+        assert_eq!(
+            ctx.implicit_wd_file_dir_fallback(),
+            Some(PathBuf::from("/proj/tests/testthat/fixtures"))
+        );
+    }
+
+    /// For a file directly in the anchor directory the compat fallback is
+    /// None (bases coincide).
+    #[test]
+    fn implicit_testthat_wd_no_fallback_when_file_dir_is_anchor() {
+        let uri = Url::from_file_path("/proj/tests/testthat/test-a.R").unwrap();
+        let root = Url::from_file_path("/proj").unwrap();
+        let ctx =
+            PathContext::from_metadata(&uri, &CrossFileMetadata::default(), Some(&root)).unwrap();
+        assert_eq!(ctx.implicit_wd_file_dir_fallback(), None);
+    }
+
+    /// An explicit `# raven: cd` suppresses the implicit anchor entirely.
+    #[test]
+    fn explicit_cd_overrides_implicit_testthat_wd() {
+        let uri = Url::from_file_path("/proj/tests/testthat/helper-x.R").unwrap();
+        let root = Url::from_file_path("/proj").unwrap();
+        let meta = CrossFileMetadata {
+            working_directory: Some("/data".to_string()),
+            ..Default::default()
+        };
+        let ctx = PathContext::from_metadata(&uri, &meta, Some(&root)).unwrap();
+        assert_eq!(ctx.implicit_test_working_directory, None);
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/proj/data")
+        );
+        assert!(ctx.cd_in_effect());
+    }
+
+    /// An inherited cd also suppresses the implicit anchor.
+    #[test]
+    fn inherited_cd_overrides_implicit_testthat_wd() {
+        let uri = Url::from_file_path("/proj/tests/testthat/helper-x.R").unwrap();
+        let root = Url::from_file_path("/proj").unwrap();
+        let meta = CrossFileMetadata {
+            inherited_working_directory: Some("/proj/scripts".to_string()),
+            ..Default::default()
+        };
+        let ctx = PathContext::from_metadata(&uri, &meta, Some(&root)).unwrap();
+        assert_eq!(ctx.implicit_test_working_directory, None);
+        assert_eq!(
+            ctx.effective_working_directory(),
+            PathBuf::from("/proj/scripts")
+        );
+    }
+
+    /// testit files anchor at tests/testit; plain tests/ scripts and files
+    /// outside the workspace get no implicit anchor.
+    #[test]
+    fn implicit_wd_layout_gating() {
+        let root = Url::from_file_path("/proj").unwrap();
+        let testit = Url::from_file_path("/proj/tests/testit/test-a.R").unwrap();
+        let ctx = PathContext::from_metadata(&testit, &CrossFileMetadata::default(), Some(&root))
+            .unwrap();
+        assert_eq!(
+            ctx.implicit_test_working_directory,
+            Some(PathBuf::from("/proj/tests/testit"))
+        );
+
+        let plain = Url::from_file_path("/proj/tests/smoke.R").unwrap();
+        let ctx =
+            PathContext::from_metadata(&plain, &CrossFileMetadata::default(), Some(&root)).unwrap();
+        assert_eq!(ctx.implicit_test_working_directory, None);
+
+        let outside = Url::from_file_path("/other/tests/testthat/test-a.R").unwrap();
+        let ctx = PathContext::from_metadata(&outside, &CrossFileMetadata::default(), Some(&root))
+            .unwrap();
+        assert_eq!(ctx.implicit_test_working_directory, None);
+
+        // No workspace root → no anchor.
+        let uri = Url::from_file_path("/proj/tests/testthat/test-a.R").unwrap();
+        let ctx = PathContext::from_metadata(&uri, &CrossFileMetadata::default(), None).unwrap();
+        assert_eq!(ctx.implicit_test_working_directory, None);
+    }
+
+    /// Backward-directive contexts (PathContext::new) never carry the
+    /// implicit anchor; forward_without_metadata does.
+    #[test]
+    fn implicit_wd_forward_only_constructors() {
+        let uri = Url::from_file_path("/proj/tests/testthat/helper-x.R").unwrap();
+        let root = Url::from_file_path("/proj").unwrap();
+        let backward = PathContext::new(&uri, Some(&root)).unwrap();
+        assert_eq!(backward.implicit_test_working_directory, None);
+        assert_eq!(
+            backward.effective_working_directory(),
+            PathBuf::from("/proj/tests/testthat")
+        );
+
+        let forward = PathContext::forward_without_metadata(&uri, Some(&root)).unwrap();
+        assert_eq!(
+            forward.implicit_test_working_directory,
+            Some(PathBuf::from("/proj/tests/testthat"))
+        );
+    }
+
+    /// The implicit anchor never propagates into a forward-sourced child
+    /// (soft default: forward_child_inherited_wd keys off cd_in_effect).
+    #[test]
+    fn implicit_wd_never_propagates_to_children() {
+        let uri = Url::from_file_path("/proj/tests/testthat/helper-x.R").unwrap();
+        let root = Url::from_file_path("/proj").unwrap();
+        let ctx =
+            PathContext::from_metadata(&uri, &CrossFileMetadata::default(), Some(&root)).unwrap();
+        assert_eq!(
+            ctx.forward_child_inherited_wd(Path::new("/proj/scripts/helpers.R"), false),
+            None
+        );
+    }
+
+    /// End-to-end resolution chain on a real directory tree: implicit anchor
+    /// first, file-dir compat fallback second, workspace-root fallback third
+    /// (the anchor never suppresses the workspace fallback).
+    #[test]
+    fn implicit_wd_resolution_chain_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests/testthat/fixtures")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join("tests/testthat/helper-common.R"), "x <- 1\n").unwrap();
+        std::fs::write(root.join("tests/testthat/fixtures/local.R"), "y <- 1\n").unwrap();
+        std::fs::write(root.join("scripts/helpers.R"), "z <- 1\n").unwrap();
+        let nested = root.join("tests/testthat/fixtures/helper.R");
+        std::fs::write(&nested, "").unwrap();
+
+        let uri = Url::from_file_path(&nested).unwrap();
+        let root_url = Url::from_file_path(root).unwrap();
+        let ctx = PathContext::from_metadata(&uri, &CrossFileMetadata::default(), Some(&root_url))
+            .unwrap();
+
+        // Anchor-relative (testthat runtime behavior).
+        assert_eq!(
+            resolve_path_with_workspace_fallback("helper-common.R", &ctx),
+            Some(root.join("tests/testthat/helper-common.R"))
+        );
+        // File-dir compat fallback for a path that only exists next to the
+        // nested file (pre-#638 behavior preserved).
+        assert_eq!(
+            resolve_path_with_workspace_fallback("local.R", &ctx),
+            Some(root.join("tests/testthat/fixtures/local.R"))
+        );
+        // Workspace-root fallback still active despite the implicit anchor.
+        assert_eq!(
+            resolve_path_with_workspace_fallback("scripts/helpers.R", &ctx),
+            Some(root.join("scripts/helpers.R"))
+        );
+        // The issue's folded "../../scripts/helpers.R" from a directly-placed
+        // helper resolves via the anchor.
+        let helper = root.join("tests/testthat/helper-project.R");
+        std::fs::write(&helper, "").unwrap();
+        let helper_uri = Url::from_file_path(&helper).unwrap();
+        let helper_ctx =
+            PathContext::from_metadata(&helper_uri, &CrossFileMetadata::default(), Some(&root_url))
+                .unwrap();
+        assert_eq!(
+            resolve_path_with_workspace_fallback("../../scripts/helpers.R", &helper_ctx),
+            Some(root.join("scripts/helpers.R"))
         );
     }
 

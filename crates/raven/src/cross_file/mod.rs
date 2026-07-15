@@ -16,6 +16,7 @@ pub mod revalidation;
 pub mod scope;
 pub mod source_detect;
 pub mod standalone_cache;
+pub(crate) mod static_path;
 pub mod types;
 pub mod workspace_index;
 
