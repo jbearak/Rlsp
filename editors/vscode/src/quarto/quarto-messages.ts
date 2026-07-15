@@ -34,6 +34,7 @@ export type QuartoThemeRole = typeof QUARTO_THEME_ROLE_KEYS[number];
 export interface QuartoThemePayload {
     enabled: boolean;
     background: string;
+    codeBackground: string;
     foreground: string;
     roles: Record<QuartoThemeRole, string>;
     fontText: string;
@@ -67,7 +68,7 @@ export type PreviewToExtensionMessage =
     | { type: 'request-restart' }
     | { type: 'load-timeout' }
     | { type: 'report-error'; message: string }
-    | { type: 'theme-context'; background: string }
+    | { type: 'theme-context'; background: string; codeBackground: string }
     | { type: 'theme-changed'; applied: boolean }
     | { type: 'theme-bridge-status'; available: boolean };
 
@@ -78,7 +79,7 @@ const PREVIEW_MESSAGE_SCHEMAS: Record<PreviewToExtensionMessage['type'], readonl
     'request-restart': ['type'],
     'load-timeout': ['type'],
     'report-error': ['message', 'type'],
-    'theme-context': ['background', 'type'],
+    'theme-context': ['background', 'codeBackground', 'type'],
     'theme-changed': ['applied', 'type'],
     'theme-bridge-status': ['available', 'type'],
 };
@@ -107,6 +108,7 @@ function hasExactKeys(value: Record<string, unknown>, expected: readonly string[
 
 export const QUARTO_THEME_PAYLOAD_KEYS = [
     'background',
+    'codeBackground',
     'enabled',
     'fontMono',
     'fontText',
@@ -141,7 +143,8 @@ const SANITIZED_FONT = new RegExp(QUARTO_SANITIZED_FONT_PATTERN_SOURCE);
 export function isQuartoThemePayload(value: unknown): value is QuartoThemePayload {
     if (!isRecord(value) || !hasExactKeys(value, QUARTO_THEME_PAYLOAD_KEYS)) return false;
     if (typeof value.enabled !== 'boolean') return false;
-    if (!isColor(value.background) || !isColor(value.foreground)) return false;
+    if (!isColor(value.background) || !isColor(value.codeBackground) ||
+        !isColor(value.foreground)) return false;
     if (typeof value.fontText !== 'string' || !SANITIZED_FONT.test(value.fontText)) return false;
     if (typeof value.fontMono !== 'string' || !SANITIZED_FONT.test(value.fontMono)) return false;
     const roles = value.roles;
@@ -156,6 +159,7 @@ export function isRavenQuartoThemeMessage(value: unknown): value is RavenQuartoT
     return isQuartoThemePayload({
         enabled: value.enabled,
         background: value.background,
+        codeBackground: value.codeBackground,
         foreground: value.foreground,
         roles: value.roles,
         fontText: value.fontText,
@@ -230,7 +234,8 @@ export function isPreviewToExtensionMessage(value: unknown): value is PreviewToE
         case 'report-error':
             return typeof value.message === 'string';
         case 'theme-context':
-            return typeof value.background === 'string';
+            return typeof value.background === 'string' &&
+                typeof value.codeBackground === 'string';
         case 'theme-changed':
             return typeof value.applied === 'boolean';
         case 'theme-bridge-status':

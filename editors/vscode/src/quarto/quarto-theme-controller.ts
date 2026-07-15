@@ -93,6 +93,7 @@ export class QuartoThemeController implements DisposableLike {
     private sourceFsPath: string;
     private enabled: boolean;
     private latestEditorBackground: string | undefined;
+    private latestCodeBackground: string | undefined;
     private pushGeneration = 0;
     private disposed = false;
     private resolveWarned = false;
@@ -151,9 +152,11 @@ export class QuartoThemeController implements DisposableLike {
             this.deps.getConfiguration<unknown>('workbench.colorCustomizations'),
             resolvedThemeId ?? candidateThemeIds[0],
         );
+        const background = colorOverrides.background ?? palette.background;
         return {
             enabled: this.enabled,
-            background: colorOverrides.background ?? palette.background,
+            background,
+            codeBackground: this.latestCodeBackground ?? background,
             foreground: colorOverrides.foreground ?? palette.foreground,
             roles: { ...palette.roles },
             fontText: fonts.text,
@@ -174,12 +177,21 @@ export class QuartoThemeController implements DisposableLike {
         }
     }
 
-    setEditorBackground(background: string): void {
+    /** Cache the live webview colors that are unavailable from VS Code's API. */
+    setThemeContext(background: string, codeBackground: string): void {
         if (this.disposed) return;
-        const normalized = normalizeEditorBackground(background);
-        if (!normalized || normalized === this.latestEditorBackground) return;
-        this.latestEditorBackground = normalized;
-        void this.push();
+        const normalizedBackground = normalizeEditorBackground(background);
+        const normalizedCodeBackground = validCssColor(codeBackground);
+        let changed = false;
+        if (normalizedBackground && normalizedBackground !== this.latestEditorBackground) {
+            this.latestEditorBackground = normalizedBackground;
+            changed = true;
+        }
+        if (normalizedCodeBackground && normalizedCodeBackground !== this.latestCodeBackground) {
+            this.latestCodeBackground = normalizedCodeBackground;
+            changed = true;
+        }
+        if (changed) void this.push();
     }
 
     /** Persist and synchronize the toggle across every open Quarto panel. */
@@ -271,6 +283,7 @@ export class QuartoThemeController implements DisposableLike {
     private handleThemeChange(): void {
         if (this.disposed) return;
         this.latestEditorBackground = undefined;
+        this.latestCodeBackground = undefined;
         try {
             void Promise.resolve(this.deps.requestThemeContext()).catch(() => undefined);
         } catch {
