@@ -120,6 +120,14 @@ export class KnitOutputPanel {
     private rootDir: string;
     private sourceUri: vscode.Uri;
     private outputPath: string;
+    /**
+     * The knit `root.dir` from the most recent knit, used as an extra
+     * base when resolving relative `include_graphics` image paths.
+     * Undefined until the first knit passes it (e.g. a serializer
+     * restore with no re-knit), in which case the source document's
+     * directory is used as the fallback base.
+     */
+    private knitRootDir: string | undefined;
     private readonly output: vscode.OutputChannel;
     /**
      * The most recent concrete `ViewColumn` this panel was observed in.
@@ -238,6 +246,13 @@ export class KnitOutputPanel {
             sourceUri: vscode.Uri;
             outputPath: string;
             output: vscode.OutputChannel;
+            /**
+             * The knit working directory (`root.dir`). Relative
+             * `include_graphics` image paths resolve against it, so the
+             * inliner can reach a workspace image the author referenced
+             * relative to the project root rather than the preview dir.
+             */
+            knitRootDir?: string;
         },
     ): Promise<{ ok: true } | { ok: false; error: string }> {
         try {
@@ -251,7 +266,11 @@ export class KnitOutputPanel {
         const existing = KnitOutputPanel.instances.get(key);
 
         if (existing && existing.rootDir === rootDir) {
-            existing.updateContent({ sourceUri: args.sourceUri, outputPath: args.outputPath });
+            existing.updateContent({
+                sourceUri: args.sourceUri,
+                outputPath: args.outputPath,
+                knitRootDir: args.knitRootDir,
+            });
             // Prefer the panel's *current* column; fall back to the
             // last-known column so re-knitting a hidden panel does
             // not relocate it to `Beside` (which moves the panel
@@ -372,6 +391,7 @@ export class KnitOutputPanel {
             sourceUri: vscode.Uri;
             outputPath: string;
             output: vscode.OutputChannel;
+            knitRootDir?: string;
         },
         rootDir: string,
         column: vscode.ViewColumn,
@@ -492,6 +512,7 @@ export class KnitOutputPanel {
             sourceUri: vscode.Uri;
             outputPath: string;
             output: vscode.OutputChannel;
+            knitRootDir?: string;
         },
         rootDir: string,
     ): KnitOutputPanel {
@@ -626,7 +647,11 @@ export class KnitOutputPanel {
         });
         instance.perPanelDisposables.push(onTheme, onConfig);
 
-        instance.updateContent({ sourceUri: args.sourceUri, outputPath: args.outputPath });
+        instance.updateContent({
+            sourceUri: args.sourceUri,
+            outputPath: args.outputPath,
+            knitRootDir: args.knitRootDir,
+        });
         return instance;
     }
 
@@ -697,9 +722,16 @@ export class KnitOutputPanel {
         this.panel.webview.onDidReceiveMessage((msg: unknown) => this.handleMessage(msg));
     }
 
-    private updateContent(args: { sourceUri: vscode.Uri; outputPath: string }): void {
+    private updateContent(args: {
+        sourceUri: vscode.Uri;
+        outputPath: string;
+        knitRootDir?: string;
+    }): void {
         this.sourceUri = args.sourceUri;
         this.outputPath = args.outputPath;
+        if (args.knitRootDir !== undefined) {
+            this.knitRootDir = args.knitRootDir;
+        }
         const nonce = crypto.randomBytes(16).toString('base64');
         // Read the rendered HTML from disk; inlining via `srcdoc`
         // bypasses the nested-iframe navigation issue (see
@@ -748,19 +780,28 @@ export class KnitOutputPanel {
         // base64 payload. The mutation only touches the in-memory
         // copy handed to the iframe.
         // `include_graphics()` can reference an image that already
-        // lives elsewhere in the workspace (issue #627). Allow the
-        // inliner to reach outside the temp preview dir by handing it
-        // the workspace folder containing the source document — or, for
-        // a loose file with no workspace, the source document's own
-        // directory. Scoping to the *containing* folder (rather than
-        // every open folder) keeps the boundary to the project the user
-        // is previewing; the inliner still `realpath`-guards containment.
+        // lives elsewhere in the workspace (issue #627). Two things let
+        // the inliner reach it:
+        //   - `resolveBases`: an author's relative
+        //     `include_graphics("images/logo.png")` is relative to the
+        //     knit `root.dir`, not the preview output dir, so pass that
+        //     base (falling back to the source document's own directory,
+        //     which is `root.dir` in the default `document` mode and a
+        //     sensible guess on a serializer restore with no re-knit).
+        //   - `additionalRoots`: the containment allow-list — the
+        //     workspace folder containing the source, plus `root.dir`
+        //     itself in case it sits outside that folder.
+        // Scoping to the containing workspace folder (not every open
+        // folder) keeps the boundary to the project being previewed; the
+        // inliner still `realpath`-guards containment.
         const sourceDir = path.dirname(this.sourceUri.fsPath);
+        const rootBase = this.knitRootDir ?? sourceDir;
         const workspaceRoot = vscode.workspace.getWorkspaceFolder(this.sourceUri)?.uri.fsPath
             ?? sourceDir;
         htmlContent = inlineLocalImagesAsDataUrls(htmlContent, docDir, this.output, {
             markSvgPlots: true,
-            additionalRoots: [workspaceRoot],
+            resolveBases: [rootBase],
+            additionalRoots: [workspaceRoot, rootBase],
         });
         this.panel.webview.html = buildShellHtml({
             htmlContent,

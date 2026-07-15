@@ -301,6 +301,62 @@ describe('inlineLocalImagesAsDataUrls', () => {
         });
     });
 
+    test('resolves a relative author path against an extra resolveBase (root.dir)', () => {
+        withTempDir((project) => {
+            // include_graphics("images/logo.png") is relative to the knit
+            // root.dir (project), NOT the preview output dir (docDir).
+            const docDir = path.join(project, 'reports', '.raven_output');
+            const imgDir = path.join(project, 'images');
+            fs.mkdirSync(docDir, { recursive: true });
+            fs.mkdirSync(imgDir, { recursive: true });
+            fs.writeFileSync(path.join(imgDir, 'logo.png'), TINY_PNG);
+
+            const html = '<img src="images/logo.png">';
+            const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                resolveBases: [project],
+                additionalRoots: [project],
+            });
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
+    test('a relative author path is not inlined without a matching resolveBase', () => {
+        withTempDir((project) => {
+            const docDir = path.join(project, 'reports', '.raven_output');
+            const imgDir = path.join(project, 'images');
+            fs.mkdirSync(docDir, { recursive: true });
+            fs.mkdirSync(imgDir, { recursive: true });
+            fs.writeFileSync(path.join(imgDir, 'logo.png'), TINY_PNG);
+
+            // project is an allowed root, but with docDir as the only
+            // resolution base `images/logo.png` resolves to
+            // docDir/images/logo.png (missing) — so it stays broken.
+            const html = '<img src="images/logo.png">';
+            const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                additionalRoots: [project],
+            });
+            expect(out).toBe(html);
+        });
+    });
+
+    test('generated figure still resolves against docDir when a resolveBase is set', () => {
+        withTempDir((project) => {
+            // The docDir-relative plot must not regress now that an extra
+            // base (root.dir) is also tried.
+            const docDir = path.join(project, 'reports', '.raven_output');
+            fs.mkdirSync(path.join(docDir, 'figure'), { recursive: true });
+            fs.writeFileSync(path.join(docDir, 'figure', 'plot-1.png'), TINY_PNG);
+
+            const html = '<img src="figure/plot-1.png">';
+            const out = inlineLocalImagesAsDataUrls(html, docDir, undefined, {
+                markSvgPlots: true,
+                resolveBases: [project],
+                additionalRoots: [project],
+            });
+            expect(out).toContain('src="data:image/png;base64,');
+        });
+    });
+
     test('blocks an absolute path outside every allowed root', () => {
         withTempDir((workspace) => {
             const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'raven-outside-'));

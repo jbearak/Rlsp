@@ -58,8 +58,9 @@
  *     left in place so the user gets a visible failure instead of a
  *     silent file-read.
  *   - Relative paths resolve against `docDir` (the rendered document's
- *     directory); absolute paths resolve as-is. Either way the result
- *     must land inside an allowed root.
+ *     directory) first, then any `resolveBases` (the knit `root.dir`,
+ *     for author `include_graphics` paths); absolute paths resolve
+ *     as-is. Either way the result must land inside an allowed root.
  *   - Unknown extensions (anything not in
  *     `mimeForImageExtension`) are passed through; we don't read
  *     arbitrary file types off disk in case a future markdown
@@ -98,6 +99,18 @@ export interface InlineImagesOptions {
      * with `realpath`; a root that doesn't exist is skipped.
      */
     additionalRoots?: string[];
+    /**
+     * Directories — beyond `docDir`, which is always tried first — to
+     * resolve a RELATIVE `<img src>` against (issue #627). A rendered
+     * document mixes two kinds of relative path with different correct
+     * bases: knitr's generated plots (`figure/plot-1.png`) are relative
+     * to the preview output dir (`docDir`), while an author's
+     * `knitr::include_graphics("images/logo.png")` is relative to the
+     * knit working directory (`root.dir`). The panel passes `root.dir`
+     * here so both resolve; each candidate is still `realpath`-gated by
+     * `additionalRoots`. Bases are tried in order, `docDir` first.
+     */
+    resolveBases?: string[];
 }
 
 export function inlineLocalImagesAsDataUrls(
@@ -187,13 +200,15 @@ export function inlineLocalImagesAsDataUrls(
         // a `%`.
         const pathCandidates = percentDecodedCandidates(srcPath);
 
-        // Absolute paths resolve as-is; relative paths resolve against
-        // the rendered document's directory (`docDir`). The leading
-        // `./` strip doesn't change semantics — it just keeps
+        // Relative-path resolution bases, tried in order. `docDir` (the
+        // preview output dir) comes first — knitr's generated plots
+        // (`figure/plot-1.png`) live there — then any caller-supplied
+        // bases (the knit `root.dir`, against which an author's
+        // `include_graphics("images/logo.png")` resolves). An absolute
+        // path ignores the bases and resolves as-is. The leading `./`
+        // strip doesn't change semantics — it just keeps
         // `normalizedRelative` (used for the figure-plot marker) clean.
-        const resolveCandidate = (cand: string): string => path.isAbsolute(cand)
-            ? path.resolve(cand)
-            : path.resolve(docDir, cand.replace(/^\.\//, ''));
+        const relativeBases = [docDir, ...(options.resolveBases ?? [])];
 
         let realResolved: string | null = null;
         // The logical (pre-realpath) resolved path of the first
@@ -201,25 +216,33 @@ export function inlineLocalImagesAsDataUrls(
         // the data-URL MIME, and the diagnostic log line.
         let logicalResolved: string | null = null;
         let mime: string | null = null;
+        outer:
         for (const cand of pathCandidates) {
-            const resolved = resolveCandidate(cand);
-            const candMime = mimeForImageExtension(path.extname(resolved).toLowerCase());
+            const candMime = mimeForImageExtension(path.extname(cand).toLowerCase());
             // Unknown extensions are passed through; we don't read
             // arbitrary file types off disk.
             if (!candMime) continue;
-            if (logicalResolved === null) logicalResolved = resolved;
-            // Canonicalize the candidate and each allowed root with
-            // `realpath` (so a symlink can't escape a root) and require
-            // the file to be contained by at least one. Fails closed: a
-            // missing file, a symlink target outside every root, or a
-            // path that simply lives elsewhere all leave the `src`
-            // untouched.
-            const real = canonicalizeContainedPath(resolved, canonicalRoots);
-            if (real !== null) {
-                realResolved = real;
-                logicalResolved = resolved;
-                mime = candMime;
-                break;
+            const isAbsolute = path.isAbsolute(cand);
+            const cleaned = isAbsolute ? cand : cand.replace(/^\.\//, '');
+            // Absolute → a single as-is resolution; relative → one per base.
+            const bases = isAbsolute ? [undefined] : relativeBases;
+            for (const base of bases) {
+                const resolved = base === undefined
+                    ? path.resolve(cleaned)
+                    : path.resolve(base, cleaned);
+                if (logicalResolved === null) logicalResolved = resolved;
+                // Canonicalize the candidate against the allowed roots
+                // with `realpath` (so a symlink can't escape a root) and
+                // require containment. Fails closed: a missing file, a
+                // symlink target outside every root, or a path that
+                // simply lives elsewhere all leave the `src` untouched.
+                const real = canonicalizeContainedPath(resolved, canonicalRoots);
+                if (real !== null) {
+                    realResolved = real;
+                    logicalResolved = resolved;
+                    mime = candMime;
+                    break outer;
+                }
             }
         }
         // No candidate had a known image extension — leave the tag alone.

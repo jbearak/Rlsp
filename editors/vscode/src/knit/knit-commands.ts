@@ -576,6 +576,7 @@ async function runKnitCommand(
             sourceUri: docUri,
             sourceLanguageId,
             cwd,
+            knitRootDir,
             output,
             rBinary,
             timeoutMs,
@@ -607,6 +608,8 @@ interface RenderOutcomeCtx {
     sourceUri: vscode.Uri;
     sourceLanguageId: string;
     cwd: string | undefined;
+    /** Chunk working directory (`root.dir`); null = inherit subprocess cwd. */
+    knitRootDir: string | null;
     output: vscode.OutputChannel;
     rBinary: string;
     timeoutMs: number;
@@ -756,6 +759,10 @@ async function renderOutcome(outcome: KnitOutcome, ctx: RenderOutcomeCtx): Promi
         sourceUri: ctx.sourceUri,
         outputPath: htmlPath,
         output: ctx.output,
+        // Effective chunk working directory: the explicit `root.dir`, or
+        // the subprocess cwd when none was pinned. Relative
+        // `include_graphics` image paths resolve against this.
+        knitRootDir: ctx.knitRootDir ?? ctx.cwd,
     });
     if (!panelResult.ok) {
         ctx.output.appendLine(`[panel] ${panelResult.error}`);
