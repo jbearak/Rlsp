@@ -137,6 +137,12 @@ async function run_chunk_at(
     cursor_line: number,
     target: TerminalTarget = 'managed',
 ): Promise<void> {
+    const kind = classify_chunk_document_for_document(document);
+    // Regular Markdown is deliberately an execution-only, one-block surface.
+    // Commands are registered globally, so enforce the same boundary for
+    // Command Palette and keybinding invocations as the CodeLens provider.
+    if (kind === 'markdown' && mode !== 'current') return;
+
     // Active-terminal path: bail upfront if there is no terminal to send
     // into. Otherwise the `…AndMove` variants would still advance the
     // cursor after `send_to_r` short-circuited on the "no active terminal"

@@ -1,6 +1,17 @@
 import * as vscode from 'vscode';
 import { chunks_for_document } from './chunk-commands';
-import { Chunk, find_chunk_at_line } from './chunk-detector';
+import {
+    Chunk,
+    classify_chunk_document_for_document,
+    find_chunk_at_line,
+} from './chunk-detector';
+
+function supports_chunk_navigation(document: vscode.TextDocument): boolean {
+    // Regular Markdown intentionally gets only the execution CodeLens. Keep
+    // the globally registered palette commands from turning it into another
+    // chunk-authoring surface.
+    return classify_chunk_document_for_document(document) !== 'markdown';
+}
 
 function move_to_line(editor: vscode.TextEditor, line: number): void {
     const safe = Math.max(0, Math.min(line, editor.document.lineCount - 1));
@@ -14,6 +25,7 @@ function move_to_line(editor: vscode.TextEditor, line: number): void {
 function go_to_next(): void {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
+    if (!supports_chunk_navigation(editor.document)) return;
     const chunks = chunks_for_document(editor.document);
     if (chunks.length === 0) return;
     const cursor = editor.selection.active.line;
@@ -30,6 +42,7 @@ function go_to_next(): void {
 function go_to_previous(): void {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
+    if (!supports_chunk_navigation(editor.document)) return;
     const chunks = chunks_for_document(editor.document);
     if (chunks.length === 0) return;
     const cursor = editor.selection.active.line;
@@ -52,6 +65,7 @@ function go_to_previous(): void {
 function select_current(): void {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return;
+    if (!supports_chunk_navigation(editor.document)) return;
     const chunks = chunks_for_document(editor.document);
     if (chunks.length === 0) return;
     const cursor = editor.selection.active.line;

@@ -59,6 +59,19 @@ const R_CELL_FIXTURE = [
     '',
 ].join('\n');
 
+const MARKDOWN_FIXTURE = [
+    '# Technical notes',
+    '',
+    '```r',
+    'summary(cars)',
+    '```',
+    '',
+    '```python',
+    'print("not R")',
+    '```',
+    '',
+].join('\n');
+
 const TEMP_FIXTURE_FILES: string[] = [];
 
 /**
@@ -70,17 +83,19 @@ const TEMP_FIXTURE_FILES: string[] = [];
  *     `.rmd` file exercises both paths and sidesteps a Linux VS Code
  *     1.120 quirk where untitled buffers can drop a freshly-contributed
  *     languageId when the extension host hasn't loaded yet.
+ *   - `'markdown'` — regular Markdown fenced-code mode. Written to `.md`.
  *   - `'r'` — plain R / `# %%` cell-marker mode. Uses an untitled buffer
  *     because `'r'` has been a registered languageId since day one and
  *     reliably survives the round-trip.
  */
 async function open_doc(
     content: string,
-    language: 'rmd' | 'r' = 'rmd',
+    language: 'rmd' | 'markdown' | 'r' = 'rmd',
 ): Promise<vscode.TextEditor> {
     let editor: vscode.TextEditor;
-    if (language === 'rmd') {
-        const tmp = path.join(os.tmpdir(), `raven-chunks-${randomUUID()}.rmd`);
+    if (language === 'rmd' || language === 'markdown') {
+        const extension = language === 'rmd' ? 'rmd' : 'md';
+        const tmp = path.join(os.tmpdir(), `raven-chunks-${randomUUID()}.${extension}`);
         fs.writeFileSync(tmp, content);
         TEMP_FIXTURE_FILES.push(tmp);
         const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(tmp));
@@ -858,6 +873,84 @@ suite('chunk commands: registration and behavior', () => {
                 previous,
                 vscode.ConfigurationTarget.Global,
             );
+        }
+    });
+
+    test('regular Markdown shows only Run Chunk for R fences and executes its body', async function () {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runCurrentChunkAt');
+        if (r_console_disabled) return;
+        const editor = await open_doc(MARKDOWN_FIXTURE, 'markdown');
+        const config = vscode.workspace.getConfiguration();
+        const previous = config.inspect<string[]>('raven.chunks.codeLens.commands')?.globalValue;
+        try {
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                ['raven.runCurrentChunk', 'raven.runAllChunks', 'raven.runBelowChunks'],
+                vscode.ConfigurationTarget.Global,
+            );
+            const lenses = await poll_for_lenses(
+                editor.document.uri,
+                (ls) => ls.length === 1,
+            );
+            assert.strictEqual(lenses.length, 1, 'Markdown should expose one lens for its R block');
+            assert.strictEqual(lenses[0].command?.title, '▷ Run Chunk');
+
+            await dispose_any_cached_r_terminal();
+            const term = stub_create_terminal();
+            try {
+                const command = lenses[0].command;
+                assert.ok(command, 'Run Chunk lens should carry a command');
+                await vscode.commands.executeCommand(command.command, ...(command.arguments ?? []));
+                assert.ok(
+                    term.sent.join('\n').includes('summary(cars)'),
+                    `expected Markdown R block body to reach terminal, got: ${term.sent.join('\n')}`,
+                );
+                assert.ok(
+                    !term.sent.join('\n').includes('print("not R")'),
+                    'non-R Markdown block must not be sent',
+                );
+            } finally {
+                term.restore();
+            }
+        } finally {
+            await config.update(
+                'raven.chunks.codeLens.commands',
+                previous,
+                vscode.ConfigurationTarget.Global,
+            );
+        }
+    });
+
+    test('regular Markdown does not participate in chunk navigation commands', async function () {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.goToNextChunk');
+        if (r_console_disabled) return;
+        const editor = await open_doc(MARKDOWN_FIXTURE, 'markdown');
+        place_cursor(editor, 0);
+        await execute_chunk_command(editor, 'raven.goToNextChunk');
+        assert.strictEqual(
+            editor.selection.active.line,
+            0,
+            'Markdown navigation command should leave the cursor unchanged',
+        );
+    });
+
+    test('regular Markdown rejects multi-chunk and cursor-moving run commands', async function () {
+        const r_console_disabled = !(await vscode.commands.getCommands(true))
+            .includes('raven.runCurrentChunkAndMove');
+        if (r_console_disabled) return;
+        const editor = await open_doc(MARKDOWN_FIXTURE, 'markdown');
+        place_cursor(editor, 3);
+        await dispose_any_cached_r_terminal();
+        const term = stub_create_terminal();
+        try {
+            await execute_chunk_command(editor, 'raven.runCurrentChunkAndMove');
+            await execute_chunk_command(editor, 'raven.runAllChunks');
+            assert.strictEqual(editor.selection.active.line, 3);
+            assert.strictEqual(term.sent.length, 0);
+        } finally {
+            term.restore();
         }
     });
 

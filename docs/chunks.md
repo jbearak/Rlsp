@@ -1,6 +1,6 @@
 # R Code Chunks
 
-Raven recognizes R code chunks in R Markdown / Quarto documents and `# %%`-delimited cells in plain `.R` files. You can run a single chunk, every chunk above the cursor, or every chunk in the document; navigate forward and backward between chunks; and see a subtle background tint that makes chunks easy to scan.
+Raven recognizes R code chunks in R Markdown / Quarto documents and `# %%`-delimited cells in plain `.R` files. In regular Markdown documentation, Raven also provides a `Run Chunk` CodeLens for fenced blocks tagged `r` or `R`. You can run a single chunk, every chunk above the cursor, or every chunk in an R Markdown / Quarto / R-cell document; navigate forward and backward between chunks; and see a subtle background tint that makes chunks easy to scan.
 
 This is the daily-driver workflow for `.Rmd` / `.Rmarkdown` / `.qmd` users coming from RStudio or vscode-R.
 
@@ -12,9 +12,16 @@ This is the daily-driver workflow for `.Rmd` / `.Rmarkdown` / `.qmd` users comin
 | Form | File types | Example header |
 |------|------------|----------------|
 | Fenced block | `.Rmd`, `.Rmarkdown`, `.qmd` | ```` ```{r setup, eval=FALSE} ```` |
+| Markdown R block | `.md`, `.markdown` | ```` ```r ```` |
 | Cell marker | `.R` | `# %% Section 1` |
 
 Fenced blocks may use either backticks or tildes, and four-or-more-character fences nest naturally (so a chunk can contain a literal `` ``` ``).
+
+Regular Markdown support is intentionally limited to execution: an `r` / `R`
+fence gets a single `Run Chunk` CodeLens that sends its body to Raven's R
+console. It does not enable knitting, chunk navigation or highlighting, or R
+language-server features in `.md` files. Like every Raven execution surface,
+the lens appears only when `raven.rConsole.activation` resolves to `enabled`.
 
 Only **R** chunks are sent to the R console. Chunks tagged with other languages (`{python}`, `{bash}`, `{julia}`, …) are still recognized for navigation and outline but not for execution.
 

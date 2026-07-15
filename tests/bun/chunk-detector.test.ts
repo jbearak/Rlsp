@@ -37,8 +37,225 @@ describe('classify_chunk_document', () => {
         expect(classify_chunk_document('/tmp/foo.r')).toBe('r');
     });
 
+    test('treats .md / .markdown as markdown', () => {
+        expect(classify_chunk_document('/tmp/notes.md')).toBe('markdown');
+        expect(classify_chunk_document('/tmp/notes.MD')).toBe('markdown');
+        expect(classify_chunk_document('/tmp/notes.markdown')).toBe('markdown');
+    });
+
     test('falls back to r for unknown extensions', () => {
         expect(classify_chunk_document('/tmp/foo.txt')).toBe('r');
+    });
+});
+
+describe('detect_chunks — regular Markdown fenced blocks', () => {
+    test('detects case-insensitive bare R fences', () => {
+        const src = lines([
+            '# Technical notes',
+            '```R',
+            'x <- 1',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].language).toBe('r');
+        expect(chunks[0].header_line).toBe(1);
+        expect(chunks[0].end_line).toBe(2);
+        expect(chunks[0].closing_fence_line).toBe(3);
+        expect(chunks[0].kind).toBe('markdown');
+    });
+
+    test('detects tilde fences and up to three leading spaces', () => {
+        const src = lines([
+            '   ~~~r',
+            '   x <- 1',
+            ' y <- 2',
+            '  ~~~',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].language).toBe('r');
+        expect(chunks[0].closing_fence_line).toBe(3);
+        expect(extract_chunk_code(src, chunks[0])).toBe('x <- 1\ny <- 2');
+    });
+
+    test('recognizes non-R fences but leaves them non-runnable', () => {
+        const src = lines([
+            '```python',
+            'print("not R")',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].language).toBe('python');
+        expect(is_runnable_chunk(chunks[0])).toBe(false);
+    });
+
+    test('does not treat knitr-style fences as regular Markdown R blocks', () => {
+        const src = lines([
+            '```{r}',
+            'x <- 1',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].language).toBe('{r}');
+        expect(is_runnable_chunk(chunks[0])).toBe(false);
+    });
+
+    test('does not discover an R fence nested inside a longer non-R fence', () => {
+        const src = lines([
+            '````text',
+            '```r',
+            'x <- 1',
+            '```',
+            '````',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].language).toBe('text');
+        expect(chunks[0].closing_fence_line).toBe(4);
+    });
+
+    test('does not discover an R fence nested inside an untagged outer fence', () => {
+        const src = lines([
+            '````',
+            '```r',
+            'x <- 1',
+            '```',
+            '````',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].language).toBe('');
+        expect(chunks[0].closing_fence_line).toBe(4);
+    });
+
+    test('permits backticks in tilde-fence info strings without exposing nested R fences', () => {
+        const src = lines([
+            '~~~text`meta`',
+            '```r',
+            'x <- 1',
+            '```',
+            '~~~',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].language).toBe('text`meta`');
+        expect(chunks[0].closing_fence_line).toBe(4);
+    });
+
+    test('rejects backticks anywhere in a backtick-fence info string', () => {
+        const src = lines([
+            '```r title=`demo`',
+            'not part of a valid fenced block',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.every((chunk) => !is_runnable_chunk(chunk))).toBe(true);
+    });
+
+    test('ignores fenced-looking text inside multiline HTML comments', () => {
+        const src = lines([
+            '<!-- disabled example',
+            '```r',
+            'stop("must not run")',
+            '```',
+            '-->',
+            '```r',
+            'x <- 1',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].header_line).toBe(5);
+    });
+
+    test('does not let inline comment syntax suppress a later fence', () => {
+        const src = lines([
+            'Document the literal `<!--` token here.',
+            '',
+            '```r',
+            'x <- 1',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].header_line).toBe(2);
+    });
+
+    test('ignores fenced-looking text inside raw HTML blocks', () => {
+        const src = lines([
+            '<pre>',
+            '```r',
+            'stop("must not run")',
+            '```',
+            '</pre>',
+            '<div>',
+            '```r',
+            'also_not_runnable()',
+            '```',
+            '',
+            '```r',
+            'x <- 1',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].header_line).toBe(10);
+    });
+
+    test('dedents tabs using CommonMark four-column tab stops', () => {
+        const src = lines([
+            '   ```r',
+            '\tfoo',
+            ' \tbar',
+            '   ```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(extract_chunk_code(src, chunks[0])).toBe(' foo\n bar');
+    });
+
+    test('recognizes fences nested in Markdown containers', () => {
+        const src = lines([
+            '- example',
+            '',
+            '  ```r',
+            '  x <- 1',
+            '  ```',
+            '',
+            '> ```R',
+            '> y <- 2',
+            '> ```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(2);
+        expect(chunks[0].header_line).toBe(2);
+        expect(chunks[0].closing_fence_line).toBe(4);
+        expect(extract_chunk_code(src, chunks[0])).toBe('x <- 1');
+        expect(chunks[1].header_line).toBe(6);
+        expect(chunks[1].closing_fence_line).toBe(8);
+        expect(extract_chunk_code(src, chunks[1])).toBe('y <- 2');
+    });
+
+    test('ignores fenced-looking examples inside YAML front matter', () => {
+        const src = lines([
+            '---',
+            'title: Technical notes',
+            'example: |',
+            '  ```r',
+            '  stop("metadata only")',
+            '  ```',
+            '---',
+            '',
+            '```r',
+            'x <- 1',
+            '```',
+        ].join('\n'));
+        const chunks = detect_chunks(src, 'markdown');
+        expect(chunks.length).toBe(1);
+        expect(chunks[0].header_line).toBe(8);
+        expect(extract_chunk_code(src, chunks[0])).toBe('x <- 1');
     });
 });
 
@@ -595,6 +812,18 @@ describe('classify_chunk_document_for_document', () => {
         expect(classify_chunk_document_for_document(qdoc)).toBe('rmd');
     });
 
+    test('prefers the Markdown languageId for untitled buffers', () => {
+        const doc = { languageId: 'Markdown', uri: { fsPath: '', path: 'Untitled-1' } };
+        expect(classify_chunk_document_for_document(doc)).toBe('markdown');
+    });
+
+    test('preserves Rmd/Qmd extension classification under a Markdown languageId', () => {
+        const rmd = { languageId: 'markdown', uri: { fsPath: '/tmp/report.Rmd', path: '/tmp/report.Rmd' } };
+        expect(classify_chunk_document_for_document(rmd)).toBe('rmd');
+        const qmd = { languageId: 'markdown', uri: { fsPath: '/tmp/report.qmd', path: '/tmp/report.qmd' } };
+        expect(classify_chunk_document_for_document(qmd)).toBe('rmd');
+    });
+
     test('falls back to URI extension for `r` languageId', () => {
         const rmd = { languageId: 'r', uri: { fsPath: '/tmp/report.Rmd', path: '/tmp/report.Rmd' } };
         expect(classify_chunk_document_for_document(rmd)).toBe('rmd');
@@ -633,6 +862,10 @@ describe('has_chunk_anchor', () => {
     test('returns true when an Rmd document contains backtick or tilde fences', () => {
         expect(has_chunk_anchor('```{r}\n1\n```\n', 'rmd')).toBe(true);
         expect(has_chunk_anchor('~~~{r}\n1\n~~~\n', 'rmd')).toBe(true);
+    });
+
+    test('returns true when a Markdown document contains a fence', () => {
+        expect(has_chunk_anchor('```r\n1\n```\n', 'markdown')).toBe(true);
     });
 
     test('does not false-trigger on single backticks (inline code)', () => {
