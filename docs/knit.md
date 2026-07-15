@@ -34,9 +34,9 @@ intentionally narrow:
 - Export commands shell out to Pandoc. PDF export additionally needs a
   PDF engine — `xelatex` (a LaTeX engine) by default, or `wkhtmltopdf`
   (WebKit-based, no LaTeX required).
-- No `.qmd` rendering in the Knit Preview pipeline. Raven's separate
-  [Quarto Preview and Render](quarto.md) commands delegate `.qmd` rendering to
-  the Quarto CLI; the two pipelines are independent.
+- Knit Preview handles `.Rmd` / `.Rmarkdown` files. For `.qmd` files, the same
+  preview button and shortcut open [Quarto Preview](quarto.md), which uses
+  Quarto to preview and render the document.
 
 For HTML, Raven calls
 [`knitr::knit`](https://yihui.org/knitr/) directly — not
@@ -486,8 +486,8 @@ those checks live in the runtime sanitizer only.
 
 | Capability | Where it lives |
 |---|---|
-| Live preview of `.Rmd` / `.Rmarkdown` | `quarto.quarto`'s `Quarto: Preview`. Raven's Knit Preview remains a static viewer with a manual Knit again button. |
-| `.qmd` preview or rendering through the Knit Preview pipeline | Use Raven's separate CLI-backed [Quarto Preview and Render](quarto.md) commands, or `quarto.quarto`. Knit Preview itself never handles `.qmd`; the pipelines are independent. |
+| Automatic refresh of `.Rmd` / `.Rmarkdown` preview after saves | Not provided. Raven's Knit Preview updates when you choose **Knit again**. |
+| `.qmd` preview or rendering with the Knit Preview command | Use Raven's [Quarto Preview and Render](quarto.md) commands, or `quarto.quarto`. Raven's shared preview shortcut selects the appropriate command for the current document format. |
 | Visual Mode and Quarto-aware YAML intelligence | `quarto.quarto`. Raven supplies `.qmd` highlighting and R-chunk language features, but not these Quarto-specific editor surfaces. |
 | html_document-specific YAML options (`theme`, `code_folding`, `df_print`, …) | Out of scope. Honoring them requires becoming `rmarkdown::html_document` (Bootstrap + JS runtime). Use `rmarkdown::render(...)` in the R console for full template fidelity. |
 | `pandoc_args:` *full* passthrough | The editor menu picks export destination (always sibling of the source document) and format, so `-o`/`--output`/`-t`/`--to`/`-w`/`--write` are stripped from YAML's `pandoc_args` and logged. Everything else flows through — see the honored-options table above. |

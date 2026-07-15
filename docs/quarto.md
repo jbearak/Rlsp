@@ -1,16 +1,40 @@
 # Quarto preview and render
 
-Raven provides a standalone, CLI-backed Quarto workflow for `.qmd` files. It
-uses the public Quarto CLI rather than the Quarto VS Code extension:
+Raven brings Quarto preview and render commands into VS Code for `.qmd` files:
 
-- **`Raven: Quarto Preview`** starts Quarto's live preview server and embeds
-  the served page in a VS Code panel.
-- **`Raven: Quarto Render`** runs a one-shot render and reports the output
-  file.
+- **`Raven: Quarto Preview`** starts Quarto's preview server and embeds the
+  served page in a VS Code panel. Quarto automatically refreshes the preview
+  after saves.
+- **`Raven: Quarto Render`** asks Quarto to render the configured output on
+  demand and reports the output file.
 - **`Raven: Stop Quarto Preview`** stops the preview associated with the
   current document.
 - **`Raven: Show Quarto Output`** opens the shared **Raven: Quarto** output
   channel.
+
+## Why Raven includes a Quarto workflow
+
+Raven supports two ways of working with R in VS Code: you can use Raven's
+language server alongside the REditorSupport extension and let that extension
+own the R session, or you can use Raven's R console and its associated session
+features. The Quarto VS Code extension's R-cell controls support the first
+arrangement only: they dispatch through REditorSupport and do not send code to
+Raven's console. Quarto preview and render still work without REditorSupport,
+but the R-cell controls do not. Raven therefore supplies its own chunk controls
+alongside Quarto Preview and Render, making a coherent R-focused `.qmd` workflow
+possible when Raven owns the R session, without requiring either REditorSupport
+or the Quarto VS Code extension. See
+[Coexistence with the Quarto extension](coexistence.md#coexistence-with-the-quarto-extension)
+for the detailed interaction between the extensions.
+
+Raven also offers an optional preview appearance that matches VS Code. Quarto's
+authored appearance remains the default; **Apply VS Code theme** is off until
+you enable it from the preview toolbar. When enabled, Raven's loopback preview
+proxy applies the editor's fonts, background, foreground, and broad syntax
+color roles to the embedded page. The overlay does not modify the source or
+rendered output, and **Open in Browser** continues to show Quarto's original
+appearance. Turn the toolbar option off at any time to return the embedded
+preview to that appearance.
 
 Quarto commands are available from the Command Palette and, for `.qmd` files,
 inside the editor-title **Send to R** ($(play)) menu. A dedicated $(preview)
@@ -21,25 +45,18 @@ Preview, providing one consistent preview action across both formats. You can
 right-click the editor toolbar and choose **Hide** if you do not want the
 button.
 
-Quarto Preview and Render follow Raven's R-console activation gate across the
-Command Palette, editor-title button, **Send to R** menu, and keyboard shortcut.
-They appear only when `raven.rConsole.activation` resolves to enabled, and their
-handlers re-check that live setting when invoked through a command link or
-custom keybinding. They do not depend on the `quarto.quarto` extension. Preview
-and Render execute the document through Quarto and therefore also require a
-trusted workspace. Stop remains palette-accessible when the R-console gate is
-closed and available in Restricted Mode so you can terminate an existing
-preview.
-
-Raven's [Knit Preview](knit.md) remains a separate pipeline for `.Rmd` and
-`.Rmarkdown` files. Knit Preview does not handle `.qmd`, and Quarto Preview does
-not use Raven's knit renderer.
+Quarto Preview and Render are available when Raven's R-session features are
+enabled through `raven.rConsole.activation`. Because Quarto may execute code
+from the document, both commands require a trusted workspace.
 
 ## Requirements and Quarto discovery
 
 Install the [Quarto CLI](https://quarto.org/docs/get-started/) on the machine
 where the VS Code extension host runs. For a local window, that is your local
-machine. Under Remote SSH, it is the remote machine.
+machine. Under Remote SSH, it is the remote machine. Raven invokes this CLI
+directly, so the Quarto VS Code extension is not required. If you use both
+extensions, see
+[Coexistence with the Quarto extension](coexistence.md#coexistence-with-the-quarto-extension).
 
 Raven resolves Quarto lazily for the active document, in this order:
 
@@ -284,7 +301,7 @@ policy, or remote tunnel does not work inside the sandboxed panel.
 |---|---:|---|
 | `raven.quarto.path` | `""` | Absolute path to a Quarto CLI executable. Leave empty to search `PATH` and the standard platform locations listed above. |
 | `raven.quarto.viewerColumn` | `"beside"` | Column for newly created preview panels: `"active"` or `"beside"`. It does not move an existing panel. |
-| `raven.quarto.render.timeoutMs` | `600000` | Hard timeout in milliseconds for a one-shot Quarto render. Cancellation and timeout stop the process tree with escalating signals. |
+| `raven.quarto.render.timeoutMs` | `600000` | Hard timeout in milliseconds for an on-demand Quarto render. Cancellation and timeout stop the process tree with escalating signals. |
 | `raven.quarto.fontFamily` | `""` | Body/prose font for the live-themed preview. Empty inherits `markdown.preview.fontFamily`. |
 | `raven.quarto.monospaceFontFamily` | `""` | Monospace font for code in the live-themed preview. Empty inherits `editor.fontFamily`. |
 
@@ -350,7 +367,7 @@ from the success notification.
   SSH, WSL, and Dev Container port mappings are authority-based.
 - PDF and other non-HTML previews are unaffected by **Apply VS Code theme**;
   Raven does not inject or theme those responses.
-- Quarto processes are window-owned. Preview and in-flight one-shot render
+- Quarto processes are window-owned. Preview and in-flight render
   processes do not continue through extension deactivation or window reload,
   and Stop does not reach previews owned by another VS Code window.
 - Remote SSH uses VS Code's URI mapping and port-forwarding support, but Raven
