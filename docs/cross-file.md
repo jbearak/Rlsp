@@ -32,7 +32,8 @@ Raven detects `source()` and `sys.source()` calls:
 - Named arguments: `source(file = "path.R")`
 - `local = TRUE` and `chdir = TRUE` parameters
 - `source(system.file("helper.R", package = "pkg"))` — the `system.file()` path is resolved statically: for the package being analyzed it maps to the source-tree `inst/` directory, and for an installed package it is found under the library paths (so a helper sourced this way contributes its definitions like any other `source()` target). Resolution tracks package lifecycle events live: installing or removing the referenced package mid-session, or renaming the workspace package in `DESCRIPTION`, re-resolves these edges without editing the file or restarting
-- Dynamic paths (variables, expressions) are skipped gracefully
+- **Computed paths** built from statically-known parts are folded to a plain path (issue #638): `file.path("scripts", "helpers.R")` (all parts must fold; `fsep` accepted only as the default `"/"`; any other named argument bails), a `normalizePath(...)` wrapper (peeled syntactically; `winslash`/`mustWork` ignored), and a local variable assigned exactly once at the top level before use — so the common testthat idiom `repo_root <- normalizePath(file.path("..", "..")); source(file.path(repo_root, "scripts/helpers.R"))` resolves. Folding is strict all-or-nothing: any component that isn't statically known (another function call, a reassigned, replacement-modified, removed, or conditionally-assigned variable, a shadowed `file.path`/`normalizePath`, or a string literal containing escape sequences) makes Raven skip the call rather than guess. It is also a purely lexical analysis — `setwd()` calls and symlink resolution that runtime `normalizePath()` would perform are ignored, the same limitation every literal path already has. Folded paths work across dependency edges, scope, missing-file diagnostics, and cmd-click navigation — a click on any string segment of the expression (e.g. `"scripts/helpers.R"` inside `file.path(repo_root, "scripts/helpers.R")`) opens the full joined target, while a click on an identifier segment such as `repo_root` keeps its usual go-to-definition to the variable's assignment
+- Other dynamic paths (e.g. `paste0(...)`, `Sys.getenv(...)`) are skipped gracefully
 
 `sys.source()` defaults to a non-global environment, so its symbols are treated as local and do **not** propagate to the calling file unless you pass `envir = globalenv()` (or `.GlobalEnv`).
 
@@ -376,6 +377,17 @@ When Raven resolves a relative path to another file, the base directory depends 
 - **Forward directives** (`# raven: source`, `# raven: run`, `# raven: include`) and **AST-detected `source()` calls** resolve relative to the directory of the file they appear in, and honor an in-effect [`# raven: cd`](directives.md) working directory.
 - **Backward directives** (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) resolve relative to the file's own directory and **ignore `# raven: cd`**.
 - **Workspace-root fallback** applies to AST-detected `source()` calls and forward directives (`# raven: source`, `# raven: run`, `# raven: include`), and only when no working directory (an explicit `# raven: cd` or one inherited from a parent file) is in effect: a path that doesn't resolve relative to the file's directory is then also tried relative to the workspace root. Forward directives are semantically equivalent to `source()` calls, so they resolve identically across dependency edges, scope, missing-file diagnostics, cmd-click, and path completion. The fallback never applies to backward directives.
+
+#### Implicit testthat/testit working directory
+
+testthat's `test_dir()`/`test_local()` (and testit's `test_dir()`) evaluate helper and test files with `tests/testthat/` (resp. `tests/testit/`) as the working directory. Raven mirrors this automatically: for a file under `<workspace root>/tests/testthat/` or `tests/testit/` (at any nesting depth), relative forward `source()` paths and forward directives anchor at that directory. This is layout-only — no `DESCRIPTION` or package mode required — and it is a **soft default**, deliberately weaker than a `# raven: cd`:
+
+- An explicit `# raven: cd` (or one inherited from a parent file) overrides it.
+- It does **not** suppress the workspace-root fallback, and it never propagates into files the test file sources (a sourced `scripts/helpers.R` still resolves its own `source()` calls from its own directory, with the fallback).
+- For a file **nested below** the anchor (e.g. `tests/testthat/fixtures/helper.R`), the file's own directory is tried as a compatibility fallback when the anchor-relative resolution misses, so file-relative paths that worked before keep working.
+- Backward directives are unaffected: they always resolve relative to the file's own directory.
+
+Path completion inside a `source()` string in a testthat file offers entries from the anchor directory, matching where the path will actually resolve.
 
 #### Case-only mismatches
 

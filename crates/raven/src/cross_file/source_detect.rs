@@ -151,7 +151,10 @@ pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
     log::trace!("Starting tree-sitter parsing for source() call detection");
     let mut sources = Vec::new();
     let root = tree.root_node();
-    visit_node(root, content, &mut sources);
+    // Single-assignment variable bindings for static path folding (issue
+    // #638): collected once per document, consulted per source() call.
+    let bindings = super::static_path::StaticBindings::collect(root, content);
+    visit_node(root, content, &bindings, &mut sources);
     log::trace!(
         "Completed source() call detection, found {} calls",
         sources.len()
@@ -170,19 +173,28 @@ pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
     sources
 }
 
-fn visit_node(node: Node, content: &str, sources: &mut Vec<ForwardSource>) {
+fn visit_node(
+    node: Node,
+    content: &str,
+    bindings: &super::static_path::StaticBindings,
+    sources: &mut Vec<ForwardSource>,
+) {
     if node.kind() == "call"
-        && let Some(source) = try_parse_source_call(node, content)
+        && let Some(source) = try_parse_source_call(node, content, bindings)
     {
         sources.push(source);
     }
 
     for child in node.children(&mut node.walk()) {
-        visit_node(child, content, sources);
+        visit_node(child, content, bindings, sources);
     }
 }
 
-fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
+fn try_parse_source_call(
+    node: Node,
+    content: &str,
+    bindings: &super::static_path::StaticBindings,
+) -> Option<ForwardSource> {
     let func_node = node.child_by_field_name("function")?;
     let func_text = node_text(func_node, content);
 
@@ -193,15 +205,24 @@ fn try_parse_source_call(node: Node, content: &str) -> Option<ForwardSource> {
     };
 
     let args_node = node.child_by_field_name("arguments")?;
+    let value_node = super::static_path::source_call_file_value_node(&args_node, content);
 
     // Try normal string-literal path first
-    let path = find_file_argument(&args_node, content);
+    let path = value_node.and_then(|v| extract_string_literal(v, content));
 
     // If no string literal, try system.file() call in the path position
     let system_file = if path.is_none() {
-        try_extract_system_file_argument(&args_node, content)
+        value_node.and_then(|v| try_parse_system_file_call(v, content))
     } else {
         None
+    };
+
+    // If neither, statically fold computed path expressions —
+    // file.path()/normalizePath()/single-assignment variables (issue #638).
+    let path = if path.is_none() && system_file.is_none() {
+        value_node.and_then(|v| super::static_path::fold_string_expr(v, content, bindings))
+    } else {
+        path
     };
 
     // Need either a path or a system.file() call
@@ -277,72 +298,6 @@ fn find_envir_is_global(args_node: &Node, content: &str) -> bool {
     // If envir is not specified, sys.source defaults to baseenv() which is NOT global
     // So we return false (conservative: no symbol inheritance)
     false
-}
-
-fn find_file_argument(args_node: &Node, content: &str) -> Option<String> {
-    let mut cursor = args_node.walk();
-    let children: Vec<_> = args_node.children(&mut cursor).collect();
-
-    // Look for named "file" argument
-    for child in &children {
-        if child.kind() == "argument"
-            && let Some(name_node) = child.child_by_field_name("name")
-        {
-            let name = node_text(name_node, content);
-            if name == "file"
-                && let Some(value_node) = child.child_by_field_name("value")
-            {
-                return extract_string_literal(value_node, content);
-            }
-        }
-    }
-
-    // Use first positional argument
-    for child in &children {
-        if child.kind() == "argument"
-            && child.child_by_field_name("name").is_none()
-            && let Some(value_node) = child.child_by_field_name("value")
-        {
-            return extract_string_literal(value_node, content);
-        }
-    }
-
-    None
-}
-
-/// Try to extract a `system.file(...)` call from the file-argument position of
-/// a `source()` call. Returns `Some(SystemFileCall)` when the argument is a call
-/// to `system.file` with all-string-literal positional parts and a literal
-/// `package = "P"` named argument. Returns `None` for computed/variable args.
-fn try_extract_system_file_argument(args_node: &Node, content: &str) -> Option<SystemFileCall> {
-    let mut cursor = args_node.walk();
-    let children: Vec<_> = args_node.children(&mut cursor).collect();
-
-    // Look for named "file" argument first
-    for child in &children {
-        if child.kind() == "argument"
-            && let Some(name_node) = child.child_by_field_name("name")
-        {
-            let name = node_text(name_node, content);
-            if name == "file"
-                && let Some(value_node) = child.child_by_field_name("value")
-            {
-                return try_parse_system_file_call(value_node, content);
-            }
-        }
-    }
-
-    // Use first positional argument
-    for child in &children {
-        if child.kind() == "argument"
-            && child.child_by_field_name("name").is_none()
-            && let Some(value_node) = child.child_by_field_name("value")
-        {
-            return try_parse_system_file_call(value_node, content);
-        }
-    }
-
-    None
 }
 
 /// Parse a `system.file(part1, part2, ..., package = "P")` call node.
@@ -2115,6 +2070,49 @@ mod tests {
             .set_language(&tree_sitter_r::LANGUAGE.into())
             .unwrap();
         parser.parse(code, None).unwrap()
+    }
+
+    #[test]
+    fn detects_folded_file_path_source_call() {
+        let code = r#"source(file.path("scripts", "helpers.R"), local = TRUE)"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "got: {sources:?}");
+        assert_eq!(sources[0].path, "scripts/helpers.R");
+        assert!(sources[0].local);
+        assert!(!sources[0].is_directive);
+        assert!(sources[0].system_file.is_none());
+    }
+
+    #[test]
+    fn detects_issue_638_repro_computed_source() {
+        // The exact idiom from issue #638: a testthat helper computing the
+        // repo root and sourcing project code through it.
+        let code = r#"
+repo_root <- normalizePath(file.path("..", ".."))
+source(file.path(repo_root, "scripts/helpers.R"))
+"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "got: {sources:?}");
+        assert_eq!(sources[0].path, "../../scripts/helpers.R");
+        assert_eq!(sources[0].line, 2);
+        assert!(!sources[0].is_function_scoped);
+    }
+
+    #[test]
+    fn computed_source_with_unfoldable_path_still_ignored() {
+        let code = r#"source(file.path(Sys.getenv("ROOT"), "x.R"))"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert!(sources.is_empty(), "got: {sources:?}");
+    }
+
+    #[test]
+    fn folded_sys_source_detected() {
+        let code = r#"sys.source(file.path("R", "utils.R"), envir = globalenv())"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "got: {sources:?}");
+        assert_eq!(sources[0].path, "R/utils.R");
+        assert!(sources[0].is_sys_source);
+        assert!(sources[0].sys_source_global_env);
     }
 
     #[test]

@@ -31157,6 +31157,10 @@ y <- totally_undefined_baseline()
             rprofile_symbols: Default::default(),
             rprofile_attached_packages: Default::default(),
             rprofile_sourced_files: Default::default(),
+            preamble_sourced_symbols: std::collections::BTreeMap::new(),
+            preamble_sourced_attached_packages: std::collections::BTreeMap::new(),
+            preamble_sourced_files: std::collections::BTreeSet::new(),
+            preamble_sourced_files_by_preamble: std::collections::BTreeMap::new(),
         };
         derive_package_state(
             &PackageState::default(),

@@ -286,6 +286,25 @@ fn find_string_in_source_call<'a>(node: Node<'a>, content: &str) -> Option<(Node
     }
 }
 
+/// Walk up from `node` (inclusive) to the innermost enclosing call to
+/// `source()`/`sys.source()`. Unlike [`find_string_in_source_call`] there is
+/// no string-ancestor requirement, so a cursor anywhere inside a computed
+/// file-argument expression — an identifier, `file.path`, punctuation —
+/// still finds the call (go-to-definition on computed paths, issue #638).
+fn find_enclosing_source_call<'a>(node: Node<'a>, content: &str) -> Option<Node<'a>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "call"
+            && let Some(func) = n.child_by_field_name("function")
+            && matches!(node_text(func, content), "source" | "sys.source")
+        {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
 /// Check if a string node is the file argument of a source() call
 fn is_file_argument(string_node: &Node, call_node: &Node, content: &str) -> bool {
     let args_node = match call_node.child_by_field_name("arguments") {
@@ -1092,22 +1111,53 @@ fn extract_full_source_call_path(
     let root = tree.root_node();
     let node = find_deepest_node_at_point(root, point)?;
 
-    // Walk up the tree to find if we're inside a string node
-    let (string_node, call_node) = find_string_in_source_call(node, content)?;
-
-    // Check if the call is to source() or sys.source()
+    // Walk up to the enclosing source()/sys.source() call. Deliberately NOT
+    // via find_string_in_source_call: this extractor accepts a cursor on any
+    // part of a computed file-argument expression (`file.path(repo_root,
+    // "x.R")` — the identifier, the callee, punctuation), not only inside a
+    // string (issue #638). NOTE the production go-to-definition path reaches
+    // it only for string-literal cursors: `detect_file_path_context` gates on
+    // `is_source_call_string_context`, deliberately, so an identifier segment
+    // like `repo_root` keeps its ordinary go-to-definition to the variable's
+    // assignment instead of being shadowed by file-path navigation.
+    let call_node = find_enclosing_source_call(node, content)?;
     let func_node = call_node.child_by_field_name("function")?;
-    let func_text = node_text(func_node, content);
-    let is_sys_source = match func_text {
+    let is_sys_source = match node_text(func_node, content) {
         "source" => false,
         "sys.source" => true,
         _ => return None,
     };
 
-    // Check if the string is the file argument (first positional or named "file")
-    if !is_file_argument(&string_node, &call_node, content) {
+    // Locate the file argument via the shared helper (same rule as source
+    // detection) and require the cursor to lie within it. Byte-point
+    // comparison, so multi-line computed expressions work.
+    let args_node = call_node.child_by_field_name("arguments")?;
+    let value_node =
+        crate::cross_file::static_path::source_call_file_value_node(&args_node, content)?;
+    if point < value_node.start_position() || point > value_node.end_position() {
         return None;
     }
+
+    if value_node.kind() != "string" {
+        // Computed file argument: fold it statically with the SAME rules as
+        // source-call detection (issue #638), so go-to-definition navigates
+        // to the joined target from any segment. Unfoldable → None (never a
+        // wrong or partial path). NOTE: unlike the literal branch below,
+        // folding never unescapes string contents — its leaf case rejects
+        // escaped literals outright, so the two branches cannot diverge on
+        // the same input.
+        let bindings = crate::cross_file::static_path::StaticBindings::collect(root, content);
+        let full_path =
+            crate::cross_file::static_path::fold_string_expr(value_node, content, &bindings)?;
+        let start = value_node.start_position();
+        let start_line_text = content.lines().nth(start.row).unwrap_or("");
+        let content_start = Position {
+            line: start.row as u32,
+            character: byte_offset_to_utf16_column(start_line_text, start.column),
+        };
+        return Some((full_path, content_start, is_sys_source));
+    }
+    let string_node = value_node;
 
     // Get the string content boundaries (excluding quotes)
     let string_text = node_text(string_node, content);
@@ -1376,12 +1426,19 @@ pub fn resolve_base_directory(
         FilePathContext::SourceCall { .. } => {
             let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
             if partial_dir.is_empty() {
-                // For unannotated files (no explicit or inherited working directory),
-                // use workspace-root fallback to match resolve_path_with_workspace_fallback behavior
+                // For unannotated files (no explicit or inherited working
+                // directory, and no implicit testthat/testit anchor — issue
+                // #638), use workspace-root fallback to match
+                // resolve_path_with_workspace_fallback behavior. A testthat
+                // file's completion base is its implicit anchor (the primary
+                // resolution base), keeping completion uniform with edge
+                // resolution.
                 let has_explicit_wd = path_context.working_directory.is_some();
                 let has_inherited_wd = path_context.inherited_working_directory.is_some();
+                let has_implicit_wd = path_context.implicit_test_working_directory.is_some();
                 if !has_explicit_wd
                     && !has_inherited_wd
+                    && !has_implicit_wd
                     && let Some(ref workspace_root) = path_context.workspace_root
                 {
                     return Some(workspace_root.clone());
@@ -1411,8 +1468,10 @@ pub fn resolve_base_directory(
                 if partial_dir.is_empty() {
                     let has_explicit_wd = path_context.working_directory.is_some();
                     let has_inherited_wd = path_context.inherited_working_directory.is_some();
+                    let has_implicit_wd = path_context.implicit_test_working_directory.is_some();
                     if !has_explicit_wd
                         && !has_inherited_wd
+                        && !has_implicit_wd
                         && let Some(ref workspace_root) = path_context.workspace_root
                     {
                         return Some(workspace_root.clone());
@@ -2788,6 +2847,79 @@ mod tests {
             }
             _ => panic!("Expected SourceCall context, got {:?}", context),
         }
+    }
+
+    #[test]
+    fn test_extract_file_path_computed_file_path_all_segments() {
+        // Go-to-definition on a computed path (issue #638): every cursor
+        // position inside the file-argument expression — first segment,
+        // second segment, the `file.path` callee, the variable — must yield
+        // the same folded path.
+        let code = "repo_root <- normalizePath(file.path(\"..\", \"..\"))\nsource(file.path(repo_root, \"scripts/helpers.R\"))";
+        let tree = parse_r(code);
+        // Columns on line 1: inside `file.path` (9), inside `repo_root` (20),
+        // inside "scripts/helpers.R" (35).
+        for character in [9u32, 20, 35] {
+            let position = Position { line: 1, character };
+            let result = extract_file_path_at_position(&tree, code, position);
+            let (full_path, context) =
+                result.unwrap_or_else(|| panic!("no result at character {character}"));
+            assert_eq!(full_path, "../../scripts/helpers.R", "at {character}");
+            match context {
+                FilePathContext::SourceCall {
+                    is_sys_source,
+                    content_start,
+                    ..
+                } => {
+                    assert!(!is_sys_source);
+                    // Position anchors at the start of the computed expression.
+                    assert_eq!(content_start.line, 1);
+                    assert_eq!(content_start.character, 7);
+                }
+                _ => panic!("Expected SourceCall context, got {context:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_file_path_computed_multiline_file_path() {
+        let code = "source(file.path(\n  \"scripts\",\n  \"helpers.R\"\n))";
+        let tree = parse_r(code);
+        // Cursor inside "helpers.R" on line 2.
+        let position = Position {
+            line: 2,
+            character: 6,
+        };
+        let result = extract_file_path_at_position(&tree, code, position);
+        let (full_path, _) = result.expect("multi-line computed path should extract");
+        assert_eq!(full_path, "scripts/helpers.R");
+    }
+
+    #[test]
+    fn test_extract_file_path_unfoldable_computed_returns_none() {
+        // Never navigate to a wrong/partial path: an unfoldable computed
+        // expression yields no result even with the cursor on a literal
+        // segment inside it.
+        let code = r#"source(file.path(Sys.getenv("ROOT"), "x.R"))"#;
+        let tree = parse_r(code);
+        let position = Position {
+            line: 0,
+            character: 39,
+        };
+        assert!(extract_file_path_at_position(&tree, code, position).is_none());
+    }
+
+    #[test]
+    fn test_extract_file_path_cursor_outside_file_argument_returns_none() {
+        // Cursor on a non-file argument of source() must not extract.
+        let code = r#"source(file.path("a", "b.R"), encoding = "UTF-8")"#;
+        let tree = parse_r(code);
+        // Cursor inside "UTF-8".
+        let position = Position {
+            line: 0,
+            character: 44,
+        };
+        assert!(extract_file_path_at_position(&tree, code, position).is_none());
     }
 
     #[test]

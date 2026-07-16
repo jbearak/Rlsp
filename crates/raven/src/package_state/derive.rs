@@ -130,16 +130,46 @@ fn build_scope_contribution(
                     // Reuse the preamble file's `top_level_defs` `Arc` rather
                     // than cloning into a fresh set — keeps
                     // `derive_package_state` O(preamble-file count) on the
-                    // cached path instead of O(total preamble defs).
-                    test_helper_symbols.insert(path.clone(), facts.top_level_defs.clone());
+                    // cached path instead of O(total preamble defs). When the
+                    // preamble-source scan harvested defs from the preamble's
+                    // transitive `source()` targets (issue #638), union them
+                    // in (allocating only for preambles that actually source
+                    // something).
+                    let sourced = inputs.preamble_sourced_symbols.get(path);
+                    let defs = match sourced.filter(|s| !s.is_empty()) {
+                        None => facts.top_level_defs.clone(),
+                        Some(harvested) => Arc::new(
+                            facts
+                                .top_level_defs
+                                .union(harvested)
+                                .cloned()
+                                .collect::<BTreeSet<String>>(),
+                        ),
+                    };
+                    test_helper_symbols.insert(path.clone(), defs);
                     // Same for top-level `library()`/`require()` attaches — a
                     // helper/setup file's attaches propagate to sibling tests
-                    // (testthat sources the preamble before each test). Skip
-                    // the entry entirely when there are no attaches so the map
-                    // stays sparse (most preamble files attach nothing).
-                    if !facts.attached_packages.is_empty() {
-                        test_helper_attached_packages
-                            .insert(path.clone(), facts.attached_packages.clone());
+                    // (testthat sources the preamble before each test),
+                    // including attaches made by the preamble's sourced
+                    // closure (issue #638). Skip the entry entirely when there
+                    // are no attaches so the map stays sparse (most preamble
+                    // files attach nothing).
+                    let sourced_attached = inputs
+                        .preamble_sourced_attached_packages
+                        .get(path)
+                        .filter(|s| !s.is_empty());
+                    let attached = match sourced_attached {
+                        None => facts.attached_packages.clone(),
+                        Some(harvested) => Arc::new(
+                            facts
+                                .attached_packages
+                                .union(harvested)
+                                .cloned()
+                                .collect::<BTreeSet<String>>(),
+                        ),
+                    };
+                    if !attached.is_empty() {
+                        test_helper_attached_packages.insert(path.clone(), attached);
                     }
                 }
             }
@@ -379,6 +409,10 @@ mod tests {
             rprofile_symbols: BTreeSet::new(),
             rprofile_attached_packages: BTreeSet::new(),
             rprofile_sourced_files: BTreeSet::new(),
+            preamble_sourced_symbols: BTreeMap::new(),
+            preamble_sourced_attached_packages: BTreeMap::new(),
+            preamble_sourced_files: BTreeSet::new(),
+            preamble_sourced_files_by_preamble: BTreeMap::new(),
         }
     }
 

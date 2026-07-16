@@ -569,6 +569,10 @@ fn derive_package_state_500_file_keystroke_budget() {
         rprofile_symbols: BTreeSet::new(),
         rprofile_attached_packages: BTreeSet::new(),
         rprofile_sourced_files: BTreeSet::new(),
+        preamble_sourced_symbols: BTreeMap::new(),
+        preamble_sourced_attached_packages: BTreeMap::new(),
+        preamble_sourced_files: BTreeSet::new(),
+        preamble_sourced_files_by_preamble: BTreeMap::new(),
     };
     for i in 0..500 {
         let p = root.join("R").join(format!("file_{}.R", i));

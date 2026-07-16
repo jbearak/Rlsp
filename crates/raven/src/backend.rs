@@ -3133,6 +3133,65 @@ fn rprofile_sourced_root_for_open_document(
         .then(|| root.clone())
 }
 
+fn file_paths_for_open_document(state: &WorldState, open_uri: &Url) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(path) = open_uri.to_file_path() {
+        paths.push(path);
+    }
+    for uri in state.canonical_uris_for_open_document(open_uri) {
+        if let Ok(path) = uri.to_file_path()
+            && !paths.contains(&path)
+        {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// Return the package root when an open document is a testthat preamble or a
+/// member of a previously scanned preamble source closure.
+fn preamble_sourced_root_for_open_document(
+    state: &WorldState,
+    open_uri: &Url,
+) -> Option<std::path::PathBuf> {
+    if state.package_inputs.package_mode == crate::cross_file::config::PackageMode::Disabled {
+        return None;
+    }
+    let root = state.package_inputs.workspace_root.as_ref()?;
+    let sourced = &state.package_inputs.preamble_sourced_files;
+    file_paths_for_open_document(state, open_uri)
+        .into_iter()
+        .any(|path| {
+            crate::package_state::preamble::is_testthat_preamble_path(&path, root)
+                || path_in_rprofile_sourced_set(&path, sourced)
+        })
+        .then(|| root.clone())
+}
+
+/// Snapshot authoritative open-buffer text without filesystem I/O. Each
+/// canonical alias path is keyed to the buffer that currently owns it.
+fn snapshot_preamble_text_overrides(
+    state: &WorldState,
+) -> crate::package_state::preamble::PreambleTextOverrides {
+    let mut overrides = crate::package_state::preamble::PreambleTextOverrides::new();
+    for (open_uri, document) in &state.documents {
+        let text = Arc::<str>::from(document.text());
+        for path in file_paths_for_open_document(state, open_uri) {
+            let Ok(candidate_uri) = Url::from_file_path(&path) else {
+                continue;
+            };
+            if state
+                .open_document_uri_for_authoritative_uri(&candidate_uri)
+                .as_ref()
+                == Some(open_uri)
+            {
+                overrides.insert(path, text.clone());
+            }
+        }
+    }
+    overrides
+}
+
 fn authoritative_rprofile_buffer_text_after_close(
     state: &WorldState,
     root: &std::path::Path,
@@ -3275,6 +3334,10 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
     state.recompute_open_neighborhood_pins();
 }
 
+// Internal seeding chokepoint deliberately taking each precomputed scan as its
+// own argument (callers precompute different subsets off-lock); a params
+// struct would obscure which callers precompute what.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     state: &mut WorldState,
     root: std::path::PathBuf,
@@ -3282,6 +3345,7 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     ns_text: Option<Arc<str>>,
     disk_r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
     precomputed_rprofile_scan: Option<crate::package_state::rprofile::RprofileScan>,
+    precomputed_preamble_scan: Option<crate::package_state::preamble::PreambleScan>,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) {
     state.package_inputs.workspace_root = Some(root.clone());
@@ -3338,6 +3402,39 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
         state.package_inputs.rprofile_attached_packages = rprofile_scan.attached_packages;
         state.package_inputs.rprofile_sourced_files = rprofile_scan.sourced_files;
     }
+
+    // Testthat preamble sourced-closure scan (issue #638). Same locking
+    // discipline as the `.Rprofile` scan: contended LSP callers precompute it
+    // OFF-lock and pass it in; `raven check` / unit tests pass `None` and let
+    // it scan inline. Gated on package mode — the harvested sets are only
+    // consumed by the (package-mode-gated) scope contribution.
+    //
+    // Unsaved-edit safety differs from the `.Rprofile` guard above by design:
+    // instead of skipping installation when a relevant document is open (which
+    // would either clobber a buffer opened before the very first seed, or
+    // leave *unrelated closed* preambles stale across an exclusions /
+    // `packageMode` reseed), preamble seeding scans BUFFER-AWARE. LSP callers
+    // snapshot open-buffer text via `snapshot_preamble_text_overrides` and
+    // precompute with `scan_testthat_preambles_with_overrides_and_exclusions`;
+    // the inline fallback overlays the same overrides from `state` directly.
+    // The result already reflects every authoritative open buffer, so it is
+    // installed unconditionally.
+    let preamble_scan =
+        if state.package_inputs.package_mode != crate::cross_file::config::PackageMode::Disabled {
+            precomputed_preamble_scan.unwrap_or_else(|| {
+            let overrides = snapshot_preamble_text_overrides(state);
+            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                &root, &overrides, exclusions,
+            )
+        })
+        } else {
+            crate::package_state::preamble::PreambleScan::default()
+        };
+    state.package_inputs.preamble_sourced_symbols = preamble_scan.symbols;
+    state.package_inputs.preamble_sourced_attached_packages = preamble_scan.attached_packages;
+    state.package_inputs.preamble_sourced_files = preamble_scan.sourced_files;
+    state.package_inputs.preamble_sourced_files_by_preamble =
+        preamble_scan.sourced_files_by_preamble;
 
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
@@ -4690,6 +4787,7 @@ async fn apply_watched_r_file_package_input_events(
     let root_for_check = state.package_inputs.workspace_root.clone();
     let model_rprofile = state.package_inputs.model_rprofile;
     let rprofile_sourced = &state.package_inputs.rprofile_sourced_files;
+    let preamble_sourced = &state.package_inputs.preamble_sourced_files;
     let has_pkg_files = root_for_check.as_ref().is_some_and(|root| {
         package_events.iter().any(|event| {
             event.uri.to_file_path().ok().is_some_and(|p| {
@@ -4706,6 +4804,11 @@ async fn apply_watched_r_file_package_input_events(
                     // re-scanned and its symbols/packages reach open
                     // `scripts/` files (Task 12).
                     || (model_rprofile && path_in_rprofile_sourced_set(&p, rprofile_sourced))
+                    // Same for a helper that a testthat preamble transitively
+                    // source()s (issue #638): editing scripts/helpers.R must
+                    // reach translate() so the preamble closure is re-scanned
+                    // and its symbols reach open test files.
+                    || path_in_rprofile_sourced_set(&p, preamble_sourced)
             })
         })
     });
@@ -5749,7 +5852,9 @@ impl LanguageServer for Backend {
                         // OFF the write lock — it follows transitive source()
                         // chains and must not run under the lock (see
                         // `initialize_package_inputs_from_state_with_exclusions`).
-                        let (desc_text, ns_text, rprofile_scan) = if let Some(ref root) =
+                        let (desc_text, ns_text, rprofile_scan, preamble_scan) = if let Some(
+                            ref root,
+                        ) =
                             root_for_pkg_inputs
                         {
                             let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
@@ -5762,9 +5867,22 @@ impl LanguageServer for Backend {
                                     root,
                                     &workspace_exclusions,
                                 );
-                            (desc, ns, Some(scan))
+                            // Buffer-aware: overlay authoritative open-buffer
+                            // text so this late-completing seed cannot clobber
+                            // unsaved preamble/closure edits (see
+                            // `initialize_package_inputs_from_state_with_exclusions`).
+                            let overrides = {
+                                let state = state_clone.read().await;
+                                snapshot_preamble_text_overrides(&state)
+                            };
+                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                                root,
+                                &overrides,
+                                &workspace_exclusions,
+                            );
+                            (desc, ns, Some(scan), Some(pre))
                         } else {
-                            (None, None, None)
+                            (None, None, None, None)
                         };
 
                         // Apply index and snapshot trigger versions under a single write lock
@@ -5787,6 +5905,7 @@ impl LanguageServer for Backend {
                                     ns_text,
                                     Default::default(),
                                     rprofile_scan,
+                                    preamble_scan,
                                     &workspace_exclusions,
                                 );
                             } else {
@@ -5817,6 +5936,18 @@ impl LanguageServer for Backend {
                             (items, debounce, pkg_lib, pkgs_enabled)
                         };
                         log::info!("[Background] Workspace index applied");
+
+                        // Close the seed-install TOCTOU window for preamble
+                        // buffers opened/edited while the seed was in flight.
+                        if let Some(root) = root_for_pkg_inputs.clone() {
+                            Backend::refresh_open_preamble_docs_after_seed(
+                                state_clone.clone(),
+                                client_clone.clone(),
+                                traversal_truncation.clone(),
+                                root,
+                            )
+                            .await;
+                        }
 
                         // Warm the package cache for inherited packages newly visible
                         // via backward edges discovered by the workspace scan. Without
@@ -5878,6 +6009,13 @@ impl LanguageServer for Backend {
                 let root_clone = root.clone();
                 let seed_exclusions = workspace_exclusions.clone();
                 let scan_exclusions = workspace_exclusions.clone();
+                // Buffer-aware preamble scan: snapshot open-buffer text before
+                // the blocking scan so the seed cannot clobber unsaved edits
+                // (see `initialize_package_inputs_from_state_with_exclusions`).
+                let preamble_overrides = {
+                    let state = self.state.read().await;
+                    snapshot_preamble_text_overrides(&state)
+                };
                 Some((
                     root,
                     seed_exclusions,
@@ -5900,12 +6038,22 @@ impl LanguageServer for Backend {
                                 &root_clone,
                                 &scan_exclusions,
                             );
-                        (desc, ns, disk_r_files, rprofile_scan)
+                        // Precompute the testthat preamble sourced-closure scan
+                        // OFF the lock too (issue #638, same discipline),
+                        // overlaying the pre-snapshotted open-buffer text.
+                        let preamble_scan =
+                            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                                &root_clone,
+                                &preamble_overrides,
+                                &scan_exclusions,
+                            );
+                        (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
                     })
                     .await
                     .unwrap_or((
                         None,
                         None,
+                        Default::default(),
                         Default::default(),
                         Default::default(),
                     )),
@@ -5917,23 +6065,41 @@ impl LanguageServer for Backend {
             // No workspace scan — mark complete immediately and still seed
             // package inputs from disk/open documents so package mode starts
             // with a derived state.
-            let mut state = self.state.write().await;
-            state.workspace_scan_complete = true;
-            if let Some((
-                root,
-                package_exclusions,
-                (desc_text, ns_text, disk_r_files, rprofile_scan),
-            )) = package_seed
-            {
-                initialize_package_inputs_from_state_with_exclusions(
-                    &mut state,
+            let seeded_root = {
+                let mut state = self.state.write().await;
+                state.workspace_scan_complete = true;
+                if let Some((
                     root,
-                    desc_text,
-                    ns_text,
-                    disk_r_files,
-                    Some(rprofile_scan),
-                    &package_exclusions,
-                );
+                    package_exclusions,
+                    (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan),
+                )) = package_seed
+                {
+                    let seeded = root.clone();
+                    initialize_package_inputs_from_state_with_exclusions(
+                        &mut state,
+                        root,
+                        desc_text,
+                        ns_text,
+                        disk_r_files,
+                        Some(rprofile_scan),
+                        Some(preamble_scan),
+                        &package_exclusions,
+                    );
+                    Some(seeded)
+                } else {
+                    None
+                }
+            };
+            // Close the seed-install TOCTOU window for preamble buffers
+            // opened/edited while the seed was in flight.
+            if let Some(root) = seeded_root {
+                Backend::refresh_open_preamble_docs_after_seed(
+                    self.state.clone(),
+                    self.client.clone(),
+                    self.traversal_truncation.clone(),
+                    root,
+                )
+                .await;
             }
         }
 
@@ -6421,6 +6587,9 @@ impl LanguageServer for Backend {
         // Captured inside the lock block when the opened doc is the
         // workspace-root `.Rprofile`; drives an off-lock prelude refresh after.
         let mut rprofile_live_edit: Option<(std::path::PathBuf, Arc<str>)> = None;
+        // Preamble roots and sourced helpers also feed package-state scope;
+        // refresh their affected closures from authoritative buffers off-lock.
+        let mut preamble_live_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
 
         // Compute affected files while holding write lock
         let (
@@ -6622,6 +6791,9 @@ impl LanguageServer for Backend {
             // prelude until the first keystroke.
             if let Some(root) = authoritative_rprofile_root_for_open_document(&state, &uri) {
                 rprofile_live_edit = Some((root, text.as_str().into()));
+            }
+            if let Some(root) = preamble_sourced_root_for_open_document(&state, &uri) {
+                preamble_live_edit = Some((root, file_paths_for_open_document(&state, &uri)));
             }
 
             let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
@@ -7300,6 +7472,15 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Re-enrichment may have changed the final work-item set. Refresh the
+        // preamble now so its sibling fanout can exclude exactly those jobs
+        // that will be marked and scheduled below.
+        if let Some((root, paths)) = preamble_live_edit {
+            let scheduled_uris = work_items.iter().map(|(uri, _)| uri.clone()).collect();
+            self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
+                .await;
+        }
+
         // Mark force-republish on the final work_items set, excluding the
         // edited URI itself (its publish is driven by its own version bump,
         // not by a cross-file marker). Marking after re-enrichment ensures
@@ -7386,6 +7567,7 @@ impl LanguageServer for Backend {
         // document, but its prelude is package-state rather than a graph edge,
         // so the normal dependent fanout below does not cover it.
         let mut rprofile_live_edit: Option<(std::path::PathBuf, Arc<str>)> = None;
+        let mut preamble_live_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
 
         // Compute affected files and debounce config while holding write lock
         let (
@@ -7503,6 +7685,9 @@ impl LanguageServer for Backend {
                     .map(|d| Arc::<str>::from(d.text()))
             {
                 rprofile_live_edit = Some((root, text));
+            }
+            if let Some(root) = preamble_sourced_root_for_open_document(&state, &uri) {
+                preamble_live_edit = Some((root, file_paths_for_open_document(&state, &uri)));
             }
 
             // Capture package settings for background prefetch
@@ -7842,6 +8027,11 @@ impl LanguageServer for Backend {
         if let Some((root, text)) = rprofile_live_edit {
             self.refresh_rprofile_prelude_from_buffer(root, text).await;
         }
+        if let Some((root, paths)) = preamble_live_edit {
+            let scheduled_uris = work_items.iter().map(|(uri, _)| uri.clone()).collect();
+            self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
+                .await;
+        }
 
         // Background prefetch package exports (without holding WorldState lock)
         // After prefetch completes, schedule diagnostic revalidation so newly
@@ -8098,6 +8288,7 @@ impl LanguageServer for Backend {
         // the live did_change refresh folded in.
         let mut rprofile_close_buffer: Option<(std::path::PathBuf, Arc<str>)> = None;
         let mut rprofile_close_root: Option<std::path::PathBuf> = None;
+        let mut preamble_close_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
 
         // Issue #558: closing a graph-relevant file schedules a disk resync
         // (spawned after this block) so cross-file state derived from a
@@ -8181,6 +8372,9 @@ impl LanguageServer for Backend {
             } else {
                 None
             };
+            if let Some(root) = preamble_sourced_root_for_open_document(&state, uri) {
+                preamble_close_edit = Some((root, file_paths_for_open_document(&state, uri)));
+            }
 
             // Close in new DocumentStore (Requirement 1.5)
             state.document_store.close(uri);
@@ -8378,6 +8572,11 @@ impl LanguageServer for Backend {
             self.refresh_rprofile_prelude_from_buffer(root, text).await;
         } else if let Some(root) = rprofile_close_root {
             self.refresh_rprofile_prelude_from_disk(root).await;
+        }
+        if let Some((root, paths)) = preamble_close_edit {
+            let scheduled_uris = sibling_fanout.iter().map(|(uri, _)| uri.clone()).collect();
+            self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
+                .await;
         }
 
         if close_resync {
@@ -9815,7 +10014,9 @@ impl Backend {
 
                 match scan_result {
                     Ok((index, cross_file_entries, new_index_entries)) => {
-                        let (desc_text, ns_text, rprofile_scan) = if let Some(ref root) =
+                        let (desc_text, ns_text, rprofile_scan, preamble_scan) = if let Some(
+                            ref root,
+                        ) =
                             root_for_pkg_inputs
                         {
                             let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
@@ -9828,9 +10029,22 @@ impl Backend {
                                     root,
                                     &workspace_exclusions,
                                 );
-                            (desc, ns, Some(scan))
+                            // Buffer-aware: overlay authoritative open-buffer
+                            // text so this reseed cannot clobber unsaved
+                            // preamble/closure edits (see
+                            // `initialize_package_inputs_from_state_with_exclusions`).
+                            let overrides = {
+                                let state = self.state.read().await;
+                                snapshot_preamble_text_overrides(&state)
+                            };
+                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                                root,
+                                &overrides,
+                                &workspace_exclusions,
+                            );
+                            (desc, ns, Some(scan), Some(pre))
                         } else {
-                            (None, None, None)
+                            (None, None, None, None)
                         };
 
                         let (package_library, packages_enabled) = {
@@ -9841,7 +10055,7 @@ impl Backend {
                                 new_index_entries,
                             );
                             replay_open_documents_after_workspace_index_apply(&mut state).await;
-                            if let Some(root) = root_for_pkg_inputs {
+                            if let Some(root) = root_for_pkg_inputs.clone() {
                                 initialize_package_inputs_from_state_with_exclusions(
                                     &mut state,
                                     root,
@@ -9849,6 +10063,7 @@ impl Backend {
                                     ns_text,
                                     Default::default(),
                                     rprofile_scan,
+                                    preamble_scan,
                                     &workspace_exclusions,
                                 );
                                 package_inputs_initialized_by_exclusion_reload = true;
@@ -9864,6 +10079,18 @@ impl Backend {
                                     && !package_settings_changed,
                             )
                         };
+
+                        // Close the seed-install TOCTOU window for preamble
+                        // buffers opened/edited while the reseed was in flight.
+                        if let Some(root) = root_for_pkg_inputs {
+                            Backend::refresh_open_preamble_docs_after_seed(
+                                self.state.clone(),
+                                self.client.clone(),
+                                self.traversal_truncation.clone(),
+                                root,
+                            )
+                            .await;
+                        }
 
                         if packages_enabled {
                             prefetch_packages_for_open_documents(&self.state, &package_library)
@@ -9886,7 +10113,14 @@ impl Backend {
             {
                 let root_clone = root.clone();
                 let scan_exclusions = workspace_exclusions.clone();
-                let (desc_text, ns_text, disk_r_files, rprofile_scan) =
+                // Buffer-aware preamble scan: snapshot open-buffer text before
+                // the blocking scan so the reseed cannot clobber unsaved edits
+                // (see `initialize_package_inputs_from_state_with_exclusions`).
+                let preamble_overrides = {
+                    let state = self.state.read().await;
+                    snapshot_preamble_text_overrides(&state)
+                };
+                let (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan) =
                     tokio::task::spawn_blocking(move || {
                         let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
                             .ok()
@@ -9903,7 +10137,16 @@ impl Backend {
                                 &root_clone,
                                 &scan_exclusions,
                             );
-                        (desc, ns, disk_r_files, rprofile_scan)
+                        // Precompute the testthat preamble sourced-closure scan
+                        // OFF the lock too (issue #638, same discipline),
+                        // overlaying the pre-snapshotted open-buffer text.
+                        let preamble_scan =
+                            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                                &root_clone,
+                                &preamble_overrides,
+                                &scan_exclusions,
+                            );
+                        (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
                     })
                     .await
                     .unwrap_or((
@@ -9911,19 +10154,32 @@ impl Backend {
                         None,
                         Default::default(),
                         Default::default(),
+                        Default::default(),
                     ));
 
-                let mut state = self.state.write().await;
-                initialize_package_inputs_from_state_with_exclusions(
-                    &mut state,
-                    root,
-                    desc_text,
-                    ns_text,
-                    disk_r_files,
-                    Some(rprofile_scan),
-                    &workspace_exclusions,
-                );
+                {
+                    let mut state = self.state.write().await;
+                    initialize_package_inputs_from_state_with_exclusions(
+                        &mut state,
+                        root.clone(),
+                        desc_text,
+                        ns_text,
+                        disk_r_files,
+                        Some(rprofile_scan),
+                        Some(preamble_scan),
+                        &workspace_exclusions,
+                    );
+                }
                 package_inputs_initialized_by_exclusion_reload = true;
+                // Close the seed-install TOCTOU window for preamble buffers
+                // opened/edited while the reseed was in flight.
+                Backend::refresh_open_preamble_docs_after_seed(
+                    self.state.clone(),
+                    self.client.clone(),
+                    self.traversal_truncation.clone(),
+                    root,
+                )
+                .await;
             }
         }
 
@@ -9937,7 +10193,14 @@ impl Backend {
             let root_clone = root.clone();
             let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
             let scan_exclusions = workspace_exclusions.clone();
-            let (desc_text, ns_text, disk_r_files, rprofile_scan) =
+            // Buffer-aware preamble scan: snapshot open-buffer text before the
+            // blocking scan so the packageMode reseed cannot clobber unsaved
+            // edits (see `initialize_package_inputs_from_state_with_exclusions`).
+            let preamble_overrides = {
+                let state = self.state.read().await;
+                snapshot_preamble_text_overrides(&state)
+            };
+            let (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan) =
                 tokio::task::spawn_blocking(move || {
                     let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
                         .ok()
@@ -9957,10 +10220,25 @@ impl Backend {
                             &root_clone,
                             &scan_exclusions,
                         );
-                    (desc, ns, disk_r_files, rprofile_scan)
+                    // Precompute the testthat preamble sourced-closure scan
+                    // OFF the lock too (issue #638, same discipline),
+                    // overlaying the pre-snapshotted open-buffer text.
+                    let preamble_scan =
+                        crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                            &root_clone,
+                            &preamble_overrides,
+                            &scan_exclusions,
+                        );
+                    (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
                 })
                 .await
-                .unwrap_or((None, None, Default::default(), Default::default()));
+                .unwrap_or((
+                    None,
+                    None,
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                ));
 
             // Re-acquire write lock to apply results. Route through the same
             // seeding helper the startup paths use, so config-reload and startup
@@ -9971,16 +10249,28 @@ impl Backend {
             // the background workspace index has not populated yet. (Re-setting
             // package_mode is a no-op: `translate(SettingChanged)` above already
             // set it to this same mode.)
-            let mut state = self.state.write().await;
-            initialize_package_inputs_from_state_with_exclusions(
-                &mut state,
+            {
+                let mut state = self.state.write().await;
+                initialize_package_inputs_from_state_with_exclusions(
+                    &mut state,
+                    root.clone(),
+                    desc_text,
+                    ns_text,
+                    disk_r_files,
+                    Some(rprofile_scan),
+                    Some(preamble_scan),
+                    &workspace_exclusions,
+                );
+            }
+            // Close the seed-install TOCTOU window for preamble buffers
+            // opened/edited while the reseed was in flight.
+            Backend::refresh_open_preamble_docs_after_seed(
+                self.state.clone(),
+                self.client.clone(),
+                self.traversal_truncation.clone(),
                 root,
-                desc_text,
-                ns_text,
-                disk_r_files,
-                Some(rprofile_scan),
-                &workspace_exclusions,
-            );
+            )
+            .await;
             log::info!("Rebuilt package state after packageMode change (event-driven)");
         }
 
@@ -10938,6 +11228,231 @@ impl Backend {
             affected,
             Some(traversal_truncation),
         ));
+    }
+
+    /// Refresh the affected testthat preamble sourced closures from a snapshot
+    /// that overlays all authoritative open buffers on disk. The scan runs
+    /// off-lock; only the already-built result is applied under the write lock.
+    async fn refresh_testthat_preambles_for_paths(
+        &self,
+        root: std::path::PathBuf,
+        affected_paths: Vec<std::path::PathBuf>,
+        scheduled_uris: &std::collections::HashSet<Url>,
+    ) {
+        Self::refresh_testthat_preambles_for_paths_with(
+            self.state.clone(),
+            self.client.clone(),
+            self.traversal_truncation.clone(),
+            root,
+            affected_paths,
+            scheduled_uris,
+        )
+        .await;
+    }
+
+    /// Handle-based body of [`Self::refresh_testthat_preambles_for_paths`],
+    /// callable from detached tasks (e.g. the startup seeding task) that hold
+    /// clones of the backend's handles rather than `&self`.
+    async fn refresh_testthat_preambles_for_paths_with(
+        state_arc: Arc<RwLock<WorldState>>,
+        client: Client,
+        traversal_truncation: Arc<TraversalTruncationState>,
+        root: std::path::PathBuf,
+        affected_paths: Vec<std::path::PathBuf>,
+        scheduled_uris: &std::collections::HashSet<Url>,
+    ) {
+        let (previous, overrides, exclusions) = {
+            let state = state_arc.read().await;
+            (
+                crate::package_state::preamble::PreambleScan {
+                    symbols: state.package_inputs.preamble_sourced_symbols.clone(),
+                    attached_packages: state
+                        .package_inputs
+                        .preamble_sourced_attached_packages
+                        .clone(),
+                    sourced_files: state.package_inputs.preamble_sourced_files.clone(),
+                    sourced_files_by_preamble: state
+                        .package_inputs
+                        .preamble_sourced_files_by_preamble
+                        .clone(),
+                },
+                snapshot_preamble_text_overrides(&state),
+                state.workspace_exclusions.clone(),
+            )
+        };
+        let root_for_scan = root.clone();
+        let affected_for_scan = affected_paths.clone();
+        let Ok((scan, rescanned)) = tokio::task::spawn_blocking(move || {
+            crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+                &root_for_scan,
+                &previous,
+                &affected_for_scan,
+                &overrides,
+                &exclusions,
+            )
+        })
+        .await
+        else {
+            return;
+        };
+        Self::apply_testthat_preamble_rescan(
+            &state_arc,
+            client,
+            traversal_truncation,
+            scan,
+            rescanned,
+            &root,
+            &affected_paths,
+            scheduled_uris,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_testthat_preamble_rescan(
+        state_arc: &Arc<RwLock<WorldState>>,
+        client: Client,
+        traversal_truncation: Arc<TraversalTruncationState>,
+        scan: crate::package_state::preamble::PreambleScan,
+        rescanned: std::collections::BTreeSet<std::path::PathBuf>,
+        root: &std::path::Path,
+        affected_paths: &[std::path::PathBuf],
+        scheduled_uris: &std::collections::HashSet<Url>,
+    ) {
+        let affected: Vec<Url> = {
+            let mut state = state_arc.write().await;
+            let current = crate::package_state::preamble::PreambleScan {
+                symbols: state.package_inputs.preamble_sourced_symbols.clone(),
+                attached_packages: state
+                    .package_inputs
+                    .preamble_sourced_attached_packages
+                    .clone(),
+                sourced_files: state.package_inputs.preamble_sourced_files.clone(),
+                sourced_files_by_preamble: state
+                    .package_inputs
+                    .preamble_sourced_files_by_preamble
+                    .clone(),
+            };
+            // The scan ran off-lock against a snapshot; a concurrent writer
+            // (the spawned watched-file resync task) may have updated OTHER
+            // preambles since. Graft only the rescanned preambles' entries
+            // onto live state so those updates survive.
+            let merged = crate::package_state::preamble::merge_rescanned_preambles(
+                &current, &scan, &rescanned,
+            );
+            if current == merged {
+                return;
+            }
+            let Some(delta) = crate::package_state::event::apply_preamble_scan(
+                &mut state.package_inputs,
+                Some(merged),
+            ) else {
+                return;
+            };
+            state.apply_package_event(&delta);
+            let testthat_dir = root.join("tests/testthat");
+            let affected: Vec<Url> = state
+                .documents
+                .keys()
+                .filter(|uri| {
+                    if scheduled_uris.contains(*uri) {
+                        return false;
+                    }
+                    package_scope_workspace_r_path_for_open_document(&state, uri, root).is_some_and(
+                        |path| path.starts_with(&testthat_dir) && !affected_paths.contains(&path),
+                    )
+                })
+                .cloned()
+                .collect();
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(affected.iter());
+            affected
+        };
+
+        if affected.is_empty() {
+            return;
+        }
+        tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
+            state_arc.clone(),
+            client,
+            affected,
+            Some(traversal_truncation),
+        ));
+    }
+
+    /// Close the seed-install TOCTOU window (issue #638): a preamble (or
+    /// sourced-closure member) opened or edited AFTER a seeding path
+    /// snapshotted its buffer overrides but BEFORE the scan was installed
+    /// could not defend itself — on the very first seed `workspace_root` was
+    /// still unset so its did_open refresh bailed, and on a reseed its
+    /// did_open/did_change refresh can be overwritten by the install. Called
+    /// AFTER every seeding install: re-runs the race-safe live refresh (fresh
+    /// override snapshot, per-preamble graft) for every open
+    /// preamble-relevant document, converging state to buffer truth. Cheap
+    /// no-op when nothing relevant is open.
+    async fn refresh_open_preamble_docs_after_seed(
+        state_arc: Arc<RwLock<WorldState>>,
+        client: Client,
+        traversal_truncation: Arc<TraversalTruncationState>,
+        root: std::path::PathBuf,
+    ) {
+        // Relevant-document snapshot: paths to refresh plus each contributing
+        // document's version, used below to detect a concurrent edit.
+        fn snapshot(
+            state: &WorldState,
+        ) -> (
+            Vec<std::path::PathBuf>,
+            std::collections::BTreeMap<Url, Option<i32>>,
+        ) {
+            let mut paths: Vec<std::path::PathBuf> = Vec::new();
+            let mut versions = std::collections::BTreeMap::new();
+            for (uri, document) in &state.documents {
+                if preamble_sourced_root_for_open_document(state, uri).is_none() {
+                    continue;
+                }
+                paths.extend(file_paths_for_open_document(state, uri));
+                versions.insert(uri.clone(), document.version);
+            }
+            paths.sort();
+            paths.dedup();
+            (paths, versions)
+        }
+
+        // This runs OUTSIDE the serialized notification loop when called from
+        // the detached startup seeding task, so an inline did_change refresh
+        // for the same preamble can land between our scan and our graft — and
+        // our (older) result would overwrite it. There is no per-preamble
+        // versioning to order the two, so converge instead: after applying,
+        // re-check the relevant documents' versions and re-run if anything
+        // changed mid-flight. Bounded retries; every later did_change
+        // self-refreshes anyway, so the loop only has to win when the user
+        // has stopped typing.
+        for _attempt in 0..3 {
+            let (affected_paths, versions_before) = {
+                let state = state_arc.read().await;
+                snapshot(&state)
+            };
+            if affected_paths.is_empty() {
+                return;
+            }
+            Self::refresh_testthat_preambles_for_paths_with(
+                state_arc.clone(),
+                client.clone(),
+                traversal_truncation.clone(),
+                root.clone(),
+                affected_paths,
+                &std::collections::HashSet::new(),
+            )
+            .await;
+            let versions_after = {
+                let state = state_arc.read().await;
+                snapshot(&state).1
+            };
+            if versions_after == versions_before {
+                return;
+            }
+        }
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -14106,6 +14621,7 @@ mod tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
 
@@ -14150,6 +14666,7 @@ mod tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
 
@@ -14185,6 +14702,7 @@ mod tests {
                 None,
                 Default::default(),
                 Some(precomputed),
+                None,
                 &exclusions,
             );
             assert!(
@@ -19594,6 +20112,7 @@ mod project_config_initialize_tests {
                 None,
                 disk_r_files,
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -20037,6 +20556,7 @@ mod project_config_initialize_tests {
                 None,
                 Default::default(),
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -20092,6 +20612,7 @@ mod project_config_initialize_tests {
                 Some(crate::package_state::rprofile::scan_workspace_rprofile(
                     &root_path,
                 )),
+                None,
                 &exclusions,
             );
             assert!(
@@ -20145,6 +20666,7 @@ mod project_config_initialize_tests {
                 None,
                 None,
                 Default::default(),
+                None,
                 None,
                 &exclusions,
             );
@@ -20206,6 +20728,293 @@ mod project_config_initialize_tests {
         assert!(
             !state.package_inputs.rprofile_symbols.contains("helper_b"),
             "final alias close must not leave stale live-buffer prelude symbols"
+        );
+    }
+
+    /// Open testthat preambles and their sourced helpers own the harvested
+    /// closure while live, and closing without save restores disk truth.
+    #[tokio::test]
+    async fn live_testthat_preamble_closure_tracks_buffers_and_close() {
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        fs::create_dir_all(root_path.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root_path.join("scripts")).unwrap();
+        let description = "Package: preamblelive\nVersion: 0.0.1\nSuggests: testthat\n";
+        fs::write(root_path.join("DESCRIPTION"), description).unwrap();
+        let preamble_path = root_path.join("tests/testthat/helper-project.R");
+        let helper_a_path = root_path.join("scripts/a.R");
+        let helper_b_path = root_path.join("scripts/b.R");
+        fs::write(&preamble_path, "source(\"../../scripts/a.R\")\n").unwrap();
+        fs::write(&helper_a_path, "disk_a <- 1\n").unwrap();
+        fs::write(&helper_b_path, "disk_b <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&root_path).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root_path.clone(),
+                Some(Arc::from(description)),
+                None,
+                Default::default(),
+                None,
+                None,
+                &crate::config_file::CompiledWorkspaceExclusions::default(),
+            );
+        }
+
+        let preamble_uri = Url::from_file_path(&preamble_path).unwrap();
+        open_doc(
+            backend,
+            &preamble_uri,
+            "r",
+            1,
+            "source(\"../../scripts/a.R\")\n",
+        )
+        .await;
+        change_doc(backend, &preamble_uri, 2, "source(\"../../scripts/b.R\")\n").await;
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(symbols.contains("disk_b"), "got {symbols:?}");
+            assert!(!symbols.contains("disk_a"), "got {symbols:?}");
+        }
+        close_doc(backend, &preamble_uri).await;
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(symbols.contains("disk_a"), "got {symbols:?}");
+            assert!(!symbols.contains("disk_b"), "got {symbols:?}");
+        }
+
+        let helper_a_uri = Url::from_file_path(&helper_a_path).unwrap();
+        open_doc(backend, &helper_a_uri, "r", 1, "buffer_a <- 1\n").await;
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(symbols.contains("buffer_a"), "got {symbols:?}");
+            assert!(!symbols.contains("disk_a"), "got {symbols:?}");
+        }
+        change_doc(backend, &helper_a_uri, 2, "changed_a <- 1\n").await;
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(symbols.contains("changed_a"), "got {symbols:?}");
+            assert!(!symbols.contains("buffer_a"), "got {symbols:?}");
+        }
+        close_doc(backend, &helper_a_uri).await;
+        let state = backend.state.read().await;
+        let symbols = state
+            .package_inputs
+            .preamble_sourced_symbols
+            .get(&preamble_path)
+            .unwrap();
+        assert!(symbols.contains("disk_a"), "got {symbols:?}");
+        assert!(!symbols.contains("changed_a"), "got {symbols:?}");
+    }
+
+    /// A preamble buffer opened (with unsaved edits) BEFORE the first package
+    /// seed — when `workspace_root` was still unset, so the did_open refresh
+    /// could not run — must win over disk when the seed finally installs: the
+    /// inline seeding scan overlays authoritative open-buffer text.
+    #[tokio::test]
+    async fn package_seed_overlays_open_preamble_buffer_opened_before_seed() {
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        fs::create_dir_all(root_path.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root_path.join("scripts")).unwrap();
+        let description = "Package: preambleseed\nVersion: 0.0.1\nSuggests: testthat\n";
+        fs::write(root_path.join("DESCRIPTION"), description).unwrap();
+        let preamble_path = root_path.join("tests/testthat/helper-project.R");
+        fs::write(&preamble_path, "source(\"../../scripts/a.R\")\n").unwrap();
+        fs::write(root_path.join("scripts/a.R"), "disk_a <- 1\n").unwrap();
+        fs::write(root_path.join("scripts/b.R"), "disk_b <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&root_path).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Open the preamble with an unsaved edit BEFORE any package seed:
+        // package_inputs.workspace_root is unset, so did_open cannot refresh
+        // the closure — the seed itself must honor the buffer.
+        let preamble_uri = Url::from_file_path(&preamble_path).unwrap();
+        open_doc(
+            backend,
+            &preamble_uri,
+            "r",
+            1,
+            "source(\"../../scripts/b.R\")\n",
+        )
+        .await;
+
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root_path.clone(),
+                Some(Arc::from(description)),
+                None,
+                Default::default(),
+                None,
+                None,
+                &crate::config_file::CompiledWorkspaceExclusions::default(),
+            );
+        }
+
+        let state = backend.state.read().await;
+        let symbols = state
+            .package_inputs
+            .preamble_sourced_symbols
+            .get(&preamble_path)
+            .unwrap();
+        assert!(
+            symbols.contains("disk_b"),
+            "seed must harvest through the open buffer's source() target: {symbols:?}"
+        );
+        assert!(
+            !symbols.contains("disk_a"),
+            "seed must not clobber the open buffer with the stale disk closure: {symbols:?}"
+        );
+    }
+
+    /// The seed-install TOCTOU window: a precomputed scan whose override
+    /// snapshot MISSED a buffer (opened after the snapshot, before the
+    /// install) gets installed, then `refresh_open_preamble_docs_after_seed`
+    /// must converge the state back to buffer truth.
+    #[tokio::test]
+    async fn post_seed_refresh_converges_to_buffer_opened_during_seed_window() {
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        fs::create_dir_all(root_path.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root_path.join("scripts")).unwrap();
+        let description = "Package: preambletoctou\nVersion: 0.0.1\nSuggests: testthat\n";
+        fs::write(root_path.join("DESCRIPTION"), description).unwrap();
+        let preamble_path = root_path.join("tests/testthat/helper-project.R");
+        fs::write(&preamble_path, "source(\"../../scripts/a.R\")\n").unwrap();
+        fs::write(root_path.join("scripts/a.R"), "disk_a <- 1\n").unwrap();
+        fs::write(root_path.join("scripts/b.R"), "disk_b <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&root_path).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Precompute a disk-only scan (its override snapshot predates the
+        // buffer), then open the buffer, then install the stale scan —
+        // exactly the interleaving of the seeding TOCTOU window.
+        let stale_scan = crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+            &root_path,
+            &crate::config_file::CompiledWorkspaceExclusions::default(),
+        );
+        let preamble_uri = Url::from_file_path(&preamble_path).unwrap();
+        open_doc(
+            backend,
+            &preamble_uri,
+            "r",
+            1,
+            "source(\"../../scripts/b.R\")\n",
+        )
+        .await;
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root_path.clone(),
+                Some(Arc::from(description)),
+                None,
+                Default::default(),
+                None,
+                Some(stale_scan),
+                &crate::config_file::CompiledWorkspaceExclusions::default(),
+            );
+        }
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(
+                symbols.contains("disk_a"),
+                "precondition: the stale disk scan was installed: {symbols:?}"
+            );
+        }
+
+        Backend::refresh_open_preamble_docs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root_path.clone(),
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        let symbols = state
+            .package_inputs
+            .preamble_sourced_symbols
+            .get(&preamble_path)
+            .unwrap();
+        assert!(
+            symbols.contains("disk_b"),
+            "post-seed refresh must converge to the open buffer's closure: {symbols:?}"
+        );
+        assert!(
+            !symbols.contains("disk_a"),
+            "stale disk-derived closure must not survive the post-seed refresh: {symbols:?}"
         );
     }
 
@@ -22237,6 +23046,7 @@ mod project_config_initialize_tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -22311,6 +23121,7 @@ mod project_config_initialize_tests {
                 Some("Package: pkg\n".into()),
                 None,
                 disk_seed,
+                None,
                 None,
                 &exclusions,
             );
@@ -22399,6 +23210,7 @@ mod project_config_initialize_tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -22486,6 +23298,7 @@ mod project_config_initialize_tests {
                 None,
                 disk_seed,
                 None,
+                None,
                 &exclusions,
             );
         }
@@ -22553,6 +23366,7 @@ mod project_config_initialize_tests {
                 Some("Package: pkg\n".into()),
                 None,
                 disk_seed,
+                None,
                 None,
                 &exclusions,
             );
@@ -22651,6 +23465,7 @@ mod project_config_initialize_tests {
                 Some(disk_description.into()),
                 None,
                 disk_seed,
+                None,
                 None,
                 &exclusions,
             );

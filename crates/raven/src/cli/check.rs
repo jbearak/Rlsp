@@ -498,8 +498,10 @@ fn build_indexed_state(
         ns_text,
         Default::default(),
         // `raven check` is a single-pass batch with no concurrent writers, so
-        // it lets the helper scan `.Rprofile` inline (no off-lock precompute
-        // needed). See `initialize_package_inputs_from_state_with_exclusions`.
+        // both `None`s let the helper scan `.Rprofile` and the testthat
+        // preamble inline (no off-lock precompute needed for either). See
+        // `initialize_package_inputs_from_state_with_exclusions`.
+        None,
         None,
         &workspace_exclusions,
     );

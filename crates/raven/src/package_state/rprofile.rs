@@ -150,7 +150,7 @@ fn scan_rprofile_worklist<const USE_EXCLUSIONS: bool>(
         ) else {
             continue;
         };
-        for target in literal_source_targets(&text) {
+        for target in static_source_targets(&text) {
             let Some(resolved) =
                 crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
                     &target, &ctx,
@@ -203,20 +203,27 @@ fn harvest_file(text: &str, scan: &mut RprofileScan) {
     }
 }
 
-/// Literal `source()` target paths in `text` that contribute to the GLOBAL /
-/// script scope. Excludes:
+/// Statically-known `source()` target paths in `text` that contribute to the
+/// GLOBAL / script scope: literal paths plus computed paths folded by
+/// `cross_file::static_path` (`file.path()` of literals, `normalizePath()`
+/// wrappers, single-assignment variables — issue #638). Following folded
+/// computed profiles is intentional: folding is strict all-or-nothing over
+/// unconditional top-level bindings, so a folded path is the path R computes
+/// (modulo the documented `setwd()`/symlink blindness shared by all of
+/// Raven's static path analysis). Excludes:
 /// - `# raven:` directives (`is_directive`);
 /// - calls that do not inherit symbols — `source(..., local = TRUE)` and
 ///   `sys.source(...)` without `envir = globalenv()` (`!inherits_symbols()`);
 /// - calls lexically inside a function body (`is_function_scoped`) — they only
 ///   run when that function is invoked, so they are not load-time globals;
-/// - non-literal paths (`detect_source_calls` yields an empty `path` for those).
+/// - paths that are neither literal nor foldable (`detect_source_calls`
+///   yields an empty `path` for those).
 ///
 /// `detect_source_calls` walks the WHOLE tree (not just top level), so these
 /// filters are load-bearing — without them a `.Rprofile` like
 /// `f <- function() source("dev.R")` would wrongly pull `dev.R` into the
 /// suppressive prelude.
-fn literal_source_targets(text: &str) -> Vec<String> {
+fn static_source_targets(text: &str) -> Vec<String> {
     use tree_sitter::Parser;
     let mut parser = Parser::new();
     if parser

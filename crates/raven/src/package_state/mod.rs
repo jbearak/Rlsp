@@ -12,6 +12,7 @@ pub use derive::derive_package_state;
 pub mod digest;
 pub use digest::ContentDigest;
 pub mod event;
+pub mod preamble;
 pub mod rprofile;
 pub mod sysdata;
 
@@ -115,6 +116,24 @@ pub struct PackageInputs {
     /// transitive-freshness wiring (Task 12) to rescan when a sourced helper is
     /// edited. Not carried onto the contribution (watch-routing only).
     pub rprofile_sourced_files: BTreeSet<PathBuf>,
+    /// Per-preamble-file (`tests/testthat/helper*.R`/`setup*.R`, keyed by the
+    /// same root-joined path as `r_files`) top-level symbol names harvested
+    /// from the preamble's transitive static `source()` targets (issue #638).
+    /// Populated by `preamble::scan_testthat_preambles_with_exclusions`;
+    /// merged with the preamble's own `top_level_defs` into
+    /// `PackageScopeContribution::test_helper_symbols` at derive time.
+    pub preamble_sourced_symbols: BTreeMap<PathBuf, BTreeSet<String>>,
+    /// Per-preamble-file packages attached by its transitive `source()`
+    /// targets (same keying as `preamble_sourced_symbols`).
+    pub preamble_sourced_attached_packages: BTreeMap<PathBuf, BTreeSet<String>>,
+    /// Routing paths of static `source()` targets from any preamble (from
+    /// `PreambleScan::sourced_files`), including currently missing targets.
+    /// Watch-routing only, like `rprofile_sourced_files`: an edit or later
+    /// creation triggers a preamble rescan so harvested symbols stay fresh.
+    pub preamble_sourced_files: BTreeSet<PathBuf>,
+    /// Sourced-target routing closure per preamble, used only to route a
+    /// watched or live-buffer edit/create to the affected preamble scans.
+    pub preamble_sourced_files_by_preamble: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
 }
 
 #[derive(Clone, Debug)]
@@ -157,13 +176,22 @@ mod input_tests {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PackageInputDelta {
     Initial,
-    RFileChanged { path: PathBuf, kind: RFileKind },
-    RFileDeleted { path: PathBuf, kind: RFileKind },
+    RFileChanged {
+        path: PathBuf,
+        kind: RFileKind,
+    },
+    RFileDeleted {
+        path: PathBuf,
+        kind: RFileKind,
+    },
     NamespaceChanged,
     DescriptionChanged,
     SettingChanged,
     DataDirChanged,
     RProfileChanged,
+    /// The testthat preamble sourced-closure scan changed (issue #638) —
+    /// `preamble_sourced_*` inputs were replaced.
+    PreambleSourcesChanged,
     Batch(Vec<PackageInputDelta>),
 }
 
