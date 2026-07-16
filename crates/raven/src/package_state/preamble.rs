@@ -44,14 +44,15 @@ pub struct PreambleScan {
     pub symbols: BTreeMap<PathBuf, BTreeSet<String>>,
     /// Per-preamble: packages attached by its transitive `source()` targets.
     pub attached_packages: BTreeMap<PathBuf, BTreeSet<String>>,
-    /// Canonicalized paths of all files followed out of any preamble via
-    /// `source()` (preamble files themselves NOT included). Used by the
-    /// watched-file freshness wiring to rescan when a sourced helper is
-    /// edited — mirrors `RprofileScan::sourced_files`.
+    /// Routing paths of all static `source()` targets from any preamble,
+    /// including targets that are currently missing or unreadable (preamble
+    /// files themselves NOT included). Existing paths are canonicalized;
+    /// missing paths use a canonical parent when possible. Used by watched-file
+    /// freshness wiring so both edits and later creation trigger a rescan.
     pub sourced_files: BTreeSet<PathBuf>,
-    /// Canonical sourced-file closure for each preamble. This routing index
-    /// identifies which closures intersect an edited helper without rebuilding
-    /// unrelated preambles.
+    /// Sourced-target routing closure for each preamble. This index identifies
+    /// which closures intersect an edited or newly created helper without
+    /// rebuilding unrelated preambles.
     pub sourced_files_by_preamble: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
 }
 
@@ -231,6 +232,20 @@ fn read_source_with_overrides(path: &Path, overrides: &PreambleTextOverrides) ->
     crate::state::read_source(path).ok()
 }
 
+/// Stable watcher-routing spelling for an existing or currently missing path.
+/// Canonicalizing the parent preserves symlink identity across delete/create
+/// events even though the target itself cannot be canonicalized while absent.
+fn canonicalize_for_routing(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => parent
+                .canonicalize()
+                .map(|canonical_parent| canonical_parent.join(name))
+                .unwrap_or_else(|_| path.to_path_buf()),
+            _ => path.to_path_buf(),
+        })
+}
+
 /// Follow one preamble file's transitive static `source()` targets, harvesting
 /// top-level defs and attaches from each target (but not from the preamble
 /// itself). Mirrors `rprofile.rs`'s worklist loop.
@@ -248,11 +263,7 @@ fn scan_one_preamble(
     // Worklist of (file_path, file_text, depth, harvest). The preamble seeds
     // the walk with harvest=false — its own defs come from RFileFacts.
     let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
-    visited.insert(
-        preamble_path
-            .canonicalize()
-            .unwrap_or_else(|_| preamble_path.to_path_buf()),
-    );
+    visited.insert(canonicalize_for_routing(preamble_path));
     let mut worklist: Vec<(PathBuf, String, usize, bool)> =
         vec![(preamble_path.to_path_buf(), preamble_text, 0, false)];
 
@@ -294,15 +305,17 @@ fn scan_one_preamble(
             if !exclusions.is_empty() && exclusions.is_excluded_path(&resolved) {
                 continue;
             }
-            let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
-            if !visited.insert(canonical.clone()) {
+            let routing_path = canonicalize_for_routing(&resolved);
+            if !visited.insert(routing_path.clone()) {
                 continue;
             }
             if visited.len() >= PREAMBLE_MAX_SOURCE_FILES {
                 break;
             }
+            // Routing must survive a failed read: if this target is created
+            // later, its watcher event needs to find and rescan this preamble.
+            sourced.insert(routing_path);
             if let Some(sourced_text) = read_source_with_overrides(&resolved, overrides) {
-                sourced.insert(canonical);
                 worklist.push((resolved, sourced_text, depth + 1, true));
             }
         }
@@ -428,6 +441,43 @@ mod tests {
                 .get(&preamble_b)
                 .is_some_and(|symbols| symbols.contains("b_old")),
             "unaffected preamble must retain its previous closure"
+        );
+    }
+
+    #[test]
+    fn incremental_rescan_follows_a_newly_created_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        let helper = root.join("scripts/later.R");
+        std::fs::write(&preamble, "source(\"../../scripts/later.R\")\n").unwrap();
+
+        let initial = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
+        let routed_helper = root.canonicalize().unwrap().join("scripts/later.R");
+        assert!(initial.sourced_files.contains(&routed_helper));
+        assert!(
+            initial
+                .sourced_files_by_preamble
+                .get(&preamble)
+                .is_some_and(|paths| paths.contains(&routed_helper))
+        );
+        assert!(!initial.symbols.contains_key(&preamble));
+
+        std::fs::write(&helper, "created_def <- 1\n").unwrap();
+        let scan = rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+            root,
+            &initial,
+            std::slice::from_ref(&helper),
+            &PreambleTextOverrides::new(),
+            &no_exclusions(),
+        );
+
+        assert!(
+            scan.symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("created_def"))
         );
     }
 

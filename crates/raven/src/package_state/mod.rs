@@ -126,13 +126,13 @@ pub struct PackageInputs {
     /// Per-preamble-file packages attached by its transitive `source()`
     /// targets (same keying as `preamble_sourced_symbols`).
     pub preamble_sourced_attached_packages: BTreeMap<PathBuf, BTreeSet<String>>,
-    /// Canonical paths of files followed out of any preamble via `source()`
-    /// (from `PreambleScan::sourced_files`). Watch-routing only, like
-    /// `rprofile_sourced_files`: an edit to one of these triggers a preamble
-    /// rescan so harvested symbols stay fresh.
+    /// Routing paths of static `source()` targets from any preamble (from
+    /// `PreambleScan::sourced_files`), including currently missing targets.
+    /// Watch-routing only, like `rprofile_sourced_files`: an edit or later
+    /// creation triggers a preamble rescan so harvested symbols stay fresh.
     pub preamble_sourced_files: BTreeSet<PathBuf>,
-    /// Canonical sourced-file closure per preamble, used only to route a
-    /// watched or live-buffer edit to the affected preamble scans.
+    /// Sourced-target routing closure per preamble, used only to route a
+    /// watched or live-buffer edit/create to the affected preamble scans.
     pub preamble_sourced_files_by_preamble: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
 }
 

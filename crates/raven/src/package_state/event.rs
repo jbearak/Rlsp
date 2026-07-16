@@ -208,7 +208,7 @@ pub(crate) fn apply_preamble_scan(
 /// preamble-source scan (issue #638): the file IS a preamble scan root
 /// (direct `tests/testthat/` child named `helper*`/`setup*` — its `source()`
 /// set may have changed), or it is one of the files a preamble transitively
-/// `source()`s (`preamble_sourced_files`, canonical).
+/// `source()`s (`preamble_sourced_files`, canonical when possible).
 fn preamble_rescan_needed(
     inputs: &PackageInputs,
     root: &Path,
@@ -218,7 +218,9 @@ fn preamble_rescan_needed(
     if inputs.package_mode == super::PackageMode::Disabled {
         return false;
     }
-    if inputs.preamble_sourced_files.contains(canonical_path) {
+    if inputs.preamble_sourced_files.contains(canonical_path)
+        || inputs.preamble_sourced_files.contains(path)
+    {
         return true;
     }
     if super::preamble::is_testthat_preamble_path(path, root) {
@@ -1532,7 +1534,31 @@ mod tests {
 
         assert_eq!(delta, Some(PackageInputDelta::PreambleSourcesChanged));
         assert!(!inputs.preamble_sourced_symbols.contains_key(&preamble));
-        assert!(inputs.preamble_sourced_files.is_empty());
+        assert!(
+            inputs
+                .preamble_sourced_files
+                .contains(&real_root.canonicalize().unwrap().join("scripts/helpers.R")),
+            "missing target must remain routed for a later creation event, got {:?}",
+            inputs.preamble_sourced_files
+        );
+
+        std::fs::write(&helper, "recreated_def <- 1\n").unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert_eq!(delta, Some(PackageInputDelta::PreambleSourcesChanged));
+        assert!(
+            inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("recreated_def"))
+        );
     }
 
     #[test]
