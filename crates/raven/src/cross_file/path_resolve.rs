@@ -252,6 +252,20 @@ impl PathContext {
         self.working_directory.is_some() || self.inherited_working_directory.is_some()
     }
 
+    /// Working directory that may propagate through `sourced-by` metadata.
+    ///
+    /// The implicit testthat/testit anchor is a soft default for this file
+    /// only, so it deliberately returns `None` unless an explicit or inherited
+    /// `# raven: cd` is present. Outside that soft-WD regime, the historical
+    /// file-directory fallback remains inheritable.
+    pub fn inheritable_working_directory(&self) -> Option<PathBuf> {
+        if self.implicit_test_working_directory.is_some() && !self.cd_in_effect() {
+            None
+        } else {
+            Some(self.effective_working_directory())
+        }
+    }
+
     /// The working directory a non-standalone forward `source()` child inherits
     /// from this (caller) context, or `None` when none is in effect.
     ///
@@ -582,21 +596,23 @@ fn resolve_path_rich(
     // testthat/testit working directory (issue #638). Only reachable when the
     // implicit anchor is the effective base and the file is nested below it
     // (see `implicit_wd_file_dir_fallback`); keeps pre-#638 file-relative
-    // resolution working for files in tests/testthat subdirectories. Exact
-    // match only — the case leniencies below still operate on the
-    // anchor-based candidate.
+    // resolution working for files in tests/testthat subdirectories. Retain
+    // the normalized candidate for the case-insensitive pass below: every
+    // resolution base's exact match must win before any base gets leniency.
+    let mut implicit_file_dir_candidate = None;
     if let Some(file_dir) = context.implicit_wd_file_dir_fallback() {
         let fallback_resolved = file_dir.join(path);
-        if let Some(fallback_canonical) = normalize_path(&fallback_resolved)
-            && fallback_canonical.exists()
-        {
-            let corrected = canonicalize_case_below(&file_dir, &fallback_canonical);
-            let mismatch = case_mismatch_if_corrected(
-                &fallback_canonical,
-                &corrected,
-                CaseMismatchRegime::CaseInsensitiveFs,
-            );
-            return ResolveOutcome::resolved(corrected, mismatch);
+        if let Some(fallback_canonical) = normalize_path(&fallback_resolved) {
+            if fallback_canonical.exists() {
+                let corrected = canonicalize_case_below(&file_dir, &fallback_canonical);
+                let mismatch = case_mismatch_if_corrected(
+                    &fallback_canonical,
+                    &corrected,
+                    CaseMismatchRegime::CaseInsensitiveFs,
+                );
+                return ResolveOutcome::resolved(corrected, mismatch);
+            }
+            implicit_file_dir_candidate = Some((file_dir, fallback_canonical));
         }
     }
 
@@ -635,6 +651,15 @@ fn resolve_path_rich(
     // path), never an alternate resolution base.
     if let Some(prefix) = scan_prefix
         && let Some(corrected) = resolve_single_ci_match(prefix, &canonical)
+    {
+        return ResolveOutcome::resolved(corrected, Some(CaseMismatchRegime::CaseSensitiveFs));
+    }
+
+    // Step 3b: file-directory compatibility single-case-insensitive-match.
+    // This comes after every exact candidate, preserving exact-wins ordering,
+    // but before the workspace CI fallback to retain the base priority above.
+    if let Some((file_dir, fallback_canonical)) = implicit_file_dir_candidate
+        && let Some(corrected) = resolve_single_ci_match(&file_dir, &fallback_canonical)
     {
         return ResolveOutcome::resolved(corrected, Some(CaseMismatchRegime::CaseSensitiveFs));
     }
@@ -1629,6 +1654,17 @@ mod tests {
         std::fs::create_dir_all(root.join("scripts")).unwrap();
         std::fs::write(root.join("tests/testthat/helper-common.R"), "x <- 1\n").unwrap();
         std::fs::write(root.join("tests/testthat/fixtures/local.R"), "y <- 1\n").unwrap();
+        std::fs::write(
+            root.join("tests/testthat/fixtures/CaseOnly.R"),
+            "case_only <- 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/testthat/fixtures/Priority.R"),
+            "compatibility_ci <- 1\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("priority.r"), "workspace_exact <- 1\n").unwrap();
         std::fs::write(root.join("scripts/helpers.R"), "z <- 1\n").unwrap();
         let nested = root.join("tests/testthat/fixtures/helper.R");
         std::fs::write(&nested, "").unwrap();
@@ -1649,6 +1685,23 @@ mod tests {
             resolve_path_with_workspace_fallback("local.R", &ctx),
             Some(root.join("tests/testthat/fixtures/local.R"))
         );
+        // The compatibility candidate gets the same unique case-insensitive
+        // pass as the anchor and workspace-root candidates.
+        assert_eq!(
+            resolve_path_with_workspace_fallback("caseonly.r", &ctx),
+            Some(root.join("tests/testthat/fixtures/CaseOnly.R"))
+        );
+        // Exact matches across every candidate precede case-insensitive
+        // leniency: a workspace exact match beats a compatibility CI match.
+        if !root.join("tests/testthat/fixtures/priority.r").exists() {
+            // Meaningful on case-sensitive filesystems. On case-insensitive
+            // filesystems `exists()` intentionally treats Priority.R as the
+            // compatibility base's exact-phase match.
+            assert_eq!(
+                resolve_path_with_workspace_fallback("priority.r", &ctx),
+                Some(root.join("priority.r"))
+            );
+        }
         // Workspace-root fallback still active despite the implicit anchor.
         assert_eq!(
             resolve_path_with_workspace_fallback("scripts/helpers.R", &ctx),

@@ -31160,6 +31160,7 @@ y <- totally_undefined_baseline()
             preamble_sourced_symbols: std::collections::BTreeMap::new(),
             preamble_sourced_attached_packages: std::collections::BTreeMap::new(),
             preamble_sourced_files: std::collections::BTreeSet::new(),
+            preamble_sourced_files_by_preamble: std::collections::BTreeMap::new(),
         };
         derive_package_state(
             &PackageState::default(),

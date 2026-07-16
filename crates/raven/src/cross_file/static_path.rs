@@ -114,6 +114,11 @@ impl<'a> StaticBindings<'a> {
             .insert(name.to_string(), folded.clone());
         folded
     }
+
+    /// Whether any binding form in the document targets `name`.
+    fn is_bound(&self, name: &str) -> bool {
+        self.bindings.contains_key(name)
+    }
 }
 
 /// Statically fold a path-valued expression to a `String`.
@@ -135,8 +140,12 @@ pub(crate) fn fold_string_expr(
         "call" => {
             let func = node.child_by_field_name("function")?;
             match node_text(func, content) {
-                "file.path" => fold_file_path_call(node, content, bindings),
-                "normalizePath" => fold_normalize_path_call(node, content, bindings),
+                "file.path" if !bindings.is_bound("file.path") => {
+                    fold_file_path_call(node, content, bindings)
+                }
+                "normalizePath" if !bindings.is_bound("normalizePath") => {
+                    fold_normalize_path_call(node, content, bindings)
+                }
                 _ => None,
             }
         }
@@ -322,30 +331,67 @@ fn record_assignment<'a>(
         "<-" | "=" | "<<-" => (named[0], named[1]),
         _ => (named[1], named[0]),
     };
-    if name_node.kind() != "identifier" {
+    let Some(root_name_node) = replacement_root_identifier(name_node) else {
         return;
-    }
-    let name = node_text(name_node, content);
+    };
+    let name = node_text(root_name_node, content);
     let entry = bump(map, name);
     let top_level = node.parent().is_some_and(|p| p.kind() == "program");
-    if matches!(op.as_str(), "<-" | "=") && top_level && entry.candidate.is_none() {
+    if name_node.kind() == "identifier"
+        && matches!(op.as_str(), "<-" | "=")
+        && top_level
+        && entry.candidate.is_none()
+    {
         entry.candidate = Some((value_node, node.start_byte()));
     }
 }
 
-/// `assign("name", ...)` — bump the count for a string-literal name (exact
-/// `x=` named or first positional). Non-literal names are ignored, matching
-/// the apply-family `VarBinding` precedent.
+/// Return the root identifier modified by an assignment target.
+///
+/// Bare identifiers are binding candidates. Replacement targets such as
+/// `p[1]`, `p[[1]]`, and `p$x` are not candidates, but still invalidate a
+/// previously collected `p` binding so folding cannot use a stale value.
+fn replacement_root_identifier(mut node: Node) -> Option<Node> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "subset" | "subset2" => node = node.child_by_field_name("function")?,
+            "extract_operator" => node = node.child_by_field_name("lhs")?,
+            "parenthesized_expression" => node = node.named_child(0)?,
+            // Replacement-function syntax (`names(p) <- value`,
+            // `attr(p, "x") <- value`) rebinds its first argument.
+            "call" => {
+                let args = node.child_by_field_name("arguments")?;
+                let mut cursor = args.walk();
+                let first = args
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == "argument")?;
+                node = first.child_by_field_name("value")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Record statically named mutation calls. `assign("name", ...)` targets a
+/// string-literal name (`x=` or first positional); `rm()` / `remove()` target
+/// bare identifiers or plain string literals. Dynamic name expressions are
+/// ignored, matching the apply-family `VarBinding` precedent.
 fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, BindingInfo>) {
     let Some(func_node) = node.child_by_field_name("function") else {
         return;
     };
-    if node_text(func_node, content) != "assign" {
+    let func = node_text(func_node, content);
+    if !matches!(func, "assign" | "rm" | "remove") {
         return;
     }
     let Some(args_node) = node.child_by_field_name("arguments") else {
         return;
     };
+    if matches!(func, "rm" | "remove") {
+        record_remove_call(args_node, content, map);
+        return;
+    }
     let mut cursor = args_node.walk();
     let mut name_value: Option<Node> = None;
     for child in args_node.children(&mut cursor) {
@@ -366,6 +412,29 @@ fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, Bindi
         && let Some(name) = extract_plain_string(value, content)
     {
         bump(map, &name);
+    }
+}
+
+fn record_remove_call(args_node: Node, content: &str, map: &mut HashMap<String, BindingInfo>) {
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() != "argument" {
+            continue;
+        }
+        let named = child
+            .child_by_field_name("name")
+            .map(|name| node_text(name, content));
+        if named.is_some_and(|name| matches!(name, "pos" | "envir" | "inherits")) {
+            continue;
+        }
+        let Some(value) = child.child_by_field_name("value") else {
+            continue;
+        };
+        if value.kind() == "identifier" {
+            bump(map, node_text(value, content));
+        } else if let Some(name) = extract_plain_string(value, content) {
+            bump(map, &name);
+        }
     }
 }
 
@@ -581,6 +650,50 @@ assign("p", "b.R")
 source(p)
 "#;
         assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn bails_when_file_path_is_shadowed() {
+        let code = r#"
+file.path <- function(...) "other.R"
+source(file.path("a.R"))
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn bails_when_normalize_path_is_shadowed() {
+        let code = r#"
+normalizePath <- function(...) "other.R"
+source(normalizePath("a.R"))
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn bails_after_replacement_assignment_to_binding_root() {
+        for code in [
+            r#"
+p <- "a.R"
+p[1] <- "b.R"
+source(p)
+"#,
+            r#"
+p <- "a.R"
+names(p) <- "path"
+source(p)
+"#,
+        ] {
+            assert_eq!(fold_last_source_arg(code), None);
+        }
+    }
+
+    #[test]
+    fn bails_after_remove_call_targets_binding() {
+        for remove in ["rm(p)", "remove(\"p\")", "rm(list = \"p\")"] {
+            let code = format!("p <- \"a.R\"\n{remove}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{remove}");
+        }
     }
 
     #[test]

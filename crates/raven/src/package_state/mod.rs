@@ -131,6 +131,9 @@ pub struct PackageInputs {
     /// `rprofile_sourced_files`: an edit to one of these triggers a preamble
     /// rescan so harvested symbols stay fresh.
     pub preamble_sourced_files: BTreeSet<PathBuf>,
+    /// Canonical sourced-file closure per preamble, used only to route a
+    /// watched or live-buffer edit to the affected preamble scans.
+    pub preamble_sourced_files_by_preamble: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
 }
 
 #[derive(Clone, Debug)]

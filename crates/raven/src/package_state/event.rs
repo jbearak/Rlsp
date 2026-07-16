@@ -179,10 +179,12 @@ pub(crate) fn apply_preamble_scan(
     if inputs.package_mode == super::PackageMode::Disabled {
         let had = !inputs.preamble_sourced_symbols.is_empty()
             || !inputs.preamble_sourced_attached_packages.is_empty()
-            || !inputs.preamble_sourced_files.is_empty();
+            || !inputs.preamble_sourced_files.is_empty()
+            || !inputs.preamble_sourced_files_by_preamble.is_empty();
         inputs.preamble_sourced_symbols.clear();
         inputs.preamble_sourced_attached_packages.clear();
         inputs.preamble_sourced_files.clear();
+        inputs.preamble_sourced_files_by_preamble.clear();
         return had.then_some(PackageInputDelta::PreambleSourcesChanged);
     }
     match scan {
@@ -190,11 +192,13 @@ pub(crate) fn apply_preamble_scan(
             inputs.preamble_sourced_symbols = scan.symbols;
             inputs.preamble_sourced_attached_packages = scan.attached_packages;
             inputs.preamble_sourced_files = scan.sourced_files;
+            inputs.preamble_sourced_files_by_preamble = scan.sourced_files_by_preamble;
         }
         None => {
             inputs.preamble_sourced_symbols.clear();
             inputs.preamble_sourced_attached_packages.clear();
             inputs.preamble_sourced_files.clear();
+            inputs.preamble_sourced_files_by_preamble.clear();
         }
     }
     Some(PackageInputDelta::PreambleSourcesChanged)
@@ -217,13 +221,40 @@ fn preamble_rescan_needed(
     if inputs.preamble_sourced_files.contains(canonical_path) {
         return true;
     }
-    let preamble_dir = root.join("tests").join("testthat");
-    path.parent() == Some(preamble_dir.as_path())
-        && path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(super::is_test_preamble_filename)
-            .unwrap_or(false)
+    if super::preamble::is_testthat_preamble_path(path, root) {
+        return true;
+    }
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    super::preamble::is_testthat_preamble_path(canonical_path, &canonical_root)
+}
+
+fn current_preamble_scan(inputs: &PackageInputs) -> super::preamble::PreambleScan {
+    super::preamble::PreambleScan {
+        symbols: inputs.preamble_sourced_symbols.clone(),
+        attached_packages: inputs.preamble_sourced_attached_packages.clone(),
+        sourced_files: inputs.preamble_sourced_files.clone(),
+        sourced_files_by_preamble: inputs.preamble_sourced_files_by_preamble.clone(),
+    }
+}
+
+fn rescan_preamble_for_path(
+    inputs: &PackageInputs,
+    root: &Path,
+    path: &Path,
+    canonical_path: &Path,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> super::preamble::PreambleScan {
+    let mut affected_paths = vec![path.to_path_buf()];
+    if canonical_path != path {
+        affected_paths.push(canonical_path.to_path_buf());
+    }
+    super::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+        root,
+        &current_preamble_scan(inputs),
+        &affected_paths,
+        &super::preamble::PreambleTextOverrides::new(),
+        exclusions,
+    )
 }
 
 /// If `canonical_path` is a file that `.Rprofile` transitively `source()`s (and
@@ -251,7 +282,7 @@ fn fold_prelude_rescan(
         deltas.push(PackageInputDelta::RProfileChanged);
     }
     if preamble_rescan_needed(inputs, root, path, canonical_path) {
-        let scan = super::preamble::scan_testthat_preambles_with_exclusions(root, exclusions);
+        let scan = rescan_preamble_for_path(inputs, root, path, canonical_path, exclusions);
         if let Some(delta) = apply_preamble_scan(inputs, Some(scan)) {
             deltas.push(delta);
         }
@@ -278,9 +309,9 @@ fn translate_watched(
     // separators. `canonicalize` requires the target to exist; on deletion it
     // fails (the file is gone), so fall back to canonicalizing the PARENT (which
     // still exists) and rejoining the file name. Without that, a DELETED
-    // `.Rprofile`-sourced helper under a SYMLINKED workspace root would miss its
-    // `rprofile_sourced_files` membership check (which stores canonical paths)
-    // and leave stale prelude symbols in scope.
+    // `.Rprofile`/testthat-preamble sourced helper under a SYMLINKED workspace
+    // root would miss its canonical source-set membership check and leave stale
+    // symbols in scope.
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let canonical_path =
         path.canonicalize()
@@ -431,7 +462,7 @@ fn translate_watched(
             }
         }
         if preamble_rescan_needed(inputs, root, &path, &canonical_path) {
-            let scan = super::preamble::scan_testthat_preambles_with_exclusions(root, exclusions);
+            let scan = rescan_preamble_for_path(inputs, root, &path, &canonical_path, exclusions);
             if let Some(delta) = apply_preamble_scan(inputs, Some(scan)) {
                 deltas.push(delta);
             }
@@ -1420,6 +1451,7 @@ mod tests {
         inputs.preamble_sourced_symbols = scan.symbols;
         inputs.preamble_sourced_attached_packages = scan.attached_packages;
         inputs.preamble_sourced_files = scan.sourced_files;
+        inputs.preamble_sourced_files_by_preamble = scan.sourced_files_by_preamble;
         assert!(
             inputs
                 .preamble_sourced_symbols
@@ -1452,6 +1484,57 @@ mod tests {
         assert!(!symbols.contains("old_def"), "got {symbols:?}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn deleting_preamble_helper_through_symlink_rescans_canonical_closure() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real_root = tmp.path().join("real-pkg");
+        let linked_root = tmp.path().join("linked-pkg");
+        std::fs::create_dir_all(real_root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(real_root.join("scripts")).unwrap();
+        symlink(&real_root, &linked_root).unwrap();
+
+        let preamble = linked_root.join("tests/testthat/helper-project.R");
+        let helper = linked_root.join("scripts/helpers.R");
+        std::fs::write(&preamble, "source(\"../../scripts/helpers.R\")\n").unwrap();
+        std::fs::write(&helper, "stale_def <- 1\n").unwrap();
+
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let scan =
+            super::preamble::scan_testthat_preambles_with_exclusions(&linked_root, &exclusions);
+        let mut inputs = PackageInputs {
+            workspace_root: Some(linked_root.clone()),
+            package_mode: PackageMode::Auto,
+            preamble_sourced_symbols: scan.symbols,
+            preamble_sourced_attached_packages: scan.attached_packages,
+            preamble_sourced_files: scan.sourced_files,
+            preamble_sourced_files_by_preamble: scan.sourced_files_by_preamble,
+            ..PackageInputs::default()
+        };
+        assert!(
+            inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("stale_def"))
+        );
+
+        std::fs::remove_file(&helper).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap(),
+                on_disk_text: None,
+                deleted: true,
+            },
+        );
+
+        assert_eq!(delta, Some(PackageInputDelta::PreambleSourcesChanged));
+        assert!(!inputs.preamble_sourced_symbols.contains_key(&preamble));
+        assert!(inputs.preamble_sourced_files.is_empty());
+    }
+
     #[test]
     fn editing_a_preamble_file_rescans_its_source_closure() {
         // Changing which files the preamble sources (a watched on-disk edit to
@@ -1473,6 +1556,7 @@ mod tests {
         let scan = super::preamble::scan_testthat_preambles_with_exclusions(root, &exclusions);
         inputs.preamble_sourced_symbols = scan.symbols;
         inputs.preamble_sourced_files = scan.sourced_files;
+        inputs.preamble_sourced_files_by_preamble = scan.sourced_files_by_preamble;
 
         // Repoint the preamble at scripts/b.R and translate the watched edit.
         std::fs::write(&preamble, "source(\"../../scripts/b.R\")\n").unwrap();
@@ -1518,6 +1602,7 @@ mod tests {
         assert!(inputs.preamble_sourced_symbols.is_empty());
         assert!(inputs.preamble_sourced_attached_packages.is_empty());
         assert!(inputs.preamble_sourced_files.is_empty());
+        assert!(inputs.preamble_sourced_files_by_preamble.is_empty());
 
         // Second application: nothing to clear → no delta.
         assert_eq!(apply_preamble_scan(&mut inputs, None), None);

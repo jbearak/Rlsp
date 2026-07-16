@@ -3133,6 +3133,65 @@ fn rprofile_sourced_root_for_open_document(
         .then(|| root.clone())
 }
 
+fn file_paths_for_open_document(state: &WorldState, open_uri: &Url) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(path) = open_uri.to_file_path() {
+        paths.push(path);
+    }
+    for uri in state.canonical_uris_for_open_document(open_uri) {
+        if let Ok(path) = uri.to_file_path()
+            && !paths.contains(&path)
+        {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// Return the package root when an open document is a testthat preamble or a
+/// member of a previously scanned preamble source closure.
+fn preamble_sourced_root_for_open_document(
+    state: &WorldState,
+    open_uri: &Url,
+) -> Option<std::path::PathBuf> {
+    if state.package_inputs.package_mode == crate::cross_file::config::PackageMode::Disabled {
+        return None;
+    }
+    let root = state.package_inputs.workspace_root.as_ref()?;
+    let sourced = &state.package_inputs.preamble_sourced_files;
+    file_paths_for_open_document(state, open_uri)
+        .into_iter()
+        .any(|path| {
+            crate::package_state::preamble::is_testthat_preamble_path(&path, root)
+                || path_in_rprofile_sourced_set(&path, sourced)
+        })
+        .then(|| root.clone())
+}
+
+/// Snapshot authoritative open-buffer text without filesystem I/O. Each
+/// canonical alias path is keyed to the buffer that currently owns it.
+fn snapshot_preamble_text_overrides(
+    state: &WorldState,
+) -> crate::package_state::preamble::PreambleTextOverrides {
+    let mut overrides = crate::package_state::preamble::PreambleTextOverrides::new();
+    for (open_uri, document) in &state.documents {
+        let text = Arc::<str>::from(document.text());
+        for path in file_paths_for_open_document(state, open_uri) {
+            let Ok(candidate_uri) = Url::from_file_path(&path) else {
+                continue;
+            };
+            if state
+                .open_document_uri_for_authoritative_uri(&candidate_uri)
+                .as_ref()
+                == Some(open_uri)
+            {
+                overrides.insert(path, text.clone());
+            }
+        }
+    }
+    overrides
+}
+
 fn authoritative_rprofile_buffer_text_after_close(
     state: &WorldState,
     root: &std::path::Path,
@@ -3362,6 +3421,8 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     state.package_inputs.preamble_sourced_symbols = preamble_scan.symbols;
     state.package_inputs.preamble_sourced_attached_packages = preamble_scan.attached_packages;
     state.package_inputs.preamble_sourced_files = preamble_scan.sourced_files;
+    state.package_inputs.preamble_sourced_files_by_preamble =
+        preamble_scan.sourced_files_by_preamble;
 
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
@@ -6467,6 +6528,9 @@ impl LanguageServer for Backend {
         // Captured inside the lock block when the opened doc is the
         // workspace-root `.Rprofile`; drives an off-lock prelude refresh after.
         let mut rprofile_live_edit: Option<(std::path::PathBuf, Arc<str>)> = None;
+        // Preamble roots and sourced helpers also feed package-state scope;
+        // refresh their affected closures from authoritative buffers off-lock.
+        let mut preamble_live_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
 
         // Compute affected files while holding write lock
         let (
@@ -6668,6 +6732,9 @@ impl LanguageServer for Backend {
             // prelude until the first keystroke.
             if let Some(root) = authoritative_rprofile_root_for_open_document(&state, &uri) {
                 rprofile_live_edit = Some((root, text.as_str().into()));
+            }
+            if let Some(root) = preamble_sourced_root_for_open_document(&state, &uri) {
+                preamble_live_edit = Some((root, file_paths_for_open_document(&state, &uri)));
             }
 
             let on_demand_enabled = state.cross_file_config.on_demand_indexing_enabled;
@@ -7346,6 +7413,15 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Re-enrichment may have changed the final work-item set. Refresh the
+        // preamble now so its sibling fanout can exclude exactly those jobs
+        // that will be marked and scheduled below.
+        if let Some((root, paths)) = preamble_live_edit {
+            let scheduled_uris = work_items.iter().map(|(uri, _)| uri.clone()).collect();
+            self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
+                .await;
+        }
+
         // Mark force-republish on the final work_items set, excluding the
         // edited URI itself (its publish is driven by its own version bump,
         // not by a cross-file marker). Marking after re-enrichment ensures
@@ -7432,6 +7508,7 @@ impl LanguageServer for Backend {
         // document, but its prelude is package-state rather than a graph edge,
         // so the normal dependent fanout below does not cover it.
         let mut rprofile_live_edit: Option<(std::path::PathBuf, Arc<str>)> = None;
+        let mut preamble_live_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
 
         // Compute affected files and debounce config while holding write lock
         let (
@@ -7549,6 +7626,9 @@ impl LanguageServer for Backend {
                     .map(|d| Arc::<str>::from(d.text()))
             {
                 rprofile_live_edit = Some((root, text));
+            }
+            if let Some(root) = preamble_sourced_root_for_open_document(&state, &uri) {
+                preamble_live_edit = Some((root, file_paths_for_open_document(&state, &uri)));
             }
 
             // Capture package settings for background prefetch
@@ -7888,6 +7968,11 @@ impl LanguageServer for Backend {
         if let Some((root, text)) = rprofile_live_edit {
             self.refresh_rprofile_prelude_from_buffer(root, text).await;
         }
+        if let Some((root, paths)) = preamble_live_edit {
+            let scheduled_uris = work_items.iter().map(|(uri, _)| uri.clone()).collect();
+            self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
+                .await;
+        }
 
         // Background prefetch package exports (without holding WorldState lock)
         // After prefetch completes, schedule diagnostic revalidation so newly
@@ -8144,6 +8229,7 @@ impl LanguageServer for Backend {
         // the live did_change refresh folded in.
         let mut rprofile_close_buffer: Option<(std::path::PathBuf, Arc<str>)> = None;
         let mut rprofile_close_root: Option<std::path::PathBuf> = None;
+        let mut preamble_close_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
 
         // Issue #558: closing a graph-relevant file schedules a disk resync
         // (spawned after this block) so cross-file state derived from a
@@ -8227,6 +8313,9 @@ impl LanguageServer for Backend {
             } else {
                 None
             };
+            if let Some(root) = preamble_sourced_root_for_open_document(&state, uri) {
+                preamble_close_edit = Some((root, file_paths_for_open_document(&state, uri)));
+            }
 
             // Close in new DocumentStore (Requirement 1.5)
             state.document_store.close(uri);
@@ -8424,6 +8513,11 @@ impl LanguageServer for Backend {
             self.refresh_rprofile_prelude_from_buffer(root, text).await;
         } else if let Some(root) = rprofile_close_root {
             self.refresh_rprofile_prelude_from_disk(root).await;
+        }
+        if let Some((root, paths)) = preamble_close_edit {
+            let scheduled_uris = sibling_fanout.iter().map(|(uri, _)| uri.clone()).collect();
+            self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
+                .await;
         }
 
         if close_resync {
@@ -11013,6 +11107,115 @@ impl Backend {
             client,
             affected,
             Some(traversal_truncation),
+        ));
+    }
+
+    /// Refresh the affected testthat preamble sourced closures from a snapshot
+    /// that overlays all authoritative open buffers on disk. The scan runs
+    /// off-lock; only the already-built result is applied under the write lock.
+    async fn refresh_testthat_preambles_for_paths(
+        &self,
+        root: std::path::PathBuf,
+        affected_paths: Vec<std::path::PathBuf>,
+        scheduled_uris: &std::collections::HashSet<Url>,
+    ) {
+        let (previous, overrides, exclusions) = {
+            let state = self.state.read().await;
+            (
+                crate::package_state::preamble::PreambleScan {
+                    symbols: state.package_inputs.preamble_sourced_symbols.clone(),
+                    attached_packages: state
+                        .package_inputs
+                        .preamble_sourced_attached_packages
+                        .clone(),
+                    sourced_files: state.package_inputs.preamble_sourced_files.clone(),
+                    sourced_files_by_preamble: state
+                        .package_inputs
+                        .preamble_sourced_files_by_preamble
+                        .clone(),
+                },
+                snapshot_preamble_text_overrides(&state),
+                state.workspace_exclusions.clone(),
+            )
+        };
+        let root_for_scan = root.clone();
+        let affected_for_scan = affected_paths.clone();
+        let Ok(scan) = tokio::task::spawn_blocking(move || {
+            crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+                &root_for_scan,
+                &previous,
+                &affected_for_scan,
+                &overrides,
+                &exclusions,
+            )
+        })
+        .await
+        else {
+            return;
+        };
+        self.apply_testthat_preamble_rescan(scan, &root, &affected_paths, scheduled_uris)
+            .await;
+    }
+
+    async fn apply_testthat_preamble_rescan(
+        &self,
+        scan: crate::package_state::preamble::PreambleScan,
+        root: &std::path::Path,
+        affected_paths: &[std::path::PathBuf],
+        scheduled_uris: &std::collections::HashSet<Url>,
+    ) {
+        let affected: Vec<Url> = {
+            let mut state = self.state.write().await;
+            let current = crate::package_state::preamble::PreambleScan {
+                symbols: state.package_inputs.preamble_sourced_symbols.clone(),
+                attached_packages: state
+                    .package_inputs
+                    .preamble_sourced_attached_packages
+                    .clone(),
+                sourced_files: state.package_inputs.preamble_sourced_files.clone(),
+                sourced_files_by_preamble: state
+                    .package_inputs
+                    .preamble_sourced_files_by_preamble
+                    .clone(),
+            };
+            if current == scan {
+                return;
+            }
+            let Some(delta) = crate::package_state::event::apply_preamble_scan(
+                &mut state.package_inputs,
+                Some(scan),
+            ) else {
+                return;
+            };
+            state.apply_package_event(&delta);
+            let testthat_dir = root.join("tests/testthat");
+            let affected: Vec<Url> = state
+                .documents
+                .keys()
+                .filter(|uri| {
+                    if scheduled_uris.contains(*uri) {
+                        return false;
+                    }
+                    package_scope_workspace_r_path_for_open_document(&state, uri, root).is_some_and(
+                        |path| path.starts_with(&testthat_dir) && !affected_paths.contains(&path),
+                    )
+                })
+                .cloned()
+                .collect();
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(affected.iter());
+            affected
+        };
+
+        if affected.is_empty() {
+            return;
+        }
+        tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
+            self.state.clone(),
+            self.client.clone(),
+            affected,
+            Some(self.traversal_truncation.clone()),
         ));
     }
 
@@ -20290,6 +20493,118 @@ mod project_config_initialize_tests {
             !state.package_inputs.rprofile_symbols.contains("helper_b"),
             "final alias close must not leave stale live-buffer prelude symbols"
         );
+    }
+
+    /// Open testthat preambles and their sourced helpers own the harvested
+    /// closure while live, and closing without save restores disk truth.
+    #[tokio::test]
+    async fn live_testthat_preamble_closure_tracks_buffers_and_close() {
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        fs::create_dir_all(root_path.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root_path.join("scripts")).unwrap();
+        let description = "Package: preamblelive\nVersion: 0.0.1\nSuggests: testthat\n";
+        fs::write(root_path.join("DESCRIPTION"), description).unwrap();
+        let preamble_path = root_path.join("tests/testthat/helper-project.R");
+        let helper_a_path = root_path.join("scripts/a.R");
+        let helper_b_path = root_path.join("scripts/b.R");
+        fs::write(&preamble_path, "source(\"../../scripts/a.R\")\n").unwrap();
+        fs::write(&helper_a_path, "disk_a <- 1\n").unwrap();
+        fs::write(&helper_b_path, "disk_b <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&root_path).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root_path.clone(),
+                Some(Arc::from(description)),
+                None,
+                Default::default(),
+                None,
+                None,
+                &crate::config_file::CompiledWorkspaceExclusions::default(),
+            );
+        }
+
+        let preamble_uri = Url::from_file_path(&preamble_path).unwrap();
+        open_doc(
+            backend,
+            &preamble_uri,
+            "r",
+            1,
+            "source(\"../../scripts/a.R\")\n",
+        )
+        .await;
+        change_doc(backend, &preamble_uri, 2, "source(\"../../scripts/b.R\")\n").await;
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(symbols.contains("disk_b"), "got {symbols:?}");
+            assert!(!symbols.contains("disk_a"), "got {symbols:?}");
+        }
+        close_doc(backend, &preamble_uri).await;
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(symbols.contains("disk_a"), "got {symbols:?}");
+            assert!(!symbols.contains("disk_b"), "got {symbols:?}");
+        }
+
+        let helper_a_uri = Url::from_file_path(&helper_a_path).unwrap();
+        open_doc(backend, &helper_a_uri, "r", 1, "buffer_a <- 1\n").await;
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(symbols.contains("buffer_a"), "got {symbols:?}");
+            assert!(!symbols.contains("disk_a"), "got {symbols:?}");
+        }
+        change_doc(backend, &helper_a_uri, 2, "changed_a <- 1\n").await;
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(symbols.contains("changed_a"), "got {symbols:?}");
+            assert!(!symbols.contains("buffer_a"), "got {symbols:?}");
+        }
+        close_doc(backend, &helper_a_uri).await;
+        let state = backend.state.read().await;
+        let symbols = state
+            .package_inputs
+            .preamble_sourced_symbols
+            .get(&preamble_path)
+            .unwrap();
+        assert!(symbols.contains("disk_a"), "got {symbols:?}");
+        assert!(!symbols.contains("changed_a"), "got {symbols:?}");
     }
 
     /// While `.Rprofile` is OPEN with unsaved edits, a file-watcher event for it

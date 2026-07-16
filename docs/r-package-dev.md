@@ -115,8 +115,8 @@ files matching `^setup.*\.[Rr]$` the same way. Raven mirrors this:
   sibling test files the same way the helper's own defs do. Relative paths
   anchor at `tests/testthat/` (the [implicit testthat working
   directory](cross-file.md#implicit-testthat-testit-working-directory)), and
-  the scan refreshes when the helper or a sourced file changes on disk
-  (unsaved edits to the helper's `source()` lines take effect on save).
+  the scan refreshes from authoritative open buffers as the helper or a
+  sourced file changes, then returns to disk state when the file closes.
 
 Note the gating difference: the helper-visibility machinery on this page
 requires package mode (a `DESCRIPTION` with a `Package:` field), while the

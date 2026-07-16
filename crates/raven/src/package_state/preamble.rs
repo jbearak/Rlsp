@@ -9,8 +9,10 @@
 //! `scripts/helpers.R`).
 //!
 //! Directly mirrors the `.Rprofile` prelude scan (`rprofile.rs`): synchronous,
-//! disk-only, best-effort, bounded, and suppressive-only — over-harvesting can
-//! mask a false positive but can never fabricate a diagnostic. Path
+//! best-effort, bounded, and suppressive-only — over-harvesting can mask a
+//! false positive but can never fabricate a diagnostic. Scans normally read
+//! disk, while live-editor refreshes can overlay authoritative open buffers.
+//! Path
 //! resolution uses forward-source semantics (`PathContext::from_metadata`
 //! with empty metadata), so a preamble's relative `source()` targets anchor
 //! at the implicit testthat working directory and computed
@@ -19,15 +21,17 @@
 //! sourced closure statically resolvable in the first place.
 //!
 //! Freshness: results enter `PackageInputs` (`preamble_sourced_*`) and are
-//! re-scanned when a preamble file or any file in `preamble_sourced_files`
-//! changes ON DISK (watched-file events; see `event.rs`). Unsaved buffer
-//! edits to a preamble's `source()` lines take effect on save — a narrower
-//! guarantee than the `.Rprofile` prelude's buffer-authoritative path, and an
-//! accepted v1 simplification.
+//! refreshed when a preamble file or any file in `preamble_sourced_files`
+//! changes in an open buffer or on disk. The per-preamble source-file index
+//! lets watched changes rescan only closures that contain the affected path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tower_lsp::lsp_types::Url;
+
+/// Authoritative in-memory text keyed by lexical or canonical file path.
+pub(crate) type PreambleTextOverrides = BTreeMap<PathBuf, Arc<str>>;
 
 /// Result of scanning every testthat preamble file's sourced closure.
 /// Maps are keyed by the preamble file's path exactly as tracked in
@@ -45,6 +49,10 @@ pub struct PreambleScan {
     /// watched-file freshness wiring to rescan when a sourced helper is
     /// edited — mirrors `RprofileScan::sourced_files`.
     pub sourced_files: BTreeSet<PathBuf>,
+    /// Canonical sourced-file closure for each preamble. This routing index
+    /// identifies which closures intersect an edited helper without rebuilding
+    /// unrelated preambles.
+    pub sourced_files_by_preamble: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
 }
 
 /// Maximum depth of `source()` chains followed out of one preamble file.
@@ -61,44 +69,166 @@ pub fn scan_testthat_preambles_with_exclusions(
     workspace_root: &Path,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> PreambleScan {
+    scan_testthat_preambles_with_overrides_and_exclusions(
+        workspace_root,
+        &PreambleTextOverrides::new(),
+        exclusions,
+    )
+}
+
+/// Scan all testthat preambles while preferring authoritative open-buffer text
+/// from `overrides` for both roots and transitive sourced helpers.
+pub(crate) fn scan_testthat_preambles_with_overrides_and_exclusions(
+    workspace_root: &Path,
+    overrides: &PreambleTextOverrides,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> PreambleScan {
     let mut scan = PreambleScan::default();
     let preamble_dir = workspace_root.join("tests").join("testthat");
-    let Ok(entries) = std::fs::read_dir(&preamble_dir) else {
-        return scan;
-    };
     let workspace_url = Url::from_file_path(workspace_root).ok();
 
-    let mut preamble_paths: Vec<PathBuf> = entries
+    let mut preamble_paths: Vec<PathBuf> = std::fs::read_dir(&preamble_dir)
+        .into_iter()
+        .flatten()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(super::is_test_preamble_filename)
-                    .unwrap_or(false)
-        })
+        .filter(|p| p.is_file() && is_testthat_preamble_path(p, workspace_root))
         .collect();
+    preamble_paths.extend(
+        overrides
+            .keys()
+            .filter(|p| is_testthat_preamble_path(p, workspace_root))
+            .cloned(),
+    );
     preamble_paths.sort();
+    preamble_paths.dedup();
 
     for preamble_path in preamble_paths {
-        if !exclusions.is_empty() && exclusions.is_excluded_path(&preamble_path) {
-            continue;
-        }
-        let Ok(text) = crate::state::read_source(&preamble_path) else {
-            continue;
-        };
-        let (symbols, attached, sourced) =
-            scan_one_preamble(&preamble_path, text, workspace_url.as_ref(), exclusions);
-        scan.sourced_files.extend(sourced);
-        if !symbols.is_empty() {
-            scan.symbols.insert(preamble_path.clone(), symbols);
-        }
-        if !attached.is_empty() {
-            scan.attached_packages.insert(preamble_path, attached);
+        scan_preamble_into(
+            &mut scan,
+            preamble_path,
+            workspace_url.as_ref(),
+            overrides,
+            exclusions,
+        );
+    }
+    rebuild_sourced_files_union(&mut scan);
+    scan
+}
+
+/// Refresh only preambles whose root or prior sourced closure intersects an
+/// affected path, retaining the prior results for all unrelated preambles.
+pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+    workspace_root: &Path,
+    previous: &PreambleScan,
+    affected_paths: &[PathBuf],
+    overrides: &PreambleTextOverrides,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> PreambleScan {
+    let mut scan = previous.clone();
+    let workspace_url = Url::from_file_path(workspace_root).ok();
+    let canonical_affected: Vec<PathBuf> = affected_paths
+        .iter()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .collect();
+    let mut affected_preambles = BTreeSet::new();
+
+    for path in affected_paths {
+        if is_testthat_preamble_path(path, workspace_root) {
+            affected_preambles.insert(path.clone());
         }
     }
+    for preamble in previous
+        .symbols
+        .keys()
+        .chain(previous.attached_packages.keys())
+        .chain(previous.sourced_files_by_preamble.keys())
+    {
+        let canonical_preamble = preamble.canonicalize().unwrap_or_else(|_| preamble.clone());
+        if canonical_affected.contains(&canonical_preamble)
+            || previous
+                .sourced_files_by_preamble
+                .get(preamble)
+                .is_some_and(|files| {
+                    canonical_affected
+                        .iter()
+                        .any(|affected| files.contains(affected))
+                })
+        {
+            affected_preambles.insert(preamble.clone());
+        }
+    }
+
+    for preamble_path in affected_preambles {
+        scan.symbols.remove(&preamble_path);
+        scan.attached_packages.remove(&preamble_path);
+        scan.sourced_files_by_preamble.remove(&preamble_path);
+        scan_preamble_into(
+            &mut scan,
+            preamble_path,
+            workspace_url.as_ref(),
+            overrides,
+            exclusions,
+        );
+    }
+    rebuild_sourced_files_union(&mut scan);
     scan
+}
+
+pub(crate) fn is_testthat_preamble_path(path: &Path, workspace_root: &Path) -> bool {
+    let preamble_dir = workspace_root.join("tests/testthat");
+    path.parent() == Some(preamble_dir.as_path())
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(super::is_test_preamble_filename)
+}
+
+fn scan_preamble_into(
+    scan: &mut PreambleScan,
+    preamble_path: PathBuf,
+    workspace_url: Option<&Url>,
+    overrides: &PreambleTextOverrides,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) {
+    if !exclusions.is_empty() && exclusions.is_excluded_path(&preamble_path) {
+        return;
+    }
+    let Some(text) = read_source_with_overrides(&preamble_path, overrides) else {
+        return;
+    };
+    let (symbols, attached, sourced) =
+        scan_one_preamble(&preamble_path, text, workspace_url, overrides, exclusions);
+    if !symbols.is_empty() {
+        scan.symbols.insert(preamble_path.clone(), symbols);
+    }
+    if !attached.is_empty() {
+        scan.attached_packages
+            .insert(preamble_path.clone(), attached);
+    }
+    if !sourced.is_empty() {
+        scan.sourced_files_by_preamble
+            .insert(preamble_path, sourced);
+    }
+}
+
+fn rebuild_sourced_files_union(scan: &mut PreambleScan) {
+    scan.sourced_files = scan
+        .sourced_files_by_preamble
+        .values()
+        .flat_map(|files| files.iter().cloned())
+        .collect();
+}
+
+fn read_source_with_overrides(path: &Path, overrides: &PreambleTextOverrides) -> Option<String> {
+    if let Some(text) = overrides.get(path) {
+        return Some(text.to_string());
+    }
+    let canonical = path.canonicalize().ok();
+    if let Some(text) = canonical.as_ref().and_then(|path| overrides.get(path)) {
+        return Some(text.to_string());
+    }
+    crate::state::read_source(path).ok()
 }
 
 /// Follow one preamble file's transitive static `source()` targets, harvesting
@@ -108,6 +238,7 @@ fn scan_one_preamble(
     preamble_path: &Path,
     preamble_text: String,
     workspace_url: Option<&Url>,
+    overrides: &PreambleTextOverrides,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<PathBuf>) {
     let mut symbols: BTreeSet<String> = BTreeSet::new();
@@ -170,7 +301,7 @@ fn scan_one_preamble(
             if visited.len() >= PREAMBLE_MAX_SOURCE_FILES {
                 break;
             }
-            if let Ok(sourced_text) = crate::state::read_source(&resolved) {
+            if let Some(sourced_text) = read_source_with_overrides(&resolved, overrides) {
                 sourced.insert(canonical);
                 worklist.push((resolved, sourced_text, depth + 1, true));
             }
@@ -254,6 +385,81 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| root.join("scripts/helpers.R"));
         assert!(scan.sourced_files.contains(&canonical_helpers));
+        assert!(
+            scan.sourced_files_by_preamble
+                .get(&helper)
+                .is_some_and(|files| files.contains(&canonical_helpers))
+        );
+    }
+
+    #[test]
+    fn incremental_rescan_keeps_unaffected_preamble_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        let helper_a = root.join("scripts/a.R");
+        let helper_b = root.join("scripts/b.R");
+        let preamble_a = root.join("tests/testthat/helper-a.R");
+        let preamble_b = root.join("tests/testthat/helper-b.R");
+        std::fs::write(&helper_a, "a_old <- 1\n").unwrap();
+        std::fs::write(&helper_b, "b_old <- 1\n").unwrap();
+        std::fs::write(&preamble_a, "source(\"../../scripts/a.R\")\n").unwrap();
+        std::fs::write(&preamble_b, "source(\"../../scripts/b.R\")\n").unwrap();
+        let initial = scan_testthat_preambles_with_exclusions(root, &no_exclusions());
+
+        std::fs::write(&helper_a, "a_new <- 1\n").unwrap();
+        // If the incremental path rebuilt every preamble, this unrelated
+        // closure would disappear after its helper is removed.
+        std::fs::remove_file(&helper_b).unwrap();
+        let scan = rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+            root,
+            &initial,
+            std::slice::from_ref(&helper_a),
+            &PreambleTextOverrides::new(),
+            &no_exclusions(),
+        );
+
+        let symbols_a = scan.symbols.get(&preamble_a).unwrap();
+        assert!(symbols_a.contains("a_new"));
+        assert!(!symbols_a.contains("a_old"));
+        assert!(
+            scan.symbols
+                .get(&preamble_b)
+                .is_some_and(|symbols| symbols.contains("b_old")),
+            "unaffected preamble must retain its previous closure"
+        );
+    }
+
+    #[test]
+    fn open_buffer_overrides_apply_to_root_and_sourced_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        let helper_a = root.join("scripts/a.R");
+        let helper_b = root.join("scripts/b.R");
+        let preamble = root.join("tests/testthat/helper-project.R");
+        std::fs::write(&helper_a, "disk_a <- 1\n").unwrap();
+        std::fs::write(&helper_b, "disk_b <- 1\n").unwrap();
+        std::fs::write(&preamble, "source(\"../../scripts/a.R\")\n").unwrap();
+        let overrides = PreambleTextOverrides::from([
+            (
+                preamble.clone(),
+                Arc::<str>::from("source(\"../../scripts/b.R\")\n"),
+            ),
+            (helper_b.clone(), Arc::<str>::from("buffer_b <- 1\n")),
+        ]);
+
+        let scan = scan_testthat_preambles_with_overrides_and_exclusions(
+            root,
+            &overrides,
+            &no_exclusions(),
+        );
+        let symbols = scan.symbols.get(&preamble).unwrap();
+        assert!(symbols.contains("buffer_b"));
+        assert!(!symbols.contains("disk_a"));
+        assert!(!symbols.contains("disk_b"));
     }
 
     /// Transitive chains are followed; setup*.R files participate; non-preamble

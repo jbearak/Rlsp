@@ -158,6 +158,7 @@ fn initial_inputs() -> PackageInputs {
         preamble_sourced_symbols: BTreeMap::new(),
         preamble_sourced_attached_packages: BTreeMap::new(),
         preamble_sourced_files: BTreeSet::new(),
+        preamble_sourced_files_by_preamble: BTreeMap::new(),
     }
 }
 

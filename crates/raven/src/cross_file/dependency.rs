@@ -17,8 +17,10 @@ use super::types::{CallSiteSpec, CrossFileMetadata};
 /// Resolve the effective working directory of a parent file for inheritance,
 /// with depth tracking and cycle detection to prevent infinite chains.
 ///
-/// Returns the parent's effective working directory as a string path that can
-/// be stored in the child's metadata.
+/// Returns the parent's inheritable working directory as a string path that
+/// can be stored in the child's metadata. The implicit testthat/testit anchor
+/// is a soft, file-local default and therefore returns `None` rather than
+/// propagating into the child.
 ///
 /// # Arguments
 /// * `parent_uri` - The URI of the parent file
@@ -29,7 +31,8 @@ use super::types::{CallSiteSpec, CrossFileMetadata};
 ///
 /// # Returns
 /// * `Some(String)` - The parent's effective working directory as a string path
-/// * `None` - If the parent URI cannot be converted to a file path
+/// * `None` - If the parent URI cannot be converted to a file path, or its
+///   only working directory is the implicit testthat/testit soft default
 ///
 /// # Fallback Behavior
 /// If parent metadata cannot be retrieved via `get_metadata`, or if the depth limit is
@@ -95,15 +98,17 @@ where
         if let Some(parent_ctx) =
             PathContext::from_metadata(parent_uri, &parent_meta, workspace_root)
         {
-            // Get effective working directory
-            let effective_wd = parent_ctx.effective_working_directory();
+            // The implicit testthat/testit anchor is deliberately not
+            // inheritable; explicit/inherited cd and the historical ordinary
+            // file-directory fallback remain so.
+            let inheritable_wd = parent_ctx.inheritable_working_directory()?;
             log::trace!(
                 "Resolved parent working directory for {}: {} (depth remaining: {})",
                 parent_uri,
-                effective_wd.display(),
+                inheritable_wd.display(),
                 remaining_depth
             );
-            return Some(effective_wd.to_string_lossy().to_string());
+            return Some(inheritable_wd.to_string_lossy().to_string());
         }
     }
 
@@ -4595,6 +4600,24 @@ z <- 3
         assert!(result.is_some());
         let wd = result.unwrap();
         assert_eq!(wd, "/project");
+    }
+
+    #[test]
+    fn implicit_testthat_wd_is_not_inherited_through_sourced_by() {
+        let parent_uri = Url::parse("file:///project/tests/testthat/helper-project.R").unwrap();
+        let workspace = Url::parse("file:///project").unwrap();
+        let parent_meta = CrossFileMetadata::default();
+        let mut visited = HashSet::new();
+
+        let result = resolve_parent_working_directory_with_visited(
+            &parent_uri,
+            &|uri| (uri == &parent_uri).then(|| std::sync::Arc::new(parent_meta.clone())),
+            Some(&workspace),
+            10,
+            &mut visited,
+        );
+
+        assert_eq!(result, None);
     }
 
     #[test]
