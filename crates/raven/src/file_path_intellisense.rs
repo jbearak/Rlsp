@@ -204,11 +204,15 @@ fn is_source_call_string_context(
         return None;
     }
 
-    // Check cursor is before or at closing quote position
+    // Tree-sitter node ranges are half-open. The closing quote itself is at
+    // `end - 1` and remains a valid cursor target, while `end` is the cursor
+    // immediately after the closing quote and must not claim path context.
     let string_end_line_text = content.lines().nth(string_end.row).unwrap_or("");
     let content_end_utf16 = byte_offset_to_utf16_column(string_end_line_text, string_end.column);
-    // Allow cursor at the closing quote position (user is still typing)
-    if position.line == string_end.row as u32 && position.character > content_end_utf16 {
+    if string_has_explicit_close(string_node)
+        && position.line == string_end.row as u32
+        && position.character >= content_end_utf16
+    {
         return None;
     }
 
@@ -358,6 +362,15 @@ fn nodes_overlap(a: &Node, b: &Node) -> bool {
     // Check if ranges overlap
     a_range.start <= b_range.start && a_range.end >= b_range.end
         || b_range.start <= a_range.start && b_range.end >= a_range.end
+}
+
+/// Whether tree-sitter observed a real closing delimiter for this string.
+/// Error recovery may synthesize a missing `close` node at EOF; raw text
+/// suffixes cannot distinguish that case from an escaped final quote.
+fn string_has_explicit_close(string_node: Node) -> bool {
+    string_node
+        .child_by_field_name("close")
+        .is_some_and(|close| !close.is_missing())
 }
 
 /// Get the text content of a node
@@ -639,42 +652,62 @@ pub fn file_path_completions(
         FilePathContext::None => return Vec::new(),
     };
 
-    // 2. Resolve the base directory for listing
-    let base_dir = match resolve_base_directory(context, file_uri, metadata, workspace_root) {
-        Some(dir) => dir,
-        None => {
-            log::trace!(
-                "file_path_completions: Failed to resolve base directory for context {:?}",
-                context
-            );
-            return Vec::new();
-        }
-    };
+    // 2. Resolve the ordered base directories for listing. Forward contexts
+    // can have three when an implicit testthat/testit anchor is complemented
+    // by a nested file-directory compatibility fallback and the still-active
+    // workspace-root fallback. Earlier bases win name collisions, matching
+    // forward resolution precedence.
+    let base_dirs =
+        resolve_completion_base_directories(context, file_uri, metadata, workspace_root);
+    if base_dirs.is_empty() {
+        log::trace!(
+            "file_path_completions: Failed to resolve base directories for context {:?}",
+            context
+        );
+        return Vec::new();
+    }
 
     // 3. Get workspace root path for boundary checking
     let workspace_path = workspace_root.and_then(|url| url.to_file_path().ok());
 
-    // 4. List directory entries (excludes hidden files)
-    let entries = match list_directory_entries(&base_dir, workspace_path.as_deref()) {
-        Ok(entries) => entries,
-        Err(e) => {
-            log::trace!(
-                "file_path_completions: Failed to list directory {:?}: {}",
-                base_dir,
-                e
-            );
-            return Vec::new();
+    // 4. List, filter, and merge entries in base-precedence order. Dedup by
+    // the inserted basename: if both the implicit anchor and compatibility
+    // directory contain `helper.R`, the anchor's entry is the one resolution
+    // would choose and the popup should contain it only once.
+    let mut seen_entries: Vec<(String, PathBuf)> = Vec::new();
+    let mut filtered_entries = Vec::new();
+    for base_dir in base_dirs {
+        let entries = match list_directory_entries(&base_dir, workspace_path.as_deref()) {
+            Ok(entries) => entries,
+            Err(e) => {
+                log::trace!(
+                    "file_path_completions: Failed to list directory {:?}: {}",
+                    base_dir,
+                    e
+                );
+                continue;
+            }
+        };
+        for entry in filter_r_files_and_dirs(entries) {
+            let name = &entry.0;
+            let shadowed = seen_entries.iter().any(|(seen_name, seen_base)| {
+                seen_name == name
+                    || (seen_base != &base_dir
+                        && seen_name.eq_ignore_ascii_case(name)
+                        && seen_base.join(name).exists())
+            });
+            if !shadowed {
+                seen_entries.push((name.clone(), base_dir.clone()));
+                filtered_entries.push(entry);
+            }
         }
-    };
+    }
 
-    // 5. Filter to R files and directories
-    let filtered_entries = filter_r_files_and_dirs(entries);
-
-    // 6. Extract the directory prefix from partial_path (everything up to and including last /)
+    // 5. Extract the directory prefix from partial_path (everything up to and including last /)
     // This prefix will be prepended to completion items
     let dir_prefix = extract_directory_component(partial_path);
 
-    // 7. Create completion items for each entry
+    // 6. Create completion items for each entry
     filtered_entries
         .iter()
         .map(|(name, _path, is_directory)| {
@@ -1134,7 +1167,15 @@ fn extract_full_source_call_path(
     let args_node = call_node.child_by_field_name("arguments")?;
     let value_node =
         crate::cross_file::static_path::source_call_file_value_node(&args_node, content)?;
-    if point < value_node.start_position() || point > value_node.end_position() {
+    let value_has_explicit_close =
+        value_node.kind() == "string" && string_has_explicit_close(value_node);
+    let at_incomplete_string_end = value_node.kind() == "string"
+        && point == value_node.end_position()
+        && !value_has_explicit_close;
+    if point < value_node.start_position()
+        || point > value_node.end_position()
+        || point == value_node.end_position() && !at_incomplete_string_end
+    {
         return None;
     }
 
@@ -1196,17 +1237,24 @@ fn extract_full_source_call_path(
         return None;
     }
 
-    // Check cursor is before or at closing quote position
+    // Keep the closing quote (`end - 1`) clickable, but reject the exclusive
+    // node end immediately after it.
     let string_end_line_text = content.lines().nth(string_end.row).unwrap_or("");
     let content_end_utf16 = byte_offset_to_utf16_column(string_end_line_text, string_end.column);
-    // Allow cursor at the closing quote position (user might be clicking on the path)
-    if position.line == string_end.row as u32 && position.character > content_end_utf16 {
+    if value_has_explicit_close
+        && position.line == string_end.row as u32
+        && position.character >= content_end_utf16
+    {
         return None;
     }
 
     // Extract the FULL path content (from content start to content end, excluding quotes)
     // The string content is between the quotes
-    let content_end_byte = string_end.column.saturating_sub(1); // -1 for closing quote
+    let content_end_byte = if value_has_explicit_close {
+        string_end.column.saturating_sub(1)
+    } else {
+        string_end.column
+    };
     let full_path = if content_end_byte > content_start_byte {
         let path_bytes = &string_start_line_text[content_start_byte..content_end_byte];
         unescape_string(path_bytes)
@@ -1376,6 +1424,11 @@ fn try_extract_full_directive_path(
 /// # Returns
 /// Some(PathBuf) with the resolved base directory, or None if resolution fails.
 /// Returns None for `/` paths when workspace_root is None.
+///
+/// This compatibility API returns only the highest-precedence base. The
+/// completion provider uses `resolve_completion_base_directories` so a
+/// nested testthat/testit file can also contribute entries from its
+/// file-directory compatibility base.
 pub fn resolve_base_directory(
     context: &FilePathContext,
     file_uri: &Url,
@@ -1426,24 +1479,10 @@ pub fn resolve_base_directory(
         FilePathContext::SourceCall { .. } => {
             let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
             if partial_dir.is_empty() {
-                // For unannotated files (no explicit or inherited working
-                // directory, and no implicit testthat/testit anchor — issue
-                // #638), use workspace-root fallback to match
-                // resolve_path_with_workspace_fallback behavior. A testthat
-                // file's completion base is its implicit anchor (the primary
-                // resolution base), keeping completion uniform with edge
-                // resolution.
-                let has_explicit_wd = path_context.working_directory.is_some();
-                let has_inherited_wd = path_context.inherited_working_directory.is_some();
-                let has_implicit_wd = path_context.implicit_test_working_directory.is_some();
-                if !has_explicit_wd
-                    && !has_inherited_wd
-                    && !has_implicit_wd
-                    && let Some(ref workspace_root) = path_context.workspace_root
-                {
-                    return Some(workspace_root.clone());
-                }
-                Some(path_context.effective_working_directory())
+                path_context
+                    .forward_completion_base_directories()
+                    .into_iter()
+                    .next()
             } else {
                 resolve_path_with_workspace_fallback(resolution_path, &path_context)
             }
@@ -1466,17 +1505,10 @@ pub fn resolve_base_directory(
                 // SourceCall arm above.
                 let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
                 if partial_dir.is_empty() {
-                    let has_explicit_wd = path_context.working_directory.is_some();
-                    let has_inherited_wd = path_context.inherited_working_directory.is_some();
-                    let has_implicit_wd = path_context.implicit_test_working_directory.is_some();
-                    if !has_explicit_wd
-                        && !has_inherited_wd
-                        && !has_implicit_wd
-                        && let Some(ref workspace_root) = path_context.workspace_root
-                    {
-                        return Some(workspace_root.clone());
-                    }
-                    Some(path_context.effective_working_directory())
+                    path_context
+                        .forward_completion_base_directories()
+                        .into_iter()
+                        .next()
                 } else {
                     resolve_path_with_workspace_fallback(resolution_path, &path_context)
                 }
@@ -1484,6 +1516,74 @@ pub fn resolve_base_directory(
         },
         FilePathContext::None => None,
     }
+}
+
+/// Resolve every directory whose entries should be merged for path
+/// completion, in path-resolution precedence order.
+///
+/// Most contexts have exactly one directory. A forward path in a file nested
+/// below an implicit testthat/testit working-directory anchor can have three:
+/// the anchor-relative directory, the corresponding directory under the
+/// file's own compatibility base, and the workspace-root fallback.
+fn resolve_completion_base_directories(
+    context: &FilePathContext,
+    file_uri: &Url,
+    metadata: &CrossFileMetadata,
+    workspace_root: Option<&Url>,
+) -> Vec<PathBuf> {
+    let partial_path = match context {
+        FilePathContext::SourceCall { partial_path, .. }
+        | FilePathContext::Directive { partial_path, .. } => partial_path,
+        FilePathContext::None => return Vec::new(),
+    };
+    let normalized_partial = normalize_path_separators(partial_path);
+    let partial_dir = extract_directory_component(&normalized_partial);
+
+    let is_forward = matches!(
+        context,
+        FilePathContext::SourceCall { .. }
+            | FilePathContext::Directive {
+                directive_type: DirectiveType::Source,
+                ..
+            }
+    );
+    if is_forward && !normalized_partial.starts_with('/') {
+        let Some(path_context) = PathContext::from_metadata(file_uri, metadata, workspace_root)
+        else {
+            return Vec::new();
+        };
+        if partial_dir.is_empty() {
+            return path_context.forward_completion_base_directories();
+        }
+        if path_context.implicit_test_working_directory.is_some() {
+            let resolution_path = if partial_dir.len() > 1 {
+                partial_dir.trim_end_matches('/')
+            } else {
+                partial_dir.as_str()
+            };
+            let mut directories: Vec<_> = path_context
+                .forward_completion_base_directories()
+                .into_iter()
+                .filter_map(|base| normalize_path_for_completion(&base.join(resolution_path)))
+                .collect();
+
+            // Retain the rich resolver's case correction and workspace-root
+            // fallback when neither implicit candidate supplies the typed
+            // directory. If it resolved to an implicit candidate already,
+            // this is just a no-op deduplication.
+            if let Some(resolved) =
+                resolve_base_directory(context, file_uri, metadata, workspace_root)
+                && !directories.contains(&resolved)
+            {
+                directories.push(resolved);
+            }
+            return directories;
+        }
+    }
+
+    resolve_base_directory(context, file_uri, metadata, workspace_root)
+        .into_iter()
+        .collect()
 }
 
 /// Extract the directory component from a partial path
@@ -1959,6 +2059,69 @@ mod tests {
         };
         let result = is_source_call_string_context(&tree, code, position);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_source_call_closing_quote_is_inside_but_exclusive_end_is_outside() {
+        let code = r#"source("utils.R")"#;
+        let tree = parse_r(code);
+
+        // The closing quote is a valid path target.
+        let on_quote = Position {
+            line: 0,
+            character: 15,
+        };
+        assert!(is_source_call_string_context(&tree, code, on_quote).is_some());
+        assert!(extract_full_source_call_path(&tree, code, on_quote).is_some());
+
+        // Tree-sitter's string-node end is the cursor immediately after that
+        // quote (before `)`) and is exclusive.
+        let after_quote = Position {
+            line: 0,
+            character: 16,
+        };
+        assert!(is_source_call_string_context(&tree, code, after_quote).is_none());
+        assert!(extract_full_source_call_path(&tree, code, after_quote).is_none());
+    }
+
+    #[test]
+    fn test_escaped_quote_does_not_replace_real_close_delimiter() {
+        let code = r#"source("foo\"bar.R")"#;
+        let tree = parse_r(code);
+        let inside = Position {
+            line: 0,
+            character: 13,
+        };
+        assert!(
+            is_source_call_string_context(&tree, code, inside).is_some(),
+            "an escaped quote must remain string content"
+        );
+
+        let after_real_close = Position {
+            line: 0,
+            character: code.len() as u32 - 1,
+        };
+        assert!(is_source_call_string_context(&tree, code, after_real_close).is_none());
+        assert!(extract_full_source_call_path(&tree, code, after_real_close).is_none());
+    }
+
+    #[test]
+    fn test_computed_source_file_argument_exclusive_end_is_outside() {
+        let code = r#"source(file.path("a", "b.R"), local = TRUE)"#;
+        let tree = parse_r(code);
+        let exclusive_end = code.find(", local").expect("outer argument comma") as u32;
+
+        assert!(
+            extract_full_source_call_path(
+                &tree,
+                code,
+                Position {
+                    line: 0,
+                    character: exclusive_end,
+                },
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -9811,6 +9974,253 @@ mod file_path_definition_tests {
             covariates.filter_text.as_deref(),
             Some("scripts/data/covariates.R")
         );
+    }
+
+    #[test]
+    fn test_nested_testthat_completions_merge_fallback_dedup_and_match_directive() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let anchor = root.join("tests/testthat");
+        let nested = anchor.join("fixtures");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(anchor.join("anchor-only.R"), "").unwrap();
+        fs::write(anchor.join("shared.R"), "anchor <- TRUE\n").unwrap();
+        fs::write(anchor.join("Helper.R"), "anchor_case <- TRUE\n").unwrap();
+        fs::write(nested.join("local-only.R"), "").unwrap();
+        fs::write(nested.join("shared.R"), "local <- TRUE\n").unwrap();
+        fs::write(nested.join("helper.R"), "local_case <- TRUE\n").unwrap();
+        fs::write(root.join("root-only.R"), "").unwrap();
+        fs::create_dir_all(anchor.join("data")).unwrap();
+        fs::create_dir_all(nested.join("data")).unwrap();
+        fs::write(anchor.join("data/anchor-data.R"), "").unwrap();
+        fs::write(nested.join("data/local-data.R"), "").unwrap();
+        let current = nested.join("test-nested.R");
+        fs::write(&current, "").unwrap();
+
+        let file_uri = Url::from_file_path(&current).unwrap();
+        let workspace_root = Url::from_file_path(root).unwrap();
+        let metadata = CrossFileMetadata::default();
+        let cursor = Position {
+            line: 0,
+            character: 8,
+        };
+        let source = FilePathContext::SourceCall {
+            partial_path: String::new(),
+            content_start: cursor,
+            is_sys_source: false,
+        };
+        let directive = FilePathContext::Directive {
+            directive_type: DirectiveType::Source,
+            partial_path: String::new(),
+            path_start: cursor,
+        };
+
+        let source_labels: Vec<_> =
+            file_path_completions(&source, &file_uri, &metadata, Some(&workspace_root), cursor)
+                .into_iter()
+                .map(|item| item.label)
+                .collect();
+        let directive_labels: Vec<_> = file_path_completions(
+            &directive,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+            cursor,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+
+        assert!(source_labels.contains(&"anchor-only.R".to_string()));
+        assert!(source_labels.contains(&"local-only.R".to_string()));
+        assert!(source_labels.contains(&"root-only.R".to_string()));
+        assert_eq!(
+            source_labels
+                .iter()
+                .filter(|label| label.as_str() == "shared.R")
+                .count(),
+            1,
+            "the anchor's higher-precedence name must deduplicate the fallback"
+        );
+        let case_variant_count = source_labels
+            .iter()
+            .filter(|label| label.eq_ignore_ascii_case("helper.r"))
+            .count();
+        assert!(source_labels.contains(&"Helper.R".to_string()));
+        assert_eq!(
+            case_variant_count,
+            if crate::test_utils::host_is_case_sensitive() {
+                2
+            } else {
+                1
+            },
+            "fallback casing is reachable only on a case-sensitive host"
+        );
+        assert_eq!(directive_labels, source_labels);
+
+        let prefixed = FilePathContext::SourceCall {
+            partial_path: "data/".to_string(),
+            content_start: cursor,
+            is_sys_source: false,
+        };
+        let prefixed_labels: Vec<_> = file_path_completions(
+            &prefixed,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+            cursor,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+        assert!(prefixed_labels.contains(&"anchor-data.R".to_string()));
+        assert!(prefixed_labels.contains(&"local-data.R".to_string()));
+    }
+
+    #[test]
+    fn test_nested_testthat_completion_fallback_is_suppressed_by_explicit_or_inherited_cd() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let anchor = root.join("tests/testthat");
+        let nested = anchor.join("fixtures");
+        let explicit = root.join("explicit");
+        let inherited = root.join("inherited");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&explicit).unwrap();
+        fs::create_dir_all(&inherited).unwrap();
+        fs::write(anchor.join("anchor-only.R"), "").unwrap();
+        fs::write(nested.join("local-only.R"), "").unwrap();
+        fs::write(explicit.join("explicit-only.R"), "").unwrap();
+        fs::write(inherited.join("inherited-only.R"), "").unwrap();
+        let current = nested.join("test-nested.R");
+        fs::write(&current, "").unwrap();
+
+        let file_uri = Url::from_file_path(&current).unwrap();
+        let workspace_root = Url::from_file_path(root).unwrap();
+        let cursor = Position {
+            line: 0,
+            character: 8,
+        };
+        let context = FilePathContext::SourceCall {
+            partial_path: String::new(),
+            content_start: cursor,
+            is_sys_source: false,
+        };
+
+        let explicit_metadata = CrossFileMetadata {
+            working_directory: Some("/explicit".to_string()),
+            ..Default::default()
+        };
+        let explicit_labels: Vec<_> = file_path_completions(
+            &context,
+            &file_uri,
+            &explicit_metadata,
+            Some(&workspace_root),
+            cursor,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+        assert_eq!(explicit_labels, vec!["explicit-only.R"]);
+
+        let inherited_metadata = CrossFileMetadata {
+            inherited_working_directory: Some(inherited.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let inherited_labels: Vec<_> = file_path_completions(
+            &context,
+            &file_uri,
+            &inherited_metadata,
+            Some(&workspace_root),
+            cursor,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+        assert_eq!(inherited_labels, vec!["inherited-only.R"]);
+    }
+
+    #[test]
+    fn test_completion_keeps_same_base_case_distinct_entries_on_case_sensitive_host() {
+        if !crate::test_utils::host_is_case_sensitive() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let anchor = root.join("tests/testthat");
+        fs::create_dir_all(&anchor).unwrap();
+        fs::write(anchor.join("Helper.R"), "").unwrap();
+        fs::write(anchor.join("helper.R"), "").unwrap();
+        let current = anchor.join("test-case.R");
+        fs::write(&current, "").unwrap();
+
+        let file_uri = Url::from_file_path(&current).unwrap();
+        let workspace_root = Url::from_file_path(root).unwrap();
+        let cursor = Position {
+            line: 0,
+            character: 8,
+        };
+        let context = FilePathContext::SourceCall {
+            partial_path: String::new(),
+            content_start: cursor,
+            is_sys_source: false,
+        };
+        let labels: Vec<_> = file_path_completions(
+            &context,
+            &file_uri,
+            &CrossFileMetadata::default(),
+            Some(&workspace_root),
+            cursor,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .filter(|label| label.eq_ignore_ascii_case("helper.r"))
+        .collect();
+
+        assert_eq!(
+            labels.len(),
+            2,
+            "both same-base exact entries are reachable"
+        );
+    }
+
+    #[test]
+    fn test_nested_testthat_backward_completion_remains_file_relative() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let anchor = root.join("tests/testthat");
+        let nested = anchor.join("fixtures");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(anchor.join("anchor-only.R"), "").unwrap();
+        fs::write(nested.join("local-only.R"), "").unwrap();
+        let current = nested.join("test-nested.R");
+        fs::write(&current, "").unwrap();
+
+        let file_uri = Url::from_file_path(&current).unwrap();
+        let workspace_root = Url::from_file_path(root).unwrap();
+        let cursor = Position {
+            line: 0,
+            character: 20,
+        };
+        let context = FilePathContext::Directive {
+            directive_type: DirectiveType::SourcedBy,
+            partial_path: String::new(),
+            path_start: cursor,
+        };
+        let labels: Vec<_> = file_path_completions(
+            &context,
+            &file_uri,
+            &CrossFileMetadata::default(),
+            Some(&workspace_root),
+            cursor,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+
+        assert!(labels.contains(&"local-only.R".to_string()));
+        assert!(!labels.contains(&"anchor-only.R".to_string()));
     }
 
     #[test]

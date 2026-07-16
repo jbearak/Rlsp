@@ -387,7 +387,7 @@ testthat's `test_dir()`/`test_local()` (and testit's `test_dir()`) evaluate help
 - For a file **nested below** the anchor (e.g. `tests/testthat/fixtures/helper.R`), the file's own directory is tried as a compatibility fallback when the anchor-relative resolution misses, so file-relative paths that worked before keep working.
 - Backward directives are unaffected: they always resolve relative to the file's own directory.
 
-Path completion inside a `source()` string in a testthat file offers entries from the anchor directory, matching where the path will actually resolve.
+Path completion inside a `source()` string or forward directive in a testthat/testit file offers entries from the anchor directory. For a file nested below the anchor, it also offers entries from the file's own directory, matching the compatibility fallback above. If both directories contain the same name, Raven shows it once and the anchor entry wins, just as it does during resolution. An explicit or inherited `# raven: cd` suppresses both implicit bases and completion uses only that working directory.
 
 #### Case-only mismatches
 

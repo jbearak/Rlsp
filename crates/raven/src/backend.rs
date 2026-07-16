@@ -3170,23 +3170,40 @@ fn preamble_sourced_root_for_open_document(
 
 /// Snapshot authoritative open-buffer text without filesystem I/O. Each
 /// canonical alias path is keyed to the buffer that currently owns it.
+/// Values remain cheap rope snapshots here; the off-lock preamble scan
+/// flattens only paths it actually reaches.
 fn snapshot_preamble_text_overrides(
     state: &WorldState,
 ) -> crate::package_state::preamble::PreambleTextOverrides {
     let mut overrides = crate::package_state::preamble::PreambleTextOverrides::new();
     for (open_uri, document) in &state.documents {
-        let text = Arc::<str>::from(document.text());
-        for path in file_paths_for_open_document(state, open_uri) {
-            let Ok(candidate_uri) = Url::from_file_path(&path) else {
-                continue;
-            };
-            if state
-                .open_document_uri_for_authoritative_uri(&candidate_uri)
-                .as_ref()
-                == Some(open_uri)
-            {
-                overrides.insert(path, text.clone());
-            }
+        // Resolve and filter aliases before cloning the rope. Untitled,
+        // superseded-alias, and excluded documents cannot contribute to a
+        // preamble scan. We deliberately do not filter only by the *previous*
+        // sourced-file set: an unsaved preamble may have just introduced a new
+        // source target, including one outside the workspace. Rope clones are
+        // structural; full text is materialized only if the scan reaches a
+        // candidate path after the state lock has been dropped.
+        let paths: Vec<std::path::PathBuf> = file_paths_for_open_document(state, open_uri)
+            .into_iter()
+            .filter(|path| {
+                let Ok(candidate_uri) = Url::from_file_path(path) else {
+                    return false;
+                };
+                state
+                    .open_document_uri_for_authoritative_uri(&candidate_uri)
+                    .as_ref()
+                    == Some(open_uri)
+                    && (state.workspace_exclusions.is_empty()
+                        || !state.workspace_exclusions.is_excluded_path(path))
+            })
+            .collect();
+        if paths.is_empty() {
+            continue;
+        }
+        let text = document.contents.clone();
+        for path in paths {
+            overrides.insert(path, text.clone());
         }
     }
     overrides
@@ -3334,9 +3351,81 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
     state.recompute_open_neighborhood_pins();
 }
 
+/// Filesystem-backed inputs computed before a package-state seed is installed.
+///
+/// Every LSP seed path uses [`Self::compute`] off the `WorldState` lock, then
+/// [`Self::install`] under one write lock. `scan_r_files` is false only when a
+/// freshly applied workspace index already owns the closed-R-file inventory.
+/// Keeping DESCRIPTION, NAMESPACE, `.Rprofile`, and testthat-preamble work in
+/// this one helper prevents startup, exclusion reloads, and package-mode
+/// rebuilds from drifting when another precomputed input is added.
+#[derive(Default)]
+struct PrecomputedPackageSeed {
+    description: Option<Arc<str>>,
+    namespace: Option<Arc<str>>,
+    disk_r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
+    rprofile_scan: crate::package_state::rprofile::RprofileScan,
+    preamble_scan: crate::package_state::preamble::PreambleScan,
+}
+
+impl PrecomputedPackageSeed {
+    fn compute(
+        root: &std::path::Path,
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+        preamble_overrides: &crate::package_state::preamble::PreambleTextOverrides,
+        scan_r_files: bool,
+    ) -> Self {
+        let description = std::fs::read_to_string(root.join("DESCRIPTION"))
+            .ok()
+            .map(|text| Arc::from(text.as_str()));
+        let namespace = std::fs::read_to_string(root.join("NAMESPACE"))
+            .ok()
+            .map(|text| Arc::from(text.as_str()));
+        let disk_r_files = if scan_r_files {
+            collect_package_r_file_inputs_from_disk_with_exclusions(root, exclusions)
+        } else {
+            Default::default()
+        };
+        let rprofile_scan = crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+            root, exclusions,
+        );
+        let preamble_scan =
+            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                root,
+                preamble_overrides,
+                exclusions,
+            );
+        Self {
+            description,
+            namespace,
+            disk_r_files,
+            rprofile_scan,
+            preamble_scan,
+        }
+    }
+
+    fn install(
+        self,
+        state: &mut WorldState,
+        root: std::path::PathBuf,
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    ) {
+        initialize_package_inputs_from_state_with_exclusions(
+            state,
+            root,
+            self.description,
+            self.namespace,
+            self.disk_r_files,
+            Some(self.rprofile_scan),
+            Some(self.preamble_scan),
+            exclusions,
+        );
+    }
+}
+
 // Internal seeding chokepoint deliberately taking each precomputed scan as its
-// own argument (callers precompute different subsets off-lock); a params
-// struct would obscure which callers precompute what.
+// own argument so non-LSP callers and focused tests can supply only the inputs
+// they need. LSP call sites use `PrecomputedPackageSeed` above.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     state: &mut WorldState,
@@ -3419,22 +3508,19 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     // the inline fallback overlays the same overrides from `state` directly.
     // The result already reflects every authoritative open buffer, so it is
     // installed unconditionally.
-    let preamble_scan =
-        if state.package_inputs.package_mode != crate::cross_file::config::PackageMode::Disabled {
+    let preamble_scan = (state.package_inputs.package_mode
+        != crate::cross_file::config::PackageMode::Disabled)
+        .then(|| {
             precomputed_preamble_scan.unwrap_or_else(|| {
-            let overrides = snapshot_preamble_text_overrides(state);
-            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
-                &root, &overrides, exclusions,
-            )
-        })
-        } else {
-            crate::package_state::preamble::PreambleScan::default()
-        };
-    state.package_inputs.preamble_sourced_symbols = preamble_scan.symbols;
-    state.package_inputs.preamble_sourced_attached_packages = preamble_scan.attached_packages;
-    state.package_inputs.preamble_sourced_files = preamble_scan.sourced_files;
-    state.package_inputs.preamble_sourced_files_by_preamble =
-        preamble_scan.sourced_files_by_preamble;
+                let overrides = snapshot_preamble_text_overrides(state);
+                crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                    &root, &overrides, exclusions,
+                )
+            })
+        });
+    // Shared writer owns package-mode gating and the four-field mapping.
+    let _ =
+        crate::package_state::event::apply_preamble_scan(&mut state.package_inputs, preamble_scan);
 
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
@@ -5852,37 +5938,30 @@ impl LanguageServer for Backend {
                         // OFF the write lock — it follows transitive source()
                         // chains and must not run under the lock (see
                         // `initialize_package_inputs_from_state_with_exclusions`).
-                        let (desc_text, ns_text, rprofile_scan, preamble_scan) = if let Some(
-                            ref root,
-                        ) =
-                            root_for_pkg_inputs
-                        {
-                            let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
-                                .ok()
-                                .map(|t| std::sync::Arc::from(t.as_str()));
-                            let ns = std::fs::read_to_string(root.join("NAMESPACE"))
-                                .ok()
-                                .map(|t| std::sync::Arc::from(t.as_str()));
-                            let scan = crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-                                    root,
-                                    &workspace_exclusions,
-                                );
+                        let package_seed = if let Some(root) = root_for_pkg_inputs.as_ref() {
                             // Buffer-aware: overlay authoritative open-buffer
                             // text so this late-completing seed cannot clobber
-                            // unsaved preamble/closure edits (see
-                            // `initialize_package_inputs_from_state_with_exclusions`).
+                            // unsaved preamble/closure edits.
                             let overrides = {
                                 let state = state_clone.read().await;
                                 snapshot_preamble_text_overrides(&state)
                             };
-                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
-                                root,
-                                &overrides,
-                                &workspace_exclusions,
-                            );
-                            (desc, ns, Some(scan), Some(pre))
+                            let root = root.clone();
+                            let exclusions = workspace_exclusions.clone();
+                            Some(
+                                tokio::task::spawn_blocking(move || {
+                                    PrecomputedPackageSeed::compute(
+                                        &root,
+                                        &exclusions,
+                                        &overrides,
+                                        false,
+                                    )
+                                })
+                                .await
+                                .unwrap_or_default(),
+                            )
                         } else {
-                            (None, None, None, None)
+                            None
                         };
 
                         // Apply index and snapshot trigger versions under a single write lock
@@ -5894,20 +5973,13 @@ impl LanguageServer for Backend {
                                 new_index_entries,
                             );
                             replay_open_documents_after_workspace_index_apply(&mut state).await;
-                            if let Some(root) = root_for_pkg_inputs.clone() {
+                            if let (Some(root), Some(seed)) =
+                                (root_for_pkg_inputs.clone(), package_seed)
+                            {
                                 // Populate package_inputs from the now-applied
                                 // workspace index and overlay open documents
                                 // (authoritative unsaved edits).
-                                initialize_package_inputs_from_state_with_exclusions(
-                                    &mut state,
-                                    root,
-                                    desc_text,
-                                    ns_text,
-                                    Default::default(),
-                                    rprofile_scan,
-                                    preamble_scan,
-                                    &workspace_exclusions,
-                                );
+                                seed.install(&mut state, root, &workspace_exclusions);
                             } else {
                                 state.apply_package_event(
                                     &crate::package_state::PackageInputDelta::Initial,
@@ -6020,43 +6092,15 @@ impl LanguageServer for Backend {
                     root,
                     seed_exclusions,
                     tokio::task::spawn_blocking(move || {
-                        let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
-                            .ok()
-                            .map(|s| Arc::from(s.as_str()));
-                        let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
-                            .ok()
-                            .map(|s| Arc::from(s.as_str()));
-                        let disk_r_files = collect_package_r_file_inputs_from_disk_with_exclusions(
+                        PrecomputedPackageSeed::compute(
                             &root_clone,
                             &scan_exclusions,
-                        );
-                        // Precompute the `.Rprofile` prelude scan OFF the write
-                        // lock (it follows transitive source(); see
-                        // `initialize_package_inputs_from_state_with_exclusions`).
-                        let rprofile_scan =
-                            crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-                                &root_clone,
-                                &scan_exclusions,
-                            );
-                        // Precompute the testthat preamble sourced-closure scan
-                        // OFF the lock too (issue #638, same discipline),
-                        // overlaying the pre-snapshotted open-buffer text.
-                        let preamble_scan =
-                            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
-                                &root_clone,
-                                &preamble_overrides,
-                                &scan_exclusions,
-                            );
-                        (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
+                            &preamble_overrides,
+                            true,
+                        )
                     })
                     .await
-                    .unwrap_or((
-                        None,
-                        None,
-                        Default::default(),
-                        Default::default(),
-                        Default::default(),
-                    )),
+                    .unwrap_or_default(),
                 ))
             } else {
                 None
@@ -6068,23 +6112,9 @@ impl LanguageServer for Backend {
             let seeded_root = {
                 let mut state = self.state.write().await;
                 state.workspace_scan_complete = true;
-                if let Some((
-                    root,
-                    package_exclusions,
-                    (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan),
-                )) = package_seed
-                {
+                if let Some((root, package_exclusions, seed)) = package_seed {
                     let seeded = root.clone();
-                    initialize_package_inputs_from_state_with_exclusions(
-                        &mut state,
-                        root,
-                        desc_text,
-                        ns_text,
-                        disk_r_files,
-                        Some(rprofile_scan),
-                        Some(preamble_scan),
-                        &package_exclusions,
-                    );
+                    seed.install(&mut state, root, &package_exclusions);
                     Some(seeded)
                 } else {
                     None
@@ -10014,37 +10044,30 @@ impl Backend {
 
                 match scan_result {
                     Ok((index, cross_file_entries, new_index_entries)) => {
-                        let (desc_text, ns_text, rprofile_scan, preamble_scan) = if let Some(
-                            ref root,
-                        ) =
-                            root_for_pkg_inputs
-                        {
-                            let desc = std::fs::read_to_string(root.join("DESCRIPTION"))
-                                .ok()
-                                .map(|s| Arc::from(s.as_str()));
-                            let ns = std::fs::read_to_string(root.join("NAMESPACE"))
-                                .ok()
-                                .map(|s| Arc::from(s.as_str()));
-                            let scan = crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-                                    root,
-                                    &workspace_exclusions,
-                                );
+                        let package_seed = if let Some(root) = root_for_pkg_inputs.as_ref() {
                             // Buffer-aware: overlay authoritative open-buffer
                             // text so this reseed cannot clobber unsaved
-                            // preamble/closure edits (see
-                            // `initialize_package_inputs_from_state_with_exclusions`).
+                            // preamble/closure edits.
                             let overrides = {
                                 let state = self.state.read().await;
                                 snapshot_preamble_text_overrides(&state)
                             };
-                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
-                                root,
-                                &overrides,
-                                &workspace_exclusions,
-                            );
-                            (desc, ns, Some(scan), Some(pre))
+                            let root = root.clone();
+                            let exclusions = workspace_exclusions.clone();
+                            Some(
+                                tokio::task::spawn_blocking(move || {
+                                    PrecomputedPackageSeed::compute(
+                                        &root,
+                                        &exclusions,
+                                        &overrides,
+                                        false,
+                                    )
+                                })
+                                .await
+                                .unwrap_or_default(),
+                            )
                         } else {
-                            (None, None, None, None)
+                            None
                         };
 
                         let (package_library, packages_enabled) = {
@@ -10055,17 +10078,10 @@ impl Backend {
                                 new_index_entries,
                             );
                             replay_open_documents_after_workspace_index_apply(&mut state).await;
-                            if let Some(root) = root_for_pkg_inputs.clone() {
-                                initialize_package_inputs_from_state_with_exclusions(
-                                    &mut state,
-                                    root,
-                                    desc_text,
-                                    ns_text,
-                                    Default::default(),
-                                    rprofile_scan,
-                                    preamble_scan,
-                                    &workspace_exclusions,
-                                );
+                            if let (Some(root), Some(seed)) =
+                                (root_for_pkg_inputs.clone(), package_seed)
+                            {
+                                seed.install(&mut state, root, &workspace_exclusions);
                                 package_inputs_initialized_by_exclusion_reload = true;
                             } else {
                                 state.apply_package_event(
@@ -10120,55 +10136,20 @@ impl Backend {
                     let state = self.state.read().await;
                     snapshot_preamble_text_overrides(&state)
                 };
-                let (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan) =
-                    tokio::task::spawn_blocking(move || {
-                        let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
-                            .ok()
-                            .map(|s| Arc::from(s.as_str()));
-                        let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
-                            .ok()
-                            .map(|s| Arc::from(s.as_str()));
-                        let disk_r_files = collect_package_r_file_inputs_from_disk_with_exclusions(
-                            &root_clone,
-                            &scan_exclusions,
-                        );
-                        let rprofile_scan =
-                            crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-                                &root_clone,
-                                &scan_exclusions,
-                            );
-                        // Precompute the testthat preamble sourced-closure scan
-                        // OFF the lock too (issue #638, same discipline),
-                        // overlaying the pre-snapshotted open-buffer text.
-                        let preamble_scan =
-                            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
-                                &root_clone,
-                                &preamble_overrides,
-                                &scan_exclusions,
-                            );
-                        (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
-                    })
-                    .await
-                    .unwrap_or((
-                        None,
-                        None,
-                        Default::default(),
-                        Default::default(),
-                        Default::default(),
-                    ));
+                let package_seed = tokio::task::spawn_blocking(move || {
+                    PrecomputedPackageSeed::compute(
+                        &root_clone,
+                        &scan_exclusions,
+                        &preamble_overrides,
+                        true,
+                    )
+                })
+                .await
+                .unwrap_or_default();
 
                 {
                     let mut state = self.state.write().await;
-                    initialize_package_inputs_from_state_with_exclusions(
-                        &mut state,
-                        root.clone(),
-                        desc_text,
-                        ns_text,
-                        disk_r_files,
-                        Some(rprofile_scan),
-                        Some(preamble_scan),
-                        &workspace_exclusions,
-                    );
+                    package_seed.install(&mut state, root.clone(), &workspace_exclusions);
                 }
                 package_inputs_initialized_by_exclusion_reload = true;
                 // Close the seed-install TOCTOU window for preamble buffers
@@ -10200,45 +10181,16 @@ impl Backend {
                 let state = self.state.read().await;
                 snapshot_preamble_text_overrides(&state)
             };
-            let (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan) =
-                tokio::task::spawn_blocking(move || {
-                    let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
-                        .ok()
-                        .map(|s| std::sync::Arc::from(s.as_str()));
-                    let ns = std::fs::read_to_string(root_clone.join("NAMESPACE"))
-                        .ok()
-                        .map(|s| std::sync::Arc::from(s.as_str()));
-                    let disk_r_files = collect_package_r_file_inputs_from_disk_with_exclusions(
-                        &root_clone,
-                        &scan_exclusions,
-                    );
-                    // Precompute the `.Rprofile` prelude scan OFF the write lock
-                    // (it follows transitive source(); see
-                    // `initialize_package_inputs_from_state_with_exclusions`).
-                    let rprofile_scan =
-                        crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-                            &root_clone,
-                            &scan_exclusions,
-                        );
-                    // Precompute the testthat preamble sourced-closure scan
-                    // OFF the lock too (issue #638, same discipline),
-                    // overlaying the pre-snapshotted open-buffer text.
-                    let preamble_scan =
-                        crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
-                            &root_clone,
-                            &preamble_overrides,
-                            &scan_exclusions,
-                        );
-                    (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
-                })
-                .await
-                .unwrap_or((
-                    None,
-                    None,
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                ));
+            let package_seed = tokio::task::spawn_blocking(move || {
+                PrecomputedPackageSeed::compute(
+                    &root_clone,
+                    &scan_exclusions,
+                    &preamble_overrides,
+                    true,
+                )
+            })
+            .await
+            .unwrap_or_default();
 
             // Re-acquire write lock to apply results. Route through the same
             // seeding helper the startup paths use, so config-reload and startup
@@ -10251,16 +10203,7 @@ impl Backend {
             // set it to this same mode.)
             {
                 let mut state = self.state.write().await;
-                initialize_package_inputs_from_state_with_exclusions(
-                    &mut state,
-                    root.clone(),
-                    desc_text,
-                    ns_text,
-                    disk_r_files,
-                    Some(rprofile_scan),
-                    Some(preamble_scan),
-                    &workspace_exclusions,
-                );
+                package_seed.install(&mut state, root.clone(), &workspace_exclusions);
             }
             // Close the seed-install TOCTOU window for preamble buffers
             // opened/edited while the reseed was in flight.
@@ -11264,18 +11207,7 @@ impl Backend {
         let (previous, overrides, exclusions) = {
             let state = state_arc.read().await;
             (
-                crate::package_state::preamble::PreambleScan {
-                    symbols: state.package_inputs.preamble_sourced_symbols.clone(),
-                    attached_packages: state
-                        .package_inputs
-                        .preamble_sourced_attached_packages
-                        .clone(),
-                    sourced_files: state.package_inputs.preamble_sourced_files.clone(),
-                    sourced_files_by_preamble: state
-                        .package_inputs
-                        .preamble_sourced_files_by_preamble
-                        .clone(),
-                },
+                crate::package_state::preamble::PreambleScan::snapshot(&state.package_inputs),
                 snapshot_preamble_text_overrides(&state),
                 state.workspace_exclusions.clone(),
             )
@@ -11321,26 +11253,22 @@ impl Backend {
     ) {
         let affected: Vec<Url> = {
             let mut state = state_arc.write().await;
-            let current = crate::package_state::preamble::PreambleScan {
-                symbols: state.package_inputs.preamble_sourced_symbols.clone(),
-                attached_packages: state
-                    .package_inputs
-                    .preamble_sourced_attached_packages
-                    .clone(),
-                sourced_files: state.package_inputs.preamble_sourced_files.clone(),
-                sourced_files_by_preamble: state
-                    .package_inputs
-                    .preamble_sourced_files_by_preamble
-                    .clone(),
-            };
+            // The common no-change case should not clone every live preamble
+            // map under the write lock. Only rescanned roots can be installed;
+            // compare those entries by reference first.
+            if scan.rescanned_match_inputs(&rescanned, &state.package_inputs) {
+                return;
+            }
+            let current =
+                crate::package_state::preamble::PreambleScan::snapshot(&state.package_inputs);
             // The scan ran off-lock against a snapshot; a concurrent writer
             // (the spawned watched-file resync task) may have updated OTHER
             // preambles since. Graft only the rescanned preambles' entries
             // onto live state so those updates survive.
             let merged = crate::package_state::preamble::merge_rescanned_preambles(
-                &current, &scan, &rescanned,
+                current, &scan, &rescanned,
             );
-            if current == merged {
+            if merged.matches_inputs(&state.package_inputs) {
                 return;
             }
             let Some(delta) = crate::package_state::event::apply_preamble_scan(

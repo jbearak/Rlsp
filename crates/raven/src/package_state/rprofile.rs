@@ -26,14 +26,6 @@ pub struct RprofileScan {
     pub sourced_files: BTreeSet<PathBuf>,
 }
 
-/// Maximum depth of `source()` chains followed out of `.Rprofile`. Mirrors the
-/// cross-file `max_chain_depth` default (64) so a profile that sources a large
-/// helper tree cannot blow up the scan.
-const RPROFILE_MAX_SOURCE_DEPTH: usize = 64;
-/// Maximum number of distinct files visited while following `source()` chains
-/// (cycle + fan-out guard). Far above any real `.Rprofile` helper tree.
-const RPROFILE_MAX_SOURCE_FILES: usize = 1000;
-
 /// Synchronously scan `<workspace_root>/.Rprofile` (never executing it) into a
 /// script-scope prelude. Returns empty when the file is absent or unreadable.
 pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
@@ -129,7 +121,9 @@ fn scan_rprofile_worklist<const USE_EXCLUSIONS: bool>(
 
     while let Some((path, text, depth)) = worklist.pop() {
         harvest_file(&text, &mut scan);
-        if depth >= RPROFILE_MAX_SOURCE_DEPTH || visited.len() >= RPROFILE_MAX_SOURCE_FILES {
+        if depth >= crate::cross_file::source_detect::STATIC_SOURCE_MAX_DEPTH
+            || visited.len() >= crate::cross_file::source_detect::STATIC_SOURCE_MAX_FILES
+        {
             continue;
         }
         // PathContext is invariant for all targets within a single file; build it once.
@@ -150,7 +144,7 @@ fn scan_rprofile_worklist<const USE_EXCLUSIONS: bool>(
         ) else {
             continue;
         };
-        for target in static_source_targets(&text) {
+        for target in crate::cross_file::source_detect::static_source_targets(&text) {
             let Some(resolved) =
                 crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
                     &target, &ctx,
@@ -169,7 +163,7 @@ fn scan_rprofile_worklist<const USE_EXCLUSIONS: bool>(
             if !visited.insert(canonical_resolved.clone()) {
                 continue;
             }
-            if visited.len() >= RPROFILE_MAX_SOURCE_FILES {
+            if visited.len() >= crate::cross_file::source_detect::STATIC_SOURCE_MAX_FILES {
                 break;
             }
             if let Ok(sourced_text) = crate::state::read_source(&resolved) {
@@ -201,47 +195,6 @@ fn harvest_file(text: &str, scan: &mut RprofileScan) {
         scan.attached_packages
             .insert(crate::package_library::LOAD_ALL_SENTINEL.to_string());
     }
-}
-
-/// Statically-known `source()` target paths in `text` that contribute to the
-/// GLOBAL / script scope: literal paths plus computed paths folded by
-/// `cross_file::static_path` (`file.path()` of literals, `normalizePath()`
-/// wrappers, single-assignment variables — issue #638). Following folded
-/// computed profiles is intentional: folding is strict all-or-nothing over
-/// unconditional top-level bindings, so a folded path is the path R computes
-/// (modulo the documented `setwd()`/symlink blindness shared by all of
-/// Raven's static path analysis). Excludes:
-/// - `# raven:` directives (`is_directive`);
-/// - calls that do not inherit symbols — `source(..., local = TRUE)` and
-///   `sys.source(...)` without `envir = globalenv()` (`!inherits_symbols()`);
-/// - calls lexically inside a function body (`is_function_scoped`) — they only
-///   run when that function is invoked, so they are not load-time globals;
-/// - paths that are neither literal nor foldable (`detect_source_calls`
-///   yields an empty `path` for those).
-///
-/// `detect_source_calls` walks the WHOLE tree (not just top level), so these
-/// filters are load-bearing — without them a `.Rprofile` like
-/// `f <- function() source("dev.R")` would wrongly pull `dev.R` into the
-/// suppressive prelude.
-fn static_source_targets(text: &str) -> Vec<String> {
-    use tree_sitter::Parser;
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_r::LANGUAGE.into())
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(text, None) else {
-        return Vec::new();
-    };
-    crate::cross_file::source_detect::detect_source_calls(&tree, text)
-        .into_iter()
-        .filter(|s| {
-            !s.is_directive && s.inherits_symbols() && !s.is_function_scoped && !s.path.is_empty()
-        })
-        .map(|s| s.path)
-        .collect()
 }
 
 #[cfg(test)]

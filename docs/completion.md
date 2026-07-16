@@ -73,6 +73,8 @@ source("utils/  # Offers: utils/helpers.R, utils/config.R, ...
 
 Path completion respects `# raven: cd` and workspace-root fallback rules for forward directives (`# raven: source`, `# raven: run`, `# raven: include`) and `source()` calls. Backward directives (`# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`) still resolve relative to the file's directory.
 
+In files under `tests/testthat/` or `tests/testit/`, forward-path completion uses that test directory as its implicit working-directory anchor. For files nested below the anchor, Raven merges in entries from the file's own directory as a compatibility fallback; duplicate names appear once, with the anchor taking precedence. An explicit or inherited `# raven: cd` overrides these implicit completion bases.
+
 ## $ Member Completions
 
 After typing `foo$`, Raven offers known members of `foo`:

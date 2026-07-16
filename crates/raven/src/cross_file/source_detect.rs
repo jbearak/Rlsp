@@ -12,6 +12,12 @@ use tree_sitter::{Node, Tree};
 use super::scope::FunctionScopeInterval;
 use super::types::{ForwardSource, byte_offset_to_utf16_column};
 
+/// Maximum depth followed by suppressive-only static source-closure scans.
+pub(crate) const STATIC_SOURCE_MAX_DEPTH: usize = 64;
+
+/// Maximum distinct files visited by one suppressive-only static source scan.
+pub(crate) const STATIC_SOURCE_MAX_FILES: usize = 1000;
+
 /// A statically-extracted `system.file(...)` call used as the path argument
 /// to `source()`. Contains the string-literal positional parts and the
 /// `package = "P"` value needed to resolve the path at analysis time.
@@ -151,10 +157,11 @@ pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
     log::trace!("Starting tree-sitter parsing for source() call detection");
     let mut sources = Vec::new();
     let root = tree.root_node();
-    // Single-assignment variable bindings for static path folding (issue
-    // #638): collected once per document, consulted per source() call.
-    let bindings = super::static_path::StaticBindings::collect(root, content);
-    visit_node(root, content, &bindings, &mut sources);
+    // Most documents have no source() call with a computed file argument.
+    // Delay the extra whole-tree binding walk until the first such argument;
+    // literal and system.file() sources never pay for it.
+    let mut bindings = None;
+    visit_node(root, root, content, &mut bindings, &mut sources);
     log::trace!(
         "Completed source() call detection, found {} calls",
         sources.len()
@@ -173,27 +180,60 @@ pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
     sources
 }
 
-fn visit_node(
-    node: Node,
-    content: &str,
-    bindings: &super::static_path::StaticBindings,
+/// Return statically known `source()` targets that contribute symbols to the
+/// surrounding script scope.
+///
+/// This is the shared filter policy for `.Rprofile` and test-preamble closure
+/// scans. It accepts literal or strictly folded computed paths and excludes
+/// directives, non-inheriting calls, function-scoped calls, and unresolved
+/// paths. Keeping the parser and all filters here prevents the two suppressive
+/// scans from drifting as source detection evolves.
+pub(crate) fn static_source_targets(text: &str) -> Vec<String> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_r::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return Vec::new();
+    };
+    detect_source_calls(&tree, text)
+        .into_iter()
+        .filter(|source| {
+            !source.is_directive
+                && source.inherits_symbols()
+                && !source.is_function_scoped
+                && !source.path.is_empty()
+        })
+        .map(|source| source.path)
+        .collect()
+}
+
+fn visit_node<'tree, 'text>(
+    node: Node<'tree>,
+    root: Node<'tree>,
+    content: &'text str,
+    bindings: &mut Option<super::static_path::StaticBindings<'tree, 'text>>,
     sources: &mut Vec<ForwardSource>,
 ) {
     if node.kind() == "call"
-        && let Some(source) = try_parse_source_call(node, content, bindings)
+        && let Some(source) = try_parse_source_call(node, root, content, bindings)
     {
         sources.push(source);
     }
 
     for child in node.children(&mut node.walk()) {
-        visit_node(child, content, bindings, sources);
+        visit_node(child, root, content, bindings, sources);
     }
 }
 
-fn try_parse_source_call(
-    node: Node,
-    content: &str,
-    bindings: &super::static_path::StaticBindings,
+fn try_parse_source_call<'tree, 'text>(
+    node: Node<'tree>,
+    root: Node<'tree>,
+    content: &'text str,
+    bindings: &mut Option<super::static_path::StaticBindings<'tree, 'text>>,
 ) -> Option<ForwardSource> {
     let func_node = node.child_by_field_name("function")?;
     let func_text = node_text(func_node, content);
@@ -220,7 +260,11 @@ fn try_parse_source_call(
     // If neither, statically fold computed path expressions —
     // file.path()/normalizePath()/single-assignment variables (issue #638).
     let path = if path.is_none() && system_file.is_none() {
-        value_node.and_then(|v| super::static_path::fold_string_expr(v, content, bindings))
+        value_node.and_then(|value| {
+            let bindings = bindings
+                .get_or_insert_with(|| super::static_path::StaticBindings::collect(root, content));
+            super::static_path::fold_string_expr(value, content, bindings)
+        })
     } else {
         path
     };
@@ -1393,224 +1437,30 @@ fn extract_package_value(node: Node, content: &str) -> Option<String> {
 use std::collections::HashMap;
 
 /// Information collected for an identifier appearing on the LHS of any
-/// binding form (assignment operator, `assign("name", ...)` call, or function
-/// parameter) anywhere in the file. Used by apply-family detection to resolve
-/// X arguments that are variable references.
+/// binding form anywhere in the file. Used by apply-family and targets
+/// detection to resolve package-vector arguments that are variable references.
 ///
-/// `assignment_count` increments for *every* binding form: `<-`, `=`, `<<-`,
-/// `->`, `->>`, `assign(...)`, and function parameters. Only `<-`, `=`, or
-/// `assign("name", ...)` whose RHS is a `c(...)` of string literals populates
-/// `static_packages`.
-#[derive(Debug, Default)]
-struct VarBinding {
-    assignment_count: u32,
-    /// `(packages, byte_offset_of_assignment_node)` from the first supported,
-    /// statically-resolved assignment.
-    static_packages: Option<(Vec<String>, usize)>,
-}
-
-impl VarBinding {
-    /// Return packages iff `count == 1`, we extracted a static c-of-strings,
-    /// and that assignment started before `before_byte`.
-    fn resolved_before(&self, before_byte: usize) -> Option<&[String]> {
-        if self.assignment_count != 1 {
-            return None;
-        }
-        let (pkgs, off) = self.static_packages.as_ref()?;
-        if *off < before_byte {
-            Some(pkgs.as_slice())
-        } else {
-            None
-        }
-    }
-}
+/// Binding counts and `assign()` matching come from the same collector used
+/// by static path folding. Only the candidate payload differs: here it is a
+/// strict `c()` of string literals from `<-`, `=`, or `assign()`.
+type VarBinding = super::binding::Binding<Vec<String>>;
 
 fn collect_var_bindings(root: Node, content: &str) -> HashMap<String, VarBinding> {
-    let mut map: HashMap<String, VarBinding> = HashMap::new();
-    visit_var_bindings(root, content, &mut map);
-    map
-}
+    use super::binding::{AssignmentOperator, BindingSite};
 
-fn visit_var_bindings(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
-    match node.kind() {
-        "binary_operator" => record_binary_assignment(node, content, map),
-        "call" => record_assign_call(node, content, map),
-        "function_definition" => record_function_params(node, content, map),
-        _ => {}
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        visit_var_bindings(child, content, map);
-    }
-}
-
-fn record_binary_assignment(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
-    let mut cursor = node.walk();
-    let named: Vec<Node> = node
-        .children(&mut cursor)
-        .filter(|c| c.is_named())
-        .collect();
-    if named.len() != 2 {
-        return;
-    }
-    let mut op_walker = node.walk();
-    let op_text = node.children(&mut op_walker).find_map(|c| {
-        let t = node_text(c, content);
-        if matches!(t, "<-" | "=" | "<<-" | "->" | "->>") {
-            Some(t.to_string())
-        } else {
-            None
-        }
-    });
-    drop(op_walker);
-    let Some(op) = op_text else { return };
-
-    let (name_node, value_node) = match op.as_str() {
-        "<-" | "=" | "<<-" => (named[0], named[1]),
-        "->" | "->>" => (named[1], named[0]),
-        _ => return,
-    };
-    if name_node.kind() != "identifier" {
-        return;
-    }
-    let name = node_text(name_node, content).to_string();
-    let entry = map.entry(name).or_default();
-    entry.assignment_count = entry.assignment_count.saturating_add(1);
-
-    if matches!(op.as_str(), "<-" | "=")
-        && let Some(packages) = extract_c_strings_strict(value_node, content)
-        && entry.static_packages.is_none()
-    {
-        entry.static_packages = Some((packages, node.start_byte()));
-    }
-}
-
-/// Returns true if `name` is a non-empty prefix of `assign()`'s `value`
-/// formal that is *not* also a prefix of any other formal — i.e. an
-/// unambiguous partial match for `value`. Excludes the exact name "value"
-/// itself; that's handled by the exact-match pass.
-fn is_partial_prefix_of_value(name: &str) -> bool {
-    if name.is_empty() || name == "value" {
-        return false;
-    }
-    if !"value".starts_with(name) {
-        return false;
-    }
-    // assign()'s other formals: x, pos, envir, inherits, immediate.
-    // (`x` is a single character so partial-matching `x` just means name == "x".)
-    !"x".starts_with(name)
-        && !"pos".starts_with(name)
-        && !"envir".starts_with(name)
-        && !"inherits".starts_with(name)
-        && !"immediate".starts_with(name)
-}
-
-fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
-    let Some(func_node) = node.child_by_field_name("function") else {
-        return;
-    };
-    if node_text(func_node, content) != "assign" {
-        return;
-    }
-    let Some(args_node) = node.child_by_field_name("arguments") else {
-        return;
-    };
-    if args_node.has_error() {
-        return;
-    }
-
-    // Bucketize args. R argument matching is two passes (exact, then partial)
-    // followed by positional fill. We only track the `x` and `value` formals
-    // — other formals (`pos`/`envir`/`inherits`/`immediate`) and unknown
-    // names are ignored and don't consume positional slots.
-    let mut exact_x: Vec<Node> = Vec::new();
-    let mut exact_value: Vec<Node> = Vec::new();
-    let mut partial_to_value: Vec<Node> = Vec::new();
-    let mut positional: Vec<Node> = Vec::new();
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        if child.kind() != "argument" {
-            continue;
-        }
-        let Some(value) = child.child_by_field_name("value") else {
-            continue;
+    super::binding::collect_bindings(root, content, |site| {
+        let value = match site {
+            BindingSite::Binary {
+                target,
+                value,
+                operator: AssignmentOperator::Left | AssignmentOperator::Equals,
+                ..
+            } if target.kind() == "identifier" => value?,
+            BindingSite::AssignCall { value, .. } => value?,
+            _ => return None,
         };
-        if let Some(name_node) = child.child_by_field_name("name") {
-            let arg_name = node_text(name_node, content);
-            if arg_name == "x" {
-                exact_x.push(value);
-            } else if arg_name == "value" {
-                exact_value.push(value);
-            } else if is_partial_prefix_of_value(arg_name) {
-                partial_to_value.push(value);
-            }
-        } else {
-            positional.push(value);
-        }
-    }
-
-    // If any of the rules R uses would error — duplicate exact, multiple
-    // partials matching the same formal, or a partial colliding with an exact
-    // — the call itself errors and never assigns. Skip the call entirely so
-    // we don't record a static binding R never produced.
-    let value_collision = (exact_value.len() == 1 && !partial_to_value.is_empty())
-        || exact_value.len() > 1
-        || partial_to_value.len() > 1;
-    if exact_x.len() > 1 || value_collision {
-        return;
-    }
-
-    // Resolve x (exact > positional[0]) and value (exact > partial > next
-    // positional after x).
-    let x_value = exact_x
-        .first()
-        .copied()
-        .or_else(|| positional.first().copied());
-    let value_node = exact_value
-        .first()
-        .copied()
-        .or_else(|| partial_to_value.first().copied())
-        .or_else(|| {
-            let next_idx = if exact_x.is_empty() { 1 } else { 0 };
-            positional.get(next_idx).copied()
-        });
-
-    let Some(x_value) = x_value else { return };
-    let Some(name) = extract_string_literal(x_value, content) else {
-        return;
-    };
-
-    let entry = map.entry(name).or_default();
-    entry.assignment_count = entry.assignment_count.saturating_add(1);
-    if let Some(value_node) = value_node
-        && let Some(packages) = extract_c_strings_strict(value_node, content)
-        && entry.static_packages.is_none()
-    {
-        entry.static_packages = Some((packages, node.start_byte()));
-    }
-}
-
-fn record_function_params(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
-    let parameters = match node.child_by_field_name("parameters") {
-        Some(n) => n,
-        None => return,
-    };
-    let mut cursor = parameters.walk();
-    for child in parameters.children(&mut cursor) {
-        if child.kind() != "parameter" {
-            continue;
-        }
-        let mut param_cursor = child.walk();
-        let Some(ident) = child
-            .children(&mut param_cursor)
-            .find(|c| c.kind() == "identifier")
-        else {
-            continue;
-        };
-        let name = node_text(ident, content).to_string();
-        let entry = map.entry(name).or_default();
-        entry.assignment_count = entry.assignment_count.saturating_add(1);
-    }
+        extract_c_strings_strict(value, content)
+    })
 }
 
 /// Apply-family functions whose bare-identifier form may load packages
@@ -2451,6 +2301,21 @@ source("b.R")"#;
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 1);
         assert!(sources[0].is_function_scoped);
+    }
+
+    #[test]
+    fn static_source_targets_applies_all_scope_filters() {
+        let code = r#"
+source("global.R")
+source(file.path("computed", "helper.R"))
+source("local.R", local = TRUE)
+sys.source("base.R")
+f <- function() source("deferred.R")
+"#;
+        assert_eq!(
+            static_source_targets(code),
+            vec!["global.R", "computed/helper.R"]
+        );
     }
 
     #[test]
@@ -3579,6 +3444,32 @@ library(ggplot2)"#;
     }
 
     #[test]
+    fn test_apply_var_shared_binding_invalidators_disqualify() {
+        // These forms were already load-bearing invalidators for static path
+        // folding. Package-vector detection must count the same bindings so
+        // the two consumers cannot drift back to stale single-assignment data.
+        for mutation in [
+            "libs[1] <- \"tidyr\"",
+            "names(libs) <- \"package\"",
+            "rm(libs)",
+            "for (libs in list(c(\"tidyr\"))) {}",
+            "libs %<>% identity()",
+            "\"libs\" <- c(\"tidyr\")",
+            "libs <- # changed\n  c(\"tidyr\")",
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{mutation}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "mutation `{mutation}` left a stale package candidate: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_apply_dynamic_x_paste0_skipped() {
         let code = r#"sapply(paste0("dp", "lyr"), library, character.only = TRUE)"#;
         let tree = parse_r(code);
@@ -3785,6 +3676,26 @@ library(ggplot2)"#;
         assert_eq!(lib_calls.len(), 0);
     }
 
+    #[test]
+    fn test_apply_var_assign_rejects_errors_in_other_formals() {
+        // assign() has no `...`: an unknown name, an ambiguous partial name,
+        // or a duplicate non-x/value formal errors before the binding occurs.
+        for args in [
+            r#"x = "libs", value = c("dplyr"), bogus = 1"#,
+            r#"x = "libs", value = c("dplyr"), i = TRUE"#,
+            r#"x = "libs", value = c("dplyr"), pos = 1, pos = 2"#,
+            r#""libs", c("dplyr"), , , , , 1"#,
+        ] {
+            let code = format!("assign({args})\nsapply(libs, library, character.only = TRUE)");
+            let tree = parse_r(&code);
+            let lib_calls = detect_library_calls(&tree, &code);
+            assert!(
+                lib_calls.is_empty(),
+                "unexpected calls for {args}: {lib_calls:?}"
+            );
+        }
+    }
+
     // ==================== tar_option_set package detection (#637) ====================
 
     /// Convenience: the detected calls minus the `targets` load itself.
@@ -3885,6 +3796,12 @@ library(ggplot2)"#;
         assert_eq!(calls[0].column, calls[1].column);
         let call_len = "tar_option_set(packages = pkgs)".len() as u32;
         assert_eq!(calls[0].column, call_len);
+    }
+
+    #[test]
+    fn test_tar_option_set_var_replacement_binding_disqualifies() {
+        let code = "library(targets)\npkgs <- c(\"dplyr\")\npkgs[1] <- \"tidyr\"\ntar_option_set(packages = pkgs)";
+        assert!(tar_calls(code).is_empty());
     }
 
     #[test]

@@ -25,13 +25,18 @@
 //! changes in an open buffer or on disk. The per-preamble source-file index
 //! lets watched changes rescan only closures that contain the affected path.
 
+use ropey::Rope;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tower_lsp::lsp_types::Url;
 
 /// Authoritative in-memory text keyed by lexical or canonical file path.
-pub(crate) type PreambleTextOverrides = BTreeMap<PathBuf, Arc<str>>;
+///
+/// Values remain as cheaply cloned ropes while the world-state lock is held;
+/// [`read_source_with_overrides`] materializes only paths the preamble scan
+/// actually reaches. This preserves unsaved newly referenced/transitive
+/// helpers without flattening every unrelated open document during snapshot.
+pub(crate) type PreambleTextOverrides = BTreeMap<PathBuf, Rope>;
 
 /// Result of scanning every testthat preamble file's sourced closure.
 /// Maps are keyed by the preamble file's path exactly as tracked in
@@ -56,11 +61,51 @@ pub struct PreambleScan {
     pub sourced_files_by_preamble: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
 }
 
-/// Maximum depth of `source()` chains followed out of one preamble file.
-const PREAMBLE_MAX_SOURCE_DEPTH: usize = 64;
-/// Maximum number of distinct files visited per preamble (cycle + fan-out
-/// guard).
-const PREAMBLE_MAX_SOURCE_FILES: usize = 1000;
+impl PreambleScan {
+    /// Snapshot the four preamble-routing fields from live package inputs.
+    ///
+    /// Keep this constructor as the single mapping between `PackageInputs`
+    /// and the scan representation: async callers use it before dropping the
+    /// state lock, while synchronous event translation uses it as the base for
+    /// an in-lock incremental rescan.
+    pub(crate) fn snapshot(inputs: &super::PackageInputs) -> Self {
+        Self {
+            symbols: inputs.preamble_sourced_symbols.clone(),
+            attached_packages: inputs.preamble_sourced_attached_packages.clone(),
+            sourced_files: inputs.preamble_sourced_files.clone(),
+            sourced_files_by_preamble: inputs.preamble_sourced_files_by_preamble.clone(),
+        }
+    }
+
+    /// Compare a completed scan to live inputs without cloning the inputs.
+    pub(crate) fn matches_inputs(&self, inputs: &super::PackageInputs) -> bool {
+        self.symbols == inputs.preamble_sourced_symbols
+            && self.attached_packages == inputs.preamble_sourced_attached_packages
+            && self.sourced_files == inputs.preamble_sourced_files
+            && self.sourced_files_by_preamble == inputs.preamble_sourced_files_by_preamble
+    }
+
+    /// Whether every preamble recomputed by this scan already matches live
+    /// package inputs.
+    ///
+    /// Async rescans call this under the write lock before snapshotting the
+    /// four full maps. Only `rescanned` keys may be installed, so equality for
+    /// those keys is enough to prove the derived `sourced_files` union is also
+    /// unchanged; unrelated live preamble entries are deliberately ignored.
+    pub(crate) fn rescanned_match_inputs(
+        &self,
+        rescanned: &BTreeSet<PathBuf>,
+        inputs: &super::PackageInputs,
+    ) -> bool {
+        rescanned.iter().all(|preamble| {
+            self.symbols.get(preamble) == inputs.preamble_sourced_symbols.get(preamble)
+                && self.attached_packages.get(preamble)
+                    == inputs.preamble_sourced_attached_packages.get(preamble)
+                && self.sourced_files_by_preamble.get(preamble)
+                    == inputs.preamble_sourced_files_by_preamble.get(preamble)
+        })
+    }
+}
 
 /// Synchronously scan every `helper*.R`/`setup*.R` direct child of
 /// `<workspace_root>/tests/testthat/`, following each one's transitive static
@@ -93,13 +138,13 @@ pub(crate) fn scan_testthat_preambles_with_overrides_and_exclusions(
         .flatten()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.is_file() && is_testthat_preamble_path(p, workspace_root))
+        .filter(|p| p.is_file())
+        .filter_map(|p| lexical_testthat_preamble_path(&p, workspace_root))
         .collect();
     preamble_paths.extend(
         overrides
             .keys()
-            .filter(|p| is_testthat_preamble_path(p, workspace_root))
-            .cloned(),
+            .filter_map(|p| lexical_testthat_preamble_path(p, workspace_root)),
     );
     preamble_paths.sort();
     preamble_paths.dedup();
@@ -136,15 +181,19 @@ pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
 ) -> (PreambleScan, BTreeSet<PathBuf>) {
     let mut scan = previous.clone();
     let workspace_url = Url::from_file_path(workspace_root).ok();
-    let canonical_affected: Vec<PathBuf> = affected_paths
+    let routing_affected: BTreeSet<PathBuf> = affected_paths
         .iter()
-        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .map(|path| canonicalize_for_routing(path))
         .collect();
+    // Preamble keys are lexical workspace-root paths. Canonicalize the root
+    // once, then derive every key's routing spelling by relative join instead
+    // of issuing one `canonicalize()` syscall per known preamble per rescan.
+    let routing_workspace_root = canonicalize_for_routing(workspace_root);
     let mut affected_preambles = BTreeSet::new();
 
     for path in affected_paths {
-        if is_testthat_preamble_path(path, workspace_root) {
-            affected_preambles.insert(path.clone());
+        if let Some(preamble) = lexical_testthat_preamble_path(path, workspace_root) {
+            affected_preambles.insert(preamble);
         }
     }
     for preamble in previous
@@ -153,13 +202,16 @@ pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
         .chain(previous.attached_packages.keys())
         .chain(previous.sourced_files_by_preamble.keys())
     {
-        let canonical_preamble = preamble.canonicalize().unwrap_or_else(|_| preamble.clone());
-        if canonical_affected.contains(&canonical_preamble)
+        let routing_preamble = preamble
+            .strip_prefix(workspace_root)
+            .map(|relative| routing_workspace_root.join(relative))
+            .unwrap_or_else(|_| canonicalize_for_routing(preamble));
+        if routing_affected.contains(&routing_preamble)
             || previous
                 .sourced_files_by_preamble
                 .get(preamble)
                 .is_some_and(|files| {
-                    canonical_affected
+                    routing_affected
                         .iter()
                         .any(|affected| files.contains(affected))
                 })
@@ -191,40 +243,56 @@ pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
 /// callers whose scan ran off-lock against a snapshot: only the preambles the
 /// scan actually recomputed may overwrite live state.
 pub(crate) fn merge_rescanned_preambles(
-    current: &PreambleScan,
+    mut current: PreambleScan,
     scan: &PreambleScan,
     rescanned: &BTreeSet<PathBuf>,
 ) -> PreambleScan {
-    let mut merged = current.clone();
     for preamble in rescanned {
-        merged.symbols.remove(preamble);
-        merged.attached_packages.remove(preamble);
-        merged.sourced_files_by_preamble.remove(preamble);
+        current.symbols.remove(preamble);
+        current.attached_packages.remove(preamble);
+        current.sourced_files_by_preamble.remove(preamble);
         if let Some(symbols) = scan.symbols.get(preamble) {
-            merged.symbols.insert(preamble.clone(), symbols.clone());
+            current.symbols.insert(preamble.clone(), symbols.clone());
         }
         if let Some(attached) = scan.attached_packages.get(preamble) {
-            merged
+            current
                 .attached_packages
                 .insert(preamble.clone(), attached.clone());
         }
         if let Some(files) = scan.sourced_files_by_preamble.get(preamble) {
-            merged
+            current
                 .sourced_files_by_preamble
                 .insert(preamble.clone(), files.clone());
         }
     }
-    rebuild_sourced_files_union(&mut merged);
-    merged
+    rebuild_sourced_files_union(&mut current);
+    current
 }
 
 pub(crate) fn is_testthat_preamble_path(path: &Path, workspace_root: &Path) -> bool {
+    lexical_testthat_preamble_path(path, workspace_root).is_some()
+}
+
+/// Normalize a recognized preamble root to the workspace's lexical spelling.
+///
+/// Open-document aliases can present a preamble through a canonical path while
+/// the package scanner discovers it through a symlinked workspace root. Scope
+/// maps must use the lexical root-joined spelling (to join `r_files`), so this
+/// is the boundary where both spellings collapse to one key.
+fn lexical_testthat_preamble_path(path: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    if !name.to_str().is_some_and(super::is_test_preamble_filename) {
+        return None;
+    }
     let preamble_dir = workspace_root.join("tests/testthat");
-    path.parent() == Some(preamble_dir.as_path())
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(super::is_test_preamble_filename)
+    let parent = path.parent()?;
+    if parent == preamble_dir
+        || canonicalize_for_routing(parent) == canonicalize_for_routing(&preamble_dir)
+    {
+        Some(preamble_dir.join(name))
+    } else {
+        None
+    }
 }
 
 fn scan_preamble_into(
@@ -234,6 +302,10 @@ fn scan_preamble_into(
     overrides: &PreambleTextOverrides,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) {
+    let preamble_path = workspace_url
+        .and_then(|url| url.to_file_path().ok())
+        .and_then(|root| lexical_testthat_preamble_path(&preamble_path, &root))
+        .unwrap_or(preamble_path);
     if !exclusions.is_empty() && exclusions.is_excluded_path(&preamble_path) {
         return;
     }
@@ -267,8 +339,8 @@ fn read_source_with_overrides(path: &Path, overrides: &PreambleTextOverrides) ->
     if let Some(text) = overrides.get(path) {
         return Some(text.to_string());
     }
-    let canonical = path.canonicalize().ok();
-    if let Some(text) = canonical.as_ref().and_then(|path| overrides.get(path)) {
+    let routing_path = canonicalize_for_routing(path);
+    if let Some(text) = overrides.get(&routing_path) {
         return Some(text.to_string());
     }
     crate::state::read_source(path).ok()
@@ -277,7 +349,7 @@ fn read_source_with_overrides(path: &Path, overrides: &PreambleTextOverrides) ->
 /// Stable watcher-routing spelling for an existing or currently missing path.
 /// Canonicalizing the parent preserves symlink identity across delete/create
 /// events even though the target itself cannot be canonicalized while absent.
-fn canonicalize_for_routing(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_for_routing(path: &Path) -> PathBuf {
     path.canonicalize()
         .unwrap_or_else(|_| match (path.parent(), path.file_name()) {
             (Some(parent), Some(name)) => parent
@@ -318,7 +390,9 @@ fn scan_one_preamble(
                 attached.insert(pkg);
             }
         }
-        if depth >= PREAMBLE_MAX_SOURCE_DEPTH || visited.len() >= PREAMBLE_MAX_SOURCE_FILES {
+        if depth >= crate::cross_file::source_detect::STATIC_SOURCE_MAX_DEPTH
+            || visited.len() >= crate::cross_file::source_detect::STATIC_SOURCE_MAX_FILES
+        {
             continue;
         }
         let Ok(file_uri) = Url::from_file_path(&path) else {
@@ -335,7 +409,7 @@ fn scan_one_preamble(
         ) else {
             continue;
         };
-        for target in static_source_targets(&text) {
+        for target in crate::cross_file::source_detect::static_source_targets(&text) {
             let Some(resolved) =
                 crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
                     &target, &ctx,
@@ -355,7 +429,7 @@ fn scan_one_preamble(
             // Insert before the cap check so the target that lands exactly on
             // the cap keeps its routing entry (only its expansion is dropped).
             sourced.insert(routing_path);
-            if visited.len() >= PREAMBLE_MAX_SOURCE_FILES {
+            if visited.len() >= crate::cross_file::source_detect::STATIC_SOURCE_MAX_FILES {
                 break;
             }
             if let Some(sourced_text) = read_source_with_overrides(&resolved, overrides) {
@@ -364,30 +438,6 @@ fn scan_one_preamble(
         }
     }
     (symbols, attached, sourced)
-}
-
-/// Statically-known symbol-contributing `source()` targets in `text` — same
-/// filters as the `.Rprofile` scan's `static_source_targets` (non-directive,
-/// symbol-inheriting, not function-scoped, literal-or-folded path).
-fn static_source_targets(text: &str) -> Vec<String> {
-    use tree_sitter::Parser;
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_r::LANGUAGE.into())
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(text, None) else {
-        return Vec::new();
-    };
-    crate::cross_file::source_detect::detect_source_calls(&tree, text)
-        .into_iter()
-        .filter(|s| {
-            !s.is_directive && s.inherits_symbols() && !s.is_function_scoped && !s.path.is_empty()
-        })
-        .map(|s| s.path)
-        .collect()
 }
 
 #[cfg(test)]
@@ -520,7 +570,7 @@ mod tests {
         rebuild_sourced_files_union(&mut scan);
 
         let rescanned = BTreeSet::from([preamble_a.clone()]);
-        let merged = merge_rescanned_preambles(&current, &scan, &rescanned);
+        let merged = merge_rescanned_preambles(current.clone(), &scan, &rescanned);
 
         assert_eq!(merged.symbols.get(&preamble_a), Some(&set("a_new")));
         assert_eq!(merged.symbols.get(&preamble_b), Some(&set("b_new")));
@@ -537,12 +587,90 @@ mod tests {
 
         // A rescanned preamble that vanished must be dropped by the graft.
         let gone = merge_rescanned_preambles(
-            &current,
+            current,
             &PreambleScan::default(),
             &BTreeSet::from([preamble_a.clone()]),
         );
         assert!(!gone.symbols.contains_key(&preamble_a));
         assert_eq!(gone.symbols.get(&preamble_b), Some(&set("b_new")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_override_keeps_lexical_preamble_key_under_symlinked_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real-pkg");
+        let linked_root = dir.path().join("linked-pkg");
+        std::fs::create_dir_all(real_root.join("tests/testthat")).unwrap();
+        std::fs::create_dir_all(real_root.join("scripts")).unwrap();
+        symlink(&real_root, &linked_root).unwrap();
+
+        let lexical_preamble = linked_root.join("tests/testthat/helper-project.R");
+        let real_preamble = real_root.join("tests/testthat/helper-project.R");
+        std::fs::write(&real_preamble, "source(\"../../scripts/on-disk.R\")\n").unwrap();
+        std::fs::write(real_root.join("scripts/on-disk.R"), "disk_def <- 1\n").unwrap();
+        std::fs::write(real_root.join("scripts/in-buffer.R"), "buffer_def <- 1\n").unwrap();
+        let canonical_preamble = real_preamble.canonicalize().unwrap();
+        // The buffer remains authoritative after an on-disk deletion. Its
+        // canonical alias must still route through the now-missing lexical
+        // symlink spelling.
+        std::fs::remove_file(&real_preamble).unwrap();
+
+        let overrides = PreambleTextOverrides::from([(
+            canonical_preamble.clone(),
+            Rope::from_str("source(\"../../scripts/in-buffer.R\")\n"),
+        )]);
+        let scan = scan_testthat_preambles_with_overrides_and_exclusions(
+            &linked_root,
+            &overrides,
+            &no_exclusions(),
+        );
+
+        assert_eq!(scan.symbols.len(), 1, "duplicate preamble keys: {scan:?}");
+        let symbols = scan.symbols.get(&lexical_preamble).unwrap();
+        assert!(symbols.contains("buffer_def"), "got {symbols:?}");
+        assert!(!symbols.contains("disk_def"), "got {symbols:?}");
+        assert!(!scan.symbols.contains_key(&canonical_preamble));
+    }
+
+    #[test]
+    fn snapshot_matches_inputs_fieldwise() {
+        let preamble = PathBuf::from("/ws/tests/testthat/helper-project.R");
+        let mut inputs = crate::package_state::PackageInputs::default();
+        inputs
+            .preamble_sourced_symbols
+            .insert(preamble, BTreeSet::from(["helper".to_string()]));
+
+        let scan = PreambleScan::snapshot(&inputs);
+        assert!(scan.matches_inputs(&inputs));
+
+        inputs
+            .preamble_sourced_files
+            .insert(PathBuf::from("/ws/scripts/new.R"));
+        assert!(!scan.matches_inputs(&inputs));
+    }
+
+    #[test]
+    fn rescanned_match_ignores_unrelated_live_updates_but_detects_deletion() {
+        let rescanned = PathBuf::from("/ws/tests/testthat/helper-a.R");
+        let unrelated = PathBuf::from("/ws/tests/testthat/helper-b.R");
+        let mut inputs = crate::package_state::PackageInputs::default();
+        inputs
+            .preamble_sourced_symbols
+            .insert(rescanned.clone(), BTreeSet::from(["a".to_string()]));
+        let scan = PreambleScan::snapshot(&inputs);
+        let roots = BTreeSet::from([rescanned.clone()]);
+
+        inputs.preamble_sourced_symbols.insert(
+            unrelated,
+            BTreeSet::from(["new concurrent value".to_string()]),
+        );
+        assert!(scan.rescanned_match_inputs(&roots, &inputs));
+
+        inputs.preamble_sourced_symbols.remove(&rescanned);
+        assert!(!scan.rescanned_match_inputs(&roots, &inputs));
     }
 
     #[test]
@@ -597,9 +725,9 @@ mod tests {
         let overrides = PreambleTextOverrides::from([
             (
                 preamble.clone(),
-                Arc::<str>::from("source(\"../../scripts/b.R\")\n"),
+                Rope::from_str("source(\"../../scripts/b.R\")\n"),
             ),
-            (helper_b.clone(), Arc::<str>::from("buffer_b <- 1\n")),
+            (helper_b.clone(), Rope::from_str("buffer_b <- 1\n")),
         ]);
 
         let scan = scan_testthat_preambles_with_overrides_and_exclusions(

@@ -32,23 +32,6 @@ use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
-/// Per-name binding facts collected in one whole-tree walk.
-struct BindingInfo<'a> {
-    /// Number of binding forms targeting this name anywhere in the file:
-    /// `<-`, `=`, `<<-`, `->`, `->>`, `assign("name", ...)`, function
-    /// parameters, and `for`-loop variables. Any count other than exactly 1
-    /// disqualifies the name from folding.
-    binding_count: u32,
-    /// The RHS node and start byte of the assignment, populated only when the
-    /// binding is an *unconditional top-level* `<-`/`=` with a bare
-    /// identifier LHS (a direct child of the `program` node — never inside a
-    /// function, `if`/`for`/`while`/`repeat`, block, or call). Assignments in
-    /// conditional or function scope never execute unconditionally, so
-    /// treating them as file-level path constants could fabricate source
-    /// edges that hide real undefined-variable errors.
-    candidate: Option<(Node<'a>, usize)>,
-}
-
 /// Single-assignment variable bindings usable in static path folding,
 /// collected once per document from the full AST.
 ///
@@ -65,20 +48,30 @@ struct BindingInfo<'a> {
 /// use-site-independent), so a use-before-assignment site can never poison a
 /// later valid use. A separate `visiting` set guards against reference
 /// cycles.
-pub(crate) struct StaticBindings<'a> {
-    content: &'a str,
-    bindings: HashMap<String, BindingInfo<'a>>,
+pub(crate) struct StaticBindings<'tree, 'text> {
+    content: &'text str,
+    bindings: HashMap<String, super::binding::Binding<Node<'tree>>>,
     /// Memoized intrinsic fold of each candidate's RHS, keyed by name.
     memo: RefCell<HashMap<String, Option<String>>>,
     /// Names currently being folded (cycle guard).
     visiting: RefCell<HashSet<String>>,
 }
 
-impl<'a> StaticBindings<'a> {
+impl<'tree, 'text> StaticBindings<'tree, 'text> {
     /// Collect binding facts for the whole document rooted at `root`.
-    pub(crate) fn collect(root: Node<'a>, content: &'a str) -> Self {
-        let mut bindings: HashMap<String, BindingInfo<'a>> = HashMap::new();
-        collect_bindings(root, content, &mut bindings);
+    pub(crate) fn collect(root: Node<'tree>, content: &'text str) -> Self {
+        use super::binding::{AssignmentOperator, BindingSite};
+
+        let bindings = super::binding::collect_bindings(root, content, |site| match site {
+            BindingSite::Binary {
+                target,
+                value: Some(value),
+                operator: AssignmentOperator::Left | AssignmentOperator::Equals,
+                top_level: true,
+                ..
+            } if target.kind() == "identifier" => Some(value),
+            _ => None,
+        });
         Self {
             content,
             bindings,
@@ -93,13 +86,7 @@ impl<'a> StaticBindings<'a> {
     /// RHS is not foldable, or resolution would cycle.
     fn resolve(&self, name: &str, use_byte: usize) -> Option<String> {
         let info = self.bindings.get(name)?;
-        if info.binding_count != 1 {
-            return None;
-        }
-        let (rhs, assign_byte) = info.candidate?;
-        if assign_byte >= use_byte {
-            return None;
-        }
+        let rhs = *info.resolved_before(use_byte)?;
         // Use-site gate passed; the RHS fold itself is use-site-independent.
         if let Some(cached) = self.memo.borrow().get(name) {
             return cached.clone();
@@ -276,211 +263,6 @@ fn extract_plain_string(node: Node, content: &str) -> Option<String> {
         return None;
     }
     Some(inner.to_string())
-}
-
-/// Walk the whole tree recording every binding form per name. Only an
-/// unconditional top-level `<-`/`=` (direct child of `program`) with a bare
-/// identifier LHS becomes a fold candidate; every other form merely bumps the
-/// count (and thereby disqualifies the name when it targets a candidate).
-fn collect_bindings<'a>(node: Node<'a>, content: &str, map: &mut HashMap<String, BindingInfo<'a>>) {
-    match node.kind() {
-        "binary_operator" => record_assignment(node, content, map),
-        "call" => record_assign_call(node, content, map),
-        "function_definition" => record_function_params(node, content, map),
-        "for_statement" => record_for_variable(node, content, map),
-        _ => {}
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_bindings(child, content, map);
-    }
-}
-
-fn bump<'a, 'm>(
-    map: &'m mut HashMap<String, BindingInfo<'a>>,
-    name: &str,
-) -> &'m mut BindingInfo<'a> {
-    let entry = map.entry(name.to_string()).or_insert(BindingInfo {
-        binding_count: 0,
-        candidate: None,
-    });
-    entry.binding_count = entry.binding_count.saturating_add(1);
-    entry
-}
-
-fn record_assignment<'a>(
-    node: Node<'a>,
-    content: &str,
-    map: &mut HashMap<String, BindingInfo<'a>>,
-) {
-    // Resolve operands by grammar field, not by counting named children:
-    // tree-sitter-r attaches inline comments as *named* extras inside
-    // `binary_operator`, so an arity check would silently skip (and thereby
-    // fail to count) an assignment like `p <- # note\n "b.R"`.
-    let Some(op_node) = node.child_by_field_name("operator") else {
-        return;
-    };
-    let op = node_text(op_node, content);
-    let (target_field, value_field) = match op {
-        "<-" | "=" | "<<-" => ("lhs", "rhs"),
-        "->" | "->>" => ("rhs", "lhs"),
-        // Compound-assignment operators (`%<>%`, `:=`) rebind their LHS:
-        // count the binding so folding cannot use a stale value, but never
-        // record a candidate — the resulting value is not statically known.
-        "%<>%" | ":=" => {
-            if let Some(lhs) = node.child_by_field_name("lhs")
-                && let Some(name) = binding_target_name(lhs, content)
-            {
-                bump(map, &name);
-            }
-            return;
-        }
-        _ => return,
-    };
-    let Some(name_node) = node.child_by_field_name(target_field) else {
-        return;
-    };
-    let Some(name) = binding_target_name(name_node, content) else {
-        return;
-    };
-    // Bump before requiring a value node so an incomplete assignment still
-    // disqualifies the name rather than leaving a stale candidate foldable.
-    let entry = bump(map, &name);
-    let top_level = node.parent().is_some_and(|p| p.kind() == "program");
-    let Some(value_node) = node.child_by_field_name(value_field) else {
-        return;
-    };
-    if name_node.kind() == "identifier"
-        && matches!(op, "<-" | "=")
-        && top_level
-        && entry.candidate.is_none()
-    {
-        entry.candidate = Some((value_node, node.start_byte()));
-    }
-}
-
-/// Name bound by an assignment target: the root identifier of a bare or
-/// replacement target, or the literal content of a quoted-name target
-/// (`"p" <- ...` rebinds `p` just like `p <- ...`).
-fn binding_target_name(node: Node, content: &str) -> Option<String> {
-    if let Some(root) = replacement_root_identifier(node) {
-        return Some(node_text(root, content).to_string());
-    }
-    extract_plain_string(node, content)
-}
-
-/// Return the root identifier modified by an assignment target.
-///
-/// Bare identifiers are binding candidates. Replacement targets such as
-/// `p[1]`, `p[[1]]`, and `p$x` are not candidates, but still invalidate a
-/// previously collected `p` binding so folding cannot use a stale value.
-fn replacement_root_identifier(mut node: Node) -> Option<Node> {
-    loop {
-        match node.kind() {
-            "identifier" => return Some(node),
-            "subset" | "subset2" => node = node.child_by_field_name("function")?,
-            "extract_operator" => node = node.child_by_field_name("lhs")?,
-            "parenthesized_expression" => node = node.named_child(0)?,
-            // Replacement-function syntax (`names(p) <- value`,
-            // `attr(p, "x") <- value`) rebinds its first argument.
-            "call" => {
-                let args = node.child_by_field_name("arguments")?;
-                let mut cursor = args.walk();
-                let first = args
-                    .children(&mut cursor)
-                    .find(|child| child.kind() == "argument")?;
-                node = first.child_by_field_name("value")?;
-            }
-            _ => return None,
-        }
-    }
-}
-
-/// Record statically named mutation calls. `assign("name", ...)` targets a
-/// string-literal name (`x=` or first positional); `rm()` / `remove()` target
-/// bare identifiers or plain string literals. Dynamic name expressions are
-/// ignored, matching the apply-family `VarBinding` precedent.
-fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, BindingInfo>) {
-    let Some(func_node) = node.child_by_field_name("function") else {
-        return;
-    };
-    let func = node_text(func_node, content);
-    if !matches!(func, "assign" | "rm" | "remove") {
-        return;
-    }
-    let Some(args_node) = node.child_by_field_name("arguments") else {
-        return;
-    };
-    if matches!(func, "rm" | "remove") {
-        record_remove_call(args_node, content, map);
-        return;
-    }
-    let mut cursor = args_node.walk();
-    let mut name_value: Option<Node> = None;
-    for child in args_node.children(&mut cursor) {
-        if child.kind() != "argument" {
-            continue;
-        }
-        if let Some(name_node) = child.child_by_field_name("name") {
-            if node_text(name_node, content) == "x" {
-                name_value = child.child_by_field_name("value");
-                break;
-            }
-        } else if name_value.is_none() {
-            name_value = child.child_by_field_name("value");
-            break;
-        }
-    }
-    if let Some(value) = name_value
-        && let Some(name) = extract_plain_string(value, content)
-    {
-        bump(map, &name);
-    }
-}
-
-fn record_remove_call(args_node: Node, content: &str, map: &mut HashMap<String, BindingInfo>) {
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        if child.kind() != "argument" {
-            continue;
-        }
-        let named = child
-            .child_by_field_name("name")
-            .map(|name| node_text(name, content));
-        if named.is_some_and(|name| matches!(name, "pos" | "envir" | "inherits")) {
-            continue;
-        }
-        let Some(value) = child.child_by_field_name("value") else {
-            continue;
-        };
-        if value.kind() == "identifier" {
-            bump(map, node_text(value, content));
-        } else if let Some(name) = extract_plain_string(value, content) {
-            bump(map, &name);
-        }
-    }
-}
-
-fn record_function_params(node: Node, content: &str, map: &mut HashMap<String, BindingInfo>) {
-    let Some(params) = node.child_by_field_name("parameters") else {
-        return;
-    };
-    let mut cursor = params.walk();
-    for child in params.children(&mut cursor) {
-        if child.kind() == "parameter"
-            && let Some(name_node) = child.child_by_field_name("name")
-        {
-            bump(map, node_text(name_node, content));
-        }
-    }
-}
-
-fn record_for_variable(node: Node, content: &str, map: &mut HashMap<String, BindingInfo>) {
-    if let Some(var) = node.child_by_field_name("variable")
-        && var.kind() == "identifier"
-    {
-        bump(map, node_text(var, content));
-    }
 }
 
 fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
@@ -673,6 +455,19 @@ assign("p", "b.R")
 source(p)
 "#;
         assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn erroneous_assign_call_does_not_count_as_a_binding() {
+        // R rejects the exact+partial collision before assigning. The shared
+        // collector must apply the same argument-matching rule to path and
+        // package-vector candidates.
+        let code = r#"
+p <- "a.R"
+assign(x = "p", value = "b.R", val = "c.R")
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), Some("a.R".to_string()));
     }
 
     #[test]

@@ -175,6 +175,53 @@ impl PathContext {
             })
     }
 
+    /// Ordered base directories whose entries should be offered for an empty
+    /// forward path completion (`source("")` or a forward directive).
+    ///
+    /// This is the completion counterpart of forward path resolution's
+    /// working-directory precedence:
+    ///
+    /// - an explicit or inherited `# raven: cd` contributes only its pinned
+    ///   effective working directory;
+    /// - the implicit testthat/testit working directory contributes its anchor
+    ///   first, followed by the nested file's own directory as the
+    ///   compatibility fallback (when those differ), then the workspace-root
+    ///   fallback because the implicit tier deliberately does not count as a
+    ///   hard cd;
+    /// - otherwise the workspace root is the default completion base when it
+    ///   is available, preserving the workspace-root completion behavior for
+    ///   ordinary unannotated files; without one, the file's directory is used.
+    ///
+    /// Keeping this policy on `PathContext` prevents completion consumers from
+    /// re-deriving the explicit/inherited/implicit tier precedence from public
+    /// fields. The returned order is significant: callers must keep the first
+    /// entry when two bases contain the same completion name, matching the
+    /// resolver's exact-match precedence.
+    pub(crate) fn forward_completion_base_directories(&self) -> Vec<PathBuf> {
+        if self.cd_in_effect() {
+            return vec![self.effective_working_directory()];
+        }
+
+        if self.implicit_test_working_directory.is_some() {
+            let mut bases = vec![self.effective_working_directory()];
+            if let Some(file_dir) = self.implicit_wd_file_dir_fallback() {
+                bases.push(file_dir);
+            }
+            if let Some(workspace_root) = self.workspace_root.clone()
+                && !bases.contains(&workspace_root)
+            {
+                bases.push(workspace_root);
+            }
+            return bases;
+        }
+
+        vec![
+            self.workspace_root
+                .clone()
+                .unwrap_or_else(|| self.effective_working_directory()),
+        ]
+    }
+
     /// The file's own directory as a compatibility resolution base, `Some`
     /// only when the implicit testthat/testit working directory (issue #638)
     /// is what `effective_working_directory()` returns AND the file's own
@@ -1532,6 +1579,14 @@ mod tests {
             ctx.implicit_wd_file_dir_fallback(),
             Some(PathBuf::from("/proj/tests/testthat/fixtures"))
         );
+        assert_eq!(
+            ctx.forward_completion_base_directories(),
+            vec![
+                PathBuf::from("/proj/tests/testthat"),
+                PathBuf::from("/proj/tests/testthat/fixtures"),
+                PathBuf::from("/proj"),
+            ]
+        );
     }
 
     /// For a file directly in the anchor directory the compat fallback is
@@ -1561,6 +1616,10 @@ mod tests {
             PathBuf::from("/proj/data")
         );
         assert!(ctx.cd_in_effect());
+        assert_eq!(
+            ctx.forward_completion_base_directories(),
+            vec![PathBuf::from("/proj/data")]
+        );
     }
 
     /// An inherited cd also suppresses the implicit anchor.
@@ -1577,6 +1636,10 @@ mod tests {
         assert_eq!(
             ctx.effective_working_directory(),
             PathBuf::from("/proj/scripts")
+        );
+        assert_eq!(
+            ctx.forward_completion_base_directories(),
+            vec![PathBuf::from("/proj/scripts")]
         );
     }
 

@@ -170,6 +170,16 @@ Rough pipeline:
 4. Resolve scope at a position by traversing edges and applying call-site filtering
 5. Revalidate dependents on relevant changes (interface hash / edges / working directory changes)
 
+Package-state seeds follow the same snapshot/off-lock/install discipline as
+cross-file diagnostics. Callers snapshot authoritative open-buffer overlays
+under the `WorldState` lock, run DESCRIPTION/NAMESPACE, package-R, `.Rprofile`,
+and testthat-preamble scans off-lock through the shared package-seed helper,
+then install the completed seed under one write lock. After installation they
+refresh open preamble documents to close the snapshot-to-install race. Keep new
+seed inputs in that shared helper so startup, exclusion reloads, and package-mode
+rebuilds cannot drift or introduce blocking filesystem work under the state
+lock.
+
 ### Module map
 
 Key files under `crates/raven/src/cross_file/`:
@@ -180,6 +190,8 @@ Key files under `crates/raven/src/cross_file/`:
 - `path_resolve.rs` — Path resolution (forward vs backward invariant)
 - `revalidation.rs` — Real-time updates, diagnostics gating, debounce
 - `source_detect.rs` — AST-based detection of `source()`, `sys.source()`, and related calls
+- `binding.rs` — Shared conservative binding-count and `assign()` argument-matching walk used by static path and package-vector inference
+- `static_path.rs` — Strict folding of computed `source()` path expressions
 - `directive.rs` — Parsing of `# raven:` / `@lsp-` directive comments
 - `types.rs` — Shared types (`CrossFileMetadata`, `SymbolKind`, etc.)
 - `config.rs` — Cross-file configuration (cache sizes, debounce intervals, feature flags)

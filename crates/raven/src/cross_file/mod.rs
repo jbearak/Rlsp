@@ -4,6 +4,7 @@
 // Cross-file awareness for Rlsp
 //
 
+pub(crate) mod binding;
 pub mod cache;
 pub mod config;
 pub mod content_provider;
