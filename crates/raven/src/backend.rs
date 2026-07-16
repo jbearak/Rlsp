@@ -11397,30 +11397,62 @@ impl Backend {
         traversal_truncation: Arc<TraversalTruncationState>,
         root: std::path::PathBuf,
     ) {
-        let affected_paths: Vec<std::path::PathBuf> = {
-            let state = state_arc.read().await;
-            let mut paths: Vec<std::path::PathBuf> = state
-                .documents
-                .keys()
-                .filter(|uri| preamble_sourced_root_for_open_document(&state, uri).is_some())
-                .flat_map(|uri| file_paths_for_open_document(&state, uri))
-                .collect();
+        // Relevant-document snapshot: paths to refresh plus each contributing
+        // document's version, used below to detect a concurrent edit.
+        fn snapshot(
+            state: &WorldState,
+        ) -> (
+            Vec<std::path::PathBuf>,
+            std::collections::BTreeMap<Url, Option<i32>>,
+        ) {
+            let mut paths: Vec<std::path::PathBuf> = Vec::new();
+            let mut versions = std::collections::BTreeMap::new();
+            for (uri, document) in &state.documents {
+                if preamble_sourced_root_for_open_document(state, uri).is_none() {
+                    continue;
+                }
+                paths.extend(file_paths_for_open_document(state, uri));
+                versions.insert(uri.clone(), document.version);
+            }
             paths.sort();
             paths.dedup();
-            paths
-        };
-        if affected_paths.is_empty() {
-            return;
+            (paths, versions)
         }
-        Self::refresh_testthat_preambles_for_paths_with(
-            state_arc,
-            client,
-            traversal_truncation,
-            root,
-            affected_paths,
-            &std::collections::HashSet::new(),
-        )
-        .await;
+
+        // This runs OUTSIDE the serialized notification loop when called from
+        // the detached startup seeding task, so an inline did_change refresh
+        // for the same preamble can land between our scan and our graft — and
+        // our (older) result would overwrite it. There is no per-preamble
+        // versioning to order the two, so converge instead: after applying,
+        // re-check the relevant documents' versions and re-run if anything
+        // changed mid-flight. Bounded retries; every later did_change
+        // self-refreshes anyway, so the loop only has to win when the user
+        // has stopped typing.
+        for _attempt in 0..3 {
+            let (affected_paths, versions_before) = {
+                let state = state_arc.read().await;
+                snapshot(&state)
+            };
+            if affected_paths.is_empty() {
+                return;
+            }
+            Self::refresh_testthat_preambles_for_paths_with(
+                state_arc.clone(),
+                client.clone(),
+                traversal_truncation.clone(),
+                root.clone(),
+                affected_paths,
+                &std::collections::HashSet::new(),
+            )
+            .await;
+            let versions_after = {
+                let state = state_arc.read().await;
+                snapshot(&state).1
+            };
+            if versions_after == versions_before {
+                return;
+            }
+        }
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
