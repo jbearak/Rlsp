@@ -3408,8 +3408,33 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     // OFF-lock and pass it in; `raven check` / unit tests pass `None` and let
     // it scan inline. Gated on package mode — the harvested sets are only
     // consumed by the (package-mode-gated) scope contribution.
-    let preamble_scan =
-        if state.package_inputs.package_mode != crate::cross_file::config::PackageMode::Disabled {
+    //
+    // Buffer-authoritative guard, mirroring the `.Rprofile` one above: when a
+    // preamble or a member of its scanned closure is OPEN, the live-edit path
+    // (`refresh_testthat_preambles_for_paths`) owns these inputs with
+    // buffer-overlaid scans; a disk-only (re)seed — startup background scan
+    // completing late, or an exclusions/`packageMode` rebuild — must not
+    // clobber them and lose unsaved edits. When package mode is disabled the
+    // inputs are cleared regardless.
+    let package_mode_enabled =
+        state.package_inputs.package_mode != crate::cross_file::config::PackageMode::Disabled;
+    // Guard only when live state actually exists: a preamble opened before the
+    // very first seed (workspace_root was unset, so the did_open refresh was
+    // skipped) must not block the initial disk scan behind empty live inputs.
+    let live_preamble_state_exists = !state
+        .package_inputs
+        .preamble_sourced_files_by_preamble
+        .is_empty();
+    let preamble_closure_open = package_mode_enabled
+        && live_preamble_state_exists
+        && state
+            .documents
+            .keys()
+            .any(|u| preamble_sourced_root_for_open_document(state, u).is_some());
+    if preamble_closure_open {
+        // Buffer-authoritative: keep the live preamble inputs as-is.
+    } else {
+        let preamble_scan = if package_mode_enabled {
             precomputed_preamble_scan.unwrap_or_else(|| {
                 crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
                     &root, exclusions,
@@ -3418,11 +3443,12 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
         } else {
             crate::package_state::preamble::PreambleScan::default()
         };
-    state.package_inputs.preamble_sourced_symbols = preamble_scan.symbols;
-    state.package_inputs.preamble_sourced_attached_packages = preamble_scan.attached_packages;
-    state.package_inputs.preamble_sourced_files = preamble_scan.sourced_files;
-    state.package_inputs.preamble_sourced_files_by_preamble =
-        preamble_scan.sourced_files_by_preamble;
+        state.package_inputs.preamble_sourced_symbols = preamble_scan.symbols;
+        state.package_inputs.preamble_sourced_attached_packages = preamble_scan.attached_packages;
+        state.package_inputs.preamble_sourced_files = preamble_scan.sourced_files;
+        state.package_inputs.preamble_sourced_files_by_preamble =
+            preamble_scan.sourced_files_by_preamble;
+    }
 
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
@@ -11140,7 +11166,7 @@ impl Backend {
         };
         let root_for_scan = root.clone();
         let affected_for_scan = affected_paths.clone();
-        let Ok(scan) = tokio::task::spawn_blocking(move || {
+        let Ok((scan, rescanned)) = tokio::task::spawn_blocking(move || {
             crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
                 &root_for_scan,
                 &previous,
@@ -11153,13 +11179,20 @@ impl Backend {
         else {
             return;
         };
-        self.apply_testthat_preamble_rescan(scan, &root, &affected_paths, scheduled_uris)
-            .await;
+        self.apply_testthat_preamble_rescan(
+            scan,
+            rescanned,
+            &root,
+            &affected_paths,
+            scheduled_uris,
+        )
+        .await;
     }
 
     async fn apply_testthat_preamble_rescan(
         &self,
         scan: crate::package_state::preamble::PreambleScan,
+        rescanned: std::collections::BTreeSet<std::path::PathBuf>,
         root: &std::path::Path,
         affected_paths: &[std::path::PathBuf],
         scheduled_uris: &std::collections::HashSet<Url>,
@@ -11178,12 +11211,19 @@ impl Backend {
                     .preamble_sourced_files_by_preamble
                     .clone(),
             };
-            if current == scan {
+            // The scan ran off-lock against a snapshot; a concurrent writer
+            // (the spawned watched-file resync task) may have updated OTHER
+            // preambles since. Graft only the rescanned preambles' entries
+            // onto live state so those updates survive.
+            let merged = crate::package_state::preamble::merge_rescanned_preambles(
+                &current, &scan, &rescanned,
+            );
+            if current == merged {
                 return;
             }
             let Some(delta) = crate::package_state::event::apply_preamble_scan(
                 &mut state.package_inputs,
-                Some(scan),
+                Some(merged),
             ) else {
                 return;
             };

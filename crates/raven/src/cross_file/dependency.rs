@@ -44,6 +44,14 @@ use super::types::{CallSiteSpec, CrossFileMetadata};
 /// inheritance and returns the *direct parent's directory*. This breaks the loop while still
 /// allowing the child to inherit from its parent.
 ///
+/// # Implicit test working directory (issue #638)
+/// Every fallback that would return the parent's raw file directory (cycle,
+/// depth exhausted, metadata unavailable) instead returns `None` when the
+/// parent lies under `tests/testthat|testit/` — see
+/// `fallback_parent_directory`. The implicit anchor never propagates into
+/// sourced children, and these fallbacks must not reintroduce it as an
+/// inherited (hard) working directory while the parent is simply unindexed.
+///
 /// # Transitive Inheritance
 /// When the parent has an inherited_working_directory in its metadata (from its own parent),
 /// that value is used through PathContext::from_metadata. This enables transitive inheritance:
@@ -70,9 +78,7 @@ where
         );
         // In a cycle, still return the direct parent's directory so the child inherits from
         // its parent (not itself), while breaking the loop.
-        let parent_path = parent_uri.to_file_path().ok()?;
-        let parent_dir = parent_path.parent()?;
-        return Some(parent_dir.to_string_lossy().to_string());
+        return fallback_parent_directory(parent_uri, workspace_root);
     }
 
     // Add current URI to visited set before processing
@@ -85,9 +91,7 @@ where
             parent_uri
         );
         // Fall back to parent's directory when depth is exhausted
-        let parent_path = parent_uri.to_file_path().ok()?;
-        let parent_dir = parent_path.parent()?;
-        return Some(parent_dir.to_string_lossy().to_string());
+        return fallback_parent_directory(parent_uri, workspace_root);
     }
 
     // Try to get parent's metadata
@@ -119,28 +123,30 @@ where
         parent_uri
     );
 
-    // Convert parent URI to file path and get its directory
-    let parent_path = match parent_uri.to_file_path() {
-        Ok(path) => path,
-        Err(_) => {
-            log::trace!(
-                "Cannot convert parent URI to file path for WD inheritance: {}",
-                parent_uri
-            );
-            return None;
-        }
-    };
-    let parent_dir = match parent_path.parent() {
-        Some(dir) => dir,
-        None => {
-            log::trace!(
-                "Parent path has no parent directory: {}",
-                parent_path.display()
-            );
-            return None;
-        }
-    };
+    fallback_parent_directory(parent_uri, workspace_root)
+}
 
+/// The parent-directory fallback shared by the cycle, depth-exhausted, and
+/// metadata-unavailable branches above.
+///
+/// A parent under an implicit testthat/testit directory (issue #638) yields
+/// `None` instead: the anchor is a soft tier that must never propagate into
+/// sourced children, and the metadata-available branch already returns `None`
+/// for such a parent (no explicit/inherited cd), so returning the raw file
+/// directory here would hand the child a *hard* inherited cd — suppressing its
+/// workspace-root fallback — purely because the parent was not indexed yet.
+fn fallback_parent_directory(parent_uri: &Url, workspace_root: Option<&Url>) -> Option<String> {
+    let parent_path = parent_uri.to_file_path().ok()?;
+    let parent_dir = parent_path.parent()?;
+    if let Some(root) = workspace_root.and_then(|u| u.to_file_path().ok())
+        && crate::package_state::is_testthat_or_testit_test(&parent_path, &root)
+    {
+        log::trace!(
+            "Parent {} is under an implicit test working directory; not inheriting its directory",
+            parent_uri
+        );
+        return None;
+    }
     Some(parent_dir.to_string_lossy().to_string())
 }
 

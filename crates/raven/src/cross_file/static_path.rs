@@ -313,37 +313,60 @@ fn record_assignment<'a>(
     content: &str,
     map: &mut HashMap<String, BindingInfo<'a>>,
 ) {
-    let mut cursor = node.walk();
-    let named: Vec<Node> = node
-        .children(&mut cursor)
-        .filter(|c| c.is_named())
-        .collect();
-    if named.len() != 2 {
-        return;
-    }
-    let mut op_walker = node.walk();
-    let op = node.children(&mut op_walker).find_map(|c| {
-        let t = node_text(c, content);
-        matches!(t, "<-" | "=" | "<<-" | "->" | "->>").then(|| t.to_string())
-    });
-    let Some(op) = op else { return };
-    let (name_node, value_node) = match op.as_str() {
-        "<-" | "=" | "<<-" => (named[0], named[1]),
-        _ => (named[1], named[0]),
-    };
-    let Some(root_name_node) = replacement_root_identifier(name_node) else {
+    // Resolve operands by grammar field, not by counting named children:
+    // tree-sitter-r attaches inline comments as *named* extras inside
+    // `binary_operator`, so an arity check would silently skip (and thereby
+    // fail to count) an assignment like `p <- # note\n "b.R"`.
+    let Some(op_node) = node.child_by_field_name("operator") else {
         return;
     };
-    let name = node_text(root_name_node, content);
-    let entry = bump(map, name);
+    let op = node_text(op_node, content);
+    let (target_field, value_field) = match op {
+        "<-" | "=" | "<<-" => ("lhs", "rhs"),
+        "->" | "->>" => ("rhs", "lhs"),
+        // Compound-assignment operators (`%<>%`, `:=`) rebind their LHS:
+        // count the binding so folding cannot use a stale value, but never
+        // record a candidate — the resulting value is not statically known.
+        "%<>%" | ":=" => {
+            if let Some(lhs) = node.child_by_field_name("lhs")
+                && let Some(name) = binding_target_name(lhs, content)
+            {
+                bump(map, &name);
+            }
+            return;
+        }
+        _ => return,
+    };
+    let Some(name_node) = node.child_by_field_name(target_field) else {
+        return;
+    };
+    let Some(name) = binding_target_name(name_node, content) else {
+        return;
+    };
+    // Bump before requiring a value node so an incomplete assignment still
+    // disqualifies the name rather than leaving a stale candidate foldable.
+    let entry = bump(map, &name);
     let top_level = node.parent().is_some_and(|p| p.kind() == "program");
+    let Some(value_node) = node.child_by_field_name(value_field) else {
+        return;
+    };
     if name_node.kind() == "identifier"
-        && matches!(op.as_str(), "<-" | "=")
+        && matches!(op, "<-" | "=")
         && top_level
         && entry.candidate.is_none()
     {
         entry.candidate = Some((value_node, node.start_byte()));
     }
+}
+
+/// Name bound by an assignment target: the root identifier of a bare or
+/// replacement target, or the literal content of a quoted-name target
+/// (`"p" <- ...` rebinds `p` just like `p <- ...`).
+fn binding_target_name(node: Node, content: &str) -> Option<String> {
+    if let Some(root) = replacement_root_identifier(node) {
+        return Some(node_text(root, content).to_string());
+    }
+    extract_plain_string(node, content)
 }
 
 /// Return the root identifier modified by an assignment target.
@@ -694,6 +717,44 @@ source(p)
             let code = format!("p <- \"a.R\"\n{remove}\nsource(p)\n");
             assert_eq!(fold_last_source_arg(&code), None, "{remove}");
         }
+    }
+
+    #[test]
+    fn bails_on_reassignment_with_inline_comment() {
+        // tree-sitter-r attaches the comment as a named child of the
+        // binary_operator; an arity-based collector would skip the rebinding
+        // and wrongly fold to "a.R" while R sources "b.R".
+        let code = "p <- \"a.R\"\np <- # tweak\n  \"b.R\"\nsource(p)\n";
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn bails_on_quoted_name_reassignment() {
+        // `"p" <- "b.R"` rebinds `p` exactly like a bare-identifier LHS.
+        let code = r#"
+p <- "a.R"
+"p" <- "b.R"
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn bails_on_compound_assignment_pipe() {
+        let code = r#"
+p <- "a.R"
+p %<>% toupper()
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn bails_when_shadow_assignment_has_inline_comment() {
+        // The comment must not hide the shadowing of the folding helper.
+        let code =
+            "file.path <- # override\n  function(...) \"other.R\"\nsource(file.path(\"a.R\"))\n";
+        assert_eq!(fold_last_source_arg(code), None);
     }
 
     #[test]

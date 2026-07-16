@@ -1112,10 +1112,14 @@ fn extract_full_source_call_path(
     let node = find_deepest_node_at_point(root, point)?;
 
     // Walk up to the enclosing source()/sys.source() call. Deliberately NOT
-    // via find_string_in_source_call: the cursor may sit on any part of a
-    // computed file-argument expression (`file.path(repo_root, "x.R")` — the
-    // identifier, the callee, punctuation), not only inside a string
-    // (issue #638).
+    // via find_string_in_source_call: this extractor accepts a cursor on any
+    // part of a computed file-argument expression (`file.path(repo_root,
+    // "x.R")` — the identifier, the callee, punctuation), not only inside a
+    // string (issue #638). NOTE the production go-to-definition path reaches
+    // it only for string-literal cursors: `detect_file_path_context` gates on
+    // `is_source_call_string_context`, deliberately, so an identifier segment
+    // like `repo_root` keeps its ordinary go-to-definition to the variable's
+    // assignment instead of being shadowed by file-path navigation.
     let call_node = find_enclosing_source_call(node, content)?;
     let func_node = call_node.child_by_field_name("function")?;
     let is_sys_source = match node_text(func_node, content) {

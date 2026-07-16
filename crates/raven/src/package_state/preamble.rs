@@ -119,13 +119,21 @@ pub(crate) fn scan_testthat_preambles_with_overrides_and_exclusions(
 
 /// Refresh only preambles whose root or prior sourced closure intersects an
 /// affected path, retaining the prior results for all unrelated preambles.
+///
+/// Also returns the set of preamble roots that were rescanned (including ones
+/// that vanished and now contribute nothing). Callers that apply the result
+/// asynchronously (snapshot → off-lock scan → write-lock apply) must merge
+/// only those preambles' entries into the *live* state via
+/// [`merge_rescanned_preambles`] — wholesale-installing the returned scan
+/// would revert any concurrent update to an unrelated preamble (e.g. from the
+/// spawned watched-file resync task) back to its snapshot-time entries.
 pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
     workspace_root: &Path,
     previous: &PreambleScan,
     affected_paths: &[PathBuf],
     overrides: &PreambleTextOverrides,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
-) -> PreambleScan {
+) -> (PreambleScan, BTreeSet<PathBuf>) {
     let mut scan = previous.clone();
     let workspace_url = Url::from_file_path(workspace_root).ok();
     let canonical_affected: Vec<PathBuf> = affected_paths
@@ -160,20 +168,54 @@ pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
         }
     }
 
-    for preamble_path in affected_preambles {
-        scan.symbols.remove(&preamble_path);
-        scan.attached_packages.remove(&preamble_path);
-        scan.sourced_files_by_preamble.remove(&preamble_path);
+    for preamble_path in &affected_preambles {
+        scan.symbols.remove(preamble_path);
+        scan.attached_packages.remove(preamble_path);
+        scan.sourced_files_by_preamble.remove(preamble_path);
         scan_preamble_into(
             &mut scan,
-            preamble_path,
+            preamble_path.clone(),
             workspace_url.as_ref(),
             overrides,
             exclusions,
         );
     }
     rebuild_sourced_files_union(&mut scan);
-    scan
+    (scan, affected_preambles)
+}
+
+/// Graft the `rescanned` preambles' entries from `scan` onto `current`,
+/// leaving every other preamble's entries as they are in `current`, and
+/// rebuild the routing union. This is the write-lock-side companion of
+/// [`rescan_testthat_preambles_for_paths_with_overrides_and_exclusions`] for
+/// callers whose scan ran off-lock against a snapshot: only the preambles the
+/// scan actually recomputed may overwrite live state.
+pub(crate) fn merge_rescanned_preambles(
+    current: &PreambleScan,
+    scan: &PreambleScan,
+    rescanned: &BTreeSet<PathBuf>,
+) -> PreambleScan {
+    let mut merged = current.clone();
+    for preamble in rescanned {
+        merged.symbols.remove(preamble);
+        merged.attached_packages.remove(preamble);
+        merged.sourced_files_by_preamble.remove(preamble);
+        if let Some(symbols) = scan.symbols.get(preamble) {
+            merged.symbols.insert(preamble.clone(), symbols.clone());
+        }
+        if let Some(attached) = scan.attached_packages.get(preamble) {
+            merged
+                .attached_packages
+                .insert(preamble.clone(), attached.clone());
+        }
+        if let Some(files) = scan.sourced_files_by_preamble.get(preamble) {
+            merged
+                .sourced_files_by_preamble
+                .insert(preamble.clone(), files.clone());
+        }
+    }
+    rebuild_sourced_files_union(&mut merged);
+    merged
 }
 
 pub(crate) fn is_testthat_preamble_path(path: &Path, workspace_root: &Path) -> bool {
@@ -282,14 +324,13 @@ fn scan_one_preamble(
         let Ok(file_uri) = Url::from_file_path(&path) else {
             continue;
         };
-        // Forward-source resolution semantics: `from_metadata` with empty
-        // metadata gives the preamble its implicit testthat working directory
-        // (issue #638) and every file the workspace-root fallback. `# raven:
-        // cd` in sourced helpers is not honored here, matching the
+        // Forward-source resolution semantics: the metadata-less forward
+        // constructor gives the preamble its implicit testthat working
+        // directory (issue #638) and every file the workspace-root fallback.
+        // `# raven: cd` in sourced helpers is not honored here, matching the
         // `.Rprofile` scan's documented exception.
-        let Some(ctx) = crate::cross_file::path_resolve::PathContext::from_metadata(
+        let Some(ctx) = crate::cross_file::path_resolve::PathContext::forward_without_metadata(
             &file_uri,
-            &crate::cross_file::types::CrossFileMetadata::default(),
             workspace_url,
         ) else {
             continue;
@@ -309,12 +350,14 @@ fn scan_one_preamble(
             if !visited.insert(routing_path.clone()) {
                 continue;
             }
+            // Routing must survive a failed read: if this target is created
+            // later, its watcher event needs to find and rescan this preamble.
+            // Insert before the cap check so the target that lands exactly on
+            // the cap keeps its routing entry (only its expansion is dropped).
+            sourced.insert(routing_path);
             if visited.len() >= PREAMBLE_MAX_SOURCE_FILES {
                 break;
             }
-            // Routing must survive a failed read: if this target is created
-            // later, its watcher event needs to find and rescan this preamble.
-            sourced.insert(routing_path);
             if let Some(sourced_text) = read_source_with_overrides(&resolved, overrides) {
                 worklist.push((resolved, sourced_text, depth + 1, true));
             }
@@ -425,12 +468,17 @@ mod tests {
         // If the incremental path rebuilt every preamble, this unrelated
         // closure would disappear after its helper is removed.
         std::fs::remove_file(&helper_b).unwrap();
-        let scan = rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+        let (scan, rescanned) = rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
             root,
             &initial,
             std::slice::from_ref(&helper_a),
             &PreambleTextOverrides::new(),
             &no_exclusions(),
+        );
+        assert!(rescanned.contains(&preamble_a));
+        assert!(
+            !rescanned.contains(&preamble_b),
+            "unaffected preamble must not be reported as rescanned"
         );
 
         let symbols_a = scan.symbols.get(&preamble_a).unwrap();
@@ -442,6 +490,59 @@ mod tests {
                 .is_some_and(|symbols| symbols.contains("b_old")),
             "unaffected preamble must retain its previous closure"
         );
+    }
+
+    #[test]
+    fn merge_keeps_concurrent_updates_to_unrescanned_preambles() {
+        // Simulates the async refresh race: while preamble A's off-lock rescan
+        // was in flight (seeded from a snapshot), a watched-file event updated
+        // preamble B in live state. Grafting only A must keep B's live update.
+        let preamble_a = PathBuf::from("/ws/tests/testthat/helper-a.R");
+        let preamble_b = PathBuf::from("/ws/tests/testthat/helper-b.R");
+        let set = |s: &str| BTreeSet::from([s.to_string()]);
+        let files = |p: &str| BTreeSet::from([PathBuf::from(p)]);
+
+        // Live state: B already carries its concurrent (post-snapshot) update.
+        let mut current = PreambleScan::default();
+        current.symbols.insert(preamble_a.clone(), set("a_old"));
+        current.symbols.insert(preamble_b.clone(), set("b_new"));
+        current
+            .sourced_files_by_preamble
+            .insert(preamble_b.clone(), files("/ws/scripts/b_new.R"));
+        rebuild_sourced_files_union(&mut current);
+
+        // Off-lock scan result: fresh A, but B frozen at snapshot time.
+        let mut scan = PreambleScan::default();
+        scan.symbols.insert(preamble_a.clone(), set("a_new"));
+        scan.symbols.insert(preamble_b.clone(), set("b_stale"));
+        scan.sourced_files_by_preamble
+            .insert(preamble_b.clone(), files("/ws/scripts/b_stale.R"));
+        rebuild_sourced_files_union(&mut scan);
+
+        let rescanned = BTreeSet::from([preamble_a.clone()]);
+        let merged = merge_rescanned_preambles(&current, &scan, &rescanned);
+
+        assert_eq!(merged.symbols.get(&preamble_a), Some(&set("a_new")));
+        assert_eq!(merged.symbols.get(&preamble_b), Some(&set("b_new")));
+        assert!(
+            merged
+                .sourced_files
+                .contains(&PathBuf::from("/ws/scripts/b_new.R"))
+        );
+        assert!(
+            !merged
+                .sourced_files
+                .contains(&PathBuf::from("/ws/scripts/b_stale.R"))
+        );
+
+        // A rescanned preamble that vanished must be dropped by the graft.
+        let gone = merge_rescanned_preambles(
+            &current,
+            &PreambleScan::default(),
+            &BTreeSet::from([preamble_a.clone()]),
+        );
+        assert!(!gone.symbols.contains_key(&preamble_a));
+        assert_eq!(gone.symbols.get(&preamble_b), Some(&set("b_new")));
     }
 
     #[test]
@@ -466,7 +567,7 @@ mod tests {
         assert!(!initial.symbols.contains_key(&preamble));
 
         std::fs::write(&helper, "created_def <- 1\n").unwrap();
-        let scan = rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+        let (scan, _) = rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
             root,
             &initial,
             std::slice::from_ref(&helper),

@@ -114,7 +114,7 @@ files matching `^setup.*\.[Rr]$` the same way. Raven mirrors this:
   `repo_root <- normalizePath(file.path("..", ".."))` — become visible to
   sibling test files the same way the helper's own defs do. Relative paths
   anchor at `tests/testthat/` (the [implicit testthat working
-  directory](cross-file.md#implicit-testthat-testit-working-directory)), and
+  directory](cross-file.md#implicit-testthattestit-working-directory)), and
   the scan refreshes from authoritative open buffers as the helper or a
   sourced file changes, then returns to disk state when the file closes.
 

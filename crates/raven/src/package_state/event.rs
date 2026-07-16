@@ -250,6 +250,10 @@ fn rescan_preamble_for_path(
     if canonical_path != path {
         affected_paths.push(canonical_path.to_path_buf());
     }
+    // Synchronous caller: `current_preamble_scan(inputs)` is read under the
+    // same lock the result is applied under, so no concurrent update can slip
+    // between snapshot and apply — installing the whole scan is safe and the
+    // rescanned-preamble set is not needed.
     super::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
         root,
         &current_preamble_scan(inputs),
@@ -257,6 +261,7 @@ fn rescan_preamble_for_path(
         &super::preamble::PreambleTextOverrides::new(),
         exclusions,
     )
+    .0
 }
 
 /// If `canonical_path` is a file that `.Rprofile` transitively `source()`s (and
