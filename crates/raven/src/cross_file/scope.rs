@@ -1432,10 +1432,10 @@ fn resolve_forward_child_memoized(
 
 /// Determine whether a `source()` call should use local scoping rules.
 ///
-/// The function returns `true` when the `ForwardSource` explicitly requests local
-/// scoping (`local = true`) or when it represents a `sys.source` call that does
-/// not target the global environment (`is_sys_source = true` and
-/// `sys_source_global_env = false`).
+/// The function returns `true` when the [`ForwardSource`] explicitly requests
+/// local scoping or its `local` argument is not statically known to be false,
+/// or when it represents a `sys.source` call that does not target the global
+/// environment (`is_sys_source = true` and `sys_source_global_env = false`).
 fn should_apply_local_scoping(source: &ForwardSource) -> bool {
     source.local || (source.is_sys_source && !source.sys_source_global_env)
 }

@@ -34,7 +34,9 @@ The startup prelude contributes:
 Raven ignores dynamic `source()` paths, `source()` calls inside function bodies,
 and calls that do not put symbols into the global script scope, such as
 `source(..., local = TRUE)` and `sys.source(...)` without
-`envir = globalenv()` or `.GlobalEnv`. It also recognizes `renv`'s
+`envir = globalenv()` or `.GlobalEnv`. An explicit `source(local = ...)` value
+that is not statically known to be `FALSE` is treated conservatively as
+non-global and is not followed. It also recognizes `renv`'s
 `source("renv/activate.R")` line and does not follow it, since that file
 activates the project library rather than defining user globals.
 

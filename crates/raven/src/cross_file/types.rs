@@ -294,7 +294,8 @@ pub struct ForwardSource {
     /// true if `# raven: source` directive, false if detected source()
     #[serde(default)]
     pub is_directive: bool,
-    /// source(..., local = TRUE)
+    /// `source(..., local = TRUE)` or an explicit `local` value that is not
+    /// statically known to be `FALSE` (conservatively treated as non-global)
     #[serde(default)]
     pub local: bool,
     /// source(..., chdir = TRUE)
@@ -371,8 +372,10 @@ impl ForwardSource {
         self.resolved_uri.is_some() || (self.system_file.is_some() && self.path.is_empty())
     }
 
-    /// Check if symbols from this source should be inherited
-    /// Returns false for local=TRUE or sys.source with non-global env
+    /// Check if symbols from this source should be inherited.
+    ///
+    /// Returns false when `local` is explicitly true or not statically known
+    /// to be false, or for `sys.source` with a non-global environment.
     pub fn inherits_symbols(&self) -> bool {
         if self.local {
             return false;

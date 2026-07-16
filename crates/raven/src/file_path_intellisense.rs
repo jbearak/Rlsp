@@ -162,8 +162,15 @@ fn is_source_call_string_context(
         _ => return None,
     };
 
-    // Check if the string is the file argument (first positional or named "file")
-    if !is_file_argument(&string_node, &call_node, content) {
+    // Check the string against the same matched file formal used by source
+    // detection and full-path extraction.
+    let args_node = call_node.child_by_field_name("arguments")?;
+    let value_node = crate::cross_file::source_detect::source_call_file_value_node(
+        &args_node,
+        content,
+        is_sys_source,
+    )?;
+    if !nodes_overlap(&value_node, &string_node) {
         return None;
     }
 
@@ -307,50 +314,6 @@ fn find_enclosing_source_call<'a>(node: Node<'a>, content: &str) -> Option<Node<
         current = n.parent();
     }
     None
-}
-
-/// Check if a string node is the file argument of a source() call
-fn is_file_argument(string_node: &Node, call_node: &Node, content: &str) -> bool {
-    let args_node = match call_node.child_by_field_name("arguments") {
-        Some(n) => n,
-        None => return false,
-    };
-
-    let mut cursor = args_node.walk();
-    let children: Vec<_> = args_node.children(&mut cursor).collect();
-
-    // Check for named "file" argument
-    for child in &children {
-        if child.kind() == "argument"
-            && let Some(name_node) = child.child_by_field_name("name")
-        {
-            let name = node_text(name_node, content);
-            if name == "file"
-                && let Some(value_node) = child.child_by_field_name("value")
-            {
-                // Check if this value node contains our string node
-                if nodes_overlap(&value_node, string_node) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Check first positional argument
-    for child in &children {
-        if child.kind() == "argument" && child.child_by_field_name("name").is_none() {
-            if let Some(value_node) = child.child_by_field_name("value") {
-                // Check if this value node contains our string node
-                if nodes_overlap(&value_node, string_node) {
-                    return true;
-                }
-            }
-            // Only check the first positional argument
-            break;
-        }
-    }
-
-    false
 }
 
 /// Check if two nodes overlap (one contains the other or they are the same)
@@ -1165,8 +1128,11 @@ fn extract_full_source_call_path(
     // detection) and require the cursor to lie within it. Byte-point
     // comparison, so multi-line computed expressions work.
     let args_node = call_node.child_by_field_name("arguments")?;
-    let value_node =
-        crate::cross_file::static_path::source_call_file_value_node(&args_node, content)?;
+    let value_node = crate::cross_file::source_detect::source_call_file_value_node(
+        &args_node,
+        content,
+        is_sys_source,
+    )?;
     let value_has_explicit_close =
         value_node.kind() == "string" && string_has_explicit_close(value_node);
     let at_incomplete_string_end = value_node.kind() == "string"
@@ -2007,6 +1973,70 @@ mod tests {
         let (partial, _, is_sys) = result.unwrap();
         assert_eq!(partial, "uti");
         assert!(!is_sys);
+    }
+
+    #[test]
+    fn test_source_call_partial_file_argument_uses_matched_file_slot() {
+        let code = r#"source(f = "utils.R", local = FALSE)"#;
+        let tree = parse_r(code);
+        let position = Position {
+            line: 0,
+            character: code.find("utils.R").unwrap() as u32 + 3,
+        };
+        let (path, _, is_sys_source) =
+            extract_full_source_call_path(&tree, code, position).expect("matched partial file");
+        assert_eq!(path, "utils.R");
+        assert!(!is_sys_source);
+        assert!(is_source_call_string_context(&tree, code, position).is_some());
+    }
+
+    #[test]
+    fn test_source_call_backtick_file_argument_uses_matched_file_slot() {
+        for code in [
+            r#"source(`file` = "utils.R", `local` = FALSE)"#,
+            r#"source("file" = "utils.R", "local" = FALSE)"#,
+            r#"source(r"(file)" = "utils.R", r"(local)" = FALSE)"#,
+            r#"sys.source(`file` = "utils.R", `envir` = globalenv())"#,
+            r#"sys.source("file" = "utils.R", "envir" = globalenv())"#,
+            r#"sys.source(r"(file)" = "utils.R", r"(envir)" = globalenv())"#,
+        ] {
+            let tree = parse_r(code);
+            let position = Position {
+                line: 0,
+                character: code.find("utils.R").unwrap() as u32 + 3,
+            };
+            let (path, _, _) = extract_full_source_call_path(&tree, code, position)
+                .expect("matched backtick file argument");
+            assert_eq!(path, "utils.R");
+            assert!(is_source_call_string_context(&tree, code, position).is_some());
+            assert!(matches!(
+                detect_file_path_context(&tree, code, position),
+                FilePathContext::SourceCall { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_source_call_invalid_file_matching_has_no_navigation_target() {
+        for (code, needle) in [
+            (r#"source(f = "real.R", "fake.R", local = FALSE)"#, "fake.R"),
+            (r#"source(file = "a.R", file = "b.R")"#, "b.R"),
+            (r#"source(, "fake.R", local = FALSE)"#, "fake.R"),
+        ] {
+            let tree = parse_r(code);
+            let position = Position {
+                line: 0,
+                character: code.find(needle).unwrap() as u32 + 2,
+            };
+            assert!(
+                extract_full_source_call_path(&tree, code, position).is_none(),
+                "{code}"
+            );
+            assert!(
+                is_source_call_string_context(&tree, code, position).is_none(),
+                "{code}"
+            );
+        }
     }
 
     #[test]

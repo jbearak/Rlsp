@@ -1358,7 +1358,7 @@ fn decode_code_point(value: u32) -> Option<char> {
 /// no escape processing — which is exactly why raw strings are the idiomatic
 /// way to write regexes in R. Returns `None` when the token is not a raw
 /// string or the closing delimiter isn't the end of the token.
-fn parse_r_raw_string_literal(raw: &str) -> Option<String> {
+pub(crate) fn parse_r_raw_string_literal(raw: &str) -> Option<String> {
     let rest = raw.strip_prefix('r').or_else(|| raw.strip_prefix('R'))?;
     let quote = rest.chars().next()?;
     if quote != '"' && quote != '\'' {

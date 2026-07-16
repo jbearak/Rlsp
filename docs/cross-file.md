@@ -35,6 +35,11 @@ Raven detects `source()` and `sys.source()` calls:
 - **Computed paths** built from statically-known parts are folded to a plain path (issue #638): `file.path("scripts", "helpers.R")` (all parts must fold; `fsep` accepted only as the default `"/"`; any other named argument bails), a `normalizePath(...)` wrapper (peeled syntactically; `winslash`/`mustWork` ignored), and a local variable assigned exactly once at the top level before use — so the common testthat idiom `repo_root <- normalizePath(file.path("..", "..")); source(file.path(repo_root, "scripts/helpers.R"))` resolves. Folding is strict all-or-nothing: any component that isn't statically known (another function call, a reassigned, replacement-modified, removed, or conditionally-assigned variable, a shadowed `file.path`/`normalizePath`, or a string literal containing escape sequences) makes Raven skip the call rather than guess. It is also a purely lexical analysis — `setwd()` calls and symlink resolution that runtime `normalizePath()` would perform are ignored, the same limitation every literal path already has. Folded paths work across dependency edges, scope, missing-file diagnostics, and cmd-click navigation — a click on any string segment of the expression (e.g. `"scripts/helpers.R"` inside `file.path(repo_root, "scripts/helpers.R")`) opens the full joined target, while a click on an identifier segment such as `repo_root` keeps its usual go-to-definition to the variable's assignment
 - Other dynamic paths (e.g. `paste0(...)`, `Sys.getenv(...)`) are skipped gracefully
 
+For scope propagation, omitted `local` and a statically known `local = FALSE`
+use the global-source behavior. Any other explicit `local` expression is
+treated conservatively as non-global, so a dynamic value cannot make an
+uncertain child lend symbols to its caller.
+
 `sys.source()` defaults to a non-global environment, so its symbols are treated as local and do **not** propagate to the calling file unless you pass `envir = globalenv()` (or `.GlobalEnv`).
 
 **`local = TRUE` inheritance.** `source("child.R", local = TRUE)` evaluates the child in the environment from which `source()` is called. At the **top level** of a script that environment is the global environment, so the child sees all of the parent's bindings defined before the call — exactly like the default `local = FALSE` — and Raven resolves the parent's earlier definitions in the child accordingly. Only when the `source(local = TRUE)` call sits **inside a function body** does the child bind to that function's frame rather than the globals; in that case the child does not inherit the parent's top-level symbols through the relationship (declared symbols from `# raven: var` directives still flow). The child's *own* new definitions never leak back out to the parent's global scope under `local = TRUE`.
@@ -201,11 +206,14 @@ sapply(libs, require, character.only = TRUE)
 This works for `sapply`, `lapply`, `vapply`, `mapply`, and the purrr forms
 (`map`, `walk`, `map_chr`, etc., bare or `purrr::`-qualified). The package
 vector must be either an inline `c("a","b",...)` of string literals, or a
-same-file variable assigned exactly once via `<-`, `=`, or `assign()` to such
-a literal vector. `character.only = TRUE` must be present (without it, R
-itself would not load the strings as packages). Dynamic constructions such as
-`paste0(...)`, `tolower(x)`, `c(libs1, libs2)`, function-parameter origins,
-or values defined in another file are silently ignored.
+same-file variable assigned exactly once at the top level via `<-`/`=`, or an
+eligible bare/base-qualified `assign()` using its default destination, to such
+a literal vector. Nested, conditional, destination-qualified, reassigned, or
+removed bindings only invalidate the variable and cannot supply packages.
+`character.only = TRUE` must be present (without it, R itself would not load
+the strings as packages). Dynamic constructions such as `paste0(...)`,
+`tolower(x)`, `c(libs1, libs2)`, function-parameter origins, or values defined
+in another file are silently ignored.
 
 ### targets::tar_option_set() Loads
 
@@ -235,9 +243,10 @@ Details:
   `tar_option_set(TRUE, c("dplyr"))` are deliberately not matched.
 - **Accepted value shapes.** A single string literal
   (`packages = "dplyr"`), an inline `c("a", "b", ...)` of string literals, or
-  a same-file variable assigned exactly once to such a literal vector (the
-  same rule as apply-family loads). Dynamic values, `character(0)`, and empty
-  `c()` are ignored.
+  a same-file variable assigned exactly once at the top level to such a
+  literal vector (the same rule as apply-family loads). Nested, conditional,
+  destination-qualified, or dynamic values, `character(0)`, and empty `c()`
+  are ignored.
 - **Per-literal anchoring.** `tar_option_set()` calls routinely span many
   lines, so each package's missing-package diagnostic is anchored at that
   package's own string literal — a `# nolint` on the literal's line suppresses

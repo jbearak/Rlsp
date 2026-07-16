@@ -103,8 +103,17 @@ impl<'tree, 'text> StaticBindings<'tree, 'text> {
     }
 
     /// Whether any binding form in the document targets `name`.
-    fn is_bound(&self, name: &str) -> bool {
-        self.bindings.contains_key(name)
+    pub(crate) fn is_bound(&self, name: &str) -> bool {
+        self.bindings.contains_key(name) || super::binding::helper_may_be_shadowed(&self.bindings)
+    }
+
+    pub(crate) fn named_binding_may_shadow_at(
+        &self,
+        name: &str,
+        before_byte: usize,
+        deferred_use: bool,
+    ) -> bool {
+        super::binding::named_binding_may_shadow_at(&self.bindings, name, before_byte, deferred_use)
     }
 }
 
@@ -123,7 +132,10 @@ pub(crate) fn fold_string_expr(
 ) -> Option<String> {
     match node.kind() {
         "string" => extract_plain_string(node, content),
-        "identifier" => bindings.resolve(node_text(node, content), node.start_byte()),
+        "identifier" => bindings.resolve(
+            super::binding::plain_identifier_name(node, content)?,
+            node.start_byte(),
+        ),
         "call" => {
             let func = node.child_by_field_name("function")?;
             match node_text(func, content) {
@@ -218,35 +230,6 @@ fn fold_normalize_path_call(
     fold_string_expr(path_node?, content, bindings)
 }
 
-/// Locate the file-argument's value node of a `source()`/`sys.source()`
-/// call's `arguments` node: the named `file=` argument if present, else the
-/// first positional argument.
-///
-/// Shared by `source_detect::try_parse_source_call` (detection) and
-/// `file_path_intellisense::extract_full_source_call_path` (go-to-definition)
-/// so the two surfaces can never disagree on which node is the file argument.
-pub(crate) fn source_call_file_value_node<'a>(
-    args_node: &Node<'a>,
-    content: &str,
-) -> Option<Node<'a>> {
-    let mut cursor = args_node.walk();
-    let children: Vec<_> = args_node.children(&mut cursor).collect();
-    for child in &children {
-        if child.kind() == "argument"
-            && let Some(name_node) = child.child_by_field_name("name")
-            && node_text(name_node, content) == "file"
-        {
-            return child.child_by_field_name("value");
-        }
-    }
-    for child in &children {
-        if child.kind() == "argument" && child.child_by_field_name("name").is_none() {
-            return child.child_by_field_name("value");
-        }
-    }
-    None
-}
-
 /// Extract a plain (escape-free) string literal's contents. A literal
 /// containing a backslash is rejected: this module never processes escape
 /// sequences, so folding `"a\tb"` raw would silently diverge from the string
@@ -293,7 +276,8 @@ mod tests {
                 && let Some(func) = node.child_by_field_name("function")
                 && &code[func.byte_range()] == "source"
                 && let Some(args) = node.child_by_field_name("arguments")
-                && let Some(value) = source_call_file_value_node(&args, code)
+                && let Some(value) =
+                    super::super::source_detect::source_call_file_value_node(&args, code, false)
             {
                 *out = fold_string_expr(value, code, bindings);
             }
@@ -393,6 +377,36 @@ p <- "b.R"
 source(p)
 "#;
         assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+makeActiveBinding("x", function(value) {
+  get("assign", baseenv())("p", "b.R", envir = .GlobalEnv)
+}, .GlobalEnv)
+p <- "a.R"
+x <- 1
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+`make\x41ctiveBinding`("x", function(value) {
+  get("assign", baseenv())("p", "b.R", envir = .GlobalEnv)
+}, .GlobalEnv)
+p <- "a.R"
+x <- 1
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn backtick_identifier_reassignment_uses_the_same_binding_key() {
+        let code = r#"
+p <- "a.R"
+`p` <- "b.R"
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
     }
 
     #[test]
@@ -458,6 +472,221 @@ source(p)
     }
 
     #[test]
+    fn dynamic_assign_name_invalidates_prior_candidates() {
+        for (setup, target) in [
+            ("n <- \"p\"\np <- \"a.R\"", "n"),
+            ("p <- \"a.R\"", r#""\x70""#),
+        ] {
+            let code = format!("{setup}\nassign({target}, \"b.R\")\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{target}");
+        }
+
+        let code = "n <- \"p\"\nassign(n, \"old.R\")\np <- \"a.R\"\nsource(p)\n";
+        assert_eq!(fold_last_source_arg(code), Some("a.R".to_string()));
+
+        for mutation in [
+            r#"assign("x" = "p", "value" = "b.R")"#,
+            r#"assign(`\x78` = "p", value = "b.R")"#,
+            r#"rm("list" = c("p"))"#,
+            r#"rm(`l\x69st` = c("p"))"#,
+        ] {
+            let code = format!("p <- \"a.R\"\n{mutation}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn escaped_mutation_callee_invalidates_prior_candidates() {
+        for remove in [r#"`\x72m`(p)"#, r#""r\x6d"(p)"#, r#"base::`\x72m`(p)"#] {
+            let code = format!("p <- \"a.R\"\n{remove}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{remove}");
+        }
+
+        for shadowed in [
+            "rm <- function(...) base::assign(\"p\", \"b.R\", envir = .GlobalEnv)\np <- \"a.R\"\nrm(other)",
+            "assign <- function(...) base::assign(\"p\", \"b.R\", envir = .GlobalEnv)\np <- \"a.R\"\nassign(\"other\", 1)",
+        ] {
+            let code = format!("{shadowed}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None);
+        }
+    }
+
+    #[test]
+    fn unknown_name_mutations_do_not_invalidate_later_candidates() {
+        for mutation in [r#"`\x70` <- "old.R""#, r#"rm("\x70")"#] {
+            let code = format!("{mutation}\np <- \"a.R\"\nsource(p)\n");
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("a.R".to_string()),
+                "{mutation}"
+            );
+        }
+
+        let code = r#"
+name <- "c"
+assign(name, function(...) "p")
+p <- "a.R"
+rm(list = c("other"))
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+name <- "file.path"
+assign(name, function(...) "wrong.R")
+p <- file.path("right.R")
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn deferred_unknown_name_mutation_persistently_invalidates_candidates() {
+        let code = r#"
+f <- function() assign("\x70", "b.R", envir = .GlobalEnv)
+p <- "a.R"
+f()
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+f <- function() rm(list = c("other"), envir = .GlobalEnv)
+p <- "a.R"
+c <- function(...) "p"
+f()
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+f <- function() rm(list = c("other",), envir = .GlobalEnv)
+p <- "a.R"
+c <- function(...) "p"
+f()
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+later <- function(x) function() x
+g <- later(rm(list = victims, envir = .GlobalEnv))
+victims <- "p"
+p <- "a.R"
+g()
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+`%delay%` <- function(x, y) function() x
+n <- "p"
+trigger <- assign(n, "b.R", envir = .GlobalEnv) %delay% NULL
+p <- "a.R"
+trigger()
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+f <- function() assign("ignored", "x")
+assign <- function(...) base::assign("p", "b.R", envir = .GlobalEnv)
+p <- "a.R"
+f()
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn base_qualified_assign_calls_invalidate_bindings() {
+        for assign in [
+            "base::assign",
+            "base:::assign",
+            "\"base\"::assign",
+            "base::\"assign\"",
+            "base::`assign`",
+        ] {
+            let code = format!("p <- \"a.R\"\n{assign}(\"p\", \"b.R\")\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{assign}");
+        }
+
+        // Another namespace may re-export base::assign, so it invalidates but
+        // cannot provide a candidate of its own.
+        for assign in ["other::assign", "other:::assign"] {
+            let code = format!("p <- \"a.R\"\n{assign}(\"p\", \"b.R\")\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{assign}");
+        }
+    }
+
+    #[test]
+    fn evaluated_assign_actuals_invalidate_other_bindings() {
+        let code = r#"
+delayedAssign("e", {
+  get("assign", baseenv())("p", "b.R", envir = .GlobalEnv)
+  .GlobalEnv
+})
+p <- "a.R"
+base::assign("other", 1, envir = e)
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+f <- function() base::assign("ignored", c("x"))
+c <- function(...) {
+  get("assign", baseenv())("p", "b.R", envir = .GlobalEnv)
+  "x"
+}
+p <- "a.R"
+f()
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn evaluated_assignment_rhs_invalidates_other_bindings() {
+        let code = r#"
+delayedAssign("v", {
+  get("assign", baseenv())("p", "b.R", envir = .GlobalEnv)
+  1
+})
+p <- "a.R"
+other <- v
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+f <- function(...) {
+  ..1 <- get("assign", baseenv())("p", "bad.R", envir = .GlobalEnv)
+}
+p <- "good.R"
+f(0)
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        // Preserve recursive folding when the identifier is a known earlier
+        // ordinary candidate rather than a delayed or active binding.
+        let code = "part <- \"a.R\"\np <- part\nsource(p)\n";
+        assert_eq!(fold_last_source_arg(code), Some("a.R".to_string()));
+
+        let code = r#"
+v <- 1
+delayedAssign("v", {
+  get("assign", baseenv())("p", "b.R", envir = .GlobalEnv)
+  1
+})
+p <- "a.R"
+other <- v
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
     fn erroneous_assign_call_does_not_count_as_a_binding() {
         // R rejects the exact+partial collision before assigning. The shared
         // collector must apply the same argument-matching rule to path and
@@ -468,6 +697,11 @@ assign(x = "p", value = "b.R", val = "c.R")
 source(p)
 "#;
         assert_eq!(fold_last_source_arg(code), Some("a.R".to_string()));
+
+        for assign in [r#"assign("p")"#, r#"assign("p", value = )"#] {
+            let code = format!("p <- \"a.R\"\n{assign}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), Some("a.R".to_string()));
+        }
     }
 
     #[test]
@@ -508,9 +742,67 @@ source(p)
 
     #[test]
     fn bails_after_remove_call_targets_binding() {
-        for remove in ["rm(p)", "remove(\"p\")", "rm(list = \"p\")"] {
+        for remove in [
+            "rm(p)",
+            "remove(\"p\")",
+            "rm(list = \"p\")",
+            "rm(list = c(\"p\", \"other\"))",
+            "remove(list = c(\"other\", \"p\"))",
+            "rm(list = base::c(\"p\", \"other\"))",
+            "rm(list = `c`(\"other\", \"p\"))",
+            "base::rm(p)",
+            "base:::remove(\"p\")",
+            "other::rm(p)",
+            "other:::remove(\"p\")",
+        ] {
             let code = format!("p <- \"a.R\"\n{remove}\nsource(p)\n");
             assert_eq!(fold_last_source_arg(&code), None, "{remove}");
+        }
+    }
+
+    #[test]
+    fn malformed_remove_vectors_do_not_invalidate_bindings() {
+        for vector in ["c()", "c(\"p\",)", "c(,\"p\")", "c(\"other\",,\"p\")"] {
+            let code = format!("p <- \"a.R\"\nrm(list = {vector})\nsource(p)\n");
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("a.R".to_string()),
+                "{vector}"
+            );
+        }
+
+        for remove in [
+            r#"rm(list = c("p"), list = c("other"))"#,
+            "rm(p, pos = 1, pos = 2)",
+            r#"rm(p, pos = 1, pos = 2, `\x6cist` = c("p"))"#,
+            r#"assign(x = "p", x = "other", `\x76alue` = "b.R")"#,
+        ] {
+            let code = format!("p <- \"a.R\"\n{remove}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), Some("a.R".to_string()));
+        }
+    }
+
+    #[test]
+    fn dynamic_remove_list_invalidates_prior_candidates_conservatively() {
+        for (remove, setup, list) in [
+            ("rm", "p <- \"victim\"\nvictim <- 1", "p"),
+            ("remove", "p <- \"p\"", "p"),
+            ("rm", "victims <- \"p\"\np <- \"a.R\"", "victims"),
+        ] {
+            let code = format!("{setup}\n{remove}(list = {list})\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{remove}: {setup}");
+        }
+
+        let code = "victims <- \"p\"\nrm(list = victims)\np <- \"a.R\"\nsource(p)\n";
+        assert_eq!(fold_last_source_arg(code), Some("a.R".to_string()));
+
+        for list in [
+            "c <- function(...) \"p\"\nrm(list = c(\"other\"))",
+            "`c` <- function(...) \"p\"\nrm(list = c(\"other\"))",
+            "rm(list = other::c(\"other\"))",
+        ] {
+            let code = format!("p <- \"a.R\"\n{list}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{list}");
         }
     }
 
@@ -560,6 +852,14 @@ f <- function(p) p
 source(p)
 "#;
         assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn variadic_parameters_do_not_invalidate_unrelated_bindings() {
+        for parameter in ["...", "..1"] {
+            let code = format!("p <- \"a.R\"\nf <- function({parameter}) NULL\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), Some("a.R".to_string()));
+        }
     }
 
     #[test]

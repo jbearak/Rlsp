@@ -433,7 +433,8 @@ pub struct DependencyEdge {
     pub call_site_line: Option<u32>,
     /// 0-based UTF-16 column in parent where call occurs
     pub call_site_column: Option<u32>,
-    /// source(..., local=TRUE) semantics
+    /// Local/non-global `source()` semantics; also true when an explicit
+    /// `local` argument is not statically known to be `FALSE`
     pub local: bool,
     /// source(..., chdir=TRUE) semantics
     pub chdir: bool,
