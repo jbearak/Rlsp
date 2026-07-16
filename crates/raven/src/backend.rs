@@ -5937,6 +5937,18 @@ impl LanguageServer for Backend {
                         };
                         log::info!("[Background] Workspace index applied");
 
+                        // Close the seed-install TOCTOU window for preamble
+                        // buffers opened/edited while the seed was in flight.
+                        if let Some(root) = root_for_pkg_inputs.clone() {
+                            Backend::refresh_open_preamble_docs_after_seed(
+                                state_clone.clone(),
+                                client_clone.clone(),
+                                traversal_truncation.clone(),
+                                root,
+                            )
+                            .await;
+                        }
+
                         // Warm the package cache for inherited packages newly visible
                         // via backward edges discovered by the workspace scan. Without
                         // this, open documents whose scope inherits packages from
@@ -6053,24 +6065,41 @@ impl LanguageServer for Backend {
             // No workspace scan — mark complete immediately and still seed
             // package inputs from disk/open documents so package mode starts
             // with a derived state.
-            let mut state = self.state.write().await;
-            state.workspace_scan_complete = true;
-            if let Some((
-                root,
-                package_exclusions,
-                (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan),
-            )) = package_seed
-            {
-                initialize_package_inputs_from_state_with_exclusions(
-                    &mut state,
+            let seeded_root = {
+                let mut state = self.state.write().await;
+                state.workspace_scan_complete = true;
+                if let Some((
                     root,
-                    desc_text,
-                    ns_text,
-                    disk_r_files,
-                    Some(rprofile_scan),
-                    Some(preamble_scan),
-                    &package_exclusions,
-                );
+                    package_exclusions,
+                    (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan),
+                )) = package_seed
+                {
+                    let seeded = root.clone();
+                    initialize_package_inputs_from_state_with_exclusions(
+                        &mut state,
+                        root,
+                        desc_text,
+                        ns_text,
+                        disk_r_files,
+                        Some(rprofile_scan),
+                        Some(preamble_scan),
+                        &package_exclusions,
+                    );
+                    Some(seeded)
+                } else {
+                    None
+                }
+            };
+            // Close the seed-install TOCTOU window for preamble buffers
+            // opened/edited while the seed was in flight.
+            if let Some(root) = seeded_root {
+                Backend::refresh_open_preamble_docs_after_seed(
+                    self.state.clone(),
+                    self.client.clone(),
+                    self.traversal_truncation.clone(),
+                    root,
+                )
+                .await;
             }
         }
 
@@ -10026,7 +10055,7 @@ impl Backend {
                                 new_index_entries,
                             );
                             replay_open_documents_after_workspace_index_apply(&mut state).await;
-                            if let Some(root) = root_for_pkg_inputs {
+                            if let Some(root) = root_for_pkg_inputs.clone() {
                                 initialize_package_inputs_from_state_with_exclusions(
                                     &mut state,
                                     root,
@@ -10050,6 +10079,18 @@ impl Backend {
                                     && !package_settings_changed,
                             )
                         };
+
+                        // Close the seed-install TOCTOU window for preamble
+                        // buffers opened/edited while the reseed was in flight.
+                        if let Some(root) = root_for_pkg_inputs {
+                            Backend::refresh_open_preamble_docs_after_seed(
+                                self.state.clone(),
+                                self.client.clone(),
+                                self.traversal_truncation.clone(),
+                                root,
+                            )
+                            .await;
+                        }
 
                         if packages_enabled {
                             prefetch_packages_for_open_documents(&self.state, &package_library)
@@ -10116,18 +10157,29 @@ impl Backend {
                         Default::default(),
                     ));
 
-                let mut state = self.state.write().await;
-                initialize_package_inputs_from_state_with_exclusions(
-                    &mut state,
-                    root,
-                    desc_text,
-                    ns_text,
-                    disk_r_files,
-                    Some(rprofile_scan),
-                    Some(preamble_scan),
-                    &workspace_exclusions,
-                );
+                {
+                    let mut state = self.state.write().await;
+                    initialize_package_inputs_from_state_with_exclusions(
+                        &mut state,
+                        root.clone(),
+                        desc_text,
+                        ns_text,
+                        disk_r_files,
+                        Some(rprofile_scan),
+                        Some(preamble_scan),
+                        &workspace_exclusions,
+                    );
+                }
                 package_inputs_initialized_by_exclusion_reload = true;
+                // Close the seed-install TOCTOU window for preamble buffers
+                // opened/edited while the reseed was in flight.
+                Backend::refresh_open_preamble_docs_after_seed(
+                    self.state.clone(),
+                    self.client.clone(),
+                    self.traversal_truncation.clone(),
+                    root,
+                )
+                .await;
             }
         }
 
@@ -10197,17 +10249,28 @@ impl Backend {
             // the background workspace index has not populated yet. (Re-setting
             // package_mode is a no-op: `translate(SettingChanged)` above already
             // set it to this same mode.)
-            let mut state = self.state.write().await;
-            initialize_package_inputs_from_state_with_exclusions(
-                &mut state,
+            {
+                let mut state = self.state.write().await;
+                initialize_package_inputs_from_state_with_exclusions(
+                    &mut state,
+                    root.clone(),
+                    desc_text,
+                    ns_text,
+                    disk_r_files,
+                    Some(rprofile_scan),
+                    Some(preamble_scan),
+                    &workspace_exclusions,
+                );
+            }
+            // Close the seed-install TOCTOU window for preamble buffers
+            // opened/edited while the reseed was in flight.
+            Backend::refresh_open_preamble_docs_after_seed(
+                self.state.clone(),
+                self.client.clone(),
+                self.traversal_truncation.clone(),
                 root,
-                desc_text,
-                ns_text,
-                disk_r_files,
-                Some(rprofile_scan),
-                Some(preamble_scan),
-                &workspace_exclusions,
-            );
+            )
+            .await;
             log::info!("Rebuilt package state after packageMode change (event-driven)");
         }
 
@@ -11176,8 +11239,30 @@ impl Backend {
         affected_paths: Vec<std::path::PathBuf>,
         scheduled_uris: &std::collections::HashSet<Url>,
     ) {
+        Self::refresh_testthat_preambles_for_paths_with(
+            self.state.clone(),
+            self.client.clone(),
+            self.traversal_truncation.clone(),
+            root,
+            affected_paths,
+            scheduled_uris,
+        )
+        .await;
+    }
+
+    /// Handle-based body of [`Self::refresh_testthat_preambles_for_paths`],
+    /// callable from detached tasks (e.g. the startup seeding task) that hold
+    /// clones of the backend's handles rather than `&self`.
+    async fn refresh_testthat_preambles_for_paths_with(
+        state_arc: Arc<RwLock<WorldState>>,
+        client: Client,
+        traversal_truncation: Arc<TraversalTruncationState>,
+        root: std::path::PathBuf,
+        affected_paths: Vec<std::path::PathBuf>,
+        scheduled_uris: &std::collections::HashSet<Url>,
+    ) {
         let (previous, overrides, exclusions) = {
-            let state = self.state.read().await;
+            let state = state_arc.read().await;
             (
                 crate::package_state::preamble::PreambleScan {
                     symbols: state.package_inputs.preamble_sourced_symbols.clone(),
@@ -11210,7 +11295,10 @@ impl Backend {
         else {
             return;
         };
-        self.apply_testthat_preamble_rescan(
+        Self::apply_testthat_preamble_rescan(
+            &state_arc,
+            client,
+            traversal_truncation,
             scan,
             rescanned,
             &root,
@@ -11220,8 +11308,11 @@ impl Backend {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_testthat_preamble_rescan(
-        &self,
+        state_arc: &Arc<RwLock<WorldState>>,
+        client: Client,
+        traversal_truncation: Arc<TraversalTruncationState>,
         scan: crate::package_state::preamble::PreambleScan,
         rescanned: std::collections::BTreeSet<std::path::PathBuf>,
         root: &std::path::Path,
@@ -11229,7 +11320,7 @@ impl Backend {
         scheduled_uris: &std::collections::HashSet<Url>,
     ) {
         let affected: Vec<Url> = {
-            let mut state = self.state.write().await;
+            let mut state = state_arc.write().await;
             let current = crate::package_state::preamble::PreambleScan {
                 symbols: state.package_inputs.preamble_sourced_symbols.clone(),
                 attached_packages: state
@@ -11283,11 +11374,53 @@ impl Backend {
             return;
         }
         tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
-            self.state.clone(),
-            self.client.clone(),
+            state_arc.clone(),
+            client,
             affected,
-            Some(self.traversal_truncation.clone()),
+            Some(traversal_truncation),
         ));
+    }
+
+    /// Close the seed-install TOCTOU window (issue #638): a preamble (or
+    /// sourced-closure member) opened or edited AFTER a seeding path
+    /// snapshotted its buffer overrides but BEFORE the scan was installed
+    /// could not defend itself — on the very first seed `workspace_root` was
+    /// still unset so its did_open refresh bailed, and on a reseed its
+    /// did_open/did_change refresh can be overwritten by the install. Called
+    /// AFTER every seeding install: re-runs the race-safe live refresh (fresh
+    /// override snapshot, per-preamble graft) for every open
+    /// preamble-relevant document, converging state to buffer truth. Cheap
+    /// no-op when nothing relevant is open.
+    async fn refresh_open_preamble_docs_after_seed(
+        state_arc: Arc<RwLock<WorldState>>,
+        client: Client,
+        traversal_truncation: Arc<TraversalTruncationState>,
+        root: std::path::PathBuf,
+    ) {
+        let affected_paths: Vec<std::path::PathBuf> = {
+            let state = state_arc.read().await;
+            let mut paths: Vec<std::path::PathBuf> = state
+                .documents
+                .keys()
+                .filter(|uri| preamble_sourced_root_for_open_document(&state, uri).is_some())
+                .flat_map(|uri| file_paths_for_open_document(&state, uri))
+                .collect();
+            paths.sort();
+            paths.dedup();
+            paths
+        };
+        if affected_paths.is_empty() {
+            return;
+        }
+        Self::refresh_testthat_preambles_for_paths_with(
+            state_arc,
+            client,
+            traversal_truncation,
+            root,
+            affected_paths,
+            &std::collections::HashSet::new(),
+        )
+        .await;
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -20751,6 +20884,105 @@ mod project_config_initialize_tests {
         assert!(
             !symbols.contains("disk_a"),
             "seed must not clobber the open buffer with the stale disk closure: {symbols:?}"
+        );
+    }
+
+    /// The seed-install TOCTOU window: a precomputed scan whose override
+    /// snapshot MISSED a buffer (opened after the snapshot, before the
+    /// install) gets installed, then `refresh_open_preamble_docs_after_seed`
+    /// must converge the state back to buffer truth.
+    #[tokio::test]
+    async fn post_seed_refresh_converges_to_buffer_opened_during_seed_window() {
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        fs::create_dir_all(root_path.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root_path.join("scripts")).unwrap();
+        let description = "Package: preambletoctou\nVersion: 0.0.1\nSuggests: testthat\n";
+        fs::write(root_path.join("DESCRIPTION"), description).unwrap();
+        let preamble_path = root_path.join("tests/testthat/helper-project.R");
+        fs::write(&preamble_path, "source(\"../../scripts/a.R\")\n").unwrap();
+        fs::write(root_path.join("scripts/a.R"), "disk_a <- 1\n").unwrap();
+        fs::write(root_path.join("scripts/b.R"), "disk_b <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&root_path).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Precompute a disk-only scan (its override snapshot predates the
+        // buffer), then open the buffer, then install the stale scan —
+        // exactly the interleaving of the seeding TOCTOU window.
+        let stale_scan = crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+            &root_path,
+            &crate::config_file::CompiledWorkspaceExclusions::default(),
+        );
+        let preamble_uri = Url::from_file_path(&preamble_path).unwrap();
+        open_doc(
+            backend,
+            &preamble_uri,
+            "r",
+            1,
+            "source(\"../../scripts/b.R\")\n",
+        )
+        .await;
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root_path.clone(),
+                Some(Arc::from(description)),
+                None,
+                Default::default(),
+                None,
+                Some(stale_scan),
+                &crate::config_file::CompiledWorkspaceExclusions::default(),
+            );
+        }
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble_path)
+                .unwrap();
+            assert!(
+                symbols.contains("disk_a"),
+                "precondition: the stale disk scan was installed: {symbols:?}"
+            );
+        }
+
+        Backend::refresh_open_preamble_docs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root_path.clone(),
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        let symbols = state
+            .package_inputs
+            .preamble_sourced_symbols
+            .get(&preamble_path)
+            .unwrap();
+        assert!(
+            symbols.contains("disk_b"),
+            "post-seed refresh must converge to the open buffer's closure: {symbols:?}"
+        );
+        assert!(
+            !symbols.contains("disk_a"),
+            "stale disk-derived closure must not survive the post-seed refresh: {symbols:?}"
         );
     }
 
