@@ -3409,46 +3409,32 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     // it scan inline. Gated on package mode — the harvested sets are only
     // consumed by the (package-mode-gated) scope contribution.
     //
-    // Buffer-authoritative guard, mirroring the `.Rprofile` one above: when a
-    // preamble or a member of its scanned closure is OPEN, the live-edit path
-    // (`refresh_testthat_preambles_for_paths`) owns these inputs with
-    // buffer-overlaid scans; a disk-only (re)seed — startup background scan
-    // completing late, or an exclusions/`packageMode` rebuild — must not
-    // clobber them and lose unsaved edits. When package mode is disabled the
-    // inputs are cleared regardless.
-    let package_mode_enabled =
-        state.package_inputs.package_mode != crate::cross_file::config::PackageMode::Disabled;
-    // Guard only when live state actually exists: a preamble opened before the
-    // very first seed (workspace_root was unset, so the did_open refresh was
-    // skipped) must not block the initial disk scan behind empty live inputs.
-    let live_preamble_state_exists = !state
-        .package_inputs
-        .preamble_sourced_files_by_preamble
-        .is_empty();
-    let preamble_closure_open = package_mode_enabled
-        && live_preamble_state_exists
-        && state
-            .documents
-            .keys()
-            .any(|u| preamble_sourced_root_for_open_document(state, u).is_some());
-    if preamble_closure_open {
-        // Buffer-authoritative: keep the live preamble inputs as-is.
-    } else {
-        let preamble_scan = if package_mode_enabled {
+    // Unsaved-edit safety differs from the `.Rprofile` guard above by design:
+    // instead of skipping installation when a relevant document is open (which
+    // would either clobber a buffer opened before the very first seed, or
+    // leave *unrelated closed* preambles stale across an exclusions /
+    // `packageMode` reseed), preamble seeding scans BUFFER-AWARE. LSP callers
+    // snapshot open-buffer text via `snapshot_preamble_text_overrides` and
+    // precompute with `scan_testthat_preambles_with_overrides_and_exclusions`;
+    // the inline fallback overlays the same overrides from `state` directly.
+    // The result already reflects every authoritative open buffer, so it is
+    // installed unconditionally.
+    let preamble_scan =
+        if state.package_inputs.package_mode != crate::cross_file::config::PackageMode::Disabled {
             precomputed_preamble_scan.unwrap_or_else(|| {
-                crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
-                    &root, exclusions,
-                )
-            })
+            let overrides = snapshot_preamble_text_overrides(state);
+            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                &root, &overrides, exclusions,
+            )
+        })
         } else {
             crate::package_state::preamble::PreambleScan::default()
         };
-        state.package_inputs.preamble_sourced_symbols = preamble_scan.symbols;
-        state.package_inputs.preamble_sourced_attached_packages = preamble_scan.attached_packages;
-        state.package_inputs.preamble_sourced_files = preamble_scan.sourced_files;
-        state.package_inputs.preamble_sourced_files_by_preamble =
-            preamble_scan.sourced_files_by_preamble;
-    }
+    state.package_inputs.preamble_sourced_symbols = preamble_scan.symbols;
+    state.package_inputs.preamble_sourced_attached_packages = preamble_scan.attached_packages;
+    state.package_inputs.preamble_sourced_files = preamble_scan.sourced_files;
+    state.package_inputs.preamble_sourced_files_by_preamble =
+        preamble_scan.sourced_files_by_preamble;
 
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
@@ -5881,8 +5867,17 @@ impl LanguageServer for Backend {
                                     root,
                                     &workspace_exclusions,
                                 );
-                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                            // Buffer-aware: overlay authoritative open-buffer
+                            // text so this late-completing seed cannot clobber
+                            // unsaved preamble/closure edits (see
+                            // `initialize_package_inputs_from_state_with_exclusions`).
+                            let overrides = {
+                                let state = state_clone.read().await;
+                                snapshot_preamble_text_overrides(&state)
+                            };
+                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
                                 root,
+                                &overrides,
                                 &workspace_exclusions,
                             );
                             (desc, ns, Some(scan), Some(pre))
@@ -6002,6 +5997,13 @@ impl LanguageServer for Backend {
                 let root_clone = root.clone();
                 let seed_exclusions = workspace_exclusions.clone();
                 let scan_exclusions = workspace_exclusions.clone();
+                // Buffer-aware preamble scan: snapshot open-buffer text before
+                // the blocking scan so the seed cannot clobber unsaved edits
+                // (see `initialize_package_inputs_from_state_with_exclusions`).
+                let preamble_overrides = {
+                    let state = self.state.read().await;
+                    snapshot_preamble_text_overrides(&state)
+                };
                 Some((
                     root,
                     seed_exclusions,
@@ -6025,10 +6027,12 @@ impl LanguageServer for Backend {
                                 &scan_exclusions,
                             );
                         // Precompute the testthat preamble sourced-closure scan
-                        // OFF the lock too (issue #638, same discipline).
+                        // OFF the lock too (issue #638, same discipline),
+                        // overlaying the pre-snapshotted open-buffer text.
                         let preamble_scan =
-                            crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
                                 &root_clone,
+                                &preamble_overrides,
                                 &scan_exclusions,
                             );
                         (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
@@ -9996,8 +10000,17 @@ impl Backend {
                                     root,
                                     &workspace_exclusions,
                                 );
-                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                            // Buffer-aware: overlay authoritative open-buffer
+                            // text so this reseed cannot clobber unsaved
+                            // preamble/closure edits (see
+                            // `initialize_package_inputs_from_state_with_exclusions`).
+                            let overrides = {
+                                let state = self.state.read().await;
+                                snapshot_preamble_text_overrides(&state)
+                            };
+                            let pre = crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
                                 root,
+                                &overrides,
                                 &workspace_exclusions,
                             );
                             (desc, ns, Some(scan), Some(pre))
@@ -10059,6 +10072,13 @@ impl Backend {
             {
                 let root_clone = root.clone();
                 let scan_exclusions = workspace_exclusions.clone();
+                // Buffer-aware preamble scan: snapshot open-buffer text before
+                // the blocking scan so the reseed cannot clobber unsaved edits
+                // (see `initialize_package_inputs_from_state_with_exclusions`).
+                let preamble_overrides = {
+                    let state = self.state.read().await;
+                    snapshot_preamble_text_overrides(&state)
+                };
                 let (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan) =
                     tokio::task::spawn_blocking(move || {
                         let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
@@ -10077,10 +10097,12 @@ impl Backend {
                                 &scan_exclusions,
                             );
                         // Precompute the testthat preamble sourced-closure scan
-                        // OFF the lock too (issue #638, same discipline).
+                        // OFF the lock too (issue #638, same discipline),
+                        // overlaying the pre-snapshotted open-buffer text.
                         let preamble_scan =
-                            crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
                                 &root_clone,
+                                &preamble_overrides,
                                 &scan_exclusions,
                             );
                         (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
@@ -10119,6 +10141,13 @@ impl Backend {
             let root_clone = root.clone();
             let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
             let scan_exclusions = workspace_exclusions.clone();
+            // Buffer-aware preamble scan: snapshot open-buffer text before the
+            // blocking scan so the packageMode reseed cannot clobber unsaved
+            // edits (see `initialize_package_inputs_from_state_with_exclusions`).
+            let preamble_overrides = {
+                let state = self.state.read().await;
+                snapshot_preamble_text_overrides(&state)
+            };
             let (desc_text, ns_text, disk_r_files, rprofile_scan, preamble_scan) =
                 tokio::task::spawn_blocking(move || {
                     let desc = std::fs::read_to_string(root_clone.join("DESCRIPTION"))
@@ -10140,10 +10169,12 @@ impl Backend {
                             &scan_exclusions,
                         );
                     // Precompute the testthat preamble sourced-closure scan
-                    // OFF the lock too (issue #638, same discipline).
+                    // OFF the lock too (issue #638, same discipline),
+                    // overlaying the pre-snapshotted open-buffer text.
                     let preamble_scan =
-                        crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                        crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
                             &root_clone,
+                            &preamble_overrides,
                             &scan_exclusions,
                         );
                     (desc, ns, disk_r_files, rprofile_scan, preamble_scan)
@@ -20645,6 +20676,82 @@ mod project_config_initialize_tests {
             .unwrap();
         assert!(symbols.contains("disk_a"), "got {symbols:?}");
         assert!(!symbols.contains("changed_a"), "got {symbols:?}");
+    }
+
+    /// A preamble buffer opened (with unsaved edits) BEFORE the first package
+    /// seed — when `workspace_root` was still unset, so the did_open refresh
+    /// could not run — must win over disk when the seed finally installs: the
+    /// inline seeding scan overlays authoritative open-buffer text.
+    #[tokio::test]
+    async fn package_seed_overlays_open_preamble_buffer_opened_before_seed() {
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        fs::create_dir_all(root_path.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root_path.join("scripts")).unwrap();
+        let description = "Package: preambleseed\nVersion: 0.0.1\nSuggests: testthat\n";
+        fs::write(root_path.join("DESCRIPTION"), description).unwrap();
+        let preamble_path = root_path.join("tests/testthat/helper-project.R");
+        fs::write(&preamble_path, "source(\"../../scripts/a.R\")\n").unwrap();
+        fs::write(root_path.join("scripts/a.R"), "disk_a <- 1\n").unwrap();
+        fs::write(root_path.join("scripts/b.R"), "disk_b <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&root_path).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Open the preamble with an unsaved edit BEFORE any package seed:
+        // package_inputs.workspace_root is unset, so did_open cannot refresh
+        // the closure — the seed itself must honor the buffer.
+        let preamble_uri = Url::from_file_path(&preamble_path).unwrap();
+        open_doc(
+            backend,
+            &preamble_uri,
+            "r",
+            1,
+            "source(\"../../scripts/b.R\")\n",
+        )
+        .await;
+
+        {
+            let mut state = backend.state.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root_path.clone(),
+                Some(Arc::from(description)),
+                None,
+                Default::default(),
+                None,
+                None,
+                &crate::config_file::CompiledWorkspaceExclusions::default(),
+            );
+        }
+
+        let state = backend.state.read().await;
+        let symbols = state
+            .package_inputs
+            .preamble_sourced_symbols
+            .get(&preamble_path)
+            .unwrap();
+        assert!(
+            symbols.contains("disk_b"),
+            "seed must harvest through the open buffer's source() target: {symbols:?}"
+        );
+        assert!(
+            !symbols.contains("disk_a"),
+            "seed must not clobber the open buffer with the stale disk closure: {symbols:?}"
+        );
     }
 
     /// While `.Rprofile` is OPEN with unsaved edits, a file-watcher event for it
