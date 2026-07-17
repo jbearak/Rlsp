@@ -1957,14 +1957,14 @@ pub(crate) fn static_script_definitions_and_load_all<'tree, 'text>(
 #[derive(Debug)]
 struct FinalizedSourceInterface {
     source: ForwardSource,
-    contributes_to_scope: bool,
+    contributes_to_timeline: bool,
 }
 
 impl FinalizedSourceInterface {
     fn from_detected(detected: &FramedSource) -> Self {
         Self {
             source: detected.source.clone(),
-            contributes_to_scope: detected.contributes_to_scope(),
+            contributes_to_timeline: detected.contributes_to_timeline(),
         }
     }
 }
@@ -2011,10 +2011,10 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         &mut artifacts,
     );
 
-    // Collect source() calls and add them to timeline.
-    // Note: even when local=TRUE (or sys.source targets a non-global env), the symbols can still
-    // be in-scope within a function body after the call site, so we keep these events and apply
-    // scoping rules later during resolution.
+    // Collect source() calls and add them to timeline. Orderable calls stay on
+    // the timeline even when they target a non-inheriting environment: ordinary
+    // child bindings remain isolated, but package attachments are process-wide
+    // side effects that become visible after the call.
     let source_calls =
         detect_source_calls_with_bindings_and_frames(tree, content, &mut capture_bindings);
     let source_interfaces: Vec<FinalizedSourceInterface> = source_calls
@@ -2022,9 +2022,9 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         .map(FinalizedSourceInterface::from_detected)
         .collect();
     for detected in source_calls {
-        if !detected.contributes_to_scope() {
-            // The dependency still exists, but its destination or capture runtime
-            // order cannot safely lend symbols to this coordinate-sorted timeline.
+        if !detected.contributes_to_timeline() {
+            // The dependency still exists, but capture runtime order cannot
+            // safely place its effects on this coordinate-sorted timeline.
             continue;
         }
         let source = detected.source;
@@ -2244,9 +2244,9 @@ pub fn compute_artifacts_with_metadata(
         &mut artifacts,
     );
 
-    // Collect source() calls from AST and add them to timeline. Keep dependency
-    // detection broader than scope lending: external local sources execute, but
-    // their child symbols belong to the external `where` environment.
+    // Collect source() calls from AST and add every source-coordinate-orderable
+    // call to the timeline. Locality later determines whether the child lends
+    // symbols or only process-wide package attachments.
     let detected_source_calls =
         detect_source_calls_with_bindings_and_frames(tree, content, &mut capture_bindings);
     let source_interfaces: Vec<FinalizedSourceInterface> = metadata
@@ -2256,7 +2256,7 @@ pub fn compute_artifacts_with_metadata(
                 .map(|detected| {
                     (
                         (detected.source.line, detected.source.column),
-                        detected.contributes_to_scope(),
+                        detected.contributes_to_timeline(),
                     )
                 })
                 .collect();
@@ -2265,14 +2265,14 @@ pub fn compute_artifacts_with_metadata(
                 .iter()
                 .cloned()
                 .map(|source| {
-                    let contributes_to_scope = source.is_directive
+                    let contributes_to_timeline = source.is_directive
                         || ast_decisions
                             .get(&(source.line, source.column))
                             .copied()
                             .unwrap_or(false);
                     FinalizedSourceInterface {
                         source,
-                        contributes_to_scope,
+                        contributes_to_timeline,
                     }
                 })
                 .collect()
@@ -2285,7 +2285,7 @@ pub fn compute_artifacts_with_metadata(
         });
     let ast_source_calls: Vec<_> = detected_source_calls
         .into_iter()
-        .filter(FramedSource::contributes_to_scope)
+        .filter(FramedSource::contributes_to_timeline)
         .collect();
 
     // Track which (line, path) pairs have AST sources to avoid duplicates
@@ -5400,7 +5400,7 @@ fn compute_interface_hash(
         source.is_sys_source.hash(&mut hasher);
         source.is_function_scoped.hash(&mut hasher);
         source.resolved_uri.hash(&mut hasher);
-        interface.contributes_to_scope.hash(&mut hasher);
+        interface.contributes_to_timeline.hash(&mut hasher);
     }
 
     hasher.finish()
@@ -6851,19 +6851,16 @@ where
                 }
                 let is_global_source = query_inside_function && function_scope.is_none();
                 if passes_position || is_global_source {
-                    // If this is a local-only source (or sys.source into a non-global env), only
-                    // make its symbols available within the containing function scope.
-                    if should_apply_local_scoping(source) && function_scope.is_none() {
-                        // FORWARD direction: a top-level local=TRUE source does not
-                        // contribute its child's symbols to THIS file's global scope
-                        // (the child's defs land in a local env, not the caller's).
-                        // This is deliberately asymmetric with the BACKWARD
-                        // parent-prefix rule in `parent_prefix_at` (issue #476),
-                        // which DOES let a top-level local=TRUE child inherit the
-                        // parent's prior globals — because `local=TRUE` evaluates the
-                        // child in the caller's env (`.GlobalEnv` at top level), so
-                        // the child sees the parent, but the parent does not gain the
-                        // child's new local bindings.
+                    let package_effects_only =
+                        source.locality == super::types::SourceLocality::NonInheriting;
+                    // A top-level CurrentFrame source contributes no child state to
+                    // this file. A NonInheriting source likewise lends no symbols,
+                    // but its orderable package-attachment side effects still apply
+                    // to R's process search path after the call.
+                    if should_apply_local_scoping(source)
+                        && function_scope.is_none()
+                        && !package_effects_only
+                    {
                         continue;
                     }
 
@@ -6963,8 +6960,8 @@ where
                         // "undefined" inside the standalone file's contribution.
                         let child_is_standalone =
                             get_metadata(&child_uri).is_some_and(|m| m.standalone);
-                        let packages_may_cross =
-                            source.locality != super::types::SourceLocality::NonInheriting;
+                        let package_effects_only =
+                            source.locality == super::types::SourceLocality::NonInheriting;
                         let child_provider = if child_is_standalone {
                             None
                         } else {
@@ -6973,7 +6970,7 @@ where
                         let empty_packages_for_child = HashSet::new();
                         let owned_packages: HashSet<String>;
                         let packages_for_child: &HashSet<String> = if child_is_standalone
-                            || !packages_may_cross
+                            || package_effects_only
                         {
                             &empty_packages_for_child
                         } else if extra_packages.is_empty() && scope.loaded_packages.is_empty() {
@@ -7100,78 +7097,85 @@ where
                             &mut scope.visible_positions,
                             &child_scope.visible_positions,
                         );
-                        // Merge child symbols (local definitions take
-                        // precedence). The forward-source leak rule (same-file
-                        // + parent-prefix-only) lives in
-                        // `child_source_symbol_is_leak`.
-                        let child_parent_prefix_symbol_names =
-                            child_scope.parent_prefix_symbol_names.clone();
-                        for (name, symbol) in child_scope.symbols {
-                            if child_source_symbol_is_leak(
-                                &symbol,
-                                &name,
-                                uri,
-                                &child_parent_prefix_symbol_names,
-                            ) {
-                                continue;
-                            }
-                            // This name is genuinely produced by executing this
-                            // file's forward source() (it passed the child leak
-                            // filter). Record it BEFORE the identical-binding
-                            // no-op so even an identical re-export clears the
-                            // stale parent-prefix marker after the loop (#476).
-                            // Only names currently marked parent-prefix-only can
-                            // be affected by the post-loop `retain`, so guard the
-                            // insert on membership — in the common case (the name
-                            // is not in the prefix) this skips the alloc/clone
-                            // entirely, keeping the hot forward path cheap.
-                            if scope.parent_prefix_symbol_names.contains(&name) {
-                                forward_contributed.insert(name.clone());
-                            }
-                            // The identical-binding no-op and marker-override
-                            // merge below stay recursive-only: they preserve
-                            // this frame's `parent_prefix_symbol_names` marker,
-                            // which streaming has no equivalent of (its prefix
-                            // is held separately and combined at snapshot).
-                            // Pinned by
-                            // `test_scope_stream_parent_prefix_override_matches_recursive`.
-                            //
-                            // A sourced file's resolved scope includes symbols
-                            // it inherited from its own parents. Re-exporting
-                            // an identical already-visible binding is a no-op
-                            // at runtime and must not consume the marker that
-                            // allows a later real source/local definition to
-                            // override a parent-prefix binding.
-                            if scope
-                                .symbols
-                                .get(&name)
-                                .map(|existing| existing == &symbol)
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            if scope.parent_prefix_symbol_names.remove(&name) {
-                                scope.symbols.insert(name, symbol);
-                            } else {
-                                scope.symbols.entry(name).or_insert(symbol);
+                        if !package_effects_only {
+                            // Merge child symbols (local definitions take
+                            // precedence). The forward-source leak rule (same-file
+                            // + parent-prefix-only) lives in
+                            // `child_source_symbol_is_leak`.
+                            let child_parent_prefix_symbol_names =
+                                child_scope.parent_prefix_symbol_names.clone();
+                            for (name, symbol) in child_scope.symbols {
+                                if child_source_symbol_is_leak(
+                                    &symbol,
+                                    &name,
+                                    uri,
+                                    &child_parent_prefix_symbol_names,
+                                ) {
+                                    continue;
+                                }
+                                // This name is genuinely produced by executing this
+                                // file's forward source() (it passed the child leak
+                                // filter). Record it BEFORE the identical-binding
+                                // no-op so even an identical re-export clears the
+                                // stale parent-prefix marker after the loop (#476).
+                                // Only names currently marked parent-prefix-only can
+                                // be affected by the post-loop `retain`, so guard the
+                                // insert on membership — in the common case (the name
+                                // is not in the prefix) this skips the alloc/clone
+                                // entirely, keeping the hot forward path cheap.
+                                if scope.parent_prefix_symbol_names.contains(&name) {
+                                    forward_contributed.insert(name.clone());
+                                }
+                                // The identical-binding no-op and marker-override
+                                // merge below stay recursive-only: they preserve
+                                // this frame's `parent_prefix_symbol_names` marker,
+                                // which streaming has no equivalent of (its prefix
+                                // is held separately and combined at snapshot).
+                                // Pinned by
+                                // `test_scope_stream_parent_prefix_override_matches_recursive`.
+                                //
+                                // A sourced file's resolved scope includes symbols
+                                // it inherited from its own parents. Re-exporting
+                                // an identical already-visible binding is a no-op
+                                // at runtime and must not consume the marker that
+                                // allows a later real source/local definition to
+                                // override a parent-prefix binding.
+                                if scope
+                                    .symbols
+                                    .get(&name)
+                                    .map(|existing| existing == &symbol)
+                                    .unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                                if scope.parent_prefix_symbol_names.remove(&name) {
+                                    scope.symbols.insert(name, symbol);
+                                } else {
+                                    scope.symbols.entry(name).or_insert(symbol);
+                                }
                             }
                         }
                         scope.chain.extend(child_scope.chain);
                         scope.depth_exceeded.extend(child_scope.depth_exceeded);
 
-                        // Packages loaded in the sourced file become available
-                        // after the source() call. The same-file leak filter
-                        // lives in `merge_child_source_packages`.
-                        if packages_may_cross {
-                            merge_child_source_packages(
-                                &child_scope.loaded_packages,
-                                &child_scope.inherited_packages,
-                                &child_scope.package_origins,
-                                uri,
-                                &mut scope.loaded_packages,
-                                &mut scope.package_origins,
-                            );
-                        }
+                        // Package attachments are process-wide side effects. A
+                        // NonInheriting source exports only packages definitely
+                        // attached while executing the child; it does not re-export
+                        // packages the isolated child merely inherited elsewhere.
+                        let empty_inherited = HashSet::new();
+                        let child_inherited_packages = if package_effects_only {
+                            &empty_inherited
+                        } else {
+                            &child_scope.inherited_packages
+                        };
+                        merge_child_source_packages(
+                            &child_scope.loaded_packages,
+                            child_inherited_packages,
+                            &child_scope.package_origins,
+                            uri,
+                            &mut scope.loaded_packages,
+                            &mut scope.package_origins,
+                        );
                     }
                 }
             }
@@ -8563,9 +8567,14 @@ where
                 function_scope,
                 ..
             } => {
-                // Local-scoping rule: top-level local sources contribute
-                // nothing (mirrors `scope.rs:3458-3463`).
-                if should_apply_local_scoping(&source) && function_scope.is_none() {
+                // Top-level CurrentFrame sources contribute nothing. An
+                // orderable NonInheriting source still contributes process-wide
+                // package attachments, while `resolve_source_contribution`
+                // suppresses all of its child symbols.
+                if should_apply_local_scoping(&source)
+                    && function_scope.is_none()
+                    && source.locality != super::types::SourceLocality::NonInheriting
+                {
                     return;
                 }
                 // Resolve once per call site, reuse on every application
@@ -9104,8 +9113,10 @@ where
                 if function_scope.is_some() {
                     return;
                 }
-                if should_apply_local_scoping(source) {
-                    // Top-level local source — skipped globally.
+                if should_apply_local_scoping(source)
+                    && source.locality != super::types::SourceLocality::NonInheriting
+                {
+                    // Top-level CurrentFrame source — skipped globally.
                     return;
                 }
                 let key = (*src_line, *src_col);
@@ -9349,19 +9360,22 @@ where
             },
         );
 
-        // Forward-source leak rule (same-file + parent-prefix-only) lives in
-        // `child_source_symbol_is_leak`.
-        let child_parent_prefix_symbol_names = child_scope.parent_prefix_symbol_names.clone();
-        for (name, symbol) in child_scope.symbols {
-            if child_source_symbol_is_leak(
-                &symbol,
-                &name,
-                self.queried_uri,
-                &child_parent_prefix_symbol_names,
-            ) {
-                continue;
+        let package_effects_only = source.locality == super::types::SourceLocality::NonInheriting;
+        if !package_effects_only {
+            // Forward-source leak rule (same-file + parent-prefix-only) lives in
+            // `child_source_symbol_is_leak`.
+            let child_parent_prefix_symbol_names = child_scope.parent_prefix_symbol_names.clone();
+            for (name, symbol) in child_scope.symbols {
+                if child_source_symbol_is_leak(
+                    &symbol,
+                    &name,
+                    self.queried_uri,
+                    &child_parent_prefix_symbol_names,
+                ) {
+                    continue;
+                }
+                contrib.symbols.entry(name).or_insert(symbol);
             }
-            contrib.symbols.entry(name).or_insert(symbol);
         }
         contrib.chain.extend(child_scope.chain);
         extend_visible_positions(
@@ -9370,18 +9384,23 @@ where
         );
         contrib.depth_exceeded.extend(child_scope.depth_exceeded);
 
-        // Same-file leak filter for packages lives in
-        // `merge_child_source_packages`.
-        if source.locality != super::types::SourceLocality::NonInheriting {
-            merge_child_source_packages(
-                &child_scope.loaded_packages,
-                &child_scope.inherited_packages,
-                &child_scope.package_origins,
-                self.queried_uri,
-                &mut contrib.packages,
-                &mut contrib.package_origins,
-            );
-        }
+        // Package attachments are process-wide. NonInheriting sources export
+        // only attachments produced while executing the child, never package
+        // context the isolated child inherited from another caller.
+        let empty_inherited = HashSet::new();
+        let child_inherited_packages = if package_effects_only {
+            &empty_inherited
+        } else {
+            &child_scope.inherited_packages
+        };
+        merge_child_source_packages(
+            &child_scope.loaded_packages,
+            child_inherited_packages,
+            &child_scope.package_origins,
+            self.queried_uri,
+            &mut contrib.packages,
+            &mut contrib.package_origins,
+        );
 
         contrib
     }
@@ -13420,11 +13439,11 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         let resolve = |source_call: &str| {
             let ancestor_code = "library(ancestorpkg)\nsource(\"parent.R\")";
             let parent_code = format!(
-                "# raven: var declared\nlibrary(directpkg)\nsource(\"sibling.R\")\n{source_call}"
+                "# raven: var declared\nparent_only <- 1\nlibrary(directpkg)\nsource(\"sibling.R\")\n{source_call}"
             );
             let sibling_code = "library(siblingpkg)";
-            let child_code = "source(\"grandchild.R\")";
-            let grandchild_code = "grandchild_only <- 1";
+            let child_code = "child_only <- 1\nlibrary(childpkg)\nsource(\"grandchild.R\")";
+            let grandchild_code = "grandchild_only <- 1\nlibrary(grandchildpkg)";
 
             let ancestor_meta = crate::cross_file::extract_metadata(ancestor_code);
             let parent_meta = crate::cross_file::extract_metadata(&parent_code);
@@ -13483,11 +13502,11 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
                     None
                 }
             };
-            let query = |uri: &Url| {
+            let query = |uri: &Url, line: u32, column: u32| {
                 scope_at_position_with_graph(
                     uri,
-                    u32::MAX,
-                    u32::MAX,
+                    line,
+                    column,
                     &get_artifacts,
                     &get_metadata,
                     &graph,
@@ -13501,14 +13520,26 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
                     None,
                 )
             };
-            (query(&child_uri), query(&grandchild_uri))
+            let source_edge = graph
+                .get_dependencies(&parent_uri)
+                .into_iter()
+                .find(|edge| edge.to == child_uri)
+                .expect("parent must source child");
+            let source_line = source_edge.call_site_line.unwrap();
+            let source_column = source_edge.call_site_column.unwrap();
+            (
+                query(&child_uri, u32::MAX, u32::MAX),
+                query(&grandchild_uri, u32::MAX, u32::MAX),
+                query(&parent_uri, source_line, source_column),
+                query(&parent_uri, source_line, source_column.saturating_add(1)),
+            )
         };
 
         for source_call in [
             r#"source("child.R")"#,
             r#"bquote(.(source("child.R", local = TRUE)), where = parent.frame())"#,
         ] {
-            let (child, grandchild) = resolve(source_call);
+            let (child, grandchild, _, _) = resolve(source_call);
             for scope in [&child, &grandchild] {
                 for package in ["ancestorpkg", "directpkg", "siblingpkg"] {
                     assert!(
@@ -13521,7 +13552,7 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
             assert!(child.symbols.contains_key("declared"));
         }
 
-        let (child, grandchild) = resolve(
+        let (child, grandchild, parent_before, parent_after) = resolve(
             r#"env <- base::new.env(parent = base::emptyenv())
 base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
         );
@@ -13530,11 +13561,38 @@ base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
                 assert!(
                     !scope.inherited_packages.contains(package)
                         && !scope.loaded_packages.contains(package),
-                    "NonInheriting leaked {package}: {scope:?}"
+                    "NonInheriting leaked incoming {package}: {scope:?}"
                 );
             }
+            assert!(
+                !scope.symbols.contains_key("parent_only"),
+                "NonInheriting leaked an ordinary caller binding: {scope:?}"
+            );
         }
         assert!(child.symbols.contains_key("declared"));
+        assert!(child.loaded_packages.contains("childpkg"));
+        assert!(child.loaded_packages.contains("grandchildpkg"));
+        assert!(grandchild.loaded_packages.contains("grandchildpkg"));
+        assert!(
+            grandchild.inherited_packages.contains("childpkg")
+                || grandchild.loaded_packages.contains("childpkg")
+        );
+        for package in ["childpkg", "grandchildpkg"] {
+            assert!(
+                !parent_before.loaded_packages.contains(package),
+                "{package} must not be visible before the NonInheriting source call"
+            );
+            assert!(
+                parent_after.loaded_packages.contains(package),
+                "{package} attached by the child closure must be visible after the call"
+            );
+        }
+        for symbol in ["child_only", "grandchild_only"] {
+            assert!(
+                !parent_after.symbols.contains_key(symbol),
+                "NonInheriting source leaked child symbol {symbol}"
+            );
+        }
     }
 
     #[test]
@@ -20178,7 +20236,13 @@ x <- 1"#;
             .collect();
         assert_eq!(
             sources,
-            vec![("external-global.R", false), ("global-local.R", false)]
+            vec![
+                ("external-local.R", true),
+                ("external-global.R", false),
+                ("global-environment.R", true),
+                ("global-local.R", false),
+            ],
+            "all orderable sources stay on the timeline; locality controls whether symbols or only package effects propagate"
         );
         let packages: HashSet<_> = artifacts
             .timeline
@@ -28053,6 +28117,147 @@ y <- filter(df)"#;
         assert!(
             stream.is_visible("helper_value"),
             "helper_value (sourced from helper.R at line 0 col 0) must be visible at (0, 1)"
+        );
+    }
+
+    #[test]
+    fn scope_stream_non_inheriting_source_exports_only_ordered_package_effects() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let root = Url::parse("file:///project").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let parent_code = r#"library(beforepkg)
+parent_only <- 1
+env <- base::new.env(parent = base::emptyenv())
+base::bquote(.(source("child.R", local = TRUE)), where = env)
+after <- 1
+"#;
+        let child_code = "child_only <- 1\nlibrary(childpkg)\n";
+        let parent_tree = parse_r(parent_code);
+        let child_tree = parse_r(child_code);
+        let parent_meta = Arc::new(crate::cross_file::extract_metadata_with_tree(
+            parent_code,
+            Some(&parent_tree),
+        ));
+        let child_meta = Arc::new(CrossFileMetadata::default());
+        let parent_artifacts = Arc::new(compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            parent_code,
+            Some(&parent_meta),
+        ));
+        let child_artifacts = Arc::new(compute_artifacts(&child_uri, &child_tree, child_code));
+        assert!(
+            parent_artifacts
+                .timeline
+                .iter()
+                .any(|event| matches!(event, ScopeEvent::Source { source, .. } if source.locality == SourceLocality::NonInheriting)),
+            "an orderable NonInheriting source must remain on the timeline"
+        );
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+        let edge = graph
+            .get_dependencies(&parent_uri)
+            .into_iter()
+            .find(|edge| edge.to == child_uri)
+            .expect("parent must source child");
+        let source_line = edge.call_site_line.unwrap();
+        let source_column = edge.call_site_column.unwrap();
+
+        let get_artifacts = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else if uri == &child_uri {
+                Some(child_meta.clone())
+            } else {
+                None
+            }
+        };
+        let base_exports = HashSet::new();
+        let is_cancelled = || false;
+
+        let child_scope = scope_at_position_with_graph(
+            &child_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &is_cancelled,
+            None,
+            None,
+        );
+        assert!(!child_scope.symbols.contains_key("parent_only"));
+        assert!(!child_scope.inherited_packages.contains("beforepkg"));
+        assert!(child_scope.loaded_packages.contains("childpkg"));
+
+        let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+        let mut stream = ScopeStream::new(
+            &parent_uri,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &is_cancelled,
+            &prefix_cache,
+            None,
+            None,
+        )
+        .expect("stream construction must succeed");
+
+        stream.advance_to(source_line, source_column);
+        let before = stream.snapshot();
+        assert!(!before.loaded_packages.contains("childpkg"));
+        assert!(!before.symbols.contains_key("child_only"));
+
+        stream.advance_to(source_line, source_column.saturating_add(1));
+        let after = stream.snapshot();
+        assert!(after.loaded_packages.contains("childpkg"));
+        assert!(!after.symbols.contains_key("child_only"));
+
+        let mut direct_cache = ParentPrefixCache::new();
+        let direct_after = scope_at_position_with_graph_cached(
+            &parent_uri,
+            source_line,
+            source_column.saturating_add(1),
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &base_exports,
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &is_cancelled,
+            &mut direct_cache,
+            None,
+            None,
+        );
+        assert_eq!(after.loaded_packages, direct_after.loaded_packages);
+        assert_eq!(
+            after.symbols.keys().collect::<HashSet<_>>(),
+            direct_after.symbols.keys().collect::<HashSet<_>>()
         );
     }
 

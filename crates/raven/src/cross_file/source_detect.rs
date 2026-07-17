@@ -242,14 +242,14 @@ pub(crate) fn detect_source_calls_with_bindings<'tree, 'text>(
 pub(crate) struct FramedSource {
     pub(crate) source: ForwardSource,
     pub(crate) runtime_function_scope: RuntimeFunctionScope,
-    /// Whether source-coordinate timeline application can safely lend symbols
-    /// from this call. Dependency detection retains the call regardless.
+    /// Whether source-coordinate timeline application can safely order this
+    /// call's effects. Dependency detection retains the call regardless.
     pub(crate) scope_lending: bool,
 }
 
 impl FramedSource {
-    pub(crate) fn contributes_to_scope(&self) -> bool {
-        self.scope_lending && self.source.locality != SourceLocality::NonInheriting
+    pub(crate) fn contributes_to_timeline(&self) -> bool {
+        self.scope_lending
     }
 }
 
@@ -2885,7 +2885,7 @@ source(file.path(repo_root, "scripts/helpers.R"))
                 "#,
                 CaptureEvaluationFrame::ExternalOrUnknown,
                 SourceLocality::NonInheriting,
-                false,
+                true,
             ),
             (
                 r#"
@@ -2932,11 +2932,11 @@ source(file.path(repo_root, "scripts/helpers.R"))
                 "#,
                 CaptureEvaluationFrame::ExternalOrUnknown,
                 SourceLocality::NonInheriting,
-                false,
+                true,
             ),
         ];
 
-        for (code, _expected_frame, expected_locality, expected_scope_lending) in cases {
+        for (code, _expected_frame, expected_locality, expected_timeline_contribution) in cases {
             let tree = parse_r(code);
             let mut bindings =
                 crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), code);
@@ -2947,8 +2947,8 @@ source(file.path(repo_root, "scripts/helpers.R"))
                 "{code}: {detected:?}"
             );
             assert_eq!(
-                detected[0].contributes_to_scope(),
-                expected_scope_lending,
+                detected[0].contributes_to_timeline(),
+                expected_timeline_contribution,
                 "{code}: {detected:?}"
             );
         }
@@ -3657,7 +3657,7 @@ source(p)
         assert_eq!(external.source.locality, SourceLocality::NonInheriting);
         assert!(external.source.locality != SourceLocality::Global);
         assert!(external.source.chdir, "chdir metadata must be preserved");
-        assert!(!external.contributes_to_scope());
+        assert!(external.contributes_to_timeline());
 
         for source in &detected[1..] {
             assert_eq!(source.source.locality, SourceLocality::Global, "{source:?}");
@@ -3665,7 +3665,7 @@ source(p)
                 source.source.locality == SourceLocality::Global,
                 "{source:?}"
             );
-            assert!(source.contributes_to_scope(), "{source:?}");
+            assert!(source.contributes_to_timeline(), "{source:?}");
         }
 
         assert_eq!(
