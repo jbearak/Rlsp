@@ -832,15 +832,6 @@ pub struct WorldState {
     pub libpath_watcher_handle:
         Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
     pub package_library_ready: bool,
-    /// Operational freshness identity for detached full-workspace scans.
-    ///
-    /// Closed-file watcher mutations and scan-affecting configuration changes
-    /// advance this generation before their state can race an in-flight scan.
-    /// A scan must atomically claim its captured generation under the
-    /// `WorldState` write lock immediately before applying; the claim advances
-    /// the generation so peer scans captured from the same state cannot both
-    /// install.
-    workspace_scan_generation: u64,
     /// Whether the background workspace scan has completed and the dependency
     /// graph has been populated from workspace entries. In `Auto` backward
     /// dependency mode, undefined variable diagnostics are deferred for files
@@ -995,29 +986,6 @@ impl WorldState {
     /// package-state input feeds the scope that the analysis did not foresee.
     pub fn bump_package_config_generation(&mut self) {
         self.package_config_generation = self.package_config_generation.wrapping_add(1);
-    }
-
-    /// Current operational generation for detached full-workspace scans.
-    pub(crate) fn workspace_scan_generation(&self) -> u64 {
-        self.workspace_scan_generation
-    }
-
-    /// Invalidate scans captured before a closed-file or configuration mutation.
-    pub(crate) fn advance_workspace_scan_generation(&mut self) {
-        self.workspace_scan_generation = self.workspace_scan_generation.wrapping_add(1);
-    }
-
-    /// Atomically claim `expected` for one full-scan application.
-    ///
-    /// Advancing on success prevents two scans captured from the same generation
-    /// from both installing. Callers must perform every structural identity check
-    /// under the same write lock immediately before this claim.
-    pub(crate) fn claim_workspace_scan_generation(&mut self, expected: u64) -> bool {
-        if self.workspace_scan_generation != expected {
-            return false;
-        }
-        self.advance_workspace_scan_generation();
-        true
     }
 
     /// Current operational generation of raw package inputs.
@@ -1316,7 +1284,6 @@ impl WorldState {
             watched_file_resync_generations: HashMap::new(),
             libpath_watcher_handle: None,
             package_library_ready: false,
-            workspace_scan_generation: 0,
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
             package_inputs: crate::package_state::PackageInputs::default(),
@@ -2054,9 +2021,7 @@ impl WorldState {
     /// application must not leave package semantics temporarily reset or empty
     /// while the seed recomputes off-lock.
     ///
-    /// Detached LSP callers must validate and claim their workspace-scan
-    /// generation under the same `WorldState` write lock immediately before
-    /// calling this method. Package-input freshness is owned separately by
+    /// Package-input freshness is owned separately by
     /// `package_input_lifecycle`, so applying an index neither advances nor
     /// resets the generation captured by a seed computed for this application.
     ///
@@ -2107,33 +2072,6 @@ impl WorldState {
         // Now that the graph reflects the workspace, refresh the document_store
         // pin set so any file opened before the scan completes picks up its
         // neighborhood.
-        self.recompute_open_neighborhood_pins();
-    }
-
-    /// Atomically install a workspace scan whose dependency graph was prepared
-    /// off-lock from the same index entries and authoritative open-buffer
-    /// snapshot.
-    ///
-    /// Unlike [`Self::apply_workspace_index`], this method performs no path
-    /// resolution, parsing, metadata enrichment, or filesystem work. Detached
-    /// LSP scan callers must validate their scan/open-document freshness under
-    /// the surrounding write lock immediately before calling it.
-    pub(crate) fn apply_prepared_workspace_index(
-        &mut self,
-        index: HashMap<Url, Document>,
-        cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
-        new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
-        graph: DependencyGraph,
-    ) {
-        self.workspace_index = index;
-        for (uri, entry) in cross_file_entries {
-            self.cross_file_workspace_index.insert(uri, entry);
-        }
-        for (uri, entry) in new_index_entries {
-            self.workspace_index_new.insert(uri, entry);
-        }
-        self.cross_file_graph = graph;
-        self.workspace_scan_complete = true;
         self.recompute_open_neighborhood_pins();
     }
 
@@ -3130,7 +3068,7 @@ pub(crate) fn should_skip_directory(dir_name: &str) -> bool {
         .any(|skip| dir_name.eq_ignore_ascii_case(skip))
 }
 
-pub(crate) fn is_stat_model_extension(path: &Path) -> bool {
+fn is_stat_model_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|s| s.to_str())
         .is_some_and(|ext| {

@@ -182,33 +182,6 @@ Keep new seed inputs in that shared helper so startup, exclusion reloads, and
 package-mode rebuilds cannot drift or introduce blocking filesystem work under
 the state lock.
 
-Detached full-workspace scans use the same transaction shape. Startup and
-workspace-exclusion reloads share one retrying runner that captures a monotonic
-scan generation plus the ordered workspace folders, exclusion patterns,
-`maxChainDepth`, and `indexWorkspace`; filesystem walking and parsing remain
-off-lock. After scanning, the runner snapshots authoritative open metadata and
-lifecycle identities under a brief read lock, then performs inherited-WD repair,
-backward call-site inference, path resolution, and complete dependency-graph
-construction off-lock. The final `WorldState` write-lock window validates both
-the scan token and open identities, claims the generation, and performs only
-in-memory index/graph installation. No parsing, metadata extraction, filesystem
-path resolution, or directory work is permitted in that commit window.
-Closed-file watcher/close transitions, both on-demand closed-file commit paths,
-and scan-affecting config changes advance the generation, so stale results are
-discarded and recomputed rather than overwriting newer indexed or package-R
-content. Preparation reapplies live parents' inherited working-directory context
-through their closed indexed forward descendants and reruns the backward-
-directive inherited-WD fixpoint; rebuilding every edge from live parent content
-also refreshes default/match-inferred backward call sites when the WD itself is
-unchanged. A false-to-true
-`indexWorkspace` transition launches its own convergence scan; that path and
-`maxChainDepth`-triggered scans prefetch packages visible through the rebuilt
-graph before their caller republishes diagnostics. Intentional no-scan startup
-completion force-republishes open documents so
-undefined-variable diagnostics deferred behind `workspace_scan_complete` are
-released. Index-backed package seeding starts only after a current scan has
-applied.
-
 The package-state-local static-source closure walker in `package_state/mod.rs`
 owns the traversal mechanics shared by `.Rprofile` and testthat preambles: LIFO
 order, visited/routing deduplication, rich forward path resolution, and the common
