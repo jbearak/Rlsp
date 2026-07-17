@@ -1954,6 +1954,21 @@ pub(crate) fn static_script_definitions_and_load_all<'tree, 'text>(
     (definitions, load_all)
 }
 
+#[derive(Debug)]
+struct FinalizedSourceInterface {
+    source: ForwardSource,
+    contributes_to_scope: bool,
+}
+
+impl FinalizedSourceInterface {
+    fn from_detected(detected: &FramedSource) -> Self {
+        Self {
+            source: detected.source.clone(),
+            contributes_to_scope: detected.contributes_to_scope(),
+        }
+    }
+}
+
 /// Build scope artifacts for a source file by extracting definitions, source() calls, and removals.
 ///
 /// The returned ScopeArtifacts contains a document-ordered timeline of scope events (definitions,
@@ -2002,9 +2017,9 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // scoping rules later during resolution.
     let source_calls =
         detect_source_calls_with_bindings_and_frames(tree, content, &mut capture_bindings);
-    let source_interfaces: Vec<ForwardSource> = source_calls
+    let source_interfaces: Vec<FinalizedSourceInterface> = source_calls
         .iter()
-        .map(|detected| detected.source.clone())
+        .map(FinalizedSourceInterface::from_detected)
         .collect();
     for detected in source_calls {
         if !detected.contributes_to_scope() {
@@ -2234,11 +2249,38 @@ pub fn compute_artifacts_with_metadata(
     // their child symbols belong to the external `where` environment.
     let detected_source_calls =
         detect_source_calls_with_bindings_and_frames(tree, content, &mut capture_bindings);
-    let source_interfaces: Vec<ForwardSource> =
-        metadata.map(|m| m.sources.clone()).unwrap_or_else(|| {
+    let source_interfaces: Vec<FinalizedSourceInterface> = metadata
+        .map(|metadata| {
+            let ast_decisions: HashMap<(u32, u32), bool> = detected_source_calls
+                .iter()
+                .map(|detected| {
+                    (
+                        (detected.source.line, detected.source.column),
+                        detected.contributes_to_scope(),
+                    )
+                })
+                .collect();
+            metadata
+                .sources
+                .iter()
+                .cloned()
+                .map(|source| {
+                    let contributes_to_scope = source.is_directive
+                        || ast_decisions
+                            .get(&(source.line, source.column))
+                            .copied()
+                            .unwrap_or(false);
+                    FinalizedSourceInterface {
+                        source,
+                        contributes_to_scope,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
             detected_source_calls
                 .iter()
-                .map(|detected| detected.source.clone())
+                .map(FinalizedSourceInterface::from_detected)
                 .collect()
         });
     let ast_source_calls: Vec<_> = detected_source_calls
@@ -5214,7 +5256,7 @@ fn compute_interface_hash(
     top_level_removals: &[TopLevelRemoval<'_>],
     data_loads: &[DataCallInfo],
     declarations: &[(Arc<str>, u32)],
-    sources: &[ForwardSource],
+    sources: &[FinalizedSourceInterface],
     standalone: bool,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -5334,11 +5376,21 @@ fn compute_interface_hash(
     // Source edges affect the resolved interface of this file even when its own
     // definitions do not change. In particular, CurrentFrame and NonInheriting
     // both serialize `local = true` through the compatibility field but differ
-    // in whether the child receives ordinary parent bindings. Hash the precise
-    // class and the other scope/path-relevant edge attributes deterministically.
-    let mut sorted_sources: Vec<&ForwardSource> = sources.iter().collect();
-    sorted_sources.sort_by_key(|source| (source.line, source.column, source.path.as_str()));
-    for source in sorted_sources {
+    // in whether the child receives ordinary parent bindings. The finalized
+    // lending/orderability decision must also participate: capture analysis can
+    // suppress a ScopeEvent::Source without changing any raw ForwardSource field
+    // or dependency edge. Hash the precise class, finalized decision, and other
+    // scope/path-relevant edge attributes deterministically.
+    let mut sorted_sources: Vec<&FinalizedSourceInterface> = sources.iter().collect();
+    sorted_sources.sort_by_key(|interface| {
+        (
+            interface.source.line,
+            interface.source.column,
+            interface.source.path.as_str(),
+        )
+    });
+    for interface in sorted_sources {
+        let source = &interface.source;
         source.path.hash(&mut hasher);
         source.line.hash(&mut hasher);
         source.column.hash(&mut hasher);
@@ -5348,6 +5400,7 @@ fn compute_interface_hash(
         source.is_sys_source.hash(&mut hasher);
         source.is_function_scoped.hash(&mut hasher);
         source.resolved_uri.hash(&mut hasher);
+        interface.contributes_to_scope.hash(&mut hasher);
     }
 
     hasher.finish()
@@ -10418,6 +10471,54 @@ mod tests {
         assert_ne!(
             current_artifacts.interface_hash, unknown_artifacts.interface_hash,
             "the precise locality must invalidate interfaces even though both legacy local booleans are true"
+        );
+    }
+
+    #[test]
+    fn interface_hash_includes_finalized_source_orderability() {
+        let orderable = r#"bquote(expr = .(source("child.R")), where = parent.frame())"#;
+        let inverted = r#"bquote(expr = .(source("child.R")), where = { x <- 1; parent.frame() })"#;
+        let orderable_tree = parse_r(orderable);
+        let inverted_tree = parse_r(inverted);
+        let orderable_metadata =
+            crate::cross_file::extract_metadata_with_tree(orderable, Some(&orderable_tree));
+        let inverted_metadata =
+            crate::cross_file::extract_metadata_with_tree(inverted, Some(&inverted_tree));
+
+        assert_eq!(
+            orderable_metadata.sources, inverted_metadata.sources,
+            "the raw ForwardSource metadata must remain identical"
+        );
+
+        let orderable_artifacts = compute_artifacts_with_metadata(
+            &test_uri(),
+            &orderable_tree,
+            orderable,
+            Some(&orderable_metadata),
+        );
+        let inverted_artifacts = compute_artifacts_with_metadata(
+            &test_uri(),
+            &inverted_tree,
+            inverted,
+            Some(&inverted_metadata),
+        );
+        assert!(
+            orderable_artifacts
+                .timeline
+                .iter()
+                .any(|event| matches!(event, ScopeEvent::Source { .. })),
+            "the orderable capture must lend its source event"
+        );
+        assert!(
+            !inverted_artifacts
+                .timeline
+                .iter()
+                .any(|event| matches!(event, ScopeEvent::Source { .. })),
+            "the coordinate-inverted capture must suppress its source event"
+        );
+        assert_ne!(
+            orderable_artifacts.interface_hash, inverted_artifacts.interface_hash,
+            "the finalized source lending decision must invalidate the interface"
         );
     }
 

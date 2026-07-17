@@ -2029,6 +2029,73 @@ mod tests {
     }
 
     #[test]
+    fn finalized_source_orderability_revalidates_dependent_without_edge_change() {
+        use crate::cross_file::scope::compute_artifacts_with_metadata;
+
+        let orderable = r#"bquote(expr = .(source("child.R")), where = parent.frame())"#;
+        let inverted = r#"bquote(expr = .(source("child.R")), where = { x <- 1; parent.frame() })"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_r::LANGUAGE.into())
+            .unwrap();
+        let orderable_tree = parser.parse(orderable, None).unwrap();
+        let inverted_tree = parser.parse(inverted, None).unwrap();
+        let orderable_metadata =
+            crate::cross_file::extract_metadata_with_tree(orderable, Some(&orderable_tree));
+        let inverted_metadata =
+            crate::cross_file::extract_metadata_with_tree(inverted, Some(&inverted_tree));
+        assert_eq!(orderable_metadata.sources, inverted_metadata.sources);
+
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &parent,
+            &orderable_metadata,
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+        let update = graph.update_file(
+            &parent,
+            &inverted_metadata,
+            Some(&affected_workspace_root()),
+            |_| None,
+        );
+        assert!(
+            !update.edges_changed,
+            "the unchanged ForwardSource must preserve graph edge identity"
+        );
+
+        let old_hash = compute_artifacts_with_metadata(
+            &parent,
+            &orderable_tree,
+            orderable,
+            Some(&orderable_metadata),
+        )
+        .interface_hash;
+        let new_hash = compute_artifacts_with_metadata(
+            &parent,
+            &inverted_tree,
+            inverted,
+            Some(&inverted_metadata),
+        )
+        .interface_hash;
+        assert_ne!(old_hash, new_hash);
+
+        let open = std::collections::HashSet::from([parent.clone(), child.clone()]);
+        let affected = compute_affected_dependents_after_edit(
+            &parent,
+            old_hash != new_hash,
+            update.edges_changed,
+            &graph,
+            |uri| open.contains(uri),
+            10,
+            200,
+        );
+        assert_eq!(affected, vec![child]);
+    }
+
+    #[test]
     fn test_compute_affected_includes_backward_dependents() {
         // child is edited; parent (which sources child) must be revalidated.
         let mut graph = DependencyGraph::new();
