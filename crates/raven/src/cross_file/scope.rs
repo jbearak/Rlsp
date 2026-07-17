@@ -1938,8 +1938,17 @@ pub(crate) fn static_script_definitions_and_load_all<'tree, 'text>(
             function_scope: None,
         });
     }
-    artifacts.timeline.sort_by_key(event_effect_position);
-    rebuild_function_scope_index(&mut artifacts, &line_index);
+    let library_calls =
+        detect_library_calls_with_bindings_for_scope(tree, content, capture_bindings);
+    finalize_real_and_synthetic_function_scopes(
+        &mut artifacts,
+        root,
+        content,
+        &line_index,
+        &uri,
+        &library_calls,
+        capture_bindings,
+    );
     let definitions = live_top_level_exports(&artifacts).into_iter().collect();
     let load_all = artifacts.dev_load_all_sites.iter().any(|site| {
         resolve_runtime_function_scope(
@@ -2060,39 +2069,15 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     let library_calls =
         detect_library_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
 
-    // Issue #402: model Shiny deferred-expression bodies as nested scopes so
-    // their local definitions do not leak into the surrounding server function.
-    // Must be pushed before the function-scope tree is built below.
-    push_shiny_deferred_scopes(
-        &mut artifacts,
-        root,
-        content,
-        &line_index,
-        &library_calls,
-        &mut capture_bindings,
-    );
-
-    // Issues #404 / #406 / #410: model `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
-    // iterator variables (including nested `%:%` compositions) as synthetic
-    // iterator scopes. Must be pushed before the function-scope tree is built
-    // below so scope-local definitions are tagged with this scope.
-    push_foreach_iterator_scopes(
+    finalize_real_and_synthetic_function_scopes(
         &mut artifacts,
         root,
         content,
         &line_index,
         uri,
+        &library_calls,
         &mut capture_bindings,
     );
-
-    // Sort timeline by *effect* position so the resolver iterates events in
-    // execution order. `event_effect_position` uses `visible_from` for Def
-    // events, so the binding from `x <- { rm(x); 1 }` is processed after the
-    // inner `rm(x)` instead of before it.
-    artifacts.timeline.sort_by_key(event_effect_position);
-
-    // Build the function-scope index and annotate scope-sensitive events.
-    rebuild_function_scope_index(&mut artifacts, &line_index);
 
     // Add PackageLoad events for library calls with function_scope determined from the tree.
     // (Requirements 14.2, 14.4)
@@ -2378,38 +2363,15 @@ pub fn compute_artifacts_with_metadata(
     let library_calls =
         detect_library_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
 
-    // Issue #402: model Shiny deferred-expression bodies as nested scopes so
-    // their local definitions do not leak into the surrounding server function.
-    // Must be pushed before the function-scope tree is built below.
-    push_shiny_deferred_scopes(
-        &mut artifacts,
-        root,
-        content,
-        &line_index,
-        &library_calls,
-        &mut capture_bindings,
-    );
-
-    // Issues #404 / #406 / #410: model `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
-    // iterator variables (including nested `%:%` compositions) as synthetic
-    // iterator scopes. Must be pushed before the function-scope tree is built
-    // below so scope-local definitions are tagged with this scope.
-    push_foreach_iterator_scopes(
+    finalize_real_and_synthetic_function_scopes(
         &mut artifacts,
         root,
         content,
         &line_index,
         uri,
+        &library_calls,
         &mut capture_bindings,
     );
-
-    // Sort timeline by *effect* position so the resolver iterates events in
-    // execution order. See `event_effect_position` for why this differs from
-    // the LHS anchor for Def events.
-    artifacts.timeline.sort_by_key(event_effect_position);
-
-    // Build the function-scope index and annotate scope-sensitive events.
-    rebuild_function_scope_index(&mut artifacts, &line_index);
 
     // Add PackageLoad events for library calls with function_scope determined from the tree.
     for detected in library_calls {
@@ -3438,6 +3400,35 @@ fn visit_runtime_reachable_scope_syntax<'tree>(
     for child in node.children(&mut node.walk()) {
         visit_runtime_reachable_scope_syntax(child, content, capture_bindings, visit);
     }
+}
+
+/// Complete the function-scope model after real function definitions and other
+/// scope-sensitive events have been collected.
+///
+/// Shiny deferred bodies and foreach execution frames are synthetic function
+/// scopes, but they are authoritative for the same top-level classification as
+/// real function bodies. Every artifact and static-prelude consumer must append
+/// them before sorting, rebuilding the interval tree, and annotating events.
+fn finalize_real_and_synthetic_function_scopes<'tree, 'text>(
+    artifacts: &mut ScopeArtifacts,
+    root: Node<'tree>,
+    content: &'text str,
+    line_index: &LineIndex,
+    uri: &Url,
+    library_calls: &[FramedLibraryCall],
+    capture_bindings: &mut LazyStaticBindings<'tree, 'text>,
+) {
+    push_shiny_deferred_scopes(
+        artifacts,
+        root,
+        content,
+        line_index,
+        library_calls,
+        capture_bindings,
+    );
+    push_foreach_iterator_scopes(artifacts, root, content, line_index, uri, capture_bindings);
+    artifacts.timeline.sort_by_key(event_effect_position);
+    rebuild_function_scope_index(artifacts, line_index);
 }
 
 /// Issue #402: append nested `FunctionScope` events for Shiny deferred-
@@ -21219,6 +21210,44 @@ sapply(libs, library, character.only = TRUE)
             !facts.calls_dev_load_all,
             "the same operand remains function-scoped when bquote runs in a function"
         );
+    }
+
+    #[test]
+    fn static_script_facts_isolate_qualified_shiny_deferred_bodies() {
+        let deferred = r#"
+            top_level <- 1
+            shiny::reactive({
+                reactive_local <- 2
+                devtools::load_all()
+            })
+        "#;
+        let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(deferred);
+        assert!(facts.top_level_defs.contains("top_level"));
+        assert!(!facts.top_level_defs.contains("reactive_local"));
+        assert!(!facts.calls_dev_load_all);
+
+        let top_level_load = format!("{deferred}\ndevtools::load_all()\n");
+        let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(&top_level_load);
+        assert!(facts.calls_dev_load_all);
+    }
+
+    #[test]
+    fn static_script_facts_isolate_foreach_execution_bodies() {
+        let deferred = r#"
+            top_level <- 1
+            foreach::foreach(i = 1:3) %do% {
+                foreach_local <- i
+                devtools::load_all()
+            }
+        "#;
+        let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(deferred);
+        assert!(facts.top_level_defs.contains("top_level"));
+        assert!(!facts.top_level_defs.contains("foreach_local"));
+        assert!(!facts.calls_dev_load_all);
+
+        let top_level_load = format!("{deferred}\ndevtools::load_all()\n");
+        let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(&top_level_load);
+        assert!(facts.calls_dev_load_all);
     }
 
     #[test]

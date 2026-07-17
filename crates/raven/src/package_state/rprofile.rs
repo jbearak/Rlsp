@@ -275,6 +275,30 @@ bquote(expr = .(library(dplyr)), where = { rm(x); parent.frame() })
     }
 
     #[test]
+    fn deferred_body_assignments_are_not_harvested() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            r#"
+                top_level <- 1
+                shiny::reactive({ reactive_local <- 2 })
+                foreach::foreach(i = 1:3) %do% { foreach_local <- i }
+            "#,
+        )
+        .unwrap();
+
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(scan.symbols.contains("top_level"), "got {:?}", scan.symbols);
+        for name in ["reactive_local", "foreach_local"] {
+            assert!(
+                !scan.symbols.contains(name),
+                "deferred local {name} must not leak: {:?}",
+                scan.symbols
+            );
+        }
+    }
+
+    #[test]
     fn follows_literal_source_with_workspace_fallback() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join("R")).unwrap();
