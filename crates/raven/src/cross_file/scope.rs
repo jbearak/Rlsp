@@ -20977,6 +20977,110 @@ x <- 1"#;
     }
 
     #[test]
+    fn nested_external_source_inversion_does_not_lend_late_file_to_early_file() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let early_uri = Url::parse("file:///project/early.R").unwrap();
+        let late_uri = Url::parse("file:///project/late.R").unwrap();
+        let parent_code = r#"
+            base::bquote(
+                where = base::new.env(),
+                expr = .(base::bquote(
+                    expr = .(source("late.R")),
+                    where = { source("early.R"); base::new.env() }
+                ))
+            )
+        "#;
+        let early_code = "late_only";
+        let late_code = "late_only <- 1";
+
+        let parent_tree = parse_r(parent_code);
+        let parent_meta = Arc::new(crate::cross_file::extract_metadata_with_tree(
+            parent_code,
+            Some(&parent_tree),
+        ));
+        let parent_artifacts = Arc::new(compute_artifacts_with_metadata(
+            &parent_uri,
+            &parent_tree,
+            parent_code,
+            Some(&parent_meta),
+        ));
+        assert_eq!(
+            parent_artifacts
+                .timeline
+                .iter()
+                .filter(|event| matches!(event, ScopeEvent::Source { .. }))
+                .count(),
+            0,
+            "unrepresentable global source order must not enter the coordinate timeline: {:?}",
+            parent_artifacts.timeline
+        );
+
+        let early_artifacts = Arc::new(compute_artifacts(
+            &early_uri,
+            &parse_r(early_code),
+            early_code,
+        ));
+        let late_artifacts = Arc::new(compute_artifacts(&late_uri, &parse_r(late_code), late_code));
+        let early_meta = Arc::new(CrossFileMetadata::default());
+        let late_meta = Arc::new(CrossFileMetadata::default());
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+        assert_eq!(
+            graph.get_dependencies(&parent_uri).len(),
+            2,
+            "both runtime source dependencies must survive lending suppression"
+        );
+
+        let get_artifacts = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(parent_artifacts.clone())
+            } else if uri == &early_uri {
+                Some(early_artifacts.clone())
+            } else if uri == &late_uri {
+                Some(late_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(parent_meta.clone())
+            } else if uri == &early_uri {
+                Some(early_meta.clone())
+            } else if uri == &late_uri {
+                Some(late_meta.clone())
+            } else {
+                None
+            }
+        };
+        let scope = scope_at_position_with_graph(
+            &early_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(
+            !scope.symbols.contains_key("late_only"),
+            "runtime-earlier early.R must not see a definition created later by late.R: {scope:?}"
+        );
+    }
+
+    #[test]
     fn disabled_bquote_dot_dot_exposes_nested_dot_scope_effects() {
         for code in [
             r#"bquote(..(.(bound <- 1)))"#,

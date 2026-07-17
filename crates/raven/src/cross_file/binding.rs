@@ -2231,11 +2231,32 @@ pub(crate) fn capture_runtime_order_has_source_inversion(
 /// coordinates. Source-position timelines cannot represent such a capture
 /// exactly; binding and scope consumers use this signal for conservative
 /// fallbacks rather than fabricating effects in the wrong order.
-pub(crate) fn capture_evaluation_order_has_source_inversion(
-    call: Node,
+pub(crate) fn capture_evaluation_order_has_source_inversion<'tree>(
+    call: Node<'tree>,
     content: &str,
     kind: CapturingCallKind,
     parent_frame: CaptureEvaluationFrame,
+) -> bool {
+    capture_evaluation_order_has_source_inversion_with_effect(
+        call,
+        content,
+        kind,
+        parent_frame,
+        &mut |_root, _frame| false,
+    )
+}
+
+/// Source-aware variant of [`capture_evaluation_order_has_source_inversion`].
+///
+/// The additional predicate is consulted only for roots evaluated in an
+/// external or unknown frame. This preserves binding-oriented precision while
+/// allowing consumers to identify other effects that escape such a frame.
+pub(crate) fn capture_evaluation_order_has_source_inversion_with_effect<'tree>(
+    call: Node<'tree>,
+    content: &str,
+    kind: CapturingCallKind,
+    parent_frame: CaptureEvaluationFrame,
+    additional_external_effect: &mut impl FnMut(Node<'tree>, CaptureEvaluationFrame) -> bool,
 ) -> bool {
     capture_order_has_source_inversion(
         call,
@@ -2243,6 +2264,7 @@ pub(crate) fn capture_evaluation_order_has_source_inversion(
         kind,
         parent_frame,
         CaptureTraversalPolicy::PositiveResults,
+        additional_external_effect,
     )
 }
 
@@ -2263,15 +2285,17 @@ fn capture_invalidation_order_has_source_inversion(
         kind,
         parent_frame,
         CaptureTraversalPolicy::ConservativeInvalidation,
+        &mut |_root, _frame| false,
     )
 }
 
-fn capture_order_has_source_inversion(
-    call: Node,
+fn capture_order_has_source_inversion<'tree>(
+    call: Node<'tree>,
     content: &str,
     kind: CapturingCallKind,
     parent_frame: CaptureEvaluationFrame,
     policy: CaptureTraversalPolicy,
+    additional_external_effect: &mut impl FnMut(Node<'tree>, CaptureEvaluationFrame) -> bool,
 ) -> bool {
     let mut previous = None;
     let mut inverted = false;
@@ -2288,7 +2312,9 @@ fn capture_order_has_source_inversion(
                 {
                     return;
                 }
-            } else if !external_capture_root_has_explicit_binding_escape(root, content) {
+            } else if !external_capture_root_has_explicit_binding_escape(root, content)
+                && !additional_external_effect(root, frame)
+            {
                 return;
             }
             if previous.is_some_and(|offset| root.start_byte() < offset) {

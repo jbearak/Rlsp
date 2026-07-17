@@ -338,14 +338,23 @@ fn visit_node<'tree, 'text>(
             });
         }
         if let Some(capture) = capture_bindings.capturing_call_kind_at(node) {
+            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
             let capture_scope_orderable = scope_orderable
-                && !super::binding::capture_evaluation_order_has_source_inversion(
+                && !super::binding::capture_evaluation_order_has_source_inversion_with_effect(
                     node,
                     content,
                     capture,
                     evaluation_frame,
+                    &mut |root, frame| {
+                        capture_root_has_global_source_effect(
+                            root,
+                            content,
+                            capture_bindings,
+                            frame,
+                            captured_runtime_scope,
+                        )
+                    },
                 );
-            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
             super::binding::visit_evaluated_capture_parts(
                 node,
                 content,
@@ -390,6 +399,69 @@ fn visit_node<'tree, 'text>(
             sources,
         );
     }
+}
+
+/// Whether a runtime-evaluated capture root contains a modeled source effect
+/// that targets the process global environment.
+///
+/// This follows the same trusted capture boundaries as source detection itself,
+/// so quoted syntax stays inert and nested evaluated capture parts keep their
+/// composed evaluation frames. Function bodies are deferred and therefore do
+/// not affect the current capture timeline.
+fn capture_root_has_global_source_effect<'tree, 'text>(
+    node: Node<'tree>,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+    evaluation_frame: CaptureEvaluationFrame,
+    runtime_function_scope: RuntimeFunctionScope,
+) -> bool {
+    if node.kind() == "function_definition" {
+        return false;
+    }
+
+    if node.kind() == "call" {
+        if try_parse_source_call(
+            node,
+            content,
+            capture_bindings,
+            evaluation_frame,
+            runtime_function_scope,
+        )
+        .is_some_and(|source| source.locality == SourceLocality::Global)
+        {
+            return true;
+        }
+
+        if let Some(capture) = capture_bindings.capturing_call_kind_at(node) {
+            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
+            let mut found = false;
+            super::binding::visit_evaluated_capture_parts(
+                node,
+                content,
+                capture,
+                &mut |evaluated, relative_frame, _role| {
+                    found |= capture_root_has_global_source_effect(
+                        evaluated,
+                        content,
+                        capture_bindings,
+                        relative_frame.relative_to(evaluation_frame),
+                        captured_runtime_scope,
+                    );
+                },
+            );
+            return found;
+        }
+    }
+
+    node.children(&mut node.walk()).any(|child| {
+        capture_root_has_global_source_effect(
+            child,
+            content,
+            capture_bindings,
+            evaluation_frame,
+            runtime_function_scope,
+        )
+    })
 }
 
 const SOURCE_FORMALS: [&str; 17] = [
@@ -2952,6 +3024,93 @@ source(file.path(repo_root, "scripts/helpers.R"))
                 "{code}: {detected:?}"
             );
         }
+    }
+
+    #[test]
+    fn nested_external_global_sources_disable_timeline_lending_on_inversion() {
+        let code = r#"
+            base::bquote(
+                where = base::new.env(),
+                expr = .(base::bquote(
+                    expr = .(source("late.R")),
+                    where = { source("early.R"); base::new.env() }
+                ))
+            )
+        "#;
+        let tree = parse_r(code);
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), code);
+        let detected = detect_source_calls_with_bindings_and_frames(&tree, code, &mut bindings);
+
+        assert_eq!(
+            detected
+                .iter()
+                .map(|source| source.source.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["early.R", "late.R"],
+            "capture traversal must retain runtime source order: {detected:?}"
+        );
+        assert!(
+            detected
+                .iter()
+                .all(|source| source.source.locality == SourceLocality::Global),
+            "default source destinations remain global: {detected:?}"
+        );
+        assert!(
+            detected
+                .iter()
+                .all(|source| !source.contributes_to_timeline()),
+            "source-coordinate inversion must suppress global timeline effects: {detected:?}"
+        );
+    }
+
+    #[test]
+    fn nested_external_source_inversion_ignores_inert_and_non_global_effects() {
+        let inert = r#"
+            base::bquote(
+                where = base::new.env(),
+                expr = .(base::bquote(
+                    expr = .(base::quote(source("late.R"))),
+                    where = { source("early.R"); base::new.env() }
+                ))
+            )
+        "#;
+        let tree = parse_r(inert);
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), inert);
+        let detected = detect_source_calls_with_bindings_and_frames(&tree, inert, &mut bindings);
+        assert_eq!(detected.len(), 1, "{detected:?}");
+        assert_eq!(detected[0].source.path, "early.R");
+        assert!(detected[0].contributes_to_timeline(), "{detected:?}");
+
+        let non_global = r#"
+            base::bquote(
+                where = base::new.env(),
+                expr = .(base::bquote(
+                    expr = .(source("late.R", local = base::new.env())),
+                    where = {
+                        source("early.R", local = base::new.env())
+                        base::new.env()
+                    }
+                ))
+            )
+        "#;
+        let tree = parse_r(non_global);
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), non_global);
+        let detected =
+            detect_source_calls_with_bindings_and_frames(&tree, non_global, &mut bindings);
+        assert_eq!(detected.len(), 2, "{detected:?}");
+        assert!(
+            detected
+                .iter()
+                .all(|source| source.source.locality == SourceLocality::NonInheriting),
+            "{detected:?}"
+        );
+        assert!(
+            detected.iter().all(FramedSource::contributes_to_timeline),
+            "explicit non-global destinations must not widen the external-effect predicate: {detected:?}"
+        );
     }
 
     #[test]
