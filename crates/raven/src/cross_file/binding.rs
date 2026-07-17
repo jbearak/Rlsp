@@ -285,6 +285,15 @@ struct BindingVisitState {
     eager_assignment_value_root: bool,
 }
 
+impl BindingVisitState {
+    /// Whether this node is known to execute immediately for binding and capture
+    /// analysis, either through ordinary top-level syntax or as the direct root
+    /// of a proven evaluated capture part.
+    fn effective_immediate_binding_context(self) -> bool {
+        self.known_immediate_context || self.proven_immediate_capture_root
+    }
+}
+
 fn visit_bindings<'tree, T>(
     node: Node<'tree>,
     content: &str,
@@ -300,7 +309,7 @@ fn visit_bindings<'tree, T>(
     let first_effect_visit = visited_effect_nodes.insert(node);
     if node.kind() == "call" {
         let capture_is_immediate =
-            state.known_immediate_context || state.eager_assignment_value_root;
+            state.effective_immediate_binding_context() || state.eager_assignment_value_root;
         let capture = capturing_call_kind(node, content, |name| {
             capture_is_immediate && bare_helper_is_trusted(&collection.map, name)
         });
@@ -554,10 +563,9 @@ fn record_assignment<'tree, T>(
     let BindingVisitState {
         evaluation_frame,
         runtime_function_scope,
-        proven_immediate_capture_root,
-        known_immediate_context,
         ..
     } = state;
+    let effective_immediate_binding_context = state.effective_immediate_binding_context();
     // Grammar fields remain reliable when inline comments appear as named
     // extras inside the binary expression; named-child arity does not.
     let Some(op_node) = node.child_by_field_name("operator") else {
@@ -576,7 +584,11 @@ fn record_assignment<'tree, T>(
             if evaluation_frame == CaptureEvaluationFrame::ExternalOrUnknown {
                 return;
             }
-            invalidate_unknown_mutation_in_context(collection, node, known_immediate_context);
+            invalidate_unknown_mutation_in_context(
+                collection,
+                node,
+                effective_immediate_binding_context,
+            );
             if let Some(lhs) = node.child_by_field_name("lhs") {
                 match binding_target_name(lhs, content) {
                     Some(BindingTargetName::Known(name)) => {
@@ -585,7 +597,7 @@ fn record_assignment<'tree, T>(
                     Some(BindingTargetName::Unknown) => invalidate_unknown_mutation_in_context(
                         collection,
                         node,
-                        known_immediate_context,
+                        effective_immediate_binding_context,
                     ),
                     None => {}
                 }
@@ -611,7 +623,11 @@ fn record_assignment<'tree, T>(
     };
     let Some(BindingTargetName::Known(name)) = binding_target_name(target, content) else {
         mark_unknown_named_binding_in_scope(collection, node, uncertainty_scope);
-        invalidate_unknown_mutation_in_context(collection, node, known_immediate_context);
+        invalidate_unknown_mutation_in_context(
+            collection,
+            node,
+            effective_immediate_binding_context,
+        );
         return;
     };
     if !matches!(
@@ -621,29 +637,42 @@ fn record_assignment<'tree, T>(
         // Replacement assignments evaluate index/target expressions and may
         // dispatch to arbitrary replacement functions before binding the
         // root name.
-        invalidate_unknown_mutation_in_context(collection, node, known_immediate_context);
+        invalidate_unknown_mutation_in_context(
+            collection,
+            node,
+            effective_immediate_binding_context,
+        );
     }
     let value = node.child_by_field_name(value_field);
     let value_is_side_effect_free = value.is_some_and(|value| {
-        binding_value_is_side_effect_free(value, content, collection, known_immediate_context)
+        binding_value_is_side_effect_free(
+            value,
+            content,
+            collection,
+            effective_immediate_binding_context,
+        )
     });
     if value.is_some() && !value_is_side_effect_free {
         // Ordinary assignment forces its RHS. An identifier may force a
         // delayed/active binding and an arbitrary expression may mutate names
         // unrelated to the assignment target.
-        invalidate_unknown_mutation_in_context(collection, node, known_immediate_context);
+        invalidate_unknown_mutation_in_context(
+            collection,
+            node,
+            effective_immediate_binding_context,
+        );
     }
     let site = BindingSite::Binary {
         node,
         target,
         value,
         operator,
-        top_level: known_immediate_context
-            || (proven_immediate_capture_root
-                && evaluation_frame.is_caller_or_global()
-                && !runtime_function_scope.is_function_scoped_at(node)),
+        top_level: effective_immediate_binding_context
+            && evaluation_frame.is_caller_or_global()
+            && !runtime_function_scope.is_function_scoped_at(node),
         value_is_side_effect_free,
-        helpers_trusted: bare_helper_is_trusted(&collection.map, "c"),
+        helpers_trusted: effective_immediate_binding_context
+            && bare_helper_is_trusted(&collection.map, "c"),
     };
     record_site(collection, &name, site, candidate_for);
 }
@@ -656,12 +685,12 @@ fn record_mutation_call<'tree, T>(
     state: BindingVisitState,
 ) {
     let BindingVisitState {
-        proven_immediate_capture_root,
         evaluation_frame,
         runtime_function_scope,
         known_immediate_context,
         ..
     } = state;
+    let effective_immediate_binding_context = state.effective_immediate_binding_context();
     let Some(function) = node.child_by_field_name("function") else {
         return;
     };
@@ -671,11 +700,16 @@ fn record_mutation_call<'tree, T>(
     if let Some(kind) = assign_call_kind(function, content) {
         if kind == AssignCallKind::UnknownNamespace
             || (kind == AssignCallKind::BareCandidate
-                && (!known_immediate_context || !bare_helper_is_trusted(&collection.map, "assign")))
+                && (!effective_immediate_binding_context
+                    || !bare_helper_is_trusted(&collection.map, "assign")))
         {
             if evaluation_frame.is_caller_or_global() {
                 mark_unknown_named_binding_in_scope(collection, node, None);
-                invalidate_unknown_mutation_in_context(collection, node, known_immediate_context);
+                invalidate_unknown_mutation_in_context(
+                    collection,
+                    node,
+                    effective_immediate_binding_context,
+                );
             }
             return;
         }
@@ -691,7 +725,11 @@ fn record_mutation_call<'tree, T>(
             // external bquote operand back into the caller.
             if evaluation_frame.is_caller_or_global() {
                 mark_unknown_named_binding_in_scope(collection, node, None);
-                invalidate_unknown_mutation_in_context(collection, node, known_immediate_context);
+                invalidate_unknown_mutation_in_context(
+                    collection,
+                    node,
+                    effective_immediate_binding_context,
+                );
             }
             return;
         }
@@ -699,7 +737,7 @@ fn record_mutation_call<'tree, T>(
             arguments,
             content,
             collection,
-            known_immediate_context,
+            effective_immediate_binding_context,
         );
         if !actuals_are_side_effect_free && evaluation_frame.is_caller_or_global() {
             // assign() may force supplied actuals before discovering a later
@@ -707,7 +745,11 @@ fn record_mutation_call<'tree, T>(
             // even when full formal matching cannot produce a binding. An
             // external bquote operand does not turn those ordinary effects into
             // mutations of the caller frame.
-            invalidate_unknown_mutation_in_context(collection, node, known_immediate_context);
+            invalidate_unknown_mutation_in_context(
+                collection,
+                node,
+                effective_immediate_binding_context,
+            );
         }
         let Some(resolved) = resolve_assign_arguments(
             arguments,
@@ -732,7 +774,11 @@ fn record_mutation_call<'tree, T>(
                 None
             };
             mark_unknown_named_binding_in_scope(collection, node, effect_scope);
-            invalidate_unknown_mutation_in_context(collection, node, known_immediate_context);
+            invalidate_unknown_mutation_in_context(
+                collection,
+                node,
+                effective_immediate_binding_context,
+            );
             return;
         };
         if matches!(
@@ -740,11 +786,11 @@ fn record_mutation_call<'tree, T>(
             AssignCallKind::BareCandidate | AssignCallKind::BaseCandidate
         ) && (resolved.destination == CaptureEvaluationFrame::Caller
             || resolved.destination == CaptureEvaluationFrame::Global)
-            && (known_immediate_context
-                || (proven_immediate_capture_root
-                    && !runtime_function_scope.is_function_scoped_at(node)))
+            && effective_immediate_binding_context
+            && !runtime_function_scope.is_function_scoped_at(node)
         {
-            let helpers_trusted = bare_helper_is_trusted(&collection.map, "c");
+            let helpers_trusted =
+                effective_immediate_binding_context && bare_helper_is_trusted(&collection.map, "c");
             record_site(
                 collection,
                 &name,
@@ -827,7 +873,7 @@ fn record_mutation_call<'tree, T>(
             } else {
                 "remove"
             };
-            if (!known_immediate_context && !proven_immediate_capture_root)
+            if !effective_immediate_binding_context
                 || !bare_helper_is_trusted(&collection.map, helper)
             {
                 invalidate_unknown_mutation_in_context(collection, node, known_immediate_context);
@@ -3878,6 +3924,66 @@ mod tests {
             names.contains("global"),
             "explicit global assign stays visible"
         );
+    }
+
+    #[test]
+    fn immediate_bquote_operand_trusts_unshadowed_quote_capture_boundary() {
+        let code = r#"
+            p <- "good.R"
+            bquote(.(quote(p <- "bad.R")))
+        "#;
+        let tree = parse_r(code);
+        let bindings = collect_bindings(tree.root_node(), code, |_| Some(()));
+        assert!(
+            bindings
+                .get("p")
+                .is_some_and(|binding| binding.resolved_before(usize::MAX).is_some())
+        );
+
+        let code = r#"
+            quote <- function(x) force(x)
+            p <- "good.R"
+            bquote(.(quote(p <- "bad.R")))
+        "#;
+        let tree = parse_r(code);
+        let bindings = collect_bindings(tree.root_node(), code, |_| Some(()));
+        assert!(
+            bindings
+                .get("p")
+                .is_some_and(|binding| binding.resolved_before(usize::MAX).is_none())
+        );
+    }
+
+    #[test]
+    fn immediate_bquote_operand_uses_one_binding_context_for_package_values() {
+        for code in [
+            r#"bquote(.(libs <- c("dplyr")))"#,
+            r#"bquote(.(assign("libs", c("dplyr"))))"#,
+        ] {
+            let tree = parse_r(code);
+            let bindings = collect_bindings(tree.root_node(), code, |site| {
+                let eligible = match site {
+                    BindingSite::Binary {
+                        top_level,
+                        value_is_side_effect_free,
+                        helpers_trusted,
+                        ..
+                    } => top_level && value_is_side_effect_free && helpers_trusted,
+                    BindingSite::AssignCall {
+                        value_is_side_effect_free,
+                        helpers_trusted,
+                        ..
+                    } => value_is_side_effect_free && helpers_trusted,
+                };
+                eligible.then_some(())
+            });
+            assert!(
+                bindings
+                    .get("libs")
+                    .is_some_and(|binding| binding.resolved_before(usize::MAX).is_some()),
+                "{code}"
+            );
+        }
     }
 
     #[test]

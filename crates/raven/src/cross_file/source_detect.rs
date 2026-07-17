@@ -2795,6 +2795,26 @@ source(file.path(repo_root, "scripts/helpers.R"))
     }
 
     #[test]
+    fn source_detection_preserves_unshadowed_quote_inside_immediate_bquote_operand() {
+        let code = r#"
+            p <- "good.R"
+            bquote(.(quote(p <- "bad.R")))
+            source(p)
+        "#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].path, "good.R");
+
+        let code = r#"
+            quote <- function(x) force(x)
+            p <- "good.R"
+            bquote(.(quote(p <- "bad.R")))
+            source(p)
+        "#;
+        assert!(detect_source_calls(&parse_r(code), code).is_empty());
+    }
+
+    #[test]
     fn root_bquote_splice_keeps_where_source_before_operand_error() {
         let code = r#"bquote(..(source("operand.R")), where = { source("where.R"); parent.frame() }, splice = TRUE)"#;
         let sources = detect_source_calls(&parse_r(code), code);
@@ -5744,6 +5764,45 @@ quote(base::assign("libs", c("tidyr"), envir = .GlobalEnv))"#,
             assert!(
                 calls.iter().any(|call| call.package == "dplyr"),
                 "{assignment}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn immediate_bquote_bindings_resolve_package_vectors() {
+        for binding in [
+            r#"bquote(.(libs <- c("dplyr", "tidyr")))"#,
+            r#"bquote(.(assign("libs", c("dplyr", "tidyr"))))"#,
+        ] {
+            let code = format!("{binding}\nsapply(libs, library, character.only = TRUE)");
+            let packages: Vec<_> = detect_library_calls(&parse_r(&code), &code)
+                .into_iter()
+                .map(|call| call.package)
+                .collect();
+            assert_eq!(packages, ["dplyr", "tidyr"], "{binding}");
+        }
+    }
+
+    #[test]
+    fn immediate_bquote_package_bindings_preserve_conservative_gates() {
+        for setup in [
+            r#"assign <- function(...) NULL
+bquote(.(assign("libs", c("dplyr"))))"#,
+            r#"c <- function(...) "dplyr"
+bquote(.(libs <- c("dplyr")))"#,
+            r#"c <- function(...) "dplyr"
+bquote(.(assign("libs", c("dplyr"))))"#,
+            r#"bquote(.(libs <- c("dplyr")), where = new.env())"#,
+            r#"bquote(.(assign("libs", c("dplyr"))), where = new.env())"#,
+            r#"bquote(.(assign("libs", c("dplyr"), envir = new.env())))"#,
+            r#"f <- function() bquote(.(libs <- c("dplyr")))"#,
+            r#"f <- function() bquote(.(assign("libs", c("dplyr"))))"#,
+        ] {
+            let code = format!("{setup}\nsapply(libs, library, character.only = TRUE)");
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "{setup}: {calls:?}"
             );
         }
     }

@@ -1397,6 +1397,43 @@ source(p)
     }
 
     #[test]
+    fn immediate_bquote_quote_boundary_preserves_computed_source_binding() {
+        let code = r#"
+            p <- "good.R"
+            bquote(.(quote(p <- "bad.R")))
+            source(p)
+        "#;
+        assert_eq!(fold_last_source_arg(code), Some("good.R".to_string()));
+
+        let code = r#"
+            quote <- function(x) force(x)
+            p <- "good.R"
+            bquote(.(quote(p <- "bad.R")))
+            source(p)
+        "#;
+        assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn immediate_bquote_bindings_supply_package_vectors() {
+        for binding in [
+            r#"bquote(.(libs <- c("dplyr", "tidyr")))"#,
+            r#"bquote(.(assign("libs", c("dplyr", "tidyr"))))"#,
+        ] {
+            let code = format!("{binding}\nsapply(libs, library, character.only = TRUE)");
+            let tree = parse(&code);
+            let root = tree.root_node();
+            let use_node = root.named_child(1).unwrap();
+            let bindings = StaticBindings::collect(root, &code);
+            assert_eq!(
+                bindings.resolve_package_vector("libs", use_node),
+                Some(["dplyr".to_string(), "tidyr".to_string()].as_slice()),
+                "{binding}"
+            );
+        }
+    }
+
+    #[test]
     fn bquote_static_paths_follow_operand_evaluation_frame() {
         for capture in [
             r#"bquote(.(p <- "bad.R"), where = new.env())"#,
