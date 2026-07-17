@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use super::directive::parse_directives;
 use super::path_resolve::{PathContext, resolve_working_directory};
-use super::types::{CallSiteSpec, CrossFileMetadata};
+use super::types::{CallSiteSpec, CrossFileMetadata, SourceLocality};
 
 // ============================================================================
 // Generators for valid R file paths
@@ -553,7 +553,7 @@ proptest! {
         prop_assert_eq!(&sources1[0].path, &path);
         prop_assert_eq!(&sources2[0].path, &path);
         prop_assert_eq!(sources1[0].is_sys_source, sources2[0].is_sys_source);
-        prop_assert_eq!(sources1[0].local, sources2[0].local);
+        prop_assert_eq!(sources1[0].locality, sources2[0].locality);
         prop_assert_eq!(sources1[0].chdir, sources2[0].chdir);
     }
 }
@@ -587,7 +587,7 @@ proptest! {
 
         prop_assert_eq!(sources.len(), 1);
         prop_assert_eq!(&sources[0].path, &path);
-        prop_assert!(sources[0].local);
+        prop_assert_eq!(sources[0].locality, SourceLocality::CurrentFrame);
     }
 }
 
@@ -689,7 +689,7 @@ proptest! {
         let sources = detect_source_calls(&tree, &code);
 
         prop_assert_eq!(sources.len(), 1);
-        prop_assert!(sources[0].local);
+        prop_assert_eq!(sources[0].locality, SourceLocality::CurrentFrame);
     }
 
     /// Property 18 extended: local = FALSE should have local = false
@@ -700,7 +700,7 @@ proptest! {
         let sources = detect_source_calls(&tree, &code);
 
         prop_assert_eq!(sources.len(), 1);
-        prop_assert!(!sources[0].local);
+        prop_assert_eq!(sources[0].locality, SourceLocality::Global);
     }
 
     /// Property 18: For any source() call with chdir = TRUE, the extracted
@@ -734,7 +734,7 @@ proptest! {
         let sources = detect_source_calls(&tree, &code);
 
         prop_assert_eq!(sources.len(), 1);
-        prop_assert!(sources[0].local);
+        prop_assert_eq!(sources[0].locality, SourceLocality::CurrentFrame);
         prop_assert!(sources[0].chdir);
     }
 }
@@ -1220,10 +1220,8 @@ fn make_meta_with_sources(sources: Vec<(&str, u32)>) -> CrossFileMetadata {
                 line,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             })
             .collect(),
@@ -1428,20 +1426,18 @@ proptest! {
                     line,
                     column: 0,
                     is_directive: false, // AST detected
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: format!("{}.R", child),
                     line,
                     column: 0,
                     is_directive: true, // Directive
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1472,20 +1468,18 @@ proptest! {
                     line: line1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: format!("{}.R", child),
                     line: line2,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1542,20 +1536,18 @@ proptest! {
                     line,
                     column: 0,
                     is_directive: true, // Directive first
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: child_file,
                     line,
                     column: 0,
                     is_directive: false, // AST second
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -6434,7 +6426,7 @@ proptest! {
         // Extract PackageLoad events from timeline
         let package_load_events: Vec<_> = artifacts.timeline.iter()
             .filter_map(|e| {
-                if let ScopeEvent::PackageLoad { line, column, package: pkg, function_scope } = e {
+                if let ScopeEvent::PackageLoad { line, column, package: pkg, function_scope, .. } = e {
                     Some((*line, *column, pkg.clone(), *function_scope))
                 } else {
                     None
@@ -6658,7 +6650,7 @@ proptest! {
         // Extract PackageLoad events from timeline
         let package_load_events: Vec<_> = artifacts.timeline.iter()
             .filter_map(|e| {
-                if let ScopeEvent::PackageLoad { line, column, package: pkg, function_scope } = e {
+                if let ScopeEvent::PackageLoad { line, column, package: pkg, function_scope, .. } = e {
                     Some((*line, *column, pkg.clone(), *function_scope))
                 } else {
                     None
@@ -15361,10 +15353,13 @@ proptest! {
         );
 
         // Directive-specific flags
-        prop_assert!(!source.local, "local should be false for directives");
+        prop_assert_eq!(
+            source.locality,
+            SourceLocality::Global,
+            "directives should source into the global environment"
+        );
         prop_assert!(!source.chdir, "chdir should be false for directives");
         prop_assert!(!source.is_sys_source, "is_sys_source should be false for directives");
-        prop_assert!(source.sys_source_global_env, "sys_source_global_env should be true for directives");
     }
 
     /// Feature: lsp-source-directive, Property 1 Extended: Paths with spaces require quotes
@@ -15486,17 +15481,14 @@ proptest! {
         prop_assert_eq!(source.is_directive, include.is_directive, "is_directive mismatch between @lsp-source and @lsp-include");
         prop_assert!(source.is_directive, "is_directive should be true for all synonyms");
 
-        prop_assert_eq!(source.local, run.local, "local mismatch between @lsp-source and @lsp-run");
-        prop_assert_eq!(source.local, include.local, "local mismatch between @lsp-source and @lsp-include");
+        prop_assert_eq!(source.locality, run.locality, "locality mismatch between @lsp-source and @lsp-run");
+        prop_assert_eq!(source.locality, include.locality, "locality mismatch between @lsp-source and @lsp-include");
 
         prop_assert_eq!(source.chdir, run.chdir, "chdir mismatch between @lsp-source and @lsp-run");
         prop_assert_eq!(source.chdir, include.chdir, "chdir mismatch between @lsp-source and @lsp-include");
 
         prop_assert_eq!(source.is_sys_source, run.is_sys_source, "is_sys_source mismatch between @lsp-source and @lsp-run");
         prop_assert_eq!(source.is_sys_source, include.is_sys_source, "is_sys_source mismatch between @lsp-source and @lsp-include");
-
-        prop_assert_eq!(source.sys_source_global_env, run.sys_source_global_env, "sys_source_global_env mismatch between @lsp-source and @lsp-run");
-        prop_assert_eq!(source.sys_source_global_env, include.sys_source_global_env, "sys_source_global_env mismatch between @lsp-source and @lsp-include");
 
         // All should have the same line (0, since directive is on first line)
         prop_assert_eq!(source.line, run.line, "line mismatch between @lsp-source and @lsp-run");
@@ -16806,10 +16798,9 @@ proptest! {
                 line: directive_line,
                 column: 0,
                 is_directive: true, // This is a directive, not an AST-detected source()
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -16917,10 +16908,9 @@ proptest! {
                 line: i as u32 * 10, // Different lines for each directive
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             })
             .collect();
 
@@ -17207,10 +17197,9 @@ proptest! {
                     line: call_site_line,
                     column: 0,  // Directives always have column 0
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 // AST-detected source() call (is_directive=false)
                 ForwardSource {
@@ -17218,10 +17207,9 @@ proptest! {
                     line: call_site_line,
                     column: 0,  // Same column for same call site
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -17330,10 +17318,9 @@ proptest! {
                     line: call_site_line,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 // AST-detected source() at different column
                 ForwardSource {
@@ -17341,10 +17328,9 @@ proptest! {
                     line: call_site_line,
                     column: source_column,  // Different column
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -17435,10 +17421,9 @@ proptest! {
                     line: call_site_line,
                     column: 0,  // Same column
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 // AST-detected source() at EXACT same position
                 ForwardSource {
@@ -17446,10 +17431,9 @@ proptest! {
                     line: call_site_line,
                     column: 0,  // Same column
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -17546,10 +17530,9 @@ proptest! {
                     line: conflict_line,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 // target1: source() at same call site
                 ForwardSource {
@@ -17557,10 +17540,9 @@ proptest! {
                     line: conflict_line,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 // target2: only source() (no conflict)
                 ForwardSource {
@@ -17568,10 +17550,9 @@ proptest! {
                     line: other_line,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -17670,10 +17651,9 @@ proptest! {
             line: call_site_line,
             column: 0,
             is_directive: true,
-            local: false,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true, ..Default::default()
+            ..Default::default()
         };
 
         let ast_source = ForwardSource {
@@ -17681,10 +17661,9 @@ proptest! {
             line: call_site_line,
             column: 0,
             is_directive: false,
-            local: false,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true, ..Default::default()
+            ..Default::default()
         };
 
         // Create metadata with sources in different orders based on directive_first
@@ -17807,10 +17786,9 @@ proptest! {
                     line: directive_line,
                     column: 0,  // Directives always have column 0
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 // AST-detected source() call (is_directive=false) at source_line
                 ForwardSource {
@@ -17818,10 +17796,9 @@ proptest! {
                     line: source_line,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -17945,20 +17922,18 @@ proptest! {
                     line: directive_line,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: target_filename.clone(),
                     line: source_line,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18045,20 +18020,18 @@ proptest! {
                     line: source_line,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: target_filename.clone(),
                     line: directive_line,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18160,10 +18133,9 @@ proptest! {
                     line: directive_line,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 // target1: source()
                 ForwardSource {
@@ -18171,10 +18143,9 @@ proptest! {
                     line: source_line,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 // target2: only source()
                 ForwardSource {
@@ -18182,10 +18153,9 @@ proptest! {
                     line: other_line,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18293,20 +18263,18 @@ proptest! {
                     line: directive_line,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: target_filename.clone(),
                     line: source_line,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18423,10 +18391,9 @@ proptest! {
                     line: directive_line,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18608,10 +18575,9 @@ proptest! {
                     line: effective_line_0based,  // 0-based effective line
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18791,10 +18757,9 @@ proptest! {
                     line: directive_line,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -18970,10 +18935,9 @@ proptest! {
                     line: directive_line,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19132,10 +19096,9 @@ proptest! {
                 line: directive_line,
                 column: 0,
                 is_directive: true, // This is a directive, not an AST-detected source()
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -19226,10 +19189,9 @@ proptest! {
                 line: (i * 10) as u32, // Different lines for each directive
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             })
             .collect();
 
@@ -19409,10 +19371,9 @@ proptest! {
                 line: 0,
                 column: 0,
                 is_directive: true, // This is a directive
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -19505,10 +19466,9 @@ proptest! {
                 line: directive_line,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -19602,10 +19562,9 @@ proptest! {
                 line: directive_line,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -19666,10 +19625,9 @@ proptest! {
                 line: directive_line,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -19746,10 +19704,9 @@ proptest! {
                 line: directive_line,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -19770,10 +19727,9 @@ proptest! {
                 line: directive_line,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -19853,20 +19809,18 @@ proptest! {
                     line: line_a,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: child_b_file.clone(),
                     line: line_b,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19885,20 +19839,18 @@ proptest! {
                     line: line_b,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
                 ForwardSource {
                     path: child_c_file.clone(),
                     line: line_c,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true, ..Default::default()
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -19984,10 +19936,9 @@ proptest! {
                 line: line_v1,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -20008,10 +19959,9 @@ proptest! {
                 line: line_v2,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true, ..Default::default()
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -20155,10 +20105,8 @@ proptest! {
                 line: 5,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             working_directory: Some(wd_path.clone()),
@@ -21142,10 +21090,8 @@ proptest! {
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             declared_variables: parent_metadata.declared_variables.clone(),
@@ -21236,10 +21182,8 @@ proptest! {
                 line: 0,  // source() is at line 0
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             declared_variables: parent_metadata.declared_variables.clone(),
@@ -21355,7 +21299,7 @@ proptest! {
                 line: 2, // inside f()'s body
                 column: 2,
                 is_directive: false,
-                local: true,             // local=TRUE
+                locality: SourceLocality::CurrentFrame, //local=TRUE
                 is_function_scoped: true, // inside a function → declared-only policy
                 ..Default::default()
             }],
@@ -21456,10 +21400,9 @@ proptest! {
                 line: 2,
                 column: 0,
                 is_directive: false,
-                local: true,  // local=TRUE
+                locality: SourceLocality::CurrentFrame, //local=TRUE
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             declared_variables: parent_metadata.declared_variables.clone(),
@@ -21566,10 +21509,8 @@ proptest! {
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             declared_variables: grandparent_metadata.declared_variables.clone(),
@@ -21585,10 +21526,8 @@ proptest! {
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -21676,10 +21615,8 @@ proptest! {
                 line: 2,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             declared_variables: parent_metadata.declared_variables.clone(),
@@ -21775,10 +21712,8 @@ proptest! {
                 line: 1,  // source() is at line 1
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             declared_variables: parent_metadata.declared_variables.clone(),
@@ -22394,10 +22329,8 @@ proptest! {
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -22532,10 +22465,8 @@ proptest! {
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -22677,10 +22608,8 @@ proptest! {
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -22800,10 +22729,8 @@ proptest! {
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -22817,10 +22744,8 @@ proptest! {
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()

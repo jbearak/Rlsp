@@ -842,6 +842,14 @@ pub struct WorldState {
     /// Inputs to the package-mode `derive` function. Updated by event handlers
     /// before calling `apply_package_event`. See package_state::PackageInputs.
     pub package_inputs: crate::package_state::PackageInputs,
+    /// Operational freshness identity for detached package-input seeds.
+    ///
+    /// Kept separate from semantic `package_state` so workspace-index
+    /// application or derivation cannot reset freshness and make an older seed
+    /// current again.
+    pub(crate) package_input_lifecycle: crate::package_state::PackageInputLifecycle,
+    /// Coalescing lifecycle for the one delayed package-seed convergence task.
+    pub(crate) package_seed_retry: crate::package_state::PackageSeedRetryLifecycle,
 }
 
 /// A snapshot of the lifecycle state a diagnostics run was triggered
@@ -980,8 +988,23 @@ impl WorldState {
         self.package_config_generation = self.package_config_generation.wrapping_add(1);
     }
 
+    /// Current operational generation of raw package inputs.
+    pub(crate) fn package_input_generation(&self) -> u64 {
+        self.package_input_lifecycle.generation()
+    }
+
+    /// Record one raw package-input write or lifecycle/configuration transition.
+    ///
+    /// Call at the same lock-protected seam that mutates the input. Value-equal
+    /// writes still advance: a detached seed must not infer freshness from
+    /// semantic equality.
+    pub(crate) fn record_package_input_mutation(&mut self) {
+        self.package_input_lifecycle.advance();
+    }
+
     /// Apply a `PackageInputDelta` produced by an event handler.
-    /// Caller has already mutated `self.package_inputs` to reflect the event.
+    /// Caller has already mutated `self.package_inputs` to reflect the event and
+    /// recorded that mutation through `record_package_input_mutation`.
     /// Recomputes `package_state` as a pure function of inputs.
     pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
         let new_package_state = crate::package_state::derive_package_state(
@@ -1264,6 +1287,8 @@ impl WorldState {
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
             package_inputs: crate::package_state::PackageInputs::default(),
+            package_input_lifecycle: crate::package_state::PackageInputLifecycle::default(),
+            package_seed_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
         }
     }
 
@@ -1321,6 +1346,13 @@ impl WorldState {
     pub(crate) fn retire_all_diagnostic_lifecycles(&self) {
         self.cross_file_revalidation.cancel_all();
         self.diagnostics_gate.clear_all();
+    }
+
+    /// Cancel the delayed package-seed convergence task, if one is pending.
+    /// Called during server shutdown so a sleeping retry cannot resume disk I/O
+    /// after the shutdown response.
+    pub(crate) fn cancel_package_seed_retry(&self) {
+        self.package_seed_retry.cancel();
     }
 
     fn open_alias_candidates_for_uri(&self, uri: &Url) -> Vec<Url> {
@@ -1982,18 +2014,16 @@ impl WorldState {
 
     /// Apply pre-scanned workspace index results (for non-blocking initialization).
     ///
-    /// Package-mode state is *not* set from parameters: this function
-    /// resets `self.package_state` to its default (neutral) value, and
-    /// the caller is expected to follow with
-    /// `apply_package_event(PackageInputDelta::Initial)` — which in turn
-    /// derives `workspace` / `namespace_model` / `r_file_facts` /
-    /// `scope_contribution` from `self.package_inputs` via
-    /// `derive_package_state`. This keeps package derivation single-sourced.
+    /// Package-mode state is not set from index parameters. The existing
+    /// semantic package state remains live until the caller atomically installs
+    /// a fresh package-input seed and derives its replacement. This matters when
+    /// a detached seed is invalidated by a concurrent watcher update: index
+    /// application must not leave package semantics temporarily reset or empty
+    /// while the seed recomputes off-lock.
     ///
-    /// Tests and benchmarks that only exercise cross-file / workspace
-    /// scanning behavior (and don't care about package state) can rely on
-    /// the post-reset `PackageState::default()` — they don't need to call
-    /// `apply_package_event` themselves.
+    /// Package-input freshness is owned separately by
+    /// `package_input_lifecycle`, so applying an index neither advances nor
+    /// resets the generation captured by a seed computed for this application.
     ///
     /// **Validates: Requirements 11.1, 13.1**
     pub fn apply_workspace_index(
@@ -2003,14 +2033,6 @@ impl WorldState {
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
     ) {
         self.workspace_index = index;
-
-        // Atomic reset of package state. Per-mode transitions (e.g. toggling
-        // packageMode) must never leave stale `r_file_facts` or
-        // `scope_contribution` from a prior mode, so we always start from a
-        // neutral default here. The scan-completion caller follows this
-        // with `apply_package_event`, which repopulates every field from
-        // `package_inputs` via `derive_package_state`.
-        self.package_state = crate::package_state::PackageState::default();
 
         // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
@@ -3724,10 +3746,8 @@ mod tests {
                         line: 1,
                         column: 0,
                         is_directive: false,
-                        local: false,
                         chdir: false,
                         is_sys_source: false,
-                        sys_source_global_env: true,
                         ..Default::default()
                     }],
                     ..Default::default()

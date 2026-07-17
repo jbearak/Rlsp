@@ -699,10 +699,12 @@ pub fn invalidate_children_on_parent_wd_change(
 /// edge-selection logic. The full directed-inverse equivalence additionally
 /// relies on both callers passing matching `max_depth` / `max_visited` budgets
 /// and on the deliberate graph asymmetry — revalidation here runs over the FULL
-/// graph, collection over the TRIMMED subgraph. That asymmetry is safe-direction
-/// (`S_trimmed ⊆ S_full`): collection can only omit a foreign suppression, never
-/// drop a needed revalidation. See the helper's doc and CLAUDE.md "Cross-file
-/// `# raven: nse` / `# raven: func` propagation".
+/// graph, collection over the TRIMMED subgraph. For an untruncated diagnostic
+/// neighborhood that asymmetry is safe-direction (`S_trimmed ⊆ S_full`). If the
+/// neighborhood walk hits either bound, collection instead fails closed and uses
+/// no foreign declarations, because root-dependent budget spending can otherwise
+/// break the per-member inverse guarantee. See the helper's doc and CLAUDE.md
+/// "Cross-file `# raven: nse` / `# raven: func` propagation".
 ///
 /// Returns deduplicated URIs filtered through `is_open`; never includes
 /// `edited_uri` itself. Returns an empty vec if neither `interface_changed`
@@ -1672,10 +1674,8 @@ mod tests {
                 line: 5,
                 column: 0,
                 is_directive: false, // This is from AST detection, not directive
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -1903,10 +1903,8 @@ mod tests {
                 line: 5,
                 column: 0,
                 is_directive: false, // This is from AST detection, not directive
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -1960,10 +1958,8 @@ mod tests {
                 line,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -1998,6 +1994,38 @@ mod tests {
             200,
         );
         assert!(affected.is_empty());
+    }
+
+    #[test]
+    fn locality_only_edge_change_revalidates_child() {
+        use crate::cross_file::types::SourceLocality;
+
+        let mut graph = DependencyGraph::new();
+        let parent = affected_url("parent.R");
+        let child = affected_url("child.R");
+        let mut meta = make_meta_with_source("child.R", 1);
+        meta.sources[0].locality = crate::cross_file::types::SourceLocality::CurrentFrame;
+        meta.sources[0].locality = SourceLocality::CurrentFrame;
+        graph.update_file(&parent, &meta, Some(&affected_workspace_root()), |_| None);
+
+        meta.sources[0].locality = SourceLocality::NonInheriting;
+        let update = graph.update_file(&parent, &meta, Some(&affected_workspace_root()), |_| None);
+        assert!(update.edges_changed);
+
+        let open = std::collections::HashSet::from([parent.clone(), child.clone()]);
+        let affected = compute_affected_dependents_after_edit(
+            &parent,
+            false,
+            update.edges_changed,
+            &graph,
+            |uri| open.contains(uri),
+            10,
+            200,
+        );
+        assert!(
+            affected.contains(&child),
+            "a CurrentFrame-to-NonInheriting edit must refresh the child's inherited scope"
+        );
     }
 
     #[test]
@@ -2243,10 +2271,8 @@ mod tests {
                     line: 0,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 crate::cross_file::types::ForwardSource {
@@ -2254,10 +2280,8 @@ mod tests {
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -2312,10 +2336,8 @@ mod tests {
                     line: 0,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 crate::cross_file::types::ForwardSource {
@@ -2323,10 +2345,8 @@ mod tests {
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -2384,10 +2404,8 @@ mod tests {
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 crate::cross_file::types::ForwardSource {
@@ -2395,10 +2413,8 @@ mod tests {
                     line: 2,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],

@@ -13,10 +13,13 @@ use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::Url;
 use tree_sitter::{Node, Tree};
 
+use super::binding::{CaptureEvaluationFrame, RuntimeFunctionScope};
 use super::source_detect::{
-    detect_exists_calls, detect_library_calls, detect_rm_calls, detect_source_calls,
-    is_nonevaluating_quote_call,
+    FramedLibraryCall, FramedSource, detect_exists_calls_with_bindings,
+    detect_library_calls_with_bindings_for_scope, detect_rm_calls_with_bindings_for_scope,
+    detect_source_calls_with_bindings_and_frames,
 };
+use super::static_path::LazyStaticBindings;
 use super::types::{ForwardSource, byte_offset_to_utf16_column};
 
 // ============================================================================
@@ -55,6 +58,20 @@ impl<'a> LineIndex<'a> {
         }
         let line = &self.text[start..end];
         line.strip_suffix('\r').unwrap_or(line)
+    }
+
+    fn position_at_byte(&self, byte: usize) -> Option<Position> {
+        if byte > self.text.len() || !self.text.is_char_boundary(byte) {
+            return None;
+        }
+        let row = self.line_starts.partition_point(|start| *start <= byte) - 1;
+        let line_start = self.line_starts[row];
+        let line = self.get_line(row);
+        let byte_column = byte.saturating_sub(line_start).min(line.len());
+        Some(Position::new(
+            row as u32,
+            byte_offset_to_utf16_column(line, byte_column),
+        ))
     }
 }
 
@@ -673,6 +690,7 @@ pub enum ScopeEvent {
         visible_from_line: u32,
         visible_from_column: u32,
         symbol: ScopedSymbol,
+        runtime_function_scope: RuntimeFunctionScope,
         function_scope: Option<FunctionScopeInterval>,
     },
     /// A source() call that introduces symbols from another file
@@ -680,9 +698,10 @@ pub enum ScopeEvent {
         line: u32,
         column: u32,
         source: ForwardSource,
+        runtime_function_scope: RuntimeFunctionScope,
         function_scope: Option<FunctionScopeInterval>,
     },
-    /// A function definition that introduces parameter scope
+    /// A function invocation frame spanning formals/defaults through the body
     FunctionScope {
         start_line: u32,
         start_column: u32,
@@ -695,6 +714,7 @@ pub enum ScopeEvent {
         line: u32,
         column: u32,
         symbols: Vec<String>,
+        runtime_function_scope: RuntimeFunctionScope,
         function_scope: Option<FunctionScopeInterval>,
     },
     /// A package load that introduces symbols from a package
@@ -703,6 +723,7 @@ pub enum ScopeEvent {
         column: u32,
         /// Package name
         package: String,
+        runtime_function_scope: RuntimeFunctionScope,
         /// Function scope if inside a function (None = global)
         function_scope: Option<FunctionScopeInterval>,
     },
@@ -719,6 +740,7 @@ pub enum ScopeEvent {
         stems: Vec<String>,
         /// `package = "..."` string-literal argument, if present.
         package: Option<String>,
+        runtime_function_scope: RuntimeFunctionScope,
         /// Function scope if inside a function (None = global)
         function_scope: Option<FunctionScopeInterval>,
     },
@@ -731,6 +753,8 @@ pub enum ScopeEvent {
         line: u32,
         column: u32,
         symbol: ScopedSymbol,
+        runtime_function_scope: RuntimeFunctionScope,
+        function_scope: Option<FunctionScopeInterval>,
     },
 }
 
@@ -742,6 +766,7 @@ pub enum ScopeEvent {
 pub struct DevLoadAllSite {
     pub line: u32,
     pub column: u32,
+    runtime_function_scope: RuntimeFunctionScope,
 }
 
 /// Per-file scope artifacts
@@ -1437,7 +1462,7 @@ fn resolve_forward_child_memoized(
 /// or when it represents a `sys.source` call that does not target the global
 /// environment (`is_sys_source = true` and `sys_source_global_env = false`).
 fn should_apply_local_scoping(source: &ForwardSource) -> bool {
-    source.local || (source.is_sys_source && !source.sys_source_global_env)
+    !source.inherits_symbols()
 }
 
 /// Build a forward-`source()` child's [`PathContext`](super::path_resolve::PathContext),
@@ -1520,6 +1545,23 @@ fn find_containing_function_scope(
 ) -> Option<FunctionScopeInterval> {
     tree.query_innermost(Position::new(line, column))
 }
+
+fn resolve_runtime_function_scope(
+    tree: &FunctionScopeTree,
+    line_index: &LineIndex,
+    runtime_scope: RuntimeFunctionScope,
+    line: u32,
+    column: u32,
+) -> Option<FunctionScopeInterval> {
+    match runtime_scope {
+        RuntimeFunctionScope::Lexical => find_containing_function_scope(tree, line, column),
+        RuntimeFunctionScope::Explicit(None) => None,
+        RuntimeFunctionScope::Explicit(Some(identity)) => line_index
+            .position_at_byte(identity.anchor_byte())
+            .and_then(|position| tree.query_innermost(position)),
+    }
+}
+
 fn active_function_scopes_at(
     tree: &FunctionScopeTree,
     line: u32,
@@ -1643,60 +1685,104 @@ fn apply_removal(
     }
 }
 
-fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
+/// Rebuild the function-scope interval tree from the current timeline and
+/// annotate scope-sensitive events against it.
+///
+/// Callers control timeline ordering; this helper deliberately does not sort.
+fn rebuild_function_scope_index(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
+    let function_scope_tuples: Vec<_> = artifacts
+        .timeline
+        .iter()
+        .filter_map(|event| match event {
+            ScopeEvent::FunctionScope {
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                ..
+            } => Some((*start_line, *start_column, *end_line, *end_column)),
+            _ => None,
+        })
+        .collect();
+    artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
+    annotate_event_function_scopes(artifacts, line_index);
+}
+
+fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
+    let tree = &artifacts.function_scope_tree;
     for event in &mut artifacts.timeline {
         match event {
             ScopeEvent::Def {
                 line,
                 column,
+                runtime_function_scope,
+                function_scope,
+                ..
+            }
+            | ScopeEvent::Removal {
+                line,
+                column,
+                runtime_function_scope,
+                function_scope,
+                ..
+            }
+            | ScopeEvent::PackageLoad {
+                line,
+                column,
+                runtime_function_scope,
+                function_scope,
+                ..
+            }
+            | ScopeEvent::DataLoad {
+                line,
+                column,
+                runtime_function_scope,
+                function_scope,
+                ..
+            }
+            | ScopeEvent::Declaration {
+                line,
+                column,
+                runtime_function_scope,
                 function_scope,
                 ..
             } => {
-                *function_scope =
-                    find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+                *function_scope = resolve_runtime_function_scope(
+                    tree,
+                    line_index,
+                    *runtime_function_scope,
+                    *line,
+                    *column,
+                );
             }
             ScopeEvent::Source {
                 line,
                 column,
-                function_scope,
                 source,
-                ..
-            } => {
-                // Only set function_scope for local-scoped source calls.
-                // Non-local source() (the default) evaluates in .GlobalEnv,
-                // so its symbols should be globally visible regardless of
-                // where the call site is.
-                #[allow(clippy::collapsible_match)] // guard would break match exhaustiveness
-                if should_apply_local_scoping(source) {
-                    *function_scope = find_containing_function_scope(
-                        &artifacts.function_scope_tree,
-                        *line,
-                        *column,
-                    );
-                }
-            }
-            ScopeEvent::Removal {
-                line,
-                column,
+                runtime_function_scope,
                 function_scope,
                 ..
             } => {
-                *function_scope =
-                    find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
+                let resolved_scope = resolve_runtime_function_scope(
+                    tree,
+                    line_index,
+                    *runtime_function_scope,
+                    *line,
+                    *column,
+                );
+                // Source detection runs before synthetic scopes exist, so this
+                // completed-tree result is authoritative for capture wrappers in
+                // Shiny/foreach frames.
+                source.is_function_scoped = resolved_scope.is_some();
+                // Non-local source() (the default) evaluates in .GlobalEnv, so
+                // its symbols remain globally visible regardless of call scope.
+                *function_scope = if should_apply_local_scoping(source) {
+                    resolved_scope
+                } else {
+                    None
+                };
             }
-            ScopeEvent::DataLoad {
-                line,
-                column,
-                function_scope,
-                ..
-            } => {
-                // Annotate so query-time expansion (issue #429) can apply the
-                // same function-scope visibility as the Def events the literal
-                // stems produce.
-                *function_scope =
-                    find_containing_function_scope(&artifacts.function_scope_tree, *line, *column);
-            }
-            _ => {}
+            ScopeEvent::FunctionScope { .. } => {}
         }
     }
 }
@@ -1711,7 +1797,13 @@ fn annotate_event_function_scopes(artifacts: &mut ScopeArtifacts) {
 /// matching how the use site is keyed. Centralizing the `ScopedSymbol`/event
 /// construction here keeps the declaration model identical across every source
 /// of declared symbols.
-fn declared_symbol_event(uri: &Url, name: &str, kind: SymbolKind, line: u32) -> ScopeEvent {
+fn declared_symbol_event(
+    uri: &Url,
+    name: &str,
+    kind: SymbolKind,
+    line: u32,
+    runtime_function_scope: RuntimeFunctionScope,
+) -> ScopeEvent {
     let symbol = ScopedSymbol {
         name: Arc::from(name),
         kind,
@@ -1726,6 +1818,8 @@ fn declared_symbol_event(uri: &Url, name: &str, kind: SymbolKind, line: u32) -> 
         line,
         column: u32::MAX,
         symbol,
+        runtime_function_scope,
+        function_scope: None,
     }
 }
 
@@ -1740,14 +1834,25 @@ fn declared_symbol_event(uri: &Url, name: &str, kind: SymbolKind, line: u32) -> 
 ///
 /// Shared by both [`compute_artifacts`] and [`compute_artifacts_with_metadata`]
 /// so the two paths cannot drift in how `exists()` declarations are modeled.
-fn push_exists_declarations(artifacts: &mut ScopeArtifacts, uri: &Url, tree: &Tree, content: &str) {
-    for call in detect_exists_calls(tree, content) {
-        let name = super::directive::callee_name_for_match(&call.name);
+fn push_exists_declarations<'tree, 'text>(
+    artifacts: &mut ScopeArtifacts,
+    uri: &Url,
+    tree: &'tree Tree,
+    content: &'text str,
+    capture_bindings: &mut LazyStaticBindings<'tree, 'text>,
+) {
+    for detected in detect_exists_calls_with_bindings(tree, content, capture_bindings) {
+        let name = super::directive::callee_name_for_match(&detected.call.name);
+        let runtime_function_scope = match detected.runtime_function_scope {
+            RuntimeFunctionScope::Lexical => RuntimeFunctionScope::Explicit(None),
+            explicit => explicit,
+        };
         artifacts.timeline.push(declared_symbol_event(
             uri,
             &name,
             SymbolKind::Variable,
-            call.line,
+            detected.call.line,
+            runtime_function_scope,
         ));
     }
 }
@@ -1759,7 +1864,12 @@ fn push_exists_declarations(artifacts: &mut ScopeArtifacts, uri: &Url, tree: &Tr
 /// `# raven: func`) and `exists()` declarations export identically.
 fn fold_declarations_into_exported_interface(artifacts: &mut ScopeArtifacts) {
     for event in &artifacts.timeline {
-        if let ScopeEvent::Declaration { symbol, .. } = event {
+        if let ScopeEvent::Declaration {
+            symbol,
+            function_scope: None,
+            ..
+        } = event
+        {
             artifacts
                 .exported_interface
                 .entry(symbol.name.clone())
@@ -1784,17 +1894,64 @@ fn fold_declarations_into_exported_interface(artifacts: &mut ScopeArtifacts) {
 /// Shared by both artifact-build paths ([`compute_artifacts`] and
 /// [`compute_artifacts_with_metadata`]) so the two cannot drift on load_all
 /// attachment semantics.
-fn push_dev_load_all_events(artifacts: &mut ScopeArtifacts) {
+fn push_dev_load_all_events(artifacts: &mut ScopeArtifacts, line_index: &LineIndex) {
     for site in &artifacts.dev_load_all_sites {
-        let function_scope =
-            find_containing_function_scope(&artifacts.function_scope_tree, site.line, site.column);
         artifacts.timeline.push(ScopeEvent::PackageLoad {
             line: site.line,
             column: site.column,
             package: crate::package_library::LOAD_ALL_SENTINEL.to_string(),
-            function_scope,
+            runtime_function_scope: site.runtime_function_scope,
+            function_scope: None,
         });
     }
+    annotate_event_function_scopes(artifacts, line_index);
+}
+
+/// Harvest the rm-aware top-level definitions and top-level `load_all()` fact
+/// needed by static Rprofile/preamble scans from an already parsed tree. The
+/// caller owns the shared lazy bindings cache so source and package facts for the
+/// same file reuse the identical collection.
+pub(crate) fn static_script_definitions_and_load_all<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    capture_bindings: &mut LazyStaticBindings<'tree, 'text>,
+) -> (std::collections::BTreeSet<String>, bool) {
+    let uri = Url::parse("memory:///static-script.R").expect("static memory URI is valid");
+    let root = tree.root_node();
+    let line_index = LineIndex::new(content);
+    let mut artifacts = ScopeArtifacts::default();
+    collect_definitions(
+        root,
+        &line_index,
+        &uri,
+        capture_bindings,
+        CaptureEvaluationFrame::Caller,
+        RuntimeFunctionScope::Lexical,
+        &mut artifacts,
+    );
+    for rm_call in detect_rm_calls_with_bindings_for_scope(tree, content, capture_bindings) {
+        artifacts.timeline.push(ScopeEvent::Removal {
+            line: rm_call.call.line,
+            column: rm_call.call.column,
+            symbols: rm_call.call.symbols,
+            runtime_function_scope: rm_call.runtime_function_scope,
+            function_scope: None,
+        });
+    }
+    artifacts.timeline.sort_by_key(event_effect_position);
+    rebuild_function_scope_index(&mut artifacts, &line_index);
+    let definitions = live_top_level_exports(&artifacts).into_iter().collect();
+    let load_all = artifacts.dev_load_all_sites.iter().any(|site| {
+        resolve_runtime_function_scope(
+            &artifacts.function_scope_tree,
+            &line_index,
+            site.runtime_function_scope,
+            site.line,
+            site.column,
+        )
+        .is_none()
+    });
+    (definitions, load_all)
 }
 
 /// Build scope artifacts for a source file by extracting definitions, source() calls, and removals.
@@ -1826,54 +1983,92 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     let root = tree.root_node();
     let line_index = LineIndex::new(content);
 
-    // Collect definitions from AST
-    collect_definitions(root, &line_index, uri, &mut artifacts);
+    // Collect definitions from AST, then reuse the same lazy whole-tree binding
+    // cache for source, removal, exists, and package detection below.
+    let mut capture_bindings = LazyStaticBindings::new(root, content);
+    collect_definitions(
+        root,
+        &line_index,
+        uri,
+        &mut capture_bindings,
+        CaptureEvaluationFrame::Caller,
+        RuntimeFunctionScope::Lexical,
+        &mut artifacts,
+    );
 
     // Collect source() calls and add them to timeline.
     // Note: even when local=TRUE (or sys.source targets a non-global env), the symbols can still
     // be in-scope within a function body after the call site, so we keep these events and apply
     // scoping rules later during resolution.
-    let source_calls = detect_source_calls(tree, content);
-    for source in source_calls {
+    let source_calls =
+        detect_source_calls_with_bindings_and_frames(tree, content, &mut capture_bindings);
+    let source_interfaces: Vec<ForwardSource> = source_calls
+        .iter()
+        .map(|detected| detected.source.clone())
+        .collect();
+    for detected in source_calls {
+        if !detected.contributes_to_scope() {
+            // The dependency still exists, but its destination or capture runtime
+            // order cannot safely lend symbols to this coordinate-sorted timeline.
+            continue;
+        }
+        let source = detected.source;
         artifacts.timeline.push(ScopeEvent::Source {
             line: source.line,
             column: source.column,
             source,
+            runtime_function_scope: detected.runtime_function_scope,
             function_scope: None,
         });
     }
 
     // Collect rm()/remove() calls and add them to timeline.
     // These events will be processed during scope resolution to remove symbols from scope.
-    let rm_calls = detect_rm_calls(tree, content);
+    let rm_calls = detect_rm_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
     for rm_call in rm_calls {
         artifacts.timeline.push(ScopeEvent::Removal {
-            line: rm_call.line,
-            column: rm_call.column,
-            symbols: rm_call.symbols,
+            line: rm_call.call.line,
+            column: rm_call.call.column,
+            symbols: rm_call.call.symbols,
+            runtime_function_scope: rm_call.runtime_function_scope,
             function_scope: None,
         });
     }
 
     // Collect `exists("name")` calls and add Declaration events (treated as
     // `# raven: var name`). See `push_exists_declarations`.
-    push_exists_declarations(&mut artifacts, uri, tree, content);
+    push_exists_declarations(&mut artifacts, uri, tree, content, &mut capture_bindings);
 
     // Collect library()/require()/loadNamespace() calls for later processing.
     // We need to wait until the function scope tree is built to determine function_scope.
     // (Requirements 14.2, 14.4)
-    let library_calls = detect_library_calls(tree, content);
+    let library_calls =
+        detect_library_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
 
     // Issue #402: model Shiny deferred-expression bodies as nested scopes so
     // their local definitions do not leak into the surrounding server function.
     // Must be pushed before the function-scope tree is built below.
-    push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
+    push_shiny_deferred_scopes(
+        &mut artifacts,
+        root,
+        content,
+        &line_index,
+        &library_calls,
+        &mut capture_bindings,
+    );
 
     // Issues #404 / #406 / #410: model `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
     // iterator variables (including nested `%:%` compositions) as synthetic
     // iterator scopes. Must be pushed before the function-scope tree is built
     // below so scope-local definitions are tagged with this scope.
-    push_foreach_iterator_scopes(&mut artifacts, root, content, &line_index, uri);
+    push_foreach_iterator_scopes(
+        &mut artifacts,
+        root,
+        content,
+        &line_index,
+        uri,
+        &mut capture_bindings,
+    );
 
     // Sort timeline by *effect* position so the resolver iterates events in
     // execution order. `event_effect_position` uses `visible_from` for Def
@@ -1881,48 +2076,25 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
     // inner `rm(x)` instead of before it.
     artifacts.timeline.sort_by_key(event_effect_position);
 
-    // Build interval tree from function scopes for O(log n) queries
-    let function_scope_tuples: Vec<(u32, u32, u32, u32)> = artifacts
-        .timeline
-        .iter()
-        .filter_map(|e| {
-            if let ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                end_line,
-                end_column,
-                ..
-            } = e
-            {
-                Some((*start_line, *start_column, *end_line, *end_column))
-            } else {
-                None
-            }
-        })
-        .collect();
-    artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
-    annotate_event_function_scopes(&mut artifacts);
+    // Build the function-scope index and annotate scope-sensitive events.
+    rebuild_function_scope_index(&mut artifacts, &line_index);
 
     // Add PackageLoad events for library calls with function_scope determined from the tree.
     // (Requirements 14.2, 14.4)
-    for lib_call in library_calls {
-        let function_scope = find_containing_function_scope(
-            &artifacts.function_scope_tree,
-            lib_call.line,
-            lib_call.column,
-        );
-
+    for detected in library_calls {
         artifacts.timeline.push(ScopeEvent::PackageLoad {
-            line: lib_call.line,
-            column: lib_call.column,
-            package: lib_call.package,
-            function_scope,
+            line: detected.call.line,
+            column: detected.call.column,
+            package: detected.call.package,
+            runtime_function_scope: detected.runtime_function_scope,
+            function_scope: None,
         });
     }
+    annotate_event_function_scopes(&mut artifacts, &line_index);
 
     // Model devtools/pkgload::load_all() as attaching a synthetic virtual package
     // (one sentinel PackageLoad per call site); see `push_dev_load_all_events`.
-    push_dev_load_all_events(&mut artifacts);
+    push_dev_load_all_events(&mut artifacts, &line_index);
 
     // Re-sort timeline to include PackageLoad events in effect-position order.
     artifacts.timeline.sort_by_key(event_effect_position);
@@ -1960,6 +2132,7 @@ pub fn compute_artifacts(uri: &Url, tree: &Tree, content: &str) -> ScopeArtifact
         &removal_refs,
         &data_loads,
         &declarations,
+        &source_interfaces,
         // No metadata available in this path → cannot be standalone.
         false,
     );
@@ -1999,77 +2172,6 @@ fn call_is_dev_load_all(node: Node, content: &str) -> bool {
         }
         _ => false,
     }
-}
-
-/// True if `node` has an ancestor that is a non-evaluating quoting call
-/// (`quote`/`bquote`/`substitute`/`expression`, rlang's `expr`/`quo`/…), in
-/// which code is captured but never evaluated. A `load_all()` so captured never
-/// runs, so it must not attach the package under development. Mirrors the
-/// `inside_quote` exclusion in [`text_calls_dev_load_all`] /
-/// `visit_node_for_top_level_library`, but walks UP the tree because
-/// `collect_definitions` visits each node individually (no top-down latch).
-fn has_nonevaluating_quote_ancestor(node: Node, content: &str) -> bool {
-    let mut ancestor = node.parent();
-    while let Some(n) = ancestor {
-        if is_nonevaluating_quote_call(n, content) {
-            return true;
-        }
-        ancestor = n.parent();
-    }
-    false
-}
-
-/// True when `text` contains a top-level `devtools::load_all()` /
-/// `pkgload::load_all()` / bare `load_all()` call — used by the workspace-root
-/// `.Rprofile` scan to decide whether the profile attaches the package under
-/// development (modeled via [`crate::package_library::LOAD_ALL_SENTINEL`]).
-///
-/// Mirrors the exclusions that [`extract_attached_packages`] applies to
-/// `library()`/`require()`. A `load_all()` lexically inside a
-/// `function_definition` only runs when that function is invoked, and a
-/// `load_all()` inside a non-evaluating quoting call (`quote`/`bquote`/
-/// `substitute`/`expression`, rlang's `expr`/`quo`/…) captures code without
-/// ever evaluating it; neither attaches at profile-load time. The quoting
-/// predicate is shared with `extract_attached_packages` via
-/// [`is_nonevaluating_quote_call`]. The per-call recognition reuses
-/// [`call_is_dev_load_all`]. Detection is error-tolerant: tree-sitter recovers
-/// from syntax errors, so a recognizable top-level `load_all()` is still found
-/// amid unrelated errors (matching the AST timeline path, which likewise
-/// tolerates `ERROR` nodes); the function only returns `false` outright if the
-/// parser yields no tree at all.
-///
-/// [`extract_attached_packages`]: crate::cross_file::source_detect::extract_attached_packages
-pub(crate) fn text_calls_dev_load_all(text: &str) -> bool {
-    use tree_sitter::Parser;
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_r::LANGUAGE.into())
-        .is_err()
-    {
-        return false;
-    }
-    let Some(tree) = parser.parse(text, None) else {
-        return false;
-    };
-    fn walk(node: Node, content: &str, inside_fn: bool, inside_quote: bool) -> bool {
-        // A call inside a function body or a non-evaluating quoting wrapper does
-        // not run at load time.
-        if !inside_fn && !inside_quote && call_is_dev_load_all(node, content) {
-            return true;
-        }
-        let entering_fn = inside_fn || node.kind() == "function_definition";
-        // Latch once an ancestor quoting call is entered, so all descendants are
-        // likewise excluded (mirrors `visit_node_for_top_level_library`).
-        let entering_quote = inside_quote || is_nonevaluating_quote_call(node, content);
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if walk(child, content, entering_fn, entering_quote) {
-                return true;
-            }
-        }
-        false
-    }
-    walk(tree.root_node(), text, false, false)
 }
 
 /// Build scope artifacts for a source file, including both AST-detected sources and directive sources.
@@ -2114,11 +2216,35 @@ pub fn compute_artifacts_with_metadata(
     let root = tree.root_node();
     let line_index = LineIndex::new(content);
 
-    // Collect definitions from AST
-    collect_definitions(root, &line_index, uri, &mut artifacts);
+    // Collect definitions from AST, then reuse the same lazy whole-tree binding
+    // cache for source, removal, exists, and package detection below.
+    let mut capture_bindings = LazyStaticBindings::new(root, content);
+    collect_definitions(
+        root,
+        &line_index,
+        uri,
+        &mut capture_bindings,
+        CaptureEvaluationFrame::Caller,
+        RuntimeFunctionScope::Lexical,
+        &mut artifacts,
+    );
 
-    // Collect source() calls from AST and add them to timeline.
-    let ast_source_calls = detect_source_calls(tree, content);
+    // Collect source() calls from AST and add them to timeline. Keep dependency
+    // detection broader than scope lending: external local sources execute, but
+    // their child symbols belong to the external `where` environment.
+    let detected_source_calls =
+        detect_source_calls_with_bindings_and_frames(tree, content, &mut capture_bindings);
+    let source_interfaces: Vec<ForwardSource> =
+        metadata.map(|m| m.sources.clone()).unwrap_or_else(|| {
+            detected_source_calls
+                .iter()
+                .map(|detected| detected.source.clone())
+                .collect()
+        });
+    let ast_source_calls: Vec<_> = detected_source_calls
+        .into_iter()
+        .filter(FramedSource::contributes_to_scope)
+        .collect();
 
     // Track which (line, path) pairs have AST sources to avoid duplicates
     // We use (line, path) instead of just (line, column) because:
@@ -2127,15 +2253,17 @@ pub fn compute_artifacts_with_metadata(
     // 3. A directive should only be suppressed if an AST source to the SAME file exists
     let ast_line_paths: std::collections::HashSet<(u32, String)> = ast_source_calls
         .iter()
-        .map(|s| (s.line, s.path.clone()))
+        .map(|detected| (detected.source.line, detected.source.path.clone()))
         .collect();
 
     // Add AST-detected sources to timeline
-    for source in ast_source_calls {
+    for detected in ast_source_calls {
+        let source = detected.source;
         artifacts.timeline.push(ScopeEvent::Source {
             line: source.line,
             column: source.column,
             source,
+            runtime_function_scope: detected.runtime_function_scope,
             function_scope: None,
         });
     }
@@ -2154,6 +2282,7 @@ pub fn compute_artifacts_with_metadata(
                         line: source.line,
                         column: source.column,
                         source: source.clone(),
+                        runtime_function_scope: RuntimeFunctionScope::Explicit(None),
                         function_scope: None,
                     });
                 }
@@ -2170,6 +2299,7 @@ pub fn compute_artifacts_with_metadata(
                 &decl.name,
                 SymbolKind::Variable,
                 decl.line,
+                RuntimeFunctionScope::Explicit(None),
             ));
         }
         for decl in &meta.declared_functions {
@@ -2178,17 +2308,19 @@ pub fn compute_artifacts_with_metadata(
                 &decl.name,
                 SymbolKind::Function,
                 decl.line,
+                RuntimeFunctionScope::Explicit(None),
             ));
         }
     }
 
     // Collect rm()/remove() calls and add them to timeline.
-    let rm_calls = detect_rm_calls(tree, content);
+    let rm_calls = detect_rm_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
     for rm_call in rm_calls {
         artifacts.timeline.push(ScopeEvent::Removal {
-            line: rm_call.line,
-            column: rm_call.column,
-            symbols: rm_call.symbols,
+            line: rm_call.call.line,
+            column: rm_call.call.column,
+            symbols: rm_call.call.symbols,
+            runtime_function_scope: rm_call.runtime_function_scope,
             function_scope: None,
         });
     }
@@ -2198,68 +2330,60 @@ pub fn compute_artifacts_with_metadata(
     // resolved positionally against other declarations — later-in-timeline
     // wins — and never downgrades a real definition). See
     // `push_exists_declarations`.
-    push_exists_declarations(&mut artifacts, uri, tree, content);
+    push_exists_declarations(&mut artifacts, uri, tree, content, &mut capture_bindings);
 
     // Collect library()/require()/loadNamespace() calls for later processing.
-    let library_calls = detect_library_calls(tree, content);
+    let library_calls =
+        detect_library_calls_with_bindings_for_scope(tree, content, &mut capture_bindings);
 
     // Issue #402: model Shiny deferred-expression bodies as nested scopes so
     // their local definitions do not leak into the surrounding server function.
     // Must be pushed before the function-scope tree is built below.
-    push_shiny_deferred_scopes(&mut artifacts, root, content, &line_index, &library_calls);
+    push_shiny_deferred_scopes(
+        &mut artifacts,
+        root,
+        content,
+        &line_index,
+        &library_calls,
+        &mut capture_bindings,
+    );
 
     // Issues #404 / #406 / #410: model `foreach(...) %do%/%dopar%/%dorng%/%dofuture% expr`
     // iterator variables (including nested `%:%` compositions) as synthetic
     // iterator scopes. Must be pushed before the function-scope tree is built
     // below so scope-local definitions are tagged with this scope.
-    push_foreach_iterator_scopes(&mut artifacts, root, content, &line_index, uri);
+    push_foreach_iterator_scopes(
+        &mut artifacts,
+        root,
+        content,
+        &line_index,
+        uri,
+        &mut capture_bindings,
+    );
 
     // Sort timeline by *effect* position so the resolver iterates events in
     // execution order. See `event_effect_position` for why this differs from
     // the LHS anchor for Def events.
     artifacts.timeline.sort_by_key(event_effect_position);
 
-    // Build interval tree from function scopes for O(log n) queries
-    let function_scope_tuples: Vec<(u32, u32, u32, u32)> = artifacts
-        .timeline
-        .iter()
-        .filter_map(|e| {
-            if let ScopeEvent::FunctionScope {
-                start_line,
-                start_column,
-                end_line,
-                end_column,
-                ..
-            } = e
-            {
-                Some((*start_line, *start_column, *end_line, *end_column))
-            } else {
-                None
-            }
-        })
-        .collect();
-    artifacts.function_scope_tree = FunctionScopeTree::from_scopes(&function_scope_tuples);
-    annotate_event_function_scopes(&mut artifacts);
+    // Build the function-scope index and annotate scope-sensitive events.
+    rebuild_function_scope_index(&mut artifacts, &line_index);
 
     // Add PackageLoad events for library calls with function_scope determined from the tree.
-    for lib_call in library_calls {
-        let function_scope = find_containing_function_scope(
-            &artifacts.function_scope_tree,
-            lib_call.line,
-            lib_call.column,
-        );
-
+    for detected in library_calls {
         artifacts.timeline.push(ScopeEvent::PackageLoad {
-            line: lib_call.line,
-            column: lib_call.column,
-            package: lib_call.package,
-            function_scope,
+            line: detected.call.line,
+            column: detected.call.column,
+            package: detected.call.package,
+            runtime_function_scope: detected.runtime_function_scope,
+            function_scope: None,
         });
     }
+    annotate_event_function_scopes(&mut artifacts, &line_index);
 
     // Model devtools/pkgload::load_all() as attaching a synthetic virtual package
     // (one sentinel PackageLoad per call site); see `push_dev_load_all_events`.
-    push_dev_load_all_events(&mut artifacts);
+    push_dev_load_all_events(&mut artifacts, &line_index);
 
     // Re-sort timeline (now includes PackageLoad events) by effect position.
     artifacts.timeline.sort_by_key(event_effect_position);
@@ -2311,6 +2435,7 @@ pub fn compute_artifacts_with_metadata(
         &removal_refs,
         &data_loads,
         &declarations,
+        &source_interfaces,
         metadata.is_some_and(|m| m.standalone),
     );
 
@@ -2322,7 +2447,7 @@ pub fn compute_artifacts_with_metadata(
 /// The returned ScopeAtPosition reflects only local, in-file visibility at (line, column):
 /// - Global definitions that occur at or before the query position are included.
 /// - Function-local definitions are included only when the query position lies inside the same function scope as the definition.
-/// - Function parameters are included when the query position is inside the function body (EOF sentinel positions are ignored).
+/// - Function parameters are included when the query position is inside the function invocation frame, including defaults and the body (EOF sentinel positions are ignored).
 /// - Removal events that occur strictly before the query position are applied, respecting function-scoped removals.
 /// - Package load events from the same file are recorded in `loaded_packages` when they occur at or before the query position and match function-scoping rules.
 ///
@@ -2403,6 +2528,7 @@ pub fn scope_at_position(
                 column: rm_col,
                 symbols,
                 function_scope,
+                ..
             } => {
                 let passes_position = (*rm_line, *rm_col) < (line, column);
                 if passes_position || query_inside_function {
@@ -2429,6 +2555,7 @@ pub fn scope_at_position(
                 column: pkg_col,
                 package,
                 function_scope,
+                ..
             } => {
                 let passes_position = (*pkg_line, *pkg_col) <= (line, column);
                 if passes_position || query_inside_function {
@@ -2453,12 +2580,18 @@ pub fn scope_at_position(
                 line: decl_line,
                 column: decl_col,
                 symbol,
+                function_scope,
+                ..
             } => {
-                // Declarations are always global scope - hoist when inside a function
-                let passes_position = (*decl_line, *decl_col) <= (line, column);
-                if passes_position || query_inside_function {
-                    // Declared symbols are always global scope (not function-local)
-                    // Only insert if no real (non-declared) definition exists
+                if is_symbol_visible(
+                    *decl_line,
+                    *decl_col,
+                    *function_scope,
+                    &active_function_scopes,
+                    line,
+                    column,
+                    query_inside_function,
+                ) {
                     scope
                         .symbols
                         .entry(symbol.name.clone())
@@ -2606,6 +2739,7 @@ where
                 column: rm_col,
                 symbols,
                 function_scope,
+                ..
             } => {
                 let passes_position = (*rm_line, *rm_col) < (line, column);
                 if passes_position || query_inside_function {
@@ -2631,6 +2765,7 @@ where
                 column: pkg_col,
                 package,
                 function_scope,
+                ..
             } => {
                 let passes_position = (*pkg_line, *pkg_col) <= (line, column);
                 if passes_position || query_inside_function {
@@ -2688,9 +2823,18 @@ where
                 line: decl_line,
                 column: decl_col,
                 symbol,
+                function_scope,
+                ..
             } => {
-                let passes_position = (*decl_line, *decl_col) <= (line, column);
-                if passes_position || query_inside_function {
+                if is_symbol_visible(
+                    *decl_line,
+                    *decl_col,
+                    *function_scope,
+                    &active_function_scopes,
+                    line,
+                    column,
+                    query_inside_function,
+                ) {
                     scope
                         .symbols
                         .entry(symbol.name.clone())
@@ -2721,8 +2865,51 @@ fn collect_definitions(
     node: Node,
     line_index: &LineIndex,
     uri: &Url,
+    capture_bindings: &mut LazyStaticBindings,
+    evaluation_frame: CaptureEvaluationFrame,
+    runtime_function_scope: RuntimeFunctionScope,
     artifacts: &mut ScopeArtifacts,
 ) {
+    if node.kind() == "call"
+        && let Some(kind) = capture_bindings.capturing_call_kind_at(node)
+    {
+        let source_order_inverted = super::binding::capture_evaluation_order_has_source_inversion(
+            node,
+            line_index.text,
+            kind,
+            evaluation_frame,
+        );
+        if source_order_inverted {
+            // Scope events are sorted by source coordinates. A trusted capture
+            // can evaluate a later control before an earlier expression
+            // (`bquote(..., where = ...)`), and representing positive effects
+            // from either side can make a definition, source, or package attach
+            // visible before it exists at runtime. Suppress those positive scope
+            // effects; removal detection separately installs a conservative
+            // boundary kill, while dependency/package fact collectors retain
+            // reachable non-scope facts.
+        } else {
+            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
+            super::binding::visit_evaluated_capture_parts(
+                node,
+                line_index.text,
+                kind,
+                &mut |evaluated, relative_frame, _role| {
+                    collect_definitions(
+                        evaluated,
+                        line_index,
+                        uri,
+                        capture_bindings,
+                        relative_frame.relative_to(evaluation_frame),
+                        captured_runtime_scope,
+                        artifacts,
+                    )
+                },
+            );
+        }
+        return;
+    }
+
     // Check for assignment expressions.
     //
     // We track two distinct positions on the Def event:
@@ -2754,7 +2941,12 @@ fn collect_definitions(
     // The symbol's own `defined_line/defined_column` (used for hover and
     // go-to-definition) remains at the LHS identifier, so navigation is
     // unaffected.
+    let assignment_escapes_current_frame = node.kind() == "binary_operator"
+        && node
+            .child_by_field_name("operator")
+            .is_some_and(|operator| matches!(node_text(operator, line_index.text), "<<-" | "->>"));
     if node.kind() == "binary_operator"
+        && (evaluation_frame.is_caller_or_global() || assignment_escapes_current_frame)
         && let Some(symbol) = try_extract_assignment(node, line_index, uri)
     {
         let (visible_line, visible_column) =
@@ -2765,6 +2957,7 @@ fn collect_definitions(
             visible_from_line: visible_line,
             visible_from_column: visible_column,
             symbol: symbol.clone(),
+            runtime_function_scope,
             function_scope: None,
         };
         artifacts.timeline.push(event);
@@ -2779,7 +2972,7 @@ fn collect_definitions(
     // bare-symbol LHS only). The RHS is evaluated (or promised) before the
     // bindings install, so each binding becomes visible at the end of the
     // whole statement — same rule as `<-` with a non-function RHS.
-    if node.kind() == "binary_operator" {
+    if node.kind() == "binary_operator" && evaluation_frame.is_caller_or_global() {
         let destructured = try_extract_destructuring_assignment(node, line_index, uri);
         if !destructured.is_empty() {
             let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2790,6 +2983,7 @@ fn collect_definitions(
                     visible_from_line: visible_line,
                     visible_from_column: visible_column,
                     symbol: symbol.clone(),
+                    runtime_function_scope,
                     function_scope: None,
                 };
                 artifacts.timeline.push(event);
@@ -2819,21 +3013,26 @@ fn collect_definitions(
     };
 
     if call_callee == Some("assign")
-        && let Some(symbol) = try_extract_assign_call(node, line_index, uri)
+        && let Some((symbol, destination)) =
+            try_extract_assign_call(node, line_index, uri, capture_bindings)
     {
-        let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
-        let event = ScopeEvent::Def {
-            line: symbol.defined_line,
-            column: symbol.defined_column,
-            visible_from_line: visible_line,
-            visible_from_column: visible_column,
-            symbol: symbol.clone(),
-            function_scope: None,
-        };
-        artifacts.timeline.push(event);
-        artifacts
-            .exported_interface
-            .insert(symbol.name.clone(), symbol);
+        let effect_frame = destination.relative_to(evaluation_frame);
+        if effect_frame.is_caller_or_global() {
+            let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
+            let event = ScopeEvent::Def {
+                line: symbol.defined_line,
+                column: symbol.defined_column,
+                visible_from_line: visible_line,
+                visible_from_column: visible_column,
+                symbol: symbol.clone(),
+                runtime_function_scope,
+                function_scope: None,
+            };
+            artifacts.timeline.push(event);
+            artifacts
+                .exported_interface
+                .insert(symbol.name.clone(), symbol);
+        }
     }
 
     // Detect `devtools::load_all()` / `pkgload::load_all()` / bare `load_all()`
@@ -2841,21 +3040,21 @@ fn collect_definitions(
     // call site (not just the first) so the emission loops can push one sentinel
     // PackageLoad event per site, each with its own function scope — matching
     // how `library()` calls are emitted (see `dev_load_all_sites`).
-    if call_callee == Some("load_all")
-        && call_is_dev_load_all(node, line_index.text)
-        && !has_nonevaluating_quote_ancestor(node, line_index.text)
-    {
+    if call_callee == Some("load_all") && call_is_dev_load_all(node, line_index.text) {
         artifacts.calls_dev_load_all = true;
         let (line, column) = node_start_position_utf16(node, line_index);
-        artifacts
-            .dev_load_all_sites
-            .push(DevLoadAllSite { line, column });
+        artifacts.dev_load_all_sites.push(DevLoadAllSite {
+            line,
+            column,
+            runtime_function_scope,
+        });
     }
 
     // Check for delayedAssign("name", expr) calls. The promise binds `name` in
     // the calling environment; like assign(), the binding becomes visible at
     // the end of the call.
     if call_callee == Some("delayedAssign")
+        && evaluation_frame.is_caller_or_global()
         && let Some(symbol) = try_extract_delayed_assign_call(node, line_index, uri)
     {
         let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2865,6 +3064,7 @@ fn collect_definitions(
             visible_from_line: visible_line,
             visible_from_column: visible_column,
             symbol: symbol.clone(),
+            runtime_function_scope,
             function_scope: None,
         };
         artifacts.timeline.push(event);
@@ -2887,6 +3087,7 @@ fn collect_definitions(
                     visible_from_line: visible_line,
                     visible_from_column: visible_column,
                     symbol: symbol.clone(),
+                    runtime_function_scope,
                     function_scope: None,
                 };
                 artifacts.timeline.push(event);
@@ -2901,7 +3102,9 @@ fn collect_definitions(
     // env_bind_lazy(current_env(), name = ...) calls. Every named argument
     // binds that name in the enclosing environment, visible from the end of
     // the call.
-    if matches!(call_callee, Some("env_bind_active" | "env_bind_lazy")) {
+    if matches!(call_callee, Some("env_bind_active" | "env_bind_lazy"))
+        && evaluation_frame.is_caller_or_global()
+    {
         let env_bind_symbols = try_extract_env_bind_definitions(node, line_index, uri);
         if !env_bind_symbols.is_empty() {
             let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2912,6 +3115,7 @@ fn collect_definitions(
                     visible_from_line: visible_line,
                     visible_from_column: visible_column,
                     symbol: symbol.clone(),
+                    runtime_function_scope,
                     function_scope: None,
                 };
                 artifacts.timeline.push(event);
@@ -2928,6 +3132,7 @@ fn collect_definitions(
     // shape so common fixtures like load("anorexia.rda"); anorexia resolve
     // without broadly suppressing unknown post-load names.
     if call_callee == Some("load")
+        && evaluation_frame.is_caller_or_global()
         && let Some((symbol, visible_line, visible_column)) =
             try_extract_literal_load_call_definition(node, line_index, uri)
     {
@@ -2937,6 +3142,7 @@ fn collect_definitions(
             visible_from_line: visible_line,
             visible_from_column: visible_column,
             symbol: symbol.clone(),
+            runtime_function_scope,
             function_scope: None,
         };
         artifacts.timeline.push(event);
@@ -2961,6 +3167,7 @@ fn collect_definitions(
             visible_from_line: visible_line,
             visible_from_column: visible_column,
             symbol: symbol.clone(),
+            runtime_function_scope,
             function_scope: None,
         };
         artifacts.timeline.push(event);
@@ -2975,6 +3182,7 @@ fn collect_definitions(
     // resolve. Read mode (the default) treats the first argument as data, not a
     // variable name, so it is deliberately not modeled.
     if call_callee == Some("textConnection")
+        && evaluation_frame.is_caller_or_global()
         && let Some(symbol) = try_extract_text_connection_definition(node, line_index, uri)
     {
         let (visible_line, visible_column) = node_end_position_utf16(node, line_index);
@@ -2984,6 +3192,7 @@ fn collect_definitions(
             visible_from_line: visible_line,
             visible_from_column: visible_column,
             symbol: symbol.clone(),
+            runtime_function_scope,
             function_scope: None,
         };
         artifacts.timeline.push(event);
@@ -2995,7 +3204,7 @@ fn collect_definitions(
     // Check for data() calls. `data(foo, "bar")` loads named datasets into the
     // calling environment. Model each positional identifier/string arg as a
     // binding visible from the call's end position.
-    if call_callee == Some("data") {
+    if call_callee == Some("data") && evaluation_frame.is_caller_or_global() {
         let (data_symbols, data_call_info) =
             try_extract_data_call_definitions(node, line_index, uri);
         if !data_symbols.is_empty() {
@@ -3007,6 +3216,7 @@ fn collect_definitions(
                     visible_from_line: visible_line,
                     visible_from_column: visible_column,
                     symbol: symbol.clone(),
+                    runtime_function_scope,
                     function_scope: None,
                 };
                 artifacts.timeline.push(event);
@@ -3030,6 +3240,7 @@ fn collect_definitions(
                 column,
                 stems,
                 package,
+                runtime_function_scope,
                 function_scope: None,
             });
         }
@@ -3045,6 +3256,7 @@ fn collect_definitions(
     // outer `i` is a separate question with the same answer R itself gives;
     // this fix targets `<-`/`=`/`<<-`/`assign()` only.)
     if node.kind() == "for_statement"
+        && evaluation_frame.is_caller_or_global()
         && let Some(symbol) = try_extract_for_loop_iterator(node, line_index, uri)
     {
         let event = ScopeEvent::Def {
@@ -3053,6 +3265,7 @@ fn collect_definitions(
             visible_from_line: symbol.defined_line,
             visible_from_column: symbol.defined_column,
             symbol: symbol.clone(),
+            runtime_function_scope,
             function_scope: None,
         };
         artifacts.timeline.push(event);
@@ -3068,14 +3281,34 @@ fn collect_definitions(
         artifacts.timeline.push(function_scope);
     }
 
-    // Recurse into children
+    // Closure creation uses the surrounding capture frame, but formals,
+    // defaults, and the body are analyzed as deferred function execution.
+    let enters_function = node.kind() == "function_definition";
+    let child_frame = if enters_function {
+        CaptureEvaluationFrame::Caller
+    } else {
+        evaluation_frame
+    };
+    let child_runtime_scope = if enters_function {
+        runtime_function_scope.enter_function()
+    } else {
+        runtime_function_scope
+    };
     for child in node.children(&mut node.walk()) {
-        collect_definitions(child, line_index, uri, artifacts);
+        collect_definitions(
+            child,
+            line_index,
+            uri,
+            capture_bindings,
+            child_frame,
+            child_runtime_scope,
+            artifacts,
+        );
     }
 }
 
-/// Extract function parameter scope from function_definition nodes.
-/// Creates ScopedSymbol for each parameter and determines function body boundaries.
+/// Extract the invocation scope from a `function_definition` node.
+/// Creates one symbol per parameter and spans default evaluation through the body.
 fn try_extract_function_scope(node: Node, line_index: &LineIndex, uri: &Url) -> Option<ScopeEvent> {
     // tree-sitter-r node shapes have changed across versions; be robust by falling back
     // to scanning children by kind if field lookups fail.
@@ -3112,23 +3345,57 @@ fn try_extract_function_scope(node: Node, line_index: &LineIndex, uri: &Url) -> 
         }
     }
 
-    // Determine function body boundaries
-    let body_start = body_node.start_position();
+    // The invocation frame begins with formal/default evaluation, not only at
+    // the body. Starting at the parameter list keeps definitions, removals, and
+    // local source calls in defaults function-scoped while still treating
+    // closure creation itself as an effect of the surrounding frame.
+    let frame_start = params_node.start_position();
     let body_end = body_node.end_position();
 
     // Convert to UTF-16 columns
-    let start_line_text = line_index.get_line(body_start.row);
+    let start_line_text = line_index.get_line(frame_start.row);
     let end_line_text = line_index.get_line(body_end.row);
-    let start_column = byte_offset_to_utf16_column(start_line_text, body_start.column);
+    let start_column = byte_offset_to_utf16_column(start_line_text, frame_start.column);
     let end_column = byte_offset_to_utf16_column(end_line_text, body_end.column);
 
     Some(ScopeEvent::FunctionScope {
-        start_line: body_start.row as u32,
+        start_line: frame_start.row as u32,
         start_column,
         end_line: body_end.row as u32,
         end_column,
         parameters,
     })
+}
+
+/// Visit only syntax that can execute under the trusted capture model.
+///
+/// Whole-capture syntax is inert, while `bquote()`/`substitute()` contribute only
+/// their proven evaluated controls and operands. Synthetic Shiny/foreach scope
+/// discovery shares this walk so quoted helper-looking syntax cannot manufacture
+/// invocation intervals that would later capture unrelated effects.
+fn visit_runtime_reachable_scope_syntax<'tree>(
+    node: Node<'tree>,
+    content: &str,
+    capture_bindings: &mut LazyStaticBindings<'tree, '_>,
+    visit: &mut impl FnMut(Node<'tree>),
+) {
+    visit(node);
+    if node.kind() == "call"
+        && let Some(kind) = capture_bindings.capturing_call_kind_at(node)
+    {
+        super::binding::visit_evaluated_capture_parts(
+            node,
+            content,
+            kind,
+            &mut |evaluated, _relative_frame, _role| {
+                visit_runtime_reachable_scope_syntax(evaluated, content, capture_bindings, visit);
+            },
+        );
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        visit_runtime_reachable_scope_syntax(child, content, capture_bindings, visit);
+    }
 }
 
 /// Issue #402: append nested `FunctionScope` events for Shiny deferred-
@@ -3146,12 +3413,13 @@ fn try_extract_function_scope(node: Node, line_index: &LineIndex, uri: &Url) -> 
 /// `library(shiny)` / `require(shiny)`) and the name is not shadowed by a
 /// top-level definition. The whole-tree walk is skipped when neither trigger
 /// can be present, so non-Shiny files pay nothing.
-fn push_shiny_deferred_scopes(
+fn push_shiny_deferred_scopes<'tree, 'text>(
     artifacts: &mut ScopeArtifacts,
-    root: Node,
-    content: &str,
+    root: Node<'tree>,
+    content: &'text str,
     line_index: &LineIndex,
-    library_calls: &[super::source_detect::LibraryCall],
+    library_calls: &[FramedLibraryCall],
+    capture_bindings: &mut LazyStaticBindings<'tree, 'text>,
 ) {
     // Only an *attach* (`library(shiny)` / `require(shiny)`) brings the bare
     // helpers (`reactive`, `render*`, …) into scope. `loadNamespace("shiny")`
@@ -3159,7 +3427,7 @@ fn push_shiny_deferred_scopes(
     // enable bare-helper semantics — see `LibraryCall::attaches`.
     let shiny_in_play = library_calls
         .iter()
-        .any(|c| c.package == "shiny" && c.attaches);
+        .any(|detected| detected.call.package == "shiny" && detected.call.attaches);
     // Cheap pre-filter: skip the walk only when the file cannot contain a
     // trigger. Any `library(shiny)`/`require(shiny)` sets `shiny_in_play`; a
     // `shiny::`-qualified call must contain the substring "shiny". A bare
@@ -3171,14 +3439,18 @@ fn push_shiny_deferred_scopes(
     // `exported_interface` is read for shadow detection while `timeline` is
     // appended to; these are disjoint fields, so borrow each directly rather
     // than buffering events in a temporary Vec.
-    collect_shiny_deferred_scopes(
-        root,
-        content,
-        line_index,
-        shiny_in_play,
-        &artifacts.exported_interface,
-        &mut artifacts.timeline,
-    );
+    let local_defs = &artifacts.exported_interface;
+    let events = &mut artifacts.timeline;
+    visit_runtime_reachable_scope_syntax(root, content, capture_bindings, &mut |node| {
+        collect_shiny_deferred_scope_at_node(
+            node,
+            content,
+            line_index,
+            shiny_in_play,
+            local_defs,
+            events,
+        );
+    });
 }
 
 /// Walk `node`, appending a parameterless `FunctionScope` event for each
@@ -3190,7 +3462,7 @@ fn push_shiny_deferred_scopes(
 /// evaluated in the current environment, so isolating it would wrongly hide a
 /// binding that really leaks. A bare-expression argument (`reactive(x)`) is
 /// skipped too — it cannot introduce a leaking binding.
-fn collect_shiny_deferred_scopes(
+fn collect_shiny_deferred_scope_at_node(
     node: Node,
     text: &str,
     line_index: &LineIndex,
@@ -3215,10 +3487,6 @@ fn collect_shiny_deferred_scopes(
                 events.push(braced_body_scope_event(value, line_index));
             }
         }
-    }
-
-    for child in node.children(&mut node.walk()) {
-        collect_shiny_deferred_scopes(child, text, line_index, shiny_in_play, local_defs, events);
     }
 }
 
@@ -3290,12 +3558,13 @@ fn call_is_shiny_deferred(
 /// spans the call itself and carries no parameters; it isolates assignments
 /// made in the iterator value expressions, which foreach evaluates in its own
 /// environment and so never leak — see [`foreach_arg_capture_scope_event`].
-fn push_foreach_iterator_scopes(
+fn push_foreach_iterator_scopes<'tree, 'text>(
     artifacts: &mut ScopeArtifacts,
-    root: Node,
-    content: &str,
+    root: Node<'tree>,
+    content: &'text str,
     line_index: &LineIndex,
     uri: &Url,
+    capture_bindings: &mut LazyStaticBindings<'tree, 'text>,
 ) {
     // Cheap pre-filter: every recognized execution operator (`%do%`, `%dopar%`,
     // `%dorng%`, `%dofuture%`) starts with `%do`, so one substring check covers
@@ -3304,13 +3573,16 @@ fn push_foreach_iterator_scopes(
     if !content.contains("%do") {
         return;
     }
-    collect_foreach_iterator_scopes(root, content, line_index, uri, &mut artifacts.timeline);
+    let events = &mut artifacts.timeline;
+    visit_runtime_reachable_scope_syntax(root, content, capture_bindings, &mut |node| {
+        collect_foreach_iterator_scope_at_node(node, content, line_index, uri, events);
+    });
 }
 
 /// Walk `node`, appending a `FunctionScope` event for each `foreach(...)` call
 /// of every recognized foreach execution expression. Each event carries that
 /// call's iterator symbols as parameters.
-fn collect_foreach_iterator_scopes(
+fn collect_foreach_iterator_scope_at_node(
     node: Node,
     text: &str,
     line_index: &LineIndex,
@@ -3338,9 +3610,6 @@ fn collect_foreach_iterator_scopes(
                 group, end_line, end_column, line_index, uri,
             ));
         }
-    }
-    for child in node.children(&mut node.walk()) {
-        collect_foreach_iterator_scopes(child, text, line_index, uri, events);
     }
 }
 
@@ -3563,70 +3832,65 @@ fn extract_parameter_symbol(
     None
 }
 
-/// Extract definition from assign("name", value) calls.
-/// Only handles string literal names per Requirement 17.4.
-fn try_extract_assign_call(node: Node, line_index: &LineIndex, uri: &Url) -> Option<ScopedSymbol> {
-    // Get function name
+/// Parse one trusted bare/base `assign()` call, extracting both its static
+/// binding and destination from the shared strict formal match.
+fn try_extract_assign_call(
+    node: Node,
+    line_index: &LineIndex,
+    uri: &Url,
+    capture_bindings: &mut LazyStaticBindings,
+) -> Option<(ScopedSymbol, CaptureEvaluationFrame)> {
     let func_node = node.child_by_field_name("function")?;
-    let func_name = node_text(func_node, line_index.text);
-
-    if func_name != "assign" {
-        return None;
-    }
-
-    // Get arguments
-    let args_node = node.child_by_field_name("arguments")?;
-
-    // Find the first argument (the name)
-    let mut name_arg = None;
-    for child in args_node.children(&mut args_node.walk()) {
-        if child.kind() == "argument" {
-            // Check if it's a named argument
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let arg_name = node_text(name_node, line_index.text);
-                if arg_name == "x" {
-                    // This is the name argument
-                    name_arg = child.child_by_field_name("value");
-                    break;
-                }
-            } else {
-                // Positional argument - first one is the name
-                name_arg = child.child_by_field_name("value");
-                break;
-            }
+    let is_assign = match func_node.kind() {
+        "identifier" => node_text(func_node, line_index.text) == "assign",
+        "namespace_operator" => {
+            func_node
+                .child_by_field_name("lhs")
+                .is_some_and(|lhs| node_text(lhs, line_index.text) == "base")
+                && func_node
+                    .child_by_field_name("rhs")
+                    .is_some_and(|rhs| node_text(rhs, line_index.text) == "assign")
         }
-    }
-
-    let name_node = name_arg?;
-
-    // Only handle string literals
-    if name_node.kind() != "string" {
+        _ => false,
+    };
+    if !is_assign {
         return None;
     }
 
-    // Extract the string content (remove quotes)
-    let name_text = node_text(name_node, line_index.text);
-    let name_str = name_text.trim_matches(|c| c == '"' || c == '\'');
+    let args_node = node.child_by_field_name("arguments")?;
+    let deferred_use = !super::binding::is_known_immediate_context(node);
+    let bindings = capture_bindings.get();
+    let bare_globalenv_trusted =
+        !bindings.named_alias_may_shadow_at("globalenv", node, deferred_use);
+    let dot_global_env_trusted =
+        !bindings.named_alias_may_shadow_at(".GlobalEnv", node, deferred_use);
+    let resolved = super::binding::resolve_assign_arguments(
+        args_node,
+        line_index.text,
+        bare_globalenv_trusted,
+        dot_global_env_trusted,
+    )?;
 
+    // Only handle plain string literal names per Requirement 17.4.
+    let name_str = super::binding::extract_plain_string(resolved.name, line_index.text)?;
     if name_str.is_empty() {
         return None;
     }
 
-    // Get position with UTF-16 column
     let start = node.start_position();
     let line_text = line_index.get_line(start.row);
     let column = byte_offset_to_utf16_column(line_text, start.column);
-
-    Some(ScopedSymbol {
-        name: Arc::from(name_str),
+    let symbol = ScopedSymbol {
+        name: Arc::from(name_str.as_str()),
         kind: SymbolKind::Variable,
         source_uri: uri.clone(),
         defined_line: start.row as u32,
         defined_column: column,
-        defined_end_column: column + crate::utf16::utf16_len(name_str),
+        defined_end_column: column + crate::utf16::utf16_len(name_str.as_str()),
         signature: None,
         is_declared: false,
-    })
+    };
+    Some((symbol, resolved.destination))
 }
 
 /// Extract the symbol name bound by a `delayedAssign("name", expr)` call.
@@ -4743,7 +5007,11 @@ pub fn live_top_level_exports(artifacts: &ScopeArtifacts) -> std::collections::H
             } => {
                 live.insert(symbol.name.to_string());
             }
-            ScopeEvent::Declaration { symbol, .. } => {
+            ScopeEvent::Declaration {
+                symbol,
+                function_scope: None,
+                ..
+            } => {
                 live.insert(symbol.name.to_string());
             }
             ScopeEvent::Removal {
@@ -4838,9 +5106,11 @@ fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<DataCallInfo> {
 
 /// Extract declaration `(name, line)` pairs from a finalized timeline.
 ///
-/// `ScopeEvent::Declaration` events — from `# raven: var` / `# raven: func`
-/// directives AND `exists("name")` calls — are always file-level, so every one
-/// is returned. Feeding them to [`compute_interface_hash`] makes cross-file
+/// Only declarations with `function_scope = None` are returned. Directives and
+/// ordinary `exists("name")` declarations retain their established file-level
+/// semantics; a declaration evaluated by a capture inside a runtime function is
+/// function-local and must not enter the cross-file interface. Feeding the
+/// top-level declarations to [`compute_interface_hash`] makes cross-file
 /// revalidation fire when a declaration is added / removed / moved EVEN WHEN a
 /// real definition shadows it in `exported_interface` (so the declaration would
 /// not otherwise alter the hashed interface). This closes the gap for `exists()`
@@ -4852,7 +5122,13 @@ fn extract_top_level_data_loads(timeline: &[ScopeEvent]) -> Vec<DataCallInfo> {
 fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32)> {
     let mut out = Vec::new();
     for event in timeline {
-        if let ScopeEvent::Declaration { symbol, line, .. } = event {
+        if let ScopeEvent::Declaration {
+            symbol,
+            line,
+            function_scope: None,
+            ..
+        } = event
+        {
             out.push((symbol.name.clone(), *line));
         }
     }
@@ -4897,7 +5173,10 @@ fn extract_top_level_declarations(timeline: &[ScopeEvent]) -> Vec<(Arc<str>, u32
 /// `# raven: nse` directive edit in any connected file revalidates dependents —
 /// see the hashing site), `top_level_removals`, `data_loads`, and
 /// `declarations` (the `(name, line)` pairs of all timeline `Declaration`
-/// events — see [`extract_top_level_declarations`]).
+/// events — see [`extract_top_level_declarations`]), and `sources` (including
+/// precise locality, so `CurrentFrame` ↔ `NonInheriting` changes invalidate
+/// dependent and standalone-scope caches even though the compatibility `local`
+/// boolean remains `true` in both cases).
 /// Extract `(package, line, column, function_scope)` for every `PackageLoad`
 /// timeline event, for inclusion in [`compute_interface_hash`]. Both position AND
 /// function scope are preserved (unlike a bare name set) because a
@@ -4919,6 +5198,7 @@ fn extract_package_load_positions(timeline: &[ScopeEvent]) -> Vec<PackageLoadKey
                 line,
                 column,
                 function_scope,
+                ..
             } => Some((package.clone(), *line, *column, *function_scope)),
             _ => None,
         })
@@ -4934,6 +5214,7 @@ fn compute_interface_hash(
     top_level_removals: &[TopLevelRemoval<'_>],
     data_loads: &[DataCallInfo],
     declarations: &[(Arc<str>, u32)],
+    sources: &[ForwardSource],
     standalone: bool,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -5048,6 +5329,25 @@ fn compute_interface_hash(
     for (name, line) in sorted_declarations {
         name.hash(&mut hasher);
         line.hash(&mut hasher);
+    }
+
+    // Source edges affect the resolved interface of this file even when its own
+    // definitions do not change. In particular, CurrentFrame and NonInheriting
+    // both serialize `local = true` through the compatibility field but differ
+    // in whether the child receives ordinary parent bindings. Hash the precise
+    // class and the other scope/path-relevant edge attributes deterministically.
+    let mut sorted_sources: Vec<&ForwardSource> = sources.iter().collect();
+    sorted_sources.sort_by_key(|source| (source.line, source.column, source.path.as_str()));
+    for source in sorted_sources {
+        source.path.hash(&mut hasher);
+        source.line.hash(&mut hasher);
+        source.column.hash(&mut hasher);
+        source.is_directive.hash(&mut hasher);
+        source.locality.hash(&mut hasher);
+        source.chdir.hash(&mut hasher);
+        source.is_sys_source.hash(&mut hasher);
+        source.is_function_scoped.hash(&mut hasher);
+        source.resolved_uri.hash(&mut hasher);
     }
 
     hasher.finish()
@@ -5719,19 +6019,51 @@ where
         return prefix;
     }
 
-    // Get edges where this file is the child (callee)
-    //
-    // If multiple edges exist from the same parent (e.g., AST-detected source()
-    // plus an explicit backward directive), prefer the most inclusive call site
-    // so that `line=eof` correctly includes symbols from later sources.
-    let mut parent_edge_indices: HashMap<Url, usize> = HashMap::new();
+    // Get eligible edges where this file is the child (callee). Eligibility must
+    // be applied before same-parent grouping: otherwise a later AST edge can
+    // displace an earlier backward directive and then itself be filtered out in
+    // Explicit mode (or Auto's per-file explicit opt-out).
+    let require_backward_directive = match backward_dep_mode {
+        super::config::BackwardDependencyMode::Explicit => true,
+        super::config::BackwardDependencyMode::Auto => {
+            get_metadata(uri).is_some_and(|m| !m.sourced_by.is_empty())
+        }
+    };
+
+    // Multiple real invocations from one parent are substitutable only when they
+    // use the same symbol-inheritance and package-flow policies. Top-level calls
+    // within one policy class are prefix-substitutable, so the latest call site
+    // subsumes earlier ones. Function-scoped CurrentFrame calls may belong to
+    // unrelated invocation frames, so retain each distinct call site. Across
+    // classes, combining a later prefix or package barrier with another call
+    // would invent an environment that never existed.
+    #[derive(PartialEq, Eq, Hash)]
+    struct ParentInvocationKey {
+        parent: Url,
+        declared_only: bool,
+        package_barrier: bool,
+        function_invocation: Option<(u32, u32)>,
+    }
+    let mut parent_edge_indices: HashMap<ParentInvocationKey, usize> = HashMap::new();
     let mut parent_edges: Vec<&super::dependency::DependencyEdge> = Vec::new();
     for edge in graph.get_dependents(uri) {
-        if edge.non_lending {
+        if edge.non_lending || (require_backward_directive && !edge.is_backward_directive) {
             continue;
         }
-        let entry = parent_edge_indices.get(&edge.from).copied();
-        match entry {
+
+        let inheritance_class = edge.uses_declared_only_parent_inheritance();
+        let package_barrier = edge.locality == super::types::SourceLocality::NonInheriting;
+        let function_invocation = edge.is_function_scoped.then_some((
+            edge.call_site_line.unwrap_or(u32::MAX),
+            edge.call_site_column.unwrap_or(u32::MAX),
+        ));
+        let key = ParentInvocationKey {
+            parent: edge.from.clone(),
+            declared_only: inheritance_class,
+            package_barrier,
+            function_invocation,
+        };
+        match parent_edge_indices.get(&key).copied() {
             Some(existing_index) => {
                 let existing = parent_edges[existing_index];
                 // None means "call site couldn't be resolved"; u32::MAX makes
@@ -5749,10 +6081,7 @@ where
                 let should_replace = if candidate_call_site > existing_call_site {
                     true
                 } else if candidate_call_site == existing_call_site {
-                    if edge.local != existing.local {
-                        // Prefer non-local edge (more inclusive)
-                        !edge.local
-                    } else if edge.is_backward_directive != existing.is_backward_directive {
+                    if edge.is_backward_directive != existing.is_backward_directive {
                         edge.is_backward_directive
                     } else if edge.is_directive != existing.is_directive {
                         edge.is_directive
@@ -5768,28 +6097,8 @@ where
                 }
             }
             None => {
-                parent_edge_indices.insert(edge.from.clone(), parent_edges.len());
+                parent_edge_indices.insert(key, parent_edges.len());
                 parent_edges.push(edge);
-            }
-        }
-    }
-
-    // Filter backward edges based on the backward dependency mode.
-    //
-    // - Explicit: Only use backward-directive edges (edges created from
-    //   `# raven: sourced-by` directives). Forward-created backward entries from
-    //   the workspace scan are ignored.
-    // - Auto: Use all backward edges, UNLESS the file has explicit backward
-    //   directives — then only use those (per-file opt-out).
-    match backward_dep_mode {
-        super::config::BackwardDependencyMode::Explicit => {
-            parent_edges.retain(|e| e.is_backward_directive);
-        }
-        super::config::BackwardDependencyMode::Auto => {
-            let file_has_backward_directives =
-                get_metadata(uri).is_some_and(|m| !m.sourced_by.is_empty());
-            if file_has_backward_directives {
-                parent_edges.retain(|e| e.is_backward_directive);
             }
         }
     }
@@ -5805,36 +6114,18 @@ where
         let parent_meta = get_metadata(&edge.from);
 
         // Determine if this edge applies the declared-only inheritance policy.
-        // `local = TRUE` / a non-global `sys.source` evaluate the child in the
-        // *caller's* environment (R `?source`): at top level that env is
-        // `.GlobalEnv`, so the child sees ALL of the parent's prior top-level
-        // bindings — identical to `local = FALSE` for backward inheritance. Only
-        // a `local = TRUE` call sited *inside a function*, or a `sys.source` into
-        // a non-global env, binds the child to a frame whose locals must not be
-        // modeled as global inheritance.
+        // Proven `CurrentFrame` destinations inherit ordinary caller bindings
+        // through the call frame at both top level and inside functions.
+        // `NonInheriting` remains declared-only: an unknown/environment-valued
+        // `local` target and a non-global `sys.source` still form dependency
+        // edges, but Raven cannot soundly lend ordinary caller bindings into that
+        // external environment.
         //
-        // Issue #476: the old logic treated every `local = TRUE` edge as
-        // declared-only, dropping regular top-level symbols (e.g. a hub that
-        // `source()`s helpers and then `source("report.R", local = TRUE)` — the
-        // report could not see the helpers). We now restrict the declared-only
-        // policy to function-scoped local calls, matching R's environment rules.
-        //
-        // Both `is_function_scoped` and `sys_source_global_env` are carried on
-        // the edge (folded into edge equality for the #483 cache), so read them
-        // directly: a single source of truth with `edge_revision`, cheaper than
-        // re-scanning `parent_meta.sources`, and correct even with two
-        // `sys.source` calls (one global, one not) on the same line — each call's
-        // edge carries its own flag.
-        let is_local_scoped = if edge.local {
-            // Top-level local=TRUE inherits like local=FALSE; only a
-            // function-scoped local source binds to a non-global frame.
-            edge.is_function_scoped
-        } else if edge.is_sys_source {
-            // A non-global sys.source (envir != globalenv) is declared-only.
-            !edge.sys_source_global_env
-        } else {
-            false
-        };
+        // The three-way locality is carried on the edge and folded into edge
+        // identity, so CurrentFrame <-> NonInheriting edits at a fixed call site
+        // bump the graph revision and revalidate dependents.
+        let declared_only_parent = edge.uses_declared_only_parent_inheritance();
+        let package_barrier = edge.locality == super::types::SourceLocality::NonInheriting;
 
         // Check if we would exceed max depth
         if current_depth + 1 >= max_depth {
@@ -5918,12 +6209,10 @@ where
             forward_child_memo,
         );
 
-        // Merge parent symbols (they are available at the START of this file)
-        // For function-scoped local edges only (`is_local_scoped`), inherit just
-        // declared symbols — the child binds to a function frame, not the parent's
-        // globals (declarations describe symbol existence, not export behavior).
-        // Top-level local=TRUE inherits all symbols (see `is_local_scoped` above,
-        // issue #476).
+        // Merge parent symbols (they are available at the START of this file).
+        // NonInheriting destinations receive declaration facts only. Global and
+        // proven CurrentFrame calls inherit ordinary bindings available through
+        // the corresponding global/call environment.
         //
         // Filter out symbols whose `source_uri` is the current file: those
         // are *our own* bindings and their visibility at the query position
@@ -5942,8 +6231,8 @@ where
             if symbol.source_uri == *uri {
                 continue;
             }
-            if is_local_scoped {
-                // For local-scoped edges, only inherit declared symbols
+            if declared_only_parent {
+                // Declared-only destinations inherit declaration facts only.
                 if symbol.is_declared {
                     prefix.symbols.entry(name).or_insert(symbol);
                 }
@@ -5959,6 +6248,13 @@ where
         );
         prefix.depth_exceeded.extend(parent_scope.depth_exceeded);
 
+        // NonInheriting destinations are a hard package barrier: unlike a
+        // function-scoped CurrentFrame edge, their external/unknown environment
+        // cannot soundly receive direct, inherited, or earlier-sibling packages.
+        if package_barrier {
+            continue;
+        }
+
         // Requirements 5.1, 5.2, 5.3: Propagate PackageLoad events from parent files
         // Collect packages loaded in parent before the source() call site
         // These packages are available in the child file from position (0, 0)
@@ -5970,6 +6266,12 @@ where
             (call_site_line, call_site_col)
         };
         if let Some(parent_artifacts) = get_artifacts(&edge.from) {
+            // EOF widens the package-position cutoff for late binding, but the
+            // invocation-frame compatibility check must use the real source call
+            // site rather than the EOF sentinel.
+            let call_site_scope = parent_artifacts
+                .function_scope_tree
+                .query_innermost(Position::new(call_site_line, call_site_col));
             for (i, event) in parent_artifacts.timeline.iter().enumerate() {
                 if i & 63 == 0 && is_cancelled() {
                     return prefix;
@@ -5979,6 +6281,7 @@ where
                     column: pkg_col,
                     package,
                     function_scope,
+                    ..
                 } = event
                 {
                     // Only propagate packages loaded before the effective call site
@@ -5991,13 +6294,7 @@ where
                             None => true, // Global package load - always propagate
                             Some(pkg_scope) => {
                                 // Function-scoped package load - only propagate if the source() call
-                                // is within the same function scope or nested inside it
-                                let call_site_scope = parent_artifacts
-                                    .function_scope_tree
-                                    .query_innermost(Position::new(
-                                        effective_call_site_line,
-                                        effective_call_site_col,
-                                    ));
+                                // is within the same function scope or nested inside it.
                                 is_same_or_descendant_function_scope(call_site_scope, *pkg_scope)
                             }
                         };
@@ -6490,6 +6787,7 @@ where
                 column: src_col,
                 source,
                 function_scope,
+                ..
             } => {
                 // Include source() if before position, or if hoisting and it's a global source()
                 let passes_position = (*src_line, *src_col) < (line, column);
@@ -6574,6 +6872,7 @@ where
                                 column: pkg_col,
                                 package,
                                 function_scope,
+                                ..
                             } = pkg_event
                             {
                                 // Only include packages loaded before the source() call
@@ -6611,15 +6910,19 @@ where
                         // "undefined" inside the standalone file's contribution.
                         let child_is_standalone =
                             get_metadata(&child_uri).is_some_and(|m| m.standalone);
+                        let packages_may_cross =
+                            source.locality != super::types::SourceLocality::NonInheriting;
                         let child_provider = if child_is_standalone {
                             None
                         } else {
                             data_alias_provider
                         };
-                        let empty_packages_for_standalone = HashSet::new();
+                        let empty_packages_for_child = HashSet::new();
                         let owned_packages: HashSet<String>;
-                        let packages_for_child: &HashSet<String> = if child_is_standalone {
-                            &empty_packages_for_standalone
+                        let packages_for_child: &HashSet<String> = if child_is_standalone
+                            || !packages_may_cross
+                        {
+                            &empty_packages_for_child
                         } else if extra_packages.is_empty() && scope.loaded_packages.is_empty() {
                             &scope.inherited_packages
                         } else {
@@ -6806,14 +7109,16 @@ where
                         // Packages loaded in the sourced file become available
                         // after the source() call. The same-file leak filter
                         // lives in `merge_child_source_packages`.
-                        merge_child_source_packages(
-                            &child_scope.loaded_packages,
-                            &child_scope.inherited_packages,
-                            &child_scope.package_origins,
-                            uri,
-                            &mut scope.loaded_packages,
-                            &mut scope.package_origins,
-                        );
+                        if packages_may_cross {
+                            merge_child_source_packages(
+                                &child_scope.loaded_packages,
+                                &child_scope.inherited_packages,
+                                &child_scope.package_origins,
+                                uri,
+                                &mut scope.loaded_packages,
+                                &mut scope.package_origins,
+                            );
+                        }
                     }
                 }
             }
@@ -6842,6 +7147,7 @@ where
                 column: rm_col,
                 symbols,
                 function_scope,
+                ..
             } => {
                 let passes_position = (*rm_line, *rm_col) < (line, column);
                 if passes_position || query_inside_function {
@@ -6867,6 +7173,7 @@ where
                 column: pkg_col,
                 package,
                 function_scope,
+                ..
             } => {
                 let passes_position = (*pkg_line, *pkg_col) <= (line, column);
                 if passes_position || query_inside_function {
@@ -6888,10 +7195,18 @@ where
                 line: decl_line,
                 column: decl_col,
                 symbol,
+                function_scope,
+                ..
             } => {
-                let passes_position = (*decl_line, *decl_col) <= (line, column);
-                if passes_position || query_inside_function {
-                    // Declared symbols are always global scope (not function-local)
+                if is_symbol_visible(
+                    *decl_line,
+                    *decl_col,
+                    *function_scope,
+                    &active_function_scopes,
+                    line,
+                    column,
+                    query_inside_function,
+                ) {
                     // Only insert if no real (non-declared) definition exists;
                     // among declared symbols, later ones win (timeline is sorted).
                     scope
@@ -6911,6 +7226,7 @@ where
                 stems,
                 package,
                 function_scope,
+                ..
             } => {
                 // Expand `data()` file-stem aliases to the dataset object names
                 // they bind (issue #429). Mirrors the PackageLoad arm above for
@@ -8164,6 +8480,7 @@ where
                 column: _,
                 symbols,
                 function_scope,
+                ..
             } => {
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
                     for sym_name in &symbols {
@@ -8178,6 +8495,7 @@ where
                 column: _,
                 package,
                 function_scope,
+                ..
             } => {
                 let queried_uri = self.queried_uri.clone();
                 if let Some(frame) = self.pick_frame_mut(function_scope) {
@@ -8190,6 +8508,7 @@ where
                 column: src_col,
                 source,
                 function_scope,
+                ..
             } => {
                 // Local-scoping rule: top-level local sources contribute
                 // nothing (mirrors `scope.rs:3458-3463`).
@@ -8235,26 +8554,26 @@ where
                 }
             }
             ScopeEvent::Declaration {
-                line: _,
-                column: _,
                 symbol,
+                function_scope,
+                ..
             } => {
-                // `# raven: var`/`# raven: func` declarations are always global.
-                let frame = &mut self.global_strict_frame;
-                // Mirror the recursive resolver's
-                // `entry().and_modify().or_insert_with()` semantics:
-                // existing real (non-declared) symbols win; among declared
-                // entries, last write wins (matches timeline order).
-                match frame.symbols.get_mut(&symbol.name) {
-                    Some(existing) if existing.is_declared => {
-                        *existing = symbol;
-                    }
-                    Some(_) => {
-                        // Real symbol already present — keep it.
-                    }
-                    None => {
-                        frame.removed_names.remove(&symbol.name);
-                        frame.symbols.insert(symbol.name.clone(), symbol);
+                if let Some(frame) = self.pick_frame_mut(function_scope) {
+                    // Mirror the recursive resolver's
+                    // `entry().and_modify().or_insert_with()` semantics:
+                    // existing real (non-declared) symbols win; among declared
+                    // entries, last write wins (matches timeline order).
+                    match frame.symbols.get_mut(&symbol.name) {
+                        Some(existing) if existing.is_declared => {
+                            *existing = symbol;
+                        }
+                        Some(_) => {
+                            // Real symbol already present — keep it.
+                        }
+                        None => {
+                            frame.removed_names.remove(&symbol.name);
+                            frame.symbols.insert(symbol.name.clone(), symbol);
+                        }
                     }
                 }
             }
@@ -8264,6 +8583,7 @@ where
                 stems,
                 package,
                 function_scope,
+                ..
             } => {
                 // Expand `data()` file-stem aliases to dataset object names
                 // (issue #429), mirroring the recursive resolver's DataLoad arm.
@@ -8726,6 +9046,7 @@ where
                 column: src_col,
                 source,
                 function_scope,
+                ..
             } => {
                 if function_scope.is_some() {
                     return;
@@ -8757,16 +9078,25 @@ where
                         .extend(origins);
                 }
             }
-            ScopeEvent::Declaration { symbol, .. } => match frame.symbols.get_mut(&symbol.name) {
-                Some(existing) if existing.is_declared => {
-                    *existing = symbol.clone();
+            ScopeEvent::Declaration {
+                symbol,
+                function_scope,
+                ..
+            } => {
+                if function_scope.is_some() {
+                    return;
                 }
-                Some(_) => {}
-                None => {
-                    frame.removed_names.remove(&symbol.name);
-                    frame.symbols.insert(symbol.name.clone(), symbol.clone());
+                match frame.symbols.get_mut(&symbol.name) {
+                    Some(existing) if existing.is_declared => {
+                        *existing = symbol.clone();
+                    }
+                    Some(_) => {}
+                    None => {
+                        frame.removed_names.remove(&symbol.name);
+                        frame.symbols.insert(symbol.name.clone(), symbol.clone());
+                    }
                 }
-            },
+            }
             ScopeEvent::DataLoad {
                 stems,
                 package,
@@ -8989,14 +9319,16 @@ where
 
         // Same-file leak filter for packages lives in
         // `merge_child_source_packages`.
-        merge_child_source_packages(
-            &child_scope.loaded_packages,
-            &child_scope.inherited_packages,
-            &child_scope.package_origins,
-            self.queried_uri,
-            &mut contrib.packages,
-            &mut contrib.package_origins,
-        );
+        if source.locality != super::types::SourceLocality::NonInheriting {
+            merge_child_source_packages(
+                &child_scope.loaded_packages,
+                &child_scope.inherited_packages,
+                &child_scope.package_origins,
+                self.queried_uri,
+                &mut contrib.packages,
+                &mut contrib.package_origins,
+            );
+        }
 
         contrib
     }
@@ -9226,6 +9558,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::SourceLocality;
     use super::*;
     use tree_sitter::Parser;
 
@@ -9450,10 +9783,8 @@ mod tests {
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -10078,6 +10409,19 @@ mod tests {
     }
 
     #[test]
+    fn interface_hash_distinguishes_current_frame_from_non_inheriting_source() {
+        let current = "source(\"child.R\", local = TRUE)";
+        let unknown = "source(\"child.R\", local = flag)";
+        let current_artifacts = compute_artifacts(&test_uri(), &parse_r(current), current);
+        let unknown_artifacts = compute_artifacts(&test_uri(), &parse_r(unknown), unknown);
+
+        assert_ne!(
+            current_artifacts.interface_hash, unknown_artifacts.interface_hash,
+            "the precise locality must invalidate interfaces even though both legacy local booleans are true"
+        );
+    }
+
+    #[test]
     fn test_interface_hash_changes_when_top_level_rm_added() {
         // Adding a top-level `rm(y)` must change interface_hash because it
         // alters which symbols are visible at downstream `source()` call
@@ -10207,6 +10551,33 @@ mod tests {
         assert_eq!(artifacts.exported_interface.len(), 1);
         let symbol = artifacts.exported_interface.get("my_var").unwrap();
         assert_eq!(symbol.kind, SymbolKind::Variable);
+    }
+
+    #[test]
+    fn assign_string_global_environment_is_not_a_global_definition() {
+        for code in [
+            r#"assign("string_env", 1, envir = ".GlobalEnv")"#,
+            r#"assign("raw_env", 1, envir = r"(.GlobalEnv)")"#,
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            assert!(
+                artifacts.exported_interface.is_empty(),
+                "{code}: {artifacts:?}"
+            );
+        }
+
+        for code in [
+            r#"assign("dot_env", 1, envir = .GlobalEnv)"#,
+            r#"assign("call_env", 1, envir = globalenv())"#,
+            r#"assign("qualified_env", 1, envir = base::globalenv())"#,
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            assert_eq!(
+                artifacts.exported_interface.len(),
+                1,
+                "{code}: {artifacts:?}"
+            );
+        }
     }
 
     #[test]
@@ -10588,6 +10959,225 @@ mod tests {
         );
     }
 
+    #[test]
+    fn backward_mode_filters_before_same_parent_invocation_grouping() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{
+            BackwardDirective, CallSiteSpec, CrossFileMetadata, ForwardSource,
+        };
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let root = Url::parse("file:///project").unwrap();
+        let parent_code = "early <- 1\nmiddle <- 2\nsource(\"child.R\")\nlate <- 3";
+        let child_code = "child <- 1";
+        let parent_artifacts = compute_artifacts(&parent_uri, &parse_r(parent_code), parent_code);
+        let child_artifacts = compute_artifacts(&child_uri, &parse_r(child_code), child_code);
+        let child_meta = CrossFileMetadata {
+            sourced_by: vec![BackwardDirective {
+                path: "parent.R".to_string(),
+                call_site: CallSiteSpec::Line(0),
+                directive_line: 0,
+            }],
+            ..Default::default()
+        };
+        let parent_meta = CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "child.R".to_string(),
+                line: 2,
+                column: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&child_uri, &child_meta, Some(&root), |uri| {
+            (uri == &parent_uri).then(|| parent_code.to_string())
+        });
+        graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+
+        let get_artifacts = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_meta.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_meta.clone()))
+            } else {
+                None
+            }
+        };
+        for mode in [
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+        ] {
+            let scope = scope_at_position_with_graph(
+                &child_uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&root),
+                10,
+                &HashSet::new(),
+                false,
+                mode,
+                &|| false,
+                None,
+                None,
+            );
+            assert!(scope.symbols.contains_key("early"), "{mode:?}: {scope:?}");
+            assert!(!scope.symbols.contains_key("middle"), "{mode:?}: {scope:?}");
+            assert!(!scope.symbols.contains_key("late"), "{mode:?}: {scope:?}");
+        }
+    }
+
+    #[test]
+    fn same_parent_invocation_classes_preserve_real_call_site_prefixes() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{
+            CrossFileMetadata, DeclaredSymbol, ForwardSource, SourceLocality,
+        };
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let root = Url::parse("file:///project").unwrap();
+        let parent_code = "early <- 1\n# global invocation\nmiddle <- 2\n# raven: var declared_middle\n# external invocation\nlate <- 3";
+        let child_code = "child <- 1";
+        let parent_meta = CrossFileMetadata {
+            sources: vec![
+                ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 1,
+                    column: 0,
+                    is_directive: true,
+                    locality: SourceLocality::Global,
+                    ..Default::default()
+                },
+                ForwardSource {
+                    path: "child.R".to_string(),
+                    line: 4,
+                    column: 0,
+                    is_directive: true,
+                    locality: SourceLocality::NonInheriting,
+                    ..Default::default()
+                },
+            ],
+            declared_variables: vec![DeclaredSymbol {
+                name: "declared_middle".to_string(),
+                line: 3,
+                is_function: false,
+                formals: None,
+            }],
+            ..Default::default()
+        };
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parse_r(parent_code),
+            parent_code,
+            Some(&parent_meta),
+        );
+        let child_artifacts = compute_artifacts(&child_uri, &parse_r(child_code), child_code);
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+        let get_artifacts = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| (uri == &parent_uri).then(|| Arc::new(parent_meta.clone()));
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(scope.symbols.contains_key("early"), "{scope:?}");
+        assert!(!scope.symbols.contains_key("middle"), "{scope:?}");
+        assert!(scope.symbols.contains_key("declared_middle"), "{scope:?}");
+        assert!(!scope.symbols.contains_key("late"), "{scope:?}");
+    }
+
+    #[test]
+    fn same_parent_function_invocations_keep_distinct_runtime_frames() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let root = Url::parse("file:///project").unwrap();
+        let parent_code = r#"
+f <- function() {
+  from_f <- 1
+  source("child.R", local = TRUE)
+}
+g <- function() {
+  from_g <- 1
+  source("child.R", local = TRUE)
+}
+"#;
+        let child_code = "child <- 1";
+        let parent_meta = crate::cross_file::extract_metadata(parent_code);
+        let parent_artifacts = compute_artifacts_with_metadata(
+            &parent_uri,
+            &parse_r(parent_code),
+            parent_code,
+            Some(&parent_meta),
+        );
+        let child_artifacts = compute_artifacts(&child_uri, &parse_r(child_code), child_code);
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+        let get_artifacts = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(Arc::new(parent_artifacts.clone()))
+            } else if uri == &child_uri {
+                Some(Arc::new(child_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| (uri == &parent_uri).then(|| Arc::new(parent_meta.clone()));
+        let scope = scope_at_position_with_graph(
+            &child_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+        assert!(scope.symbols.contains_key("from_f"), "{scope:?}");
+        assert!(scope.symbols.contains_key("from_g"), "{scope:?}");
+    }
+
     /// Issue #479 knob 1: a `# raven: standalone` callee is resolved in
     /// isolation — it does NOT inherit symbols from the files that source it.
     /// Without the directive the callee sees the parent's pre-call bindings;
@@ -10615,7 +11205,6 @@ mod tests {
                 path: "child.R".to_string(),
                 line: 1,
                 column: 0,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -11282,11 +11871,11 @@ mod tests {
 
     /// Regression (confirmed by Codex): two `sys.source()` calls on ONE line —
     /// one into `globalenv()`, one into `new.env()` — must each use their OWN
-    /// envir to decide backward inheritance. `parent_prefix_at` reads
-    /// `edge.sys_source_global_env` per edge, so the non-global child does NOT
-    /// inherit the parent's top-level symbols while the global one does. (The
-    /// earlier line-only metadata scan let a global `sys.source` on the same line
-    /// wrongly classify a non-global call as global, suppressing diagnostics.)
+    /// envir to decide backward inheritance. `parent_prefix_at` reads each
+    /// edge's precise `SourceLocality`, so the non-global child does NOT inherit
+    /// the parent's top-level symbols while the global one does. (The earlier
+    /// line-only metadata scan let a global `sys.source` on the same line wrongly
+    /// classify a non-global call as global, suppressing diagnostics.)
     #[test]
     fn sys_source_two_calls_on_one_line_use_per_call_envir() {
         let root = Url::parse("file:///proj").unwrap();
@@ -11343,14 +11932,11 @@ mod tests {
     /// (confirmed by Codex): whether a `sys.source()` callee contributes its
     /// top-level symbols depends on its `envir` argument — `globalenv()`
     /// contributes (like `source()`), a non-global env does NOT (see
-    /// `should_apply_local_scoping`). That flag (`sys_source_global_env`) is
-    /// absent from `compute_interface_hash`, so toggling
-    /// `globalenv()` ↔ `new.env()` at a FIXED call site leaves the closure
-    /// fingerprint unchanged. The fix carries `sys_source_global_env` on the
-    /// `DependencyEdge` (folded into full-edge equality), so the toggle bumps
-    /// `edge_revision` — which IS in the cache key — and the stale isolated
-    /// scope is not served. Without the edge field this test would hit the
-    /// pre-toggle entry and still see `leaf_fn`.
+    /// `should_apply_local_scoping`). Precise `SourceLocality` is carried on the
+    /// `DependencyEdge`, folded into full-edge equality, and included in the
+    /// source-aware interface hash. Toggling `globalenv()` ↔ `new.env()` at a
+    /// fixed call site therefore bumps `edge_revision` and the closure
+    /// fingerprint, either of which prevents a stale isolated-scope cache hit.
     #[test]
     fn standalone_cache_invalidates_on_sys_source_envir_toggle() {
         use crate::cross_file::standalone_cache::StandaloneScopeCache;
@@ -11842,10 +12428,9 @@ mod tests {
             line: 0,
             column: 0,
             is_directive: false,
-            local: false, // local=FALSE
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: false,
+            locality: SourceLocality::Global,
             ..Default::default()
         };
 
@@ -11870,7 +12455,10 @@ mod tests {
             .collect();
 
         assert_eq!(source_events.len(), 1, "Should have one source event");
-        assert!(!source_events[0].local, "Source should have local=FALSE");
+        assert!(
+            source_events[0].locality == SourceLocality::Global,
+            "Source should have local=FALSE"
+        );
         assert!(
             source_events[0].inherits_symbols(),
             "Source should inherit symbols"
@@ -11887,10 +12475,9 @@ mod tests {
             line: 0,
             column: 0,
             is_directive: false,
-            local: true, // local=TRUE
+            locality: crate::cross_file::types::SourceLocality::CurrentFrame,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: false,
             ..Default::default()
         };
 
@@ -11914,7 +12501,10 @@ mod tests {
             .collect();
 
         assert_eq!(source_events.len(), 1, "Should have one source event");
-        assert!(source_events[0].local, "Source should have local=TRUE");
+        assert!(
+            source_events[0].locality != SourceLocality::Global,
+            "Source should have local=TRUE"
+        );
     }
 
     #[test]
@@ -12145,7 +12735,7 @@ outside_var <- 2"#;
 
         assert_eq!(source_events.len(), 1, "Should have one source event");
         assert!(
-            !source_events[0].local,
+            source_events[0].locality == SourceLocality::Global,
             "Source should default to local=FALSE"
         );
         assert!(
@@ -12181,10 +12771,8 @@ outside_var <- 2"#;
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -12413,10 +13001,8 @@ outside_var <- 2"#;
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -12474,8 +13060,8 @@ outside_var <- 2"#;
         // Issue #476: a TOP-LEVEL source(local=TRUE) evaluates the child in
         // `.GlobalEnv`, so BOTH the parent's declared symbols AND its regular
         // top-level bindings are visible in the child — identical to local=FALSE.
-        // (The declared-only policy is retained only for function-scoped local=TRUE
-        // calls; see `test_auto_mode_function_scoped_local_true_does_not_inherit_parent_globals`.)
+        // Function-scoped CurrentFrame calls likewise inherit through their call
+        // frame; only NonInheriting destinations remain declared-only.
         // This test asserts both: declared_var (always inherited) and regular_var
         // (the load-bearing #476 behavior — would FAIL under the pre-fix code).
         use crate::cross_file::dependency::DependencyGraph;
@@ -12506,6 +13092,8 @@ outside_var <- 2"#;
                 signature: None,
                 is_declared: true,
             },
+            runtime_function_scope: RuntimeFunctionScope::Explicit(None),
+            function_scope: None,
         });
         // Re-sort timeline
         parent_artifacts.timeline.sort_by_key(|event| match event {
@@ -12535,10 +13123,9 @@ outside_var <- 2"#;
                 line: 2,
                 column: 0,
                 is_directive: false,
-                local: true, // local=TRUE
+                locality: crate::cross_file::types::SourceLocality::CurrentFrame,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: false,
                 ..Default::default()
             }],
             declared_variables: vec![DeclaredSymbol {
@@ -12572,8 +13159,8 @@ outside_var <- 2"#;
         // In the child file, BOTH declared_var and regular_var should be available.
         // Issue #476: a top-level source(local=TRUE) evaluates the child in
         // .GlobalEnv, so the parent's prior top-level bindings (regular AND declared)
-        // are visible — identical to local=FALSE. (The declared-only policy is
-        // retained only for function-scoped local=TRUE calls.)
+        // are visible — identical to local=FALSE. CurrentFrame calls inside
+        // functions inherit through the same call-frame chain.
         let scope = scope_at_position_with_graph(
             &child_uri,
             10,
@@ -12598,9 +13185,9 @@ outside_var <- 2"#;
         // Issue #476: a TOP-LEVEL `source(local = TRUE)` evaluates the child in
         // the caller's environment, which at top level is `.GlobalEnv` (R
         // `?source`). The child therefore sees the parent's prior top-level
-        // bindings — regular AND declared — exactly like local=FALSE. (Only a
-        // `local = TRUE` call sited inside a function binds the child to a
-        // non-global frame; that case keeps the declared-only policy.)
+        // bindings — regular AND declared — exactly like local=FALSE. Inside a
+        // function, `local = TRUE` targets that call frame, which still inherits
+        // the enclosing top-level environment.
         assert!(
             scope.symbols.contains_key("regular_var"),
             "regular_var SHOULD be available from a top-level parent with local=TRUE (issue #476)"
@@ -12609,6 +13196,244 @@ outside_var <- 2"#;
             scope.symbols.contains_key("child_var"),
             "child_var should be available locally"
         );
+    }
+
+    #[test]
+    fn bquote_external_source_retains_dependency_without_inheritance_or_lending() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::{CrossFileMetadata, SourceLocality};
+
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let child_code = "child_only <- 2";
+        let child_artifacts = compute_artifacts(&child_uri, &parse_r(child_code), child_code);
+
+        let resolve_child = |source_call: &str| {
+            let parent_code =
+                format!("# raven: var declared_only\nparent_only <- 1\n{source_call}");
+            let parent_meta = crate::cross_file::extract_metadata(&parent_code);
+            let parent_artifacts = compute_artifacts_with_metadata(
+                &parent_uri,
+                &parse_r(&parent_code),
+                &parent_code,
+                Some(&parent_meta),
+            );
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+            let dependencies = graph.get_dependencies(&parent_uri);
+            assert_eq!(dependencies.len(), 1, "{parent_code}");
+            let edge_locality = dependencies[0].locality;
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else {
+                    None
+                }
+            };
+            let get_metadata = |uri: &Url| -> Option<Arc<CrossFileMetadata>> {
+                (uri == &parent_uri).then(|| Arc::new(parent_meta.clone()))
+            };
+            let child_scope = scope_at_position_with_graph(
+                &child_uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+            let parent_scope = scope_at_position_with_graph(
+                &parent_uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &HashSet::new(),
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Auto,
+                &|| false,
+                None,
+                None,
+            );
+            (edge_locality, child_scope, parent_scope)
+        };
+
+        let (locality, caller_child, caller_parent) =
+            resolve_child(r#"bquote(.(source("child.R", local = TRUE)), where = parent.frame())"#);
+        assert_eq!(locality, SourceLocality::CurrentFrame);
+        assert!(caller_child.symbols.contains_key("parent_only"));
+        assert!(caller_child.symbols.contains_key("declared_only"));
+        assert!(
+            !caller_parent.symbols.contains_key("child_only"),
+            "a caller-frame local source must not lend child bindings outward"
+        );
+
+        let (locality, external_child, external_parent) = resolve_child(
+            r#"env <- base::new.env(parent = base::emptyenv())
+base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
+        );
+        assert_eq!(locality, SourceLocality::NonInheriting);
+        assert!(external_child.symbols.contains_key("declared_only"));
+        assert!(
+            !external_child.symbols.contains_key("parent_only"),
+            "a source evaluated in an environment with an empty parent must not inherit ordinary parent bindings"
+        );
+        assert!(
+            !external_parent.symbols.contains_key("child_only"),
+            "an external capture frame must not lend child bindings outward"
+        );
+
+        let (locality, global_child, global_parent) =
+            resolve_child(r#"bquote(.(source("child.R", local = TRUE)), where = .GlobalEnv)"#);
+        assert_eq!(locality, SourceLocality::Global);
+        assert!(global_child.symbols.contains_key("parent_only"));
+        assert!(global_child.symbols.contains_key("declared_only"));
+        assert!(global_parent.symbols.contains_key("child_only"));
+    }
+
+    #[test]
+    fn source_locality_controls_direct_inherited_and_sibling_packages() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let root = Url::parse("file:///project").unwrap();
+        let ancestor_uri = Url::parse("file:///project/ancestor.R").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let sibling_uri = Url::parse("file:///project/sibling.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let grandchild_uri = Url::parse("file:///project/grandchild.R").unwrap();
+
+        let resolve = |source_call: &str| {
+            let ancestor_code = "library(ancestorpkg)\nsource(\"parent.R\")";
+            let parent_code = format!(
+                "# raven: var declared\nlibrary(directpkg)\nsource(\"sibling.R\")\n{source_call}"
+            );
+            let sibling_code = "library(siblingpkg)";
+            let child_code = "source(\"grandchild.R\")";
+            let grandchild_code = "grandchild_only <- 1";
+
+            let ancestor_meta = crate::cross_file::extract_metadata(ancestor_code);
+            let parent_meta = crate::cross_file::extract_metadata(&parent_code);
+            let child_meta = crate::cross_file::extract_metadata(child_code);
+            let ancestor_artifacts = compute_artifacts_with_metadata(
+                &ancestor_uri,
+                &parse_r(ancestor_code),
+                ancestor_code,
+                Some(&ancestor_meta),
+            );
+            let parent_artifacts = compute_artifacts_with_metadata(
+                &parent_uri,
+                &parse_r(&parent_code),
+                &parent_code,
+                Some(&parent_meta),
+            );
+            let sibling_artifacts =
+                compute_artifacts(&sibling_uri, &parse_r(sibling_code), sibling_code);
+            let child_artifacts = compute_artifacts_with_metadata(
+                &child_uri,
+                &parse_r(child_code),
+                child_code,
+                Some(&child_meta),
+            );
+            let grandchild_artifacts =
+                compute_artifacts(&grandchild_uri, &parse_r(grandchild_code), grandchild_code);
+
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&ancestor_uri, &ancestor_meta, Some(&root), |_| None);
+            graph.update_file(&parent_uri, &parent_meta, Some(&root), |_| None);
+            graph.update_file(&child_uri, &child_meta, Some(&root), |_| None);
+
+            let get_artifacts = |uri: &Url| -> Option<Arc<ScopeArtifacts>> {
+                if uri == &ancestor_uri {
+                    Some(Arc::new(ancestor_artifacts.clone()))
+                } else if uri == &parent_uri {
+                    Some(Arc::new(parent_artifacts.clone()))
+                } else if uri == &sibling_uri {
+                    Some(Arc::new(sibling_artifacts.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_artifacts.clone()))
+                } else if uri == &grandchild_uri {
+                    Some(Arc::new(grandchild_artifacts.clone()))
+                } else {
+                    None
+                }
+            };
+            let get_metadata = |uri: &Url| -> Option<Arc<CrossFileMetadata>> {
+                if uri == &ancestor_uri {
+                    Some(Arc::new(ancestor_meta.clone()))
+                } else if uri == &parent_uri {
+                    Some(Arc::new(parent_meta.clone()))
+                } else if uri == &child_uri {
+                    Some(Arc::new(child_meta.clone()))
+                } else {
+                    None
+                }
+            };
+            let query = |uri: &Url| {
+                scope_at_position_with_graph(
+                    uri,
+                    u32::MAX,
+                    u32::MAX,
+                    &get_artifacts,
+                    &get_metadata,
+                    &graph,
+                    Some(&root),
+                    10,
+                    &HashSet::new(),
+                    false,
+                    crate::cross_file::config::BackwardDependencyMode::Auto,
+                    &|| false,
+                    None,
+                    None,
+                )
+            };
+            (query(&child_uri), query(&grandchild_uri))
+        };
+
+        for source_call in [
+            r#"source("child.R")"#,
+            r#"bquote(.(source("child.R", local = TRUE)), where = parent.frame())"#,
+        ] {
+            let (child, grandchild) = resolve(source_call);
+            for scope in [&child, &grandchild] {
+                for package in ["ancestorpkg", "directpkg", "siblingpkg"] {
+                    assert!(
+                        scope.inherited_packages.contains(package)
+                            || scope.loaded_packages.contains(package),
+                        "{source_call}: missing {package}: {scope:?}"
+                    );
+                }
+            }
+            assert!(child.symbols.contains_key("declared"));
+        }
+
+        let (child, grandchild) = resolve(
+            r#"env <- base::new.env(parent = base::emptyenv())
+base::bquote(.(source("child.R", local = TRUE)), where = env)"#,
+        );
+        for scope in [&child, &grandchild] {
+            for package in ["ancestorpkg", "directpkg", "siblingpkg"] {
+                assert!(
+                    !scope.inherited_packages.contains(package)
+                        && !scope.loaded_packages.contains(package),
+                    "NonInheriting leaked {package}: {scope:?}"
+                );
+            }
+        }
+        assert!(child.symbols.contains_key("declared"));
     }
 
     #[test]
@@ -12642,6 +13467,8 @@ outside_var <- 2"#;
                 signature: None,
                 is_declared: true,
             },
+            runtime_function_scope: RuntimeFunctionScope::Explicit(None),
+            function_scope: None,
         });
         parent_artifacts.timeline.push(ScopeEvent::Declaration {
             line: 2,
@@ -12656,6 +13483,8 @@ outside_var <- 2"#;
                 signature: None,
                 is_declared: true,
             },
+            runtime_function_scope: RuntimeFunctionScope::Explicit(None),
+            function_scope: None,
         });
         // Re-sort timeline
         parent_artifacts.timeline.sort_by_key(|event| match event {
@@ -12685,10 +13514,8 @@ outside_var <- 2"#;
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             declared_variables: vec![
@@ -12789,10 +13616,8 @@ outside_var <- 2"#;
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -12803,10 +13628,8 @@ outside_var <- 2"#;
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -12900,10 +13723,8 @@ outside_var <- 2"#;
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: true, // chdir=TRUE
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -12914,10 +13735,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -13012,10 +13831,8 @@ outside_var <- 2"#;
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -13408,6 +14225,66 @@ outside_var <- 2"#;
         assert!(scope_in_body.symbols.contains_key("y"));
     }
 
+    /// Default expressions are inside the function invocation frame, so normal
+    /// scope queries preserve R's late binding and can see a later global
+    /// source(). The used-before-source diagnostic applies its narrower ordering
+    /// policy in handlers rather than weakening this scope invariant.
+    #[test]
+    fn default_parameter_scope_late_binds_later_global_source() {
+        use crate::cross_file::dependency::DependencyGraph;
+
+        let root = Url::parse("file:///workspace").unwrap();
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helper_uri = Url::parse("file:///workspace/helper.R").unwrap();
+        let main_code = "f <- function(a = x) a\nsource(\"helper.R\")\n";
+        let helper_code = "x <- 42\n";
+
+        let main_artifacts = compute_artifacts(&main_uri, &parse_r(main_code), main_code);
+        let helper_artifacts = compute_artifacts(&helper_uri, &parse_r(helper_code), helper_code);
+        let main_meta = crate::cross_file::extract_metadata(main_code);
+        let mut graph = DependencyGraph::new();
+        graph.update_file(&main_uri, &main_meta, Some(&root), |_| None);
+
+        let get_artifacts = |uri: &Url| {
+            if uri == &main_uri {
+                Some(Arc::new(main_artifacts.clone()))
+            } else if uri == &helper_uri {
+                Some(Arc::new(helper_artifacts.clone()))
+            } else {
+                None
+            }
+        };
+        let get_metadata =
+            |uri: &Url| (uri == &main_uri).then(|| std::sync::Arc::new(main_meta.clone()));
+
+        let scope = scope_at_position_with_graph(
+            &main_uri,
+            0,
+            18,
+            &get_artifacts,
+            &get_metadata,
+            &graph,
+            Some(&root),
+            10,
+            &HashSet::new(),
+            true,
+            crate::cross_file::config::BackwardDependencyMode::Auto,
+            &|| false,
+            None,
+            None,
+        );
+
+        assert!(
+            scope.symbols.contains_key("a"),
+            "all formals should be bound while evaluating a default"
+        );
+        assert_eq!(
+            scope.symbols.get("x").map(|symbol| &symbol.source_uri),
+            Some(&helper_uri),
+            "normal scope resolution should retain late-bound global source visibility"
+        );
+    }
+
     #[test]
     fn test_function_with_ellipsis_parameter() {
         let code = "my_func <- function(x, ...) { list(x, ...) }";
@@ -13696,6 +14573,7 @@ outside_var <- 2"#;
             line: 5,
             column: 0,
             symbols: vec!["x".to_string()],
+            runtime_function_scope: RuntimeFunctionScope::Lexical,
             function_scope: None,
         };
 
@@ -13722,6 +14600,7 @@ outside_var <- 2"#;
             line: 10,
             column: 4,
             symbols: vec!["x".to_string(), "y".to_string(), "z".to_string()],
+            runtime_function_scope: RuntimeFunctionScope::Lexical,
             function_scope: None,
         };
 
@@ -13750,6 +14629,7 @@ outside_var <- 2"#;
             line: 0,
             column: 0,
             symbols: vec![],
+            runtime_function_scope: RuntimeFunctionScope::Lexical,
             function_scope: None,
         };
 
@@ -13776,24 +14656,28 @@ outside_var <- 2"#;
                 line: 5,
                 column: 10,
                 symbols: vec!["c".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Removal {
                 line: 2,
                 column: 0,
                 symbols: vec!["a".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Removal {
                 line: 5,
                 column: 5,
                 symbols: vec!["b".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Removal {
                 line: 10,
                 column: 0,
                 symbols: vec!["d".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
         ];
@@ -13824,18 +14708,21 @@ outside_var <- 2"#;
                 line: 3,
                 column: 20,
                 symbols: vec!["c".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Removal {
                 line: 3,
                 column: 5,
                 symbols: vec!["a".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Removal {
                 line: 3,
                 column: 10,
                 symbols: vec!["b".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
         ];
@@ -13866,6 +14753,7 @@ outside_var <- 2"#;
                 line: 3,
                 column: 0,
                 symbols: vec!["x".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Def {
@@ -13883,6 +14771,7 @@ outside_var <- 2"#;
                     signature: None,
                     is_declared: false,
                 },
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Def {
@@ -13900,6 +14789,7 @@ outside_var <- 2"#;
                     signature: None,
                     is_declared: false,
                 },
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
         ];
@@ -13944,6 +14834,7 @@ outside_var <- 2"#;
                 line: 2,
                 column: 0,
                 symbols: vec!["x".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Source {
@@ -13954,18 +14845,18 @@ outside_var <- 2"#;
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Removal {
                 line: 4,
                 column: 0,
                 symbols: vec!["y".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
         ];
@@ -13999,6 +14890,7 @@ outside_var <- 2"#;
                 line: 5,
                 column: 0,
                 symbols: vec!["z".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Def {
@@ -14016,6 +14908,7 @@ outside_var <- 2"#;
                     signature: None,
                     is_declared: false,
                 },
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Source {
@@ -14026,12 +14919,11 @@ outside_var <- 2"#;
                     line: 3,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::FunctionScope {
@@ -14045,6 +14937,7 @@ outside_var <- 2"#;
                 line: 9,
                 column: 0,
                 symbols: vec!["w".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
         ];
@@ -14100,6 +14993,7 @@ outside_var <- 2"#;
                 line: 2,
                 column: 0,
                 symbols: vec!["x".to_string()],
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
             ScopeEvent::Def {
@@ -14117,6 +15011,7 @@ outside_var <- 2"#;
                     signature: None,
                     is_declared: false,
                 },
+                runtime_function_scope: RuntimeFunctionScope::Lexical,
                 function_scope: None,
             },
         ];
@@ -14146,6 +15041,7 @@ outside_var <- 2"#;
             line: 5,
             column: 10,
             symbols: vec!["x".to_string(), "y".to_string()],
+            runtime_function_scope: RuntimeFunctionScope::Lexical,
             function_scope: None,
         };
 
@@ -15243,10 +16139,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -15368,10 +16262,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -15507,10 +16399,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -15521,10 +16411,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -15813,10 +16701,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -15945,10 +16831,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -16033,10 +16917,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -16141,10 +17023,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -16155,10 +17035,8 @@ outside_var <- 2"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -16271,10 +17149,8 @@ outside_var <- 2"#;
                     line: 0,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -16282,10 +17158,8 @@ outside_var <- 2"#;
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -17085,6 +17959,7 @@ outside_var <- 2"#;
                     column,
                     package,
                     function_scope,
+                    ..
                 } = e
                 {
                     Some((line, column, package, function_scope))
@@ -17125,6 +18000,7 @@ outside_var <- 2"#;
                     column,
                     package,
                     function_scope,
+                    ..
                 } = e
                 {
                     Some((*line, *column, package.clone(), *function_scope))
@@ -18100,10 +18976,8 @@ x <- 1"#;
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18182,10 +19056,8 @@ x <- 1"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18263,10 +19135,8 @@ x <- 1"#;
                 line: 2,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18349,10 +19219,8 @@ x <- 1"#;
                 line: 3,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18426,10 +19294,9 @@ x <- 1"#;
                 line: 3,
                 column: 4,
                 is_directive: false,
-                local: true,
+                locality: crate::cross_file::types::SourceLocality::CurrentFrame,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18522,10 +19389,8 @@ x <- 1"#;
                 line: source_line,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18639,7 +19504,6 @@ x <- 1"#;
                 path: "b.R".to_string(),
                 line: 1,
                 column: 0,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18649,7 +19513,6 @@ x <- 1"#;
                 path: "c.R".to_string(),
                 line: 0,
                 column: 0,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18729,7 +19592,6 @@ x <- 1"#;
                 path: "loader.R".to_string(),
                 line: 0,
                 column: 0,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18814,8 +19676,7 @@ x <- 1"#;
                 path: "inside.R".to_string(),
                 line: 2,
                 column: 2,
-                local: true,
-                sys_source_global_env: true,
+                locality: crate::cross_file::types::SourceLocality::CurrentFrame,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18888,7 +19749,6 @@ x <- 1"#;
                 path: "outside.R".to_string(),
                 line: 3,
                 column: 0,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -18964,7 +19824,6 @@ x <- 1"#;
                 path: "child.R".to_string(),
                 line: 2,
                 column: 0,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -19013,6 +19872,1091 @@ x <- 1"#;
     }
 
     #[test]
+    fn root_bquote_splice_keeps_where_definition_before_operand_error() {
+        let code = r#"bquote(..(operand <- 1), where = { before_error <- 1; parent.frame() }, splice = TRUE)"#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(!scope.symbols.contains_key("operand"));
+        assert!(scope.symbols.contains_key("before_error"));
+    }
+
+    #[test]
+    fn bquote_external_where_does_not_mutate_caller_scope() {
+        let code = "x <- 1; bquote(where=new.env(), expr=.(rm(x))); x";
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(scope.symbols.contains_key("x"), "{:?}", artifacts.timeline);
+
+        let code = r#"
+            bquote(
+                where = { control <- 1; new.env() },
+                expr = .({
+                    local <- 1
+                    assign("also_local", 1)
+                    exists("external_decl")
+                })
+            )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(
+            scope.symbols.contains_key("control"),
+            "{:?}",
+            artifacts.timeline
+        );
+        for name in ["local", "also_local", "external_decl"] {
+            assert!(
+                !scope.symbols.contains_key(name),
+                "{name}: {:?}",
+                artifacts.timeline
+            );
+        }
+    }
+
+    #[test]
+    fn external_bquote_function_definitions_use_function_local_execution_frames() {
+        let code = r#"
+            bquote(
+                .(function(
+                    default = {
+                        default_local <- 1
+                        source("default.R", local = TRUE)
+                    }
+                ) {
+                    body_local <- 1
+                    source("body.R", local = TRUE)
+                    function() { nested_local <- 1 }
+                    escaped <<- 1
+                }),
+                where = new.env()
+            )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        for name in ["default_local", "body_local", "nested_local", "escaped"] {
+            assert!(
+                artifacts.timeline.iter().any(|event| matches!(
+                    event,
+                    ScopeEvent::Def {
+                        symbol,
+                        function_scope: Some(_),
+                        ..
+                    } if symbol.name.as_ref() == name
+                )),
+                "{name}: {:?}",
+                artifacts.timeline
+            );
+        }
+        let sources: Vec<_> = artifacts
+            .timeline
+            .iter()
+            .filter_map(|event| match event {
+                ScopeEvent::Source {
+                    source,
+                    function_scope,
+                    ..
+                } => Some((
+                    source.path.as_str(),
+                    source.locality != SourceLocality::Global,
+                    function_scope.is_some(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![("default.R", true, true), ("body.R", true, true)]
+        );
+
+        let direct = r#"bquote(.(direct_local <- 1), where = new.env())"#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(direct), direct);
+        assert!(!artifacts.timeline.iter().any(|event| {
+            matches!(event, ScopeEvent::Def { symbol, .. } if symbol.name.as_ref() == "direct_local")
+        }));
+
+        let global_closure = r#"
+            bquote(
+                .(function() source("global-closure.R", local = TRUE)),
+                where = .GlobalEnv
+            )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(global_closure), global_closure);
+        assert!(artifacts.timeline.iter().any(|event| matches!(
+            event,
+            ScopeEvent::Source { source, .. }
+                if source.path == "global-closure.R" && source.locality != SourceLocality::Global
+        )));
+    }
+
+    #[test]
+    fn bquote_scope_macros_require_identifier_call_heads() {
+        let code = r#"
+            bquote("."(literal_dot <- 1))
+            bquote(list(".."(literal_dot_dot <- 1)), splice = TRUE)
+            bquote(`.`(backtick_dot <- 1))
+            bquote(list(`..`(backtick_dot_dot <- 1)), splice = TRUE)
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        for name in ["literal_dot", "literal_dot_dot"] {
+            assert!(
+                !scope.symbols.contains_key(name),
+                "{name}: {:?}",
+                artifacts.timeline
+            );
+        }
+        for name in ["backtick_dot", "backtick_dot_dot"] {
+            assert!(
+                scope.symbols.contains_key(name),
+                "{name}: {:?}",
+                artifacts.timeline
+            );
+        }
+    }
+
+    #[test]
+    fn bquote_caller_global_and_escape_definitions_remain_visible() {
+        for code in [
+            r#"bquote(.(bound <- 1))"#,
+            r#"bquote(.(bound <- 1), where = parent.frame())"#,
+            r#"bquote(where = environment(), expr = .(bound <- 1))"#,
+            r#"bquote(expr = .(bound <- 1), where = .GlobalEnv)"#,
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+            assert!(
+                scope.symbols.contains_key("bound"),
+                "{code}: {:?}",
+                artifacts.timeline
+            );
+        }
+
+        let code = r#"
+            bquote(
+                where = new.env(),
+                expr = .({
+                    escaped <<- 1
+                    assign(value = 1, envir = .GlobalEnv, x = "global_named")
+                    assign(pos = 1, x = "global_pos", value = 1)
+                })
+            )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        for name in ["escaped", "global_named", "global_pos"] {
+            assert!(
+                scope.symbols.contains_key(name),
+                "{name}: {:?}",
+                artifacts.timeline
+            );
+        }
+    }
+
+    #[test]
+    fn bquote_source_lending_and_packages_follow_evaluation_frame() {
+        let code = r#"
+            bquote(where = new.env(), expr = .(source("external-local.R", local = TRUE)))
+            bquote(where = new.env(), expr = .(source("external-global.R")))
+            bquote(where = .GlobalEnv, expr = .(source("global-environment.R", local = e)))
+            bquote(where = .GlobalEnv, expr = .(source("global-local.R", local = TRUE)))
+            bquote(
+                where = { library(controlpkg); new.env() },
+                expr = .(library(operandpkg))
+            )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let sources: Vec<_> = artifacts
+            .timeline
+            .iter()
+            .filter_map(|event| match event {
+                ScopeEvent::Source { source, .. } => Some((
+                    source.path.as_str(),
+                    source.locality != SourceLocality::Global,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![("external-global.R", false), ("global-local.R", false)]
+        );
+        let packages: HashSet<_> = artifacts
+            .timeline
+            .iter()
+            .filter_map(|event| match event {
+                ScopeEvent::PackageLoad { package, .. } => Some(package.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(packages.contains("controlpkg"), "{:?}", artifacts.timeline);
+        assert!(packages.contains("operandpkg"), "{:?}", artifacts.timeline);
+    }
+
+    #[test]
+    fn bquote_function_syntax_scope_events_follow_runtime_function() {
+        let top_level = r#"
+            x <- 0
+            bquote(function() .({
+                bound <- 1
+                source("top.R", local = TRUE)
+                library(toppkg)
+                rm(x)
+                exists("declared")
+            }))
+        "#;
+        let top = compute_artifacts(&test_uri(), &parse_r(top_level), top_level);
+        for event in &top.timeline {
+            match event {
+                ScopeEvent::Def {
+                    symbol,
+                    function_scope,
+                    ..
+                } if symbol.name.as_ref() == "bound" => assert!(function_scope.is_none()),
+                ScopeEvent::Source {
+                    source,
+                    function_scope,
+                    ..
+                } if source.path == "top.R" => {
+                    assert!(function_scope.is_none());
+                    assert!(!source.is_function_scoped);
+                }
+                ScopeEvent::PackageLoad {
+                    package,
+                    function_scope,
+                    ..
+                } if package == "toppkg" => assert!(function_scope.is_none()),
+                ScopeEvent::Removal {
+                    symbols,
+                    function_scope,
+                    ..
+                } if symbols == &["x"] => assert!(function_scope.is_none()),
+                ScopeEvent::Declaration {
+                    symbol,
+                    function_scope,
+                    ..
+                } if symbol.name.as_ref() == "declared" => assert!(function_scope.is_none()),
+                _ => {}
+            }
+        }
+        let top_scope = scope_at_position(&top, u32::MAX, u32::MAX, false);
+        assert!(
+            top_scope.symbols.contains_key("bound"),
+            "{:?}",
+            top.timeline
+        );
+        assert!(
+            top_scope.symbols.contains_key("declared"),
+            "{:?}",
+            top.timeline
+        );
+        assert!(!top_scope.symbols.contains_key("x"), "{:?}", top.timeline);
+        assert!(top_scope.loaded_packages.contains("toppkg"));
+
+        let outer_function = r#"
+            outer <- function() {
+                x <- 0
+                bquote(function() .({
+                    bound <- 1
+                    source("outer.R", local = TRUE)
+                    library(outerpkg)
+                    rm(x)
+                    exists("outer_declared")
+                }))
+                bound
+            }
+        "#;
+        let outer = compute_artifacts(&test_uri(), &parse_r(outer_function), outer_function);
+        for event in &outer.timeline {
+            match event {
+                ScopeEvent::Def {
+                    symbol,
+                    function_scope,
+                    ..
+                } if symbol.name.as_ref() == "bound" => assert!(function_scope.is_some()),
+                ScopeEvent::Source {
+                    source,
+                    function_scope,
+                    ..
+                } if source.path == "outer.R" => {
+                    assert!(function_scope.is_some());
+                    assert!(source.is_function_scoped);
+                }
+                ScopeEvent::PackageLoad {
+                    package,
+                    function_scope,
+                    ..
+                } if package == "outerpkg" => assert!(function_scope.is_some()),
+                ScopeEvent::Removal {
+                    symbols,
+                    function_scope,
+                    ..
+                } if symbols == &["x"] => assert!(function_scope.is_some()),
+                ScopeEvent::Declaration {
+                    symbol,
+                    function_scope,
+                    ..
+                } if symbol.name.as_ref() == "outer_declared" => {
+                    assert!(function_scope.is_some())
+                }
+                _ => {}
+            }
+        }
+        assert!(!live_top_level_exports(&outer).contains("bound"));
+        assert!(!live_top_level_exports(&outer).contains("outer_declared"));
+
+        let ordinary = r#"
+            ordinary <- function() {
+                local <- 1
+                source("ordinary.R", local = TRUE)
+                library(ordinarypkg)
+                rm(local)
+            }
+        "#;
+        let ordinary = compute_artifacts(&test_uri(), &parse_r(ordinary), ordinary);
+        assert!(ordinary.timeline.iter().all(|event| match event {
+            ScopeEvent::Def {
+                symbol,
+                function_scope,
+                ..
+            } if symbol.name.as_ref() == "local" => function_scope.is_some(),
+            ScopeEvent::Source {
+                source,
+                function_scope,
+                ..
+            } if source.path == "ordinary.R" => function_scope.is_some(),
+            ScopeEvent::PackageLoad {
+                package,
+                function_scope,
+                ..
+            } if package == "ordinarypkg" => function_scope.is_some(),
+            ScopeEvent::Removal {
+                symbols,
+                function_scope,
+                ..
+            } if symbols == &["local"] => function_scope.is_some(),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn evaluated_capture_effects_use_shiny_synthetic_runtime_scope() {
+        let code = r#"
+            shiny::reactive({
+                x <- 0
+                bquote(function() .({
+                    captured <- 1
+                    source("child.R", local = TRUE)
+                    library(capturedpkg)
+                    rm(x)
+                    exists("captured_declared")
+                }))
+                captured
+            })
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let shiny_scope = artifacts
+            .timeline
+            .iter()
+            .find_map(|event| match event {
+                ScopeEvent::FunctionScope {
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column,
+                    parameters,
+                } if parameters.is_empty() => Some(FunctionScopeInterval::new(
+                    Position::new(*start_line, *start_column),
+                    Position::new(*end_line, *end_column),
+                )),
+                _ => None,
+            })
+            .expect("reactive body scope");
+
+        for event in &artifacts.timeline {
+            let scope = match event {
+                ScopeEvent::Def {
+                    symbol,
+                    function_scope,
+                    ..
+                } if symbol.name.as_ref() == "captured" => *function_scope,
+                ScopeEvent::Source {
+                    source,
+                    function_scope,
+                    ..
+                } if source.path == "child.R" => {
+                    assert!(source.is_function_scoped);
+                    *function_scope
+                }
+                ScopeEvent::PackageLoad {
+                    package,
+                    function_scope,
+                    ..
+                } if package == "capturedpkg" => *function_scope,
+                ScopeEvent::Removal {
+                    symbols,
+                    function_scope,
+                    ..
+                } if symbols == &["x"] => *function_scope,
+                ScopeEvent::Declaration {
+                    symbol,
+                    function_scope,
+                    ..
+                } if symbol.name.as_ref() == "captured_declared" => *function_scope,
+                _ => continue,
+            };
+            assert_eq!(scope, Some(shiny_scope), "{event:?}");
+        }
+        let eof = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(!eof.symbols.contains_key("captured"));
+        assert!(!eof.symbols.contains_key("captured_declared"));
+        assert!(!eof.loaded_packages.contains("capturedpkg"));
+    }
+
+    #[test]
+    fn evaluated_capture_effects_use_foreach_body_and_argument_scopes() {
+        let body_code = r#"
+            foreach(i = 1:2) %do% {
+                bquote(.(bquote(function() .({
+                    body_bound <- i
+                    source("body.R", local = TRUE)
+                }))))
+                body_bound
+            }
+        "#;
+        let body = compute_artifacts(&test_uri(), &parse_r(body_code), body_code);
+        let body_scope = body
+            .timeline
+            .iter()
+            .find_map(|event| match event {
+                ScopeEvent::FunctionScope {
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column,
+                    parameters,
+                } if parameters
+                    .iter()
+                    .any(|parameter| parameter.name.as_ref() == "i") =>
+                {
+                    Some(FunctionScopeInterval::new(
+                        Position::new(*start_line, *start_column),
+                        Position::new(*end_line, *end_column),
+                    ))
+                }
+                _ => None,
+            })
+            .expect("foreach body scope");
+        assert!(body.timeline.iter().any(|event| matches!(
+            event,
+            ScopeEvent::Def { symbol, function_scope: Some(scope), .. }
+                if symbol.name.as_ref() == "body_bound" && *scope == body_scope
+        )));
+        assert!(body.timeline.iter().any(|event| matches!(
+            event,
+            ScopeEvent::Source { source, function_scope: Some(scope), .. }
+                if source.path == "body.R" && source.is_function_scoped && *scope == body_scope
+        )));
+        assert!(
+            !scope_at_position(&body, u32::MAX, u32::MAX, false)
+                .symbols
+                .contains_key("body_bound")
+        );
+
+        let argument_code = r#"
+            foreach(i = bquote(function() .({ arg_bound <- 1; 1:2 }))) %do% i
+        "#;
+        let argument = compute_artifacts(&test_uri(), &parse_r(argument_code), argument_code);
+        let arg_scope = argument
+            .timeline
+            .iter()
+            .find_map(|event| match event {
+                ScopeEvent::Def {
+                    symbol,
+                    function_scope,
+                    ..
+                } if symbol.name.as_ref() == "arg_bound" => *function_scope,
+                _ => None,
+            })
+            .expect("foreach argument capture scope");
+        assert!(argument.timeline.iter().any(|event| matches!(
+            event,
+            ScopeEvent::FunctionScope { start_line, start_column, end_line, end_column, parameters }
+                if parameters.is_empty()
+                    && FunctionScopeInterval::new(
+                        Position::new(*start_line, *start_column),
+                        Position::new(*end_line, *end_column),
+                    ) == arg_scope
+        )));
+        assert!(
+            !scope_at_position(&argument, u32::MAX, u32::MAX, false)
+                .symbols
+                .contains_key("arg_bound")
+        );
+    }
+
+    #[test]
+    fn inert_quoted_shiny_and_foreach_syntax_add_no_synthetic_scopes() {
+        let code = r#"
+            quote(shiny::reactive({ shiny_local <- 1 }))
+            expression(foreach(i = 1:2) %do% { foreach_local <- i })
+            bquote(shiny::reactive({ .(operand <- 1) }))
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        assert!(
+            !artifacts
+                .timeline
+                .iter()
+                .any(|event| matches!(event, ScopeEvent::FunctionScope { .. }))
+        );
+        let eof = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(eof.symbols.contains_key("operand"));
+        assert!(!eof.symbols.contains_key("shiny_local"));
+        assert!(!eof.symbols.contains_key("foreach_local"));
+    }
+
+    #[test]
+    fn function_bquote_effects_remain_execution_guarded() {
+        let code = r#"
+            f <- function() {
+                bquote(where = .GlobalEnv, expr = .(global_bound <- 1))
+                bquote(where = new.env(), expr = .(external_bound <- 1))
+                global_bound
+            }
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let global_event = artifacts.timeline.iter().find(|event| {
+            matches!(event, ScopeEvent::Def { symbol, .. } if symbol.name.as_ref() == "global_bound")
+        });
+        assert!(matches!(
+            global_event,
+            Some(ScopeEvent::Def {
+                function_scope: Some(_),
+                ..
+            })
+        ));
+        assert!(!artifacts.timeline.iter().any(|event| {
+            matches!(event, ScopeEvent::Def { symbol, .. } if symbol.name.as_ref() == "external_bound")
+        }));
+    }
+
+    #[test]
+    fn definite_bquote_aborts_stop_scope_effects() {
+        let code = r#"
+        bquote(
+            list(.(head <- 1), ..(), .(tail <- 1)),
+            where = { where_effect <- 1; parent.frame() },
+            splice = TRUE
+        )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(
+            scope.symbols.contains_key("where_effect"),
+            "{:?}",
+            artifacts.timeline
+        );
+        assert!(
+            !scope.symbols.contains_key("head"),
+            "{:?}",
+            artifacts.timeline
+        );
+        assert!(
+            !scope.symbols.contains_key("tail"),
+            "{:?}",
+            artifacts.timeline
+        );
+
+        let code = r#"
+        x <- 0
+        bquote(list(.(rm(x)), list(.(), .(later <- 1)), .(exists("declared"))))
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(!scope.symbols.contains_key("x"), "{:?}", artifacts.timeline);
+        assert!(
+            !scope.symbols.contains_key("later"),
+            "{:?}",
+            artifacts.timeline
+        );
+        assert!(
+            !scope.symbols.contains_key("declared"),
+            "{:?}",
+            artifacts.timeline
+        );
+    }
+
+    #[test]
+    fn bquote_splice_result_gates_later_scope_effects() {
+        let code = r#"
+        base::bquote(
+            ..({ operand_effect <- 1; function() {} }) + .(tail <- 1),
+            splice = TRUE
+        )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(
+            scope.symbols.contains_key("operand_effect"),
+            "{:?}",
+            artifacts.timeline
+        );
+        assert!(
+            !scope.symbols.contains_key("tail"),
+            "{:?}",
+            artifacts.timeline
+        );
+
+        let code = r#"base::bquote(..(unknown) + .(tail <- 1), splice = TRUE)"#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(
+            !scope.symbols.contains_key("tail"),
+            "{:?}",
+            artifacts.timeline
+        );
+
+        for operand in ["1", r#""value""#, "list(1)", "c(1)", "base::list(1)"] {
+            let code = format!("base::bquote(..({operand}) + .(vector_tail <- 1), splice = TRUE)");
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(&code), &code);
+            let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+            assert!(
+                scope.symbols.contains_key("vector_tail"),
+                "{code}: {:?}",
+                artifacts.timeline
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_bquote_splice_suppresses_later_scope_effects() {
+        let code = r#"
+        base::bquote(
+            list(..(unknown), .(tail <- 1)),
+            splice = { control <- 1; flag }
+        )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(
+            scope.symbols.contains_key("control"),
+            "{:?}",
+            artifacts.timeline
+        );
+        assert!(
+            !scope.symbols.contains_key("tail"),
+            "{:?}",
+            artifacts.timeline
+        );
+    }
+
+    #[test]
+    fn named_unknown_bquote_splice_before_expr_suppresses_scope_effects() {
+        let code = r#"
+        base::bquote(
+            splice = flag,
+            expr = list(.(prefix <- 1), ..(operand <- 1), .(tail <- 1))
+        )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        for name in ["prefix", "operand", "tail"] {
+            assert!(
+                !scope.symbols.contains_key(name),
+                "{name}: {:?}",
+                artifacts.timeline
+            );
+        }
+
+        let code = r#"
+        base::bquote(
+            splice = { control <- 1; flag },
+            expr = list(.(prefix <- 1), ..(operand <- 1), .(tail <- 1))
+        )
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(
+            scope.symbols.contains_key("control"),
+            "{:?}",
+            artifacts.timeline
+        );
+        for name in ["prefix", "operand", "tail"] {
+            assert!(
+                !scope.symbols.contains_key(name),
+                "{name}: {:?}",
+                artifacts.timeline
+            );
+        }
+    }
+
+    #[test]
+    fn inverted_capture_package_load_does_not_reach_earlier_runtime_use() {
+        let code = r#"bquote(
+            expr = .(library(dplyr)),
+            where = { mutate(mtcars); parent.frame() }
+        )"#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let get_exports = mock_package_exports(&[("dplyr", &["mutate"])]);
+        let scope = scope_at_position_with_packages(
+            &artifacts,
+            2,
+            30,
+            &get_exports,
+            &empty_base_exports(),
+            false,
+        );
+        assert!(
+            !scope.symbols.contains_key("mutate"),
+            "runtime-earlier where use must not see expr attachment: {:?}",
+            artifacts.timeline
+        );
+        assert!(
+            artifacts
+                .timeline
+                .iter()
+                .all(|event| !matches!(event, ScopeEvent::PackageLoad { package, .. } if package == "dplyr")),
+            "unorderable positive attachment must be suppressed: {:?}",
+            artifacts.timeline
+        );
+    }
+
+    #[test]
+    fn inverted_capture_removal_precedes_earlier_textual_use() {
+        let code = "x <- 1\nbquote(expr = .(x), where = { rm(x); parent.frame() })";
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, 1, 18, false);
+        assert!(
+            !scope.symbols.contains_key("x"),
+            "runtime-earlier removal must kill x before expr use: {:?}",
+            artifacts.timeline
+        );
+    }
+
+    #[test]
+    fn bquote_where_then_rm_cannot_fabricate_a_definition() {
+        let code = r#"
+        x <- 0
+        bquote(.(rm(x)), where = { x <- 1; parent.frame() })
+        "#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(!scope.symbols.contains_key("x"), "{:?}", artifacts.timeline);
+    }
+
+    #[test]
+    fn capture_source_then_remove_order_never_fabricates_navigation() {
+        use crate::cross_file::dependency::DependencyGraph;
+        use crate::cross_file::types::CrossFileMetadata;
+
+        let workspace_root = Url::parse("file:///project").unwrap();
+        let parent_uri = Url::parse("file:///project/parent.R").unwrap();
+        let child_uri = Url::parse("file:///project/child.R").unwrap();
+        let child_code = "x <- function() 1";
+        let child_artifacts = Arc::new(compute_artifacts(
+            &child_uri,
+            &parse_r(child_code),
+            child_code,
+        ));
+
+        for (label, parent_code, source_event_expected) in [
+            (
+                "where before expr",
+                r#"bquote(where = { source("child.R"); parent.frame() }, expr = .(rm(x)))"#,
+                true,
+            ),
+            (
+                "where forced before earlier expr syntax",
+                r#"bquote(expr = .(rm(x)), where = { source("child.R"); parent.frame() })"#,
+                false,
+            ),
+            (
+                "direct splice operand before prefix",
+                r#"bquote(list(.(rm(x)), ..({ source("child.R"); list(1) })), splice = TRUE)"#,
+                false,
+            ),
+        ] {
+            let parent_tree = parse_r(parent_code);
+            let parent_artifacts =
+                Arc::new(compute_artifacts(&parent_uri, &parent_tree, parent_code));
+            assert_eq!(
+                parent_artifacts
+                    .timeline
+                    .iter()
+                    .filter(|event| matches!(event, ScopeEvent::Source { .. }))
+                    .count(),
+                usize::from(source_event_expected),
+                "{label}: {:?}",
+                parent_artifacts.timeline
+            );
+            assert!(
+                parent_artifacts
+                    .timeline
+                    .iter()
+                    .any(|event| matches!(event, ScopeEvent::Removal { symbols, .. } if symbols.len() == 1 && symbols[0] == "x")),
+                "{label}: {:?}",
+                parent_artifacts.timeline
+            );
+
+            let parent_meta = Arc::new(crate::cross_file::extract_metadata_with_tree(
+                parent_code,
+                Some(&parent_tree),
+            ));
+            let child_meta = Arc::new(CrossFileMetadata::default());
+            let mut graph = DependencyGraph::new();
+            graph.update_file(&parent_uri, &parent_meta, Some(&workspace_root), |_| None);
+            assert_eq!(
+                graph.get_dependencies(&parent_uri).len(),
+                1,
+                "{label}: dependency edge must survive lending suppression"
+            );
+
+            let get_artifacts = |uri: &Url| {
+                if uri == &parent_uri {
+                    Some(parent_artifacts.clone())
+                } else if uri == &child_uri {
+                    Some(child_artifacts.clone())
+                } else {
+                    None
+                }
+            };
+            let get_metadata = |uri: &Url| {
+                if uri == &parent_uri {
+                    Some(parent_meta.clone())
+                } else if uri == &child_uri {
+                    Some(child_meta.clone())
+                } else {
+                    None
+                }
+            };
+            let base_exports = HashSet::new();
+            let scope = scope_at_position_with_graph(
+                &parent_uri,
+                u32::MAX,
+                u32::MAX,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
+                None,
+                None,
+            );
+            assert!(!scope.symbols.contains_key("x"), "{label}: {scope:?}");
+
+            let prefix_cache = std::cell::RefCell::new(ParentPrefixCache::new());
+            let mut stream = ScopeStream::new(
+                &parent_uri,
+                &get_artifacts,
+                &get_metadata,
+                &graph,
+                Some(&workspace_root),
+                10,
+                &base_exports,
+                false,
+                crate::cross_file::config::BackwardDependencyMode::Explicit,
+                &|| false,
+                &prefix_cache,
+                None,
+                None,
+            )
+            .unwrap();
+            stream.advance_to(u32::MAX, u32::MAX);
+            assert!(
+                stream.symbol_for("x").is_none(),
+                "{label}: removed source symbol must not remain navigable"
+            );
+        }
+
+        let control_code =
+            r#"bquote(where = { source("child.R"); parent.frame() }, expr = .(NULL))"#;
+        let control_tree = parse_r(control_code);
+        let control_artifacts =
+            Arc::new(compute_artifacts(&parent_uri, &control_tree, control_code));
+        let control_meta = Arc::new(crate::cross_file::extract_metadata_with_tree(
+            control_code,
+            Some(&control_tree),
+        ));
+        let mut control_graph = DependencyGraph::new();
+        control_graph.update_file(&parent_uri, &control_meta, Some(&workspace_root), |_| None);
+        let get_artifacts = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(control_artifacts.clone())
+            } else if uri == &child_uri {
+                Some(child_artifacts.clone())
+            } else {
+                None
+            }
+        };
+        let get_metadata = |uri: &Url| {
+            if uri == &parent_uri {
+                Some(control_meta.clone())
+            } else {
+                None
+            }
+        };
+        let scope = scope_at_position_with_graph(
+            &parent_uri,
+            u32::MAX,
+            u32::MAX,
+            &get_artifacts,
+            &get_metadata,
+            &control_graph,
+            Some(&workspace_root),
+            10,
+            &HashSet::new(),
+            false,
+            crate::cross_file::config::BackwardDependencyMode::Explicit,
+            &|| false,
+            None,
+            None,
+        );
+        let x = scope
+            .symbols
+            .get("x")
+            .expect("ordinary orderable source must still contribute x");
+        assert_eq!(x.source_uri, child_uri);
+    }
+
+    #[test]
+    fn disabled_bquote_dot_dot_exposes_nested_dot_scope_effects() {
+        for code in [
+            r#"bquote(..(.(bound <- 1)))"#,
+            r#"bquote(list(..(list(.(bound <- 1)))), splice = FALSE)"#,
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+            assert!(
+                scope.symbols.contains_key("bound"),
+                "{code}: {:?}",
+                artifacts.timeline
+            );
+        }
+    }
+
+    #[test]
+    fn bquote_macro_extra_actuals_have_no_scope_effects() {
+        for code in [
+            r#"bquote(.(first <- 1, extra <- 2))"#,
+            r#"bquote(list(..(first <- 1, extra <- 2)), splice = TRUE)"#,
+            r#"bquote(list(.(list(.(first <- 1)), extra <- 2)))"#,
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+            assert!(
+                scope.symbols.contains_key("first"),
+                "{code}: {:?}",
+                artifacts.timeline
+            );
+            assert!(
+                !scope.symbols.contains_key("extra"),
+                "{code}: {:?}",
+                artifacts.timeline
+            );
+        }
+    }
+
+    #[test]
+    fn direct_bquote_splice_assignment_before_head_removal_cannot_survive() {
+        for code in [
+            r#"bquote(list(.(rm(x)), ..(x <- 1)), splice = TRUE)"#,
+            r#"bquote(list(list(.(rm(x)), ..(x <- 1))), splice = TRUE)"#,
+        ] {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+            assert!(
+                !scope.symbols.contains_key("x"),
+                "{code}: {:?}",
+                artifacts.timeline
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_rlang_capture_has_no_operand_scope_effects() {
+        let code = r#"rlang::expr(!!(captured <- 1), unused = 2)"#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        assert!(!artifacts.exported_interface.contains_key("captured"));
+
+        let code = r#"x <- 1
+rlang::expr(!!rm(x), unused = 2)"#;
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let scope = scope_at_position(&artifacts, u32::MAX, u32::MAX, false);
+        assert!(scope.symbols.contains_key("x"));
+    }
+
+    #[test]
+    fn indirect_unknown_helper_mutations_respect_quoted_scope_effects() {
+        let has_captured_definition = |code: &str| {
+            let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+            artifacts.timeline.iter().any(|event| {
+                matches!(
+                    event,
+                    ScopeEvent::Def { symbol, .. } if symbol.name.as_ref() == "captured"
+                )
+            })
+        };
+
+        let earlier = r#"
+x <- get("assign", baseenv())("quote", get("identity", baseenv()), envir = .GlobalEnv)
+quote(captured <- 1)
+"#;
+        assert!(has_captured_definition(earlier));
+
+        let later = r#"
+quote(captured <- 1)
+x <- get("assign", baseenv())("quote", get("identity", baseenv()), envir = .GlobalEnv)
+"#;
+        assert!(!has_captured_definition(later));
+
+        let unrelated_scope = r#"
+f <- function() {
+  x <- get("assign", baseenv())("quote", get("identity", baseenv()), envir = .GlobalEnv)
+}
+quote(captured <- 1)
+"#;
+        assert!(!has_captured_definition(unrelated_scope));
+
+        let deferred = r#"
+f <- function() {
+  quote(captured <- 1)
+  x <- get("assign", baseenv())("quote", get("identity", baseenv()), envir = .GlobalEnv)
+}
+"#;
+        assert!(has_captured_definition(deferred));
+    }
+
+    #[test]
+    fn artifact_build_collects_static_bindings_once_for_all_consumers() {
+        let code = r#"
+path <- "child.R"
+libs <- c("dplyr")
+quote(captured)
+source(path)
+sapply(libs, library, character.only = TRUE)
+"#;
+        let before = super::super::static_path::collection_count_for_current_thread();
+        let artifacts = compute_artifacts(&test_uri(), &parse_r(code), code);
+        let after = super::super::static_path::collection_count_for_current_thread();
+
+        assert_eq!(after, before + 1, "one shared full-tree collection");
+        assert!(
+            artifacts
+                .timeline
+                .iter()
+                .any(|event| matches!(event, ScopeEvent::Source { .. }))
+        );
+        assert!(artifacts.timeline.iter().any(|event| {
+            matches!(
+                event,
+                ScopeEvent::PackageLoad { package, .. } if package == "dplyr"
+            )
+        }));
+    }
+
+    #[test]
     fn load_all_in_nonevaluating_quote_is_not_recorded() {
         // A `load_all()` captured inside a non-evaluating quoting call
         // (`quote`/`expr`/…) is never evaluated, so it must NOT record a
@@ -19034,6 +20978,81 @@ x <- 1"#;
             arts2.dev_load_all_sites.len(),
             1,
             "bare top-level load_all() is recorded",
+        );
+    }
+
+    #[test]
+    fn load_all_capture_classification_matches_unified_static_facts() {
+        let uri = Url::parse("file:///project/a.R").unwrap();
+        for (code, expected) in [
+            (
+                r#"bquote(devtools::load_all(), where = parent.frame())"#,
+                false,
+            ),
+            (r#"bquote(x, where = devtools::load_all())"#, true),
+            (
+                r#"substitute(devtools::load_all(), env = globalenv())"#,
+                false,
+            ),
+            (r#"substitute(x, env = devtools::load_all())"#, true),
+            (r#"bquote(..(devtools::load_all()))"#, false),
+            (r#"bquote(..(devtools::load_all()), splice = FALSE)"#, false),
+            (r#"bquote(..(devtools::load_all()), splice = flag)"#, false),
+            (r#"bquote(..(devtools::load_all()), splice = TRUE)"#, false),
+            (
+                r#"bquote(list(..(devtools::load_all())), splice = TRUE)"#,
+                true,
+            ),
+            (r#"bquote(.(devtools::load_all()), splice = FALSE)"#, true),
+            (
+                r#"bquote(list(.(devtools::load_all()), ..()), splice = TRUE)"#,
+                false,
+            ),
+            (r#"bquote(list(.(), .(devtools::load_all())))"#, false),
+            (r#"bquote(list(.(devtools::load_all()), .()))"#, true),
+            (
+                r#"bquote(..(stop("boom")), where = devtools::load_all(), splice = TRUE)"#,
+                true,
+            ),
+            (r#"bquote(expr = devtools::load_all(), expr = x)"#, false),
+            (
+                r#"substitute(expr = devtools::load_all(), expr = x)"#,
+                false,
+            ),
+            (
+                "bquote <- function(...) force(..1)\nbquote(devtools::load_all())",
+                true,
+            ),
+        ] {
+            let artifacts = compute_artifacts(&uri, &parse_r(code), code);
+            assert_eq!(
+                !artifacts.dev_load_all_sites.is_empty(),
+                expected,
+                "artifact consumer for {code}: {:?}",
+                artifacts.dev_load_all_sites
+            );
+            let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(code);
+            assert_eq!(
+                facts.calls_dev_load_all, expected,
+                "unified static-facts consumer for {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_load_all_facts_follow_capture_runtime_function_scope() {
+        let top_level = r#"bquote(function() .(devtools::load_all()))"#;
+        let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(top_level);
+        assert!(
+            facts.calls_dev_load_all,
+            "an evaluated operand runs immediately in the top-level bquote frame"
+        );
+
+        let function_scoped = r#"outer <- function() bquote(function() .(devtools::load_all()))"#;
+        let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(function_scoped);
+        assert!(
+            !facts.calls_dev_load_all,
+            "the same operand remains function-scoped when bquote runs in a function"
         );
     }
 
@@ -19063,7 +21082,6 @@ x <- 1"#;
                 path: "child.R".to_string(),
                 line: 1,
                 column: 0,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -19073,7 +21091,6 @@ x <- 1"#;
                 path: "child.R".to_string(),
                 line: 0,
                 column: 0,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -19261,10 +21278,8 @@ x <- 1"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -19348,10 +21363,8 @@ x <- 1"#;
                 line: 2,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -19432,10 +21445,8 @@ x <- 1"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -20331,10 +22342,8 @@ x <- 1"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -20352,10 +22361,8 @@ x <- 1"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -20462,10 +22469,8 @@ x <- 1"#;
                 line: 1,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -20588,10 +22593,8 @@ x <- 1"#;
                     line: 0,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -20599,10 +22602,8 @@ x <- 1"#;
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -20616,10 +22617,8 @@ x <- 1"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -20632,10 +22631,8 @@ x <- 1"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -20733,10 +22730,8 @@ x <- 1"#;
                     line: 0,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -20744,10 +22739,8 @@ x <- 1"#;
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -24868,10 +26861,8 @@ y <- filter(df)"#;
                     line: 2,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -24963,10 +26954,8 @@ y <- filter(df)"#;
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -24977,10 +26966,8 @@ y <- filter(df)"#;
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -25081,10 +27068,8 @@ y <- filter(df)"#;
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -25175,10 +27160,8 @@ y <- filter(df)"#;
                         line: 0,
                         column: 0,
                         is_directive: false,
-                        local: false,
                         chdir: false,
                         is_sys_source: false,
-                        sys_source_global_env: true,
                         ..Default::default()
                     },
                     ForwardSource {
@@ -25186,10 +27169,8 @@ y <- filter(df)"#;
                         line: 1,
                         column: 0,
                         is_directive: false,
-                        local: false,
                         chdir: false,
                         is_sys_source: false,
-                        sys_source_global_env: true,
                         ..Default::default()
                     },
                     ForwardSource {
@@ -25197,10 +27178,8 @@ y <- filter(df)"#;
                         line: 2,
                         column: 0,
                         is_directive: false,
-                        local: false,
                         chdir: false,
                         is_sys_source: false,
-                        sys_source_global_env: true,
                         ..Default::default()
                     },
                 ],
@@ -25212,10 +27191,8 @@ y <- filter(df)"#;
                     line: 2,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -25335,10 +27312,9 @@ y <- filter(df)"#;
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: true, // local=TRUE
+                    locality: crate::cross_file::types::SourceLocality::CurrentFrame,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -25392,20 +27368,12 @@ y <- filter(df)"#;
             );
         }
 
-        /// Test: a FUNCTION-SCOPED local=TRUE keeps the declared-only policy — the
-        /// child evaluates in the function's call frame, NOT `.GlobalEnv`, so the
-        /// parent's top-level globals are not modeled as inherited.
-        ///
-        /// This is a **preservation guard**, not a regression gate for the issue
-        /// #476 fix: the pre-fix code blocked regular symbols for ALL local=TRUE, so
-        /// it would also pass here. The guard's job is to ensure the #476 fix didn't
-        /// *over-correct* — i.e. didn't make the function-scoped case inherit regular
-        /// globals too. The tests that fail under the pre-fix code are the top-level
-        /// ones (`test_auto_mode_local_true_inherits_top_level_parent_scope`,
-        /// `test_cross_file_declared_symbols_inherited_with_local_true`, and the
-        /// top-level property test).
+        /// A function-scoped `local=TRUE` child evaluates in the function call
+        /// frame. That frame inherits the caller's enclosing environment, so the
+        /// parent's top-level globals remain visible in the child even though the
+        /// child's own contributions stay confined to the current frame.
         #[test]
-        fn test_auto_mode_function_scoped_local_true_does_not_inherit_parent_globals() {
+        fn test_auto_mode_function_scoped_local_true_inherits_parent_globals() {
             use crate::cross_file::dependency::DependencyGraph;
             use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
 
@@ -25430,10 +27398,9 @@ y <- filter(df)"#;
                     line: 2,
                     column: 2,
                     is_directive: false,
-                    local: true,
+                    locality: crate::cross_file::types::SourceLocality::CurrentFrame,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     is_function_scoped: true, // inside f()'s body
                     ..Default::default()
                 }],
@@ -25479,9 +27446,9 @@ y <- filter(df)"#;
             );
 
             assert!(
-                !scope.symbols.contains_key("parent_var"),
-                "A function-scoped local=TRUE child must NOT inherit the parent's \
-                 top-level globals (declared-only policy retained). Got: {:?}",
+                scope.symbols.contains_key("parent_var"),
+                "A function-scoped local=TRUE child should inherit the parent's \
+                 top-level globals through the call frame. Got: {:?}",
                 scope.symbols.keys().collect::<Vec<_>>()
             );
         }
@@ -25528,10 +27495,8 @@ y <- filter(df)"#;
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()

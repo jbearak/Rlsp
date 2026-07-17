@@ -20,7 +20,10 @@ pub mod sysdata;
 mod proptest_machine;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+
+use tokio_util::sync::CancellationToken;
 
 use crate::package_namespace::{PackageNamespaceModel, PackageWorkspace};
 use crate::roxygen::RoxygenNamespace;
@@ -35,6 +38,74 @@ pub struct PackageState {
     // Populated by derive_package_state
     pub(super) r_file_facts: BTreeMap<PathBuf, RFileFacts>,
     pub(super) scope_contribution: PackageScopeContribution,
+}
+
+/// Operational identity of the raw inputs from which [`PackageState`] is
+/// derived.
+///
+/// This lifecycle deliberately lives outside semantic [`PackageState`]:
+/// workspace-index application may preserve or replace derived caches, but it
+/// must never make an older detached filesystem seed current again. Every raw
+/// package-input writer and every package-root/exclusion/configuration
+/// transition advances the generation, including value-equal writes and
+/// close/reopen transitions that return to the same path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PackageInputLifecycle {
+    generation: u64,
+}
+
+impl PackageInputLifecycle {
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn advance(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+/// Owns the one delayed package-seed convergence task for a backend.
+///
+/// Scheduling supersedes and cancels the prior task. Generation-aware
+/// completion prevents an older task's tail from removing a newer task's token,
+/// while cancellation on shutdown stops a sleeping retry before it performs
+/// more filesystem work.
+#[derive(Debug, Default)]
+pub(crate) struct PackageSeedRetryLifecycle {
+    pending: RwLock<Option<(u64, CancellationToken)>>,
+    next_generation: AtomicU64,
+}
+
+impl PackageSeedRetryLifecycle {
+    pub(crate) fn schedule(&self) -> (u64, CancellationToken) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let mut pending = self.pending.write().unwrap();
+        if let Some((_, token)) = pending.take() {
+            token.cancel();
+        }
+        let token = CancellationToken::new();
+        *pending = Some((generation, token.clone()));
+        (generation, token)
+    }
+
+    pub(crate) fn complete(&self, generation: u64) {
+        let mut pending = self.pending.write().unwrap();
+        if pending.as_ref().map(|(current, _)| *current) == Some(generation) {
+            pending.take();
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        let mut pending = self.pending.write().unwrap();
+        if let Some((_, token)) = pending.take() {
+            token.cancel();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.read().unwrap().is_some()
+    }
 }
 
 impl PackageState {
@@ -77,7 +148,127 @@ impl PackageState {
 // ============== INPUTS ==============
 
 use crate::cross_file::config::PackageMode;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Merge the suppressive static facts shared by Rprofile and test-preamble scans.
+pub(crate) fn merge_static_script_prelude(
+    facts: &crate::cross_file::source_detect::StaticScriptFacts,
+    symbols: &mut BTreeSet<String>,
+    attached_packages: &mut BTreeSet<String>,
+) {
+    symbols.extend(facts.top_level_defs.iter().cloned());
+    attached_packages.extend(facts.attached_packages.iter().cloned());
+    if facts.calls_dev_load_all {
+        attached_packages.insert(crate::package_library::LOAD_ALL_SENTINEL.to_string());
+    }
+}
+
+/// Caller-specific policy for Raven's package-state static-source closure walk.
+///
+/// The walker owns path resolution, routing-path deduplication, traversal order,
+/// and the shared depth/file budgets. Policies stay deliberately small: they
+/// decide whether the root contributes facts, reject caller-specific targets,
+/// provide source text (disk-only or open-buffer-aware), and merge harvested
+/// facts into their own result.
+pub(crate) trait StaticSourceClosurePolicy {
+    fn harvest_root(&self) -> bool;
+
+    fn accept_target(&self, resolved: &Path, routing_path: &Path) -> bool;
+
+    fn read_source(&mut self, resolved: &Path) -> Option<String>;
+
+    fn harvest(&mut self, facts: &crate::cross_file::source_detect::StaticScriptFacts);
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct StaticSourceClosureResult {
+    /// Routing spellings of every accepted static target, including targets that
+    /// are currently missing or unreadable. The root itself is not included.
+    pub(crate) sourced_files: BTreeSet<PathBuf>,
+}
+
+/// Walk a bounded transitive closure of static global `source()` targets.
+///
+/// This is the single owner of the traversal mechanics shared by `.Rprofile`
+/// and testthat-preamble scans: a LIFO worklist, root-counting visited set,
+/// metadata-free forward path contexts (including workspace fallback), and the
+/// package-wide static-source depth/file budgets. A popped file is harvested
+/// before its depth is checked. A newly discovered target is retained for
+/// watcher routing before either the file-budget check or source read, so the
+/// cap-boundary target and missing/unreadable targets can trigger a later rescan.
+pub(crate) fn walk_static_source_closure<P: StaticSourceClosurePolicy>(
+    root_path: &Path,
+    root_text: String,
+    workspace_url: Option<&tower_lsp::lsp_types::Url>,
+    policy: &mut P,
+) -> StaticSourceClosureResult {
+    walk_static_source_closure_with_limits(
+        root_path,
+        root_text,
+        workspace_url,
+        crate::cross_file::source_detect::STATIC_SOURCE_MAX_DEPTH,
+        crate::cross_file::source_detect::STATIC_SOURCE_MAX_FILES,
+        policy,
+    )
+}
+
+fn walk_static_source_closure_with_limits<P: StaticSourceClosurePolicy>(
+    root_path: &Path,
+    root_text: String,
+    workspace_url: Option<&tower_lsp::lsp_types::Url>,
+    max_depth: usize,
+    max_files: usize,
+    policy: &mut P,
+) -> StaticSourceClosureResult {
+    let mut result = StaticSourceClosureResult::default();
+    let mut visited = BTreeSet::from([preamble::canonicalize_for_routing(root_path)]);
+    let mut worklist = vec![(root_path.to_path_buf(), root_text, 0usize, true)];
+
+    while let Some((path, text, depth, is_root)) = worklist.pop() {
+        let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(&text);
+        if !is_root || policy.harvest_root() {
+            policy.harvest(&facts);
+        }
+        if depth >= max_depth || visited.len() >= max_files {
+            continue;
+        }
+        let Ok(file_uri) = tower_lsp::lsp_types::Url::from_file_path(&path) else {
+            continue;
+        };
+        // Package startup/test-preamble scans intentionally ignore `# raven: cd`.
+        // Empty-metadata forward semantics still provide the implicit testthat WD
+        // and workspace-root fallback used by ordinary static source detection.
+        let Some(context) = crate::cross_file::path_resolve::PathContext::forward_without_metadata(
+            &file_uri,
+            workspace_url,
+        ) else {
+            continue;
+        };
+
+        for target in facts.source_targets {
+            let Some(resolved) =
+                crate::cross_file::path_resolve::resolve_source_path_rich(&target, &context).path
+            else {
+                continue;
+            };
+            let routing_path = preamble::canonicalize_for_routing(&resolved);
+            if !policy.accept_target(&resolved, &routing_path)
+                || !visited.insert(routing_path.clone())
+            {
+                continue;
+            }
+            result.sourced_files.insert(routing_path);
+            if visited.len() >= max_files {
+                break;
+            }
+            if let Some(sourced_text) = policy.read_source(&resolved) {
+                worklist.push((resolved, sourced_text, depth + 1, false));
+            }
+        }
+    }
+
+    result
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct PackageInputs {
@@ -111,10 +302,10 @@ pub struct PackageInputs {
     /// Packages attached (top-level `library()`/`require()`) by the
     /// workspace-root `.Rprofile` and its transitive `source()` targets.
     pub rprofile_attached_packages: BTreeSet<String>,
-    /// Canonical paths of helper files the prelude followed via `source()`
-    /// (from `RprofileScan::sourced_files`). Used by the optional
-    /// transitive-freshness wiring (Task 12) to rescan when a sourced helper is
-    /// edited. Not carried onto the contribution (watch-routing only).
+    /// Routing paths of accepted static `source()` targets from `.Rprofile`
+    /// (from `RprofileScan::sourced_files`), including currently missing or
+    /// unreadable targets. Watch-routing only: edits, later creation, and
+    /// delete/recreate cycles trigger a fresh prelude scan.
     pub rprofile_sourced_files: BTreeSet<PathBuf>,
     /// Per-preamble-file (`tests/testthat/helper*.R`/`setup*.R`, keyed by the
     /// same root-joined path as `r_files`) top-level symbol names harvested
@@ -171,6 +362,188 @@ mod input_tests {
     }
 }
 
+#[cfg(test)]
+mod static_source_closure_tests {
+    use super::*;
+
+    struct TestPolicy {
+        harvest_root: bool,
+        sources: BTreeMap<PathBuf, String>,
+        harvested: Vec<String>,
+        reads: Vec<PathBuf>,
+    }
+
+    impl StaticSourceClosurePolicy for TestPolicy {
+        fn harvest_root(&self) -> bool {
+            self.harvest_root
+        }
+
+        fn accept_target(&self, _resolved: &Path, _routing_path: &Path) -> bool {
+            true
+        }
+
+        fn read_source(&mut self, resolved: &Path) -> Option<String> {
+            self.reads.push(resolved.to_path_buf());
+            self.sources.get(resolved).cloned()
+        }
+
+        fn harvest(&mut self, facts: &crate::cross_file::source_detect::StaticScriptFacts) {
+            self.harvested.extend(facts.top_level_defs.iter().cloned());
+        }
+    }
+
+    fn policy(
+        harvest_root: bool,
+        sources: impl IntoIterator<Item = (PathBuf, &'static str)>,
+    ) -> TestPolicy {
+        TestPolicy {
+            harvest_root,
+            sources: sources
+                .into_iter()
+                .map(|(path, text)| (path, text.to_string()))
+                .collect(),
+            harvested: Vec::new(),
+            reads: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn static_source_closure_uses_lifo_sibling_order_and_root_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root.R");
+        let a = tmp.path().join("a.R");
+        let b = tmp.path().join("b.R");
+        let workspace_url = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
+        let mut policy = policy(
+            false,
+            [(a.clone(), "a_def <- 1\n"), (b.clone(), "b_def <- 1\n")],
+        );
+
+        let closure = walk_static_source_closure_with_limits(
+            &root,
+            "root_def <- 1\nsource(\"a.R\")\nsource(\"b.R\")\n".to_string(),
+            Some(&workspace_url),
+            8,
+            8,
+            &mut policy,
+        );
+
+        assert_eq!(policy.harvested, ["b_def", "a_def"]);
+        assert!(!policy.harvested.iter().any(|name| name == "root_def"));
+        assert_eq!(
+            closure.sourced_files,
+            BTreeSet::from([
+                preamble::canonicalize_for_routing(&a),
+                preamble::canonicalize_for_routing(&b),
+            ])
+        );
+    }
+
+    #[test]
+    fn static_source_closure_routes_cap_boundary_without_reading_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root.R");
+        let target = tmp.path().join("target.R");
+        let workspace_url = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
+        let mut policy = policy(true, [(target.clone(), "target_def <- 1\n")]);
+
+        let closure = walk_static_source_closure_with_limits(
+            &root,
+            "root_def <- 1\nsource(\"target.R\")\n".to_string(),
+            Some(&workspace_url),
+            8,
+            2,
+            &mut policy,
+        );
+
+        assert_eq!(policy.harvested, ["root_def"]);
+        assert!(policy.reads.is_empty());
+        assert_eq!(
+            closure.sourced_files,
+            BTreeSet::from([preamble::canonicalize_for_routing(&target)])
+        );
+    }
+
+    #[test]
+    fn static_source_closure_harvests_max_depth_node_without_routing_children() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root.R");
+        let child = tmp.path().join("child.R");
+        let grandchild = tmp.path().join("grandchild.R");
+        let workspace_url = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
+        let mut policy = policy(
+            true,
+            [(child.clone(), "child_def <- 1\nsource(\"grandchild.R\")\n")],
+        );
+
+        let closure = walk_static_source_closure_with_limits(
+            &root,
+            "source(\"child.R\")\n".to_string(),
+            Some(&workspace_url),
+            1,
+            8,
+            &mut policy,
+        );
+
+        assert_eq!(policy.harvested, ["child_def"]);
+        assert!(
+            closure
+                .sourced_files
+                .contains(&preamble::canonicalize_for_routing(&child))
+        );
+        assert!(
+            !closure
+                .sourced_files
+                .contains(&preamble::canonicalize_for_routing(&grandchild))
+        );
+    }
+
+    #[test]
+    fn static_source_closure_deduplicates_cycles_and_routes_missing_targets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root.R");
+        let child = tmp.path().join("child.R");
+        let missing = tmp.path().join("missing.R");
+        let workspace_url = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
+        let mut policy = policy(
+            true,
+            [(
+                child.clone(),
+                "child_def <- 1\nsource(\"root.R\")\nsource(\"missing.R\")\n",
+            )],
+        );
+
+        let closure = walk_static_source_closure_with_limits(
+            &root,
+            "source(\"child.R\")\nsource(\"child.R\")\n".to_string(),
+            Some(&workspace_url),
+            8,
+            8,
+            &mut policy,
+        );
+
+        assert_eq!(policy.harvested, ["child_def"]);
+        assert_eq!(
+            policy
+                .reads
+                .iter()
+                .filter(|path| path.as_path() == child)
+                .count(),
+            1
+        );
+        assert!(
+            closure
+                .sourced_files
+                .contains(&preamble::canonicalize_for_routing(&missing))
+        );
+        assert!(
+            !closure
+                .sourced_files
+                .contains(&preamble::canonicalize_for_routing(&root))
+        );
+    }
+}
+
 // ============== DELTA ==============
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,7 +560,11 @@ pub enum PackageInputDelta {
     NamespaceChanged,
     DescriptionChanged,
     SettingChanged,
+    /// Compatibility signal for callers that do not distinguish the two
+    /// package-data inputs.
     DataDirChanged,
+    DatasetNamesChanged,
+    SysdataNamesChanged,
     RProfileChanged,
     /// The testthat preamble sourced-closure scan changed (issue #638) —
     /// `preamble_sourced_*` inputs were replaced.
@@ -884,8 +1261,6 @@ mod path_tests {
 }
 
 // ============== OUTPUTS (continued) ==============
-
-use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RFileFacts {

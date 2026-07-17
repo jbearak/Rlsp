@@ -4,7 +4,8 @@
 // Core types for cross-file awareness
 //
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use tower_lsp::lsp_types::Url;
 
@@ -280,51 +281,76 @@ pub struct BackwardDirective {
     pub directive_line: u32,
 }
 
-/// A forward source (directive or detected source() call)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// Where a statically detected source call evaluates its child.
+///
+/// This is deliberately more precise than the legacy serialized `local`
+/// boolean: both [`CurrentFrame`](Self::CurrentFrame) and
+/// [`NonInheriting`](Self::NonInheriting) are non-global, but only the current
+/// frame can lend ordinary caller bindings to the child. Legacy booleans exist
+/// only on the `ForwardSource` wire format; runtime code carries this enum alone.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+pub enum SourceLocality {
+    /// The child is evaluated in the process global environment.
+    #[default]
+    Global,
+    /// The child is evaluated in the frame currently evaluating `source()`.
+    CurrentFrame,
+    /// The destination is external or cannot be proven to inherit into Raven's
+    /// lexical scope model.
+    NonInheriting,
+}
+
+impl SourceLocality {
+    /// Compose a source destination with the frame evaluating its call.
+    ///
+    /// `CurrentFrame` is relative: a global capture frame promotes it to
+    /// `Global`, while an external or unknown capture frame makes it
+    /// `NonInheriting`. Absolute global and already-non-inheriting destinations
+    /// are unchanged.
+    pub(crate) fn relative_to(self, frame: super::binding::CaptureEvaluationFrame) -> Self {
+        use super::binding::CaptureEvaluationFrame;
+
+        match (self, frame) {
+            (Self::CurrentFrame, CaptureEvaluationFrame::Global) => Self::Global,
+            (Self::CurrentFrame, CaptureEvaluationFrame::ExternalOrUnknown) => Self::NonInheriting,
+            _ => self,
+        }
+    }
+}
+
+/// A forward source (directive or detected source() call).
+///
+/// [`SourceLocality`] is the sole runtime destination representation. Custom
+/// serde implementations retain the legacy `local` and
+/// `sys_source_global_env` fields only at the wire boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ForwardSource {
-    #[serde(default)]
     pub path: String,
     /// 0-based line
-    #[serde(default)]
     pub line: u32,
     /// 0-based UTF-16 column
-    #[serde(default)]
     pub column: u32,
     /// true if `# raven: source` directive, false if detected source()
-    #[serde(default)]
     pub is_directive: bool,
-    /// `source(..., local = TRUE)` or an explicit `local` value that is not
-    /// statically known to be `FALSE` (conservatively treated as non-global)
-    #[serde(default)]
-    pub local: bool,
+    /// Precise destination class for scope and package propagation.
+    pub locality: SourceLocality,
     /// source(..., chdir = TRUE)
-    #[serde(default)]
     pub chdir: bool,
     /// true for sys.source(), false for source()
-    #[serde(default)]
     pub is_sys_source: bool,
-    /// For sys.source: true if envir=globalenv()/.GlobalEnv, false otherwise
-    /// When false for sys.source, symbols are NOT inherited (treated as local)
-    /// Default is true for regular source() calls
-    #[serde(default = "default_sys_source_global_env")]
-    pub sys_source_global_env: bool,
     /// true if the directive had an explicit `line=N` parameter
     /// Used to determine if redundancy diagnostics should be emitted.
     /// Only relevant when is_directive=true.
     /// _Requirements: 6.2_
-    #[serde(default)]
     pub explicit_line: bool,
     /// 0-based line where the directive itself appears in the file.
     /// Only relevant when is_directive=true.
     /// Used for diagnostic positioning when line= parameter is invalid.
-    #[serde(default)]
     pub directive_line: u32,
     /// true if the user explicitly specified `line=0` (invalid value).
     /// Line numbers in directives are 1-based, so line=0 is invalid.
     /// When true, a warning diagnostic should be emitted.
     /// Only relevant when is_directive=true and explicit_line=true.
-    #[serde(default)]
     pub user_line_zero: bool,
     /// true if the source() call is lexically inside a function body.
     ///
@@ -333,25 +359,116 @@ pub struct ForwardSource {
     /// top-level usages. Used by the "used before it's available" diagnostic
     /// to skip blame attribution. Always false for `# raven: source` directives,
     /// which are header-only and run at load time.
-    #[serde(default)]
     pub is_function_scoped: bool,
     /// If the `source()` file argument is a `system.file(...)` call with
     /// statically determinable string-literal parts and package, store the
     /// extracted call here. Resolution is deferred to the path-resolve layer
     /// because it needs workspace and library-path information unavailable at
     /// parse time. When `Some`, `path` is empty.
-    #[serde(default)]
     pub system_file: Option<super::source_detect::SystemFileCall>,
     /// Pre-resolved absolute file URI for cross-package `system.file()` targets.
     /// When set, dependency and scope resolution use this directly instead of
     /// calling `resolve_path` (which can't handle true absolute paths outside
     /// the workspace). Set by `resolve_system_file_sources` for branch-2 hits.
-    #[serde(default)]
     pub resolved_uri: Option<tower_lsp::lsp_types::Url>,
 }
 
 fn default_sys_source_global_env() -> bool {
     true
+}
+
+#[derive(Deserialize)]
+struct ForwardSourceWire {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    line: u32,
+    #[serde(default)]
+    column: u32,
+    #[serde(default)]
+    is_directive: bool,
+    #[serde(default)]
+    local: bool,
+    #[serde(default)]
+    locality: SourceLocality,
+    #[serde(default)]
+    chdir: bool,
+    #[serde(default)]
+    is_sys_source: bool,
+    #[serde(default = "default_sys_source_global_env")]
+    sys_source_global_env: bool,
+    #[serde(default)]
+    explicit_line: bool,
+    #[serde(default)]
+    directive_line: u32,
+    #[serde(default)]
+    user_line_zero: bool,
+    #[serde(default)]
+    is_function_scoped: bool,
+    #[serde(default)]
+    system_file: Option<super::source_detect::SystemFileCall>,
+    #[serde(default)]
+    resolved_uri: Option<tower_lsp::lsp_types::Url>,
+}
+
+impl Serialize for ForwardSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let local = !self.is_sys_source && self.locality != SourceLocality::Global;
+        let sys_source_global_env = !self.is_sys_source || self.locality == SourceLocality::Global;
+        let mut state = serializer.serialize_struct("ForwardSource", 15)?;
+        state.serialize_field("path", &self.path)?;
+        state.serialize_field("line", &self.line)?;
+        state.serialize_field("column", &self.column)?;
+        state.serialize_field("is_directive", &self.is_directive)?;
+        state.serialize_field("local", &local)?;
+        state.serialize_field("locality", &self.locality)?;
+        state.serialize_field("chdir", &self.chdir)?;
+        state.serialize_field("is_sys_source", &self.is_sys_source)?;
+        state.serialize_field("sys_source_global_env", &sys_source_global_env)?;
+        state.serialize_field("explicit_line", &self.explicit_line)?;
+        state.serialize_field("directive_line", &self.directive_line)?;
+        state.serialize_field("user_line_zero", &self.user_line_zero)?;
+        state.serialize_field("is_function_scoped", &self.is_function_scoped)?;
+        state.serialize_field("system_file", &self.system_file)?;
+        state.serialize_field("resolved_uri", &self.resolved_uri)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ForwardSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ForwardSourceWire::deserialize(deserializer)?;
+        let locality = if wire.locality != SourceLocality::Global {
+            wire.locality
+        } else if wire.is_sys_source && !wire.sys_source_global_env {
+            SourceLocality::NonInheriting
+        } else if wire.local {
+            SourceLocality::CurrentFrame
+        } else {
+            SourceLocality::Global
+        };
+        Ok(Self {
+            path: wire.path,
+            line: wire.line,
+            column: wire.column,
+            is_directive: wire.is_directive,
+            locality,
+            chdir: wire.chdir,
+            is_sys_source: wire.is_sys_source,
+            explicit_line: wire.explicit_line,
+            directive_line: wire.directive_line,
+            user_line_zero: wire.user_line_zero,
+            is_function_scoped: wire.is_function_scoped,
+            system_file: wire.system_file,
+            resolved_uri: wire.resolved_uri,
+        })
+    }
 }
 
 impl ForwardSource {
@@ -372,18 +489,9 @@ impl ForwardSource {
         self.resolved_uri.is_some() || (self.system_file.is_some() && self.path.is_empty())
     }
 
-    /// Check if symbols from this source should be inherited.
-    ///
-    /// Returns false when `local` is explicitly true or not statically known
-    /// to be false, or for `sys.source` with a non-global environment.
+    /// Check if symbols from this source lend outward as global bindings.
     pub fn inherits_symbols(&self) -> bool {
-        if self.local {
-            return false;
-        }
-        if self.is_sys_source && !self.sys_source_global_env {
-            return false;
-        }
-        true
+        self.locality == SourceLocality::Global
     }
 }
 
@@ -521,6 +629,41 @@ mod tests {
     }
 
     #[test]
+    fn source_locality_composes_with_capture_frame() {
+        use crate::cross_file::binding::CaptureEvaluationFrame;
+
+        for (locality, frame, expected) in [
+            (
+                SourceLocality::CurrentFrame,
+                CaptureEvaluationFrame::Caller,
+                SourceLocality::CurrentFrame,
+            ),
+            (
+                SourceLocality::CurrentFrame,
+                CaptureEvaluationFrame::Global,
+                SourceLocality::Global,
+            ),
+            (
+                SourceLocality::CurrentFrame,
+                CaptureEvaluationFrame::ExternalOrUnknown,
+                SourceLocality::NonInheriting,
+            ),
+            (
+                SourceLocality::Global,
+                CaptureEvaluationFrame::ExternalOrUnknown,
+                SourceLocality::Global,
+            ),
+            (
+                SourceLocality::NonInheriting,
+                CaptureEvaluationFrame::Global,
+                SourceLocality::NonInheriting,
+            ),
+        ] {
+            assert_eq!(locality.relative_to(frame), expected);
+        }
+    }
+
+    #[test]
     fn test_cross_file_metadata_serialization() {
         let meta = CrossFileMetadata {
             sourced_by: vec![BackwardDirective {
@@ -533,10 +676,9 @@ mod tests {
                 line: 5,
                 column: 0,
                 is_directive: false,
-                local: false,
+                locality: SourceLocality::NonInheriting,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             working_directory: Some("/data".to_string()),
@@ -555,9 +697,73 @@ mod tests {
 
         assert_eq!(parsed.sourced_by.len(), 1);
         assert_eq!(parsed.sources.len(), 1);
+        assert_eq!(parsed.sources[0].locality, SourceLocality::NonInheriting);
+        assert!(json.contains("NonInheriting"));
         assert_eq!(parsed.working_directory, Some("/data".to_string()));
         assert!(parsed.ignored_lines.contains_key(&10));
         assert!(parsed.ignored_next_lines.contains_key(&15));
+    }
+
+    #[test]
+    fn forward_source_deserialization_normalizes_legacy_locality_fields() {
+        for (json, expected) in [
+            (r#"{"path":"child.R"}"#, SourceLocality::Global),
+            (
+                r#"{"path":"child.R","local":false}"#,
+                SourceLocality::Global,
+            ),
+            (
+                r#"{"path":"child.R","local":true}"#,
+                SourceLocality::CurrentFrame,
+            ),
+            (
+                r#"{"path":"child.R","is_sys_source":true,"sys_source_global_env":true}"#,
+                SourceLocality::Global,
+            ),
+            (
+                r#"{"path":"child.R","is_sys_source":true,"sys_source_global_env":false}"#,
+                SourceLocality::NonInheriting,
+            ),
+            (
+                r#"{"path":"child.R","locality":"CurrentFrame","local":false}"#,
+                SourceLocality::CurrentFrame,
+            ),
+            (
+                r#"{"path":"child.R","locality":"NonInheriting","local":false}"#,
+                SourceLocality::NonInheriting,
+            ),
+            (
+                r#"{"path":"child.R","locality":"Global","local":true}"#,
+                SourceLocality::CurrentFrame,
+            ),
+        ] {
+            let source: ForwardSource = serde_json::from_str(json).unwrap();
+            assert_eq!(source.locality, expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn forward_source_serialization_projects_legacy_locality_fields() {
+        for (is_sys_source, locality, local, sys_global) in [
+            (false, SourceLocality::Global, false, true),
+            (false, SourceLocality::CurrentFrame, true, true),
+            (false, SourceLocality::NonInheriting, true, true),
+            (true, SourceLocality::Global, false, true),
+            (true, SourceLocality::NonInheriting, false, false),
+        ] {
+            let source = ForwardSource {
+                path: "child.R".to_string(),
+                locality,
+                is_sys_source,
+                ..Default::default()
+            };
+            let value = serde_json::to_value(&source).unwrap();
+            assert_eq!(value["locality"], serde_json::json!(locality));
+            assert_eq!(value["local"], local);
+            assert_eq!(value["sys_source_global_env"], sys_global);
+            let round_trip: ForwardSource = serde_json::from_value(value).unwrap();
+            assert_eq!(round_trip, source);
+        }
     }
 
     #[test]
@@ -616,10 +822,8 @@ mod tests {
                 line: 10,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             working_directory: Some("/child/explicit".to_string()),
@@ -671,10 +875,9 @@ mod tests {
             line: 0,
             column: 0,
             is_directive: false,
-            local: true,
+            locality: crate::cross_file::types::SourceLocality::CurrentFrame,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true,
             ..Default::default()
         };
         assert!(!source.inherits_symbols());
@@ -687,10 +890,9 @@ mod tests {
             line: 0,
             column: 0,
             is_directive: false,
-            local: false,
             chdir: false,
             is_sys_source: true,
-            sys_source_global_env: false,
+            locality: crate::cross_file::types::SourceLocality::NonInheriting,
             ..Default::default()
         };
         assert!(!source.inherits_symbols());
@@ -703,10 +905,8 @@ mod tests {
             line: 0,
             column: 0,
             is_directive: false,
-            local: false,
             chdir: false,
             is_sys_source: true,
-            sys_source_global_env: true,
             ..Default::default()
         };
         assert!(source.inherits_symbols());
@@ -719,10 +919,8 @@ mod tests {
             line: 0,
             column: 0,
             is_directive: false,
-            local: false,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true,
             ..Default::default()
         };
         assert!(source.inherits_symbols());

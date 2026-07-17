@@ -9,6 +9,7 @@
 // 3. Go-to-definition for file paths in source() calls and LSP directives
 //
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -19,7 +20,7 @@ use tree_sitter::{Node, Tree};
 use crate::cross_file::directive::{
     BACKWARD_DIRECTIVE_KEYWORDS, DIRECTIVE_PREFIX, FORWARD_DIRECTIVE_KEYWORDS,
 };
-use crate::cross_file::path_resolve::PathContext;
+use crate::cross_file::path_resolve::{PathContext, normalize_path_public};
 use crate::cross_file::types::{CrossFileMetadata, byte_offset_to_utf16_column};
 use crate::utf16::utf16_column_to_byte_offset;
 
@@ -65,6 +66,35 @@ pub enum DirectiveType {
     /// Forward directive: `# raven: source`
     /// This declares that the current file sources another file
     Source,
+}
+
+/// An owned file-path navigation target produced by one syntax analysis.
+///
+/// Completion deliberately remains limited to directly typed string paths.
+/// Navigation additionally recognizes contributing string-literal segments in
+/// statically foldable computed `source()` / `sys.source()` file arguments and
+/// carries the extracted path forward so resolution never repeats AST analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilePathNavigationTarget {
+    /// A matched `source()` or `sys.source()` file argument.
+    SourceCall {
+        /// The complete extracted or statically folded file path.
+        path: String,
+    },
+    /// A Raven forward or backward path directive.
+    Directive {
+        /// Whether the directive points forward or backward in the source graph.
+        directive_type: DirectiveType,
+        /// The complete directive path.
+        path: String,
+    },
+}
+
+impl FilePathNavigationTarget {
+    /// Whether this target came from a source call rather than a directive.
+    pub fn is_source_call(&self) -> bool {
+        matches!(self, Self::SourceCall { .. })
+    }
 }
 
 // ============================================================================
@@ -121,117 +151,446 @@ pub fn detect_file_path_context(tree: &Tree, content: &str, position: Position) 
     FilePathContext::None
 }
 
-/// Check if cursor is inside a string literal in a source()/sys.source() call
+/// Detect and extract an owned go-to-definition target for a file path.
 ///
-/// Uses tree-sitter AST traversal to find call nodes with function name
-/// "source" or "sys.source", then checks if cursor is within the string argument.
+/// This is intentionally broader than [`detect_file_path_context`] only for
+/// statically foldable computed source-file arguments. A computed expression is
+/// eligible solely when the cursor is on a string literal that contributes to
+/// the folded path. Identifiers and helper names therefore continue through the
+/// ordinary symbol-navigation path, and completion remains string-only.
 ///
-/// # Arguments
-/// * `tree` - The tree-sitter parse tree
-/// * `content` - The document text content
-/// * `position` - The cursor position (line, character in UTF-16)
+/// The returned target owns the complete extracted or folded path so the
+/// definition resolver can use this one analysis result directly.
+pub fn detect_file_path_navigation_target(
+    tree: &Tree,
+    content: &str,
+    position: Position,
+) -> Option<FilePathNavigationTarget> {
+    if let Some(argument) = source_file_argument_at_cursor(tree, content, position) {
+        let path = match argument.value {
+            SourceFileArgumentValue::String(string) => {
+                let line_text = content.lines().nth(string.content_start.line as usize)?;
+                let path = line_text.get(string.content_start_byte..string.content_end_byte)?;
+                Some(unescape_string(path))
+            }
+            SourceFileArgumentValue::Computed {
+                root_node,
+                value_node,
+                cursor_node,
+                ..
+            } => {
+                // Identify syntax only; the shared fold decides whether this
+                // literal is path-bearing. This keeps identifiers and helper
+                // names on ordinary symbol navigation and avoids duplicating
+                // file.path/normalizePath argument policy here.
+                let target_literal = string_ancestor_at_position(cursor_node, content, position)?;
+                let bindings =
+                    crate::cross_file::static_path::StaticBindings::collect(root_node, content);
+                let mut target_was_visited = false;
+                let path = crate::cross_file::static_path::fold_string_expr_with_path_literals(
+                    value_node,
+                    content,
+                    &bindings,
+                    &mut |literal| target_was_visited |= literal == target_literal,
+                );
+                path.filter(|_| target_was_visited)
+            }
+        };
+        if let Some(path) = path {
+            return Some(FilePathNavigationTarget::SourceCall { path });
+        }
+    }
+
+    let (directive_type, path, _) = extract_full_directive_path(content, position)?;
+    Some(FilePathNavigationTarget::Directive {
+        directive_type,
+        path,
+    })
+}
+
+/// The matched `file` actual under the cursor in a bare `source()` or
+/// `sys.source()` call.
 ///
-/// # Returns
-/// Some((partial_path, content_start, is_sys_source)) if in source call context
+/// Completion and navigation share this representation so cursor conversion,
+/// R argument matching, UTF-16 string boundaries, and incomplete-call recovery
+/// cannot drift. Recovery remains AST-only: tree-sitter must retain either the
+/// ordinary call nodes or its constrained bare-identifier-plus-`ERROR` shape.
+struct SourceFileArgumentAtCursor<'tree> {
+    value: SourceFileArgumentValue<'tree>,
+    is_sys_source: bool,
+}
+
+enum SourceFileArgumentValue<'tree> {
+    String(SourceStringAtCursor),
+    Computed {
+        root_node: Node<'tree>,
+        value_node: Node<'tree>,
+        cursor_node: Node<'tree>,
+        #[cfg(test)]
+        value_start: Position,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct SourceStringAtCursor {
+    content_start: Position,
+    content_end: Position,
+    content_start_byte: usize,
+    content_end_byte: usize,
+}
+
+/// Check if the cursor is inside the matched string-valued `file` argument of
+/// a bare `source()` or `sys.source()` call.
 fn is_source_call_string_context(
     tree: &Tree,
     content: &str,
     position: Position,
 ) -> Option<(String, Position, bool)> {
-    // Convert LSP position (UTF-16) to tree-sitter point (bytes)
+    let argument = source_file_argument_at_cursor(tree, content, position)?;
+    let SourceFileArgumentValue::String(string) = argument.value else {
+        return None;
+    };
+    let partial_path = extract_partial_path(
+        content,
+        position.line,
+        string.content_start.character,
+        position.character.min(string.content_end.character),
+    );
+
+    Some((partial_path, string.content_start, argument.is_sys_source))
+}
+
+/// Locate the matched source-file actual at `position` using only tree-sitter
+/// nodes. Normal and missing-delimiter calls use the shared recovering matcher
+/// directly. An unclosed quote can collapse the call into an `identifier` plus
+/// `ERROR`; that narrow shape is completed in-memory and reparsed solely to run
+/// the same authoritative R argument matcher against the incomplete tail.
+fn source_file_argument_at_cursor<'tree>(
+    tree: &'tree Tree,
+    content: &str,
+    position: Position,
+) -> Option<SourceFileArgumentAtCursor<'tree>> {
     let line_text = content.lines().nth(position.line as usize)?;
-    let byte_col = utf16_column_to_byte_offset(line_text, position.character);
     let point = tree_sitter::Point {
         row: position.line as usize,
-        column: byte_col,
+        column: utf16_column_to_byte_offset(line_text, position.character),
     };
+    let root_node = tree.root_node();
+    let node = find_deepest_node_at_point(root_node, point)?;
 
-    // Find the deepest node at the cursor position
-    let root = tree.root_node();
-    let node = find_deepest_node_at_point(root, point)?;
+    if let Some((call_node, is_sys_source)) = find_enclosing_source_call(node, content)
+        && let Some(argument) = source_file_argument_from_call(
+            root_node,
+            node,
+            call_node,
+            content,
+            position,
+            point,
+            is_sys_source,
+        )
+    {
+        return Some(argument);
+    }
 
-    // Walk up the tree to find if we're inside a string node
-    let (string_node, call_node) = find_string_in_source_call(node, content)?;
+    recover_source_file_argument_from_error(node, content, position, point)
+}
 
-    // Check if the call is to source() or sys.source()
-    let func_node = call_node.child_by_field_name("function")?;
-    let func_text = node_text(func_node, content);
-    let is_sys_source = match func_text {
-        "source" => false,
-        "sys.source" => true,
-        _ => return None,
-    };
-
-    // Check the string against the same matched file formal used by source
-    // detection and full-path extraction.
+fn source_file_argument_from_call<'tree>(
+    root_node: Node<'tree>,
+    cursor_node: Node<'tree>,
+    call_node: Node<'tree>,
+    content: &str,
+    position: Position,
+    point: tree_sitter::Point,
+    is_sys_source: bool,
+) -> Option<SourceFileArgumentAtCursor<'tree>> {
     let args_node = call_node.child_by_field_name("arguments")?;
-    let value_node = crate::cross_file::source_detect::source_call_file_value_node(
+    let value_node = crate::cross_file::source_detect::source_call_file_value_node_recovering(
         &args_node,
         content,
         is_sys_source,
     )?;
-    if !nodes_overlap(&value_node, &string_node) {
-        return None;
-    }
 
-    // Get the string content boundaries (excluding quotes)
-    let string_text = node_text(string_node, content);
-    if string_text.len() < 2 {
-        return None; // String too short to have content
-    }
-
-    // Determine quote character and content start
-    let quote_char = string_text.chars().next()?;
-    if quote_char != '"' && quote_char != '\'' {
-        return None;
-    }
-
-    // Calculate content start position (after opening quote)
-    let string_start = string_node.start_position();
-    let string_start_line_text = content.lines().nth(string_start.row).unwrap_or("");
-    let content_start_byte = string_start.column + 1; // +1 for opening quote
-    let content_start_utf16 =
-        byte_offset_to_utf16_column(string_start_line_text, content_start_byte);
-    let content_start = Position {
-        line: string_start.row as u32,
-        character: content_start_utf16,
+    let value = if value_node.kind() == "string" {
+        SourceFileArgumentValue::String(source_string_at_cursor(
+            value_node, args_node, content, position, point,
+        )?)
+    } else {
+        if point < value_node.start_position() || point >= value_node.end_position() {
+            return None;
+        }
+        #[cfg(test)]
+        let value_start = {
+            let value_start_point = value_node.start_position();
+            let value_start_line = content.lines().nth(value_start_point.row)?;
+            Position {
+                line: value_start_point.row as u32,
+                character: byte_offset_to_utf16_column(value_start_line, value_start_point.column),
+            }
+        };
+        SourceFileArgumentValue::Computed {
+            root_node,
+            value_node,
+            cursor_node,
+            #[cfg(test)]
+            value_start,
+        }
     };
 
-    // Calculate string content end (before closing quote)
-    let string_end = string_node.end_position();
+    Some(SourceFileArgumentAtCursor {
+        value,
+        is_sys_source,
+    })
+}
 
-    // Check if cursor is within the string content (after opening quote, before closing quote)
-    // Cursor must be on the same line as string start (we don't support multi-line strings)
-    if position.line != string_start.row as u32 {
+fn classify_bare_source_call(call_node: Node, content: &str) -> Option<bool> {
+    classify_bare_source_function(call_node.child_by_field_name("function")?, content)
+}
+
+fn classify_bare_source_function(function: Node, content: &str) -> Option<bool> {
+    if function.kind() != "identifier" {
         return None;
     }
-
-    // Check cursor is after opening quote
-    if position.character < content_start_utf16 {
-        return None;
+    match node_text(function, content) {
+        "source" => Some(false),
+        "sys.source" => Some(true),
+        _ => None,
     }
+}
 
-    // Tree-sitter node ranges are half-open. The closing quote itself is at
-    // `end - 1` and remains a valid cursor target, while `end` is the cursor
-    // immediately after the closing quote and must not claim path context.
-    let string_end_line_text = content.lines().nth(string_end.row).unwrap_or("");
-    let content_end_utf16 = byte_offset_to_utf16_column(string_end_line_text, string_end.column);
-    if string_has_explicit_close(string_node)
-        && position.line == string_end.row as u32
-        && position.character >= content_end_utf16
+fn recover_source_file_argument_from_error<'tree>(
+    node: Node<'tree>,
+    content: &str,
+    position: Position,
+    point: tree_sitter::Point,
+) -> Option<SourceFileArgumentAtCursor<'tree>> {
+    let error = find_enclosing_error(node)?;
+    let function = previous_non_extra_sibling(error)?;
+    let is_sys_source = classify_bare_source_function(function, content)?;
+    if !content
+        .get(function.end_byte()..error.start_byte())?
+        .trim()
+        .is_empty()
     {
         return None;
     }
 
-    // Extract partial path from content start to cursor position
-    let partial_path = extract_partial_path(
-        content,
-        position.line,
-        content_start_utf16,
-        position.character,
-    );
+    let open = error.child(0)?;
+    if open.kind() != "(" || open.start_byte() != error.start_byte() {
+        return None;
+    }
+    let mut cursor = error.walk();
+    let quote = error
+        .children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "\"" | "'") && !child.is_missing())
+        .last()?;
+    let quote_char = quote.kind().chars().next()?;
+    let quote_end = quote.end_position();
+    let error_end = error.end_position();
+    if quote_end.row != error_end.row
+        || position.line != quote_end.row as u32
+        || point < quote_end
+        || point > error_end
+    {
+        return None;
+    }
 
-    Some((partial_path, content_start, is_sys_source))
+    // Complete only the AST-bounded error slice, then use the authoritative
+    // source-call matcher to prove that this incomplete string is the matched
+    // `file` actual. No surrounding line text participates in recovery.
+    let call_text = content.get(function.start_byte()..error.end_byte())?;
+    let mut completed_call = String::with_capacity(call_text.len() + 3);
+    completed_call.push_str(call_text);
+    let trailing_backslashes = call_text
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count();
+    if trailing_backslashes % 2 == 1 {
+        completed_call.push('\\');
+    }
+    completed_call.push(quote_char);
+    completed_call.push(')');
+
+    let recovered_tree =
+        crate::parser_pool::with_parser(|parser| parser.parse(&completed_call, None))?;
+    let recovered_root = recovered_tree.root_node();
+    let recovered_call = recovered_root.named_child(0)?;
+    if classify_bare_source_call(recovered_call, &completed_call)? != is_sys_source {
+        return None;
+    }
+    let recovered_args = recovered_call.child_by_field_name("arguments")?;
+    let recovered_value = crate::cross_file::source_detect::source_call_file_value_node(
+        &recovered_args,
+        &completed_call,
+        is_sys_source,
+    )?;
+    let expected_value_start = quote.start_byte().checked_sub(function.start_byte())?;
+    if recovered_value.kind() != "string" || recovered_value.start_byte() != expected_value_start {
+        return None;
+    }
+
+    let line_text = content.lines().nth(quote_end.row)?;
+    let content_start_byte = quote_end.column;
+    let content_end_byte = error_end.column;
+    let string = SourceStringAtCursor {
+        content_start: Position {
+            line: quote_end.row as u32,
+            character: byte_offset_to_utf16_column(line_text, content_start_byte),
+        },
+        content_end: Position {
+            line: error_end.row as u32,
+            character: byte_offset_to_utf16_column(line_text, content_end_byte),
+        },
+        content_start_byte,
+        content_end_byte,
+    };
+    Some(SourceFileArgumentAtCursor {
+        value: SourceFileArgumentValue::String(string),
+        is_sys_source,
+    })
+}
+
+fn find_enclosing_error(mut node: Node) -> Option<Node> {
+    loop {
+        if node.kind() == "ERROR" {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn previous_non_extra_sibling(node: Node) -> Option<Node> {
+    let mut sibling = node.prev_sibling();
+    while let Some(previous) = sibling {
+        if !previous.is_extra() {
+            return Some(previous);
+        }
+        sibling = previous.prev_sibling();
+    }
+    None
+}
+
+fn source_string_at_cursor(
+    string_node: Node,
+    args_node: Node,
+    content: &str,
+    position: Position,
+    point: tree_sitter::Point,
+) -> Option<SourceStringAtCursor> {
+    let string_text = node_text(string_node, content);
+    if !matches!(string_text.chars().next(), Some('"' | '\'')) {
+        return None;
+    }
+
+    let start = string_node.start_position();
+    let end = string_node.end_position();
+    if start.row != end.row || position.line != start.row as u32 {
+        return None;
+    }
+
+    let line_text = content.lines().nth(start.row)?;
+    let content_start_byte = start.column + 1;
+    let content_start = Position {
+        line: start.row as u32,
+        character: byte_offset_to_utf16_column(line_text, content_start_byte),
+    };
+    if position.character < content_start.character {
+        return None;
+    }
+
+    // A string node's end is normally exclusive. At that exact boundary we
+    // recover only for a truly unterminated string when the source call itself
+    // lacks its final `)` and this is the final argument value. The latter
+    // prevents a file string from claiming the cursor before a comma or later
+    // argument.
+    let has_explicit_close = string_has_explicit_close(string_node);
+    if point > end
+        || point == end
+            && (has_explicit_close
+                || arguments_have_explicit_close(args_node)
+                || !matched_value_is_final_argument(string_node, args_node))
+    {
+        return None;
+    }
+
+    let content_end_byte = if has_explicit_close {
+        end.column.saturating_sub(1)
+    } else {
+        end.column
+    };
+    Some(SourceStringAtCursor {
+        content_start,
+        content_end: Position {
+            line: end.row as u32,
+            character: byte_offset_to_utf16_column(line_text, content_end_byte),
+        },
+        content_start_byte,
+        content_end_byte,
+    })
+}
+
+/// Return the string syntax ancestor of the already-located cursor node,
+/// without deciding whether it has path semantics. Static folding owns that
+/// policy and reports which string nodes actually participate.
+fn string_ancestor_at_position<'tree>(
+    mut node: Node<'tree>,
+    content: &str,
+    position: Position,
+) -> Option<Node<'tree>> {
+    loop {
+        if node.kind() == "string" && string_literal_contains_position(node, content, position) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+/// Match the established source-string cursor boundaries for a nested literal:
+/// after the opening quote through the closing quote, excluding the string
+/// node's end position immediately after that delimiter.
+fn string_literal_contains_position(node: Node, content: &str, position: Position) -> bool {
+    let start = node.start_position();
+    let end = node.end_position();
+    if start.row != end.row || position.line != start.row as u32 {
+        return false;
+    }
+
+    let Some(line_text) = content.lines().nth(start.row) else {
+        return false;
+    };
+    let content_start = byte_offset_to_utf16_column(line_text, start.column.saturating_add(1));
+    let exclusive_end = byte_offset_to_utf16_column(line_text, end.column);
+    position.character >= content_start && position.character < exclusive_end
+}
+
+fn arguments_have_explicit_close(args_node: Node) -> bool {
+    args_node
+        .child_by_field_name("close")
+        .is_some_and(|close| !close.is_missing())
+}
+
+fn matched_value_is_final_argument(value_node: Node, args_node: Node) -> bool {
+    if value_node == args_node {
+        return false;
+    }
+
+    let mut argument = value_node;
+    while argument.parent() != Some(args_node) {
+        let Some(parent) = argument.parent() else {
+            return false;
+        };
+        argument = parent;
+    }
+
+    let mut sibling = argument.next_sibling();
+    while let Some(next) = sibling {
+        if !next.is_missing() {
+            return false;
+        }
+        sibling = next.next_sibling();
+    }
+    true
 }
 
 /// Find the deepest node at a given point in the AST
@@ -253,78 +612,23 @@ fn find_deepest_node_at_point(node: Node, point: tree_sitter::Point) -> Option<N
     Some(node)
 }
 
-/// Walk up the tree from a node to find if it's inside a string that's an argument to a source() call
-/// Returns (string_node, call_node) if found
-fn find_string_in_source_call<'a>(node: Node<'a>, content: &str) -> Option<(Node<'a>, Node<'a>)> {
-    let mut current = node;
-
-    // First, find the string node (we might be inside it or at it)
-    let string_node = if current.kind() == "string" {
-        current
-    } else {
-        // Walk up to find a string node
-        loop {
-            if let Some(parent) = current.parent() {
-                if parent.kind() == "string" {
-                    current = parent;
-                    break;
-                }
-                current = parent;
-            } else {
-                return None;
-            }
-        }
-        current
-    };
-
-    // Now walk up from the string to find a call node
-    let mut current = string_node;
-    loop {
-        if let Some(parent) = current.parent() {
-            if parent.kind() == "call" {
-                // Check if this is a source() or sys.source() call
-                if let Some(func_node) = parent.child_by_field_name("function") {
-                    let func_text = node_text(func_node, content);
-                    if func_text == "source" || func_text == "sys.source" {
-                        return Some((string_node, parent));
-                    }
-                }
-            }
-            current = parent;
-        } else {
-            return None;
-        }
-    }
-}
-
-/// Walk up from `node` (inclusive) to the innermost enclosing call to
-/// `source()`/`sys.source()`. Unlike [`find_string_in_source_call`] there is
-/// no string-ancestor requirement, so a cursor anywhere inside a computed
-/// file-argument expression — an identifier, `file.path`, punctuation —
-/// still finds the call (go-to-definition on computed paths, issue #638).
-fn find_enclosing_source_call<'a>(node: Node<'a>, content: &str) -> Option<Node<'a>> {
+/// Walk up from `node` (inclusive) to the innermost enclosing bare source
+/// call. Nested calls inside a computed file argument are skipped until the
+/// outer `source()`/`sys.source()` call is reached.
+fn find_enclosing_source_call<'tree>(
+    node: Node<'tree>,
+    content: &str,
+) -> Option<(Node<'tree>, bool)> {
     let mut current = Some(node);
-    while let Some(n) = current {
-        if n.kind() == "call"
-            && let Some(func) = n.child_by_field_name("function")
-            && matches!(node_text(func, content), "source" | "sys.source")
+    while let Some(node) = current {
+        if node.kind() == "call"
+            && let Some(is_sys_source) = classify_bare_source_call(node, content)
         {
-            return Some(n);
+            return Some((node, is_sys_source));
         }
-        current = n.parent();
+        current = node.parent();
     }
     None
-}
-
-/// Check if two nodes overlap (one contains the other or they are the same)
-fn nodes_overlap(a: &Node, b: &Node) -> bool {
-    // Check if they are the same node or one contains the other
-    let a_range = a.byte_range();
-    let b_range = b.byte_range();
-
-    // Check if ranges overlap
-    a_range.start <= b_range.start && a_range.end >= b_range.end
-        || b_range.start <= a_range.start && b_range.end >= a_range.end
 }
 
 /// Whether tree-sitter observed a real closing delimiter for this string.
@@ -341,87 +645,48 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
     &content[node.byte_range()]
 }
 
-/// Check if cursor is after an LSP directive where a path is expected
+/// Directive path geometry shared by completion and navigation.
 ///
-/// Uses regex patterns consistent with cross_file/directive.rs to detect
-/// `# raven: sourced-by`, `# raven: run-by`, `# raven: included-by`, and forward source directives
-/// (`# raven: source`, `# raven: run`, `# raven: include`).
-/// Handles optional colon and quotes syntax variations.
-///
-/// # Arguments
-/// * `content` - The document text content
-/// * `position` - The cursor position (line, character in UTF-16)
-///
-/// # Returns
-/// Some((directive_type, partial_path, path_start)) if in directive context
-fn is_directive_path_context(
-    content: &str,
-    position: Position,
-) -> Option<(DirectiveType, String, Position)> {
-    // Get the line at the cursor position
-    let line_text = content.lines().nth(position.line as usize)?;
-
-    // Convert cursor position from UTF-16 to byte offset
-    let cursor_byte = utf16_column_to_byte_offset(line_text, position.character);
-
-    // Get the patterns
-    let patterns = directive_path_patterns();
-
-    // Try backward directive pattern first
-    if let Some(result) = try_match_directive_path(
-        line_text,
-        cursor_byte,
-        position.line,
-        &patterns.backward,
-        DirectiveType::SourcedBy,
-    ) {
-        return Some(result);
-    }
-
-    // Try forward directive pattern
-    if let Some(result) = try_match_directive_path(
-        line_text,
-        cursor_byte,
-        position.line,
-        &patterns.forward,
-        DirectiveType::Source,
-    ) {
-        return Some(result);
-    }
-
-    None
+/// The byte range excludes optional quotes. `cursor_byte` is guaranteed to be
+/// within that range, inclusively, so completion can slice through the cursor
+/// while navigation can slice through the complete path end.
+struct DirectivePathAtCursor<'a> {
+    line_text: &'a str,
+    directive_type: DirectiveType,
+    path_start_byte: usize,
+    path_end_byte: usize,
+    cursor_byte: usize,
+    path_start: Position,
 }
 
-/// Try to match a directive pattern and extract path context
+/// Parse the forward or backward directive path under the cursor.
 ///
-/// # Arguments
-/// * `line_text` - The line text to match against
-/// * `cursor_byte` - The cursor position as byte offset
-/// * `line_num` - The line number (0-based)
-/// * `pattern` - The regex pattern to match
-/// * `directive_type` - The type of directive if matched
-///
-/// # Returns
-/// Some((directive_type, partial_path, path_start)) if cursor is in path context
-fn try_match_directive_path(
-    line_text: &str,
-    cursor_byte: usize,
-    line_num: u32,
-    pattern: &Regex,
-    directive_type: DirectiveType,
-) -> Option<(DirectiveType, String, Position)> {
-    // Check if the line matches the directive pattern
-    let caps = pattern.captures(line_text)?;
+/// Backward directives are dispatched first, preserving the historical regex
+/// precedence. Quoted paths end at the closing quote; unquoted paths end at the
+/// first whitespace. In both cases the cursor may sit exactly at either path
+/// boundary.
+fn directive_path_at_cursor(
+    content: &str,
+    position: Position,
+) -> Option<DirectivePathAtCursor<'_>> {
+    let line_text = content.lines().nth(position.line as usize)?;
+    let cursor_byte = utf16_column_to_byte_offset(line_text, position.character);
+    let patterns = directive_path_patterns();
 
-    // Get the full match to find where the directive prefix ends
-    let full_match = caps.get(0)?;
+    let (directive_type, full_match) = [
+        (DirectiveType::SourcedBy, &patterns.backward),
+        (DirectiveType::Source, &patterns.forward),
+    ]
+    .into_iter()
+    .find_map(|(directive_type, pattern)| {
+        pattern
+            .captures(line_text)
+            .and_then(|captures| captures.get(0))
+            .map(|full_match| (directive_type, full_match))
+    })?;
+
     let directive_prefix_end = full_match.end();
-
-    // The path starts after the directive prefix
-    // But we need to account for optional quotes
     let remaining = &line_text[directive_prefix_end..];
-
-    // Determine if path is quoted and find path start
     let (path_start_byte, quote_char) = if remaining.starts_with('"') {
         (directive_prefix_end + 1, Some('"'))
     } else if remaining.starts_with('\'') {
@@ -430,54 +695,49 @@ fn try_match_directive_path(
         (directive_prefix_end, None)
     };
 
-    // Check if cursor is at or after the path start position
     if cursor_byte < path_start_byte {
         return None;
     }
 
-    // Find the path end (closing quote or end of non-whitespace)
-    let path_end_byte = if let Some(quote) = quote_char {
-        // Find closing quote
-        let path_content = &line_text[path_start_byte..];
-        if let Some(close_pos) = path_content.find(quote) {
-            path_start_byte + close_pos
-        } else {
-            // No closing quote found, path extends to end of line
-            line_text.len()
-        }
-    } else {
-        // Unquoted path: ends at whitespace or end of line
-        let path_content = &line_text[path_start_byte..];
-        if let Some(space_pos) = path_content.find(char::is_whitespace) {
-            path_start_byte + space_pos
-        } else {
-            line_text.len()
-        }
+    let path_content = &line_text[path_start_byte..];
+    let path_end_byte = match quote_char {
+        Some(quote) => path_content
+            .find(quote)
+            .map_or(line_text.len(), |offset| path_start_byte + offset),
+        None => path_content
+            .find(char::is_whitespace)
+            .map_or(line_text.len(), |offset| path_start_byte + offset),
     };
 
-    // Check if cursor is within the path region
-    // Allow cursor at path_end_byte for quoted paths (user might be at closing quote)
-    // For unquoted paths, cursor can be anywhere after path_start
     if cursor_byte > path_end_byte {
         return None;
     }
 
-    // Extract partial path from path start to cursor
-    let partial_path = if cursor_byte > path_start_byte {
-        line_text[path_start_byte..cursor_byte].to_string()
-    } else {
-        String::new()
-    };
+    Some(DirectivePathAtCursor {
+        line_text,
+        directive_type,
+        path_start_byte,
+        path_end_byte,
+        cursor_byte,
+        path_start: Position {
+            line: position.line,
+            character: byte_offset_to_utf16_column(line_text, path_start_byte),
+        },
+    })
+}
 
-    // Convert path_start_byte to UTF-16 column
-    let path_start_utf16 = byte_offset_to_utf16_column(line_text, path_start_byte);
+/// Check if cursor is after an LSP directive where a path is expected.
+///
+/// Returns the directive kind, the partial path through the cursor, and the
+/// UTF-16 position where the path starts.
+fn is_directive_path_context(
+    content: &str,
+    position: Position,
+) -> Option<(DirectiveType, String, Position)> {
+    let directive = directive_path_at_cursor(content, position)?;
+    let partial_path = directive.line_text[directive.path_start_byte..directive.cursor_byte].into();
 
-    let path_start = Position {
-        line: line_num,
-        character: path_start_utf16,
-    };
-
-    Some((directive_type, partial_path, path_start))
+    Some((directive.directive_type, partial_path, directive.path_start))
 }
 
 /// Extract the partial path from string start to cursor position
@@ -568,6 +828,66 @@ fn unescape_string(s: &str) -> String {
 // Completions
 // ============================================================================
 
+#[derive(Debug)]
+struct ListedDirectoryEntry {
+    name: String,
+    #[cfg(test)]
+    path: PathBuf,
+    is_directory: bool,
+    is_within_workspace: bool,
+}
+
+#[cfg(test)]
+impl ListedDirectoryEntry {
+    fn into_tuple(self) -> (String, PathBuf, bool) {
+        (self.name, self.path, self.is_directory)
+    }
+}
+
+/// Indexed basename state for merging completion directories in precedence order.
+///
+/// Exact names always use first-base-wins semantics. ASCII-case-equivalent names
+/// from different bases are shadowed only when spelling the lower entry's name in
+/// the higher base resolves on the host filesystem. This retains distinct,
+/// reachable case variants on case-sensitive filesystems without offering an
+/// unreachable lower-base variant on case-insensitive filesystems.
+#[derive(Debug, Default)]
+struct CompletionEntryIndex {
+    exact_names: HashSet<String>,
+    folded_name_bases: HashMap<String, Vec<usize>>,
+}
+
+impl CompletionEntryIndex {
+    /// Return whether `name` is shadowed, recording it when it establishes new
+    /// precedence. Call this before workspace-boundary filtering so an excluded
+    /// higher-precedence target still prevents an unsafe lower suggestion.
+    fn is_shadowed_or_record(
+        &mut self,
+        name: &str,
+        base_index: usize,
+        base_dirs: &[PathBuf],
+    ) -> bool {
+        if self.exact_names.contains(name) {
+            return true;
+        }
+
+        let folded_name = name.to_ascii_lowercase();
+        let seen_bases = self.folded_name_bases.entry(folded_name).or_default();
+        let shadowed = seen_bases.iter().any(|seen_base_index| {
+            *seen_base_index != base_index && base_dirs[*seen_base_index].join(name).exists()
+        });
+        if shadowed {
+            return true;
+        }
+
+        self.exact_names.insert(name.to_owned());
+        if seen_bases.last() != Some(&base_index) {
+            seen_bases.push(base_index);
+        }
+        false
+    }
+}
+
 /// Generate file path completions for the given context
 ///
 /// Determines the base directory based on context type and directive variant
@@ -630,17 +950,24 @@ pub fn file_path_completions(
         return Vec::new();
     }
 
-    // 3. Get workspace root path for boundary checking
+    // 3. Get and canonicalize the workspace root once for this listing batch.
+    // Entry targets still need individual canonicalization to detect symlinks.
     let workspace_path = workspace_root.and_then(|url| url.to_file_path().ok());
+    let canonical_workspace_path = workspace_path
+        .as_deref()
+        .and_then(|workspace| workspace.canonicalize().ok());
 
-    // 4. List, filter, and merge entries in base-precedence order. Dedup by
-    // the inserted basename: if both the implicit anchor and compatibility
-    // directory contain `helper.R`, the anchor's entry is the one resolution
-    // would choose and the popup should contain it only once.
-    let mut seen_entries: Vec<(String, PathBuf)> = Vec::new();
+    // 4. List, filter, and merge entries in base-precedence order. Index names
+    // before workspace filtering: a higher-precedence external symlink must
+    // still shadow a lower entry because resolution would select that symlink.
+    let mut entry_index = CompletionEntryIndex::default();
     let mut filtered_entries = Vec::new();
-    for base_dir in base_dirs {
-        let entries = match list_directory_entries(&base_dir, workspace_path.as_deref()) {
+    for (base_index, base_dir) in base_dirs.iter().enumerate() {
+        let entries = match list_directory_entries_with_canonical_workspace(
+            base_dir,
+            workspace_path.as_deref(),
+            canonical_workspace_path.as_deref(),
+        ) {
             Ok(entries) => entries,
             Err(e) => {
                 log::trace!(
@@ -651,17 +978,13 @@ pub fn file_path_completions(
                 continue;
             }
         };
-        for entry in filter_r_files_and_dirs(entries) {
-            let name = &entry.0;
-            let shadowed = seen_entries.iter().any(|(seen_name, seen_base)| {
-                seen_name == name
-                    || (seen_base != &base_dir
-                        && seen_name.eq_ignore_ascii_case(name)
-                        && seen_base.join(name).exists())
-            });
-            if !shadowed {
-                seen_entries.push((name.clone(), base_dir.clone()));
-                filtered_entries.push(entry);
+        for entry in entries {
+            if !is_r_file_or_directory(&entry.name, entry.is_directory) {
+                continue;
+            }
+            let shadowed = entry_index.is_shadowed_or_record(&entry.name, base_index, &base_dirs);
+            if !shadowed && entry.is_within_workspace {
+                filtered_entries.push((entry.name, entry.is_directory));
             }
         }
     }
@@ -673,7 +996,7 @@ pub fn file_path_completions(
     // 6. Create completion items for each entry
     filtered_entries
         .iter()
-        .map(|(name, _path, is_directory)| {
+        .map(|(name, is_directory)| {
             create_path_completion_item(
                 name,
                 *is_directory,
@@ -698,10 +1021,33 @@ pub fn file_path_completions(
 /// Returns an error if the directory cannot be read. However, individual
 /// entry errors (e.g., permission denied on a specific file) are silently
 /// skipped to provide graceful degradation.
+#[cfg(test)]
 fn list_directory_entries(
     base_path: &Path,
     workspace_root: Option<&Path>,
 ) -> std::io::Result<Vec<(String, PathBuf, bool)>> {
+    let canonical_workspace_root = workspace_root.and_then(|path| path.canonicalize().ok());
+    let entries = list_directory_entries_with_canonical_workspace(
+        base_path,
+        workspace_root,
+        canonical_workspace_root.as_deref(),
+    )?;
+
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.is_within_workspace)
+        .map(ListedDirectoryEntry::into_tuple)
+        .collect())
+}
+
+/// List non-hidden entries while retaining whether each canonical target is
+/// inside the workspace. `canonical_workspace_root` must be computed once by
+/// the caller for the whole listing batch.
+fn list_directory_entries_with_canonical_workspace(
+    base_path: &Path,
+    workspace_root: Option<&Path>,
+    canonical_workspace_root: Option<&Path>,
+) -> std::io::Result<Vec<ListedDirectoryEntry>> {
     let mut entries = Vec::new();
 
     // Read directory entries
@@ -736,29 +1082,18 @@ fn list_directory_entries(
         // Get the full path
         let path = entry.path();
 
-        // Check workspace boundary if workspace_root is provided
-        if let Some(workspace) = workspace_root {
-            // Canonicalize paths for accurate comparison
-            // If canonicalization fails, fall back to non-canonical comparison
-            let canonical_path_opt = path.canonicalize().ok();
-            let canonical_workspace_opt = workspace.canonicalize().ok();
-
-            match (canonical_path_opt, canonical_workspace_opt) {
-                (Some(resolved), Some(ws)) => {
-                    if !resolved.starts_with(&ws) {
-                        continue;
-                    }
+        // Preserve boundary status for the precedence merge. If target
+        // canonicalization fails, retain the existing lexical fallback.
+        let is_within_workspace = match workspace_root {
+            None => true,
+            Some(workspace) => match (path.canonicalize().ok(), canonical_workspace_root) {
+                (Some(resolved), Some(canonical_workspace)) => {
+                    resolved.starts_with(canonical_workspace)
                 }
-                (None, _) => {
-                    // Path doesn't exist yet or can't be accessed
-                    // Fall back to checking if path starts with workspace
-                    if !path.starts_with(workspace) {
-                        continue;
-                    }
-                }
-                _ => continue, // Can't verify workspace boundary
-            }
-        }
+                (None, _) => path.starts_with(workspace),
+                _ => false,
+            },
+        };
 
         // Determine if this is a directory
         let is_directory = match entry.file_type() {
@@ -769,17 +1104,17 @@ fn list_directory_entries(
             }
         };
 
-        entries.push((name, path, is_directory));
+        entries.push(ListedDirectoryEntry {
+            name,
+            #[cfg(test)]
+            path,
+            is_directory,
+            is_within_workspace,
+        });
     }
 
     // Sort entries: directories first, then alphabetically by name
-    entries.sort_by(|a, b| {
-        match (a.2, b.2) {
-            (true, false) => std::cmp::Ordering::Less, // directories first
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()), // alphabetical (case-insensitive)
-        }
-    });
+    entries.sort_by_cached_key(|entry| (!entry.is_directory, entry.name.to_lowercase()));
 
     Ok(entries)
 }
@@ -795,25 +1130,28 @@ fn list_directory_entries(
 ///
 /// # Returns
 /// Filtered vector containing only R files and directories
+#[cfg(test)]
 fn filter_r_files_and_dirs(entries: Vec<(String, PathBuf, bool)>) -> Vec<(String, PathBuf, bool)> {
     entries
         .into_iter()
-        .filter(|(name, _, is_directory)| {
-            // Keep all directories for navigation
-            if *is_directory {
-                return true;
-            }
-
-            // For files, check if the extension is .R or .r
-            // Use the name to check extension (more reliable than path for edge cases)
-            if let Some(ext) = Path::new(name).extension() {
-                let ext_str = ext.to_string_lossy();
-                ext_str == "R" || ext_str == "r"
-            } else {
-                false
-            }
-        })
+        .filter(|(name, _, is_directory)| is_r_file_or_directory(name, *is_directory))
         .collect()
+}
+
+fn is_r_file_or_directory(name: &str, is_directory: bool) -> bool {
+    // Keep all directories for navigation
+    if is_directory {
+        return true;
+    }
+
+    // For files, check if the extension is .R or .r
+    // Use the name to check extension (more reliable than path for edge cases)
+    if let Some(ext) = Path::new(name).extension() {
+        let ext_str = ext.to_string_lossy();
+        ext_str == "R" || ext_str == "r"
+    } else {
+        false
+    }
 }
 
 /// Create a completion item for a file or directory
@@ -896,78 +1234,56 @@ fn create_path_completion_item(
 // Go-to-Definition
 // ============================================================================
 
-/// Get definition location for a file path at the given position
+/// Resolve an analyzed file-path navigation target to its definition location.
 ///
-/// Detects context type and resolves path using appropriate PathContext:
-/// - SourceCall: Uses PathContext::from_metadata() (respects `# raven: cd`)
-/// - Directive: Uses PathContext::new() (ignores `# raven: cd`)
+/// The target already owns its extracted or folded path, so this function does
+/// not inspect the syntax tree or repeat static binding collection.
 ///
-/// If workspace_root is provided, enforces workspace boundary: paths resolving
-/// outside the workspace return None.
+/// Resolution uses the appropriate [`PathContext`]:
+/// - Source calls use [`PathContext::from_metadata`] and respect `# raven: cd`.
+/// - Backward directives use [`PathContext::new`] and ignore `# raven: cd`.
+/// - Forward directives use the same path-resolution behavior as source calls.
 ///
-/// # Arguments
-/// * `tree` - The tree-sitter parse tree
-/// * `content` - The document text content
-/// * `position` - The cursor position
-/// * `file_uri` - URI of the current file
-/// * `metadata` - Cross-file metadata for the current file
-/// * `workspace_root` - Optional workspace root URI
-///
-/// # Returns
-/// Some(Location) at line 0, column 0 if file exists and is within workspace, None otherwise
+/// If `workspace_root` is provided, paths resolving outside it return `None`.
+/// Existing files resolve to line 0, column 0.
 pub fn file_path_definition(
-    tree: &Tree,
-    content: &str,
-    position: Position,
+    target: FilePathNavigationTarget,
     file_uri: &Url,
     metadata: &CrossFileMetadata,
     workspace_root: Option<&Url>,
 ) -> Option<Location> {
     use crate::cross_file::path_resolve::{resolve_path, resolve_path_with_workspace_fallback};
 
-    // 1. Extract file path at position
-    let (path_string, context) = extract_file_path_at_position(tree, content, position)?;
+    let (path_string, is_backward_directive) = match target {
+        FilePathNavigationTarget::SourceCall { path }
+        | FilePathNavigationTarget::Directive {
+            directive_type: DirectiveType::Source,
+            path,
+        } => (path, false),
+        FilePathNavigationTarget::Directive {
+            directive_type: DirectiveType::SourcedBy,
+            path,
+        } => (path, true),
+    };
 
-    // Return None if path is empty
     if path_string.is_empty() {
-        log::trace!(
-            "file_path_definition: Empty path string at position {:?}",
-            position
-        );
+        log::trace!("file_path_definition: Empty path string");
         return None;
     }
 
     // Normalize path separators (convert backslashes to forward slashes)
     let normalized_path = normalize_path_separators(&path_string);
 
-    // 2. Create appropriate PathContext based on context type and resolve the path.
-    let resolved_path = match &context {
-        FilePathContext::SourceCall { .. } => {
-            // source() navigation should match dependency-graph and scope resolution:
-            // respect explicit/inherited working directories, then fall back to the workspace
-            // root only when neither is present.
-            let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
-            resolve_path_with_workspace_fallback(&normalized_path, &path_context)?
-        }
-        FilePathContext::Directive { directive_type, .. } => match directive_type {
-            DirectiveType::SourcedBy => {
-                // Backward directives: relative to file's directory (ignore `# raven: cd`)
-                let path_context = PathContext::new(file_uri, workspace_root)?;
-                resolve_path(&normalized_path, &path_context)?
-            }
-            DirectiveType::Source => {
-                // Forward directives are semantically equivalent to source()
-                // calls — they get the same workspace-root fallback so that
-                // cmd-click on the directive path matches the dependency
-                // graph edge built by `dependency.rs::do_resolve`.
-                let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
-                resolve_path_with_workspace_fallback(&normalized_path, &path_context)?
-            }
-        },
-        FilePathContext::None => {
-            // Should not happen since extract_file_path_at_position returns None for this case
-            return None;
-        }
+    let resolved_path = if is_backward_directive {
+        // Backward directives: relative to file's directory (ignore `# raven: cd`)
+        let path_context = PathContext::new(file_uri, workspace_root)?;
+        resolve_path(&normalized_path, &path_context)?
+    } else {
+        // source() calls and forward directives should match dependency-graph
+        // and scope resolution: respect explicit/inherited working directories,
+        // then fall back to the workspace root only when neither is present.
+        let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
+        resolve_path_with_workspace_fallback(&normalized_path, &path_context)?
     };
 
     log::trace!(
@@ -1033,6 +1349,19 @@ pub fn file_path_definition(
     })
 }
 
+#[cfg(test)]
+fn file_path_definition_at_position(
+    tree: &Tree,
+    content: &str,
+    position: Position,
+    file_uri: &Url,
+    metadata: &CrossFileMetadata,
+    workspace_root: Option<&Url>,
+) -> Option<Location> {
+    let target = detect_file_path_navigation_target(tree, content, position)?;
+    file_path_definition(target, file_uri, metadata, workspace_root)
+}
+
 /// Extract the complete file path string at the cursor position
 ///
 /// For source() calls: extracts the full string literal content
@@ -1045,6 +1374,7 @@ pub fn file_path_definition(
 ///
 /// # Returns
 /// Some((path_string, context_type)) if cursor is on a file path
+#[cfg(test)]
 fn extract_file_path_at_position(
     tree: &Tree,
     content: &str,
@@ -1090,281 +1420,52 @@ fn extract_file_path_at_position(
 ///
 /// # Returns
 /// Some((full_path, content_start, is_sys_source)) if cursor is in source call context
+#[cfg(test)]
 fn extract_full_source_call_path(
     tree: &Tree,
     content: &str,
     position: Position,
 ) -> Option<(String, Position, bool)> {
-    // Convert LSP position (UTF-16) to tree-sitter point (bytes)
-    let line_text = content.lines().nth(position.line as usize)?;
-    let byte_col = utf16_column_to_byte_offset(line_text, position.character);
-    let point = tree_sitter::Point {
-        row: position.line as usize,
-        column: byte_col,
+    let argument = source_file_argument_at_cursor(tree, content, position)?;
+    let (full_path, content_start) = match argument.value {
+        SourceFileArgumentValue::String(string) => {
+            let line_text = content.lines().nth(string.content_start.line as usize)?;
+            let path = line_text.get(string.content_start_byte..string.content_end_byte)?;
+            (unescape_string(path), string.content_start)
+        }
+        SourceFileArgumentValue::Computed {
+            root_node,
+            value_node,
+            value_start,
+            ..
+        } => {
+            // Computed file argument: fold it statically with the SAME rules as
+            // source-call detection (issue #638), so go-to-definition navigates
+            // to the joined target from any segment. Unfoldable → None (never a
+            // wrong or partial path).
+            let bindings =
+                crate::cross_file::static_path::StaticBindings::collect(root_node, content);
+            let full_path =
+                crate::cross_file::static_path::fold_string_expr(value_node, content, &bindings)?;
+            (full_path, value_start)
+        }
     };
 
-    // Find the deepest node at the cursor position
-    let root = tree.root_node();
-    let node = find_deepest_node_at_point(root, point)?;
-
-    // Walk up to the enclosing source()/sys.source() call. Deliberately NOT
-    // via find_string_in_source_call: this extractor accepts a cursor on any
-    // part of a computed file-argument expression (`file.path(repo_root,
-    // "x.R")` — the identifier, the callee, punctuation), not only inside a
-    // string (issue #638). NOTE the production go-to-definition path reaches
-    // it only for string-literal cursors: `detect_file_path_context` gates on
-    // `is_source_call_string_context`, deliberately, so an identifier segment
-    // like `repo_root` keeps its ordinary go-to-definition to the variable's
-    // assignment instead of being shadowed by file-path navigation.
-    let call_node = find_enclosing_source_call(node, content)?;
-    let func_node = call_node.child_by_field_name("function")?;
-    let is_sys_source = match node_text(func_node, content) {
-        "source" => false,
-        "sys.source" => true,
-        _ => return None,
-    };
-
-    // Locate the file argument via the shared helper (same rule as source
-    // detection) and require the cursor to lie within it. Byte-point
-    // comparison, so multi-line computed expressions work.
-    let args_node = call_node.child_by_field_name("arguments")?;
-    let value_node = crate::cross_file::source_detect::source_call_file_value_node(
-        &args_node,
-        content,
-        is_sys_source,
-    )?;
-    let value_has_explicit_close =
-        value_node.kind() == "string" && string_has_explicit_close(value_node);
-    let at_incomplete_string_end = value_node.kind() == "string"
-        && point == value_node.end_position()
-        && !value_has_explicit_close;
-    if point < value_node.start_position()
-        || point > value_node.end_position()
-        || point == value_node.end_position() && !at_incomplete_string_end
-    {
-        return None;
-    }
-
-    if value_node.kind() != "string" {
-        // Computed file argument: fold it statically with the SAME rules as
-        // source-call detection (issue #638), so go-to-definition navigates
-        // to the joined target from any segment. Unfoldable → None (never a
-        // wrong or partial path). NOTE: unlike the literal branch below,
-        // folding never unescapes string contents — its leaf case rejects
-        // escaped literals outright, so the two branches cannot diverge on
-        // the same input.
-        let bindings = crate::cross_file::static_path::StaticBindings::collect(root, content);
-        let full_path =
-            crate::cross_file::static_path::fold_string_expr(value_node, content, &bindings)?;
-        let start = value_node.start_position();
-        let start_line_text = content.lines().nth(start.row).unwrap_or("");
-        let content_start = Position {
-            line: start.row as u32,
-            character: byte_offset_to_utf16_column(start_line_text, start.column),
-        };
-        return Some((full_path, content_start, is_sys_source));
-    }
-    let string_node = value_node;
-
-    // Get the string content boundaries (excluding quotes)
-    let string_text = node_text(string_node, content);
-    if string_text.len() < 2 {
-        return None; // String too short to have content
-    }
-
-    // Determine quote character and content start
-    let quote_char = string_text.chars().next()?;
-    if quote_char != '"' && quote_char != '\'' {
-        return None;
-    }
-
-    // Calculate content start position (after opening quote)
-    let string_start = string_node.start_position();
-    let string_start_line_text = content.lines().nth(string_start.row).unwrap_or("");
-    let content_start_byte = string_start.column + 1; // +1 for opening quote
-    let content_start_utf16 =
-        byte_offset_to_utf16_column(string_start_line_text, content_start_byte);
-    let content_start = Position {
-        line: string_start.row as u32,
-        character: content_start_utf16,
-    };
-
-    // Calculate string content end (before closing quote)
-    let string_end = string_node.end_position();
-
-    // Check if cursor is within the string content (after opening quote, before closing quote)
-    // Cursor must be on the same line as string start (we don't support multi-line strings)
-    if position.line != string_start.row as u32 {
-        return None;
-    }
-
-    // Check cursor is after opening quote
-    if position.character < content_start_utf16 {
-        return None;
-    }
-
-    // Keep the closing quote (`end - 1`) clickable, but reject the exclusive
-    // node end immediately after it.
-    let string_end_line_text = content.lines().nth(string_end.row).unwrap_or("");
-    let content_end_utf16 = byte_offset_to_utf16_column(string_end_line_text, string_end.column);
-    if value_has_explicit_close
-        && position.line == string_end.row as u32
-        && position.character >= content_end_utf16
-    {
-        return None;
-    }
-
-    // Extract the FULL path content (from content start to content end, excluding quotes)
-    // The string content is between the quotes
-    let content_end_byte = if value_has_explicit_close {
-        string_end.column.saturating_sub(1)
-    } else {
-        string_end.column
-    };
-    let full_path = if content_end_byte > content_start_byte {
-        let path_bytes = &string_start_line_text[content_start_byte..content_end_byte];
-        unescape_string(path_bytes)
-    } else {
-        String::new()
-    };
-
-    Some((full_path, content_start, is_sys_source))
+    Some((full_path, content_start, argument.is_sys_source))
 }
 
-/// Extract the full path string from an LSP directive at the cursor position
+/// Extract the full path string from an LSP directive at the cursor position.
 ///
-/// Unlike `is_directive_path_context()` which returns the partial path up to cursor,
-/// this function returns the FULL path for go-to-definition.
-///
-/// # Arguments
-/// * `content` - The document text content
-/// * `position` - The cursor position (line, character in UTF-16)
-///
-/// # Returns
-/// Some((directive_type, full_path, path_start)) if cursor is in directive context
+/// Unlike [`is_directive_path_context`], which slices through the cursor, this
+/// function slices through the complete path end for navigation.
 fn extract_full_directive_path(
     content: &str,
     position: Position,
 ) -> Option<(DirectiveType, String, Position)> {
-    // Get the line at the cursor position
-    let line_text = content.lines().nth(position.line as usize)?;
+    let directive = directive_path_at_cursor(content, position)?;
+    let full_path = directive.line_text[directive.path_start_byte..directive.path_end_byte].into();
 
-    // Convert cursor position from UTF-16 to byte offset
-    let cursor_byte = utf16_column_to_byte_offset(line_text, position.character);
-
-    // Get the patterns
-    let patterns = directive_path_patterns();
-
-    // Try backward directive pattern first
-    if let Some(result) = try_extract_full_directive_path(
-        line_text,
-        cursor_byte,
-        position.line,
-        &patterns.backward,
-        DirectiveType::SourcedBy,
-    ) {
-        return Some(result);
-    }
-
-    // Try forward directive pattern
-    if let Some(result) = try_extract_full_directive_path(
-        line_text,
-        cursor_byte,
-        position.line,
-        &patterns.forward,
-        DirectiveType::Source,
-    ) {
-        return Some(result);
-    }
-
-    None
-}
-
-/// Try to match a directive pattern and extract the full path
-///
-/// # Arguments
-/// * `line_text` - The line text to match against
-/// * `cursor_byte` - The cursor position as byte offset
-/// * `line_num` - The line number (0-based)
-/// * `pattern` - The regex pattern to match
-/// * `directive_type` - The type of directive if matched
-///
-/// # Returns
-/// Some((directive_type, full_path, path_start)) if cursor is in path context
-fn try_extract_full_directive_path(
-    line_text: &str,
-    cursor_byte: usize,
-    line_num: u32,
-    pattern: &Regex,
-    directive_type: DirectiveType,
-) -> Option<(DirectiveType, String, Position)> {
-    // Check if the line matches the directive pattern
-    let caps = pattern.captures(line_text)?;
-
-    // Get the full match to find where the directive prefix ends
-    let full_match = caps.get(0)?;
-    let directive_prefix_end = full_match.end();
-
-    // The path starts after the directive prefix
-    // But we need to account for optional quotes
-    let remaining = &line_text[directive_prefix_end..];
-
-    // Determine if path is quoted and find path start
-    let (path_start_byte, quote_char) = if remaining.starts_with('"') {
-        (directive_prefix_end + 1, Some('"'))
-    } else if remaining.starts_with('\'') {
-        (directive_prefix_end + 1, Some('\''))
-    } else {
-        (directive_prefix_end, None)
-    };
-
-    // Check if cursor is at or after the path start position
-    if cursor_byte < path_start_byte {
-        return None;
-    }
-
-    // Find the path end (closing quote or end of non-whitespace)
-    let path_end_byte = if let Some(quote) = quote_char {
-        // Find closing quote
-        let path_content = &line_text[path_start_byte..];
-        if let Some(close_pos) = path_content.find(quote) {
-            path_start_byte + close_pos
-        } else {
-            // No closing quote found, path extends to end of line
-            line_text.len()
-        }
-    } else {
-        // Unquoted path: ends at whitespace or end of line
-        let path_content = &line_text[path_start_byte..];
-        if let Some(space_pos) = path_content.find(char::is_whitespace) {
-            path_start_byte + space_pos
-        } else {
-            line_text.len()
-        }
-    };
-
-    // Check if cursor is within the path region
-    // Allow cursor at path_end_byte for quoted paths (user might be clicking on the path)
-    if cursor_byte > path_end_byte {
-        return None;
-    }
-
-    // Extract the FULL path (from path start to path end)
-    let full_path = if path_end_byte > path_start_byte {
-        line_text[path_start_byte..path_end_byte].to_string()
-    } else {
-        String::new()
-    };
-
-    // Convert path_start_byte to UTF-16 column
-    let path_start_utf16 = byte_offset_to_utf16_column(line_text, path_start_byte);
-
-    let path_start = Position {
-        line: line_num,
-        character: path_start_utf16,
-    };
-
-    Some((directive_type, full_path, path_start))
+    Some((directive.directive_type, full_path, directive.path_start))
 }
 
 // ============================================================================
@@ -1401,87 +1502,9 @@ pub fn resolve_base_directory(
     metadata: &CrossFileMetadata,
     workspace_root: Option<&Url>,
 ) -> Option<PathBuf> {
-    use crate::cross_file::path_resolve::{resolve_path, resolve_path_with_workspace_fallback};
-
-    // Extract partial path from context
-    let partial_path = match context {
-        FilePathContext::SourceCall { partial_path, .. } => partial_path,
-        FilePathContext::Directive { partial_path, .. } => partial_path,
-        FilePathContext::None => return None,
-    };
-
-    // Normalize path separators (convert backslashes to forward slashes)
-    let normalized_partial = normalize_path_separators(partial_path);
-
-    // Get the directory component of the partial path
-    // e.g., "../data/file.R" -> "../data/", "file.R" -> "", "../" -> "../"
-    let partial_dir = extract_directory_component(&normalized_partial);
-    let resolution_path = if partial_dir.len() > 1 {
-        partial_dir.trim_end_matches('/')
-    } else {
-        partial_dir.as_str()
-    };
-
-    // Handle workspace-root-relative paths (paths starting with `/`)
-    // For BOTH SourceCall and Directive contexts: `/path` resolves relative to workspace root
-    // If workspace_root is None, return None (cannot resolve workspace-relative paths)
-    if normalized_partial.starts_with('/') {
-        let workspace_path = workspace_root.and_then(|url| url.to_file_path().ok())?;
-
-        // Strip the leading `/` from partial_dir and join with workspace root
-        let relative_dir = partial_dir.strip_prefix('/').unwrap_or(&partial_dir);
-
-        if relative_dir.is_empty() {
-            // Just "/" - return workspace root
-            return Some(workspace_path);
-        }
-
-        // Join workspace root with the relative directory
-        let joined = workspace_path.join(relative_dir);
-        return normalize_path_for_completion(&joined);
-    }
-
-    match context {
-        FilePathContext::SourceCall { .. } => {
-            let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
-            if partial_dir.is_empty() {
-                path_context
-                    .forward_completion_base_directories()
-                    .into_iter()
-                    .next()
-            } else {
-                resolve_path_with_workspace_fallback(resolution_path, &path_context)
-            }
-        }
-        FilePathContext::Directive { directive_type, .. } => match directive_type {
-            DirectiveType::SourcedBy => {
-                // Backward directives: relative to file's directory (ignore `# raven: cd`)
-                let path_context = PathContext::new(file_uri, workspace_root)?;
-                if partial_dir.is_empty() {
-                    Some(path_context.effective_working_directory())
-                } else {
-                    resolve_path(resolution_path, &path_context)
-                }
-            }
-            DirectiveType::Source => {
-                // Forward directives are semantically equivalent to source()
-                // calls — they get the same workspace-root fallback so that
-                // path completion inside the directive lists workspace-root
-                // files (matching the dependency graph behavior). Mirror the
-                // SourceCall arm above.
-                let path_context = PathContext::from_metadata(file_uri, metadata, workspace_root)?;
-                if partial_dir.is_empty() {
-                    path_context
-                        .forward_completion_base_directories()
-                        .into_iter()
-                        .next()
-                } else {
-                    resolve_path_with_workspace_fallback(resolution_path, &path_context)
-                }
-            }
-        },
-        FilePathContext::None => None,
-    }
+    resolve_completion_base_directories(context, file_uri, metadata, workspace_root)
+        .into_iter()
+        .next()
 }
 
 /// Resolve every directory whose entries should be merged for path
@@ -1497,6 +1520,8 @@ fn resolve_completion_base_directories(
     metadata: &CrossFileMetadata,
     workspace_root: Option<&Url>,
 ) -> Vec<PathBuf> {
+    use crate::cross_file::path_resolve::{resolve_path, resolve_path_with_workspace_fallback};
+
     let partial_path = match context {
         FilePathContext::SourceCall { partial_path, .. }
         | FilePathContext::Directive { partial_path, .. } => partial_path,
@@ -1505,6 +1530,26 @@ fn resolve_completion_base_directories(
     let normalized_partial = normalize_path_separators(partial_path);
     let partial_dir = extract_directory_component(&normalized_partial);
 
+    // Workspace-root-relative completion is context independent and needs no
+    // PathContext construction.
+    if normalized_partial.starts_with('/') {
+        let Some(workspace_path) = workspace_root.and_then(|url| url.to_file_path().ok()) else {
+            return Vec::new();
+        };
+        let relative_dir = partial_dir.strip_prefix('/').unwrap_or(&partial_dir);
+        if relative_dir.is_empty() {
+            return vec![workspace_path];
+        }
+        return normalize_path_public(&workspace_path.join(relative_dir))
+            .into_iter()
+            .collect();
+    }
+
+    let resolution_path = if partial_dir.len() > 1 {
+        partial_dir.trim_end_matches('/')
+    } else {
+        partial_dir.as_str()
+    };
     let is_forward = matches!(
         context,
         FilePathContext::SourceCall { .. }
@@ -1513,7 +1558,8 @@ fn resolve_completion_base_directories(
                 ..
             }
     );
-    if is_forward && !normalized_partial.starts_with('/') {
+
+    if is_forward {
         let Some(path_context) = PathContext::from_metadata(file_uri, metadata, workspace_root)
         else {
             return Vec::new();
@@ -1521,33 +1567,36 @@ fn resolve_completion_base_directories(
         if partial_dir.is_empty() {
             return path_context.forward_completion_base_directories();
         }
-        if path_context.implicit_test_working_directory.is_some() {
-            let resolution_path = if partial_dir.len() > 1 {
-                partial_dir.trim_end_matches('/')
-            } else {
-                partial_dir.as_str()
-            };
-            let mut directories: Vec<_> = path_context
-                .forward_completion_base_directories()
-                .into_iter()
-                .filter_map(|base| normalize_path_for_completion(&base.join(resolution_path)))
-                .collect();
 
-            // Retain the rich resolver's case correction and workspace-root
-            // fallback when neither implicit candidate supplies the typed
-            // directory. If it resolved to an implicit candidate already,
-            // this is just a no-op deduplication.
-            if let Some(resolved) =
-                resolve_base_directory(context, file_uri, metadata, workspace_root)
-                && !directories.contains(&resolved)
-            {
-                directories.push(resolved);
-            }
-            return directories;
+        let resolved = resolve_path_with_workspace_fallback(resolution_path, &path_context);
+        if path_context.implicit_test_working_directory.is_none() {
+            return resolved.into_iter().collect();
         }
+
+        // Preserve the resolver's exact-before-case-insensitive base ordering:
+        // list each implicit/test compatibility/workspace candidate as typed,
+        // then append a distinct case-corrected result. Nonexistent typed
+        // candidates naturally drop out when the completion provider lists them.
+        let mut directories: Vec<_> = path_context
+            .forward_completion_base_directories()
+            .into_iter()
+            .filter_map(|base| normalize_path_public(&base.join(resolution_path)))
+            .collect();
+        if let Some(resolved) = resolved
+            && !directories.contains(&resolved)
+        {
+            directories.push(resolved);
+        }
+        return directories;
     }
 
-    resolve_base_directory(context, file_uri, metadata, workspace_root)
+    let Some(path_context) = PathContext::new(file_uri, workspace_root) else {
+        return Vec::new();
+    };
+    if partial_dir.is_empty() {
+        return vec![path_context.effective_working_directory()];
+    }
+    resolve_path(resolution_path, &path_context)
         .into_iter()
         .collect()
 }
@@ -1572,48 +1621,6 @@ fn extract_directory_component(partial_path: &str) -> String {
         // No separator found, no directory component
         String::new()
     }
-}
-
-/// Normalize a path for completion purposes
-///
-/// Resolves `.` and `..` components without requiring the path to exist.
-/// This is similar to `canonicalize()` but works on non-existent paths.
-///
-/// # Arguments
-/// * `path` - The path to normalize
-///
-/// # Returns
-/// Some(PathBuf) with the normalized path, or None if normalization fails
-fn normalize_path_for_completion(path: &Path) -> Option<PathBuf> {
-    let mut components = Vec::new();
-
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                // Only pop if the last component is a Normal segment
-                // Preserve RootDir and Prefix components
-                if let Some(last) = components.last()
-                    && matches!(last, std::path::Component::Normal(_))
-                {
-                    components.pop();
-                }
-            }
-            std::path::Component::CurDir => {
-                // Skip current directory components
-            }
-            c => components.push(c),
-        }
-    }
-
-    if components.is_empty() {
-        return None;
-    }
-
-    let mut result = PathBuf::new();
-    for c in components {
-        result.push(c);
-    }
-    Some(result)
 }
 
 /// Normalize backslashes to forward slashes in a path string
@@ -1714,6 +1721,21 @@ mod tests {
             .set_language(&tree_sitter_r::LANGUAGE.into())
             .unwrap();
         parser.parse(code, None).unwrap()
+    }
+
+    fn apply_ascii_completion_edit(code: &str, item: &CompletionItem) -> String {
+        let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+            panic!("expected completion text edit");
+        };
+        assert_eq!(edit.range.start.line, 0);
+        assert_eq!(edit.range.end.line, 0);
+
+        let mut result = code.to_string();
+        result.replace_range(
+            edit.range.start.character as usize..edit.range.end.character as usize,
+            &edit.new_text,
+        );
+        result
     }
 
     // Unit tests will be added in subsequent tasks
@@ -2035,6 +2057,176 @@ mod tests {
             assert!(
                 is_source_call_string_context(&tree, code, position).is_none(),
                 "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_incomplete_source_string_ast_recovery_uses_r_argument_matching() {
+        for (code, expected_path, expected_sys_source) in [
+            (r#"source(""#, "", false),
+            (r#"source("uti"#, "uti", false),
+            (r#"source(fi = "uti"#, "uti", false),
+            (r#"source(fil = "uti"#, "uti", false),
+            (r#"source(local = FALSE, file = "uti"#, "uti", false),
+            (r#"source(local = FALSE, "uti"#, "uti", false),
+            (r#"sys.source(envir = globalenv(), fil = "uti"#, "uti", true),
+            (r#"sys.source(envir = globalenv(), "uti"#, "uti", true),
+            (r#"prefix <- "😀"; source(fi = "é/uti"#, "é/uti", false),
+        ] {
+            let tree = parse_r(code);
+            let position = Position::new(0, code.encode_utf16().count() as u32);
+            let (partial, content_start, is_sys_source) =
+                is_source_call_string_context(&tree, code, position)
+                    .unwrap_or_else(|| panic!("missing context for {code}"));
+            assert_eq!(partial, expected_path, "{code}");
+            assert_eq!(is_sys_source, expected_sys_source, "{code}");
+            let opening_quote = if expected_path.is_empty() {
+                code.rfind('"').unwrap()
+            } else {
+                code.rfind(expected_path).unwrap() - 1
+            };
+            assert_eq!(
+                content_start.character,
+                code[..=opening_quote].encode_utf16().count() as u32,
+                "{code}"
+            );
+
+            let (path, full_start, full_is_sys_source) =
+                extract_full_source_call_path(&tree, code, position)
+                    .unwrap_or_else(|| panic!("missing path for {code}"));
+            assert_eq!(path, expected_path, "{code}");
+            assert_eq!(full_start, content_start, "{code}");
+            assert_eq!(full_is_sys_source, expected_sys_source, "{code}");
+        }
+    }
+
+    #[test]
+    fn test_closed_source_string_without_call_close_rejects_exclusive_end_completion() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("utils.R"), "").unwrap();
+        let file_uri = Url::from_file_path(temp_dir.path().join("main.R")).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = CrossFileMetadata::default();
+        let code = "source(\"uti\"";
+        let tree = parse_r(code);
+        let exclusive_end = Position::new(0, code.encode_utf16().count() as u32);
+
+        let rejected = detect_file_path_context(&tree, code, exclusive_end);
+        assert_eq!(rejected, FilePathContext::None);
+        assert!(
+            file_path_completions(
+                &rejected,
+                &file_uri,
+                &metadata,
+                Some(&workspace_root),
+                exclusive_end,
+            )
+            .is_empty()
+        );
+
+        // Completion immediately before the explicit closing quote remains valid,
+        // and its real text edit must leave that quote in the resulting source.
+        let before_quote = Position::new(0, exclusive_end.character - 1);
+        let context = detect_file_path_context(&tree, code, before_quote);
+        let completions = file_path_completions(
+            &context,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+            before_quote,
+        );
+        let completion = completions
+            .iter()
+            .find(|item| item.label == "utils.R")
+            .expect("expected utils.R completion before the closing quote");
+        assert_eq!(
+            apply_ascii_completion_edit(code, completion),
+            "source(\"utils.R\""
+        );
+    }
+
+    #[test]
+    fn test_unterminated_source_string_exclusive_end_completion_remains_valid() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("utils.R"), "").unwrap();
+        let file_uri = Url::from_file_path(temp_dir.path().join("main.R")).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let metadata = CrossFileMetadata::default();
+        let code = "source(\"uti";
+        let tree = parse_r(code);
+        let cursor = Position::new(0, code.encode_utf16().count() as u32);
+        let context = detect_file_path_context(&tree, code, cursor);
+        assert!(matches!(
+            &context,
+            FilePathContext::SourceCall { partial_path, .. } if partial_path == "uti"
+        ));
+
+        let completions = file_path_completions(
+            &context,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+            cursor,
+        );
+        let completion = completions
+            .iter()
+            .find(|item| item.label == "utils.R")
+            .expect("expected utils.R completion at the unterminated string end");
+        assert_eq!(
+            apply_ascii_completion_edit(code, completion),
+            "source(\"utils.R"
+        );
+    }
+
+    #[test]
+    fn test_incomplete_source_string_recovery_rejects_non_bare_or_unmatched_syntax() {
+        for code in [
+            r#"# source("uti"#,
+            r#"x <- "uti"#,
+            r#"print("uti"#,
+            r#"object$source("uti"#,
+            r#"base::source("uti"#,
+            r#"source(local = "uti"#,
+            r#"source(file = "real.R", "uti"#,
+            r#"source(file = "real.R", fi = "uti"#,
+        ] {
+            let tree = parse_r(code);
+            let position = Position::new(0, code.encode_utf16().count() as u32);
+            assert!(
+                is_source_call_string_context(&tree, code, position).is_none(),
+                "unexpected completion context for {code}"
+            );
+            assert!(
+                extract_full_source_call_path(&tree, code, position).is_none(),
+                "unexpected navigation path for {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_closed_source_file_argument_before_other_arguments_is_not_recovered_at_end() {
+        for code in [
+            r#"source("closed.R", local = TRUE)"#,
+            r#"source("closed.R", local = TRUE"#,
+            r#"source("closed.R","#,
+        ] {
+            let tree = parse_r(code);
+            let after_file_quote = code.find("\",").unwrap() as u32 + 1;
+            let position = Position::new(0, after_file_quote);
+            assert!(
+                is_source_call_string_context(&tree, code, position).is_none(),
+                "unexpected completion context for {code}"
+            );
+            assert!(
+                extract_full_source_call_path(&tree, code, position).is_none(),
+                "unexpected navigation path for {code}"
             );
         }
     }
@@ -2706,6 +2898,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_shared_directive_parser_completion_and_navigation_slices() {
+        let cases = [
+            (
+                "# @lsp-sourced-by ../main.R",
+                Position::new(0, 18),
+                DirectiveType::SourcedBy,
+                "",
+                "../main.R",
+                18,
+            ),
+            (
+                r#"# @lsp-source "utils/helpers.R""#,
+                Position::new(0, 20),
+                DirectiveType::Source,
+                "utils",
+                "utils/helpers.R",
+                15,
+            ),
+            (
+                "# @lsp-source utils.R trailing",
+                Position::new(0, 21),
+                DirectiveType::Source,
+                "utils.R",
+                "utils.R",
+                14,
+            ),
+            (
+                "# @lsp-sourced-by '../main.R'",
+                Position::new(0, 28),
+                DirectiveType::SourcedBy,
+                "../main.R",
+                "../main.R",
+                19,
+            ),
+        ];
+
+        for (content, position, expected_type, expected_partial, expected_full, expected_start) in
+            cases
+        {
+            let (completion_type, partial, completion_start) =
+                is_directive_path_context(content, position).unwrap();
+            let (navigation_type, full, navigation_start) =
+                extract_full_directive_path(content, position).unwrap();
+
+            assert_eq!(completion_type, expected_type);
+            assert_eq!(navigation_type, expected_type);
+            assert_eq!(partial, expected_partial);
+            assert_eq!(full, expected_full);
+            assert_eq!(completion_start, Position::new(0, expected_start));
+            assert_eq!(navigation_start, completion_start);
+        }
+
+        let after_unquoted_path = Position::new(0, 22);
+        assert!(
+            is_directive_path_context("# @lsp-source utils.R trailing", after_unquoted_path)
+                .is_none()
+        );
+        assert!(
+            extract_full_directive_path("# @lsp-source utils.R trailing", after_unquoted_path)
+                .is_none()
+        );
+
+        let after_closing_quote = Position::new(0, 29);
+        assert!(
+            is_directive_path_context("# @lsp-sourced-by '../main.R'", after_closing_quote)
+                .is_none()
+        );
+        assert!(
+            extract_full_directive_path("# @lsp-sourced-by '../main.R'", after_closing_quote)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_shared_directive_parser_uses_utf16_cursor_columns() {
+        let content = r#"# @lsp-source "🎉/utils.R""#;
+        let position = Position::new(0, 18);
+
+        let (completion_type, partial, completion_start) =
+            is_directive_path_context(content, position).unwrap();
+        let (navigation_type, full, navigation_start) =
+            extract_full_directive_path(content, position).unwrap();
+
+        assert_eq!(completion_type, DirectiveType::Source);
+        assert_eq!(navigation_type, DirectiveType::Source);
+        assert_eq!(partial, "🎉/");
+        assert_eq!(full, "🎉/utils.R");
+        assert_eq!(completion_start, Position::new(0, 15));
+        assert_eq!(navigation_start, completion_start);
+    }
+
     // ========================================================================
     // Tests for detect_file_path_context
     // ========================================================================
@@ -3043,11 +3327,191 @@ mod tests {
     }
 
     #[test]
+    fn test_navigation_context_computed_paths_is_literal_only() {
+        let code = "repo_root <- normalizePath(\"scripts\")\nsource(file.path(\"🎉base\", repo_root, \"helpers.R\"))";
+        let tree = parse_r(code);
+
+        let source_line = code.lines().nth(1).unwrap();
+        let position_in = |needle: &str, offset: usize| {
+            let byte = source_line.find(needle).unwrap() + offset;
+            Position::new(1, source_line[..byte].encode_utf16().count() as u32)
+        };
+        let literal_position = position_in("helpers.R", 1);
+        assert_eq!(
+            detect_file_path_context(&tree, code, literal_position),
+            FilePathContext::None,
+            "completion must remain disabled in computed expressions"
+        );
+        assert_eq!(
+            detect_file_path_navigation_target(&tree, code, literal_position),
+            Some(FilePathNavigationTarget::SourceCall {
+                path: "🎉base/scripts/helpers.R".to_string(),
+            })
+        );
+
+        let identifier_position = position_in("repo_root", 2);
+        assert_eq!(
+            detect_file_path_navigation_target(&tree, code, identifier_position),
+            None,
+            "identifier segments must retain ordinary symbol navigation at UTF-16 positions"
+        );
+        let helper_position = position_in("file.path", 2);
+        assert_eq!(
+            detect_file_path_navigation_target(&tree, code, helper_position),
+            None,
+            "helper identifiers are not path-literal targets"
+        );
+    }
+
+    #[test]
+    fn test_navigation_context_shared_fold_handles_nested_named_paths() {
+        let code = r#"source(file.path((normalizePath((file.path(("🎉scripts"), "nested")), winslash = "base-option")), normalizePath(path = (file.path(("helpers.R"))), winslash = "slash-option", mustWork = "work-option"), fsep = "/"))"#;
+        let tree = parse_r(code);
+        let position_in = |needle: &str| {
+            let byte = code.find(needle).unwrap() + 1;
+            Position::new(0, code[..byte].encode_utf16().count() as u32)
+        };
+        let target_position = position_in("helpers.R");
+        assert_eq!(
+            extract_file_path_at_position(&tree, code, target_position).map(|(path, _)| path),
+            Some("🎉scripts/nested/helpers.R".to_string()),
+            "the shared static fold must accept the UTF-16 nested fixture"
+        );
+
+        assert_eq!(
+            detect_file_path_navigation_target(&tree, code, target_position),
+            Some(FilePathNavigationTarget::SourceCall {
+                path: "🎉scripts/nested/helpers.R".to_string(),
+            })
+        );
+
+        for non_path in [
+            "file.path",
+            "normalizePath",
+            "base-option",
+            "slash-option",
+            "work-option",
+        ] {
+            let position = position_in(non_path);
+            assert_eq!(
+                detect_file_path_navigation_target(&tree, code, position),
+                None,
+                "non-path syntax must not become a target: {non_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_computed_argument_carries_deepest_cursor_node_to_navigation() {
+        let code = r#"source(file.path((("🎉scripts")), normalizePath(path = (("helpers.R")))))"#;
+        let tree = parse_r(code);
+        let target_byte = code.find("helpers.R").unwrap() + 2;
+        let position = Position::new(0, code[..target_byte].encode_utf16().count() as u32);
+        let line_text = code.lines().next().unwrap();
+        let point = tree_sitter::Point {
+            row: 0,
+            column: utf16_column_to_byte_offset(line_text, position.character),
+        };
+        let deepest = find_deepest_node_at_point(tree.root_node(), point).unwrap();
+
+        let argument = source_file_argument_at_cursor(&tree, code, position).unwrap();
+        let SourceFileArgumentValue::Computed { cursor_node, .. } = argument.value else {
+            panic!("expected a computed source-file argument");
+        };
+        assert_eq!(cursor_node, deepest);
+        let literal = string_ancestor_at_position(cursor_node, code, position)
+            .expect("the carried node should reach its string ancestor");
+        assert_eq!(node_text(literal, code), r#""helpers.R""#);
+        assert_eq!(
+            detect_file_path_navigation_target(&tree, code, position),
+            Some(FilePathNavigationTarget::SourceCall {
+                path: "🎉scripts/helpers.R".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_navigation_context_computed_literal_boundaries() {
+        let code = r#"source(file.path("scripts", "helpers.R"))"#;
+        let tree = parse_r(code);
+        let opening_quote = code.find("\"scripts\"").unwrap() as u32;
+        let closing_quote = opening_quote + "\"scripts".len() as u32;
+
+        assert_eq!(
+            detect_file_path_navigation_target(&tree, code, Position::new(0, opening_quote)),
+            None,
+            "the opening quote boundary remains outside"
+        );
+        assert_eq!(
+            detect_file_path_navigation_target(&tree, code, Position::new(0, opening_quote + 1),),
+            Some(FilePathNavigationTarget::SourceCall {
+                path: "scripts/helpers.R".to_string(),
+            })
+        );
+        assert_eq!(
+            detect_file_path_navigation_target(&tree, code, Position::new(0, closing_quote)),
+            Some(FilePathNavigationTarget::SourceCall {
+                path: "scripts/helpers.R".to_string(),
+            }),
+            "the closing quote remains a valid path target"
+        );
+        assert_eq!(
+            detect_file_path_navigation_target(&tree, code, Position::new(0, closing_quote + 1),),
+            None,
+            "the string node's exclusive end remains outside"
+        );
+    }
+
+    #[test]
+    fn test_navigation_context_ignores_computed_option_literals() {
+        for (code, option_literal, cursor_text) in [
+            (
+                r#"source(file.path("🎉scripts", "helpers.R", fsep = "/"))"#,
+                "fsep = \"/\"",
+                "/",
+            ),
+            (
+                r#"source(normalizePath("🎉scripts/helpers.R", winslash = "/"))"#,
+                "winslash = \"/\"",
+                "/",
+            ),
+            (
+                r#"source(normalizePath(path = "🎉scripts/helpers.R", mustWork = "option"))"#,
+                "mustWork = \"option\"",
+                "option",
+            ),
+        ] {
+            let tree = parse_r(code);
+            let option_start = code.find(option_literal).unwrap();
+            let cursor_byte = option_start + option_literal.find(cursor_text).unwrap();
+            let cursor = code[..cursor_byte].encode_utf16().count() as u32;
+            assert_eq!(
+                detect_file_path_navigation_target(&tree, code, Position::new(0, cursor)),
+                None,
+                "option literals are not path segments at a UTF-16 position: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_navigation_context_rejects_nonfoldable_computed_path() {
+        let code = r#"source(file.path("scripts", Sys.getenv("ROOT"), "helpers.R"))"#;
+        let tree = parse_r(code);
+        for literal in ["scripts", "ROOT", "helpers.R"] {
+            let position = Position::new(0, code.find(literal).unwrap() as u32 + 1);
+            assert_eq!(
+                detect_file_path_navigation_target(&tree, code, position),
+                None,
+                "nonfoldable expression must not mark {literal} as path-bearing"
+            );
+        }
+    }
+
+    #[test]
     fn test_extract_file_path_computed_file_path_all_segments() {
-        // Go-to-definition on a computed path (issue #638): every cursor
-        // position inside the file-argument expression — first segment,
-        // second segment, the `file.path` callee, the variable — must yield
-        // the same folded path.
+        // The low-level extractor can fold the matched argument from any cursor
+        // inside it. The production handler's navigation-specific predicate
+        // narrows interception to contributing string-literal segments.
         let code = "repo_root <- normalizePath(file.path(\"..\", \"..\"))\nsource(file.path(repo_root, \"scripts/helpers.R\"))";
         let tree = parse_r(code);
         // Columns on line 1: inside `file.path` (9), inside `repo_root` (20),
@@ -6000,7 +6464,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &code,
                     position,
@@ -6107,7 +6571,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &code,
                     position,
@@ -6212,7 +6676,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &code,
                     position,
@@ -6305,7 +6769,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &code,
                     position,
@@ -6398,7 +6862,7 @@ mod tests {
                     };
 
                     // Call the function under test
-                    let result = file_path_definition(
+                    let result = file_path_definition_at_position(
                         &tree,
                         &code,
                         position,
@@ -6481,7 +6945,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &code,
                     position,
@@ -6553,7 +7017,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &code,
                     position,
@@ -6624,7 +7088,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &code,
                     position,
@@ -6693,7 +7157,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -6778,7 +7242,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -6891,7 +7355,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -6999,7 +7463,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -7099,7 +7563,7 @@ mod tests {
                     };
 
                     // Call the function under test
-                    let result = file_path_definition(
+                    let result = file_path_definition_at_position(
                         &tree,
                         &content,
                         position,
@@ -7190,7 +7654,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -7297,7 +7761,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -7384,7 +7848,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -7467,7 +7931,7 @@ mod tests {
                     };
 
                     // Call the function under test
-                    let result = file_path_definition(
+                    let result = file_path_definition_at_position(
                         &tree,
                         &content,
                         position,
@@ -7588,7 +8052,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -7712,7 +8176,7 @@ mod tests {
                 };
 
                 // Call the function under test
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -7825,7 +8289,7 @@ mod tests {
                 };
 
                 // Call the function under test for the backward directive
-                let result = file_path_definition(
+                let result = file_path_definition_at_position(
                     &tree,
                     &content,
                     position,
@@ -7904,7 +8368,7 @@ mod tests {
 
                 // Go-to-definition should return None without panicking
                 // (the file with null byte in name cannot exist)
-                let gtd_result = file_path_definition(
+                let gtd_result = file_path_definition_at_position(
                     &tree,
                     &code_with_null,
                     position,
@@ -7950,7 +8414,7 @@ mod tests {
                 let code_with_control = format!("source(\"{}\")", invalid_path_with_control);
                 let tree_control = parse_r(&code_with_control);
 
-                let gtd_result_control = file_path_definition(
+                let gtd_result_control = file_path_definition_at_position(
                     &tree_control,
                     &code_with_control,
                     position,
@@ -8049,7 +8513,7 @@ mod tests {
                 };
 
                 // Go-to-definition should find the file
-                let gtd_result = file_path_definition(
+                let gtd_result = file_path_definition_at_position(
                     &tree,
                     &code,
                     position,
@@ -8085,7 +8549,7 @@ mod tests {
                     character: directive_cursor_col as u32,
                 };
 
-                let directive_result = file_path_definition(
+                let directive_result = file_path_definition_at_position(
                     &directive_tree,
                     &directive_content,
                     directive_position,
@@ -8715,45 +9179,6 @@ mod resolve_base_directory_tests {
     #[test]
     fn test_extract_directory_component_deep_path() {
         assert_eq!(extract_directory_component("a/b/c/d/file.R"), "a/b/c/d/");
-    }
-
-    // ====================================================================
-    // Tests for normalize_path_for_completion
-    // ====================================================================
-
-    #[test]
-    fn test_normalize_path_simple() {
-        let path = Path::new("/project/src/utils.R");
-        let result = normalize_path_for_completion(path).unwrap();
-        assert_eq!(result, PathBuf::from("/project/src/utils.R"));
-    }
-
-    #[test]
-    fn test_normalize_path_with_parent_dir() {
-        let path = Path::new("/project/src/../data/utils.R");
-        let result = normalize_path_for_completion(path).unwrap();
-        assert_eq!(result, PathBuf::from("/project/data/utils.R"));
-    }
-
-    #[test]
-    fn test_normalize_path_with_current_dir() {
-        let path = Path::new("/project/./src/./utils.R");
-        let result = normalize_path_for_completion(path).unwrap();
-        assert_eq!(result, PathBuf::from("/project/src/utils.R"));
-    }
-
-    #[test]
-    fn test_normalize_path_multiple_parent_dirs() {
-        let path = Path::new("/project/src/deep/../../data/utils.R");
-        let result = normalize_path_for_completion(path).unwrap();
-        assert_eq!(result, PathBuf::from("/project/data/utils.R"));
-    }
-
-    #[test]
-    fn test_normalize_path_preserves_root() {
-        let path = Path::new("/../project/utils.R");
-        let result = normalize_path_for_completion(path).unwrap();
-        assert_eq!(result, PathBuf::from("/project/utils.R"));
     }
 
     // ====================================================================
@@ -9389,6 +9814,40 @@ mod file_path_definition_tests {
     }
 
     #[test]
+    fn computed_navigation_target_resolves_from_one_analysis_result() {
+        let temp_dir = TempDir::new().unwrap();
+        let scripts_dir = temp_dir.path().join("scripts");
+        fs::create_dir(&scripts_dir).unwrap();
+        let target_path = scripts_dir.join("helpers.R");
+        fs::write(&target_path, "# helpers").unwrap();
+
+        let main_path = temp_dir.path().join("main.R");
+        let code = r#"source(file.path("scripts", "helpers.R"))"#;
+        let tree = parse_r(code);
+        let position = Position::new(0, code.find("helpers.R").unwrap() as u32 + 1);
+        let target = detect_file_path_navigation_target(&tree, code, position)
+            .expect("computed path should produce a navigation target");
+        assert_eq!(
+            target,
+            FilePathNavigationTarget::SourceCall {
+                path: "scripts/helpers.R".to_string(),
+            }
+        );
+
+        let file_uri = Url::from_file_path(main_path).unwrap();
+        let workspace_root = Url::from_file_path(temp_dir.path()).unwrap();
+        let location = file_path_definition(
+            target,
+            &file_uri,
+            &make_metadata(None),
+            Some(&workspace_root),
+        )
+        .expect("the analyzed target should resolve");
+
+        assert_eq!(location.uri, Url::from_file_path(target_path).unwrap());
+    }
+
+    #[test]
     fn test_file_path_definition_source_call_existing_file() {
         // Create a temp directory with a file
         let temp_dir = TempDir::new().unwrap();
@@ -9409,7 +9868,7 @@ mod file_path_definition_tests {
             character: 10,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9441,7 +9900,7 @@ mod file_path_definition_tests {
             character: 10,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9474,7 +9933,7 @@ mod file_path_definition_tests {
             character: 20,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9518,7 +9977,7 @@ mod file_path_definition_tests {
             character: 24,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9555,7 +10014,7 @@ mod file_path_definition_tests {
             character: 24,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9588,7 +10047,7 @@ mod file_path_definition_tests {
             character: 14,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9618,7 +10077,7 @@ mod file_path_definition_tests {
             character: 20,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9658,7 +10117,7 @@ mod file_path_definition_tests {
             character: 10,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9702,7 +10161,7 @@ mod file_path_definition_tests {
             character: 21,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9745,7 +10204,7 @@ mod file_path_definition_tests {
             character: 22,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9796,7 +10255,7 @@ mod file_path_definition_tests {
             character: 22,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9863,7 +10322,7 @@ mod file_path_definition_tests {
             character: 21,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -9933,7 +10392,7 @@ mod file_path_definition_tests {
             character: 21,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10003,6 +10462,43 @@ mod file_path_definition_tests {
         assert_eq!(
             covariates.filter_text.as_deref(),
             Some("scripts/data/covariates.R")
+        );
+    }
+
+    #[test]
+    fn test_compatibility_base_is_first_rich_implicit_test_base() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let anchor = root.join("tests/testthat");
+        let nested = anchor.join("fixtures");
+        fs::create_dir_all(anchor.join("data")).unwrap();
+        fs::create_dir_all(nested.join("data")).unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        let current = nested.join("test-nested.R");
+        fs::write(&current, "").unwrap();
+
+        let file_uri = Url::from_file_path(&current).unwrap();
+        let workspace_root = Url::from_file_path(root).unwrap();
+        let metadata = CrossFileMetadata::default();
+        let context = FilePathContext::SourceCall {
+            partial_path: "data/".to_string(),
+            content_start: Position::new(0, 8),
+            is_sys_source: false,
+        };
+
+        let rich = resolve_completion_base_directories(
+            &context,
+            &file_uri,
+            &metadata,
+            Some(&workspace_root),
+        );
+        assert_eq!(
+            rich,
+            vec![anchor.join("data"), nested.join("data"), root.join("data"),]
+        );
+        assert_eq!(
+            resolve_base_directory(&context, &file_uri, &metadata, Some(&workspace_root)),
+            rich.first().cloned()
         );
     }
 
@@ -10171,6 +10667,65 @@ mod file_path_definition_tests {
     }
 
     #[test]
+    fn test_completion_entry_index_preserves_first_base_precedence() {
+        let base_dirs = vec![PathBuf::from("higher"), PathBuf::from("lower")];
+        let mut index = CompletionEntryIndex::default();
+
+        assert!(!index.is_shadowed_or_record("shared.R", 0, &base_dirs));
+        assert!(index.is_shadowed_or_record("shared.R", 1, &base_dirs));
+        assert!(!index.is_shadowed_or_record("higher-only.R", 0, &base_dirs));
+        assert!(!index.is_shadowed_or_record("lower-only.R", 1, &base_dirs));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_nested_completion_external_anchor_symlink_shadows_lower_entry() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let root = workspace.path();
+        let anchor = root.join("tests/testthat");
+        let nested = anchor.join("fixtures");
+        fs::create_dir_all(&nested).unwrap();
+
+        let external_target = external.path().join("shared.R");
+        fs::write(&external_target, "external <- TRUE\n").unwrap();
+        symlink(&external_target, anchor.join("shared.R")).unwrap();
+        fs::write(nested.join("shared.R"), "nested <- TRUE\n").unwrap();
+
+        let current = nested.join("test-nested.R");
+        fs::write(&current, "").unwrap();
+        let file_uri = Url::from_file_path(&current).unwrap();
+        let workspace_root = Url::from_file_path(root).unwrap();
+        let cursor = Position {
+            line: 0,
+            character: 8,
+        };
+        let context = FilePathContext::SourceCall {
+            partial_path: String::new(),
+            content_start: cursor,
+            is_sys_source: false,
+        };
+
+        let labels: Vec<_> = file_path_completions(
+            &context,
+            &file_uri,
+            &CrossFileMetadata::default(),
+            Some(&workspace_root),
+            cursor,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+
+        assert!(
+            !labels.contains(&"shared.R".to_string()),
+            "the excluded higher-precedence symlink must shadow the lower entry"
+        );
+    }
+
+    #[test]
     fn test_completion_keeps_same_base_case_distinct_entries_on_case_sensitive_host() {
         if !crate::test_utils::host_is_case_sensitive() {
             return;
@@ -10284,7 +10839,7 @@ mod file_path_definition_tests {
             character: 20,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10326,7 +10881,7 @@ mod file_path_definition_tests {
             character: 12,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10369,7 +10924,7 @@ mod file_path_definition_tests {
             character: 15,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10418,7 +10973,7 @@ mod file_path_definition_tests {
             character: 18,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10450,7 +11005,7 @@ source("utils.R")"#;
             character: 3,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10480,7 +11035,7 @@ source("utils.R")"#;
             character: 8,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10513,7 +11068,7 @@ source("utils.R")"#;
             character: 15,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10546,7 +11101,7 @@ source("utils.R")"#;
             character: 10,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10581,7 +11136,7 @@ source("utils.R")"#;
             character: 15,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10626,7 +11181,7 @@ source("utils.R")"#;
             character: 12,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10667,7 +11222,7 @@ source("utils.R")"#;
             character: 12,
         };
 
-        let result = file_path_definition(
+        let result = file_path_definition_at_position(
             &tree,
             code,
             position,
@@ -10704,7 +11259,8 @@ source("utils.R")"#;
         };
 
         // No workspace_root provided
-        let result = file_path_definition(&tree, code, position, &file_uri, &metadata, None);
+        let result =
+            file_path_definition_at_position(&tree, code, position, &file_uri, &metadata, None);
 
         // Should succeed (no boundary check without workspace_root)
         assert!(result.is_some());

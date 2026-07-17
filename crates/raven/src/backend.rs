@@ -2155,9 +2155,99 @@ fn watched_manifest_change_for_uri(
     }
 }
 
+/// Mutate raw package inputs and advance the cohesive seed-input generation at
+/// the same in-memory seam whenever the adapter reports an event. The returned
+/// delta remains advisory for semantic derivation; freshness follows the raw
+/// writer transaction instead, including value-equal writes that intentionally
+/// still produce a delta.
+fn mutate_package_inputs(
+    state: &mut WorldState,
+    mutate: impl FnOnce(
+        &mut crate::package_state::PackageInputs,
+    ) -> Option<crate::package_state::PackageInputDelta>,
+) -> Option<crate::package_state::PackageInputDelta> {
+    let delta = mutate(&mut state.package_inputs);
+    if delta.is_some() {
+        state.record_package_input_mutation();
+    }
+    delta
+}
+
+fn translate_package_event(
+    state: &mut WorldState,
+    event: crate::package_state::event::HandlerEvent,
+) -> Option<crate::package_state::PackageInputDelta> {
+    mutate_package_inputs(state, |inputs| {
+        crate::package_state::event::translate(inputs, event)
+    })
+}
+
+/// Exclusion-aware watched-event variant of [`translate_package_event`]. A
+/// directory deletion batch advances once for the cohesive batch mutation,
+/// which is sufficient to invalidate every seed computed before the batch.
+fn translate_watched_package_event(
+    state: &mut WorldState,
+    event: crate::package_state::event::HandlerEvent,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> Option<crate::package_state::PackageInputDelta> {
+    mutate_package_inputs(state, |inputs| {
+        crate::package_state::event::translate_with_exclusions(inputs, event, exclusions)
+    })
+}
+
+fn apply_rprofile_scan_to_state(
+    state: &mut WorldState,
+    scan: Option<crate::package_state::rprofile::RprofileScan>,
+) -> Option<crate::package_state::PackageInputDelta> {
+    mutate_package_inputs(state, |inputs| {
+        crate::package_state::event::apply_rprofile_scan(inputs, scan)
+    })
+}
+
+fn apply_preamble_scan_to_state(
+    state: &mut WorldState,
+    scan: Option<crate::package_state::preamble::PreambleScan>,
+) -> Option<crate::package_state::PackageInputDelta> {
+    mutate_package_inputs(state, |inputs| {
+        crate::package_state::event::apply_preamble_scan(inputs, scan)
+    })
+}
+
 enum WatchedManifestPayload {
     Text(Option<Arc<str>>),
-    Rprofile(Option<crate::package_state::rprofile::RprofileScan>),
+    Rprofile(Box<WatchedRprofilePayload>),
+}
+
+struct WatchedRprofilePayload {
+    scan: Option<crate::package_state::rprofile::RprofileScan>,
+    root: std::path::PathBuf,
+    input_snapshot: PackageSeedInputSnapshot,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
+}
+
+/// Apply an off-lock watched `.Rprofile` scan only while every package-input
+/// identity it observed is still current. Returning no delta for stale work is
+/// intentional: the current seed/reload/live-buffer convergence owner will
+/// install its own data, while this watcher performs no mutation, derive, or
+/// diagnostic fanout.
+fn apply_watched_rprofile_scan_to_state(
+    state: &mut WorldState,
+    scan: Option<crate::package_state::rprofile::RprofileScan>,
+    root: &std::path::Path,
+    input_snapshot: &PackageSeedInputSnapshot,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> Option<crate::package_state::PackageInputDelta> {
+    if !input_snapshot.is_current_for(state, root, exclusions) {
+        log::trace!(
+            "Skipping stale watched .Rprofile scan for {} (captured generation {}, current generation {})",
+            root.display(),
+            input_snapshot.generation,
+            state.package_input_generation()
+        );
+        return None;
+    }
+
+    apply_rprofile_scan_to_state(state, scan)
 }
 
 /// Apply watched DESCRIPTION/NAMESPACE/`.Rprofile` changes to package inputs,
@@ -2186,16 +2276,20 @@ async fn apply_watched_manifest_changes(
         return;
     }
 
-    // Snapshot the root + modeling flag so the `.Rprofile` prelude scan can
-    // run OFF-lock below (it follows transitive source(); the locking
-    // discipline invariant forbids that scan under the write lock — see
-    // `initialize_package_inputs_from_state_with_exclusions`).
-    let (ws_root, model_rprofile, workspace_exclusions) = {
+    // Snapshot the cohesive package-input identity with the root, modeling
+    // flag, and exclusions so the `.Rprofile` prelude scan can run OFF-lock
+    // below and be rejected atomically if any of those inputs changes before
+    // commit. The scan follows transitive source(); the locking-discipline
+    // invariant forbids that work under the write lock — see
+    // `initialize_package_inputs_from_state_with_exclusions`.
+    let (ws_root, model_rprofile, workspace_exclusions, rprofile_input_snapshot) = {
         let state = state_arc.read().await;
+        let workspace_exclusions = state.workspace_exclusions.clone();
         (
             state.package_inputs.workspace_root.clone(),
             state.package_inputs.model_rprofile,
-            state.workspace_exclusions.clone(),
+            workspace_exclusions.clone(),
+            PackageSeedInputSnapshot::capture(&state, &workspace_exclusions),
         )
     };
     let rprofile_path = ws_root.as_ref().map(|r| r.join(".Rprofile"));
@@ -2212,22 +2306,29 @@ async fn apply_watched_manifest_changes(
     for change in pkg_manifest_changes {
         let is_rprofile = change.uri.to_file_path().ok().as_deref() == rprofile_path.as_deref();
         let payload = if is_rprofile {
+            let Some(root) = ws_root.clone() else {
+                continue;
+            };
             let scan = if change.deleted || !model_rprofile {
                 None
-            } else if let Some(root) = ws_root.clone() {
-                let workspace_exclusions = workspace_exclusions.clone();
+            } else {
+                let root_for_scan = root.clone();
+                let exclusions_for_scan = workspace_exclusions.clone();
                 tokio::task::spawn_blocking(move || {
                     crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-                        &root,
-                        &workspace_exclusions,
+                        &root_for_scan,
+                        &exclusions_for_scan,
                     )
                 })
                 .await
                 .ok()
-            } else {
-                None
             };
-            WatchedManifestPayload::Rprofile(scan)
+            WatchedManifestPayload::Rprofile(Box::new(WatchedRprofilePayload {
+                scan,
+                root,
+                input_snapshot: rprofile_input_snapshot.clone(),
+                exclusions: workspace_exclusions.clone(),
+            }))
         } else if change.deleted {
             WatchedManifestPayload::Text(None)
         } else if let Ok(path) = change.uri.to_file_path() {
@@ -2249,6 +2350,12 @@ async fn apply_watched_manifest_changes(
             change.generation_expectation,
         ));
     }
+    // The freshness snapshot predates every mutation in this cohesive watcher
+    // batch. Apply `.Rprofile` first so a sibling DESCRIPTION/NAMESPACE delta
+    // cannot make the scan look externally stale merely by advancing the shared
+    // package-input generation. The sort is stable within each payload kind.
+    manifest_contents
+        .sort_by_key(|(_, payload, _, _)| matches!(payload, WatchedManifestPayload::Text(_)));
 
     let mut state = state_arc.write().await;
     let workspace_exclusions = state.workspace_exclusions.clone();
@@ -2279,18 +2386,18 @@ async fn apply_watched_manifest_changes(
                     on_disk_text,
                     deleted,
                 };
-                crate::package_state::event::translate_with_exclusions(
-                    &mut state.package_inputs,
-                    event,
-                    &workspace_exclusions,
-                )
+                translate_watched_package_event(&mut state, event, &workspace_exclusions)
             }
             // Apply the off-lock prelude scan via the lock-safe seam. `None`
             // (delete/disabled) clears; the deletion delta is still emitted
             // when enabled so the script fanout fires.
-            WatchedManifestPayload::Rprofile(scan) => {
-                crate::package_state::event::apply_rprofile_scan(&mut state.package_inputs, scan)
-            }
+            WatchedManifestPayload::Rprofile(payload) => apply_watched_rprofile_scan_to_state(
+                &mut state,
+                payload.scan,
+                &payload.root,
+                &payload.input_snapshot,
+                &payload.exclusions,
+            ),
         };
         if let Some(delta) = delta {
             deltas.push(delta);
@@ -2810,18 +2917,17 @@ fn is_package_relevant_open_uri(uri: &Url, root: &std::path::Path) -> bool {
     })
 }
 
-/// True if `p` (or its canonical form) is one of the files `.Rprofile`
-/// transitively `source()`s. The static scanner records *canonical* paths in
-/// `rprofile_sourced_files`, but watcher URIs are not necessarily canonical
-/// (symlinked roots like macOS `/tmp` → `/private/tmp`), so fall back to
-/// canonicalizing `p` before giving up. Used to route an edit to a sourced
-/// helper that lives outside the package's tracked R dirs (e.g. `scripts/`,
-/// `inst/`) into the package-state update so the prelude is re-scanned (Task 12).
+/// True if `p` is one of the static source-routing paths retained by a
+/// `.Rprofile` or preamble scan. Routing canonicalization tolerates a missing
+/// target by canonicalizing its parent, so delete/create events under symlinked
+/// roots keep matching the same set entry. Used for helpers outside the tracked
+/// package R directories as well as ordinary existing targets.
 fn path_in_rprofile_sourced_set(
     p: &std::path::Path,
     sourced: &std::collections::BTreeSet<std::path::PathBuf>,
 ) -> bool {
-    sourced.contains(p) || p.canonicalize().ok().is_some_and(|c| sourced.contains(&c))
+    sourced.contains(p)
+        || sourced.contains(&crate::package_state::preamble::canonicalize_for_routing(p))
 }
 
 /// Returns `true` when any delta in `deltas` is `RProfileChanged`, or when any
@@ -3209,31 +3315,113 @@ fn snapshot_preamble_text_overrides(
     overrides
 }
 
+/// O(1) identity for an open document snapshot used by seed convergence.
+///
+/// The diagnostics lifecycle epoch distinguishes close/reopen when the document
+/// is diagnostics-eligible. `Rope::is_instance` is the fallback that also
+/// distinguishes diagnostics-ineligible lifecycles (and even identical reopened
+/// content) without hashing or flattening text under the `WorldState` lock.
+#[derive(Clone)]
+struct OpenDocumentSeedIdentity {
+    trigger: DiagnosticsTrigger,
+    contents: ropey::Rope,
+}
+
+impl PartialEq for OpenDocumentSeedIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.trigger == other.trigger && self.contents.is_instance(&other.contents)
+    }
+}
+
+impl Eq for OpenDocumentSeedIdentity {}
+
+fn open_document_seed_identity(state: &WorldState, uri: &Url) -> Option<OpenDocumentSeedIdentity> {
+    let document = state.documents.get(uri)?;
+    Some(OpenDocumentSeedIdentity {
+        trigger: DiagnosticsTrigger::capture(state, uri),
+        contents: document.contents.clone(),
+    })
+}
+
+fn authoritative_open_rprofile_uris<'a>(
+    state: &'a WorldState,
+    root: &std::path::Path,
+) -> impl Iterator<Item = &'a Url> + 'a {
+    let rprofile_path = root.join(".Rprofile");
+    state.documents.keys().filter(move |uri| {
+        state
+            .authoritative_open_uri_for_path(uri, &rprofile_path)
+            .is_some()
+    })
+}
+
+fn snapshot_authoritative_open_rprofile(
+    state: &WorldState,
+    root: &std::path::Path,
+) -> Option<(Url, ropey::Rope, OpenDocumentSeedIdentity)> {
+    let uri =
+        authoritative_open_rprofile_uris(state, root).min_by(|a, b| a.as_str().cmp(b.as_str()))?;
+    let identity = open_document_seed_identity(state, uri)?;
+    Some((uri.clone(), identity.contents.clone(), identity))
+}
+
+fn open_document_seed_identities(
+    state: &WorldState,
+) -> impl Iterator<Item = (Url, OpenDocumentSeedIdentity)> + '_ {
+    state.documents.keys().filter_map(|uri| {
+        open_document_seed_identity(state, uri).map(|identity| (uri.clone(), identity))
+    })
+}
+
+/// Snapshot only open-document lifecycle identities. Tracking every open
+/// document is deliberately conservative: it detects a document that becomes a
+/// preamble contributor during an off-lock scan without resolving aliases or
+/// sorting/deduplicating path spellings under the state lock.
+fn snapshot_open_document_seed_identities(
+    state: &WorldState,
+) -> std::collections::BTreeMap<Url, OpenDocumentSeedIdentity> {
+    open_document_seed_identities(state).collect()
+}
+
+fn snapshot_open_preamble_documents(
+    state: &WorldState,
+) -> (
+    Vec<std::path::PathBuf>,
+    std::collections::BTreeMap<Url, OpenDocumentSeedIdentity>,
+) {
+    let identities = snapshot_open_document_seed_identities(state);
+    let mut paths = Vec::new();
+    for uri in identities.keys() {
+        if preamble_sourced_root_for_open_document(state, uri).is_some() {
+            paths.extend(file_paths_for_open_document(state, uri));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    (paths, identities)
+}
+
 fn authoritative_rprofile_buffer_text_after_close(
     state: &WorldState,
     root: &std::path::Path,
 ) -> Option<Arc<str>> {
-    let rprofile_path = root.join(".Rprofile");
-    state.documents.keys().find_map(|uri| {
+    authoritative_open_rprofile_uris(state, root).find_map(|uri| {
         state
-            .authoritative_open_uri_for_path(uri, &rprofile_path)
-            .and_then(|_| {
-                state
-                    .documents
-                    .get(uri)
-                    .map(|doc| Arc::<str>::from(doc.text()))
-            })
+            .documents
+            .get(uri)
+            .map(|doc| Arc::<str>::from(doc.text()))
     })
 }
 
+/// Add closed package R files from the workspace index without admitting stale
+/// disk snapshots for open documents. Live package R buffers are installed once,
+/// authoritatively, by [`replay_open_package_inputs_after_seed`].
 fn hydrate_package_r_files_from_state(
     state: &WorldState,
     root: &std::path::Path,
     mut r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
 ) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
-    let mut open_uris: Vec<Url> = state.documents.keys().cloned().collect();
-    open_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-    let open_uri_set: std::collections::HashSet<Url> = open_uris.iter().cloned().collect();
+    let open_uri_set: std::collections::HashSet<Url> = state.documents.keys().cloned().collect();
 
     for uri in state.workspace_index_new.uris() {
         let open_or_alias = if state.open_document_aliases.is_empty() {
@@ -3252,23 +3440,6 @@ fn hydrate_package_r_files_from_state(
             && let Some(entry) = state.workspace_index_new.get(&uri)
         {
             let text: std::sync::Arc<str> = entry.contents.to_string().into();
-            r_files.insert(path, package_r_file_input_from_text(text, kind));
-        }
-    }
-
-    for uri in &open_uris {
-        if state.is_project_excluded_uri(uri) {
-            continue;
-        }
-        if let Some((_, path, kind)) =
-            authoritative_package_r_file_uri_for_open_document(state, uri, root)
-        {
-            let text: std::sync::Arc<str> = state
-                .documents
-                .get(uri)
-                .map(|d| d.text())
-                .unwrap_or_default()
-                .into();
             r_files.insert(path, package_r_file_input_from_text(text, kind));
         }
     }
@@ -3317,26 +3488,8 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
         }
 
         let analysis_text = crate::cross_file::analysis_text_for_kind(chunk_kind, &text);
-        let mut meta = crate::cross_file::extract_metadata(&analysis_text);
+        let meta = extract_enriched_live_metadata(state, &uri, &analysis_text);
         let workspace_root = state.workspace_folders.first().cloned();
-        let max_chain_depth = state.cross_file_config.max_chain_depth;
-        crate::cross_file::enrich_metadata_with_inherited_wd(
-            &mut meta,
-            &uri,
-            workspace_root.as_ref(),
-            |parent_uri| state.get_enriched_metadata(parent_uri),
-            max_chain_depth,
-        );
-
-        {
-            let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
-            crate::cross_file::resolve_system_file_sources(
-                &mut meta,
-                ws_name.as_deref(),
-                ws_root.as_deref(),
-                &lib_paths,
-            );
-        }
 
         state
             .document_store
@@ -3351,30 +3504,210 @@ async fn replay_open_documents_after_workspace_index_apply(state: &mut WorldStat
     state.recompute_open_neighborhood_pins();
 }
 
-/// Filesystem-backed inputs computed before a package-state seed is installed.
+/// Package-input lifecycle observed immediately before a detached seed begins
+/// its filesystem scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PackageSeedInputSnapshot {
+    workspace_root: Option<std::path::PathBuf>,
+    generation: u64,
+    exclusion_patterns: Vec<String>,
+    workspace_folders: Vec<Url>,
+    package_mode: crate::cross_file::config::PackageMode,
+    model_rprofile: bool,
+}
+
+impl PackageSeedInputSnapshot {
+    fn capture(
+        state: &WorldState,
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    ) -> Self {
+        Self {
+            workspace_root: state.package_inputs.workspace_root.clone(),
+            generation: state.package_input_generation(),
+            exclusion_patterns: exclusions.patterns().to_vec(),
+            workspace_folders: state.workspace_folders.clone(),
+            package_mode: state.cross_file_config.package_mode,
+            model_rprofile: state.cross_file_config.model_rprofile,
+        }
+    }
+
+    /// Validate both the operational lifecycle and structural configuration
+    /// backstops used by an off-lock package-input scan.
+    fn is_current_for(
+        &self,
+        state: &WorldState,
+        root: &std::path::Path,
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    ) -> bool {
+        self.workspace_root.as_deref() == Some(root)
+            && state.package_inputs.workspace_root == self.workspace_root
+            && state.package_input_generation() == self.generation
+            && state.workspace_exclusions.patterns() == self.exclusion_patterns.as_slice()
+            && exclusions.patterns() == self.exclusion_patterns.as_slice()
+            && state.workspace_folders == self.workspace_folders
+            && state.cross_file_config.package_mode == self.package_mode
+            && state.cross_file_config.model_rprofile == self.model_rprofile
+    }
+}
+
+/// Cohesive, fully in-memory fields installed by one package-seed transaction.
 ///
-/// Every LSP seed path uses [`Self::compute`] off the `WorldState` lock, then
-/// [`Self::install`] under one write lock. `scan_r_files` is false only when a
-/// freshly applied workspace index already owns the closed-R-file inventory.
-/// Keeping DESCRIPTION, NAMESPACE, `.Rprofile`, and testthat-preamble work in
-/// this one helper prevents startup, exclusion reloads, and package-mode
-/// rebuilds from drifting when another precomputed input is added.
+/// Source-following scans are concrete even when their modeling feature is
+/// disabled (represented by an empty scan). Compatibility callers resolve any
+/// filesystem fallback before constructing this value, so installation performs
+/// no filesystem traversal while mutating `WorldState`.
 #[derive(Default)]
-struct PrecomputedPackageSeed {
+struct PackageSeedInstall {
     description: Option<Arc<str>>,
     namespace: Option<Arc<str>>,
     disk_r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
+    dataset_names: std::collections::BTreeSet<String>,
+    sysdata_names: std::collections::BTreeSet<String>,
     rprofile_scan: crate::package_state::rprofile::RprofileScan,
     preamble_scan: crate::package_state::preamble::PreambleScan,
 }
 
+/// Filesystem-backed inputs computed before a package-state seed is installed.
+///
+/// Every LSP seed path uses [`Self::compute_from_state`] off the `WorldState`
+/// lock, then [`Self::install`] under one write lock. `scan_r_files` is false
+/// only when a freshly applied workspace index already owns the closed-R-file
+/// inventory. Keeping DESCRIPTION, NAMESPACE, package datasets/sysdata,
+/// `.Rprofile`, and testthat-preamble work in this one helper prevents startup,
+/// exclusion reloads, and package-mode rebuilds from drifting when another
+/// precomputed input is added.
+struct PrecomputedPackageSeed {
+    root: std::path::PathBuf,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    input_snapshot: Option<PackageSeedInputSnapshot>,
+    install: PackageSeedInstall,
+}
+
+#[derive(Debug)]
+struct PackageSeedComputeError {
+    message: String,
+}
+
+impl std::fmt::Display for PackageSeedComputeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 impl PrecomputedPackageSeed {
+    /// Snapshot authoritative preamble buffers and the cohesive raw-input
+    /// generation under a brief read lock, then compute every filesystem-backed
+    /// seed input on the blocking pool.
+    ///
+    /// Cancellation is returned as a failed attempt. A worker panic is resumed
+    /// on this task so it cannot be mistaken for an ordinary, installable seed.
+    async fn compute_from_state(
+        state_arc: &Arc<RwLock<WorldState>>,
+        root: &std::path::Path,
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+        scan_r_files: bool,
+    ) -> std::result::Result<Self, PackageSeedComputeError> {
+        Self::compute_from_state_with(
+            state_arc,
+            root,
+            exclusions,
+            scan_r_files,
+            Self::compute_install,
+        )
+        .await
+    }
+
+    async fn compute_from_state_with<F>(
+        state_arc: &Arc<RwLock<WorldState>>,
+        root: &std::path::Path,
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+        scan_r_files: bool,
+        compute_install: F,
+    ) -> std::result::Result<Self, PackageSeedComputeError>
+    where
+        F: FnOnce(
+                &std::path::Path,
+                &crate::config_file::CompiledWorkspaceExclusions,
+                &crate::package_state::preamble::PreambleTextOverrides,
+                bool,
+                crate::cross_file::config::PackageMode,
+                bool,
+            ) -> PackageSeedInstall
+            + Send
+            + 'static,
+    {
+        let (preamble_overrides, input_snapshot, package_mode, model_rprofile) = {
+            let state = state_arc.read().await;
+            (
+                snapshot_preamble_text_overrides(&state),
+                PackageSeedInputSnapshot::capture(&state, exclusions),
+                state.cross_file_config.package_mode,
+                state.cross_file_config.model_rprofile,
+            )
+        };
+        let root = root.to_path_buf();
+        let exclusions = exclusions.clone();
+        let compute_root = root.clone();
+        let compute_exclusions = exclusions.clone();
+
+        let install = match tokio::task::spawn_blocking(move || {
+            compute_install(
+                &compute_root,
+                &compute_exclusions,
+                &preamble_overrides,
+                scan_r_files,
+                package_mode,
+                model_rprofile,
+            )
+        })
+        .await
+        {
+            Ok(install) => install,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => {
+                return Err(PackageSeedComputeError {
+                    message: error.to_string(),
+                });
+            }
+        };
+        Ok(Self {
+            root,
+            exclusions,
+            input_snapshot: Some(input_snapshot),
+            install,
+        })
+    }
+
+    #[cfg(test)]
     fn compute(
         root: &std::path::Path,
         exclusions: &crate::config_file::CompiledWorkspaceExclusions,
         preamble_overrides: &crate::package_state::preamble::PreambleTextOverrides,
         scan_r_files: bool,
     ) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            exclusions: exclusions.clone(),
+            input_snapshot: None,
+            install: Self::compute_install(
+                root,
+                exclusions,
+                preamble_overrides,
+                scan_r_files,
+                crate::cross_file::config::PackageMode::Auto,
+                true,
+            ),
+        }
+    }
+
+    fn compute_install(
+        root: &std::path::Path,
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+        preamble_overrides: &crate::package_state::preamble::PreambleTextOverrides,
+        scan_r_files: bool,
+        package_mode: crate::cross_file::config::PackageMode,
+        model_rprofile: bool,
+    ) -> PackageSeedInstall {
         let description = std::fs::read_to_string(root.join("DESCRIPTION"))
             .ok()
             .map(|text| Arc::from(text.as_str()));
@@ -3386,74 +3719,466 @@ impl PrecomputedPackageSeed {
         } else {
             Default::default()
         };
-        let rprofile_scan = crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-            root, exclusions,
-        );
-        let preamble_scan =
+        let dataset_names =
+            crate::package_state::scan_own_package_data_dir_with_exclusions(root, exclusions);
+        let sysdata_names =
+            crate::package_state::sysdata::scan_sysdata_generating_scripts_with_exclusions(
+                root, exclusions,
+            );
+        let rprofile_scan = if model_rprofile {
+            crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                root, exclusions,
+            )
+        } else {
+            Default::default()
+        };
+        let preamble_scan = if package_mode != crate::cross_file::config::PackageMode::Disabled {
             crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
                 root,
                 preamble_overrides,
                 exclusions,
-            );
-        Self {
+            )
+        } else {
+            Default::default()
+        };
+        PackageSeedInstall {
             description,
             namespace,
             disk_r_files,
+            dataset_names,
+            sysdata_names,
             rprofile_scan,
             preamble_scan,
         }
     }
 
-    fn install(
-        self,
-        state: &mut WorldState,
-        root: std::path::PathBuf,
-        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
-    ) {
-        initialize_package_inputs_from_state_with_exclusions(
-            state,
+    /// Install only if every raw package input still belongs to the captured
+    /// lifecycle. A `false` result means nothing was mutated and the caller must
+    /// recompute off-lock before retrying.
+    fn install(self, state: &mut WorldState) -> bool {
+        let Self {
             root,
-            self.description,
-            self.namespace,
-            self.disk_r_files,
-            Some(self.rprofile_scan),
-            Some(self.preamble_scan),
             exclusions,
-        );
+            input_snapshot,
+            install,
+        } = self;
+        install_package_seed(state, root, install, input_snapshot, &exclusions)
     }
 }
 
-// Internal seeding chokepoint deliberately taking each precomputed scan as its
-// own argument so non-LSP callers and focused tests can supply only the inputs
-// they need. LSP call sites use `PrecomputedPackageSeed` above.
-#[allow(clippy::too_many_arguments)]
+const PACKAGE_SEED_MAX_ATTEMPTS: usize = 3;
+const PACKAGE_SEED_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Clone)]
+struct PackageSeedTaskHandles {
+    state: Arc<RwLock<WorldState>>,
+    client: Client,
+    traversal_truncation: Arc<TraversalTruncationState>,
+}
+
+impl PackageSeedTaskHandles {
+    fn from_backend(backend: &Backend) -> Self {
+        Self {
+            state: backend.state.clone(),
+            client: backend.client.clone(),
+            traversal_truncation: backend.traversal_truncation.clone(),
+        }
+    }
+}
+
+/// Recompute a failed or rejected detached seed off-lock until one installs
+/// against a stable raw-input generation. Every failed computation and rejected
+/// install consumes one bounded attempt and mutates nothing, so the previously
+/// derived package state remains authoritative between attempts. Exhaustion
+/// schedules one coalesced delayed worker that repeats bounded transactions
+/// until a stable period installs successfully.
+async fn install_package_seed_with_retry(
+    handles: &PackageSeedTaskHandles,
+    root: std::path::PathBuf,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    scan_r_files: bool,
+    initial_attempt: Option<std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>>,
+) -> bool {
+    let compute_state = Arc::clone(&handles.state);
+    let compute_root = root.clone();
+    let compute_exclusions = exclusions.clone();
+    install_package_seed_with_retry_using(handles, root, initial_attempt, move || {
+        let state_arc = Arc::clone(&compute_state);
+        let root = compute_root.clone();
+        let exclusions = compute_exclusions.clone();
+        async move {
+            PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, scan_r_files)
+                .await
+        }
+    })
+    .await
+}
+
+async fn install_package_seed_with_retry_using<F, Fut>(
+    handles: &PackageSeedTaskHandles,
+    root: std::path::PathBuf,
+    initial_attempt: Option<std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>>,
+    compute: F,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>>,
+{
+    // A foreground transaction supersedes any sleeping follow-up. A running
+    // worker observes cancellation before installing its detached candidate.
+    handles.state.read().await.package_seed_retry.cancel();
+    let installed =
+        attempt_package_seed_install_using(&handles.state, root, initial_attempt, compute, None)
+            .await;
+    if !installed {
+        schedule_package_seed_retry(handles.clone()).await;
+    }
+    installed
+}
+
+async fn attempt_package_seed_install(
+    state_arc: &Arc<RwLock<WorldState>>,
+    root: std::path::PathBuf,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    scan_r_files: bool,
+    cancel: Option<&CancellationToken>,
+) -> bool {
+    let compute_state = Arc::clone(state_arc);
+    let compute_root = root.clone();
+    let compute_exclusions = exclusions.clone();
+    attempt_package_seed_install_using(
+        state_arc,
+        root,
+        None,
+        move || {
+            let state_arc = Arc::clone(&compute_state);
+            let root = compute_root.clone();
+            let exclusions = compute_exclusions.clone();
+            async move {
+                PrecomputedPackageSeed::compute_from_state(
+                    &state_arc,
+                    &root,
+                    &exclusions,
+                    scan_r_files,
+                )
+                .await
+            }
+        },
+        cancel,
+    )
+    .await
+}
+
+async fn attempt_package_seed_install_using<F, Fut>(
+    state_arc: &Arc<RwLock<WorldState>>,
+    root: std::path::PathBuf,
+    mut initial_attempt: Option<
+        std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>,
+    >,
+    mut compute: F,
+    cancel: Option<&CancellationToken>,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>>,
+{
+    for attempt in 0..PACKAGE_SEED_MAX_ATTEMPTS {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return false;
+        }
+        let candidate = match initial_attempt.take() {
+            Some(result) => result,
+            None => compute().await,
+        };
+        let candidate = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                log::warn!(
+                    "Package seed computation for {} failed on attempt {}/{}: {}; preserving current package inputs",
+                    root.display(),
+                    attempt + 1,
+                    PACKAGE_SEED_MAX_ATTEMPTS,
+                    error
+                );
+                if attempt + 1 < PACKAGE_SEED_MAX_ATTEMPTS {
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
+        };
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return false;
+        }
+        let installed = {
+            let mut state = state_arc.write().await;
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return false;
+            }
+            candidate.install(&mut state)
+        };
+        if installed {
+            return true;
+        }
+        if attempt + 1 < PACKAGE_SEED_MAX_ATTEMPTS {
+            tokio::task::yield_now().await;
+        }
+    }
+    log::warn!(
+        "Package seed for {} did not install after {} attempts; preserving current package inputs",
+        root.display(),
+        PACKAGE_SEED_MAX_ATTEMPTS
+    );
+    false
+}
+
+/// Coalesce package-seed exhaustion into one delayed convergence worker. Each
+/// cycle captures the CURRENT root and compiled exclusions, runs one bounded
+/// full-disk transaction (the rare retry deliberately drops any prior
+/// index-backed R-file optimization), and waits again after failure; stable
+/// periods therefore converge without an immediate retry loop or duplicate task
+/// storm.
+async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
+    let (generation, token) = {
+        let state = handles.state.read().await;
+        state.package_seed_retry.schedule()
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY) => {}
+            }
+
+            let current = {
+                let state = handles.state.read().await;
+                state
+                    .package_inputs
+                    .workspace_root
+                    .clone()
+                    .map(|root| (root, state.workspace_exclusions.clone()))
+            };
+            let Some((root, exclusions)) = current else {
+                handles
+                    .state
+                    .read()
+                    .await
+                    .package_seed_retry
+                    .complete(generation);
+                return;
+            };
+
+            let installed = attempt_package_seed_install(
+                &handles.state,
+                root.clone(),
+                exclusions,
+                true,
+                Some(&token),
+            )
+            .await;
+            if token.is_cancelled() {
+                return;
+            }
+            if !installed {
+                log::warn!(
+                    "Delayed package seed for {} exhausted another bounded transaction; retrying after debounce",
+                    root.display()
+                );
+                continue;
+            }
+
+            Backend::refresh_open_package_inputs_after_seed(
+                handles.state.clone(),
+                handles.client.clone(),
+                handles.traversal_truncation.clone(),
+                root,
+            )
+            .await;
+            if token.is_cancelled() {
+                return;
+            }
+
+            let open_uris = {
+                let state = handles.state.read().await;
+                let uris: Vec<Url> = state.documents.keys().cloned().collect();
+                state
+                    .diagnostics_gate
+                    .mark_force_republish_many(uris.iter());
+                uris
+            };
+            if !open_uris.is_empty() {
+                Backend::publish_diagnostics_for_uris_bounded(
+                    handles.state.clone(),
+                    handles.client.clone(),
+                    open_uris,
+                    Some(handles.traversal_truncation.clone()),
+                )
+                .await;
+            }
+            handles
+                .state
+                .read()
+                .await
+                .package_seed_retry
+                .complete(generation);
+            return;
+        }
+    });
+}
+
+/// Establish the non-filesystem package-input state needed to translate live
+/// document events while a detached seed scans disk.
+///
+/// This must run synchronously before spawning the initial workspace seed:
+/// `DidOpen`/`DidChange` translation uses `workspace_root` to classify
+/// DESCRIPTION, NAMESPACE, and package R buffers, while live `.Rprofile` and
+/// testthat-preamble refresh routing also depends on these three fields. No disk
+/// work or package derivation happens here.
+fn establish_package_event_translation_state(state: &mut WorldState, root: std::path::PathBuf) {
+    state.package_inputs.workspace_root = Some(root);
+    state.package_inputs.package_mode = state.cross_file_config.package_mode;
+    state.package_inputs.model_rprofile = state.cross_file_config.model_rprofile;
+    // Advance even when all values are equal. A completed seed begins a new raw
+    // input lifecycle, and two same-root seed transactions must not both install
+    // from the same captured generation.
+    state.record_package_input_mutation();
+}
+
+/// Replay every authoritative open manifest/package-R buffer into freshly
+/// installed disk inputs. This is pure in-memory work under the state lock; the
+/// final `Initial` derive below observes the complete converged input set.
+fn replay_open_package_inputs_after_seed(state: &mut WorldState, root: &std::path::Path) {
+    let mut open_uris: Vec<Url> = state.documents.keys().cloned().collect();
+    open_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    let mut events = Vec::new();
+    for open_uri in open_uris {
+        if state.is_project_excluded_uri(&open_uri) {
+            continue;
+        }
+        let Some(package_input) =
+            authoritative_package_input_uri_for_open_document(state, &open_uri, root)
+        else {
+            continue;
+        };
+        if state.is_project_excluded_uri(package_input.uri()) {
+            continue;
+        }
+        let Some(document) = state.documents.get(&open_uri) else {
+            continue;
+        };
+        events.push(crate::package_state::event::HandlerEvent::DidOpen {
+            uri: package_input.uri().clone(),
+            text: Arc::from(document.text()),
+        });
+    }
+
+    for event in events {
+        let _ = translate_package_event(state, event);
+    }
+}
+
+/// Single-owner compatibility entry point used by `raven check` and focused
+/// tests.
+///
+/// The optional arguments preserve the existing call shape, but any missing
+/// source-following scan is resolved here before the concrete
+/// [`PackageSeedInstall`] is constructed. The central installation transaction
+/// therefore remains filesystem-free for every caller.
+#[allow(clippy::too_many_arguments)] // Compatibility API shared by CLI and focused tests.
 pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     state: &mut WorldState,
     root: std::path::PathBuf,
-    desc_text: Option<Arc<str>>,
-    ns_text: Option<Arc<str>>,
+    description: Option<Arc<str>>,
+    namespace: Option<Arc<str>>,
     disk_r_files: std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
-    precomputed_rprofile_scan: Option<crate::package_state::rprofile::RprofileScan>,
-    precomputed_preamble_scan: Option<crate::package_state::preamble::PreambleScan>,
+    rprofile_scan: Option<crate::package_state::rprofile::RprofileScan>,
+    preamble_scan: Option<crate::package_state::preamble::PreambleScan>,
     exclusions: &crate::config_file::CompiledWorkspaceExclusions,
 ) {
-    state.package_inputs.workspace_root = Some(root.clone());
-    state.package_inputs.package_mode = state.cross_file_config.package_mode;
-    state.package_inputs.model_rprofile = state.cross_file_config.model_rprofile;
+    let rprofile_scan = if state.cross_file_config.model_rprofile {
+        rprofile_scan.unwrap_or_else(|| {
+            crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                &root, exclusions,
+            )
+        })
+    } else {
+        Default::default()
+    };
+    let preamble_scan = if state.cross_file_config.package_mode
+        != crate::cross_file::config::PackageMode::Disabled
+    {
+        preamble_scan.unwrap_or_else(|| {
+            let overrides = snapshot_preamble_text_overrides(state);
+            crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                &root, &overrides, exclusions,
+            )
+        })
+    } else {
+        Default::default()
+    };
+    let install = PackageSeedInstall {
+        description,
+        namespace,
+        disk_r_files,
+        dataset_names: crate::package_state::scan_own_package_data_dir_with_exclusions(
+            &root, exclusions,
+        ),
+        sysdata_names:
+            crate::package_state::sysdata::scan_sysdata_generating_scripts_with_exclusions(
+                &root, exclusions,
+            ),
+        rprofile_scan,
+        preamble_scan,
+    };
+    let installed = install_package_seed(state, root, install, None, exclusions);
+    debug_assert!(installed, "single-owner package seed cannot be stale");
+}
+
+// Internal installation chokepoint. Every field is already in memory; this
+// transaction performs no filesystem traversal. Detached staleness is checked
+// before any field mutation, while compatibility callers omit the snapshot.
+fn install_package_seed(
+    state: &mut WorldState,
+    root: std::path::PathBuf,
+    install: PackageSeedInstall,
+    input_snapshot: Option<PackageSeedInputSnapshot>,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> bool {
+    if let Some(snapshot) = &input_snapshot
+        && !snapshot.is_current_for(state, &root, exclusions)
+    {
+        // Root identity and the single cohesive generation cover every seeded
+        // closed-file group: manifests, disk R files, Rprofile, preambles,
+        // datasets, sysdata, and exclusion/config transitions. Structural
+        // config checks remain as a backstop for any missed lifecycle bump.
+        log::debug!(
+            "Retrying package seed for {} because raw package inputs changed while it was scanning",
+            root.display()
+        );
+        return false;
+    }
+
+    let PackageSeedInstall {
+        description,
+        namespace,
+        disk_r_files,
+        dataset_names,
+        sysdata_names,
+        rprofile_scan,
+        preamble_scan,
+    } = install;
+
+    establish_package_event_translation_state(state, root.clone());
 
     state.package_inputs.description =
-        desc_text.map(|text| crate::package_state::DescriptionInput { text });
+        description.map(|text| crate::package_state::DescriptionInput { text });
     state.package_inputs.namespace =
-        ns_text.map(|text| crate::package_state::NamespaceInput { text });
+        namespace.map(|text| crate::package_state::NamespaceInput { text });
 
     let new_r_files = hydrate_package_r_files_from_state(state, &root, disk_r_files);
     state.package_inputs.r_files = new_r_files;
-    state.package_inputs.dataset_names =
-        crate::package_state::scan_own_package_data_dir_with_exclusions(&root, exclusions);
-    state.package_inputs.sysdata_names =
-        crate::package_state::sysdata::scan_sysdata_generating_scripts_with_exclusions(
-            &root, exclusions,
-        );
+    state.package_inputs.dataset_names = dataset_names;
+    state.package_inputs.sysdata_names = sysdata_names;
+    replay_open_package_inputs_after_seed(state, &root);
 
     // If `.Rprofile` is currently OPEN as a live document, its prelude is owned
     // by the did_open/did_change path (sourced from the in-memory buffer). A
@@ -3463,27 +4188,16 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
     // inputs untouched in that case (modeling stays enabled). When modeling is
     // disabled the prelude is cleared regardless (an open buffer can't keep a
     // prelude that the feature is turned off for).
-    let rprofile_open = state.documents.keys().any(|u| {
-        state
-            .authoritative_open_uri_for_path(u, &root.join(".Rprofile"))
-            .is_some()
-    });
+    let rprofile_open = authoritative_open_rprofile_uris(state, &root)
+        .next()
+        .is_some();
     if state.package_inputs.model_rprofile && rprofile_open {
         // Buffer-authoritative: keep the live prelude inputs as-is.
     } else {
-        // The `.Rprofile` prelude scan follows transitive `source()` chains, so
-        // it must NOT run while the `WorldState` write lock is held
-        // (locking-discipline invariant). Callers that hold the lock under
-        // contention (LSP startup / `packageMode` rebuild) precompute the scan
-        // OFF-lock and pass it in via `precomputed_rprofile_scan`; the
-        // non-contended callers (`raven check`, unit tests) pass `None` and let
-        // it scan inline. When modeling is disabled the prelude is cleared.
+        // The concrete scan was computed before this transaction. Modeling-off
+        // still clears the prelude even if a compatibility caller supplied data.
         let rprofile_scan = if state.package_inputs.model_rprofile {
-            precomputed_rprofile_scan.unwrap_or_else(|| {
-                crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-                    &root, exclusions,
-                )
-            })
+            rprofile_scan
         } else {
             crate::package_state::rprofile::RprofileScan::default()
         };
@@ -3492,41 +4206,21 @@ pub(crate) fn initialize_package_inputs_from_state_with_exclusions(
         state.package_inputs.rprofile_sourced_files = rprofile_scan.sourced_files;
     }
 
-    // Testthat preamble sourced-closure scan (issue #638). Same locking
-    // discipline as the `.Rprofile` scan: contended LSP callers precompute it
-    // OFF-lock and pass it in; `raven check` / unit tests pass `None` and let
-    // it scan inline. Gated on package mode — the harvested sets are only
-    // consumed by the (package-mode-gated) scope contribution.
-    //
-    // Unsaved-edit safety differs from the `.Rprofile` guard above by design:
-    // instead of skipping installation when a relevant document is open (which
-    // would either clobber a buffer opened before the very first seed, or
-    // leave *unrelated closed* preambles stale across an exclusions /
-    // `packageMode` reseed), preamble seeding scans BUFFER-AWARE. LSP callers
-    // snapshot open-buffer text via `snapshot_preamble_text_overrides` and
-    // precompute with `scan_testthat_preambles_with_overrides_and_exclusions`;
-    // the inline fallback overlays the same overrides from `state` directly.
-    // The result already reflects every authoritative open buffer, so it is
-    // installed unconditionally.
+    // Testthat preamble sourced-closure scan (issue #638). The concrete scan is
+    // buffer-aware when constructed by the LSP path. Unlike `.Rprofile`, it is
+    // installed unconditionally because it already reflects authoritative open
+    // buffers; the shared writer still owns package-mode-disabled clearing.
     let preamble_scan = (state.package_inputs.package_mode
         != crate::cross_file::config::PackageMode::Disabled)
-        .then(|| {
-            precomputed_preamble_scan.unwrap_or_else(|| {
-                let overrides = snapshot_preamble_text_overrides(state);
-                crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
-                    &root, &overrides, exclusions,
-                )
-            })
-        });
-    // Shared writer owns package-mode gating and the four-field mapping.
-    let _ =
-        crate::package_state::event::apply_preamble_scan(&mut state.package_inputs, preamble_scan);
+        .then_some(preamble_scan);
+    let _ = apply_preamble_scan_to_state(state, preamble_scan);
 
     state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
 
     // Resolve system.file() sources in workspace index now that package state
     // (workspace name, lib paths) is available.
     state.resolve_system_file_in_workspace();
+    true
 }
 
 /// Shared trigger predicate for the sysdata R fallback: the AST scan of
@@ -4931,11 +5625,9 @@ async fn apply_watched_r_file_package_input_events(
                 on_disk_text,
                 deleted: event.deleted,
             };
-            if let Some(delta) = crate::package_state::event::translate_with_exclusions(
-                &mut state.package_inputs,
-                event,
-                &workspace_exclusions,
-            ) {
+            if let Some(delta) =
+                translate_watched_package_event(&mut state, event, &workspace_exclusions)
+            {
                 deltas.push(delta);
             }
         }
@@ -5900,6 +6592,15 @@ impl LanguageServer for Backend {
         // read DESCRIPTION/NAMESPACE outside the WorldState write lock below.
         let root_for_pkg_inputs: Option<std::path::PathBuf> =
             folders.first().and_then(|u| u.to_file_path().ok());
+        // Package document notifications may arrive while the default workspace
+        // scan/seed runs in this detached task. Install the root and config-only
+        // routing state synchronously first so those events are translated rather
+        // than silently dropped; the seed later replaces disk-backed inputs and
+        // replays every authoritative open buffer over them.
+        if let Some(root) = root_for_pkg_inputs.clone() {
+            let mut state = self.state.write().await;
+            establish_package_event_translation_state(&mut state, root);
+        }
         let client_clone = self.client.clone();
         let traversal_truncation = self.traversal_truncation.clone();
         if index_workspace {
@@ -5939,33 +6640,23 @@ impl LanguageServer for Backend {
                         // chains and must not run under the lock (see
                         // `initialize_package_inputs_from_state_with_exclusions`).
                         let package_seed = if let Some(root) = root_for_pkg_inputs.as_ref() {
-                            // Buffer-aware: overlay authoritative open-buffer
-                            // text so this late-completing seed cannot clobber
-                            // unsaved preamble/closure edits.
-                            let overrides = {
-                                let state = state_clone.read().await;
-                                snapshot_preamble_text_overrides(&state)
-                            };
-                            let root = root.clone();
-                            let exclusions = workspace_exclusions.clone();
                             Some(
-                                tokio::task::spawn_blocking(move || {
-                                    PrecomputedPackageSeed::compute(
-                                        &root,
-                                        &exclusions,
-                                        &overrides,
-                                        false,
-                                    )
-                                })
-                                .await
-                                .unwrap_or_default(),
+                                PrecomputedPackageSeed::compute_from_state(
+                                    &state_clone,
+                                    root,
+                                    &workspace_exclusions,
+                                    false,
+                                )
+                                .await,
                             )
                         } else {
                             None
                         };
 
-                        // Apply index and snapshot trigger versions under a single write lock
-                        let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
+                        // Apply the index first. Package semantics remain live
+                        // until the seed transaction installs, so a rejected
+                        // generation never exposes a reset/partially-empty state.
+                        {
                             let mut state = state_clone.write().await;
                             state.apply_workspace_index(
                                 index,
@@ -5973,23 +6664,36 @@ impl LanguageServer for Backend {
                                 new_index_entries,
                             );
                             replay_open_documents_after_workspace_index_apply(&mut state).await;
-                            if let (Some(root), Some(seed)) =
-                                (root_for_pkg_inputs.clone(), package_seed)
-                            {
-                                // Populate package_inputs from the now-applied
-                                // workspace index and overlay open documents
-                                // (authoritative unsaved edits).
-                                seed.install(&mut state, root, &workspace_exclusions);
-                            } else {
-                                state.apply_package_event(
-                                    &crate::package_state::PackageInputDelta::Initial,
-                                );
-                            }
-                            // Mark force republish for all open documents so they pick up
-                            // newly discovered backward edges from the dependency graph
-                            // and snapshot trigger versions while we hold the lock.
-                            // Bulk-mark first to avoid per-URI lock churn on large
-                            // workspaces.
+                        }
+
+                        let package_seed_installed = if let (Some(root), Some(seed)) =
+                            (root_for_pkg_inputs.clone(), package_seed)
+                        {
+                            let seed_handles = PackageSeedTaskHandles {
+                                state: state_clone.clone(),
+                                client: client_clone.clone(),
+                                traversal_truncation: traversal_truncation.clone(),
+                            };
+                            install_package_seed_with_retry(
+                                &seed_handles,
+                                root,
+                                workspace_exclusions.clone(),
+                                false,
+                                Some(seed),
+                            )
+                            .await
+                        } else {
+                            state_clone.write().await.apply_package_event(
+                                &crate::package_state::PackageInputDelta::Initial,
+                            );
+                            true
+                        };
+
+                        // Snapshot trigger versions only after package seeding
+                        // converges, so diagnostics observe the installed input
+                        // transaction rather than an intermediate attempt.
+                        let (work_items, debounce_ms, pkg_lib, packages_enabled) = {
+                            let state = state_clone.read().await;
                             let open_keys: Vec<Url> = state.documents.keys().cloned().collect();
                             state
                                 .diagnostics_gate
@@ -6011,8 +6715,8 @@ impl LanguageServer for Backend {
 
                         // Close the seed-install TOCTOU window for preamble
                         // buffers opened/edited while the seed was in flight.
-                        if let Some(root) = root_for_pkg_inputs.clone() {
-                            Backend::refresh_open_preamble_docs_after_seed(
+                        if package_seed_installed && let Some(root) = root_for_pkg_inputs.clone() {
+                            Backend::refresh_open_package_inputs_after_seed(
                                 state_clone.clone(),
                                 client_clone.clone(),
                                 traversal_truncation.clone(),
@@ -6078,30 +6782,15 @@ impl LanguageServer for Backend {
             });
         } else {
             let package_seed = if let Some(root) = root_for_pkg_inputs.clone() {
-                let root_clone = root.clone();
                 let seed_exclusions = workspace_exclusions.clone();
-                let scan_exclusions = workspace_exclusions.clone();
-                // Buffer-aware preamble scan: snapshot open-buffer text before
-                // the blocking scan so the seed cannot clobber unsaved edits
-                // (see `initialize_package_inputs_from_state_with_exclusions`).
-                let preamble_overrides = {
-                    let state = self.state.read().await;
-                    snapshot_preamble_text_overrides(&state)
-                };
-                Some((
-                    root,
-                    seed_exclusions,
-                    tokio::task::spawn_blocking(move || {
-                        PrecomputedPackageSeed::compute(
-                            &root_clone,
-                            &scan_exclusions,
-                            &preamble_overrides,
-                            true,
-                        )
-                    })
-                    .await
-                    .unwrap_or_default(),
-                ))
+                let seed = PrecomputedPackageSeed::compute_from_state(
+                    &self.state,
+                    &root,
+                    &seed_exclusions,
+                    true,
+                )
+                .await;
+                Some((root, seed_exclusions, seed))
             } else {
                 None
             };
@@ -6109,21 +6798,24 @@ impl LanguageServer for Backend {
             // No workspace scan — mark complete immediately and still seed
             // package inputs from disk/open documents so package mode starts
             // with a derived state.
-            let seeded_root = {
-                let mut state = self.state.write().await;
-                state.workspace_scan_complete = true;
-                if let Some((root, package_exclusions, seed)) = package_seed {
-                    let seeded = root.clone();
-                    seed.install(&mut state, root, &package_exclusions);
-                    Some(seeded)
-                } else {
-                    None
-                }
+            self.state.write().await.workspace_scan_complete = true;
+            let seeded_root = if let Some((root, package_exclusions, seed)) = package_seed {
+                install_package_seed_with_retry(
+                    &PackageSeedTaskHandles::from_backend(self),
+                    root.clone(),
+                    package_exclusions,
+                    true,
+                    Some(seed),
+                )
+                .await
+                .then_some(root)
+            } else {
+                None
             };
             // Close the seed-install TOCTOU window for preamble buffers
             // opened/edited while the seed was in flight.
             if let Some(root) = seeded_root {
-                Backend::refresh_open_preamble_docs_after_seed(
+                Backend::refresh_open_package_inputs_after_seed(
                     self.state.clone(),
                     self.client.clone(),
                     self.traversal_truncation.clone(),
@@ -6268,8 +6960,9 @@ impl LanguageServer for Backend {
                             let open_uris: Vec<tower_lsp::lsp_types::Url> = {
                                 let mut state = state_arc.write().await;
                                 state.package_inputs.sysdata_names = names;
+                                state.record_package_input_mutation();
                                 state.apply_package_event(
-                                    &crate::package_state::PackageInputDelta::DataDirChanged,
+                                    &crate::package_state::PackageInputDelta::SysdataNamesChanged,
                                 );
                                 let uris: Vec<_> = state.documents.keys().cloned().collect();
                                 state
@@ -6353,6 +7046,7 @@ impl LanguageServer for Backend {
         {
             let state = self.state.read().await;
             state.retire_all_diagnostic_lifecycles();
+            state.cancel_package_seed_retry();
         }
         Ok(())
     }
@@ -6730,31 +7424,9 @@ impl LanguageServer for Backend {
             // the DocumentStore open below so its tree/artifacts agree.
             let (chunk_kind, analysis_text) =
                 crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
-            let mut meta = crate::cross_file::extract_metadata(&analysis_text);
+            let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
             let uri_clone = uri.clone();
             let workspace_root = state.workspace_folders.first().cloned();
-            let max_chain_depth = state.cross_file_config.max_chain_depth;
-
-            // Enrich metadata with inherited working directory before any use
-            // Use get_enriched_metadata to prefer already-enriched sources for transitive inheritance
-            crate::cross_file::enrich_metadata_with_inherited_wd(
-                &mut meta,
-                &uri_clone,
-                workspace_root.as_ref(),
-                |parent_uri| state.get_enriched_metadata(parent_uri),
-                max_chain_depth,
-            );
-
-            // Resolve system.file() source entries into concrete paths
-            {
-                let ws = state.package_state.workspace();
-                let ws_name = ws.map(|w| w.name.as_str());
-                let ws_root = ws.map(|w| w.root.as_path());
-                let lib_paths = state.package_library.lib_paths();
-                crate::cross_file::resolve_system_file_sources(
-                    &mut meta, ws_name, ws_root, lib_paths,
-                );
-            }
 
             // Update new DocumentStore with enriched metadata (Requirement 1.3).
             // `chunk_kind` was classified above by languageId-then-URI so
@@ -6802,9 +7474,7 @@ impl LanguageServer for Backend {
                         uri: package_event_uri,
                         text: arc_text,
                     };
-                    if let Some(delta) =
-                        crate::package_state::event::translate(&mut state.package_inputs, event)
-                    {
+                    if let Some(delta) = translate_package_event(&mut state, event) {
                         state.apply_package_event(&delta);
                         package_visibility_changed = state.package_state.namespace_model()
                             != old_ns_model.as_ref()
@@ -7205,26 +7875,18 @@ impl LanguageServer for Backend {
             {
                 let mut state = self.state.write().await;
                 let workspace_root = state.workspace_folders.first().cloned();
-                let max_chain_depth = state.cross_file_config.max_chain_depth;
 
                 // Masked for Rmd/Quarto (chunk bodies only); raw otherwise.
                 // Classify by languageId-then-URI so untitled buffers mask, and
                 // extract metadata from that same masked view (#343).
                 let (chunk_kind, analysis_text) =
                     crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
-                let mut meta = crate::cross_file::extract_metadata(&analysis_text);
+                let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
                 log::trace!(
                     "did_open re-enrich: uri={}, sources={}, sourced_by={}",
                     uri,
                     meta.sources.len(),
                     meta.sourced_by.len()
-                );
-                crate::cross_file::enrich_metadata_with_inherited_wd(
-                    &mut meta,
-                    &uri,
-                    workspace_root.as_ref(),
-                    |parent_uri| state.get_enriched_metadata(parent_uri),
-                    max_chain_depth,
                 );
                 log::trace!(
                     "did_open re-enrich: uri={} working_directory={:?} inherited_working_directory={:?}",
@@ -7232,17 +7894,6 @@ impl LanguageServer for Backend {
                     meta.working_directory,
                     meta.inherited_working_directory
                 );
-
-                // Resolve system.file() source entries into concrete paths
-                {
-                    let ws = state.package_state.workspace();
-                    let ws_name = ws.map(|w| w.name.as_str());
-                    let ws_root = ws.map(|w| w.root.as_path());
-                    let lib_paths = state.package_library.lib_paths();
-                    crate::cross_file::resolve_system_file_sources(
-                        &mut meta, ws_name, ws_root, lib_paths,
-                    );
-                }
 
                 state
                     .document_store
@@ -7350,32 +8001,13 @@ impl LanguageServer for Backend {
             }
             let mut state = self.state.write().await;
             let workspace_root = state.workspace_folders.first().cloned();
-            let max_chain_depth = state.cross_file_config.max_chain_depth;
 
             // languageId-then-URI classification masks untitled buffers (#343);
             // extract metadata from the same masked view so the graph and the
             // DocumentStore tree/artifacts agree (chunk bodies only for Rmd).
             let (chunk_kind, analysis_text) =
                 crate::cross_file::classify_and_mask(Some(language_id.as_str()), &uri, &text);
-            let mut meta = crate::cross_file::extract_metadata(&analysis_text);
-            crate::cross_file::enrich_metadata_with_inherited_wd(
-                &mut meta,
-                &uri,
-                workspace_root.as_ref(),
-                |parent_uri| state.get_enriched_metadata(parent_uri),
-                max_chain_depth,
-            );
-
-            // Resolve system.file() source entries into concrete paths
-            {
-                let ws = state.package_state.workspace();
-                let ws_name = ws.map(|w| w.name.as_str());
-                let ws_root = ws.map(|w| w.root.as_path());
-                let lib_paths = state.package_library.lib_paths();
-                crate::cross_file::resolve_system_file_sources(
-                    &mut meta, ws_name, ws_root, lib_paths,
-                );
-            }
+            let meta = extract_enriched_live_metadata(&state, &uri, &analysis_text);
 
             state
                 .document_store
@@ -7877,9 +8509,7 @@ impl LanguageServer for Backend {
                     uri: package_event_uri,
                     text,
                 };
-                if let Some(delta) =
-                    crate::package_state::event::translate(&mut state.package_inputs, event)
-                {
+                if let Some(delta) = translate_package_event(&mut state, event) {
                     state.apply_package_event(&delta);
                     package_visibility_changed = state.package_state.namespace_model()
                         != old_ns_model.as_ref()
@@ -8476,9 +9106,7 @@ impl LanguageServer for Backend {
                         on_disk_text: close_text.clone(),
                     }
                 };
-                if let Some(delta) =
-                    crate::package_state::event::translate(&mut state.package_inputs, event)
-                {
+                if let Some(delta) = translate_package_event(&mut state, event) {
                     state.apply_package_event(&delta);
                 }
             }
@@ -8975,8 +9603,8 @@ impl LanguageServer for Backend {
                                     on_disk_text: None,
                                     deleted: true,
                                 };
-                            if crate::package_state::event::translate_with_exclusions(
-                                &mut state.package_inputs,
+                            if translate_watched_package_event(
+                                &mut state,
                                 event,
                                 &workspace_exclusions,
                             )
@@ -9029,8 +9657,8 @@ impl LanguageServer for Backend {
                                     on_disk_text: None,
                                     deleted: true,
                                 };
-                            if crate::package_state::event::translate_with_exclusions(
-                                &mut state.package_inputs,
+                            if translate_watched_package_event(
+                                &mut state,
                                 event,
                                 &workspace_exclusions,
                             )
@@ -9874,6 +10502,12 @@ impl Backend {
                     != prev.prev_indentation_producer_policy;
             let workspace_exclusions_changed =
                 state.workspace_exclusions.patterns() != prev.prev_workspace_exclusions.as_slice();
+            if workspace_exclusions_changed {
+                // `recompute_parsed_configs` already replaced the compiled
+                // exclusions. Invalidate every seed scanned under the prior
+                // matcher before any off-lock rescan begins.
+                state.record_package_input_mutation();
+            }
             let workspace_exclusion_package_reseed = workspace_exclusions_changed.then(|| {
                 state
                     .package_inputs
@@ -9913,9 +10547,7 @@ impl Backend {
                 let mode = state.cross_file_config.package_mode;
                 let event =
                     crate::package_state::event::HandlerEvent::SettingChanged { new_mode: mode };
-                if let Some(delta) =
-                    crate::package_state::event::translate(&mut state.package_inputs, event)
-                {
+                if let Some(delta) = translate_package_event(&mut state, event) {
                     if mode == PackageMode::Disabled {
                         state.apply_package_event(&delta);
                         None
@@ -9934,6 +10566,11 @@ impl Backend {
 
             let model_rprofile_changed =
                 state.cross_file_config.model_rprofile != prev.prev_cross_file.model_rprofile;
+            if model_rprofile_changed {
+                // The seed's `.Rprofile` install semantics changed even if the
+                // resulting symbol sets would be value-equal.
+                state.record_package_input_mutation();
+            }
             let pkg_mode_io_needed = pkg_mode_io_needed.or_else(|| {
                 if model_rprofile_changed {
                     state
@@ -10045,32 +10682,20 @@ impl Backend {
                 match scan_result {
                     Ok((index, cross_file_entries, new_index_entries)) => {
                         let package_seed = if let Some(root) = root_for_pkg_inputs.as_ref() {
-                            // Buffer-aware: overlay authoritative open-buffer
-                            // text so this reseed cannot clobber unsaved
-                            // preamble/closure edits.
-                            let overrides = {
-                                let state = self.state.read().await;
-                                snapshot_preamble_text_overrides(&state)
-                            };
-                            let root = root.clone();
-                            let exclusions = workspace_exclusions.clone();
                             Some(
-                                tokio::task::spawn_blocking(move || {
-                                    PrecomputedPackageSeed::compute(
-                                        &root,
-                                        &exclusions,
-                                        &overrides,
-                                        false,
-                                    )
-                                })
-                                .await
-                                .unwrap_or_default(),
+                                PrecomputedPackageSeed::compute_from_state(
+                                    &self.state,
+                                    root,
+                                    &workspace_exclusions,
+                                    false,
+                                )
+                                .await,
                             )
                         } else {
                             None
                         };
 
-                        let (package_library, packages_enabled) = {
+                        {
                             let mut state = self.state.write().await;
                             state.apply_workspace_index(
                                 index,
@@ -10078,16 +10703,26 @@ impl Backend {
                                 new_index_entries,
                             );
                             replay_open_documents_after_workspace_index_apply(&mut state).await;
-                            if let (Some(root), Some(seed)) =
-                                (root_for_pkg_inputs.clone(), package_seed)
-                            {
-                                seed.install(&mut state, root, &workspace_exclusions);
-                                package_inputs_initialized_by_exclusion_reload = true;
-                            } else {
-                                state.apply_package_event(
-                                    &crate::package_state::PackageInputDelta::Initial,
-                                );
-                            }
+                        }
+                        if let (Some(root), Some(seed)) =
+                            (root_for_pkg_inputs.clone(), package_seed)
+                        {
+                            package_inputs_initialized_by_exclusion_reload =
+                                install_package_seed_with_retry(
+                                    &PackageSeedTaskHandles::from_backend(self),
+                                    root,
+                                    workspace_exclusions.clone(),
+                                    false,
+                                    Some(seed),
+                                )
+                                .await;
+                        } else {
+                            self.state.write().await.apply_package_event(
+                                &crate::package_state::PackageInputDelta::Initial,
+                            );
+                        }
+                        let (package_library, packages_enabled) = {
+                            let state = self.state.read().await;
                             (
                                 state.package_library.clone(),
                                 state.cross_file_config.packages_enabled
@@ -10098,8 +10733,10 @@ impl Backend {
 
                         // Close the seed-install TOCTOU window for preamble
                         // buffers opened/edited while the reseed was in flight.
-                        if let Some(root) = root_for_pkg_inputs {
-                            Backend::refresh_open_preamble_docs_after_seed(
+                        if package_inputs_initialized_by_exclusion_reload
+                            && let Some(root) = root_for_pkg_inputs
+                        {
+                            Backend::refresh_open_package_inputs_after_seed(
                                 self.state.clone(),
                                 self.client.clone(),
                                 self.traversal_truncation.clone(),
@@ -10127,40 +10764,9 @@ impl Backend {
                 && let Some((root, workspace_exclusions)) =
                     workspace_exclusion_package_reseed.clone()
             {
-                let root_clone = root.clone();
-                let scan_exclusions = workspace_exclusions.clone();
-                // Buffer-aware preamble scan: snapshot open-buffer text before
-                // the blocking scan so the reseed cannot clobber unsaved edits
-                // (see `initialize_package_inputs_from_state_with_exclusions`).
-                let preamble_overrides = {
-                    let state = self.state.read().await;
-                    snapshot_preamble_text_overrides(&state)
-                };
-                let package_seed = tokio::task::spawn_blocking(move || {
-                    PrecomputedPackageSeed::compute(
-                        &root_clone,
-                        &scan_exclusions,
-                        &preamble_overrides,
-                        true,
-                    )
-                })
-                .await
-                .unwrap_or_default();
-
-                {
-                    let mut state = self.state.write().await;
-                    package_seed.install(&mut state, root.clone(), &workspace_exclusions);
-                }
+                self.reseed_package_inputs_and_refresh(root, workspace_exclusions, true)
+                    .await;
                 package_inputs_initialized_by_exclusion_reload = true;
-                // Close the seed-install TOCTOU window for preamble buffers
-                // opened/edited while the reseed was in flight.
-                Backend::refresh_open_preamble_docs_after_seed(
-                    self.state.clone(),
-                    self.client.clone(),
-                    self.traversal_truncation.clone(),
-                    root,
-                )
-                .await;
             }
         }
 
@@ -10171,49 +10777,17 @@ impl Backend {
         if let Some(root) = pkg_mode_io_needed
             && !package_inputs_initialized_by_exclusion_reload
         {
-            let root_clone = root.clone();
             let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
-            let scan_exclusions = workspace_exclusions.clone();
-            // Buffer-aware preamble scan: snapshot open-buffer text before the
-            // blocking scan so the packageMode reseed cannot clobber unsaved
-            // edits (see `initialize_package_inputs_from_state_with_exclusions`).
-            let preamble_overrides = {
-                let state = self.state.read().await;
-                snapshot_preamble_text_overrides(&state)
-            };
-            let package_seed = tokio::task::spawn_blocking(move || {
-                PrecomputedPackageSeed::compute(
-                    &root_clone,
-                    &scan_exclusions,
-                    &preamble_overrides,
-                    true,
-                )
-            })
-            .await
-            .unwrap_or_default();
-
-            // Re-acquire write lock to apply results. Route through the same
-            // seeding helper the startup paths use, so config-reload and startup
-            // share one implementation: it sets workspace_root, package_mode,
+            // Route through the same seeding transaction as the workspace-
+            // exclusion fallback. It sets workspace_root, package_mode,
             // description, and namespace, hydrates R files from disk + index +
             // open buffers, then applies the `Initial` delta. Seeding from disk
             // matters here so a packageMode switch still sees closed R files when
             // the background workspace index has not populated yet. (Re-setting
             // package_mode is a no-op: `translate(SettingChanged)` above already
             // set it to this same mode.)
-            {
-                let mut state = self.state.write().await;
-                package_seed.install(&mut state, root.clone(), &workspace_exclusions);
-            }
-            // Close the seed-install TOCTOU window for preamble buffers
-            // opened/edited while the reseed was in flight.
-            Backend::refresh_open_preamble_docs_after_seed(
-                self.state.clone(),
-                self.client.clone(),
-                self.traversal_truncation.clone(),
-                root,
-            )
-            .await;
+            self.reseed_package_inputs_and_refresh(root, workspace_exclusions, true)
+                .await;
             log::info!("Rebuilt package state after packageMode change (event-driven)");
         }
 
@@ -11120,16 +11694,49 @@ impl Backend {
         &self,
         scan: crate::package_state::rprofile::RprofileScan,
     ) {
+        let _ = Self::apply_rprofile_prelude_rescan_with(
+            &self.state,
+            self.client.clone(),
+            self.traversal_truncation.clone(),
+            scan,
+            None,
+        )
+        .await;
+    }
+
+    /// Apply a completed `.Rprofile` scan, optionally only if the authoritative
+    /// open buffer and package inputs still belong to the captured lifecycles.
+    /// The commit-time check prevents a seed refresh scanned for a closed
+    /// lifecycle, older package generation, root, or exclusion/config identity
+    /// from overwriting current state.
+    async fn apply_rprofile_prelude_rescan_with(
+        state_arc: &Arc<RwLock<WorldState>>,
+        client: Client,
+        traversal_truncation: Arc<TraversalTruncationState>,
+        scan: crate::package_state::rprofile::RprofileScan,
+        expected_open: Option<(
+            Url,
+            OpenDocumentSeedIdentity,
+            std::path::PathBuf,
+            PackageSeedInputSnapshot,
+            crate::config_file::CompiledWorkspaceExclusions,
+        )>,
+    ) -> bool {
         let affected: Vec<Url> = {
-            let mut state = self.state.write().await;
+            let mut state = state_arc.write().await;
+            if let Some((uri, identity, root, package_inputs, exclusions)) = expected_open.as_ref()
+                && (open_document_seed_identity(&state, uri).as_ref() != Some(identity)
+                    || authoritative_rprofile_root_for_open_document(&state, uri).as_ref()
+                        != Some(root)
+                    || !package_inputs.is_current_for(&state, root, exclusions))
+            {
+                return false;
+            }
             // Pure in-memory apply — safe under the lock. `None` means modeling
             // is disabled and nothing was cleared, so there's no re-derive or
             // fanout to do.
-            let Some(delta) = crate::package_state::event::apply_rprofile_scan(
-                &mut state.package_inputs,
-                Some(scan),
-            ) else {
-                return;
+            let Some(delta) = apply_rprofile_scan_to_state(&mut state, Some(scan)) else {
+                return true;
             };
             state.apply_package_event(&delta);
             // Fan out to every open workspace R file that consumes the prelude
@@ -11138,7 +11745,7 @@ impl Backend {
             // and the edited buffer's own diagnostics are republished by the
             // normal did_change/did_close flow.
             let Some(ws_root) = state.package_inputs.workspace_root.clone() else {
-                return;
+                return true;
             };
             let affected: Vec<Url> = state
                 .documents
@@ -11156,21 +11763,19 @@ impl Backend {
         };
 
         if affected.is_empty() {
-            return;
+            return true;
         }
         // Publish via the bounded, concurrency-capped fanout — and SPAWN it
         // rather than await, so this live-edit refresh does not block the
         // sequentially-processed LSP message queue (a serial per-file publish
         // here would stall subsequent edits on large workspaces).
-        let state_arc = self.state.clone();
-        let client = self.client.clone();
-        let traversal_truncation = self.traversal_truncation.clone();
         tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
-            state_arc,
+            state_arc.clone(),
             client,
             affected,
             Some(traversal_truncation),
         ));
+        true
     }
 
     /// Refresh the affected testthat preamble sourced closures from a snapshot
@@ -11182,13 +11787,14 @@ impl Backend {
         affected_paths: Vec<std::path::PathBuf>,
         scheduled_uris: &std::collections::HashSet<Url>,
     ) {
-        Self::refresh_testthat_preambles_for_paths_with(
+        let _ = Self::refresh_testthat_preambles_for_paths_with(
             self.state.clone(),
             self.client.clone(),
             self.traversal_truncation.clone(),
             root,
             affected_paths,
             scheduled_uris,
+            None,
         )
         .await;
     }
@@ -11203,21 +11809,29 @@ impl Backend {
         root: std::path::PathBuf,
         affected_paths: Vec<std::path::PathBuf>,
         scheduled_uris: &std::collections::HashSet<Url>,
-    ) {
-        let (previous, overrides, exclusions) = {
+        expected_open_documents: Option<&std::collections::BTreeMap<Url, OpenDocumentSeedIdentity>>,
+    ) -> bool {
+        let (previous, overrides, exclusions, package_inputs) = {
             let state = state_arc.read().await;
+            let exclusions = state.workspace_exclusions.clone();
             (
-                crate::package_state::preamble::PreambleScan::snapshot(&state.package_inputs),
+                crate::package_state::preamble::PreambleSnapshot::from_inputs(
+                    &state.package_inputs,
+                ),
                 snapshot_preamble_text_overrides(&state),
-                state.workspace_exclusions.clone(),
+                exclusions.clone(),
+                PackageSeedInputSnapshot::capture(&state, &exclusions),
             )
         };
+        let expected_package_inputs = expected_open_documents
+            .is_some()
+            .then(|| (package_inputs, exclusions.clone()));
         let root_for_scan = root.clone();
         let affected_for_scan = affected_paths.clone();
         let Ok((scan, rescanned)) = tokio::task::spawn_blocking(move || {
             crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
                 &root_for_scan,
-                &previous,
+                previous,
                 &affected_for_scan,
                 &overrides,
                 &exclusions,
@@ -11225,7 +11839,7 @@ impl Backend {
         })
         .await
         else {
-            return;
+            return false;
         };
         Self::apply_testthat_preamble_rescan(
             &state_arc,
@@ -11236,8 +11850,10 @@ impl Backend {
             &root,
             &affected_paths,
             scheduled_uris,
+            expected_open_documents,
+            expected_package_inputs.as_ref(),
         )
-        .await;
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11250,34 +11866,58 @@ impl Backend {
         root: &std::path::Path,
         affected_paths: &[std::path::PathBuf],
         scheduled_uris: &std::collections::HashSet<Url>,
-    ) {
+        expected_open_documents: Option<&std::collections::BTreeMap<Url, OpenDocumentSeedIdentity>>,
+        expected_package_inputs: Option<&(
+            PackageSeedInputSnapshot,
+            crate::config_file::CompiledWorkspaceExclusions,
+        )>,
+    ) -> bool {
         let affected: Vec<Url> = {
             let mut state = state_arc.write().await;
-            // The common no-change case should not clone every live preamble
-            // map under the write lock. Only rescanned roots can be installed;
-            // compare those entries by reference first.
-            if scan.rescanned_match_inputs(&rescanned, &state.package_inputs) {
-                return;
+            if let Some(expected) = expected_open_documents
+                && snapshot_open_document_seed_identities(&state) != *expected
+            {
+                // The off-lock scan belongs to an older edit or document
+                // lifecycle. In particular, close/reopen at the same LSP version
+                // changes the epoch even though version and revision can repeat.
+                return false;
             }
-            let current =
-                crate::package_state::preamble::PreambleScan::snapshot(&state.package_inputs);
-            // The scan ran off-lock against a snapshot; a concurrent writer
-            // (the spawned watched-file resync task) may have updated OTHER
-            // preambles since. Graft only the rescanned preambles' entries
-            // onto live state so those updates survive.
-            let merged = crate::package_state::preamble::merge_rescanned_preambles(
-                current, &scan, &rescanned,
-            );
-            if merged.matches_inputs(&state.package_inputs) {
-                return;
+            if let Some((expected, exclusions)) = expected_package_inputs
+                && !expected.is_current_for(&state, root, exclusions)
+            {
+                // A watcher/config/reseed installed newer package inputs while
+                // this off-lock post-seed scan was running.
+                return false;
             }
-            let Some(delta) = crate::package_state::event::apply_preamble_scan(
-                &mut state.package_inputs,
-                Some(merged),
-            ) else {
-                return;
-            };
-            state.apply_package_event(&delta);
+            if state.package_inputs.package_mode == crate::cross_file::config::PackageMode::Disabled
+            {
+                let Some(delta) = apply_preamble_scan_to_state(&mut state, None) else {
+                    return true;
+                };
+                state.apply_package_event(&delta);
+            } else {
+                // The common no-change case compares only rescanned roots by
+                // reference and avoids touching the live maps under the lock.
+                if scan.rescanned_match_inputs(&rescanned, &state.package_inputs) {
+                    return true;
+                }
+                // The scan ran off-lock against a snapshot; a concurrent writer
+                // may have updated OTHER preambles since. Mutate only rescanned
+                // keys in live state so those updates survive, then rebuild the
+                // derived routing union from that live keyed state.
+                let changed = crate::package_state::preamble::apply_rescanned_preambles(
+                    &mut state.package_inputs,
+                    scan,
+                    &rescanned,
+                );
+                if !changed {
+                    return true;
+                }
+                state.record_package_input_mutation();
+                state.apply_package_event(
+                    &crate::package_state::PackageInputDelta::PreambleSourcesChanged,
+                );
+            }
             let testthat_dir = root.join("tests/testthat");
             let affected: Vec<Url> = state
                 .documents
@@ -11299,7 +11939,7 @@ impl Backend {
         };
 
         if affected.is_empty() {
-            return;
+            return true;
         }
         tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
             state_arc.clone(),
@@ -11307,77 +11947,160 @@ impl Backend {
             affected,
             Some(traversal_truncation),
         ));
+        true
+    }
+
+    /// Recompute and install package inputs, then converge open source-following
+    /// inputs that may have changed while the seed was in flight.
+    ///
+    /// Seed computation and the convergence refresh stay off the `WorldState`
+    /// write lock. Only installation holds the lock.
+    async fn reseed_package_inputs_and_refresh(
+        &self,
+        root: std::path::PathBuf,
+        workspace_exclusions: crate::config_file::CompiledWorkspaceExclusions,
+        scan_r_files: bool,
+    ) {
+        let installed = install_package_seed_with_retry(
+            &PackageSeedTaskHandles::from_backend(self),
+            root.clone(),
+            workspace_exclusions,
+            scan_r_files,
+            None,
+        )
+        .await;
+        if !installed {
+            return;
+        }
+
+        Self::refresh_open_package_inputs_after_seed(
+            self.state.clone(),
+            self.client.clone(),
+            self.traversal_truncation.clone(),
+            root,
+        )
+        .await;
+    }
+
+    /// Reassert every open package input after a seed installs disk snapshots.
+    /// Manifest and package-R buffers are replayed synchronously by
+    /// `initialize_package_inputs_from_state_with_exclusions`; this off-lock tail
+    /// refreshes the two source-following inputs whose scans cannot run under the
+    /// `WorldState` lock.
+    async fn refresh_open_package_inputs_after_seed(
+        state_arc: Arc<RwLock<WorldState>>,
+        client: Client,
+        traversal_truncation: Arc<TraversalTruncationState>,
+        root: std::path::PathBuf,
+    ) {
+        Self::refresh_open_rprofile_after_seed(
+            &state_arc,
+            client.clone(),
+            traversal_truncation.clone(),
+            &root,
+        )
+        .await;
+        Self::refresh_open_preamble_docs_after_seed(state_arc, client, traversal_truncation, root)
+            .await;
+    }
+
+    /// Converge an `.Rprofile` opened during seed computation to its current
+    /// authoritative buffer. The scan is off-lock and the apply is guarded by
+    /// version/revision/epoch plus O(1) Rope instance identity, so a stale
+    /// lifecycle cannot win even when diagnostics eligibility supplied no epoch.
+    async fn refresh_open_rprofile_after_seed(
+        state_arc: &Arc<RwLock<WorldState>>,
+        client: Client,
+        traversal_truncation: Arc<TraversalTruncationState>,
+        root: &std::path::Path,
+    ) {
+        for _attempt in 0..3 {
+            let snapshot = {
+                let state = state_arc.read().await;
+                if !state.package_inputs.model_rprofile {
+                    return;
+                }
+                snapshot_authoritative_open_rprofile(&state, root).map(
+                    |(uri, contents, identity)| {
+                        let exclusions = state.workspace_exclusions.clone();
+                        let package_inputs = PackageSeedInputSnapshot::capture(&state, &exclusions);
+                        (uri, contents, identity, exclusions, package_inputs)
+                    },
+                )
+            };
+            let Some((uri, contents, identity, exclusions, package_inputs)) = snapshot else {
+                return;
+            };
+            let root_for_scan = root.to_path_buf();
+            let scan_exclusions = exclusions.clone();
+            let Ok(scan) = tokio::task::spawn_blocking(move || {
+                let text = contents.to_string();
+                crate::package_state::rprofile::scan_workspace_rprofile_with_root_text_and_exclusions(
+                    &root_for_scan,
+                    &text,
+                    &scan_exclusions,
+                )
+            })
+            .await
+            else {
+                return;
+            };
+            if Self::apply_rprofile_prelude_rescan_with(
+                state_arc,
+                client.clone(),
+                traversal_truncation.clone(),
+                scan,
+                Some((
+                    uri,
+                    identity,
+                    root.to_path_buf(),
+                    package_inputs,
+                    exclusions,
+                )),
+            )
+            .await
+            {
+                return;
+            }
+        }
     }
 
     /// Close the seed-install TOCTOU window (issue #638): a preamble (or
-    /// sourced-closure member) opened or edited AFTER a seeding path
-    /// snapshotted its buffer overrides but BEFORE the scan was installed
-    /// could not defend itself — on the very first seed `workspace_root` was
-    /// still unset so its did_open refresh bailed, and on a reseed its
-    /// did_open/did_change refresh can be overwritten by the install. Called
-    /// AFTER every seeding install: re-runs the race-safe live refresh (fresh
-    /// override snapshot, per-preamble graft) for every open
-    /// preamble-relevant document, converging state to buffer truth. Cheap
-    /// no-op when nothing relevant is open.
+    /// sourced-closure member) opened or edited after a seeding path snapshotted
+    /// its buffer overrides but before the scan was installed must win over that
+    /// stale result. Each off-lock scan carries all open documents'
+    /// version/revision/epoch plus O(1) Rope instance identity into the write-lock
+    /// apply; a close/reopen at the same LSP version therefore vetoes the stale
+    /// graft, and this bounded loop retries from the new lifecycle.
     async fn refresh_open_preamble_docs_after_seed(
         state_arc: Arc<RwLock<WorldState>>,
         client: Client,
         traversal_truncation: Arc<TraversalTruncationState>,
         root: std::path::PathBuf,
     ) {
-        // Relevant-document snapshot: paths to refresh plus each contributing
-        // document's version, used below to detect a concurrent edit.
-        fn snapshot(
-            state: &WorldState,
-        ) -> (
-            Vec<std::path::PathBuf>,
-            std::collections::BTreeMap<Url, Option<i32>>,
-        ) {
-            let mut paths: Vec<std::path::PathBuf> = Vec::new();
-            let mut versions = std::collections::BTreeMap::new();
-            for (uri, document) in &state.documents {
-                if preamble_sourced_root_for_open_document(state, uri).is_none() {
-                    continue;
-                }
-                paths.extend(file_paths_for_open_document(state, uri));
-                versions.insert(uri.clone(), document.version);
-            }
-            paths.sort();
-            paths.dedup();
-            (paths, versions)
-        }
-
-        // This runs OUTSIDE the serialized notification loop when called from
-        // the detached startup seeding task, so an inline did_change refresh
-        // for the same preamble can land between our scan and our graft — and
-        // our (older) result would overwrite it. There is no per-preamble
-        // versioning to order the two, so converge instead: after applying,
-        // re-check the relevant documents' versions and re-run if anything
-        // changed mid-flight. Bounded retries; every later did_change
-        // self-refreshes anyway, so the loop only has to win when the user
-        // has stopped typing.
         for _attempt in 0..3 {
-            let (affected_paths, versions_before) = {
+            let (affected_paths, identities_before) = {
                 let state = state_arc.read().await;
-                snapshot(&state)
+                snapshot_open_preamble_documents(&state)
             };
             if affected_paths.is_empty() {
                 return;
             }
-            Self::refresh_testthat_preambles_for_paths_with(
+            let applied = Self::refresh_testthat_preambles_for_paths_with(
                 state_arc.clone(),
                 client.clone(),
                 traversal_truncation.clone(),
                 root.clone(),
                 affected_paths,
                 &std::collections::HashSet::new(),
+                Some(&identities_before),
             )
             .await;
-            let versions_after = {
+            let identities_after = {
                 let state = state_arc.read().await;
-                snapshot(&state).1
+                snapshot_open_document_seed_identities(&state)
             };
-            if versions_after == versions_before {
+            if applied && identities_after == identities_before {
                 return;
             }
         }
@@ -14300,9 +15023,8 @@ mod tests {
     mod close_fanout_siblings {
         use super::super::{
             collect_close_fanout_siblings, collect_package_r_file_inputs_from_disk,
-            extend_with_open_package_docs, hydrate_package_r_files_from_state,
-            initialize_package_inputs_from_state_with_exclusions, is_package_data_path,
-            is_package_relevant_open_uri, is_package_source_dir,
+            extend_with_open_package_docs, initialize_package_inputs_from_state_with_exclusions,
+            is_package_data_path, is_package_relevant_open_uri, is_package_source_dir,
             package_scope_workspace_r_path_for_open_document, path_in_rprofile_sourced_set,
         };
         use crate::state::{Document, WorldState};
@@ -14461,7 +15183,7 @@ mod tests {
         }
 
         #[test]
-        fn package_hydration_uses_disk_fallback_with_open_overlay() {
+        fn package_seed_replay_overlays_open_buffer_on_disk_fallback() {
             let temp = tempfile::TempDir::new().unwrap();
             let root = temp.path();
             let r_dir = root.join("R");
@@ -14478,16 +15200,30 @@ mod tests {
                 .insert(open_uri, Document::new("open_value <- 'buffer'\n", Some(3)));
 
             let disk_seed = collect_package_r_file_inputs_from_disk(root);
-            let hydrated = hydrate_package_r_files_from_state(&state, root, disk_seed);
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root.to_path_buf(),
+                None,
+                None,
+                disk_seed,
+                None,
+                None,
+                &exclusions,
+            );
 
-            assert!(hydrated.contains_key(&disk_only));
-            let open_entry = hydrated.get(&open_path).expect("open file hydrated");
+            assert!(state.package_inputs.r_files.contains_key(&disk_only));
+            let open_entry = state
+                .package_inputs
+                .r_files
+                .get(&open_path)
+                .expect("open file replayed");
             assert_eq!(&*open_entry.text, "open_value <- 'buffer'\n");
         }
 
         #[cfg(unix)]
         #[test]
-        fn package_hydration_prefers_symlink_target_over_case_corrected_alias() {
+        fn package_seed_replay_prefers_symlink_target_over_case_corrected_alias() {
             let temp = tempfile::TempDir::new().unwrap();
             let root = temp.path();
             let r_dir = root.join("R");
@@ -14514,17 +15250,29 @@ mod tests {
                 .open(raw_alias_uri, vec![link_uri.clone(), target_uri.clone()]);
 
             let disk_seed = collect_package_r_file_inputs_from_disk(root);
-            let hydrated = hydrate_package_r_files_from_state(&state, root, disk_seed);
+            let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root.to_path_buf(),
+                None,
+                None,
+                disk_seed,
+                None,
+                None,
+                &exclusions,
+            );
 
             assert!(
-                !hydrated.contains_key(&raw_alias_path),
+                !state.package_inputs.r_files.contains_key(&raw_alias_path),
                 "raw wrong-case symlink spelling must not become a package input"
             );
             assert!(
-                !hydrated.contains_key(&link_path),
+                !state.package_inputs.r_files.contains_key(&link_path),
                 "case-corrected symlink spelling must not become a phantom package input"
             );
-            let target_entry = hydrated
+            let target_entry = state
+                .package_inputs
+                .r_files
                 .get(&target_path)
                 .expect("final symlink target must be the package slot");
             assert_eq!(&*target_entry.text, "live_target <- function() 2\n");
@@ -14584,8 +15332,8 @@ mod tests {
             let mut state = WorldState::new();
             // model_rprofile defaults true in CrossFileConfig.
             let disk_seed = collect_package_r_file_inputs_from_disk(root);
-            // `None` → the helper scans `.Rprofile` inline (the non-contended
-            // path); this asserts that inline scan still harvests the prelude.
+            // `None` asks the compatibility wrapper to resolve the scan before
+            // constructing its in-memory install transaction.
             let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
             initialize_package_inputs_from_state_with_exclusions(
                 &mut state,
@@ -14718,6 +15466,11 @@ mod tests {
                 .join("..")
                 .join("scripts")
                 .join("setup.R");
+            assert!(path_in_rprofile_sourced_set(&non_canonical, &sourced));
+            // Deletion-tolerant routing canonicalizes the surviving parent, so
+            // the same watcher spelling still matches after the target vanishes.
+            std::fs::remove_file(&helper).unwrap();
+            assert!(path_in_rprofile_sourced_set(&helper, &sourced));
             assert!(path_in_rprofile_sourced_set(&non_canonical, &sourced));
             // An unrelated file is not a member.
             let other = tmp.path().join("scripts").join("other.R");
@@ -20379,6 +21132,163 @@ mod project_config_initialize_tests {
         }
     }
 
+    #[tokio::test]
+    async fn watched_creation_of_initially_missing_rprofile_helper_refreshes_prelude() {
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        fs::create_dir_all(root_path.join("scripts")).unwrap();
+        let helper = root_path.join("scripts/later.R");
+        fs::write(root_path.join(".Rprofile"), "source(\"scripts/later.R\")\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&root_path).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(root_path.clone());
+            state.package_inputs.model_rprofile = true;
+            let scan = crate::package_state::rprofile::scan_workspace_rprofile(&root_path);
+            state.package_inputs.rprofile_symbols = scan.symbols;
+            state.package_inputs.rprofile_attached_packages = scan.attached_packages;
+            state.package_inputs.rprofile_sourced_files = scan.sourced_files;
+            assert!(state.package_inputs.rprofile_sourced_files.contains(
+                &crate::package_state::preamble::canonicalize_for_routing(&helper)
+            ));
+        }
+
+        fs::write(&helper, "created_def <- 1\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&helper).unwrap(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+
+        let refreshed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if backend
+                    .state
+                    .read()
+                    .await
+                    .package_inputs
+                    .rprofile_symbols
+                    .contains("created_def")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(refreshed, "watched creation must refresh the prelude");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watched_rprofile_helper_delete_recreate_survives_symlinked_root() {
+        let tmp = TempDir::new().unwrap();
+        let real_root = tmp.path().join("real-pkg");
+        let linked_root = tmp.path().join("linked-pkg");
+        fs::create_dir_all(real_root.join("scripts")).unwrap();
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+        let helper = linked_root.join("scripts/setup.R");
+        fs::write(
+            linked_root.join(".Rprofile"),
+            "source(\"scripts/setup.R\")\n",
+        )
+        .unwrap();
+        fs::write(&helper, "stale_def <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&linked_root).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(linked_root.clone());
+            state.package_inputs.model_rprofile = true;
+            let scan = crate::package_state::rprofile::scan_workspace_rprofile(&linked_root);
+            state.package_inputs.rprofile_symbols = scan.symbols;
+            state.package_inputs.rprofile_attached_packages = scan.attached_packages;
+            state.package_inputs.rprofile_sourced_files = scan.sourced_files;
+            assert!(state.package_inputs.rprofile_symbols.contains("stale_def"));
+        }
+
+        fs::remove_file(&helper).unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&helper).unwrap(),
+                    typ: FileChangeType::DELETED,
+                }],
+            })
+            .await;
+        {
+            let state = backend.state.read().await;
+            assert!(!state.package_inputs.rprofile_symbols.contains("stale_def"));
+            assert!(
+                state
+                    .package_inputs
+                    .rprofile_sourced_files
+                    .contains(&real_root.canonicalize().unwrap().join("scripts/setup.R"))
+            );
+        }
+
+        fs::write(&helper, "recreated_def <- 1\n").unwrap();
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Url::from_file_path(&helper).unwrap(),
+                    typ: FileChangeType::CREATED,
+                }],
+            })
+            .await;
+        let refreshed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if backend
+                    .state
+                    .read()
+                    .await
+                    .package_inputs
+                    .rprofile_symbols
+                    .contains("recreated_def")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(refreshed, "watched recreation must refresh the prelude");
+    }
+
     /// `did_open` can carry UNSAVED `.Rprofile` text (e.g. VS Code hot-exit
     /// restoring a dirty buffer) with no following `did_change`. The prelude
     /// must reflect the opened buffer, not just the disk seed.
@@ -20847,10 +21757,1078 @@ mod project_config_initialize_tests {
         );
     }
 
+    #[tokio::test]
+    async fn indexed_workspace_apply_preserves_seed_freshness_and_installs_data_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("data-raw")).unwrap();
+        fs::write(root.join("DESCRIPTION"), "Package: indexedseed\n").unwrap();
+        fs::write(root.join("data/indexed.rda"), b"indexed").unwrap();
+        fs::write(
+            root.join("data-raw/indexed.R"),
+            "usethis::use_data(indexed_internal, internal = TRUE)\n",
+        )
+        .unwrap();
+
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+        }
+        let seed =
+            PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, false)
+                .await
+                .expect("package seed computation must succeed");
+        let generation_before_apply = state_arc.read().await.package_input_generation();
+
+        let mut state = state_arc.write().await;
+        state.apply_workspace_index(Default::default(), Default::default(), Default::default());
+        assert_eq!(
+            state.package_input_generation(),
+            generation_before_apply,
+            "workspace index application must not reset or advance raw-input freshness"
+        );
+        assert!(seed.install(&mut state));
+        assert!(state.package_inputs.dataset_names.contains("indexed"));
+        assert!(
+            state
+                .package_inputs
+                .sysdata_names
+                .contains("indexed_internal")
+        );
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .dataset_symbols
+                .contains("indexed")
+        );
+        assert!(
+            state
+                .package_state
+                .scope_contribution()
+                .sysdata_symbols
+                .contains("indexed_internal")
+        );
+    }
+
+    #[tokio::test]
+    async fn package_seed_rejects_newer_closed_file_watchers_as_one_transaction() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("R")).unwrap();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(root.join("DESCRIPTION"), "Package: oldpkg\n").unwrap();
+        fs::write(root.join("NAMESPACE"), "export(old_fun)\n").unwrap();
+        fs::write(root.join("R/fun.R"), "old_fun <- function() 1\n").unwrap();
+        fs::write(root.join(".Rprofile"), "old_profile <- 1\n").unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/old.R\")\n").unwrap();
+        fs::write(root.join("scripts/old.R"), "old_preamble <- 1\n").unwrap();
+        fs::write(root.join("scripts/new.R"), "new_preamble <- 1\n").unwrap();
+
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+        }
+        let seed = PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, true)
+            .await
+            .expect("package seed computation must succeed");
+
+        fs::write(root.join("DESCRIPTION"), "Package: newpkg\n").unwrap();
+        fs::write(root.join("NAMESPACE"), "export(new_fun)\n").unwrap();
+        fs::write(root.join("R/fun.R"), "new_fun <- function() 2\n").unwrap();
+        fs::write(root.join(".Rprofile"), "new_profile <- 1\n").unwrap();
+        fs::write(&preamble, "source(\"../../scripts/new.R\")\n").unwrap();
+
+        let mut state = state_arc.write().await;
+        for path in [
+            root.join("DESCRIPTION"),
+            root.join("NAMESPACE"),
+            root.join("R/fun.R"),
+            root.join(".Rprofile"),
+            preamble.clone(),
+        ] {
+            let delta = translate_watched_package_event(
+                &mut state,
+                crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                    uri: Url::from_file_path(path).unwrap(),
+                    on_disk_text: None,
+                    deleted: false,
+                },
+                &exclusions,
+            )
+            .expect("closed package input watcher must mutate inputs");
+            state.apply_package_event(&delta);
+        }
+
+        assert!(!seed.install(&mut state));
+        assert_eq!(
+            state
+                .package_inputs
+                .description
+                .as_ref()
+                .map(|input| &*input.text),
+            Some("Package: newpkg\n")
+        );
+        assert_eq!(
+            state
+                .package_inputs
+                .namespace
+                .as_ref()
+                .map(|input| &*input.text),
+            Some("export(new_fun)\n")
+        );
+        assert_eq!(
+            state
+                .package_inputs
+                .r_files
+                .get(&root.join("R/fun.R"))
+                .map(|input| &*input.text),
+            Some("new_fun <- function() 2\n")
+        );
+        assert!(
+            state
+                .package_inputs
+                .rprofile_symbols
+                .contains("new_profile")
+        );
+        assert!(
+            !state
+                .package_inputs
+                .rprofile_symbols
+                .contains("old_profile")
+        );
+        assert!(
+            state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("new_preamble"))
+        );
+        assert!(
+            !state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("old_preamble"))
+        );
+    }
+
+    #[tokio::test]
+    async fn package_seed_retry_recomputes_after_generation_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("DESCRIPTION"), "Package: before\n").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+        }
+        let stale_seed =
+            PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, true)
+                .await
+                .expect("package seed computation must succeed");
+
+        fs::write(root.join("DESCRIPTION"), "Package: after\n").unwrap();
+        {
+            let mut state = state_arc.write().await;
+            let delta = translate_watched_package_event(
+                &mut state,
+                crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                    uri: Url::from_file_path(root.join("DESCRIPTION")).unwrap(),
+                    on_disk_text: None,
+                    deleted: false,
+                },
+                &exclusions,
+            )
+            .unwrap();
+            state.apply_package_event(&delta);
+        }
+
+        let compute_state = state_arc.clone();
+        let compute_root = root.clone();
+        let compute_exclusions = exclusions.clone();
+        assert!(
+            attempt_package_seed_install_using(
+                &state_arc,
+                root,
+                Some(Ok(stale_seed)),
+                move || {
+                    let state = compute_state.clone();
+                    let root = compute_root.clone();
+                    let exclusions = compute_exclusions.clone();
+                    async move {
+                        PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+                            .await
+                    }
+                },
+                None,
+            )
+            .await
+        );
+        let state = state_arc.read().await;
+        assert_eq!(
+            state
+                .package_inputs
+                .description
+                .as_ref()
+                .map(|input| &*input.text),
+            Some("Package: after\n")
+        );
+        assert_eq!(
+            state
+                .package_workspace()
+                .map(|workspace| workspace.name.as_str()),
+            Some("after")
+        );
+    }
+
+    #[tokio::test]
+    async fn package_seed_compute_failure_retries_then_installs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root.clone(),
+                Some(Arc::from("Package: current\n")),
+                None,
+                Default::default(),
+                None,
+                None,
+                &exclusions,
+            );
+        }
+
+        fs::write(root.join("DESCRIPTION"), "Package: replacement\n").unwrap();
+        let replacement =
+            PrecomputedPackageSeed::compute(&root, &exclusions, &Default::default(), true);
+        let mut replacement = Some(replacement);
+        let installed = attempt_package_seed_install_using(
+            &state_arc,
+            root.clone(),
+            Some(Err(PackageSeedComputeError {
+                message: "injected compute failure".into(),
+            })),
+            move || {
+                std::future::ready(Ok(replacement.take().expect("retry computes exactly once")))
+            },
+            None,
+        )
+        .await;
+
+        assert!(installed, "a later successful attempt must install");
+        let state = state_arc.read().await;
+        assert_eq!(
+            state
+                .package_inputs
+                .description
+                .as_ref()
+                .map(|input| &*input.text),
+            Some("Package: replacement\n")
+        );
+        assert_eq!(
+            state
+                .package_workspace()
+                .map(|workspace| workspace.name.as_str()),
+            Some("replacement")
+        );
+    }
+
+    #[tokio::test]
+    async fn package_seed_compute_failures_abandon_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root.clone(),
+                Some(Arc::from("Package: current\n")),
+                Some(Arc::from("export(current_fun)\n")),
+                Default::default(),
+                None,
+                None,
+                &exclusions,
+            );
+        }
+        let (inputs_before, package_state_before, generation_before) = {
+            let state = state_arc.read().await;
+            (
+                format!("{:?}", state.package_inputs),
+                state.package_state.clone(),
+                state.package_input_generation(),
+            )
+        };
+        let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retry_counter = Arc::clone(&retries);
+
+        let installed = attempt_package_seed_install_using(
+            &state_arc,
+            root,
+            Some(Err(PackageSeedComputeError {
+                message: "injected initial failure".into(),
+            })),
+            move || {
+                retry_counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(PackageSeedComputeError {
+                    message: "injected retry failure".into(),
+                }))
+            },
+            None,
+        )
+        .await;
+
+        assert!(!installed, "exhausted compute failures must abandon");
+        assert_eq!(
+            retries.load(Ordering::SeqCst),
+            PACKAGE_SEED_MAX_ATTEMPTS - 1,
+            "the initial failure counts against the bounded attempt budget"
+        );
+        let state = state_arc.read().await;
+        assert_eq!(format!("{:?}", state.package_inputs), inputs_before);
+        assert_eq!(state.package_state, package_state_before);
+        assert_eq!(state.package_input_generation(), generation_before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_package_seed_schedules_one_followup_and_converges_current_root_config() {
+        let tmp = TempDir::new().unwrap();
+        let old_root = tmp.path().join("old");
+        let new_root = tmp.path().join("new");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(new_root.join("R")).unwrap();
+        fs::write(old_root.join("DESCRIPTION"), "Package: oldroot\n").unwrap();
+        fs::write(new_root.join("DESCRIPTION"), "Package: newroot\n").unwrap();
+        fs::write(new_root.join("R/excluded.R"), "must_not_install <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            establish_package_event_translation_state(&mut state, old_root.clone());
+        }
+        let handles = PackageSeedTaskHandles::from_backend(backend);
+        let computes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let compute_count = computes.clone();
+        let installed = install_package_seed_with_retry_using(
+            &handles,
+            old_root,
+            Some(Err(PackageSeedComputeError {
+                message: "injected initial failure".into(),
+            })),
+            move || {
+                compute_count.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(PackageSeedComputeError {
+                    message: "injected retry failure".into(),
+                }))
+            },
+        )
+        .await;
+        assert!(!installed);
+        assert_eq!(
+            computes.load(Ordering::SeqCst),
+            PACKAGE_SEED_MAX_ATTEMPTS - 1
+        );
+        assert!(backend.state.read().await.package_seed_retry.has_pending());
+
+        // Repeated requests coalesce into the same single pending slot. Only the
+        // newest task survives to observe the later root/config lifecycle.
+        schedule_package_seed_retry(handles.clone()).await;
+        schedule_package_seed_retry(handles).await;
+        tokio::task::yield_now().await;
+        assert!(backend.state.read().await.package_seed_retry.has_pending());
+
+        let new_exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["R/**"] } }),
+            vec![new_root.clone()],
+        );
+        {
+            let mut state = backend.state.write().await;
+            establish_package_event_translation_state(&mut state, new_root.clone());
+            state.workspace_exclusions = new_exclusions;
+            state.record_package_input_mutation();
+        }
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(PACKAGE_SEED_RETRY_DELAY).await;
+        for _ in 0..5_000 {
+            if !backend.state.read().await.package_seed_retry.has_pending() {
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let generation_after_install = {
+            let state = backend.state.read().await;
+            assert!(
+                !state.package_seed_retry.has_pending(),
+                "the successful delayed transaction must complete its pending slot"
+            );
+            assert_eq!(
+                state.package_inputs.workspace_root.as_ref(),
+                Some(&new_root)
+            );
+            assert_eq!(
+                state
+                    .package_workspace()
+                    .map(|workspace| workspace.name.as_str()),
+                Some("newroot")
+            );
+            assert!(
+                state.package_inputs.r_files.is_empty(),
+                "the delayed seed must use the current compiled exclusions"
+            );
+            state.package_input_generation()
+        };
+
+        // The successful worker exits; no duplicate delayed task remains to
+        // reinstall the same seed on subsequent debounce boundaries.
+        tokio::time::advance(PACKAGE_SEED_RETRY_DELAY * 3).await;
+        tokio::task::yield_now().await;
+        let state = backend.state.read().await;
+        assert_eq!(state.package_input_generation(), generation_after_install);
+        assert!(!state.package_seed_retry.has_pending());
+    }
+
+    #[tokio::test]
+    async fn package_seed_compute_panic_is_not_masked_or_installed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            initialize_package_inputs_from_state_with_exclusions(
+                &mut state,
+                root.clone(),
+                Some(Arc::from("Package: current\n")),
+                None,
+                Default::default(),
+                None,
+                None,
+                &exclusions,
+            );
+        }
+        let (inputs_before, package_state_before, generation_before) = {
+            let state = state_arc.read().await;
+            (
+                format!("{:?}", state.package_inputs),
+                state.package_state.clone(),
+                state.package_input_generation(),
+            )
+        };
+        let compute_state = Arc::clone(&state_arc);
+        let compute_root = root.clone();
+        let compute_exclusions = exclusions.clone();
+
+        let task = tokio::spawn(async move {
+            PrecomputedPackageSeed::compute_from_state_with(
+                &compute_state,
+                &compute_root,
+                &compute_exclusions,
+                true,
+                |_, _, _, _, _, _| -> PackageSeedInstall { panic!("injected seed panic") },
+            )
+            .await
+        });
+        match task.await {
+            Err(error) => assert!(error.is_panic()),
+            Ok(_) => panic!("seed panic must propagate to its owner task"),
+        }
+
+        let state = state_arc.read().await;
+        assert_eq!(format!("{:?}", state.package_inputs), inputs_before);
+        assert_eq!(state.package_state, package_state_before);
+        assert_eq!(state.package_input_generation(), generation_before);
+        assert!(
+            !state.package_seed_retry.has_pending(),
+            "a compute panic propagates instead of becoming an ordinary retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_root_and_exclusion_lifecycles_invalidate_stale_seeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("DESCRIPTION"), "Package: lifecycle\n").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+        }
+
+        let same_root_seed =
+            PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, true)
+                .await
+                .expect("package seed computation must succeed");
+        {
+            let mut state = state_arc.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+            assert!(!same_root_seed.install(&mut state));
+        }
+
+        let exclusion_seed =
+            PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, true)
+                .await
+                .expect("package seed computation must succeed");
+        let new_exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["R/**"] } }),
+            vec![root.clone()],
+        );
+        let mut state = state_arc.write().await;
+        state.workspace_exclusions = new_exclusions;
+        state.record_package_input_mutation();
+        assert!(!exclusion_seed.install(&mut state));
+    }
+
+    #[test]
+    fn precomputed_package_seed_owns_its_root_and_compiled_exclusions() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("owned");
+        fs::create_dir_all(root.join("R")).unwrap();
+        fs::write(root.join("DESCRIPTION"), "Package: ownedseed\n").unwrap();
+        fs::write(root.join("R/excluded.R"), "excluded_symbol <- 1\n").unwrap();
+        let exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["R/**"] } }),
+            vec![root.clone()],
+        );
+
+        let seed = PrecomputedPackageSeed::compute(
+            &root,
+            &exclusions,
+            &crate::package_state::preamble::PreambleTextOverrides::new(),
+            true,
+        );
+        assert_eq!(seed.root, root);
+        assert_eq!(seed.exclusions.patterns(), exclusions.patterns());
+
+        let mut state = WorldState::new();
+        assert!(seed.install(&mut state));
+        assert_eq!(state.package_inputs.workspace_root.as_ref(), Some(&root));
+        assert!(
+            state.package_inputs.r_files.is_empty(),
+            "installation can only use the exclusions owned by the seed"
+        );
+    }
+
+    /// With no intervening package-data writer, installation uses the detached
+    /// scan directly and does not rescan under the state lock.
+    #[tokio::test]
+    async fn package_seed_installs_precomputed_scans_without_rescanning() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("data-raw")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::write(root.join("data/seeded.rda"), b"seeded").unwrap();
+        fs::write(
+            root.join("data-raw/seeded.R"),
+            "usethis::use_data(seeded_internal, internal = TRUE)\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"scripts/profile.R\")\n").unwrap();
+        fs::write(root.join("scripts/profile.R"), "seeded_profile <- 1\n").unwrap();
+        fs::write(
+            root.join("tests/testthat/helper-seed.R"),
+            "source(\"../../scripts/preamble.R\")\n",
+        )
+        .unwrap();
+        fs::write(root.join("scripts/preamble.R"), "seeded_preamble <- 1\n").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+        }
+
+        let seed =
+            PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, false)
+                .await
+                .expect("package seed computation must succeed");
+        let expected_datasets = seed.install.dataset_names.clone();
+        let expected_sysdata = seed.install.sysdata_names.clone();
+        let expected_rprofile = seed.install.rprofile_scan.clone();
+        let expected_preamble = seed.install.preamble_scan.clone();
+
+        fs::remove_file(root.join("data/seeded.rda")).unwrap();
+        fs::remove_file(root.join("data-raw/seeded.R")).unwrap();
+        fs::write(root.join("data/replacement.rda"), b"replacement").unwrap();
+        fs::write(
+            root.join("data-raw/replacement.R"),
+            "usethis::use_data(replacement_internal, internal = TRUE)\n",
+        )
+        .unwrap();
+        fs::write(root.join("scripts/profile.R"), "replacement_profile <- 1\n").unwrap();
+        fs::write(
+            root.join("scripts/preamble.R"),
+            "replacement_preamble <- 1\n",
+        )
+        .unwrap();
+
+        let mut state = state_arc.write().await;
+        assert!(seed.install(&mut state));
+        assert_eq!(state.package_inputs.dataset_names, expected_datasets);
+        assert_eq!(state.package_inputs.sysdata_names, expected_sysdata);
+        assert_eq!(
+            state.package_inputs.rprofile_symbols,
+            expected_rprofile.symbols
+        );
+        assert_eq!(
+            state.package_inputs.rprofile_attached_packages,
+            expected_rprofile.attached_packages
+        );
+        assert_eq!(
+            state.package_inputs.rprofile_sourced_files,
+            expected_rprofile.sourced_files
+        );
+        assert_eq!(
+            state.package_inputs.preamble_sourced_symbols,
+            expected_preamble.symbols
+        );
+        assert_eq!(
+            state.package_inputs.preamble_sourced_attached_packages,
+            expected_preamble.attached_packages
+        );
+        assert_eq!(
+            state.package_inputs.preamble_sourced_files,
+            expected_preamble.sourced_files
+        );
+        assert_eq!(
+            state.package_inputs.preamble_sourced_files_by_preamble,
+            expected_preamble.sourced_files_by_preamble
+        );
+        assert!(!state.package_inputs.dataset_names.contains("replacement"));
+        assert!(
+            !state
+                .package_inputs
+                .sysdata_names
+                .contains("replacement_internal")
+        );
+        assert!(
+            !state
+                .package_inputs
+                .rprofile_symbols
+                .contains("replacement_profile")
+        );
+        assert!(
+            !state
+                .package_inputs
+                .preamble_sourced_symbols
+                .values()
+                .any(|symbols| symbols.contains("replacement_preamble"))
+        );
+    }
+
+    #[tokio::test]
+    async fn package_seed_preserves_newer_watcher_dataset_rescan() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(root.join("data/seeded.rda"), b"seeded").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+        }
+        let seed =
+            PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, false)
+                .await
+                .expect("package seed computation must succeed");
+
+        fs::remove_file(root.join("data/seeded.rda")).unwrap();
+        let replacement = root.join("data/replacement.rda");
+        fs::write(&replacement, b"replacement").unwrap();
+        let mut state = state_arc.write().await;
+        let delta = translate_watched_package_event(
+            &mut state,
+            crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                uri: Url::from_file_path(&replacement).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+            &exclusions,
+        )
+        .expect("dataset watcher event must rescan package data");
+        state.apply_package_event(&delta);
+        assert!(state.package_inputs.dataset_names.contains("replacement"));
+
+        assert!(!seed.install(&mut state));
+        assert!(state.package_inputs.dataset_names.contains("replacement"));
+        assert!(!state.package_inputs.dataset_names.contains("seeded"));
+    }
+
+    #[tokio::test]
+    async fn package_seed_preserves_newer_watcher_sysdata_rescan() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("data-raw")).unwrap();
+        fs::write(
+            root.join("data-raw/seeded.R"),
+            "usethis::use_data(seeded_internal, internal = TRUE)\n",
+        )
+        .unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+        }
+        let seed =
+            PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, false)
+                .await
+                .expect("package seed computation must succeed");
+
+        fs::remove_file(root.join("data-raw/seeded.R")).unwrap();
+        let replacement = root.join("data-raw/replacement.R");
+        fs::write(
+            &replacement,
+            "usethis::use_data(replacement_internal, internal = TRUE)\n",
+        )
+        .unwrap();
+        let mut state = state_arc.write().await;
+        let delta = translate_watched_package_event(
+            &mut state,
+            crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                uri: Url::from_file_path(&replacement).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+            &exclusions,
+        )
+        .expect("sysdata watcher event must rescan package data-raw");
+        state.apply_package_event(&delta);
+        assert!(
+            state
+                .package_inputs
+                .sysdata_names
+                .contains("replacement_internal")
+        );
+
+        assert!(!seed.install(&mut state));
+        assert!(
+            state
+                .package_inputs
+                .sysdata_names
+                .contains("replacement_internal")
+        );
+        assert!(
+            !state
+                .package_inputs
+                .sysdata_names
+                .contains("seeded_internal")
+        );
+    }
+
+    #[tokio::test]
+    async fn package_seed_does_not_restore_an_obsolete_package_root_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        let old_root = tmp.path().join("old");
+        let new_root = tmp.path().join("new");
+        fs::create_dir_all(old_root.join("data")).unwrap();
+        fs::create_dir_all(new_root.join("data")).unwrap();
+        fs::write(old_root.join("data/old.rda"), b"old").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state_arc = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state_arc.write().await;
+            establish_package_event_translation_state(&mut state, old_root.clone());
+        }
+        let seed =
+            PrecomputedPackageSeed::compute_from_state(&state_arc, &old_root, &exclusions, false)
+                .await
+                .expect("package seed computation must succeed");
+
+        let mut state = state_arc.write().await;
+        establish_package_event_translation_state(&mut state, new_root.clone());
+        state.package_inputs.dataset_names = std::collections::BTreeSet::from(["new".to_string()]);
+        state.record_package_input_mutation();
+        assert!(!seed.install(&mut state));
+
+        assert_eq!(
+            state.package_inputs.workspace_root.as_ref(),
+            Some(&new_root)
+        );
+        assert_eq!(
+            state.package_inputs.dataset_names,
+            std::collections::BTreeSet::from(["new".to_string()])
+        );
+    }
+
+    /// A detached seed may finish after dirty package inputs have opened. The
+    /// disk snapshot must be overlaid by authoritative DESCRIPTION, NAMESPACE,
+    /// package-R, and `.Rprofile` buffers; the latter requires an explicit
+    /// off-lock post-install refresh when its did_open scan has not committed yet.
+    #[tokio::test]
+    async fn seed_install_converges_all_open_package_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("R")).unwrap();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: diskpkg\nVersion: 0.0.1\n",
+        )
+        .unwrap();
+        fs::write(root.join("NAMESPACE"), "export(disk_fun)\n").unwrap();
+        fs::write(root.join("R/fun.R"), "disk_fun <- function() 1\n").unwrap();
+        fs::write(root.join(".Rprofile"), "disk_profile <- function() 1\n").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let stale_seed = PrecomputedPackageSeed::compute(
+            &root,
+            &exclusions,
+            &crate::package_state::preamble::PreambleTextOverrides::new(),
+            true,
+        );
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+            for (relative, text) in [
+                ("DESCRIPTION", "Package: bufferpkg\nVersion: 9.9.9\n"),
+                ("NAMESPACE", "export(buffer_fun)\n"),
+                ("R/fun.R", "buffer_fun <- function() 2\n"),
+                (".Rprofile", "buffer_profile <- function() 3\n"),
+            ] {
+                let uri = Url::from_file_path(root.join(relative)).unwrap();
+                state
+                    .documents
+                    .insert(uri.clone(), crate::state::Document::new(text, Some(7)));
+                state.begin_diagnostic_lifecycle(&uri);
+                if relative != ".Rprofile" {
+                    let delta = crate::package_state::event::translate(
+                        &mut state.package_inputs,
+                        crate::package_state::event::HandlerEvent::DidOpen {
+                            uri,
+                            text: Arc::from(text),
+                        },
+                    )
+                    .expect("pre-seed package event must translate once root state is established");
+                    state.apply_package_event(&delta);
+                }
+            }
+            assert_eq!(
+                state
+                    .package_inputs
+                    .description
+                    .as_ref()
+                    .map(|input| &*input.text),
+                Some("Package: bufferpkg\nVersion: 9.9.9\n")
+            );
+            assert!(state.package_inputs.rprofile_symbols.is_empty());
+            stale_seed.install(&mut state);
+
+            assert_eq!(
+                state
+                    .package_inputs
+                    .description
+                    .as_ref()
+                    .map(|input| &*input.text),
+                Some("Package: bufferpkg\nVersion: 9.9.9\n")
+            );
+            assert_eq!(
+                state
+                    .package_inputs
+                    .namespace
+                    .as_ref()
+                    .map(|input| &*input.text),
+                Some("export(buffer_fun)\n")
+            );
+            assert_eq!(
+                state
+                    .package_inputs
+                    .r_files
+                    .get(&root.join("R/fun.R"))
+                    .map(|input| &*input.text),
+                Some("buffer_fun <- function() 2\n")
+            );
+            assert!(
+                state.package_inputs.rprofile_symbols.is_empty(),
+                "an open .Rprofile makes seed installation defer to the live refresh"
+            );
+        }
+
+        Backend::refresh_open_package_inputs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root,
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .package_inputs
+                .rprofile_symbols
+                .contains("buffer_profile")
+        );
+        assert!(
+            !state
+                .package_inputs
+                .rprofile_symbols
+                .contains("disk_profile")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_post_seed_scans_reject_newer_package_generation_and_exclusions() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/stale.R\")\n").unwrap();
+        fs::write(root.join("scripts/stale.R"), "stale_preamble <- 1\n").unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let preamble_uri = Url::from_file_path(&preamble).unwrap();
+        let (
+            rprofile_identity,
+            open_identities,
+            package_inputs,
+            captured_exclusions,
+            rprofile_scan,
+            preamble_scan,
+            rescanned,
+            affected_paths,
+        ) = {
+            let mut state = backend.state.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+            state.documents.insert(
+                rprofile_uri.clone(),
+                crate::state::Document::new("stale_profile <- 1\n", Some(1)),
+            );
+            state.documents.insert(
+                preamble_uri.clone(),
+                crate::state::Document::new("source(\"../../scripts/stale.R\")\n", Some(1)),
+            );
+            state.begin_diagnostic_lifecycle(&rprofile_uri);
+            state.begin_diagnostic_lifecycle(&preamble_uri);
+
+            let captured_exclusions = state.workspace_exclusions.clone();
+            let package_inputs = PackageSeedInputSnapshot::capture(&state, &captured_exclusions);
+            let (_, rprofile_contents, rprofile_identity) =
+                snapshot_authoritative_open_rprofile(&state, &root).unwrap();
+            let rprofile_scan =
+                crate::package_state::rprofile::scan_workspace_rprofile_with_root_text_and_exclusions(
+                    &root,
+                    &rprofile_contents.to_string(),
+                    &captured_exclusions,
+                );
+            let (affected_paths, open_identities) = snapshot_open_preamble_documents(&state);
+            let previous = crate::package_state::preamble::PreambleSnapshot::from_inputs(
+                &state.package_inputs,
+            );
+            let overrides = snapshot_preamble_text_overrides(&state);
+            let (preamble_scan, rescanned) = crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+                &root,
+                previous,
+                &affected_paths,
+                &overrides,
+                &captured_exclusions,
+            );
+            (
+                rprofile_identity,
+                open_identities,
+                package_inputs,
+                captured_exclusions,
+                rprofile_scan,
+                preamble_scan,
+                rescanned,
+                affected_paths,
+            )
+        };
+
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_exclusions = crate::config_file::compile_workspace_exclusions(
+                &serde_json::json!({ "workspace": { "exclude": ["scripts/**"] } }),
+                vec![root.clone()],
+            );
+            state.package_inputs.rprofile_symbols =
+                std::collections::BTreeSet::from(["newer_profile".to_string()]);
+            state.package_inputs.preamble_sourced_symbols.insert(
+                preamble.clone(),
+                std::collections::BTreeSet::from(["newer_preamble".to_string()]),
+            );
+            state.record_package_input_mutation();
+            assert!(
+                snapshot_open_document_seed_identities(&state) == open_identities,
+                "the rejection must come from package lifecycle/config identity"
+            );
+        }
+
+        let rprofile_applied = Backend::apply_rprofile_prelude_rescan_with(
+            &backend.state,
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            rprofile_scan,
+            Some((
+                rprofile_uri,
+                rprofile_identity,
+                root.clone(),
+                package_inputs.clone(),
+                captured_exclusions.clone(),
+            )),
+        )
+        .await;
+        assert!(!rprofile_applied);
+
+        let expected_package_inputs = (package_inputs, captured_exclusions);
+        let preamble_applied = Backend::apply_testthat_preamble_rescan(
+            &backend.state,
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            preamble_scan,
+            rescanned,
+            &root,
+            &affected_paths,
+            &std::collections::HashSet::new(),
+            Some(&open_identities),
+            Some(&expected_package_inputs),
+        )
+        .await;
+        assert!(!preamble_applied);
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.package_inputs.rprofile_symbols,
+            std::collections::BTreeSet::from(["newer_profile".to_string()])
+        );
+        assert_eq!(
+            state.package_inputs.preamble_sourced_symbols.get(&preamble),
+            Some(&std::collections::BTreeSet::from([
+                "newer_preamble".to_string()
+            ]))
+        );
+    }
+
     /// The seed-install TOCTOU window: a precomputed scan whose override
     /// snapshot MISSED a buffer (opened after the snapshot, before the
-    /// install) gets installed, then `refresh_open_preamble_docs_after_seed`
-    /// must converge the state back to buffer truth.
+    /// install) gets installed, then the post-seed package-input refresh must
+    /// converge the state back to buffer truth.
     #[tokio::test]
     async fn post_seed_refresh_converges_to_buffer_opened_during_seed_window() {
         let tmp = TempDir::new().unwrap();
@@ -20922,7 +22900,7 @@ mod project_config_initialize_tests {
             );
         }
 
-        Backend::refresh_open_preamble_docs_after_seed(
+        Backend::refresh_open_package_inputs_after_seed(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -20943,6 +22921,206 @@ mod project_config_initialize_tests {
         assert!(
             !symbols.contains("disk_a"),
             "stale disk-derived closure must not survive the post-seed refresh: {symbols:?}"
+        );
+    }
+
+    /// A close/reopen can reuse both LSP version and document revision. The
+    /// seed identity must veto the old off-lock scan before it grafts even when
+    /// diagnostics eligibility means no epoch exists, then a fresh post-seed
+    /// pass must observe the reopened buffer.
+    #[tokio::test]
+    async fn close_reopen_same_version_vetoes_stale_post_seed_preamble_scan() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/a.R\")\n").unwrap();
+        fs::write(root.join("scripts/a.R"), "from_a <- 1\n").unwrap();
+        fs::write(root.join("scripts/b.R"), "from_b <- 1\n").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let preamble_uri = Url::from_file_path(&preamble).unwrap();
+        let (affected_paths, old_identities, stale_scan, rescanned, old_trigger) = {
+            let mut state = backend.state.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+            // Exercise the Rope-instance fallback: this URI is deliberately not
+            // diagnostics-eligible, so both lifecycles have epoch=None.
+            state.editor_diagnostic_uris = Some(std::collections::HashSet::new());
+            let initial = crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                &root,
+                &exclusions,
+            );
+            let _ = crate::package_state::event::apply_preamble_scan(
+                &mut state.package_inputs,
+                Some(initial),
+            );
+            state.documents.insert(
+                preamble_uri.clone(),
+                crate::state::Document::new("source(\"../../scripts/a.R\")\n", Some(1)),
+            );
+            state.begin_diagnostic_lifecycle(&preamble_uri);
+            let (affected_paths, identities) = snapshot_open_preamble_documents(&state);
+            let old_trigger = identities[&preamble_uri].trigger;
+            let previous = crate::package_state::preamble::PreambleSnapshot::from_inputs(
+                &state.package_inputs,
+            );
+            let overrides = snapshot_preamble_text_overrides(&state);
+            let (scan, rescanned) = crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+                &root,
+                previous,
+                &affected_paths,
+                &overrides,
+                &exclusions,
+            );
+            (affected_paths, identities, scan, rescanned, old_trigger)
+        };
+
+        {
+            let mut state = backend.state.write().await;
+            state.retire_diagnostic_lifecycle(&preamble_uri);
+            state.documents.insert(
+                preamble_uri.clone(),
+                crate::state::Document::new("source(\"../../scripts/b.R\")\n", Some(1)),
+            );
+            state.begin_diagnostic_lifecycle(&preamble_uri);
+            let new_trigger = DiagnosticsTrigger::capture(&state, &preamble_uri);
+            assert_eq!(new_trigger.version, old_trigger.version);
+            assert_eq!(new_trigger.revision, old_trigger.revision);
+            assert_eq!(new_trigger.epoch, None);
+            assert_eq!(old_trigger.epoch, None);
+
+            let overrides = snapshot_preamble_text_overrides(&state);
+            let fresh =
+                crate::package_state::preamble::scan_testthat_preambles_with_overrides_and_exclusions(
+                    &root,
+                    &overrides,
+                    &exclusions,
+                );
+            let _ = crate::package_state::event::apply_preamble_scan(
+                &mut state.package_inputs,
+                Some(fresh),
+            );
+        }
+
+        let applied = Backend::apply_testthat_preamble_rescan(
+            &backend.state,
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            stale_scan,
+            rescanned,
+            &root,
+            &affected_paths,
+            &std::collections::HashSet::new(),
+            Some(&old_identities),
+            None,
+        )
+        .await;
+        assert!(!applied, "the retired lifecycle's scan must be vetoed");
+        {
+            let state = backend.state.read().await;
+            let symbols = state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .unwrap();
+            assert!(symbols.contains("from_b"), "got {symbols:?}");
+            assert!(!symbols.contains("from_a"), "got {symbols:?}");
+        }
+
+        Backend::refresh_open_package_inputs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root.clone(),
+        )
+        .await;
+        let state = backend.state.read().await;
+        let symbols = state
+            .package_inputs
+            .preamble_sourced_symbols
+            .get(&preamble)
+            .unwrap();
+        assert!(symbols.contains("from_b"), "got {symbols:?}");
+        assert!(!symbols.contains("from_a"), "got {symbols:?}");
+    }
+
+    /// A watched closed-file `.Rprofile` scan may finish after another package
+    /// input owner has installed newer symbols/routing and exclusions. Exercising
+    /// the commit seam directly makes that ordering deterministic: the old scan
+    /// must return no delta, which is what prevents the caller from deriving or
+    /// scheduling diagnostic fanout.
+    #[test]
+    fn stale_watched_rprofile_scan_cannot_overwrite_newer_package_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let stale_helper = root.join("stale-helper.R");
+        let newer_helper = root.join("newer-helper.R");
+        let captured_exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let mut state = WorldState::new();
+        establish_package_event_translation_state(&mut state, root.clone());
+        state.workspace_exclusions = captured_exclusions.clone();
+
+        let stale_snapshot = PackageSeedInputSnapshot::capture(&state, &captured_exclusions);
+        let stale_scan = crate::package_state::rprofile::RprofileScan {
+            symbols: std::collections::BTreeSet::from(["stale_profile".to_string()]),
+            attached_packages: std::collections::BTreeSet::from(["stalePackage".to_string()]),
+            sourced_files: std::collections::BTreeSet::from([stale_helper]),
+        };
+
+        let newer_scan = crate::package_state::rprofile::RprofileScan {
+            symbols: std::collections::BTreeSet::from(["newer_profile".to_string()]),
+            attached_packages: std::collections::BTreeSet::from(["newerPackage".to_string()]),
+            sourced_files: std::collections::BTreeSet::from([newer_helper.clone()]),
+        };
+        let newer_delta = apply_rprofile_scan_to_state(&mut state, Some(newer_scan)).unwrap();
+        state.apply_package_event(&newer_delta);
+        state.workspace_exclusions = crate::config_file::compile_workspace_exclusions(
+            &serde_json::json!({ "workspace": { "exclude": ["stale/**"] } }),
+            vec![root.clone()],
+        );
+        state.record_package_input_mutation();
+
+        let generation_before_stale_commit = state.package_input_generation();
+        let package_state_before_stale_commit = state.package_state.clone();
+        let mut deltas = Vec::new();
+        if let Some(delta) = apply_watched_rprofile_scan_to_state(
+            &mut state,
+            Some(stale_scan),
+            &root,
+            &stale_snapshot,
+            &captured_exclusions,
+        ) {
+            deltas.push(delta);
+        }
+
+        assert!(
+            deltas.is_empty(),
+            "a stale watcher payload must not request derive or diagnostic fanout"
+        );
+        assert_eq!(
+            state.package_input_generation(),
+            generation_before_stale_commit,
+            "rejecting stale work must not count as a package-input mutation"
+        );
+        assert_eq!(state.package_state, package_state_before_stale_commit);
+        assert_eq!(
+            state.package_inputs.rprofile_symbols,
+            std::collections::BTreeSet::from(["newer_profile".to_string()])
+        );
+        assert_eq!(
+            state.package_inputs.rprofile_attached_packages,
+            std::collections::BTreeSet::from(["newerPackage".to_string()])
+        );
+        assert_eq!(
+            state.package_inputs.rprofile_sourced_files,
+            std::collections::BTreeSet::from([newer_helper])
+        );
+        assert_eq!(
+            state.workspace_exclusions.patterns(),
+            ["stale/**".to_string()].as_slice()
         );
     }
 

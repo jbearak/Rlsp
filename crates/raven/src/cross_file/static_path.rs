@@ -32,29 +32,53 @@ use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
-/// Single-assignment variable bindings usable in static path folding,
+#[cfg(test)]
+thread_local! {
+    static COLLECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn collection_count_for_current_thread() -> usize {
+    COLLECTION_COUNT.with(std::cell::Cell::get)
+}
+
+/// Neutral payload collected at one statically named binding site.
+///
+/// Path and package-vector eligibility are intentionally independent: ordinary
+/// top-level assignments may supply a path RHS, while package vectors additionally
+/// require a trusted bare `c()` and may also come from eligible `assign()` calls.
+/// Keeping both options in one payload lets every artifact consumer share one
+/// full-tree binding collection without widening either policy.
+#[derive(Debug)]
+struct StaticCandidate<'tree> {
+    path_rhs: Option<Node<'tree>>,
+    package_vector: Option<Vec<String>>,
+}
+
+/// Single-assignment facts usable by static path and package-vector consumers,
 /// collected once per document from the full AST.
 ///
-/// A name resolves at a use site iff:
-/// - exactly one binding form targets it in the whole file
-///   (`binding_count == 1`),
-/// - that binding is an unconditional top-level `<-`/`=` assignment, and
-/// - the assignment starts strictly before the use site (textual
-///   "declared, then used" order — deliberately not scope-aware, matching the
-///   existing apply-family `VarBinding` precedent in `source_detect.rs`).
-///
-/// The use-site ordering check runs *before* the memo is consulted; the memo
-/// caches only the intrinsic fold of a binding's fixed RHS (which is
-/// use-site-independent), so a use-before-assignment site can never poison a
-/// later valid use. A separate `visiting` set guards against reference
-/// cycles.
+/// A candidate resolves at a use site iff exactly one binding form targets its
+/// name in the whole file and that binding starts strictly before the use site.
+/// Each payload field then applies its own eligibility policy. Path folding also
+/// memoizes the intrinsic fold of a fixed RHS after the use-site ordering gate;
+/// a separate `visiting` set guards against reference cycles.
 pub(crate) struct StaticBindings<'tree, 'text> {
     content: &'text str,
-    bindings: HashMap<String, super::binding::Binding<Node<'tree>>>,
+    bindings: HashMap<String, super::binding::Binding<StaticCandidate<'tree>>>,
     /// Memoized intrinsic fold of each candidate's RHS, keyed by name.
-    memo: RefCell<HashMap<String, Option<String>>>,
+    ///
+    /// Participating literals are retained with the value so callback-enabled
+    /// folds can replay the same traversal result on a memo hit.
+    memo: RefCell<HashMap<String, MemoizedFold<'tree>>>,
     /// Names currently being folded (cycle guard).
     visiting: RefCell<HashSet<String>>,
+}
+
+#[derive(Clone)]
+struct MemoizedFold<'tree> {
+    value: Option<String>,
+    path_literals: Vec<Node<'tree>>,
 }
 
 impl<'tree, 'text> StaticBindings<'tree, 'text> {
@@ -62,15 +86,34 @@ impl<'tree, 'text> StaticBindings<'tree, 'text> {
     pub(crate) fn collect(root: Node<'tree>, content: &'text str) -> Self {
         use super::binding::{AssignmentOperator, BindingSite};
 
-        let bindings = super::binding::collect_bindings(root, content, |site| match site {
-            BindingSite::Binary {
-                target,
-                value: Some(value),
-                operator: AssignmentOperator::Left | AssignmentOperator::Equals,
-                top_level: true,
-                ..
-            } if target.kind() == "identifier" => Some(value),
-            _ => None,
+        #[cfg(test)]
+        COLLECTION_COUNT.with(|count| count.set(count.get() + 1));
+
+        let bindings = super::binding::collect_bindings(root, content, |site| {
+            let (path_rhs, package_rhs) = match site {
+                BindingSite::Binary {
+                    target,
+                    value,
+                    operator: AssignmentOperator::Left | AssignmentOperator::Equals,
+                    top_level: true,
+                    helpers_trusted,
+                    ..
+                } if target.kind() == "identifier" => {
+                    (value, helpers_trusted.then_some(value).flatten())
+                }
+                BindingSite::AssignCall {
+                    value,
+                    helpers_trusted: true,
+                    ..
+                } => (None, value),
+                _ => (None, None),
+            };
+            let package_vector =
+                package_rhs.and_then(|value| extract_package_vector(value, content));
+            (path_rhs.is_some() || package_vector.is_some()).then_some(StaticCandidate {
+                path_rhs,
+                package_vector,
+            })
         });
         Self {
             content,
@@ -80,70 +123,325 @@ impl<'tree, 'text> StaticBindings<'tree, 'text> {
         }
     }
 
-    /// Resolve `name` at a use site starting at byte `use_byte`, folding the
-    /// binding's RHS recursively. Returns `None` when the name is not a valid
-    /// single-assignment candidate, is assigned at or after the use site, its
-    /// RHS is not foldable, or resolution would cycle.
-    fn resolve(&self, name: &str, use_byte: usize) -> Option<String> {
+    /// Resolve `name` at `use_node`, folding the binding's RHS recursively.
+    /// Returns `None` when the name is not a valid single-assignment candidate,
+    /// is assigned at or after the use, may have been replaced by a relevant
+    /// unknown-name load, has an unfodable RHS, or resolution would cycle.
+    fn resolve(
+        &self,
+        name: &str,
+        use_node: Node<'tree>,
+        on_path_literal: &mut dyn FnMut(Node<'tree>),
+    ) -> Option<String> {
         let info = self.bindings.get(name)?;
-        let rhs = *info.resolved_before(use_byte)?;
+        let (candidate, candidate_offset) =
+            info.resolved_with_offset_before(use_node.start_byte())?;
+        if super::binding::unknown_loaded_names_may_affect_candidate(
+            &self.bindings,
+            candidate_offset,
+            use_node,
+            helper_use_is_deferred(use_node, self.content),
+        ) {
+            return None;
+        }
+        let rhs = candidate.path_rhs?;
         // Use-site gate passed; the RHS fold itself is use-site-independent.
         if let Some(cached) = self.memo.borrow().get(name) {
-            return cached.clone();
+            for literal in &cached.path_literals {
+                on_path_literal(*literal);
+            }
+            return cached.value.clone();
         }
         if !self.visiting.borrow_mut().insert(name.to_string()) {
             return None; // cycle
         }
-        let folded = fold_string_expr(rhs, self.content, self);
+        let mut path_literals = Vec::new();
+        let mut record_literal = |literal| {
+            path_literals.push(literal);
+            on_path_literal(literal);
+        };
+        let value =
+            fold_string_expr_with_path_literals(rhs, self.content, self, &mut record_literal);
         self.visiting.borrow_mut().remove(name);
-        self.memo
-            .borrow_mut()
-            .insert(name.to_string(), folded.clone());
-        folded
+        self.memo.borrow_mut().insert(
+            name.to_string(),
+            MemoizedFold {
+                value: value.clone(),
+                path_literals,
+            },
+        );
+        value
     }
 
     /// Whether any binding form in the document targets `name`.
-    pub(crate) fn is_bound(&self, name: &str) -> bool {
-        self.bindings.contains_key(name) || super::binding::helper_may_be_shadowed(&self.bindings)
+    pub(crate) fn helper_is_bound_at(&self, name: &str, use_node: Node) -> bool {
+        // Keep exact named helper bindings at the established file-wide
+        // conservative policy. Only unknown helper uncertainty is ordered: a
+        // later immediate unknown assignment cannot retroactively change an
+        // earlier top-level helper call.
+        let deferred_use = helper_use_is_deferred(use_node, self.content);
+        self.bindings.contains_key(name)
+            || super::binding::path_helper_may_be_shadowed_at(
+                &self.bindings,
+                use_node.start_byte(),
+                deferred_use,
+            )
+            || super::binding::unknown_loaded_names_may_shadow_at(
+                &self.bindings,
+                use_node,
+                deferred_use,
+            )
     }
 
     pub(crate) fn named_binding_may_shadow_at(
         &self,
         name: &str,
-        before_byte: usize,
+        use_node: Node,
         deferred_use: bool,
     ) -> bool {
-        super::binding::named_binding_may_shadow_at(&self.bindings, name, before_byte, deferred_use)
+        super::binding::named_binding_may_shadow_lexically_at(
+            &self.bindings,
+            name,
+            use_node,
+            deferred_use,
+        )
     }
+
+    pub(crate) fn named_alias_may_shadow_at(
+        &self,
+        name: &str,
+        use_node: Node,
+        deferred_use: bool,
+    ) -> bool {
+        super::binding::named_alias_may_shadow_lexically_at(
+            &self.bindings,
+            name,
+            use_node,
+            deferred_use,
+        )
+    }
+
+    /// Resolve a package-vector candidate under the package consumer's distinct
+    /// eligibility policy.
+    pub(crate) fn resolve_package_vector(&self, name: &str, use_node: Node) -> Option<&[String]> {
+        let (candidate, candidate_offset) = self
+            .bindings
+            .get(name)?
+            .resolved_with_offset_before(use_node.start_byte())?;
+        if super::binding::unknown_loaded_names_may_affect_candidate(
+            &self.bindings,
+            candidate_offset,
+            use_node,
+            !super::binding::is_known_immediate_context(use_node),
+        ) {
+            return None;
+        }
+        candidate.package_vector.as_deref()
+    }
+
+    /// Whether an inline bare `c()` has provable base semantics at `use_node`.
+    pub(crate) fn package_c_is_trusted_at(&self, use_node: Node) -> bool {
+        let deferred_use = !super::binding::is_known_immediate_context(use_node);
+        !super::binding::helper_may_be_shadowed_at(
+            &self.bindings,
+            use_node.start_byte(),
+            deferred_use,
+        ) && !super::binding::unknown_loaded_names_may_shadow_at(
+            &self.bindings,
+            use_node,
+            deferred_use,
+        ) && !super::binding::named_binding_may_shadow_at(
+            &self.bindings,
+            "c",
+            use_node.start_byte(),
+            deferred_use,
+        )
+    }
+}
+
+/// Walk-scoped lazy cache for capture-helper shadow checks.
+///
+/// Recursive source/package/scope walkers create one instance at their root and
+/// thread it through every nested capture classification. Qualified helpers do
+/// not force collection; the first bare base helper collects [`StaticBindings`]
+/// once and all later calls in the same walk reuse it.
+pub(crate) struct LazyStaticBindings<'tree, 'text> {
+    root: Node<'tree>,
+    content: &'text str,
+    bindings: Option<StaticBindings<'tree, 'text>>,
+    /// Capture classification is shared across several artifact walkers. Cache
+    /// the ancestor-based immediacy result per capture node so each node pays for
+    /// that walk at most once.
+    immediate_context_by_node: HashMap<usize, bool>,
+}
+
+impl<'tree, 'text> LazyStaticBindings<'tree, 'text> {
+    pub(crate) fn new(root: Node<'tree>, content: &'text str) -> Self {
+        Self {
+            root,
+            content,
+            bindings: None,
+            immediate_context_by_node: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn get(&mut self) -> &StaticBindings<'tree, 'text> {
+        self.bindings
+            .get_or_insert_with(|| StaticBindings::collect(self.root, self.content))
+    }
+
+    pub(crate) fn capturing_call_kind_at(
+        &mut self,
+        node: Node,
+    ) -> Option<super::binding::CapturingCallKind> {
+        let content = self.content;
+        let mut deferred_use = None;
+        super::binding::capturing_call_kind(node, content, |name| {
+            let deferred_use = *deferred_use.get_or_insert_with(|| {
+                let immediate = *self
+                    .immediate_context_by_node
+                    .entry(node.id())
+                    .or_insert_with(|| super::binding::is_known_immediate_context(node));
+                !immediate
+            });
+            !self
+                .get()
+                .named_binding_may_shadow_at(name, node, deferred_use)
+        })
+    }
+
+    pub(crate) fn resolve_package_vector(
+        &mut self,
+        name: &str,
+        use_node: Node,
+    ) -> Option<Vec<String>> {
+        self.get()
+            .resolve_package_vector(name, use_node)
+            .map(<[String]>::to_vec)
+    }
+
+    pub(crate) fn package_c_is_trusted_at(&mut self, use_node: Node) -> bool {
+        self.get().package_c_is_trusted_at(use_node)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_collected(&self) -> bool {
+        self.bindings.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn collection_address(&self) -> Option<usize> {
+        self.bindings
+            .as_ref()
+            .map(|bindings| std::ptr::from_ref(bindings).addr())
+    }
+}
+
+/// Extract a strict bare `c()` of positional plain string literals for the
+/// package-vector payload. Helper trust is established by the binding-site
+/// policy before this function is called.
+fn extract_package_vector(node: Node, content: &str) -> Option<Vec<String>> {
+    super::binding::extract_bare_c_plain_strings(node, content)
+        .map(|pairs| pairs.into_iter().map(|(package, _)| package).collect())
+}
+
+/// Classify a folding-helper call from its enclosing path consumer.
+///
+/// The helper itself sits below argument/call syntax, so immediacy is decided
+/// from the nearest enclosing `source()`/`sys.source()` call or assignment.
+/// The shared predicate then permits only top-level brace/parenthesis wrappers.
+fn helper_use_is_deferred(node: Node, content: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            return true;
+        }
+        if parent.kind() == "call"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|function| {
+                    matches!(node_text(function, content), "source" | "sys.source")
+                })
+        {
+            return !super::binding::is_known_immediate_context(parent);
+        }
+        if parent.kind() == "binary_operator"
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| {
+                    matches!(
+                        node_text(operator, content),
+                        "<-" | "=" | "<<-" | "->" | "->>"
+                    )
+                })
+        {
+            return !super::binding::is_known_immediate_context(parent);
+        }
+        current = parent;
+    }
+    true
 }
 
 /// Statically fold a path-valued expression to a `String`.
 ///
-/// Handles exactly three forms (strict all-or-nothing; anything else → `None`):
+/// Handles exactly four forms (strict all-or-nothing; anything else → `None`):
 /// - a string literal (raw text between the quotes; a literal containing a
 ///   backslash bails, so folded paths never diverge from R's unescaped
 ///   runtime string),
 /// - a bare identifier resolved through `bindings`,
-/// - a call to `file.path(...)` or `normalizePath(...)`.
-pub(crate) fn fold_string_expr(
-    node: Node,
+/// - a call to `file.path(...)` or `normalizePath(...)`,
+/// - a parenthesized expression, peeled recursively.
+///
+/// Braced expressions remain conservative: evaluating a block may run
+/// preceding side effects before producing its final value.
+pub(crate) fn fold_string_expr<'tree>(
+    node: Node<'tree>,
     content: &str,
-    bindings: &StaticBindings,
+    bindings: &StaticBindings<'tree, '_>,
+) -> Option<String> {
+    fold_string_expr_with_path_literals(node, content, bindings, &mut |_| {})
+}
+
+/// Fold a path-valued expression and report every accepted string literal that
+/// participates in the traversal.
+///
+/// This is the policy-bearing fold used by both static source detection and
+/// computed-path navigation. The callback runs only for plain string literals
+/// reached through the same accepted branches as [`fold_string_expr`]; option
+/// literals and strings below rejected branches are never traversed. Memoized
+/// identifier folds replay their participating literals without changing the
+/// existing value memoization or cycle guard.
+pub(crate) fn fold_string_expr_with_path_literals<'tree>(
+    node: Node<'tree>,
+    content: &str,
+    bindings: &StaticBindings<'tree, '_>,
+    on_path_literal: &mut dyn FnMut(Node<'tree>),
 ) -> Option<String> {
     match node.kind() {
-        "string" => extract_plain_string(node, content),
+        "parenthesized_expression" => fold_string_expr_with_path_literals(
+            node.named_child(0)?,
+            content,
+            bindings,
+            on_path_literal,
+        ),
+        "string" => {
+            let value = super::binding::extract_plain_string(node, content)?;
+            on_path_literal(node);
+            Some(value)
+        }
         "identifier" => bindings.resolve(
             super::binding::plain_identifier_name(node, content)?,
-            node.start_byte(),
+            node,
+            on_path_literal,
         ),
         "call" => {
             let func = node.child_by_field_name("function")?;
             match node_text(func, content) {
-                "file.path" if !bindings.is_bound("file.path") => {
-                    fold_file_path_call(node, content, bindings)
+                "file.path" if !bindings.helper_is_bound_at("file.path", node) => {
+                    fold_file_path_call(node, content, bindings, on_path_literal)
                 }
-                "normalizePath" if !bindings.is_bound("normalizePath") => {
-                    fold_normalize_path_call(node, content, bindings)
+                "normalizePath" if !bindings.helper_is_bound_at("normalizePath", node) => {
+                    fold_normalize_path_call(node, content, bindings, on_path_literal)
                 }
                 _ => None,
             }
@@ -161,7 +459,12 @@ pub(crate) fn fold_string_expr(
 /// path component (`file.path("a", b = "x")` is `"a/x"`), and reproducing
 /// that argument-ordering subtlety statically is not worth the risk of
 /// folding a wrong path.
-fn fold_file_path_call(node: Node, content: &str, bindings: &StaticBindings) -> Option<String> {
+fn fold_file_path_call<'tree>(
+    node: Node<'tree>,
+    content: &str,
+    bindings: &StaticBindings<'tree, '_>,
+    on_path_literal: &mut dyn FnMut(Node<'tree>),
+) -> Option<String> {
     let args_node = node.child_by_field_name("arguments")?;
     if args_node.has_error() {
         return None;
@@ -184,7 +487,12 @@ fn fold_file_path_call(node: Node, content: &str, bindings: &StaticBindings) -> 
             }
         } else {
             let value_node = child.child_by_field_name("value")?;
-            let part = fold_string_expr(value_node, content, bindings)?;
+            let part = fold_string_expr_with_path_literals(
+                value_node,
+                content,
+                bindings,
+                on_path_literal,
+            )?;
             parts.push(part);
         }
     }
@@ -194,58 +502,37 @@ fn fold_file_path_call(node: Node, content: &str, bindings: &StaticBindings) -> 
     Some(parts.join("/"))
 }
 
-/// Fold `normalizePath(path, winslash =, mustWork =)` by recursing into the
-/// `path` argument (named `path=` or first positional). Pure syntactic
-/// unwrap: `winslash`/`mustWork` are ignored without inspecting their values
-/// (they don't change which file the path denotes); any other named argument
-/// bails (`normalizePath` has no `...`, so an unknown name is either a typo
-/// or something we can't reason about).
-fn fold_normalize_path_call(
-    node: Node,
+/// Fold `normalizePath(path, winslash =, mustWork =)` by strictly matching R
+/// actuals to those three formals (exact name, unique partial name, then
+/// position) and recursing into the matched `path`. `winslash`/`mustWork` values
+/// are ignored once present and syntactically complete because they do not
+/// change which file the path denotes. Duplicate/ambiguous names, excess
+/// positionals, missing actuals, parser errors, and unmatched names all bail.
+fn fold_normalize_path_call<'tree>(
+    node: Node<'tree>,
     content: &str,
-    bindings: &StaticBindings,
+    bindings: &StaticBindings<'tree, '_>,
+    on_path_literal: &mut dyn FnMut(Node<'tree>),
 ) -> Option<String> {
-    let args_node = node.child_by_field_name("arguments")?;
-    if args_node.has_error() {
-        return None;
-    }
-    let mut path_node: Option<Node> = None;
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        if child.kind() != "argument" {
-            continue;
-        }
-        if let Some(name_node) = child.child_by_field_name("name") {
-            match node_text(name_node, content) {
-                "path" => {
-                    path_node = Some(child.child_by_field_name("value")?);
-                }
-                "winslash" | "mustWork" => {}
-                _ => return None,
-            }
-        } else if path_node.is_none() {
-            path_node = Some(child.child_by_field_name("value")?);
-        }
-    }
-    fold_string_expr(path_node?, content, bindings)
-}
+    use super::binding::{CallActual, CallMatchMode, match_call_arguments};
 
-/// Extract a plain (escape-free) string literal's contents. A literal
-/// containing a backslash is rejected: this module never processes escape
-/// sequences, so folding `"a\tb"` raw would silently diverge from the string
-/// R actually builds.
-fn extract_plain_string(node: Node, content: &str) -> Option<String> {
-    let text = node_text(node, content);
-    if !((text.starts_with('"') && text.ends_with('"'))
-        || (text.starts_with('\'') && text.ends_with('\'')))
+    let arguments = node.child_by_field_name("arguments")?;
+    let matched = match_call_arguments(
+        arguments,
+        content,
+        &["path", "winslash", "mustWork"],
+        CallMatchMode::Strict,
+    )?;
+    let CallActual::Value(path) = matched[0]? else {
+        return None;
+    };
+    if matched[1..]
+        .iter()
+        .any(|actual| matches!(actual, Some(CallActual::Missing)))
     {
         return None;
     }
-    let inner = &text[1..text.len() - 1];
-    if inner.contains('\\') {
-        return None;
-    }
-    Some(inner.to_string())
+    fold_string_expr_with_path_literals(path, content, bindings, on_path_literal)
 }
 
 fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
@@ -265,13 +552,23 @@ mod tests {
         parser.parse(code, None).unwrap()
     }
 
-    /// Fold the file argument of the LAST source() call in `code`.
-    fn fold_last_source_arg(code: &str) -> Option<String> {
+    /// Fold the file argument of the LAST source() call in `code`, reporting
+    /// accepted path literals through `on_path_literal`.
+    fn fold_last_source_arg_with(
+        code: &str,
+        on_path_literal: &mut dyn FnMut(Node),
+    ) -> Option<String> {
         let tree = parse(code);
         let root = tree.root_node();
         let bindings = StaticBindings::collect(root, code);
         let mut result = None;
-        fn visit(node: Node, code: &str, bindings: &StaticBindings, out: &mut Option<String>) {
+        fn visit<'tree>(
+            node: Node<'tree>,
+            code: &str,
+            bindings: &StaticBindings<'tree, '_>,
+            out: &mut Option<String>,
+            on_path_literal: &mut dyn FnMut(Node<'tree>),
+        ) {
             if node.kind() == "call"
                 && let Some(func) = node.child_by_field_name("function")
                 && &code[func.byte_range()] == "source"
@@ -279,15 +576,95 @@ mod tests {
                 && let Some(value) =
                     super::super::source_detect::source_call_file_value_node(&args, code, false)
             {
-                *out = fold_string_expr(value, code, bindings);
+                *out = fold_string_expr_with_path_literals(value, code, bindings, on_path_literal);
             }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit(child, code, bindings, out);
+                visit(child, code, bindings, out, on_path_literal);
             }
         }
-        visit(root, code, &bindings, &mut result);
+        visit(root, code, &bindings, &mut result, on_path_literal);
         result
+    }
+
+    /// Fold the file argument of the LAST source() call in `code`.
+    fn fold_last_source_arg(code: &str) -> Option<String> {
+        fold_last_source_arg_with(code, &mut |_| {})
+    }
+
+    /// Fold the last source argument and collect the exact string nodes visited
+    /// by the policy-bearing traversal.
+    fn fold_last_source_arg_with_literals(code: &str) -> (Option<String>, Vec<String>) {
+        let mut literals = Vec::new();
+        let result = fold_last_source_arg_with(code, &mut |literal| {
+            literals.push(code[literal.byte_range()].to_string())
+        });
+        (result, literals)
+    }
+
+    #[test]
+    fn lazy_static_bindings_reuses_one_capture_cache_per_walk() {
+        let code = "quote(x)\nquote(y)\n";
+        let tree = parse(code);
+        let root = tree.root_node();
+        let first = root.named_child(0).unwrap();
+        let second = root.named_child(1).unwrap();
+        let mut bindings = LazyStaticBindings::new(root, code);
+
+        assert!(bindings.bindings.is_none());
+        assert_eq!(
+            bindings.capturing_call_kind_at(first),
+            Some(super::super::binding::CapturingCallKind::Whole)
+        );
+        let first_cache = bindings.bindings.as_ref().unwrap() as *const StaticBindings;
+        assert_eq!(
+            bindings.capturing_call_kind_at(second),
+            Some(super::super::binding::CapturingCallKind::Whole)
+        );
+        let second_cache = bindings.bindings.as_ref().unwrap() as *const StaticBindings;
+        assert_eq!(first_cache, second_cache);
+    }
+
+    #[test]
+    fn shared_candidates_keep_path_and_package_payloads_independent() {
+        let code = r#"
+path <- "child.R"
+libs <- c("dplyr")
+assign("assigned", c("tidyr"))
+source(path)
+"#;
+        let tree = parse(code);
+        let bindings = StaticBindings::collect(tree.root_node(), code);
+
+        let path = bindings
+            .bindings
+            .get("path")
+            .and_then(|binding| binding.resolved_before(usize::MAX))
+            .unwrap();
+        assert!(path.path_rhs.is_some());
+        assert!(path.package_vector.is_none());
+
+        let libs = bindings
+            .bindings
+            .get("libs")
+            .and_then(|binding| binding.resolved_before(usize::MAX))
+            .unwrap();
+        assert!(libs.path_rhs.is_some());
+        assert_eq!(
+            libs.package_vector.as_deref().unwrap(),
+            ["dplyr".to_string()]
+        );
+
+        let assigned = bindings
+            .bindings
+            .get("assigned")
+            .and_then(|binding| binding.resolved_before(usize::MAX))
+            .unwrap();
+        assert!(assigned.path_rhs.is_none());
+        assert_eq!(
+            assigned.package_vector.as_deref().unwrap(),
+            ["tidyr".to_string()]
+        );
     }
 
     #[test]
@@ -315,6 +692,25 @@ mod tests {
     }
 
     #[test]
+    fn folds_parenthesized_path_values() {
+        assert_eq!(
+            fold_last_source_arg(r#"source((file.path("a", "b.R")))"#),
+            Some("a/b.R".to_string())
+        );
+
+        let code = r#"
+p <- ("child.R")
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(code), Some("child.R".to_string()));
+    }
+
+    #[test]
+    fn braced_path_values_remain_conservative() {
+        assert_eq!(fold_last_source_arg(r#"source({ "child.R" })"#), None);
+    }
+
+    #[test]
     fn folds_normalize_path_named_path_and_ignored_args() {
         assert_eq!(
             fold_last_source_arg(
@@ -329,6 +725,69 @@ mod tests {
         assert_eq!(
             fold_last_source_arg(r#"source(normalizePath(file.path("a"), bogus = 1))"#),
             None
+        );
+    }
+
+    #[test]
+    fn normalize_path_uses_strict_r_argument_matching() {
+        for code in [
+            r#"source(normalizePath(pa = file.path("a", "b.R"), win = arbitrary(), must = another()))"#,
+            r#"source(normalizePath(file.path("a", "b.R"), arbitrary(), another()))"#,
+            r#"source(normalizePath(mustWork = arbitrary(), file.path("a", "b.R"), winslash = another()))"#,
+        ] {
+            assert_eq!(
+                fold_last_source_arg(code),
+                Some("a/b.R".to_string()),
+                "{code}"
+            );
+        }
+
+        for code in [
+            r#"source(normalizePath(path = "a.R", path = "b.R"))"#,
+            r#"source(normalizePath(pa = "a.R", pat = "b.R"))"#,
+            r#"source(normalizePath("a.R", "/", FALSE, "extra"))"#,
+            r#"source(normalizePath(, "/", FALSE))"#,
+            r#"source(normalizePath("a.R", winslash =))"#,
+            r#"source(normalizePath("a.R", mustWork =))"#,
+            r#"source(normalizePath("a.R", bogus = FALSE))"#,
+            r#"source(normalizePath("a.R""))"#,
+        ] {
+            assert_eq!(fold_last_source_arg(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn callback_tracks_only_literals_on_the_shared_fold_path() {
+        let code = r#"
+source(file.path((normalizePath((file.path(("scripts"), "nested")), winslash = "base-option")), normalizePath(path = (file.path(("helpers.R"))), winslash = "slash-option", mustWork = "work-option"), fsep = "/"))
+"#;
+        let (folded, literals) = fold_last_source_arg_with_literals(code);
+
+        assert_eq!(folded, Some("scripts/nested/helpers.R".to_string()));
+        assert_eq!(literals, vec!["\"scripts\"", "\"nested\"", "\"helpers.R\""]);
+    }
+
+    #[test]
+    fn callback_replays_variable_literals_on_memo_hits() {
+        let code = r#"
+root <- file.path("scripts", "nested")
+source(file.path(root, root, "helpers.R"))
+"#;
+        let (folded, literals) = fold_last_source_arg_with_literals(code);
+
+        assert_eq!(
+            folded,
+            Some("scripts/nested/scripts/nested/helpers.R".to_string())
+        );
+        assert_eq!(
+            literals,
+            vec![
+                "\"scripts\"",
+                "\"nested\"",
+                "\"scripts\"",
+                "\"nested\"",
+                "\"helpers.R\""
+            ]
         );
     }
 
@@ -541,6 +1000,124 @@ source(p)
     }
 
     #[test]
+    fn helper_uncertainty_is_position_aware_for_immediate_uses() {
+        for helper in ["file.path", "normalizePath"] {
+            let source_expr = if helper == "file.path" {
+                r#"file.path("right.R")"#
+            } else {
+                r#"normalizePath("right.R")"#
+            };
+            let code = format!(
+                "source({source_expr})\nname <- \"{helper}\"\nassign(name, function(...) \"wrong.R\")\n"
+            );
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("right.R".to_string()),
+                "{helper}"
+            );
+
+            let code = format!(
+                "name <- \"{helper}\"\nassign(name, function(...) \"wrong.R\")\nsource({source_expr})\n"
+            );
+            assert_eq!(fold_last_source_arg(&code), None, "earlier {helper}");
+
+            let code = format!(
+                "source({source_expr})\nf <- function() assign(name, function(...) \"wrong.R\")\n"
+            );
+            assert_eq!(fold_last_source_arg(&code), None, "deferred {helper}");
+        }
+    }
+
+    #[test]
+    fn wrapped_immediate_helper_uses_ignore_later_dynamic_rebinding() {
+        for source in [
+            r#"(source(file.path("right.R")))"#,
+            r#"{ source(file.path("right.R")) }"#,
+        ] {
+            let code = format!(
+                "{source}\nname <- \"file.path\"\nassign(name, function(...) \"wrong.R\")\n"
+            );
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("right.R".to_string()),
+                "{source}"
+            );
+        }
+
+        for assignment in [
+            r#"(p <- file.path("right.R"))"#,
+            r#"{ p <- file.path("right.R") }"#,
+        ] {
+            let tree = parse(assignment);
+            let mut file_path_call = None;
+            fn find_file_path_call<'tree>(
+                node: Node<'tree>,
+                code: &str,
+                result: &mut Option<Node<'tree>>,
+            ) {
+                if node.kind() == "call"
+                    && node
+                        .child_by_field_name("function")
+                        .is_some_and(|function| &code[function.byte_range()] == "file.path")
+                {
+                    *result = Some(node);
+                    return;
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    find_file_path_call(child, code, result);
+                }
+            }
+            find_file_path_call(tree.root_node(), assignment, &mut file_path_call);
+            assert!(!helper_use_is_deferred(file_path_call.unwrap(), assignment));
+        }
+    }
+
+    #[test]
+    fn proven_non_mutating_constructs_preserve_path_candidates() {
+        for intervening in [
+            "for (i in NULL) assign(name, \"bad.R\")",
+            "rm(list = NULL)",
+            "rm(list = base::character())",
+            "rm(list = base::character(0))",
+            "rm(list = base::character(length = 0))",
+            "rm(list = character())",
+            "rm(list = character(0))",
+            "x <- base::paste0(\"a\", \"b\")",
+            "x <- base::paste(\"a\", \"b\")",
+            "quote(rm(p))",
+            "quote(p <- \"bad.R\")",
+            "x <- quote(assign(\"p\", \"bad.R\"))",
+        ] {
+            let code = format!("p <- \"good.R\"\n{intervening}\nsource(p)\n");
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("good.R".to_string()),
+                "{intervening}"
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_or_deferred_character_removals_stay_conservative() {
+        for setup in [
+            "character <- function(...) \"p\"\np <- \"good.R\"\nrm(list = character())",
+            "p <- \"good.R\"\nf <- function() rm(list = character())",
+        ] {
+            let code = format!("{setup}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{setup}");
+        }
+    }
+
+    #[test]
+    fn transparent_top_level_wrappers_keep_later_candidates_viable() {
+        for mutation in ["{ assign(name, \"old.R\") }", "(assign(name, \"old.R\"))"] {
+            let code = format!("{mutation}\np <- \"good.R\"\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), Some("good.R".to_string()));
+        }
+    }
+
+    #[test]
     fn deferred_unknown_name_mutation_persistently_invalidates_candidates() {
         let code = r#"
 f <- function() assign("\x70", "b.R", envir = .GlobalEnv)
@@ -620,6 +1197,106 @@ source(p)
     }
 
     #[test]
+    fn trusted_loaders_invalidate_unknown_names_by_destination_and_scope() {
+        for loader in [
+            r#"load("state.RData")"#,
+            r#"base::load("state.RData")"#,
+            r#"base:::load("state.RData")"#,
+            r#"sys.load.image("state.RData")"#,
+            r#"sys.load.image("state.RData", quiet = TRUE)"#,
+            r#"base::sys.load.image("state.RData")"#,
+        ] {
+            let code = format!("p <- \"good.R\"\n{loader}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{loader}");
+        }
+
+        for external in [
+            r#"base::load("state.RData", envir = base::new.env())"#,
+            r#"base::load("state.RData", envir = base::baseenv())"#,
+            r#"base::load("state.RData", envir = base::emptyenv())"#,
+        ] {
+            let code = format!("p <- \"good.R\"\n{external}\nsource(p)\n");
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("good.R".to_string()),
+                "{external}"
+            );
+        }
+
+        let unknown = "p <- \"good.R\"\nenv <- choose_env()\nbase::load(\"state.RData\", envir = env)\nsource(p)\n";
+        assert_eq!(fold_last_source_arg(unknown), None);
+
+        let later_assignment = "base::load(\"state.RData\")\np <- \"good.R\"\nsource(p)\n";
+        assert_eq!(
+            fold_last_source_arg(later_assignment),
+            Some("good.R".to_string())
+        );
+
+        let unrelated_function =
+            "p <- \"good.R\"\nf <- function() base::load(\"state.RData\")\nsource(p)\n";
+        assert_eq!(
+            fold_last_source_arg(unrelated_function),
+            Some("good.R".to_string())
+        );
+
+        let same_function =
+            "p <- \"good.R\"\nf <- function() { base::load(\"state.RData\"); source(p) }\n";
+        assert_eq!(fold_last_source_arg(same_function), None);
+
+        let explicit_global = "p <- \"good.R\"\nf <- function() base::load(\"state.RData\", envir = .GlobalEnv)\nsource(p)\n";
+        assert_eq!(fold_last_source_arg(explicit_global), None);
+    }
+
+    #[test]
+    fn load_argument_side_effects_and_trust_policy_are_preserved() {
+        let side_effect = r#"
+p <- "good.R"
+base::load({ base::assign("p", "bad.R", envir = .GlobalEnv); "state.RData" },
+           envir = base::new.env())
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(side_effect), None);
+
+        let escaped_destination = r#"
+p <- "good.R"
+base::load(file = "state.RData", `\x65nvir` = .GlobalEnv)
+source(p)
+"#;
+        assert_eq!(fold_last_source_arg(escaped_destination), None);
+
+        for untrusted in [
+            "load <- function(...) NULL\np <- \"good.R\"\nload(\"state.RData\")\nsource(p)\n",
+            "p <- \"good.R\"\nother::load(\"state.RData\")\nsource(p)\n",
+            "sys.load.image <- function(...) NULL\np <- \"good.R\"\nsys.load.image(\"state.RData\")\nsource(p)\n",
+        ] {
+            assert_eq!(
+                fold_last_source_arg(untrusted),
+                Some("good.R".to_string()),
+                "{untrusted}"
+            );
+        }
+
+        for helper in ["file.path", "normalizePath"] {
+            let expression = if helper == "file.path" {
+                r#"file.path("good.R")"#
+            } else {
+                r#"normalizePath("good.R")"#
+            };
+            let code = format!("base::load(\"state.RData\")\np <- {expression}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{helper}");
+
+            let code = format!(
+                "f <- function() base::load(\"state.RData\")\np <- {expression}\nsource(p)\n"
+            );
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("good.R".to_string()),
+                "unrelated {helper}"
+            );
+        }
+    }
+
+    #[test]
     fn evaluated_assign_actuals_invalidate_other_bindings() {
         let code = r#"
 delayedAssign("e", {
@@ -684,6 +1361,158 @@ other <- v
 source(p)
 "#;
         assert_eq!(fold_last_source_arg(code), None);
+    }
+
+    #[test]
+    fn bquote_splice_result_preserves_only_reachable_binding_candidates() {
+        let code = r#"
+ p <- "good.R"
+ base::bquote(..(function() {}) + .(base::assign("p", "bad.R")), splice = TRUE)
+ source(p)
+ "#;
+        assert_eq!(fold_last_source_arg(code), Some("good.R".to_string()));
+
+        let code = r#"
+ p <- "good.R"
+ base::bquote(..({ other <- 1; function() {} }) + .(base::assign("p", "bad.R")), splice = TRUE)
+ source(p)
+ "#;
+        assert_eq!(fold_last_source_arg(code), Some("good.R".to_string()));
+
+        // An unknown result may be vector-like, so conservative invalidation
+        // must inspect the assignment that would run after a successful splice.
+        let code = r#"
+ p <- "good.R"
+ base::bquote(..(unknown) + .(base::assign("p", "bad.R")), splice = TRUE)
+ source(p)
+ "#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        for operand in ["1", "list(1)", "c(1)", "base::c(1)"] {
+            let code = format!(
+                "p <- \"good.R\"\nbase::bquote(..({operand}) + .(base::assign(\"p\", \"bad.R\")), splice = TRUE)\nsource(p)\n"
+            );
+            assert_eq!(fold_last_source_arg(&code), None, "{operand}");
+        }
+    }
+
+    #[test]
+    fn bquote_static_paths_follow_operand_evaluation_frame() {
+        for capture in [
+            r#"bquote(.(p <- "bad.R"), where = new.env())"#,
+            r#"bquote(where = new.env(), expr = .(p <- "bad.R"))"#,
+            r#"bquote(.(rm(p)), where = new.env())"#,
+        ] {
+            let code = format!("p <- \"good.R\"\n{capture}\nsource(p)\n");
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("good.R".to_string()),
+                "{capture}"
+            );
+        }
+
+        for capture in [
+            r#"bquote(.(p <- "good.R"))"#,
+            r#"bquote(.(p <- "good.R"), where = parent.frame())"#,
+            r#"bquote(where = environment(), expr = .(p <- "good.R"))"#,
+            r#"bquote(expr = .(p <- "good.R"), where = .GlobalEnv)"#,
+            r#"bquote(expr = .(p <- "good.R"), where = globalenv())"#,
+            r#"bquote(expr = .(p <- "good.R"), where = base::globalenv())"#,
+        ] {
+            let code = format!("{capture}\nsource(p)\n");
+            assert_eq!(
+                fold_last_source_arg(&code),
+                Some("good.R".to_string()),
+                "{capture}"
+            );
+        }
+
+        for capture in [
+            r#"bquote(.(p <- "bad.R"))"#,
+            r#"bquote(.(p <- "bad.R"), where = .GlobalEnv)"#,
+            r#"bquote(.(base::assign("p", "bad.R", envir = .GlobalEnv)), where = new.env())"#,
+            r#"bquote(where = new.env(), expr = .(p <<- "bad.R"))"#,
+        ] {
+            let code = format!("p <- \"good.R\"\n{capture}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), None, "{capture}");
+        }
+    }
+
+    #[test]
+    fn bquote_function_syntax_static_bindings_follow_runtime_scope() {
+        let top_level = r#"
+            bquote(function() .(p <- "good.R"))
+            source(p)
+        "#;
+        assert_eq!(fold_last_source_arg(top_level), Some("good.R".to_string()));
+
+        let outer_function = r#"
+            outer <- function() {
+                bquote(function() .(p <- "outer.R"))
+            }
+            source(p)
+        "#;
+        assert_eq!(fold_last_source_arg(outer_function), None);
+
+        let nested_closure = r#"
+            bquote(function() .(function() p <- "nested.R"))
+            source(p)
+        "#;
+        assert_eq!(fold_last_source_arg(nested_closure), None);
+
+        let ordinary = r#"
+            ordinary <- function() p <- "ordinary.R"
+            source(p)
+        "#;
+        assert_eq!(fold_last_source_arg(ordinary), None);
+    }
+
+    #[test]
+    fn external_bquote_function_bindings_are_analyzed_as_deferred_local_execution() {
+        let code = r#"
+            p <- "good.R"
+            bquote(
+                .(function(default = { p <- "default.R" }) {
+                    p <- "body.R"
+                    function() { nested <- p }
+                }),
+                where = new.env()
+            )
+            source(p)
+        "#;
+        assert_eq!(fold_last_source_arg(code), None);
+
+        let code = r#"
+            p <- "good.R"
+            bquote(.(external <- "unrelated.R"), where = new.env())
+            source(p)
+        "#;
+        assert_eq!(fold_last_source_arg(code), Some("good.R".to_string()));
+    }
+
+    #[test]
+    fn unknown_bquote_splice_false_branch_invalidates_path_binding() {
+        for (capture, expected) in [
+            (
+                r#"base::bquote(list(..(1, .(base::assign("p", "bad.R")))), splice = flag)"#,
+                None,
+            ),
+            (
+                r#"base::bquote(list(..(1, .(base::assign("p", "bad.R")))), splice = TRUE)"#,
+                Some("good.R".to_string()),
+            ),
+            (
+                r#"base::bquote(list(..(base::quote(.(base::assign("p", "bad.R"))))), splice = flag)"#,
+                None,
+            ),
+            (
+                r#"base::bquote(list(..(base::quote(.(base::assign("p", "bad.R"))))), splice = TRUE)"#,
+                Some("good.R".to_string()),
+            ),
+        ] {
+            let code = format!("p <- \"good.R\"\n{capture}\nsource(p)\n");
+            assert_eq!(fold_last_source_arg(&code), expected, "{capture}");
+        }
     }
 
     #[test]

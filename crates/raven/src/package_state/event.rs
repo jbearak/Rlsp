@@ -230,8 +230,8 @@ fn preamble_rescan_needed(
     super::preamble::is_testthat_preamble_path(canonical_path, &canonical_root)
 }
 
-fn current_preamble_scan(inputs: &PackageInputs) -> super::preamble::PreambleScan {
-    super::preamble::PreambleScan::snapshot(inputs)
+fn current_preamble_snapshot(inputs: &PackageInputs) -> super::preamble::PreambleSnapshot {
+    super::preamble::PreambleSnapshot::from_inputs(inputs)
 }
 
 fn rescan_preamble_for_path(
@@ -245,13 +245,13 @@ fn rescan_preamble_for_path(
     if canonical_path != path {
         affected_paths.push(canonical_path.to_path_buf());
     }
-    // Synchronous caller: `current_preamble_scan(inputs)` is read under the
+    // Synchronous caller: `current_preamble_snapshot(inputs)` is read under the
     // same lock the result is applied under, so no concurrent update can slip
     // between snapshot and apply — installing the whole scan is safe and the
     // rescanned-preamble set is not needed.
     super::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
         root,
-        &current_preamble_scan(inputs),
+        current_preamble_snapshot(inputs),
         &affected_paths,
         &super::preamble::PreambleTextOverrides::new(),
         exclusions,
@@ -420,7 +420,7 @@ fn translate_watched(
             root,
             &path,
             &canonical_path,
-            Some(PackageInputDelta::DataDirChanged),
+            Some(PackageInputDelta::DatasetNamesChanged),
             exclusions,
         );
     }
@@ -436,7 +436,7 @@ fn translate_watched(
             root,
             &path,
             &canonical_path,
-            Some(PackageInputDelta::DataDirChanged),
+            Some(PackageInputDelta::SysdataNamesChanged),
             exclusions,
         );
     }
@@ -475,7 +475,7 @@ fn translate_watched_directory(
     let data_dir = root.join("data");
     if path == data_dir || path.starts_with(&data_dir) {
         inputs.dataset_names = super::scan_own_package_data_dir_with_exclusions(root, exclusions);
-        return Some(PackageInputDelta::DataDirChanged);
+        return Some(PackageInputDelta::DatasetNamesChanged);
     }
 
     // data-raw/ directory: rescan sysdata generating scripts.
@@ -483,7 +483,7 @@ fn translate_watched_directory(
     if path == data_raw_dir || path.starts_with(&data_raw_dir) {
         inputs.sysdata_names =
             super::sysdata::scan_sysdata_generating_scripts_with_exclusions(root, exclusions);
-        return Some(PackageInputDelta::DataDirChanged);
+        return Some(PackageInputDelta::SysdataNamesChanged);
     }
 
     let mut deltas = Vec::new();
@@ -1403,6 +1403,103 @@ mod tests {
     }
 
     #[test]
+    fn creating_an_initially_missing_rprofile_helper_rescans_the_prelude() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        let helper = root.join("scripts/later.R");
+        std::fs::write(root.join(".Rprofile"), "source(\"scripts/later.R\")\n").unwrap();
+
+        let initial = super::rprofile::scan_workspace_rprofile(root);
+        let mut inputs = PackageInputs {
+            workspace_root: Some(root.to_path_buf()),
+            package_mode: PackageMode::Auto,
+            model_rprofile: true,
+            rprofile_symbols: initial.symbols,
+            rprofile_attached_packages: initial.attached_packages,
+            rprofile_sourced_files: initial.sourced_files,
+            ..PackageInputs::default()
+        };
+        let routed = super::preamble::canonicalize_for_routing(&helper);
+        assert!(inputs.rprofile_sourced_files.contains(&routed));
+
+        std::fs::write(&helper, "created_def <- 1\n").unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+
+        assert_eq!(delta, Some(PackageInputDelta::RProfileChanged));
+        assert!(inputs.rprofile_symbols.contains("created_def"));
+        assert!(inputs.rprofile_sourced_files.contains(&routed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_rprofile_helper_through_symlink_keeps_route_for_recreation() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real_root = tmp.path().join("real-pkg");
+        let linked_root = tmp.path().join("linked-pkg");
+        std::fs::create_dir_all(real_root.join("scripts")).unwrap();
+        symlink(&real_root, &linked_root).unwrap();
+        let helper = linked_root.join("scripts/setup.R");
+        std::fs::write(
+            linked_root.join(".Rprofile"),
+            "source(\"scripts/setup.R\")\n",
+        )
+        .unwrap();
+        std::fs::write(&helper, "stale_def <- 1\n").unwrap();
+
+        let scan = super::rprofile::scan_workspace_rprofile(&linked_root);
+        let mut inputs = PackageInputs {
+            workspace_root: Some(linked_root.clone()),
+            package_mode: PackageMode::Auto,
+            model_rprofile: true,
+            rprofile_symbols: scan.symbols,
+            rprofile_attached_packages: scan.attached_packages,
+            rprofile_sourced_files: scan.sourced_files,
+            ..PackageInputs::default()
+        };
+        assert!(inputs.rprofile_symbols.contains("stale_def"));
+
+        std::fs::remove_file(&helper).unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap(),
+                on_disk_text: None,
+                deleted: true,
+            },
+        );
+        assert_eq!(delta, Some(PackageInputDelta::RProfileChanged));
+        assert!(!inputs.rprofile_symbols.contains("stale_def"));
+        let routed = real_root.canonicalize().unwrap().join("scripts/setup.R");
+        assert!(
+            inputs.rprofile_sourced_files.contains(&routed),
+            "deleted helper must remain routed for recreation: {:?}",
+            inputs.rprofile_sourced_files
+        );
+
+        std::fs::write(&helper, "recreated_def <- 1\n").unwrap();
+        let delta = translate(
+            &mut inputs,
+            HandlerEvent::WatchedFileChanged {
+                uri: tower_lsp::lsp_types::Url::from_file_path(&helper).unwrap(),
+                on_disk_text: None,
+                deleted: false,
+            },
+        );
+        assert_eq!(delta, Some(PackageInputDelta::RProfileChanged));
+        assert!(inputs.rprofile_symbols.contains("recreated_def"));
+    }
+
+    #[test]
     fn editing_a_preamble_sourced_helper_rescans_the_preamble_closure() {
         // tests/testthat/helper-project.R sources scripts/helpers.R via the
         // issue #638 computed-path idiom. scripts/helpers.R is NOT a tracked
@@ -1748,7 +1845,7 @@ mod tests {
         assert!(
             deltas
                 .iter()
-                .any(|d| matches!(d, PackageInputDelta::DataDirChanged)),
+                .any(|d| matches!(d, PackageInputDelta::SysdataNamesChanged)),
             "sysdata rescan must still fire: {:?}",
             deltas
         );
@@ -1797,8 +1894,8 @@ mod tests {
         );
 
         assert!(
-            matches!(delta, Some(PackageInputDelta::DataDirChanged)),
-            "expected DataDirChanged, got: {:?}",
+            matches!(delta, Some(PackageInputDelta::SysdataNamesChanged)),
+            "expected SysdataNamesChanged, got: {:?}",
             delta
         );
         assert!(
@@ -1837,8 +1934,8 @@ mod tests {
         );
 
         assert!(
-            matches!(delta, Some(PackageInputDelta::DataDirChanged)),
-            "expected DataDirChanged, got: {:?}",
+            matches!(delta, Some(PackageInputDelta::DatasetNamesChanged)),
+            "expected DatasetNamesChanged, got: {:?}",
             delta
         );
         assert!(

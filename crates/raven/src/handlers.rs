@@ -114,6 +114,10 @@ pub(crate) struct DiagnosticsSnapshot {
     /// Stored as `Arc` so concurrent fan-out revalidations share allocation
     /// instead of each cloning the trimmed graph from the cache payload.
     pub cross_file_graph: Arc<crate::cross_file::dependency::DependencyGraph>,
+    /// Whether the bounded neighborhood walk omitted any reachable node due to
+    /// either the depth or visited limit. Foreign NSE/func propagation fails
+    /// closed when this is true; own-file directives remain authoritative.
+    pub cross_file_neighborhood_truncated: bool,
     pub workspace_folders: Vec<Url>,
     pub base_exports: Arc<HashSet<String>>,
     pub package_library_ready: bool,
@@ -613,6 +617,7 @@ impl DiagnosticsSnapshot {
             lint_config,
             indentation_producer_policy,
             cross_file_graph: trimmed_graph,
+            cross_file_neighborhood_truncated: payload.truncation.is_truncated(),
             workspace_folders: state.workspace_folders.clone(),
             base_exports,
             package_library_ready: state.package_library_ready,
@@ -6307,12 +6312,10 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         &text[start..end]
     };
 
-    // Pre-resolve each source() target's local exports. Matching the legacy
-    // (non-snapshot) collector's semantics: the diagnostic fires only when
-    // the named symbol appears in *that specific* source target's
-    // `exported_interface`. Without this, a symbol brought in by an earlier
-    // source() (or inherited from a parent) could be misattributed to a
-    // later, unrelated source() call. Computed once per pass and reused.
+    // Pre-resolve each source() target's live local exports. The diagnostic
+    // fires only when the named symbol survives in that specific target;
+    // otherwise an earlier source (or inherited parent) could be misattributed
+    // to a later unrelated call. Computed once per target and reused.
     let workspace_root = snapshot.workspace_folders.first();
     let source_path_ctx = crate::cross_file::path_resolve::PathContext::from_metadata(
         uri,
@@ -6331,28 +6334,21 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     // on `live_top_level_exports` flags per-source-call lookups as a hot
     // path that must be cached.
     let mut live_exports_cache: HashMap<Url, HashSet<String>> = HashMap::new();
-    let source_target_live_exports: Vec<Option<HashSet<String>>> = source_calls
+    let source_target_uris: Vec<Option<Url>> = source_calls
         .iter()
         .map(|source| {
-            let resolved_uri = source_path_ctx.as_ref().and_then(|ctx| {
-                let resolved =
-                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                        &source.path,
-                        ctx,
-                    )?;
-                Url::from_file_path(resolved).ok()
-            });
-            resolved_uri.and_then(|target_uri| {
-                if let Some(cached) = live_exports_cache.get(&target_uri) {
-                    return Some(cached.clone());
-                }
-                let computed = snapshot
-                    .artifacts_map
-                    .get(&target_uri)
-                    .map(|artifacts| crate::cross_file::scope::live_top_level_exports(artifacts))?;
-                live_exports_cache.insert(target_uri, computed.clone());
-                Some(computed)
-            })
+            let ctx = source_path_ctx.as_ref()?;
+            let resolved = crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                &source.path,
+                ctx,
+            )?;
+            let target_uri = Url::from_file_path(resolved).ok()?;
+            if let Some(artifacts) = snapshot.artifacts_map.get(&target_uri) {
+                live_exports_cache
+                    .entry(target_uri.clone())
+                    .or_insert_with(|| crate::cross_file::scope::live_top_level_exports(artifacts));
+            }
+            Some(target_uri)
         })
         .collect();
 
@@ -6362,6 +6358,20 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
     let mut usages: Vec<(String, u32, u32, Node)> = Vec::new();
     collect_identifier_usages_utf16(node, text, &line_starts, &mut usages);
     usages.sort_by_key(|(_, l, c, _)| (*l, *c));
+
+    // Defaults are forced later, so source-order attribution must follow the
+    // binding that survives in the caller's full EOF scope, not merely notice
+    // that the name is absent at the default's source position. This one
+    // rm-aware provenance query covers later same-file redefinitions/removals,
+    // competing sources, and repeated calls to the same target.
+    let default_eof_symbols = if usages
+        .iter()
+        .any(|(_, _, _, node)| containing_default_parameter(*node).is_some())
+    {
+        snapshot.get_scope(uri, u32::MAX, u32::MAX, cancel).symbols
+    } else {
+        HashMap::new()
+    };
 
     // Build a ScopeStream for the queried URI. The closures borrow the
     // snapshot's pre-collected artifacts/metadata maps; the stream
@@ -6484,6 +6494,17 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
         // (single forward sweep amortizes the cache work). Falls back
         // to the legacy snapshot-cache path when the stream couldn't be
         // constructed.
+        //
+        // Ordinary usages are attributed only when absent at their source
+        // position. Defaults are different: they are forced later, so the
+        // candidate source must own the binding that survives at EOF. Nested
+        // closures inside defaults are excluded by `containing_default_parameter`
+        // and therefore follow the ordinary late-bound function path.
+        let default_expression = containing_default_parameter(*usage_node).is_some();
+        let default_body_binding = default_expression
+            && containing_function_definition(*usage_node)
+                .and_then(function_body_node)
+                .is_some_and(|body| function_body_binds_name(body, text, name));
         let in_scope = if let Some(stream) = stream_opt.as_mut() {
             stream.advance_to(*usage_line, *usage_col);
             stream.is_visible(name)
@@ -6493,8 +6514,19 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
                 .or_insert_with(|| snapshot.get_scope(uri, *usage_line, *usage_col, cancel));
             scope.symbols.contains_key(name.as_str())
         };
+        let default_eof_source_uri = default_expression
+            .then(|| {
+                default_eof_symbols
+                    .get(name.as_str())
+                    .map(|symbol| &symbol.source_uri)
+            })
+            .flatten();
 
-        if in_scope {
+        if default_body_binding
+            || (!default_expression && in_scope)
+            || default_eof_source_uri.is_some_and(|source_uri| source_uri == uri)
+            || (default_expression && default_eof_source_uri.is_none())
+        {
             continue;
         }
 
@@ -6540,12 +6572,29 @@ fn collect_out_of_scope_diagnostics_from_snapshot(
             // doesn't bring it in at all). When the target's artifacts
             // aren't available (closed file not yet indexed), we
             // conservatively skip — better to under-report than misattribute.
-            let exports_match = source_target_live_exports
+            let Some(target_uri) = source_target_uris
                 .get(src_idx)
-                .and_then(|exports| exports.as_ref())
-                .map(|set| set.contains(name.as_str()))
-                .unwrap_or(false);
-            if !exports_match {
+                .and_then(|target| target.as_ref())
+            else {
+                continue;
+            };
+            let Some(exports) = live_exports_cache.get(target_uri) else {
+                continue;
+            };
+            if !exports.contains(name.as_str()) {
+                continue;
+            }
+
+            // A default is attributed only to the candidate whose target owns
+            // the rm-aware EOF binding. A pre-existing symbol at this call site
+            // still wins: this covers earlier providers and repeated calls to
+            // the same target without confusing URI equality with provenance.
+            if default_expression
+                && (default_eof_source_uri != Some(target_uri)
+                    || source_scope_symbols
+                        .get(&(source.line, source.column))
+                        .is_some_and(|symbols| symbols.contains_key(name.as_str())))
+            {
                 continue;
             }
 
@@ -6832,10 +6881,11 @@ struct CrossFileNse {
 /// (`snapshot.cross_file_graph`). Sharing that helper with
 /// [`crate::cross_file::revalidation::compute_affected_dependents_after_edit`]
 /// (which runs it over the FULL graph) gives the two the **identical traversal
-/// shape**, so they can no longer drift in edge-selection logic. They are the
-/// directed inverse of each other when the budgets match and modulo the
-/// deliberate trimmed-vs-full graph asymmetry: for any `D ∈ S(uri)` within the
-/// trimmed neighborhood, editing `D` already revalidates `uri`. Computing over
+/// shape**, so they can no longer drift in edge-selection logic. For an
+/// UNTRUNCATED neighborhood they are the directed inverse of each other when the
+/// budgets match and modulo the deliberate trimmed-vs-full graph asymmetry: for
+/// any `D ∈ S(uri)` within the trimmed neighborhood, editing `D` already
+/// revalidates `uri`. Computing over
 /// the trimmed subgraph (rather than the full graph) restricts members to the
 /// neighborhood, so every member is read from `metadata_map`; a member absent
 /// from it (an unresolved / missing-file node) simply contributes nothing — it
@@ -6848,15 +6898,16 @@ struct CrossFileNse {
 /// treat the excluded buffer as the helper's ancestor or propagate its NSE/func
 /// declarations into the helper.
 ///
-/// Because the trimmed subgraph is the bounded (`max_chain_depth` /
-/// `max_transitive_dependents_visited`) neighborhood, propagation is likewise
-/// bounded: a declaration on an `S(uri)` member beyond the neighborhood bound
-/// (a source chain longer than the depth limit in an up-then-down shape) is not
-/// collected here even though editing it may revalidate `uri` over the full
-/// graph. This is the SAFE direction — `S_trimmed ⊆ S_full`, so it can only
-/// *miss* a suppression (leaving a real diagnostic), never add a wrong one — and
-/// matches the existing scope/in-play depth-bound behavior (default depth 20, so
-/// the bound never bites for the issue's required topologies).
+/// The trimmed subgraph is bounded by `max_chain_depth` and
+/// `max_transitive_dependents_visited`. If either bound truncated the snapshot's
+/// neighborhood, this collector returns no FOREIGN declarations at all. That
+/// fail-closed rule is required because a declaration can be present in one
+/// budget-limited query walk while the inverse edit-time walk omits the query;
+/// selectively propagating it could then leave a stale suppression. Own-file
+/// directives are unaffected because they enter `NseAnalysis` through
+/// `snapshot.directive_meta`, not this collector. When the neighborhood is
+/// untruncated, the existing safe-direction guarantee remains
+/// `S_trimmed ⊆ S_full`.
 ///
 /// Declarations are collapsed deterministically: members are visited in
 /// sorted-URI order, the first (smallest URI) file to set a key wins, and within
@@ -6865,6 +6916,18 @@ struct CrossFileNse {
 /// one foreign declaration per `(name, package)` (NSE) / bare `name` (func).
 fn collect_cross_file_nse(snapshot: &DiagnosticsSnapshot, uri: &Url) -> CrossFileNse {
     use std::collections::BTreeMap;
+
+    // A bounded neighborhood can contain a declaration whose edit-time inverse
+    // walk omits this query under the same visited/depth budget. Propagating that
+    // foreign declaration would suppress a diagnostic without guaranteeing the
+    // query is revalidated when the declaration changes. Fail closed for all
+    // foreign declarations; own-file directives bypass this collector.
+    if snapshot.cross_file_neighborhood_truncated {
+        return CrossFileNse {
+            nse: Vec::new(),
+            funcs: Vec::new(),
+        };
+    }
 
     let graph = snapshot.cross_file_graph.as_ref();
     let max_depth = snapshot.cross_file_config.max_chain_depth;
@@ -7398,6 +7461,7 @@ fn collect_undefined_variables_from_snapshot(
             usage_line,
             usage_col_utf16,
             &top_level_defs_by_name,
+            local_opt.as_ref().map(|(exports, _)| exports),
         ) {
             continue;
         }
@@ -7986,6 +8050,13 @@ fn default_of_defused_formal(parameter: Node, node: Node, text: &str) -> bool {
 fn containing_default_parameter(node: Node) -> Option<Node> {
     let mut current = node;
     while let Some(parent) = current.parent() {
+        // The nested closure is created while the outer default is forced, but
+        // identifiers in its formals/body are evaluated only when that closure
+        // is called. They therefore use ordinary lexical late binding and must
+        // not inherit the owning outer parameter's default attribution.
+        if parent.kind() == "function_definition" {
+            return None;
+        }
         if parent.kind() == "default_parameter" {
             return Some(parent);
         }
@@ -8008,9 +8079,10 @@ fn containing_default_parameter(node: Node) -> Option<Node> {
 ///
 /// Defaults are promises evaluated in the eventual call frame, not when the
 /// function is defined. That means two otherwise-forward references are valid:
-/// a top-level helper declared later in the same file, and a binding created in
-/// the containing function body before the promise is forced. This is still
-/// evidence-based: a genuinely missing default name remains diagnosable.
+/// a top-level helper declared later in the same file and still live at EOF, and
+/// a binding created in the containing function body before the promise is
+/// forced. This is still evidence-based: a removed or genuinely missing default
+/// name remains diagnosable.
 fn default_expression_resolves_lazily(
     node: Node,
     text: &str,
@@ -8018,16 +8090,19 @@ fn default_expression_resolves_lazily(
     usage_line: u32,
     usage_col_utf16: u32,
     top_level_defs_by_name: &HashMap<String, Vec<(u32, u32)>>,
+    live_top_level_exports: Option<&HashSet<String>>,
 ) -> bool {
     if containing_default_parameter(node).is_none() {
         return false;
     }
 
-    if top_level_defs_by_name.get(name).is_some_and(|positions| {
-        positions
-            .iter()
-            .any(|&(line, col)| (line, col) > (usage_line, usage_col_utf16))
-    }) {
+    if live_top_level_exports.is_some_and(|exports| exports.contains(name))
+        && top_level_defs_by_name.get(name).is_some_and(|positions| {
+            positions
+                .iter()
+                .any(|&(line, col)| (line, col) > (usage_line, usage_col_utf16))
+        })
+    {
         return true;
     }
 
@@ -21556,29 +21631,25 @@ pub fn goto_definition_with_cancel(
     // R / JAGS / Stan, where this equals the raw text.
     let text = doc.analysis_text();
 
-    // Check for file path context first (source() calls and LSP directives)
+    // Check the navigation-specific file path context first. Completion remains
+    // limited to directly typed strings, while navigation also accepts literal
+    // path segments inside statically foldable computed source arguments.
     // Requirements 5.1-5.5, 6.1-6.5: Go-to-definition for file paths
-    let file_path_context =
-        crate::file_path_intellisense::detect_file_path_context(tree, &text, position);
-    if !matches!(
-        file_path_context,
-        crate::file_path_intellisense::FilePathContext::None
-    ) {
-        // Get enriched metadata from state for source() calls (includes inherited_working_directory)
-        // Directive contexts don't use `# raven: cd`, so we use default metadata
-        let metadata = match file_path_context {
-            crate::file_path_intellisense::FilePathContext::SourceCall { .. } => {
-                // Use get_enriched_metadata to get metadata with inherited_working_directory
-                // from parent files, not just the current file's directives
-                state.get_enriched_metadata(uri).unwrap_or_default()
-            }
-            _ => Default::default(),
+    if let Some(target) =
+        crate::file_path_intellisense::detect_file_path_navigation_target(tree, &text, position)
+    {
+        // Get enriched metadata from state for source() calls (includes inherited_working_directory).
+        // Directive handling retains its existing metadata behavior.
+        let metadata = if target.is_source_call() {
+            // Use get_enriched_metadata to get metadata with inherited_working_directory
+            // from parent files, not just the current file's directives
+            state.get_enriched_metadata(uri).unwrap_or_default()
+        } else {
+            Default::default()
         };
 
         if let Some(location) = crate::file_path_intellisense::file_path_definition(
-            tree,
-            &text,
-            position,
+            target,
             uri,
             &metadata,
             state.workspace_folders.first(),
@@ -31653,8 +31724,8 @@ y <- totally_undefined_baseline()
         // Wire up the dependency graph so the source() edge is visible
         // to the out-of-scope collector. Without these calls
         // `snapshot.cross_file_graph.get_dependencies(main_url)` returns
-        // nothing and the inner loop's `source_target_live_exports` lookup
-        // returns None — meaning the guard under test would never fire
+        // nothing and the inner loop's target/export-cache lookup returns None —
+        // meaning the guard under test would never fire
         // even if it were broken.
         state.cross_file_graph.update_file(
             &main_url,
@@ -55063,10 +55134,12 @@ result <- helper_with_spaces(42)"#;
         // Cursor at line 0, column 17 — inside `helpers.R`.
         let cursor = Position::new(0, 17);
         let metadata = crate::cross_file::CrossFileMetadata::default();
+        let target = crate::file_path_intellisense::detect_file_path_navigation_target(
+            &tree, main_code, cursor,
+        )
+        .expect("Expected a directive navigation target");
         let location = crate::file_path_intellisense::file_path_definition(
-            &tree,
-            main_code,
-            cursor,
+            target,
             &main_url,
             &metadata,
             Some(&workspace_url),
@@ -58477,6 +58550,462 @@ source(\"helpers.R\")
                 .collect::<Vec<_>>()
         );
         assert_eq!(used_before_x[0].range.start.line, 0);
+    }
+
+    #[test]
+    fn test_nested_closure_default_invoked_before_source_is_not_attributed() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = None;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        let main_code = "\
+f <- function(a = function() x) a
+f()()
+source(\"helpers.R\")
+";
+        let helpers_code = "x <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        assert!(
+            !diagnostics.iter().any(|d| {
+                d.message.contains("is used before it's available") && d.message.contains("'x'")
+            }),
+            "`x` belongs to the nested closure, not the outer default evaluation. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_nested_closure_default_invoked_after_source_is_not_attributed() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = None;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        let main_code = "\
+f <- function(a = function() x) a
+source(\"helpers.R\")
+f()()
+";
+        let helpers_code = "x <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        assert!(
+            !diagnostics.iter().any(|d| {
+                d.message.contains("is used before it's available") && d.message.contains("'x'")
+            }),
+            "A nested closure invoked after source() must use ordinary late binding. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_default_source_then_rm_allows_undefined_diagnostic() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        let main_code = "f <- function(a = x) a\nsource(\"helpers.R\")\n";
+        let helpers_code = "x <- 42\nrm(x)\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        assert!(
+            !diagnostics.iter().any(|d| {
+                d.message.contains("is used before it's available") && d.message.contains("'x'")
+            }),
+            "A source target that removes `x` must not receive attribution. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.message.contains("x is not defined"))
+                .count(),
+            1,
+            "The removed export must remain available to ordinary undefined-variable analysis. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_default_source_redefinition_after_rm_is_attributed() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = None;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        let main_code = "f <- function(a = x) a\nsource(\"helpers.R\")\n";
+        let helpers_code = "x <- 1\nrm(x)\nx <- 2\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| {
+                    d.message.contains("is used before it's available") && d.message.contains("'x'")
+                })
+                .count(),
+            1,
+            "A final redefinition resurrects the source export and should be attributed. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_default_source_then_caller_rm_allows_undefined_diagnostic() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        let main_code = "f <- function(a = x) a\nsource(\"helpers.R\")\nrm(x)\n";
+        let helpers_code = "x <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        assert!(
+            !diagnostics.iter().any(|d| {
+                d.message.contains("is used before it's available") && d.message.contains("'x'")
+            }),
+            "A caller-side rm() means the source binding does not survive to default evaluation. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.message.contains("x is not defined"))
+                .count(),
+            1,
+            "Caller-side removal must leave the ordinary undefined-variable diagnostic. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_default_repeated_source_target_attributes_first_provider_once() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = None;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        let main_code = "f <- function(a = x) a\nsource(\"helpers.R\")\nsource(\"helpers.R\")\n";
+        let helpers_code = "x <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        let used_before: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("is used before it's available") && d.message.contains("'x'")
+            })
+            .collect();
+        assert_eq!(
+            used_before.len(),
+            1,
+            "Repeated calls to one target should attribute the surviving first provider once. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+        assert!(used_before[0].message.contains("line 2"));
+    }
+
+    /// A same-file top-level definition remains a valid late-bound default even
+    /// when an intervening source target exports the same name. The source must
+    /// not be blamed when the final default binding comes from this file.
+    #[test]
+    fn test_default_parameter_later_same_file_definition_suppresses_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = None;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        let main_code = "\
+f <- function(a = x) {
+  a
+}
+source(\"helpers.R\")
+x <- 1
+";
+        let helpers_code = "x <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        assert!(
+            !diagnostics.iter().any(|d| {
+                d.message.contains("is used before it's available") && d.message.contains("'x'")
+            }),
+            "The later same-file definition should satisfy the lazy default without blaming the \
+             intervening source. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A default promise may resolve a binding created in its containing body
+    /// before the promise is forced. A later source exporting the same name is
+    /// therefore not the binding origin and must not receive ordering blame.
+    #[test]
+    fn test_default_parameter_body_binding_suppresses_used_before_sourced() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = None;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let helpers_uri = Url::parse("file:///workspace/helpers.R").unwrap();
+        let main_code = "\
+f <- function(a = x) {
+  x <- 1
+  a
+}
+source(\"helpers.R\")
+";
+        let helpers_code = "x <- 42\n";
+
+        for (uri, code) in [(&main_uri, main_code), (&helpers_uri, helpers_code)] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        assert!(
+            !diagnostics.iter().any(|d| {
+                d.message.contains("is used before it's available") && d.message.contains("'x'")
+            }),
+            "The containing-body binding should satisfy the lazy default without blaming the \
+             later source. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A default that already resolves through an earlier source has independent
+    /// availability. A later source that re-exports the name must not be blamed.
+    #[test]
+    fn test_default_parameter_earlier_source_suppresses_later_source_attribution() {
+        let mut state = create_test_state();
+        state.cross_file_config.out_of_scope_severity =
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        state.cross_file_config.undefined_variable_severity = None;
+
+        let main_uri = Url::parse("file:///workspace/main.R").unwrap();
+        let first_uri = Url::parse("file:///workspace/first.R").unwrap();
+        let second_uri = Url::parse("file:///workspace/second.R").unwrap();
+        let main_code = "\
+source(\"first.R\")
+f <- function(a = x) {
+  a
+}
+source(\"second.R\")
+";
+        let helper_code = "x <- 42\n";
+
+        for (uri, code) in [
+            (&main_uri, main_code),
+            (&first_uri, helper_code),
+            (&second_uri, helper_code),
+        ] {
+            state
+                .documents
+                .insert(uri.clone(), Document::new(code, None));
+            state.cross_file_graph.update_file(
+                uri,
+                &crate::cross_file::extract_metadata(code),
+                None,
+                |_| None,
+            );
+        }
+
+        let snapshot = DiagnosticsSnapshot::build(&state, &main_uri)
+            .expect("Should build snapshot for main.R");
+        let diagnostics =
+            diagnostics_from_snapshot(&snapshot, &main_uri, &DiagCancelToken::never())
+                .expect("Should produce diagnostics");
+
+        assert!(
+            !diagnostics.iter().any(|d| {
+                d.message.contains("is used before it's available") && d.message.contains("'x'")
+            }),
+            "The earlier source already provides the default binding; the later source must not be \
+             blamed. Diagnostics: {:?}",
+            diagnostics
+                .iter()
+                .map(|d| (d.message.clone(), d.range))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// A default expression can refer to another formal parameter. If a later
@@ -62446,10 +62975,20 @@ my_func <- function(a = default_value) {
     // `(WorldState, workspace_root)` so a test can build a `DiagnosticsSnapshot`
     // and inspect the `any_nse_or_func_directives` short-circuit signal directly.
     fn cross_file_state(files: &[(&str, &str)]) -> (WorldState, Url) {
+        cross_file_state_with_limits(files, 20, 200)
+    }
+
+    fn cross_file_state_with_limits(
+        files: &[(&str, &str)],
+        max_depth: usize,
+        max_visited: usize,
+    ) -> (WorldState, Url) {
         let ws = Url::parse("file:///w/").unwrap();
         let mut state = WorldState::new();
         state.workspace_folders.push(ws.clone());
         state.workspace_scan_complete = true;
+        state.cross_file_config.max_chain_depth = max_depth;
+        state.cross_file_config.max_transitive_dependents_visited = max_visited;
         for (name, code) in files {
             let uri = ws.join(name).unwrap();
             state
@@ -62579,6 +63118,127 @@ my_func <- function(a = default_value) {
             snap_a.any_nse_or_func_directives,
             "the file carrying the directive sees it in its own neighborhood"
         );
+    }
+
+    #[test]
+    fn truncated_budget_three_snapshot_fails_closed_for_foreign_nse() {
+        let (state, ws) = cross_file_state_with_limits(
+            &[
+                ("A.R", "source(\"Q.R\")\nsource(\"D.R\")\n"),
+                ("Q.R", "nrow(undefined_var)\n"),
+                ("D.R", "# raven: nse: nrow\nsource(\"X.R\")\n"),
+                ("X.R", "x <- 1\n"),
+            ],
+            20,
+            3,
+        );
+        let q = ws.join("Q.R").unwrap();
+        let snapshot = DiagnosticsSnapshot::build(&state, &q).expect("snapshot built");
+        assert!(snapshot.cross_file_neighborhood_truncated);
+        assert!(snapshot.metadata_map.contains_key(&ws.join("D.R").unwrap()));
+        let collected = super::collect_cross_file_nse(&snapshot, &q);
+        assert!(collected.nse.is_empty() && collected.funcs.is_empty());
+
+        let messages: Vec<String> = super::diagnostics(&state, &q, &DiagCancelToken::never())
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("undefined_var")),
+            "a truncated snapshot must not apply D's foreign suppression: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn depth_truncated_snapshot_fails_closed_for_foreign_nse() {
+        let (state, ws) = cross_file_state_with_limits(
+            &[
+                ("A.R", "source(\"Q.R\")\nsource(\"D.R\")\n"),
+                ("Q.R", "nrow(undefined_var)\n"),
+                ("D.R", "# raven: nse: nrow\nsource(\"X.R\")\n"),
+                ("X.R", "x <- 1\n"),
+            ],
+            2,
+            100,
+        );
+        let q = ws.join("Q.R").unwrap();
+        let snapshot = DiagnosticsSnapshot::build(&state, &q).expect("snapshot built");
+        assert!(snapshot.cross_file_neighborhood_truncated);
+        assert!(snapshot.metadata_map.contains_key(&ws.join("D.R").unwrap()));
+
+        let messages: Vec<String> = super::diagnostics(&state, &q, &DiagCancelToken::never())
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("undefined_var")),
+            "depth truncation must fail closed for foreign suppression: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_snapshot_preserves_own_file_nse_directive() {
+        let (state, ws) = cross_file_state_with_limits(
+            &[
+                ("A.R", "source(\"Q.R\")\nsource(\"D.R\")\n"),
+                ("Q.R", "# raven: nse: nrow\nnrow(undefined_var)\n"),
+                ("D.R", "source(\"X.R\")\n"),
+                ("X.R", "x <- 1\n"),
+            ],
+            20,
+            3,
+        );
+        let q = ws.join("Q.R").unwrap();
+        let snapshot = DiagnosticsSnapshot::build(&state, &q).expect("snapshot built");
+        assert!(snapshot.cross_file_neighborhood_truncated);
+
+        let messages: Vec<String> = super::diagnostics(&state, &q, &DiagCancelToken::never())
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("undefined_var")),
+            "own-file directives remain active under truncation: {messages:?}"
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(24))]
+
+        #[test]
+        fn foreign_nse_propagation_matches_neighborhood_completeness_across_small_budgets(
+            max_visited in 1usize..=6,
+        ) {
+            let (state, ws) = cross_file_state_with_limits(
+                &[
+                    ("A.R", "source(\"Q.R\")\nsource(\"D.R\")\n"),
+                    ("Q.R", "nrow(undefined_var)\n"),
+                    ("D.R", "# raven: nse: nrow\nsource(\"X.R\")\n"),
+                    ("X.R", "x <- 1\n"),
+                ],
+                20,
+                max_visited,
+            );
+            let q = ws.join("Q.R").unwrap();
+            let snapshot = DiagnosticsSnapshot::build(&state, &q).expect("snapshot built");
+            let truncated = snapshot.cross_file_neighborhood_truncated;
+            proptest::prop_assert_eq!(truncated, max_visited < 4);
+
+            let messages: Vec<String> = super::diagnostics(&state, &q, &DiagCancelToken::never())
+                .into_iter()
+                .map(|diagnostic| diagnostic.message)
+                .collect();
+            let undefined_reported = messages
+                .iter()
+                .any(|message| message.contains("undefined_var"));
+            proptest::prop_assert_eq!(undefined_reported, truncated);
+        }
     }
 
     // B1: an NSE directive in a sourced PARENT suppresses the child call.
@@ -66974,6 +67634,146 @@ generated quantities {
         // function body is found). This tests actual behavior.
         let syms = BlockDetector::detect_jags("model <- function() { }");
         assert_eq!(syms.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod computed_source_path_navigation_tests {
+    use super::goto_definition;
+    use crate::state::{Document, WorldState};
+    use tempfile::TempDir;
+    use tower_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, Url};
+
+    struct Fixture {
+        _temp_dir: TempDir,
+        state: WorldState,
+        main_uri: Url,
+        target_uri: Url,
+    }
+
+    fn fixture(code: &str) -> Fixture {
+        let temp_dir = TempDir::new().unwrap();
+        let scripts = temp_dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        let target = scripts.join("helpers.R");
+        std::fs::write(&target, "helper <- function() 1\n").unwrap();
+        let main = temp_dir.path().join("main.R");
+        std::fs::write(&main, code).unwrap();
+
+        let workspace_uri = Url::from_file_path(temp_dir.path()).unwrap();
+        let main_uri = Url::from_file_path(main).unwrap();
+        let target_uri = Url::from_file_path(target).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_scan_complete = true;
+        state.workspace_folders.push(workspace_uri);
+        state
+            .documents
+            .insert(main_uri.clone(), Document::new(code, None));
+
+        Fixture {
+            _temp_dir: temp_dir,
+            state,
+            main_uri,
+            target_uri,
+        }
+    }
+
+    fn position_in_line(code: &str, line: u32, needle: &str) -> Position {
+        let line_text = code.lines().nth(line as usize).expect("line exists");
+        let byte = line_text.find(needle).expect("needle exists") + 1;
+        Position::new(line, line_text[..byte].encode_utf16().count() as u32)
+    }
+
+    fn scalar(result: Option<GotoDefinitionResponse>) -> Location {
+        match result {
+            Some(GotoDefinitionResponse::Scalar(location)) => location,
+            other => panic!("expected scalar definition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_file_path_navigates_from_each_literal_segment() {
+        let code = r#"source(file.path("scripts", "helpers.R"))"#;
+        let fixture = fixture(code);
+
+        for literal in ["scripts", "helpers.R"] {
+            let location = scalar(goto_definition(
+                &fixture.state,
+                &fixture.main_uri,
+                position_in_line(code, 0, literal),
+            ));
+            assert_eq!(location.uri, fixture.target_uri, "literal {literal}");
+        }
+    }
+
+    #[test]
+    fn sys_source_file_path_uses_shared_argument_matching() {
+        let code = r#"sys.source(file.path("scripts", "helpers.R"), envir = globalenv())"#;
+        let fixture = fixture(code);
+
+        for literal in ["scripts", "helpers.R"] {
+            let location = scalar(goto_definition(
+                &fixture.state,
+                &fixture.main_uri,
+                position_in_line(code, 0, literal),
+            ));
+            assert_eq!(location.uri, fixture.target_uri, "literal {literal}");
+        }
+    }
+
+    #[test]
+    fn normalize_path_literals_navigate_to_folded_target() {
+        let code = r#"source(file.path(normalizePath("scripts"), "helpers.R"))"#;
+        let fixture = fixture(code);
+
+        for literal in ["scripts", "helpers.R"] {
+            let location = scalar(goto_definition(
+                &fixture.state,
+                &fixture.main_uri,
+                position_in_line(code, 0, literal),
+            ));
+            assert_eq!(location.uri, fixture.target_uri, "literal {literal}");
+        }
+    }
+
+    #[test]
+    fn variable_segment_falls_through_to_symbol_navigation() {
+        let code =
+            "repo_root <- normalizePath(\"scripts\")\nsource(file.path(repo_root, \"helpers.R\"))";
+        let fixture = fixture(code);
+
+        let identifier_location = scalar(goto_definition(
+            &fixture.state,
+            &fixture.main_uri,
+            position_in_line(code, 1, "repo_root"),
+        ));
+        assert_eq!(identifier_location.uri, fixture.main_uri);
+        assert_eq!(identifier_location.range.start, Position::new(0, 0));
+
+        let literal_location = scalar(goto_definition(
+            &fixture.state,
+            &fixture.main_uri,
+            position_in_line(code, 1, "helpers.R"),
+        ));
+        assert_eq!(literal_location.uri, fixture.target_uri);
+    }
+
+    #[test]
+    fn nonfoldable_computed_source_path_does_not_navigate() {
+        let code = r#"source(file.path(Sys.getenv("ROOT"), "scripts", "helpers.R"))"#;
+        let fixture = fixture(code);
+
+        for literal in ["scripts", "helpers.R"] {
+            assert!(
+                goto_definition(
+                    &fixture.state,
+                    &fixture.main_uri,
+                    position_in_line(code, 0, literal),
+                )
+                .is_none(),
+                "nonfoldable expression navigated from {literal}"
+            );
+        }
     }
 }
 

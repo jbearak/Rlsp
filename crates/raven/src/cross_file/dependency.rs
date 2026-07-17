@@ -12,7 +12,7 @@ use super::parent_resolve::{infer_call_site_from_parent, resolve_match_pattern};
 use super::path_resolve::{
     PathContext, path_to_uri, resolve_path, resolve_path_with_workspace_fallback,
 };
-use super::types::{CallSiteSpec, CrossFileMetadata};
+use super::types::{CallSiteSpec, CrossFileMetadata, SourceLocality};
 
 /// Resolve the effective working directory of a parent file for inheritance,
 /// with depth tracking and cycle detection to prevent infinite chains.
@@ -433,39 +433,23 @@ pub struct DependencyEdge {
     pub call_site_line: Option<u32>,
     /// 0-based UTF-16 column in parent where call occurs
     pub call_site_column: Option<u32>,
-    /// Local/non-global `source()` semantics; also true when an explicit
-    /// `local` argument is not statically known to be `FALSE`
-    pub local: bool,
+    /// Precise source destination class. Unlike the legacy metadata `local`
+    /// boolean, this distinguishes a proven current frame from an unknown or
+    /// external environment that must not inherit ordinary parent bindings.
+    pub locality: SourceLocality,
     /// source(..., chdir=TRUE) semantics
     pub chdir: bool,
     /// True for sys.source(), false for source()
     pub is_sys_source: bool,
-    /// For a `sys.source()` edge, whether it targets the global environment
-    /// (`envir = globalenv()` or the directive default). A non-global
-    /// `sys.source` does NOT contribute its child's top-level symbols to the
-    /// caller (see `should_apply_local_scoping` / `ForwardSource::inherits_symbols`),
-    /// exactly like `local = TRUE`. It is carried on the edge — and folded into
-    /// full-edge equality below — so that toggling `globalenv()` ↔ `new.env()`
-    /// at a fixed call site counts as an edge change and bumps `edge_revision`.
-    /// Without this, the cross-snapshot standalone-scope cache (#483), whose key
-    /// includes `edge_revision`, would serve a stale isolated scope after such a
-    /// toggle (the flag is absent from `compute_interface_hash` too). Always
-    /// `true` for plain `source()` and for backward-directive edges, mirroring
-    /// the `is_sys_source = false` convention.
-    pub sys_source_global_env: bool,
     /// Whether the `source()`/`sys.source()` call is lexically inside a function
     /// body. A function-scoped call does NOT contribute its child's symbols to
     /// the caller's top-level (EOF) scope, and a function-scoped `local = TRUE`
     /// call binds the child to a non-global frame (declared-only inheritance) —
     /// see the forward gate in `scope_at_position_with_graph_recursive` and the
-    /// `is_local_scoped` decision in `parent_prefix_at`. Carried on the edge —
-    /// and folded into full-edge equality below — for the same reason as
-    /// `sys_source_global_env`: a contrived-but-real edit can flip it at a FIXED
-    /// call site (e.g. dropping an enclosing `function(){...}` wrapper on a prior
-    /// line) without changing the source's `(line, column)` or the file's
-    /// `interface_hash`, so without it on the edge such a toggle would neither
-    /// bump `edge_revision` nor be seen by the standalone-scope cache (#483) or
-    /// dependent revalidation. Always `false` for `# raven` directives.
+    /// declared-only decision in `parent_prefix_at`. Carried on the edge and
+    /// folded into full-edge equality so a fixed-call-site scope flip bumps
+    /// `edge_revision` as well as the source-aware interface hash. Always `false`
+    /// for `# raven` directives.
     pub is_function_scoped: bool,
     /// True if the edge was created from any Raven directive — forward-family
     /// (`# raven: source`/`run`/`include`) or backward-family
@@ -491,19 +475,96 @@ pub struct DependencyEdge {
     pub non_lending: bool,
 }
 
+/// Caller/callee relationship used only to find directive-vs-AST conflicts.
+///
+/// This deliberately ignores call sites and source semantics: finding a
+/// relationship merely enters conflict resolution, which then decides whether
+/// distinct invocations must both survive.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirectiveConflictIdentity {
+    from: Url,
+    to: Url,
+}
+
+/// Position component of a source invocation identity.
+///
+/// The paired options preserve the existing three states: an exact position,
+/// an explicit end-of-line position (`column == u32::MAX`), or an unknown
+/// position. Keeping the interpretation here prevents endpoint or revision
+/// projections from reimplementing call-site comparisons ad hoc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SourceCallSiteIdentity {
+    line: Option<u32>,
+    column: Option<u32>,
+}
+
+impl SourceCallSiteIdentity {
+    fn is_known_directive_call_site(self) -> bool {
+        self.line.is_some() && self.line != Some(u32::MAX)
+    }
+}
+
+/// Source behavior that can change how the child inherits or lends scope.
+///
+/// This is intentionally distinct from invocation position and directive
+/// provenance. Every field here affects source semantics and therefore belongs
+/// in graph deduplication, dependency-interface comparison, and revision
+/// invalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SourceInheritanceIdentity {
+    locality: SourceLocality,
+    chdir: bool,
+    is_sys_source: bool,
+    is_function_scoped: bool,
+}
+
+/// Semantic identity of one source invocation.
+///
+/// Multiple calls from the same parent to the same child remain distinct by
+/// call site. Backward directives remain distinct from forward invocations
+/// because their eligibility and removal rules differ.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SourceInvocationIdentity {
+    relation: DirectiveConflictIdentity,
+    call_site: SourceCallSiteIdentity,
+    inheritance: SourceInheritanceIdentity,
+    is_backward_directive: bool,
+}
+
+/// Purpose-specific key for deduplicating copies inserted into the graph.
+///
+/// Directive provenance is deliberately absent: after conflict resolution, an
+/// AST call and directive describing the same semantic invocation collapse.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GraphEdgeDedupKey(SourceInvocationIdentity);
+
+impl GraphEdgeDedupKey {
+    fn target(&self) -> &Url {
+        &self.0.relation.to
+    }
+}
+
+/// Edge projection whose changes require dependent revalidation.
+///
+/// Unlike graph deduplication, directive provenance is interface-visible for
+/// diagnostics and revalidation. Lending policy is excluded because it changes
+/// snapshot construction without adding or removing a revalidation edge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DependencyInterfaceEdgeIdentity {
+    invocation: SourceInvocationIdentity,
+    is_directive: bool,
+}
+
+/// Complete edge projection whose changes invalidate revision-gated caches.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EdgeRevisionIdentity {
+    interface: DependencyInterfaceEdgeIdentity,
+    non_lending: bool,
+}
+
 impl PartialEq for DependencyEdge {
     fn eq(&self, other: &Self) -> bool {
-        self.from == other.from
-            && self.to == other.to
-            && self.call_site_line == other.call_site_line
-            && self.call_site_column == other.call_site_column
-            && self.local == other.local
-            && self.chdir == other.chdir
-            && self.is_sys_source == other.is_sys_source
-            && self.sys_source_global_env == other.sys_source_global_env
-            && self.is_function_scoped == other.is_function_scoped
-            && self.is_directive == other.is_directive
-            && self.is_backward_directive == other.is_backward_directive
+        self.dependency_interface_identity() == other.dependency_interface_identity()
     }
 }
 
@@ -511,76 +572,60 @@ impl Eq for DependencyEdge {}
 
 impl Hash for DependencyEdge {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.from.hash(state);
-        self.to.hash(state);
-        self.call_site_line.hash(state);
-        self.call_site_column.hash(state);
-        self.local.hash(state);
-        self.chdir.hash(state);
-        self.is_sys_source.hash(state);
-        self.sys_source_global_env.hash(state);
-        self.is_function_scoped.hash(state);
-        self.is_directive.hash(state);
-        self.is_backward_directive.hash(state);
+        self.dependency_interface_identity().hash(state);
     }
 }
 
-/// Canonical key for edge deduplication (from, to pair only)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FromToPair {
-    from: Url,
-    to: Url,
-}
-
-/// Full edge key for deduplication including call site
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct EdgeKey {
-    from: Url,
-    to: Url,
-    call_site_line: Option<u32>,
-    call_site_column: Option<u32>,
-    local: bool,
-    chdir: bool,
-    is_sys_source: bool,
-    sys_source_global_env: bool,
-    is_function_scoped: bool,
-    is_backward_directive: bool,
-}
-
-/// Full edge key plus lending policy, used only for revision invalidation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct EdgePolicyKey {
-    key: EdgeKey,
-    non_lending: bool,
-}
-
 impl DependencyEdge {
-    fn key(&self) -> EdgeKey {
-        EdgeKey {
+    /// Whether the child may inherit only declarations, not ordinary bindings,
+    /// from this parent edge.
+    pub(crate) fn uses_declared_only_parent_inheritance(&self) -> bool {
+        matches!(self.locality, SourceLocality::NonInheriting)
+    }
+
+    fn directive_conflict_identity(&self) -> DirectiveConflictIdentity {
+        DirectiveConflictIdentity {
             from: self.from.clone(),
             to: self.to.clone(),
-            call_site_line: self.call_site_line,
-            call_site_column: self.call_site_column,
-            local: self.local,
-            chdir: self.chdir,
-            is_sys_source: self.is_sys_source,
-            sys_source_global_env: self.sys_source_global_env,
-            is_function_scoped: self.is_function_scoped,
+        }
+    }
+
+    fn call_site_identity(&self) -> SourceCallSiteIdentity {
+        SourceCallSiteIdentity {
+            line: self.call_site_line,
+            column: self.call_site_column,
+        }
+    }
+
+    fn source_invocation_identity(&self) -> SourceInvocationIdentity {
+        SourceInvocationIdentity {
+            relation: self.directive_conflict_identity(),
+            call_site: self.call_site_identity(),
+            inheritance: SourceInheritanceIdentity {
+                locality: self.locality,
+                chdir: self.chdir,
+                is_sys_source: self.is_sys_source,
+                is_function_scoped: self.is_function_scoped,
+            },
             is_backward_directive: self.is_backward_directive,
         }
     }
 
-    fn policy_key(&self) -> EdgePolicyKey {
-        EdgePolicyKey {
-            key: self.key(),
-            non_lending: self.non_lending,
+    fn graph_dedup_key(&self) -> GraphEdgeDedupKey {
+        GraphEdgeDedupKey(self.source_invocation_identity())
+    }
+
+    fn dependency_interface_identity(&self) -> DependencyInterfaceEdgeIdentity {
+        DependencyInterfaceEdgeIdentity {
+            invocation: self.source_invocation_identity(),
+            is_directive: self.is_directive,
         }
     }
 
-    fn as_from_to_pair(&self) -> FromToPair {
-        FromToPair {
-            from: self.from.clone(),
-            to: self.to.clone(),
+    fn revision_identity(&self) -> EdgeRevisionIdentity {
+        EdgeRevisionIdentity {
+            interface: self.dependency_interface_identity(),
+            non_lending: self.non_lending,
         }
     }
 }
@@ -605,14 +650,33 @@ pub struct UpdateResult {
     pub edges_changed: bool,
 }
 
-/// Cached `(neighborhood, subgraph)` payload for a `(root, depth, visited)`
-/// query. Wrapped in `Arc` so cache reads are refcount bumps; the inner
-/// `subgraph` is also held as `Arc` so consumers (e.g. `DiagnosticsSnapshot`)
-/// can keep a refcount-bumped reference instead of cloning the trimmed
-/// graph per snapshot.
+/// Which bound, if any, prevented a neighborhood query from visiting every
+/// reachable node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NeighborhoodTruncation {
+    /// At least one edge led beyond `max_depth`.
+    pub depth: bool,
+    /// At least one otherwise-unvisited neighbor was omitted at `max_visited`.
+    pub visited: bool,
+}
+
+impl NeighborhoodTruncation {
+    /// Whether either traversal bound truncated the neighborhood.
+    pub fn is_truncated(self) -> bool {
+        self.depth || self.visited
+    }
+}
+
+/// Cached `(neighborhood, subgraph, truncation)` payload for a
+/// `(root, depth, visited)` query. Wrapped in `Arc` so cache reads are refcount
+/// bumps; the inner `subgraph` is also held as `Arc` so consumers (e.g.
+/// `DiagnosticsSnapshot`) can keep a refcount-bumped reference instead of
+/// cloning the trimmed graph per snapshot.
 pub struct NeighborhoodSubgraph {
     pub neighborhood: HashSet<Url>,
     pub subgraph: std::sync::Arc<DependencyGraph>,
+    /// Authoritative status from the bounded walk that produced `neighborhood`.
+    pub truncation: NeighborhoodTruncation,
 }
 
 /// Cap for the per-`DependencyGraph` cycle/subgraph caches. Sized to match
@@ -828,47 +892,55 @@ impl DependencyGraph {
             path_to_uri(&resolved)
         };
 
-        // Snapshot forward edges (full DependencyEdge, not just .to URIs).
-        // The cached subgraph in `subgraph_cache` holds full edge values
-        // (call_site_line/column, flags, …) which diagnostics use for cycle
-        // and source positioning, so a metadata-only change (e.g. moving
-        // the source() call to a different line) must invalidate the cache
-        // even when the target URI set is unchanged. `edges_changed` and
-        // `edge_revision` then both track full-edge equality.
-        let old_forward: HashSet<DependencyEdge> = self
+        // Snapshot both purpose-specific edge projections. Dependency-interface
+        // identity drives dependent revalidation; revision identity additionally
+        // includes lending policy for cache invalidation. Both include call-site
+        // and source semantics, so metadata-only changes still invalidate the
+        // appropriate consumers when the target URI set is unchanged.
+        let old_forward_interface: HashSet<DependencyInterfaceEdgeIdentity> = self
             .forward
             .get(uri)
-            .map(|edges| edges.iter().cloned().collect())
+            .map(|edges| {
+                edges
+                    .iter()
+                    .map(DependencyEdge::dependency_interface_identity)
+                    .collect()
+            })
             .unwrap_or_default();
-        let old_forward_policy: HashSet<EdgePolicyKey> = self
+        let old_forward_revision: HashSet<EdgeRevisionIdentity> = self
             .forward
             .get(uri)
-            .map(|edges| edges.iter().map(DependencyEdge::policy_key).collect())
+            .map(|edges| {
+                edges
+                    .iter()
+                    .map(DependencyEdge::revision_identity)
+                    .collect()
+            })
             .unwrap_or_default();
         // Snapshot backward edges (incoming `is_backward_directive` edges)
         // before removal: a `# raven: sourced-by` directive change rewires the
         // backward map for `uri` and the forward map for each parent, but
         // leaves `forward[uri]` (this file's outgoing edges) untouched.
-        // Same full-edge equality applies here.
-        let old_backward: HashSet<DependencyEdge> = self
+        // The same interface/revision projections apply here.
+        let old_backward_interface: HashSet<DependencyInterfaceEdgeIdentity> = self
             .backward
             .get(uri)
             .map(|edges| {
                 edges
                     .iter()
                     .filter(|e| e.is_backward_directive)
-                    .cloned()
+                    .map(DependencyEdge::dependency_interface_identity)
                     .collect()
             })
             .unwrap_or_default();
-        let old_backward_policy: HashSet<EdgePolicyKey> = self
+        let old_backward_revision: HashSet<EdgeRevisionIdentity> = self
             .backward
             .get(uri)
             .map(|edges| {
                 edges
                     .iter()
                     .filter(|e| e.is_backward_directive)
-                    .map(DependencyEdge::policy_key)
+                    .map(DependencyEdge::revision_identity)
                     .collect()
             })
             .unwrap_or_default();
@@ -884,7 +956,7 @@ impl DependencyGraph {
 
         // Collect directive edges first (they are authoritative)
         let mut directive_edges: Vec<DependencyEdge> = Vec::new();
-        let mut directive_from_to: HashSet<FromToPair> = HashSet::new();
+        let mut directive_from_to: HashSet<DirectiveConflictIdentity> = HashSet::new();
 
         // Process forward directive sources (`# raven: source`, `# raven: run`, `# raven: include`)
         // Uses do_resolve which includes `# raven: cd` working directory in path resolution.
@@ -901,16 +973,15 @@ impl DependencyGraph {
                             to: to_uri.clone(),
                             call_site_line: Some(source.line),
                             call_site_column: Some(source.column),
-                            local: source.local,
+                            locality: source.locality,
                             chdir: source.chdir,
                             is_sys_source: source.is_sys_source,
-                            sys_source_global_env: source.sys_source_global_env,
                             is_function_scoped: source.is_function_scoped,
                             is_directive: true,
                             is_backward_directive: false,
                             non_lending: false,
                         };
-                        directive_from_to.insert(edge.as_from_to_pair());
+                        directive_from_to.insert(edge.directive_conflict_identity());
                         directive_edges.push(edge);
                     }
                     None => {
@@ -975,16 +1046,15 @@ impl DependencyGraph {
                     to: uri.clone(),
                     call_site_line,
                     call_site_column,
-                    local: false,
+                    locality: SourceLocality::Global,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     is_function_scoped: false,
                     is_directive: true,
                     is_backward_directive: true,
                     non_lending: false,
                 };
-                let pair = edge.as_from_to_pair();
+                let pair = edge.directive_conflict_identity();
                 if !directive_from_to.contains(&pair) {
                     directive_from_to.insert(pair);
                     directive_edges.push(edge);
@@ -1007,35 +1077,31 @@ impl DependencyGraph {
                     to: to_uri.clone(),
                     call_site_line: Some(source.line),
                     call_site_column: Some(source.column),
-                    local: source.local,
+                    locality: source.locality,
                     chdir: source.chdir,
                     is_sys_source: source.is_sys_source,
-                    sys_source_global_env: source.sys_source_global_env,
                     is_function_scoped: source.is_function_scoped,
                     is_directive: false,
                     is_backward_directive: false,
                     non_lending: false,
                 };
-                let pair = edge.as_from_to_pair();
+                let pair = edge.directive_conflict_identity();
 
                 // Check for directive-vs-AST conflict
                 if directive_from_to.contains(&pair) {
                     // Find the directive edge for this (from, to) pair
-                    let directive_edge =
-                        directive_edges.iter().find(|e| e.as_from_to_pair() == pair);
+                    let directive_edge = directive_edges
+                        .iter()
+                        .find(|e| e.directive_conflict_identity() == pair);
 
                     if let Some(dir_edge) = directive_edge {
                         // Check if directive has a known call site
-                        let directive_has_call_site = dir_edge.call_site_line.is_some()
-                            && dir_edge.call_site_line != Some(u32::MAX);
+                        let directive_call_site = dir_edge.call_site_identity();
 
-                        if directive_has_call_site {
+                        if directive_call_site.is_known_directive_call_site() {
                             // Directive has known call site: only override AST edge at same call site
                             // (Requirement 4.3)
-                            let call_sites_match = dir_edge.call_site_line == edge.call_site_line
-                                && dir_edge.call_site_column == edge.call_site_column;
-
-                            if call_sites_match {
+                            if directive_call_site == edge.call_site_identity() {
                                 // Case 1: Same call site - directive wins, skip AST edge
                                 // (Requirement 4.3)
                                 continue;
@@ -1092,9 +1158,7 @@ impl DependencyGraph {
         // Deduplicate and add all edges
         let mut seen_keys = HashSet::new();
         for edge in directive_edges.into_iter().chain(ast_edges) {
-            let key = edge.key();
-            if !seen_keys.contains(&key) {
-                seen_keys.insert(key);
+            if seen_keys.insert(edge.graph_dedup_key()) {
                 self.add_edge(edge);
             }
         }
@@ -1104,51 +1168,62 @@ impl DependencyGraph {
         // `forward[uri]`, but they DO change the dependency graph that
         // `collect_neighborhood` and `detect_cycle` traverse — so the caches
         // keyed on `edge_revision` must be invalidated for those too. We
-        // compare full DependencyEdge values (not just URIs), so a
-        // metadata-only change (e.g. moved call site) also bumps the
-        // revision and refreshes diagnostic positioning.
-        let new_forward: HashSet<DependencyEdge> = self
+        // compare dependency-interface identities (not just URIs), so a
+        // metadata-only change (e.g. moved call site) also requests dependent
+        // revalidation and refreshes diagnostic positioning.
+        let new_forward_interface: HashSet<DependencyInterfaceEdgeIdentity> = self
             .forward
             .get(uri)
-            .map(|edges| edges.iter().cloned().collect())
+            .map(|edges| {
+                edges
+                    .iter()
+                    .map(DependencyEdge::dependency_interface_identity)
+                    .collect()
+            })
             .unwrap_or_default();
-        let new_forward_policy: HashSet<EdgePolicyKey> = self
+        let new_forward_revision: HashSet<EdgeRevisionIdentity> = self
             .forward
             .get(uri)
-            .map(|edges| edges.iter().map(DependencyEdge::policy_key).collect())
+            .map(|edges| {
+                edges
+                    .iter()
+                    .map(DependencyEdge::revision_identity)
+                    .collect()
+            })
             .unwrap_or_default();
-        let new_backward: HashSet<DependencyEdge> = self
+        let new_backward_interface: HashSet<DependencyInterfaceEdgeIdentity> = self
             .backward
             .get(uri)
             .map(|edges| {
                 edges
                     .iter()
                     .filter(|e| e.is_backward_directive)
-                    .cloned()
+                    .map(DependencyEdge::dependency_interface_identity)
                     .collect()
             })
             .unwrap_or_default();
-        let new_backward_policy: HashSet<EdgePolicyKey> = self
+        let new_backward_revision: HashSet<EdgeRevisionIdentity> = self
             .backward
             .get(uri)
             .map(|edges| {
                 edges
                     .iter()
                     .filter(|e| e.is_backward_directive)
-                    .map(DependencyEdge::policy_key)
+                    .map(DependencyEdge::revision_identity)
                     .collect()
             })
             .unwrap_or_default();
-        result.edges_changed = old_forward != new_forward || old_backward != new_backward;
-        let lending_policy_changed =
-            old_forward_policy != new_forward_policy || old_backward_policy != new_backward_policy;
+        result.edges_changed = old_forward_interface != new_forward_interface
+            || old_backward_interface != new_backward_interface;
+        let revision_identity_changed = old_forward_revision != new_forward_revision
+            || old_backward_revision != new_backward_revision;
 
         // Bump edge_revision so cycle/subgraph caches become stale for every
         // URI. detect_cycle and cached_neighborhood_subgraph then either
         // re-fill their slot or evict via the revision-mismatch check. A
         // non_lending flip invalidates those caches too, but deliberately does
         // not set `edges_changed`: lending policy is not a revalidation edge.
-        if result.edges_changed || lending_policy_changed {
+        if result.edges_changed || revision_identity_changed {
             self.edge_revision
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
@@ -1256,24 +1331,17 @@ impl DependencyGraph {
                 edge.from,
                 edge.to
             );
-            // Remove from forward index
+            let dedup_key = edge.graph_dedup_key();
+            // Remove the same semantic invocation from the forward index.
             if let Some(forward_edges) = self.forward.get_mut(&edge.from) {
-                forward_edges.retain(|e| {
-                    !(e.to == edge.to
-                        && e.is_backward_directive
-                        && e.call_site_line == edge.call_site_line)
-                });
+                forward_edges.retain(|candidate| candidate.graph_dedup_key() != dedup_key);
                 if forward_edges.is_empty() {
                     self.forward.remove(&edge.from);
                 }
             }
-            // Remove from backward index
+            // Remove the same semantic invocation from the backward index.
             if let Some(backward_edges) = self.backward.get_mut(child_uri) {
-                backward_edges.retain(|e| {
-                    !(e.from == edge.from
-                        && e.is_backward_directive
-                        && e.call_site_line == edge.call_site_line)
-                });
+                backward_edges.retain(|candidate| candidate.graph_dedup_key() != dedup_key);
                 if backward_edges.is_empty() {
                     self.backward.remove(child_uri);
                 }
@@ -1488,12 +1556,15 @@ impl DependencyGraph {
     /// depends on inputs this helper does not encode: both callers passing
     /// matching `max_depth` / `max_visited` budgets, and the deliberate graph
     /// asymmetry (collection over the trimmed subgraph, revalidation over the
-    /// full graph). That asymmetry is intentional and **safe-direction**:
-    /// `S_trimmed ⊆ S_full`, so collection can only ever *omit* a foreign
-    /// suppression (leaving a real diagnostic in place — a false positive at
-    /// worst), never fabricate one or drop a needed revalidation. Under budget
-    /// truncation the two graphs can reach different sets — the same safe
-    /// direction. `extract_subgraph` also drops `non_lending` edges from its
+    /// full graph). For an UNTRUNCATED neighborhood that asymmetry is intentional
+    /// and **safe-direction**: `S_trimmed ⊆ S_full`, so collection can only ever
+    /// *omit* a foreign suppression (leaving a real diagnostic in place — a false
+    /// positive at worst), never fabricate one or drop a needed revalidation.
+    /// Budget truncation does not preserve the per-member directed inverse:
+    /// different roots can spend the same budget in different orders. Therefore
+    /// the diagnostics snapshot carries the neighborhood walk's authoritative
+    /// truncation status and foreign NSE/func collection fails closed whenever
+    /// either limit was hit. `extract_subgraph` also drops `non_lending` edges from its
     /// backward index (while the full graph keeps them for revalidation), which
     /// is the same safe-direction asymmetry: excluded open buffers can be
     /// rescheduled when their helpers change, but cannot lend declarations or
@@ -1590,13 +1661,13 @@ impl DependencyGraph {
 
     fn add_edge(&mut self, edge: DependencyEdge) {
         log::trace!(
-            "Adding edge: {} -> {} at line {:?}, column {:?} (directive: {}, local: {}, chdir: {})",
+            "Adding edge: {} -> {} at line {:?}, column {:?} (directive: {}, locality: {:?}, chdir: {})",
             edge.from,
             edge.to,
             edge.call_site_line,
             edge.call_site_column,
             edge.is_directive,
-            edge.local,
+            edge.locality,
             edge.chdir
         );
 
@@ -1737,7 +1808,7 @@ impl DependencyGraph {
             changed = true;
         }
 
-        let outgoing: Vec<(Url, EdgeKey)> = self
+        let outgoing: Vec<GraphEdgeDedupKey> = self
             .forward
             .get_mut(uri)
             .map(|edges| {
@@ -1748,16 +1819,17 @@ impl DependencyGraph {
                             edge.non_lending = true;
                             changed = true;
                         }
-                        (edge.to.clone(), edge.key())
+                        edge.graph_dedup_key()
                     })
                     .collect()
             })
             .unwrap_or_default();
 
-        for (to, key) in outgoing {
+        for key in outgoing {
+            let to = key.target().clone();
             if let Some(backward_edges) = self.backward.get_mut(&to) {
                 for candidate in backward_edges {
-                    if candidate.key() == key && !candidate.non_lending {
+                    if candidate.graph_dedup_key() == key && !candidate.non_lending {
                         candidate.non_lending = true;
                         changed = true;
                     }
@@ -1787,7 +1859,24 @@ impl DependencyGraph {
         max_depth: usize,
         max_visited: usize,
     ) -> HashSet<Url> {
-        self.collect_neighborhood_multi(std::iter::once(uri.clone()), max_depth, max_visited)
+        self.collect_neighborhood_with_truncation(uri, max_depth, max_visited)
+            .0
+    }
+
+    /// Single-seed neighborhood walk with authoritative per-query truncation
+    /// status. Unlike the graph-wide counters, this result can safely govern a
+    /// specific diagnostic snapshot.
+    fn collect_neighborhood_with_truncation(
+        &self,
+        uri: &Url,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> (HashSet<Url>, NeighborhoodTruncation) {
+        self.collect_neighborhood_multi_with_truncation(
+            std::iter::once(uri.clone()),
+            max_depth,
+            max_visited,
+        )
     }
 
     /// Multi-seed neighborhood walk: a single BFS from all seeds sharing one
@@ -1800,55 +1889,70 @@ impl DependencyGraph {
         max_depth: usize,
         max_visited: usize,
     ) -> HashSet<Url> {
+        self.collect_neighborhood_multi_with_truncation(seeds, max_depth, max_visited)
+            .0
+    }
+
+    fn collect_neighborhood_multi_with_truncation(
+        &self,
+        seeds: impl IntoIterator<Item = Url>,
+        max_depth: usize,
+        max_visited: usize,
+    ) -> (HashSet<Url>, NeighborhoodTruncation) {
         let mut visited = HashSet::new();
         let mut queue = std::collections::VecDeque::new();
+        let mut truncation = NeighborhoodTruncation::default();
         for seed in seeds {
-            if visited.insert(seed.clone()) {
-                queue.push_back((seed, 0usize));
+            if visited.contains(&seed) {
+                continue;
             }
+            if visited.len() >= max_visited {
+                truncation.visited = true;
+                continue;
+            }
+            visited.insert(seed.clone());
+            queue.push_back((seed, 0usize));
         }
 
         while let Some((current, depth)) = queue.pop_front() {
             if depth >= max_depth {
-                if self.has_unvisited_neighbors(&current, &visited) {
-                    self.record_depth_truncation();
-                }
-                continue;
-            }
-            if visited.len() >= max_visited {
-                if self.has_unvisited_neighbors(&current, &visited) {
-                    self.record_visited_budget_truncation();
-                }
+                truncation.depth |= self.has_unvisited_neighbors(&current, &visited);
                 continue;
             }
             if let Some(edges) = self.forward.get(&current) {
                 for edge in edges {
+                    if visited.contains(&edge.to) {
+                        continue;
+                    }
                     if visited.len() >= max_visited {
-                        if !visited.contains(&edge.to) {
-                            self.record_visited_budget_truncation();
-                        }
-                        break;
+                        truncation.visited = true;
+                        continue;
                     }
-                    if visited.insert(edge.to.clone()) {
-                        queue.push_back((edge.to.clone(), depth + 1));
-                    }
+                    visited.insert(edge.to.clone());
+                    queue.push_back((edge.to.clone(), depth + 1));
                 }
             }
             if let Some(edges) = self.backward.get(&current) {
                 for edge in edges {
+                    if visited.contains(&edge.from) {
+                        continue;
+                    }
                     if visited.len() >= max_visited {
-                        if !visited.contains(&edge.from) {
-                            self.record_visited_budget_truncation();
-                        }
-                        break;
+                        truncation.visited = true;
+                        continue;
                     }
-                    if visited.insert(edge.from.clone()) {
-                        queue.push_back((edge.from.clone(), depth + 1));
-                    }
+                    visited.insert(edge.from.clone());
+                    queue.push_back((edge.from.clone(), depth + 1));
                 }
             }
         }
-        visited
+        if truncation.depth {
+            self.record_depth_truncation();
+        }
+        if truncation.visited {
+            self.record_visited_budget_truncation();
+        }
+        (visited, truncation)
     }
 
     /// Truncation gate for issue #479's cross-prefix forward-child memo sharing
@@ -1861,10 +1965,10 @@ impl DependencyGraph {
     /// shared across queries" discipline). Within one stream there are exactly
     /// two such varying inputs, handled by two independent mechanisms:
     ///
-    /// 1. **`query_inside_function` (local scoping).** `source(..., local =
-    ///    TRUE)` / `sys.source(...)` apply a `query_inside_function`-dependent
-    ///    declared-only inheritance policy (`is_local_scoped`,
-    ///    `should_apply_local_scoping`) that the memo key omits. This is handled
+    /// 1. **`query_inside_function` (local scoping).** Current-frame and
+    ///    non-inheriting source destinations can apply a
+    ///    `query_inside_function`-dependent declared-only inheritance policy
+    ///    that the memo key omits. This is handled
     ///    by **slot isolation** in `ScopeStream`: the `query_inside_function =
     ///    true` (hoisted, inside-a-function) prefix slot gets its OWN fresh memo,
     ///    so only the mutually-consistent `false`-context computations (the
@@ -2091,11 +2195,13 @@ impl DependencyGraph {
             return std::sync::Arc::clone(cached);
         }
 
-        let neighborhood = self.collect_neighborhood(uri, max_depth, max_visited);
+        let (neighborhood, truncation) =
+            self.collect_neighborhood_with_truncation(uri, max_depth, max_visited);
         let subgraph = std::sync::Arc::new(self.extract_subgraph(&neighborhood));
         let payload = std::sync::Arc::new(NeighborhoodSubgraph {
             neighborhood,
             subgraph,
+            truncation,
         });
 
         if let Ok(mut guard) = self.subgraph_cache.write() {
@@ -2180,8 +2286,12 @@ impl DependencyGraph {
                         if edge.is_directive {
                             f.push("directive");
                         }
-                        if edge.local {
-                            f.push("local");
+                        if edge.locality != SourceLocality::Global {
+                            f.push(match edge.locality {
+                                SourceLocality::Global => unreachable!(),
+                                SourceLocality::CurrentFrame => "local",
+                                SourceLocality::NonInheriting => "non-inheriting",
+                            });
                         }
                         if edge.chdir {
                             f.push("chdir");
@@ -2276,10 +2386,8 @@ mod tests {
             line,
             column: 0,
             is_directive: false,
-            local: false,
             chdir: false,
             is_sys_source: false,
-            sys_source_global_env: true,
             ..Default::default()
         }
     }
@@ -2292,15 +2400,13 @@ mod tests {
     }
 
     /// Regression (WI2b cache soundness, confirmed by Codex): a `source()` /
-    /// `sys.source()` call's `sys_source_global_env` and `is_function_scoped`
-    /// flags change whether/how it contributes symbols, yet an edit can flip
-    /// either at a FIXED `(line, column)` — e.g. `envir = globalenv()` →
-    /// `new.env()`, or dropping an enclosing `function(){}` wrapper on a prior
-    /// line. Both flags are carried on `DependencyEdge` and folded into
-    /// full-edge equality, so such a flip is an edge change that bumps
-    /// `edge_revision`; the standalone-scope cache key (#483) and dependent
-    /// revalidation both depend on it. Without the fields, the flipped edges
-    /// would compare equal and `edge_revision` would not move.
+    /// `sys.source()` call's destination locality and `is_function_scoped` flag
+    /// change whether/how it contributes symbols, yet an edit can flip either at
+    /// a FIXED `(line, column)` — e.g. `envir = globalenv()` → `new.env()`, or
+    /// dropping an enclosing `function(){}` wrapper on a prior line. Both are in
+    /// source invocation identity, so such a flip changes the dependency
+    /// interface and bumps `edge_revision`; the standalone-scope cache key (#483)
+    /// and dependent revalidation both depend on it.
     #[test]
     fn edge_revision_bumps_on_source_semantics_flip_at_fixed_position() {
         use super::super::types::ForwardSource;
@@ -2311,10 +2417,13 @@ mod tests {
                     line: 1,
                     column: 0,
                     is_directive: false,
-                    local: false,
+                    locality: if sys_global {
+                        SourceLocality::Global
+                    } else {
+                        SourceLocality::NonInheriting
+                    },
                     chdir: false,
                     is_sys_source: true,
-                    sys_source_global_env: sys_global,
                     is_function_scoped: func_scoped,
                     ..Default::default()
                 }],
@@ -2330,7 +2439,7 @@ mod tests {
         );
         let rev0 = graph.edge_revision();
 
-        // Flip ONLY sys_source_global_env (same line/col/path/other flags).
+        // Flip ONLY the sys.source destination locality (same line/col/path/other flags).
         graph.update_file(
             &url("A.R"),
             &meta(false, false),
@@ -2340,7 +2449,7 @@ mod tests {
         let rev1 = graph.edge_revision();
         assert!(
             rev1 > rev0,
-            "flipping sys_source_global_env at a fixed call site must bump edge_revision"
+            "flipping sys.source locality at a fixed call site must bump edge_revision"
         );
 
         // Flip ONLY is_function_scoped.
@@ -2355,6 +2464,88 @@ mod tests {
             rev2 > rev1,
             "flipping is_function_scoped at a fixed call site must bump edge_revision"
         );
+    }
+
+    #[test]
+    fn locality_survives_graph_insertion_trim_and_revision_flip() {
+        use super::super::types::{ForwardSource, SourceLocality};
+
+        let meta = |locality| CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "B.R".to_string(),
+                line: 1,
+                column: 0,
+                locality,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &url("A.R"),
+            &meta(SourceLocality::CurrentFrame),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        let edge = &graph.get_dependencies(&url("A.R"))[0];
+        assert_eq!(edge.locality, SourceLocality::CurrentFrame);
+        assert!(!edge.uses_declared_only_parent_inheritance());
+
+        let trimmed = graph.extract_subgraph(&HashSet::from([url("A.R"), url("B.R")]));
+        assert_eq!(
+            trimmed.get_dependencies(&url("A.R"))[0].locality,
+            SourceLocality::CurrentFrame
+        );
+
+        let revision = graph.edge_revision();
+        let update = graph.update_file(
+            &url("A.R"),
+            &meta(SourceLocality::NonInheriting),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        assert!(update.edges_changed);
+        assert!(graph.edge_revision() > revision);
+        let edge = &graph.get_dependencies(&url("A.R"))[0];
+        assert_eq!(edge.locality, SourceLocality::NonInheriting);
+        assert!(edge.uses_declared_only_parent_inheritance());
+    }
+
+    #[test]
+    fn declared_only_parent_inheritance_depends_only_on_non_inheriting_locality() {
+        use super::super::types::{ForwardSource, SourceLocality};
+
+        let meta = |locality| CrossFileMetadata {
+            sources: vec![ForwardSource {
+                path: "B.R".to_string(),
+                line: 1,
+                column: 0,
+                locality,
+                is_function_scoped: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut graph = DependencyGraph::new();
+
+        for (locality, expected) in [
+            (SourceLocality::Global, false),
+            (SourceLocality::CurrentFrame, false),
+            (SourceLocality::NonInheriting, true),
+        ] {
+            graph.update_file(
+                &url("A.R"),
+                &meta(locality),
+                Some(&workspace_root()),
+                |_| None,
+            );
+            assert_eq!(
+                graph.get_dependencies(&url("A.R"))[0].uses_declared_only_parent_inheritance(),
+                expected,
+                "unexpected declared-only policy for {locality:?}"
+            );
+        }
     }
 
     /// Issue #479: the truncation gate admits a shallow acyclic neighborhood.
@@ -2423,7 +2614,7 @@ mod tests {
     fn prefix_memo_share_safe_ignores_local_edges() {
         let mut graph = DependencyGraph::new();
         let mut meta = make_meta_with_source("B.R", 1);
-        meta.sources[0].local = true;
+        meta.sources[0].locality = SourceLocality::CurrentFrame;
         graph.update_file(&url("A.R"), &meta, Some(&workspace_root()), |_| None);
         assert!(graph.prefix_memo_share_safe(&url("A.R"), 64, 200_000));
     }
@@ -2770,10 +2961,8 @@ mod tests {
                     line: 5,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -2781,10 +2970,8 @@ mod tests {
                     line: 5,
                     column: 0,
                     is_directive: true, // Different is_directive, but same key
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -3613,10 +3800,8 @@ mod tests {
                     line: 5,
                     column: 0,
                     is_directive: true, // Directive at line 5
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -3624,10 +3809,8 @@ mod tests {
                     line: 10,
                     column: 0,
                     is_directive: false, // AST at line 10
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -3665,10 +3848,8 @@ mod tests {
                 line: 10,
                 column: 0,
                 is_directive: false, // AST at line 10
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -3699,10 +3880,8 @@ mod tests {
                     line: 5,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -3710,10 +3889,8 @@ mod tests {
                     line: 5,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -3746,10 +3923,8 @@ mod tests {
                     line: 5,
                     column: 0,
                     is_directive: true,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -3757,10 +3932,8 @@ mod tests {
                     line: 10,
                     column: 0,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -3793,10 +3966,8 @@ mod tests {
                 line: 5,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -3828,10 +3999,8 @@ mod tests {
                 line: 5,
                 column: 0,
                 is_directive: false, // AST-detected, not directive
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -3868,10 +4037,8 @@ mod tests {
                 line: 5,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -3987,10 +4154,8 @@ z <- 3
                     line: 5,
                     column: 10,
                     is_directive: false,
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 super::super::types::ForwardSource {
@@ -3998,10 +4163,9 @@ z <- 3
                     line: 10,
                     column: 5,
                     is_directive: true,
-                    local: true,
+                    locality: SourceLocality::CurrentFrame,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -4684,10 +4848,8 @@ z <- 3
                     line: 5,
                     column: 0,
                     is_directive: true, // Directive
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -4695,10 +4857,8 @@ z <- 3
                     line: 5,
                     column: 0,
                     is_directive: false, // AST
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -4746,10 +4906,8 @@ z <- 3
                     line: 5,
                     column: 0,
                     is_directive: true, // Directive at line 5
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -4757,10 +4915,8 @@ z <- 3
                     line: 10,
                     column: 0,
                     is_directive: false, // AST at line 10
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -4808,10 +4964,8 @@ z <- 3
                     line: 5,
                     column: 0,
                     is_directive: false, // AST at line 5 (earlier)
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -4819,10 +4973,8 @@ z <- 3
                     line: 10,
                     column: 0,
                     is_directive: true, // Directive at line 10 (later)
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -4867,10 +5019,8 @@ z <- 3
                     line: 5,
                     column: 0,
                     is_directive: true, // Directive at line 5 (earlier)
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
                 ForwardSource {
@@ -4878,10 +5028,8 @@ z <- 3
                     line: 10,
                     column: 0,
                     is_directive: false, // AST at line 10 (later)
-                    local: false,
                     chdir: false,
                     is_sys_source: false,
-                    sys_source_global_env: true,
                     ..Default::default()
                 },
             ],
@@ -4922,10 +5070,8 @@ z <- 3
                 line: 5,
                 column: 0,
                 is_directive: true,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -4946,6 +5092,79 @@ z <- 3
     }
 
     #[test]
+    fn purpose_specific_edge_identities_do_not_collapse_distinct_projections() {
+        let base = DependencyEdge {
+            from: url("parent.R"),
+            to: url("child.R"),
+            call_site_line: Some(3),
+            call_site_column: Some(7),
+            locality: SourceLocality::Global,
+            chdir: false,
+            is_sys_source: false,
+            is_function_scoped: false,
+            is_directive: false,
+            is_backward_directive: false,
+            non_lending: false,
+        };
+
+        let mut other_call_site = base.clone();
+        other_call_site.call_site_line = Some(4);
+        assert_eq!(
+            base.directive_conflict_identity(),
+            other_call_site.directive_conflict_identity(),
+            "relationship conflict detection intentionally ignores call sites"
+        );
+        assert_ne!(
+            base.graph_dedup_key(),
+            other_call_site.graph_dedup_key(),
+            "multiple same-parent call sites must remain distinct invocations"
+        );
+
+        let mut directive = base.clone();
+        directive.is_directive = true;
+        assert_eq!(
+            base.graph_dedup_key(),
+            directive.graph_dedup_key(),
+            "directive provenance must not defeat graph deduplication"
+        );
+        assert_ne!(
+            base.dependency_interface_identity(),
+            directive.dependency_interface_identity(),
+            "directive provenance remains dependency-interface-visible"
+        );
+
+        let mut non_lending = base.clone();
+        non_lending.non_lending = true;
+        assert_eq!(
+            base.dependency_interface_identity(),
+            non_lending.dependency_interface_identity(),
+            "lending policy is not a revalidation edge"
+        );
+        assert_ne!(
+            base.revision_identity(),
+            non_lending.revision_identity(),
+            "lending policy must invalidate revision-gated caches"
+        );
+
+        let mut backward = base.clone();
+        backward.is_directive = true;
+        backward.is_backward_directive = true;
+        assert_ne!(
+            base.graph_dedup_key(),
+            backward.graph_dedup_key(),
+            "backward-directive eligibility must remain part of graph identity"
+        );
+
+        let mut different_locality = base.clone();
+        different_locality.locality = SourceLocality::CurrentFrame;
+        assert_ne!(
+            base.source_invocation_identity(),
+            different_locality.source_invocation_identity(),
+            "inheritance semantics must remain part of invocation identity"
+        );
+    }
+
+    #[test]
     fn non_lending_marker_does_not_participate_in_edge_identity() {
         let mut graph = DependencyGraph::new();
         let excluded = url("excluded.R");
@@ -4957,13 +5176,21 @@ z <- 3
             |_| None,
         );
 
-        let before: HashSet<DependencyEdge> = graph
+        let before_interface: HashSet<DependencyInterfaceEdgeIdentity> = graph
             .get_dependencies(&excluded)
             .into_iter()
-            .cloned()
+            .map(DependencyEdge::dependency_interface_identity)
+            .collect();
+        let before_revision: HashSet<EdgeRevisionIdentity> = graph
+            .get_dependencies(&excluded)
+            .into_iter()
+            .map(DependencyEdge::revision_identity)
             .collect();
         assert!(
-            before.iter().all(|edge| !edge.non_lending),
+            graph
+                .get_dependencies(&excluded)
+                .iter()
+                .all(|edge| !edge.non_lending),
             "precondition: freshly built edges are lending"
         );
 
@@ -4971,18 +5198,30 @@ z <- 3
             graph.make_forward_edges_non_lending(&excluded),
             "first mark must report a graph change"
         );
-        let after: HashSet<DependencyEdge> = graph
+        let after_interface: HashSet<DependencyInterfaceEdgeIdentity> = graph
             .get_dependencies(&excluded)
             .into_iter()
-            .cloned()
+            .map(DependencyEdge::dependency_interface_identity)
+            .collect();
+        let after_revision: HashSet<EdgeRevisionIdentity> = graph
+            .get_dependencies(&excluded)
+            .into_iter()
+            .map(DependencyEdge::revision_identity)
             .collect();
         assert!(
-            after.iter().all(|edge| edge.non_lending),
+            graph
+                .get_dependencies(&excluded)
+                .iter()
+                .all(|edge| edge.non_lending),
             "edge copies should now be marked non-lending"
         );
         assert_eq!(
-            before, after,
-            "non_lending is a policy marker, not edge identity"
+            before_interface, after_interface,
+            "non_lending must not change the dependency interface"
+        );
+        assert_ne!(
+            before_revision, after_revision,
+            "non_lending must participate in revision invalidation"
         );
         let revision_after_first_mark = graph.edge_revision();
         assert!(
@@ -5139,10 +5378,8 @@ z <- 3
                 line: 5,
                 column: 0,
                 is_directive: false, // AST source
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -5412,5 +5649,76 @@ z <- 3
             in_consistent_set(&url("C.R"), &url("D.R")),
             "sibling-subtree: D must be in the consistent set of C"
         );
+    }
+
+    /// Exact bounded-traversal counterexample: A→Q, A→D, D→X with budget 3.
+    /// Q's trimmed query can reach D, while the full inverse walk rooted at D
+    /// spends its budget on X and A before reaching Q.
+    #[test]
+    fn budget_three_neighborhood_reports_directed_inverse_truncation() {
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &url("A.R"),
+            &multi_source_meta(&["Q.R", "D.R"]),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &url("D.R"),
+            &make_meta_with_source("X.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+
+        let payload = graph.cached_neighborhood_subgraph(&url("Q.R"), 20, 3);
+        assert_eq!(
+            payload.truncation,
+            NeighborhoodTruncation {
+                depth: false,
+                visited: true,
+            }
+        );
+        assert!(payload.neighborhood.contains(&url("D.R")));
+        assert!(
+            payload
+                .subgraph
+                .revalidation_consistent_set(&url("Q.R"), 20, 3)
+                .any(|member| member == url("D.R")),
+            "the truncated query-side set reproduces the unsafe foreign member"
+        );
+        assert!(
+            !graph
+                .revalidation_consistent_set(&url("D.R"), 20, 3)
+                .any(|dependent| dependent == url("Q.R")),
+            "editing D does not revalidate Q under the same budget"
+        );
+    }
+
+    #[test]
+    fn neighborhood_reports_depth_truncation_separately() {
+        let mut graph = DependencyGraph::new();
+        graph.update_file(
+            &url("A.R"),
+            &multi_source_meta(&["Q.R", "D.R"]),
+            Some(&workspace_root()),
+            |_| None,
+        );
+        graph.update_file(
+            &url("D.R"),
+            &make_meta_with_source("X.R", 1),
+            Some(&workspace_root()),
+            |_| None,
+        );
+
+        let payload = graph.cached_neighborhood_subgraph(&url("Q.R"), 2, 100);
+        assert_eq!(
+            payload.truncation,
+            NeighborhoodTruncation {
+                depth: true,
+                visited: false,
+            }
+        );
+        assert!(payload.neighborhood.contains(&url("D.R")));
+        assert!(!payload.neighborhood.contains(&url("X.R")));
     }
 }
