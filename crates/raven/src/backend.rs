@@ -30,11 +30,13 @@ use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::indentation;
 use crate::state::{
-    AnalysisBasis, DiagnosticsTrigger, IndentationSettings, OpenInstallIntentToken,
-    PreparedAnalysisCommit, PreparedOpenAliasReconcileAnalysis, PreparedOpenCommitPlan,
-    PreparedOpenEditAnalysis, PreparedOpenGraphProjection, PreparedOpenInstallAnalysis,
-    PreparedOpenPackageInstall, SymbolConfig, WorkspaceGraphDerivationContext,
-    WorkspaceGraphOverlay, WorldState, derive_workspace_dependency_graph,
+    AnalysisBasis, DiagnosticsTrigger, IndentationSettings, OpenCloseDiskObservation,
+    OpenCloseIntentToken, OpenCloseResyncTicket, OpenInstallIntentToken, PreparedAnalysisCommit,
+    PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall,
+    PreparedOpenCommitPlan, PreparedOpenEditAnalysis, PreparedOpenGraphProjection,
+    PreparedOpenInstallAnalysis, PreparedOpenPackageInstall, SymbolConfig,
+    WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorldState,
+    derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
 tokio::task_local! {
@@ -1822,153 +1824,6 @@ impl Backend {
     }
 }
 
-/// Collect open R/*.R and tests/testthat/ siblings of `closing_uri` whose
-/// diagnostics must refresh after a package-mode visibility change triggered
-/// by `did_close`. Filters out the closing URI and non-package files,
-/// enforces `max_revalidations_per_trigger` (priority-ordered via
-/// `cross_file_activity`), then snapshots each survivor's `(version, revision)`
-/// for the `run_debounced_diagnostics` freshness guard.
-///
-/// Returned as a `Vec` (not a `HashSet`) because the caller iterates in the
-/// post-cap, post-priority order to spawn one debounced diagnostic task per
-/// sibling.
-fn collect_close_fanout_siblings(
-    state: &WorldState,
-    closing_uri: &Url,
-    workspace_root: &std::path::Path,
-) -> Vec<(Url, DiagnosticsTrigger)> {
-    let mut candidates: Vec<Url> = state
-        .documents
-        .keys()
-        .filter(|open_uri| *open_uri != closing_uri)
-        .filter(|open_uri| {
-            is_authoritative_package_source_open_uri(state, open_uri, workspace_root)
-        })
-        .cloned()
-        .collect();
-    cap_watched_file_revalidations(
-        &mut candidates,
-        &state.cross_file_activity,
-        state.cross_file_config.max_revalidations_per_trigger,
-    );
-    candidates
-        .into_iter()
-        .filter(|sibling_uri| state.documents.contains_key(sibling_uri))
-        .map(|sibling_uri| {
-            let trigger = DiagnosticsTrigger::capture(state, &sibling_uri);
-            (sibling_uri, trigger)
-        })
-        .collect()
-}
-
-fn add_close_fanout_uris(
-    state: &WorldState,
-    fanout: &mut Vec<(Url, DiagnosticsTrigger)>,
-    additional: impl IntoIterator<Item = Url>,
-) {
-    let mut candidates: Vec<Url> = fanout.iter().map(|(uri, _)| uri.clone()).collect();
-    let mut seen: std::collections::HashSet<Url> = candidates.iter().cloned().collect();
-    for uri in additional {
-        if state.documents.contains_key(&uri) && seen.insert(uri.clone()) {
-            candidates.push(uri);
-        }
-    }
-    cap_watched_file_revalidations(
-        &mut candidates,
-        &state.cross_file_activity,
-        state.cross_file_config.max_revalidations_per_trigger,
-    );
-    *fanout = candidates
-        .into_iter()
-        .filter(|uri| state.documents.contains_key(uri))
-        .map(|uri| {
-            let trigger = DiagnosticsTrigger::capture(state, &uri);
-            (uri, trigger)
-        })
-        .collect();
-}
-
-fn remirror_authoritative_alias_roots_after_close(
-    state: &mut WorldState,
-    roots: &[Url],
-    old_meta: Option<&crate::cross_file::CrossFileMetadata>,
-    old_interface_hash: Option<u64>,
-) -> Vec<Url> {
-    let workspace_root = state.workspace_folders.first().cloned();
-    let mut affected = Vec::new();
-    let mut affected_set = std::collections::HashSet::new();
-    let mut edges_changed = false;
-    let mut seen_roots = std::collections::HashSet::new();
-
-    for root in roots {
-        if !seen_roots.insert(root.clone()) {
-            continue;
-        }
-        let Some(open_uri) = state.open_document_uri_for_authoritative_uri(root) else {
-            continue;
-        };
-        let Some(open_doc) = state.documents.get_record(&open_uri) else {
-            continue;
-        };
-        let meta = open_doc.metadata().clone();
-        let new_interface_hash = open_doc.artifacts().interface_hash;
-        let root_meta = metadata_for_graph_root(
-            state,
-            root,
-            &open_uri,
-            meta.as_ref(),
-            workspace_root.as_ref(),
-        );
-        let result = update_cross_file_graph_for_roots(
-            state,
-            std::slice::from_ref(root),
-            root_meta.as_ref(),
-            workspace_root.as_ref(),
-        );
-        let mut root_edges_changed = result.edges_changed;
-        if state.is_project_excluded_uri(&open_uri) || state.is_project_excluded_uri(root) {
-            root_edges_changed |= state.cross_file_graph.make_forward_edges_non_lending(root);
-        }
-        edges_changed |= root_edges_changed;
-
-        let interface_changed = old_interface_hash != Some(new_interface_hash);
-        if interface_changed || root_edges_changed {
-            for dep in state.affected_open_dependents_after_edit(
-                root,
-                interface_changed,
-                root_edges_changed,
-            ) {
-                if affected_set.insert(dep.clone()) {
-                    affected.push(dep);
-                }
-            }
-        }
-
-        let old_root_meta = old_meta.map(|old_meta| {
-            metadata_for_graph_root(state, root, &open_uri, old_meta, workspace_root.as_ref())
-                .into_owned()
-        });
-        for child in crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-            root,
-            old_root_meta.as_ref(),
-            root_meta.as_ref(),
-            &state.cross_file_graph,
-            &state.cross_file_meta,
-        ) {
-            if let Some(open_child) = state.open_document_uri_for_authoritative_uri(&child)
-                && affected_set.insert(open_child.clone())
-            {
-                affected.push(open_child);
-            }
-        }
-    }
-
-    if edges_changed {
-        state.recompute_open_neighborhood_pins();
-    }
-    affected
-}
-
 fn extend_with_open_package_docs(
     affected: &mut Vec<Url>,
     affected_set: &mut std::collections::HashSet<Url>,
@@ -3324,33 +3179,6 @@ fn authoritative_rprofile_root_for_open_document(
         .map(|_| root.clone())
 }
 
-fn rprofile_sourced_root_for_open_document(
-    state: &WorldState,
-    open_uri: &Url,
-) -> Option<std::path::PathBuf> {
-    if !state.package_inputs.model_rprofile {
-        return None;
-    }
-    let root = state.package_inputs.workspace_root.as_ref()?;
-    let sourced = &state.package_inputs.rprofile_sourced_files;
-    if open_uri
-        .to_file_path()
-        .ok()
-        .is_some_and(|p| path_in_rprofile_sourced_set(&p, sourced))
-    {
-        return Some(root.clone());
-    }
-    if state.open_document_aliases.is_empty() {
-        return None;
-    }
-    state
-        .canonical_uris_for_open_document(open_uri)
-        .into_iter()
-        .filter_map(|uri| uri.to_file_path().ok())
-        .any(|p| path_in_rprofile_sourced_set(&p, sourced))
-        .then(|| root.clone())
-}
-
 fn file_paths_for_open_document(state: &WorldState, open_uri: &Url) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     if let Ok(path) = open_uri.to_file_path() {
@@ -3515,18 +3343,6 @@ fn snapshot_open_preamble_documents(
     paths.sort();
     paths.dedup();
     (paths, identities)
-}
-
-fn authoritative_rprofile_buffer_text_after_close(
-    state: &WorldState,
-    root: &std::path::Path,
-) -> Option<Arc<str>> {
-    authoritative_open_rprofile_uris(state, root).find_map(|uri| {
-        state
-            .documents
-            .get(uri)
-            .map(|doc| Arc::<str>::from(doc.text()))
-    })
 }
 
 /// Add closed package R files from the workspace index without admitting stale
@@ -5662,6 +5478,561 @@ fn derive_open_alias_reconcile(captured: CapturedOpenAliasReconcile) -> DerivedO
     }
 }
 
+struct CapturedOpenCloseRoot {
+    uri: Url,
+    owner_uri: Option<Url>,
+    metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
+    content: Option<String>,
+    interface_hash: Option<u64>,
+    make_non_lending: bool,
+    retained_shadow: bool,
+    excluded: bool,
+}
+
+struct CapturedOpenCloseAnalysis {
+    basis: AnalysisBasis,
+    intent: OpenCloseIntentToken,
+    uri: Url,
+    expected_aliases: Vec<Url>,
+    old_metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
+    chunk_kind: crate::chunks::ChunkKind,
+    roots: Vec<CapturedOpenCloseRoot>,
+    workspace_root: Option<Url>,
+    system_file_workspace_name: Option<String>,
+    package_workspace_root: Option<std::path::PathBuf>,
+    library_paths: Vec<std::path::PathBuf>,
+    max_chain_depth: usize,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    content_map: HashMap<Url, String>,
+    package_inputs: crate::package_state::PackageInputs,
+    package_state: crate::package_state::PackageState,
+    package_text_overrides: crate::package_state::preamble::PreambleTextOverrides,
+    candidate_paths: Vec<std::path::PathBuf>,
+    package_close_uri: Option<Url>,
+    package_close_text: Option<Arc<str>>,
+    package_close_has_live_owner: bool,
+    package_close_excluded: bool,
+    package_fanout_uris: Vec<Url>,
+    rprofile_fanout_uris: Vec<Url>,
+    preamble_fanout_uris: Vec<Url>,
+}
+
+fn capture_open_close_analysis(
+    state: &WorldState,
+    intent: &OpenCloseIntentToken,
+) -> Option<CapturedOpenCloseAnalysis> {
+    let basis = state.capture_open_close_analysis_basis(intent)?;
+    let uri = intent.uri().clone();
+    let record = state.documents.get_record(&uri);
+    let expected_aliases = state.canonical_uris_for_open_document(&uri);
+    let old_metadata = record.map(|record| record.metadata().clone());
+    let chunk_kind = record
+        .map(|record| record.document().chunk_kind)
+        .unwrap_or_else(|| state.chunk_kind_for_closed_file(&uri));
+
+    let mut metadata_map = HashMap::new();
+    let mut content_map = HashMap::new();
+    for open_uri in state.documents.uris() {
+        if let Some(open_record) = state.documents.get_record(&open_uri) {
+            metadata_map.insert(open_uri.clone(), open_record.metadata().clone());
+            content_map.insert(open_uri.clone(), open_record.document().text());
+        }
+    }
+    for closed_uri in state.workspace_index.artifact_uris() {
+        if let Some(metadata) = state.workspace_index.get_metadata(&closed_uri) {
+            metadata_map.entry(closed_uri.clone()).or_insert(metadata);
+        }
+        if let Some(entry) = state.workspace_index.get(&closed_uri) {
+            content_map
+                .entry(closed_uri)
+                .or_insert_with(|| entry.contents.to_string());
+        }
+    }
+
+    let mut authoritative_roots = state.authoritative_revalidation_roots_for_uri(&uri);
+    authoritative_roots.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    authoritative_roots.dedup();
+    let mut roots = Vec::with_capacity(authoritative_roots.len());
+    for root in authoritative_roots {
+        let next_owner = if root != uri && state.documents.contains_key(&root) {
+            Some(root.clone())
+        } else {
+            state
+                .open_document_aliases
+                .open_uris_for_canonical(&root)
+                .and_then(|owners| {
+                    owners
+                        .iter()
+                        .find(|owner| *owner != &uri && state.documents.contains_key(owner))
+                        .cloned()
+                })
+        };
+        let retained_shadow = next_owner.is_none() && state.workspace_index.get(&root).is_some();
+        let (metadata, content, interface_hash) = if let Some(owner) = next_owner.as_ref() {
+            let next = state
+                .documents
+                .get_record(owner)
+                .expect("captured next alias owner remains open under read lock");
+            (
+                Some(next.metadata().clone()),
+                Some(next.document().text()),
+                Some(next.artifacts().interface_hash),
+            )
+        } else if let Some(entry) = state.workspace_index.get(&root) {
+            (
+                Some(entry.metadata.clone()),
+                Some(entry.contents.to_string()),
+                Some(entry.artifacts.interface_hash),
+            )
+        } else {
+            (None, None, None)
+        };
+        roots.push(CapturedOpenCloseRoot {
+            uri: root.clone(),
+            owner_uri: next_owner.clone(),
+            metadata,
+            content: content.clone(),
+            interface_hash,
+            make_non_lending: next_owner
+                .as_ref()
+                .is_some_and(|owner| state.is_project_excluded_uri(owner))
+                || state.is_project_excluded_uri(&root),
+            retained_shadow,
+            excluded: state.is_project_excluded_uri(&root),
+        });
+        if let Some(metadata) = roots.last().and_then(|root| root.metadata.clone()) {
+            metadata_map.insert(root.clone(), metadata);
+        }
+        if let Some(content) = content {
+            content_map.insert(root, content);
+        }
+    }
+
+    let mut package_text_overrides = snapshot_preamble_text_overrides(state);
+    let mut candidate_paths = file_paths_for_open_document(state, &uri);
+    candidate_paths.sort();
+    candidate_paths.dedup();
+    for path in &candidate_paths {
+        package_text_overrides.remove(path);
+    }
+    for root in &roots {
+        if let (Ok(path), Some(content)) = (root.uri.to_file_path(), root.content.as_ref()) {
+            package_text_overrides.insert(path, ropey::Rope::from_str(content));
+        }
+    }
+
+    let package_workspace_root = state.package_inputs.workspace_root.clone();
+    let package_close_uri = package_workspace_root.as_deref().and_then(|root| {
+        authoritative_package_input_uri_for_open_document(state, &uri, root)
+            .map(|input| input.uri().clone())
+    });
+    let package_close_text = package_close_uri.as_ref().and_then(|package_uri| {
+        roots
+            .iter()
+            .find(|root| &root.uri == package_uri)
+            .and_then(|root| root.content.as_deref())
+            .map(Arc::<str>::from)
+    });
+    let package_close_has_live_owner = package_close_uri.as_ref().is_some_and(|package_uri| {
+        roots
+            .iter()
+            .find(|root| &root.uri == package_uri)
+            .is_some_and(|root| root.owner_uri.is_some())
+    });
+    let package_close_excluded = state.is_project_excluded_uri(&uri)
+        || package_close_uri
+            .as_ref()
+            .is_some_and(|package_uri| state.is_project_excluded_uri(package_uri));
+    let package_fanout_uris = package_workspace_root
+        .as_deref()
+        .map(|root| {
+            state
+                .documents
+                .keys()
+                .filter(|open_uri| {
+                    *open_uri != &uri
+                        && is_authoritative_package_source_open_uri(state, open_uri, root)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let rprofile_fanout_uris = package_workspace_root
+        .as_deref()
+        .map(|root| {
+            state
+                .documents
+                .keys()
+                .filter(|open_uri| {
+                    *open_uri != &uri
+                        && is_package_scope_workspace_r_open_document(state, open_uri, root)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let preamble_fanout_uris = package_workspace_root
+        .as_deref()
+        .map(|root| {
+            let testthat = root.join("tests/testthat");
+            state
+                .documents
+                .keys()
+                .filter(|open_uri| {
+                    *open_uri != &uri
+                        && package_scope_workspace_r_path_for_open_document(state, open_uri, root)
+                            .is_some_and(|path| path.starts_with(&testthat))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(CapturedOpenCloseAnalysis {
+        basis,
+        intent: intent.clone(),
+        uri,
+        expected_aliases,
+        old_metadata,
+        chunk_kind,
+        roots,
+        workspace_root: state.workspace_folders.first().cloned(),
+        system_file_workspace_name: state.package_state.workspace().map(|ws| ws.name.clone()),
+        package_workspace_root: state.package_state.workspace().map(|ws| ws.root.clone()),
+        library_paths: state.package_library.lib_paths().to_vec(),
+        max_chain_depth: state.cross_file_config.max_chain_depth,
+        exclusions: state.workspace_exclusions.clone(),
+        metadata_map,
+        content_map,
+        package_inputs: state.package_inputs.clone(),
+        package_state: state.package_state.clone(),
+        package_text_overrides,
+        candidate_paths,
+        package_close_uri,
+        package_close_text,
+        package_close_has_live_owner,
+        package_close_excluded,
+        package_fanout_uris,
+        rprofile_fanout_uris,
+        preamble_fanout_uris,
+    })
+}
+
+fn derive_open_close_analysis(
+    mut captured: CapturedOpenCloseAnalysis,
+) -> PreparedOpenCloseAnalysis {
+    let mut disk_observations = Vec::new();
+    let mut disk_material = HashMap::new();
+    for root in &mut captured.roots {
+        if root.owner_uri.is_some() || root.retained_shadow || root.excluded {
+            continue;
+        }
+        let Ok(path) = root.uri.to_file_path() else {
+            continue;
+        };
+        let content = match crate::state::read_source(&path) {
+            Ok(content) => content,
+            Err(crate::state::SourceReadError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                disk_observations.push(OpenCloseDiskObservation {
+                    uri: root.uri.clone(),
+                    snapshot: None,
+                });
+                continue;
+            }
+            Err(crate::state::SourceReadError::InvalidEncoding { .. }) => {
+                disk_observations.push(OpenCloseDiskObservation {
+                    uri: root.uri.clone(),
+                    snapshot: None,
+                });
+                continue;
+            }
+            Err(_) => {
+                disk_observations.push(OpenCloseDiskObservation {
+                    uri: root.uri.clone(),
+                    snapshot: None,
+                });
+                continue;
+            }
+        };
+        let Ok(fs_metadata) = std::fs::metadata(&path) else {
+            disk_observations.push(OpenCloseDiskObservation {
+                uri: root.uri.clone(),
+                snapshot: None,
+            });
+            continue;
+        };
+        let snapshot =
+            crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_metadata, &content);
+        let analysis =
+            crate::cross_file::analysis_text_for_kind(captured.chunk_kind, &content).into_owned();
+        let tree = crate::parser_pool::with_parser(|parser| parser.parse(&analysis, None));
+        let mut metadata = crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
+        crate::cross_file::resolve_system_file_sources(
+            &mut metadata,
+            captured.system_file_workspace_name.as_deref(),
+            captured.package_workspace_root.as_deref(),
+            &captured.library_paths,
+        );
+        let artifacts = Arc::new(match tree.as_ref() {
+            Some(tree) => crate::cross_file::scope::compute_artifacts_with_metadata(
+                &root.uri,
+                tree,
+                &analysis,
+                Some(&metadata),
+            ),
+            None => crate::cross_file::scope::ScopeArtifacts::default(),
+        });
+        root.metadata = Some(Arc::new(metadata));
+        root.content = Some(content.clone());
+        root.interface_hash = Some(artifacts.interface_hash);
+        captured
+            .metadata_map
+            .insert(root.uri.clone(), root.metadata.as_ref().unwrap().clone());
+        captured
+            .content_map
+            .insert(root.uri.clone(), content.clone());
+        captured
+            .package_text_overrides
+            .insert(path, ropey::Rope::from_str(&content));
+        if captured.package_close_uri.as_ref() == Some(&root.uri) {
+            captured.package_close_text = Some(Arc::<str>::from(content.as_str()));
+        }
+        disk_observations.push(OpenCloseDiskObservation {
+            uri: root.uri.clone(),
+            snapshot: Some(snapshot.clone()),
+        });
+        disk_material.insert(
+            root.uri.clone(),
+            (content, analysis, tree, snapshot, artifacts),
+        );
+    }
+
+    let metadata_lookup = |uri: &Url| captured.metadata_map.get(uri).cloned();
+    let mut graph = Vec::new();
+    let mut reset_closed_roots = Vec::new();
+    let mut close_disk_installs = Vec::new();
+    let mut replacement_interface_hash = None;
+    let mut resync = Vec::new();
+    for root in &captured.roots {
+        if root.uri == captured.uri {
+            replacement_interface_hash = root.interface_hash;
+        }
+        if let Some(metadata) = root.metadata.as_ref() {
+            let mut semantic = metadata.as_ref().clone();
+            if root
+                .owner_uri
+                .as_ref()
+                .is_some_and(|owner| owner != &root.uri)
+            {
+                semantic.inherited_working_directory = None;
+                crate::cross_file::enrich_metadata_with_inherited_wd(
+                    &mut semantic,
+                    &root.uri,
+                    captured.workspace_root.as_ref(),
+                    metadata_lookup,
+                    captured.max_chain_depth,
+                );
+            }
+            let graph_metadata = WorldState::metadata_for_dependency_graph_with_exclusions(
+                &captured.exclusions,
+                &root.uri,
+                &semantic,
+                captured.workspace_root.as_ref(),
+            )
+            .into_owned();
+            let (parent_content, _) = collect_backward_parent_content_with(
+                &root.uri,
+                captured.workspace_root.as_ref(),
+                &graph_metadata,
+                |parent_uri| captured.content_map.get(parent_uri).cloned(),
+            );
+            graph.push(PreparedOpenGraphProjection {
+                uri: root.uri.clone(),
+                graph_metadata: Arc::new(graph_metadata),
+                old_metadata: captured.old_metadata.clone(),
+                new_metadata: Arc::new(semantic.clone()),
+                parent_content,
+                make_non_lending: root.make_non_lending,
+            });
+            if let Some((content, analysis, tree, snapshot, artifacts)) =
+                disk_material.remove(&root.uri)
+            {
+                close_disk_installs.push(PreparedOpenCloseDiskInstall {
+                    uri: root.uri.clone(),
+                    entry: crate::workspace_index::IndexEntry {
+                        contents: ropey::Rope::from_str(&content),
+                        tree: tree.clone(),
+                        loaded_packages: extract_loaded_packages_from_library_calls(
+                            &semantic.library_calls,
+                        ),
+                        data_packages: crate::state::extract_data_packages(&tree, &analysis),
+                        snapshot: snapshot.clone(),
+                        metadata: Arc::new(semantic.clone()),
+                        artifacts,
+                        indexed_at_version: 0,
+                    },
+                    snapshot,
+                    content,
+                });
+            } else if root.owner_uri.is_none()
+                && root.retained_shadow
+                && root.uri.to_file_path().is_ok()
+            {
+                resync.push(OpenCloseResyncTicket {
+                    uri: root.uri.clone(),
+                    chunk_kind: captured.chunk_kind,
+                    old_metadata: Some(Arc::new(semantic)),
+                    old_interface_hash: root.interface_hash,
+                });
+            }
+        } else {
+            reset_closed_roots.push(root.uri.clone());
+            if root.uri.to_file_path().is_ok() {
+                resync.push(OpenCloseResyncTicket {
+                    uri: root.uri.clone(),
+                    chunk_kind: captured.chunk_kind,
+                    old_metadata: None,
+                    old_interface_hash: None,
+                });
+            }
+        }
+    }
+
+    let mut inputs = captured.package_inputs;
+    let mut deltas = Vec::new();
+    if let Some(package_uri) = captured.package_close_uri {
+        let package_close_text = if captured.package_close_has_live_owner
+            || captured.package_close_excluded
+            || captured.package_close_text.is_some()
+        {
+            captured.package_close_text
+        } else {
+            package_uri.to_file_path().ok().and_then(|path| {
+                crate::state::read_source(&path)
+                    .ok()
+                    .map(|text| Arc::<str>::from(text.as_str()))
+            })
+        };
+        let event = if captured.package_close_has_live_owner {
+            crate::package_state::event::HandlerEvent::DidChange {
+                uri: package_uri,
+                text: package_close_text.expect("captured live package alias has immutable text"),
+            }
+        } else {
+            crate::package_state::event::HandlerEvent::DidClose {
+                uri: package_uri,
+                on_disk_text: package_close_text,
+            }
+        };
+        if let Some(delta) = crate::package_state::event::translate(&mut inputs, event) {
+            deltas.push(delta);
+        }
+    }
+    let mut rprofile_changed = false;
+    let mut preamble_changed = false;
+    if let Some(root) = inputs.workspace_root.clone() {
+        let affects_rprofile = inputs.model_rprofile
+            && captured.candidate_paths.iter().any(|path| {
+                path == &root.join(".Rprofile")
+                    || path_in_rprofile_sourced_set(path, &inputs.rprofile_sourced_files)
+            });
+        if affects_rprofile {
+            let scan =
+                crate::package_state::rprofile::scan_workspace_rprofile_with_overrides_and_exclusions(
+                    &root,
+                    &captured.package_text_overrides,
+                    &captured.exclusions,
+                );
+            if let Some(delta) =
+                crate::package_state::event::apply_rprofile_scan(&mut inputs, Some(scan))
+            {
+                deltas.push(delta);
+                rprofile_changed = true;
+            }
+        }
+        let affects_preamble = inputs.package_mode
+            != crate::cross_file::config::PackageMode::Disabled
+            && captured.candidate_paths.iter().any(|path| {
+                crate::package_state::preamble::is_testthat_preamble_path(path, &root)
+                    || path_in_rprofile_sourced_set(path, &inputs.preamble_sourced_files)
+            });
+        if affects_preamble {
+            let (scan, _) = crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+                &root,
+                crate::package_state::preamble::PreambleSnapshot::from_inputs(&inputs),
+                &captured.candidate_paths,
+                &captured.package_text_overrides,
+                &captured.exclusions,
+            );
+            if let Some(delta) =
+                crate::package_state::event::apply_preamble_scan(&mut inputs, Some(scan))
+            {
+                deltas.push(delta);
+                preamble_changed = true;
+            }
+        }
+    }
+    let mut package = None;
+    let mut package_visibility_changed = false;
+    if !deltas.is_empty() {
+        let delta = if deltas.len() == 1 {
+            deltas.pop().expect("one close package delta")
+        } else {
+            crate::package_state::PackageInputDelta::Batch(deltas)
+        };
+        let next =
+            crate::package_state::derive_package_state(&captured.package_state, &inputs, &delta);
+        package_visibility_changed = next.namespace_model()
+            != captured.package_state.namespace_model()
+            || next.scope_contribution() != captured.package_state.scope_contribution();
+        package = Some(PreparedOpenPackageInstall {
+            inputs,
+            state: next,
+        });
+    }
+
+    let mut seed_revalidation_uris = Vec::new();
+    if package_visibility_changed {
+        seed_revalidation_uris.extend(captured.package_fanout_uris.iter().cloned());
+    }
+    if rprofile_changed {
+        seed_revalidation_uris.extend(captured.rprofile_fanout_uris);
+    }
+    if preamble_changed {
+        seed_revalidation_uris.extend(captured.preamble_fanout_uris);
+    }
+    let plan = PreparedOpenCommitPlan {
+        graph,
+        reset_closed_roots,
+        refresh_pins: true,
+        seed_revalidation_uris,
+        closing_subject: true,
+        replacement_interface_hash,
+        close_disk_installs,
+        ..PreparedOpenCommitPlan::default()
+    };
+    let watched_roots = captured
+        .roots
+        .iter()
+        .filter(|root| root.uri.to_file_path().is_ok())
+        .map(|root| (root.uri.clone(), captured.chunk_kind))
+        .collect();
+    PreparedOpenCloseAnalysis::new(
+        captured.basis,
+        captured.intent,
+        captured.uri,
+        captured.expected_aliases,
+        package,
+        plan,
+        resync,
+        disk_observations,
+        watched_roots,
+    )
+}
+
 struct CapturedOpenInstallAnalysis {
     basis: AnalysisBasis,
     intent: OpenInstallIntentToken,
@@ -7171,6 +7542,7 @@ async fn resync_file_from_disk(
         artifacts: artifacts.clone(),
         indexed_at_version: 0,
     };
+    let commit_snapshot = snapshot.clone();
     let prepared = crate::state::PreparedClosedAnalysis::new(
         analysis_basis,
         uri.clone(),
@@ -7188,6 +7560,32 @@ async fn resync_file_from_disk(
             mutation: crate::state::PreparedClosedMutation::Upsert(Box::new(prepared)),
             deleted: false,
         };
+    }
+    #[cfg(test)]
+    {
+        let armed = {
+            let state = state_arc.read().await;
+            state.close_resync_pre_commit_test_pause.take_armed(uri)
+        };
+        if let Some(pause_gate) = armed {
+            pause_gate.pause().await;
+        }
+    }
+    let disk_snapshot_is_current = match (
+        crate::state::read_source_async(&path).await,
+        tokio::fs::metadata(&path).await,
+    ) {
+        (Ok(current_content), Ok(current_metadata)) => {
+            crate::cross_file::file_cache::FileSnapshot::with_content_hash(
+                &current_metadata,
+                &current_content,
+            ) == commit_snapshot
+        }
+        _ => false,
+    };
+    if !disk_snapshot_is_current {
+        log::trace!("Disk resync snapshot changed before commit: {}", uri);
+        return ResyncOutcome::Skipped;
     }
     let effects = {
         let mut state = state_arc.write().await;
@@ -8062,6 +8460,29 @@ async fn pause_if_armed_for_test(state_arc: &Arc<RwLock<WorldState>>, uri: &Url)
 #[cfg(not(any(test, feature = "test-support")))]
 async fn pause_if_armed_for_test(_state_arc: &Arc<RwLock<WorldState>>, _uri: &Url) {}
 
+#[cfg(test)]
+async fn pause_after_diagnostics_publish_lock_for_test(
+    state_arc: &Arc<RwLock<WorldState>>,
+    uri: &Url,
+) {
+    let armed = {
+        let state = state_arc.read().await;
+        state
+            .diagnostics_post_publish_lock_test_pause
+            .take_armed(uri)
+    };
+    if let Some(pause_gate) = armed {
+        pause_gate.pause().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn pause_after_diagnostics_publish_lock_for_test(
+    _state_arc: &Arc<RwLock<WorldState>>,
+    _uri: &Url,
+) {
+}
+
 /// Run debounced diagnostics for a single URI.
 ///
 /// This is the shared diagnostics pipeline used by both `did_open`/`did_change`
@@ -8227,6 +8648,7 @@ async fn run_debounced_diagnostics(
         Arc::clone(&state.diagnostics_publish_lock)
     };
     let _publish_guard = publish_lock.lock().await;
+    pause_after_diagnostics_publish_lock_for_test(&state_arc, &affected_uri).await;
 
     // Re-check cancellation now that the publish lock is held. A `did_close`
     // racing with this task cancels the token, clears the gate, and a
@@ -8823,6 +9245,175 @@ async fn did_open_transactional(
         .await
         .cancel_open_install_intent_if_current(&intent);
     true
+}
+
+async fn did_close_transactional(backend: &Backend, uri: &Url) {
+    let intent = {
+        let mut state = backend.state.write().await;
+        state.begin_open_close_intent(uri)
+    };
+
+    for attempt in 0..2 {
+        let Some(captured) = ({
+            let state = backend.state.read().await;
+            capture_open_close_analysis(&state, &intent)
+        }) else {
+            break;
+        };
+        let Ok(prepared) =
+            tokio::task::spawn_blocking(move || derive_open_close_analysis(captured)).await
+        else {
+            log::warn!("didClose detached derivation task failed for {uri}");
+            break;
+        };
+
+        #[cfg(test)]
+        {
+            let pause = {
+                let state = backend.state.read().await;
+                state.did_close_pre_commit_test_pause.take_armed(uri)
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+
+        let publish_lock = {
+            let state = backend.state.read().await;
+            state.diagnostics_publish_lock.clone()
+        };
+        let publish_guard = publish_lock.lock().await;
+        let disk_observations = prepared.disk_observations().to_vec();
+        let disk_is_current = tokio::task::spawn_blocking(move || {
+            disk_observations.iter().all(|observation| {
+                let Ok(path) = observation.uri.to_file_path() else {
+                    return observation.snapshot.is_none();
+                };
+                match observation.snapshot.as_ref() {
+                    Some(expected) => {
+                        let Ok(content) = crate::state::read_source(&path) else {
+                            return false;
+                        };
+                        let Ok(metadata) = std::fs::metadata(&path) else {
+                            return false;
+                        };
+                        crate::cross_file::file_cache::FileSnapshot::with_content_hash(
+                            &metadata, &content,
+                        ) == *expected
+                    }
+                    None => std::fs::metadata(path)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                }
+            })
+        })
+        .await
+        .unwrap_or(false);
+        if !disk_is_current {
+            drop(publish_guard);
+            if attempt == 0
+                && backend
+                    .state
+                    .read()
+                    .await
+                    .open_close_intent_is_current(&intent)
+            {
+                continue;
+            }
+            break;
+        }
+        let committed = {
+            let mut state = backend.state.write().await;
+            state.try_commit_analysis(PreparedAnalysisCommit::OpenClose(Box::new(prepared)))
+        };
+        let mut effects = match committed {
+            Ok(effects) => effects,
+            Err(crate::state::AnalysisCommitRejected::StaleBasis) => {
+                drop(publish_guard);
+                let target_still_current = backend
+                    .state
+                    .read()
+                    .await
+                    .open_close_intent_is_current(&intent);
+                if attempt == 0 && target_still_current {
+                    continue;
+                }
+                break;
+            }
+        };
+
+        #[cfg(test)]
+        {
+            let pause = {
+                let state = backend.state.read().await;
+                state
+                    .did_close_post_commit_pre_publish_test_pause
+                    .take_armed(uri)
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+
+        log::trace!(
+            "diagnostics lifecycle: publish uri={} count=0 path=close-clear open=false",
+            uri
+        );
+        backend
+            .client
+            .publish_diagnostics(uri.clone(), Vec::new(), None)
+            .await;
+        drop(publish_guard);
+
+        let close = effects
+            .close
+            .take()
+            .expect("OpenClose commit returns immutable close effects");
+        if close.resync.is_empty() {
+            backend.spawn_analysis_commit_effects(effects);
+        } else {
+            let state = backend.state.clone();
+            let client = backend.client.clone();
+            let traversal = backend.traversal_truncation.clone();
+            tokio::spawn(async move {
+                // Drain the atomic shadow/remirror reservation before a fresh
+                // disk transaction can reserve the same URI. Otherwise its
+                // schedule would cancel this worker and strand one force
+                // marker. Disk convergence follows, so observers see shadow A
+                // before fresh disk C and each real transition publishes once.
+                for ticket in effects.revalidations {
+                    run_debounced_diagnostics(
+                        state.clone(),
+                        client.clone(),
+                        ticket.uri,
+                        ticket.debounce_ms,
+                        ticket.trigger,
+                        Some(traversal.clone()),
+                    )
+                    .await;
+                }
+                for ticket in close.resync {
+                    run_close_resync(
+                        state.clone(),
+                        client.clone(),
+                        traversal.clone(),
+                        ticket.uri,
+                        Some(ticket.chunk_kind),
+                        ticket.old_metadata,
+                        ticket.old_interface_hash,
+                        Vec::new(),
+                    )
+                    .await;
+                }
+            });
+        }
+        return;
+    }
+
+    backend
+        .state
+        .write()
+        .await
+        .cancel_open_close_intent_if_current(&intent);
 }
 
 #[tower_lsp::async_trait]
@@ -10181,402 +10772,7 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = &params.text_document.uri;
         log::trace!("diagnostics lifecycle: didClose uri={}", uri);
-
-        let (package_close_uri, package_close_excluded): (Option<Url>, bool) = {
-            let state = self.state.read().await;
-            let package_close_uri = state
-                .package_inputs
-                .workspace_root
-                .as_ref()
-                .and_then(|root| {
-                    authoritative_package_input_uri_for_open_document(&state, uri, root)
-                        .map(|package_input| package_input.uri().clone())
-                });
-            let package_close_excluded = state.is_project_excluded_uri(uri)
-                || package_close_uri
-                    .as_ref()
-                    .is_some_and(|package_uri| state.is_project_excluded_uri(package_uri));
-            (package_close_uri, package_close_excluded)
-        };
-
-        // Closing reverts package inputs to the canonical slot's next
-        // authoritative source: a remaining live alias if one exists, otherwise
-        // DISK truth (the same convergence rule the cross-file resync below
-        // follows, and what `refresh_rprofile_prelude_from_disk` documents for
-        // `.Rprofile`). A missing/undecodable disk file, or a file now excluded
-        // by `[workspace].exclude`, yields `None`, which
-        // `HandlerEvent::DidClose` translates into removing the file from
-        // `package_inputs` — so deleted or excluded files drop package-internal
-        // symbols on close instead of retaining them until an (never-coming)
-        // watcher event.
-        //
-        // Deliberate double read: the spawned cross-file resync re-reads the
-        // same file. Handing this snapshot to the resync would trade
-        // commit-time freshness (the resync's read happens right before its
-        // veto+commit) for one saved small-file read on a warm page cache —
-        // not worth the coupling. If a disk write lands between the two
-        // reads, package and cross-file state briefly reflect different
-        // snapshots; the write also fires a watcher CHANGED event whose
-        // pipeline re-syncs both, so the straddle self-heals.
-        let close_text: Option<Arc<str>> = if !package_close_excluded {
-            if let Some(package_close_uri) = package_close_uri.clone() {
-                match package_close_uri.to_file_path() {
-                    Ok(path) => {
-                        tokio::task::spawn_blocking(move || {
-                            // BOM-aware decode (read off the async runtime).
-                            crate::state::read_source(&path)
-                                .ok()
-                                .map(|text| Arc::from(text.as_str()))
-                        })
-                        .await
-                        .unwrap_or(None)
-                    }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // If the closed document is the workspace-root `.Rprofile`, its prelude
-        // must switch to the next authoritative live alias, or be re-scanned
-        // from disk after this block: closing discards any unsaved buffer edits
-        // the live did_change refresh folded in.
-        let mut rprofile_close_buffer: Option<(std::path::PathBuf, Arc<str>)> = None;
-        let mut rprofile_close_root: Option<std::path::PathBuf> = None;
-        let mut preamble_close_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
-
-        // Issue #558: closing a graph-relevant file schedules a disk resync
-        // (spawned after this block) so cross-file state derived from a
-        // discarded unsaved buffer converges back to disk truth. Gated on
-        // the tracked document's own `file_type` (set inside the write-lock
-        // block below), not the URI extension: that is what fed the buffer's
-        // edges into the graph in the first place, and it covers
-        // extension-less R documents like `.Rprofile` as well as `.R` and
-        // Rmd/Quarto extensions. Non-`file:` URIs (untitled buffers) have no disk
-        // truth to converge to.
-        let has_disk_path = uri.to_file_path().is_ok();
-        let close_resync;
-        let mut resync_old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>> =
-            None;
-        let mut resync_old_interface_hash: Option<u64> = None;
-        let mut resync_chunk_kind: Option<crate::chunks::ChunkKind> = None;
-        let mut close_resync_uris: Vec<Url> = Vec::new();
-
-        // Serialize the close commit + empty publish with diagnostic commit
-        // tails. Cancellation alone has a narrow race after a worker's final
-        // state check; this lock guarantees the empty publication is ordered
-        // after every diagnostic publish that observed the document as open.
-        let diagnostics_publish_lock = {
-            let state = self.state.read().await;
-            Arc::clone(&state.diagnostics_publish_lock)
-        };
-        let _diagnostics_publish_guard = diagnostics_publish_lock.lock().await;
-
-        let (sibling_fanout, debounce_ms): (Vec<(Url, DiagnosticsTrigger)>, u64) = {
-            let mut state = self.state.write().await;
-            state.advance_workspace_scan_generation();
-
-            // Capture the pre-close view the disk resync needs, BEFORE the
-            // open-document record is removed below. `old_meta` must come from the
-            // buffer tier: working-directory change detection compares the
-            // buffer's `# raven: cd` (what dependents last resolved against)
-            // against the disk state the resync installs. The dependent walk
-            // runs over the buffer-derived graph edges, which deliberately
-            // stay in place until the resync commits — there is no transient
-            // empty-edge window for dependents to observe.
-            close_resync = has_disk_path
-                && state
-                    .documents
-                    .get(uri)
-                    .is_some_and(|doc| doc.file_type == crate::file_type::FileType::R);
-            if close_resync {
-                resync_old_meta = state.get_enriched_metadata(uri);
-                resync_old_interface_hash = state
-                    .documents
-                    .get_record(uri)
-                    .map(|record| record.artifacts().interface_hash);
-                // The buffer's chunk classification came from the editor's
-                // languageId (#343); the resync must mask disk content the
-                // same way — path reclassification would parse an
-                // extensionless Rmd/Quarto document as plain R.
-                // (The pre-commit dependent WALK deliberately lives inside
-                // `run_close_resync`, off the handler path: it needs only
-                // the pre-commit graph — the buffer-derived edges stay in
-                // place until that resync's own commit replaces them.)
-                resync_chunk_kind = state.documents.get(uri).map(|doc| doc.chunk_kind);
-                if let Some(kind) = resync_chunk_kind {
-                    state.record_editor_chunk_kind_override(uri, kind);
-                }
-            }
-
-            let mut closed_authoritative_roots = Vec::new();
-            if state.open_document_uri_for_authoritative_uri(uri).as_ref() == Some(uri) {
-                closed_authoritative_roots.push(uri.clone());
-            }
-            for alias in state.canonical_uris_for_open_document(uri) {
-                if state
-                    .open_document_uri_for_authoritative_uri(&alias)
-                    .as_ref()
-                    == Some(uri)
-                {
-                    closed_authoritative_roots.push(alias);
-                }
-            }
-            let closing_rprofile_root = authoritative_rprofile_root_for_open_document(&state, uri);
-            let closing_rprofile_sourced_root = if closing_rprofile_root.is_none() {
-                rprofile_sourced_root_for_open_document(&state, uri)
-            } else {
-                None
-            };
-            if let Some(root) = preamble_sourced_root_for_open_document(&state, uri) {
-                preamble_close_edit = Some((root, file_paths_for_open_document(&state, uri)));
-            }
-
-            // Retire the diagnostic lifecycle: cancel pending revalidation
-            // and clear the gate, including the lifecycle epoch (#603) so a
-            // worker this cancel cannot reach (not yet scheduled) still
-            // cannot publish into a reopen at the same version/revision.
-            state.retire_diagnostic_lifecycle(uri);
-
-            // Remove from activity tracking
-            state.cross_file_activity.remove(uri);
-
-            // Close the authoritative document and tear down canonical alias
-            // entries before watched-generation ownership is returned to disk.
-            let closed_aliases = state.close_document(uri);
-            if close_resync {
-                close_resync_uris.push(uri.clone());
-                for alias in &closed_aliases {
-                    if !close_resync_uris.contains(alias) {
-                        close_resync_uris.push(alias.clone());
-                    }
-                }
-            }
-
-            // Closing takes watched-resync generation ownership before any
-            // close-driven package mutation and before the spawned
-            // `run_close_resync` below. Watcher events for open documents are
-            // skipped, so a delayed retry that removed state and pruned this
-            // entry must not later apply its stale package removal after this
-            // close has reinstalled disk truth.
-            if has_disk_path {
-                bump_watched_file_resync_generation(&mut state, uri);
-                for alias in &closed_aliases {
-                    bump_watched_file_resync_generation(&mut state, alias);
-                }
-            }
-
-            // Snapshot package visibility before applying the close event, so we
-            // can detect symbol/import changes caused by switching the closed
-            // file's content from Open (unsaved buffer) to Disk. Open siblings
-            // resolved against the unsaved buffer must refresh their diagnostics
-            // when the buffer-only symbols disappear; otherwise stale "no error"
-            // diagnostics linger until the user touches each sibling.
-            let old_ns_model = state.package_state.namespace_model().cloned();
-            let old_contribution = state.package_state.scope_contribution().clone();
-
-            // In package mode, update package inputs on close. If another alias
-            // remains authoritative for the same canonical package slot, switch
-            // the slot to that live buffer immediately; otherwise revert to the
-            // disk snapshot captured above.
-            if let Some(package_close_uri) = package_close_uri.clone() {
-                let live_text = if package_close_excluded {
-                    None
-                } else {
-                    state
-                        .open_document_uri_for_authoritative_uri(&package_close_uri)
-                        .and_then(|open_uri| state.documents.get(&open_uri).map(|doc| doc.text()))
-                        .map(Arc::<str>::from)
-                };
-                let event = if let Some(text) = live_text {
-                    crate::package_state::event::HandlerEvent::DidChange {
-                        uri: package_close_uri,
-                        text,
-                    }
-                } else {
-                    crate::package_state::event::HandlerEvent::DidClose {
-                        uri: package_close_uri,
-                        on_disk_text: close_text.clone(),
-                    }
-                };
-                if let Some(delta) = translate_package_event(&mut state, event) {
-                    state.apply_package_event(&delta);
-                }
-            }
-
-            // Workspace-root `.Rprofile` is not a package close URI (it is
-            // neither an R-source path nor a manifest), so the close above does
-            // not touch the prelude. The alias map is already torn down here,
-            // so ownership was captured before close; now either promote the
-            // next live alias or schedule a disk re-scan.
-            if let Some(root) = closing_rprofile_root {
-                if let Some(text) = authoritative_rprofile_buffer_text_after_close(&state, &root) {
-                    rprofile_close_buffer = Some((root, text));
-                } else {
-                    rprofile_close_root = Some(root);
-                }
-            } else if let Some(root) = closing_rprofile_sourced_root {
-                // Closing a helper the `.Rprofile` transitively source()s also
-                // reverts the prelude to disk: the watcher path — which folds
-                // the same rescan into its R-file deltas (Task 12) — skipped
-                // every event while this document was open.
-                rprofile_close_root = Some(root);
-            }
-
-            // Detect package-mode visibility changes triggered by the close.
-            // When an unsaved buffer with buffer-only symbols (e.g. a freshly
-            // added function) closes, those symbols leave `r_internal_symbols`
-            // and any open sibling that referenced them needs its diagnostics
-            // recomputed. Mirrors the watched-file fanout above (including
-            // `max_revalidations_per_trigger`).
-            let mut sibling_fanout: Vec<(Url, DiagnosticsTrigger)> = Vec::new();
-            let pkg_visibility_changed = state.package_state.namespace_model()
-                != old_ns_model.as_ref()
-                || state.package_state.scope_contribution() != &old_contribution;
-            if pkg_visibility_changed
-                && let Some(root) = state.package_inputs.workspace_root.clone()
-            {
-                sibling_fanout = collect_close_fanout_siblings(&state, uri, &root);
-                // Close-time visibility changes must also reach
-                // devtools::load_all() carriers (root-level analysis.R,
-                // scripts/) and their source-graph neighborhoods —
-                // `is_r_source_path` misses those, and every
-                // watcher-driven visibility fanout already widens this
-                // way. Re-cap the union so the extension cannot bypass
-                // `max_revalidations_per_trigger`.
-                let mut uris: Vec<Url> = sibling_fanout.iter().map(|(u, _)| u.clone()).collect();
-                let mut seen: std::collections::HashSet<Url> = uris.iter().cloned().collect();
-                seen.insert(uri.clone());
-                extend_affected_for_load_all_revalidation_from_state(
-                    &mut uris, &mut seen, &state, &root,
-                );
-                cap_watched_file_revalidations(
-                    &mut uris,
-                    &state.cross_file_activity,
-                    state.cross_file_config.max_revalidations_per_trigger,
-                );
-                sibling_fanout = uris
-                    .into_iter()
-                    .filter(|u| state.documents.contains_key(u))
-                    .map(|u| {
-                        let trigger = DiagnosticsTrigger::capture(&state, &u);
-                        (u, trigger)
-                    })
-                    .collect();
-            }
-            let remirror_affected = remirror_authoritative_alias_roots_after_close(
-                &mut state,
-                &closed_authoritative_roots,
-                resync_old_meta.as_deref(),
-                resync_old_interface_hash,
-            );
-            if !remirror_affected.is_empty() {
-                add_close_fanout_uris(&state, &mut sibling_fanout, remirror_affected);
-            }
-            // When the disk resync runs, it owns the siblings' marking and
-            // publishing (folded into run_close_resync so an open file
-            // that is both a package sibling and a graph dependent is
-            // force-marked exactly once, and publishes post-commit).
-            // Marking here as well would strand a counter: the resync's
-            // debounced schedule cancels the pending sibling task.
-            if !sibling_fanout.is_empty() && !close_resync {
-                state
-                    .diagnostics_gate
-                    .mark_force_republish_many(sibling_fanout.iter().map(|(u, _)| u));
-            }
-
-            // Invalidate the workspace index entry so the next scan re-reads from disk.
-            if let Ok(p) = uri.to_file_path()
-                && state
-                    .package_workspace()
-                    .is_some_and(|pkg| is_package_source_dir(&p, &pkg.root))
-            {
-                state.workspace_index.invalidate(uri);
-            }
-
-            // Refresh the pin set now that the open set has shrunk; URIs reachable
-            // only from the closed file are no longer protected from eviction.
-            state.recompute_open_neighborhood_pins();
-
-            let debounce_ms = state.cross_file_config.revalidation_debounce_ms;
-            (sibling_fanout, debounce_ms)
-        };
-
-        // Push diagnostics are owned by the server and survive document close
-        // unless explicitly replaced. Clear the raw client URI after the state
-        // commit (pending work is cancelled and the gate is cleared above) but
-        // before slower close-time rescans. With the LSP dispatcher serialized,
-        // a subsequent didOpen cannot overtake this empty publication.
-        log::trace!(
-            "diagnostics lifecycle: publish uri={} count=0 path=close-clear open=false",
-            uri
-        );
-        self.client
-            .publish_diagnostics(uri.clone(), Vec::new(), None)
-            .await;
-        drop(_diagnostics_publish_guard);
-
-        // Switch the prelude to a remaining live `.Rprofile` alias, or revert
-        // it to on-disk `.Rprofile` after a close (off-lock).
-        if let Some((root, text)) = rprofile_close_buffer {
-            self.refresh_rprofile_prelude_from_buffer(root, text).await;
-        } else if let Some(root) = rprofile_close_root {
-            self.refresh_rprofile_prelude_from_disk(root).await;
-        }
-        if let Some((root, paths)) = preamble_close_edit {
-            let scheduled_uris = sibling_fanout.iter().map(|(uri, _)| uri.clone()).collect();
-            self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
-                .await;
-        }
-
-        if close_resync {
-            // Issue #558: converge cross-file state back to disk truth
-            // off-lock. The buffer-derived graph edges were deliberately left
-            // untouched in the write-lock block above; the spawned resync
-            // replaces them atomically from disk (or removes the file's entry
-            // if it is gone), then republishes affected open dependents —
-            // including the package-visibility siblings, which ride the
-            // resync so each URI is marked exactly once and published after
-            // the commit — through the normal gate. A close-then-reopen race
-            // is handled by the resync's commit-time veto. Never calls
-            // `scan_workspace` — this re-reads exactly one file.
-            let mut sibling_uris: Vec<Url> = sibling_fanout.into_iter().map(|(u, _)| u).collect();
-            for resync_uri in close_resync_uris {
-                let package_siblings = std::mem::take(&mut sibling_uris);
-                tokio::spawn(run_close_resync(
-                    self.state.clone(),
-                    self.client.clone(),
-                    self.traversal_truncation.clone(),
-                    resync_uri,
-                    resync_chunk_kind,
-                    resync_old_meta.clone(),
-                    resync_old_interface_hash,
-                    package_siblings,
-                ));
-            }
-        } else {
-            // No disk resync for this close (non-file URI or non-R document):
-            // schedule the package-sibling revalidation directly, outside the
-            // write lock. The debounce window collapses bursts (e.g. "close
-            // all" closing many files in quick succession) into a single
-            // republish per sibling.
-            for (sibling_uri, trigger) in sibling_fanout {
-                let state_arc = self.state.clone();
-                let client = self.client.clone();
-                let traversal_truncation = self.traversal_truncation.clone();
-                tokio::spawn(run_debounced_diagnostics(
-                    state_arc,
-                    client,
-                    sibling_uri,
-                    debounce_ms,
-                    trigger,
-                    Some(traversal_truncation),
-                ));
-            }
-        }
+        did_close_transactional(self, uri).await;
     }
 
     /// Apply updated workspace configuration, invalidate caches that affect name-resolution scope, and re-run diagnostics for all open documents.
@@ -13340,28 +13536,6 @@ impl Backend {
         self.apply_rprofile_prelude_rescan(scan).await;
     }
 
-    /// Revert the `.Rprofile` prelude to the on-disk content (`did_close`). When
-    /// an open `.Rprofile` is closed WITHOUT saving, the live buffer edits that
-    /// `refresh_rprofile_prelude_from_buffer` folded into the prelude must be
-    /// discarded — the disk file is authoritative again. Re-scans from disk
-    /// OFF-lock and applies + fans out, mirroring how `did_close` reverts open
-    /// package R files from buffer to disk.
-    async fn refresh_rprofile_prelude_from_disk(&self, root: std::path::PathBuf) {
-        let root_for_scan = root.clone();
-        let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
-        let Ok(scan) = tokio::task::spawn_blocking(move || {
-            crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-                &root_for_scan,
-                &workspace_exclusions,
-            )
-        })
-        .await
-        else {
-            return;
-        };
-        self.apply_rprofile_prelude_rescan(scan).await;
-    }
-
     /// Shared tail of the live `.Rprofile` refresh: apply the already-scanned
     /// (off-lock) prelude under the write lock via the lock-safe seam
     /// ([`apply_rprofile_scan`]), then republish every open workspace R file
@@ -14207,6 +14381,7 @@ pub(crate) async fn publish_diagnostics_inner(
         Arc::clone(&state.diagnostics_publish_lock)
     };
     let _publish_guard = publish_lock.lock().await;
+    pause_after_diagnostics_publish_lock_for_test(state_arc, uri).await;
     let open_at_publish = {
         let state = state_arc.read().await;
         if !state.diagnostics_publish_allowed(uri) {
@@ -14873,6 +15048,7 @@ async fn run_libpath_consumer(
 mod tests {
     mod diagnostic_lifecycle {
         use futures_util::StreamExt;
+        use std::sync::Arc;
         use std::time::Duration;
         use tempfile::TempDir;
         use tower::{Service, ServiceExt};
@@ -14996,6 +15172,185 @@ mod tests {
                 "closed document diagnostics must be cleared, got {:?}",
                 cleared.diagnostics
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn diagnostic_worker_owning_publish_lock_orders_before_close_empty() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("worker-first.R");
+            std::fs::write(&path, "missing_worker_first\n").unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: "missing_worker_first\n".into(),
+                    },
+                })
+                .await;
+            wait_until_pending(backend, &uri).await;
+            let (pause, trigger) = {
+                let state = backend.state.write().await;
+                (
+                    state
+                        .diagnostics_post_publish_lock_test_pause
+                        .arm(uri.clone()),
+                    super::super::DiagnosticsTrigger::capture(&state, &uri),
+                )
+            };
+            let worker = tokio::spawn(super::super::run_debounced_diagnostics(
+                Arc::clone(&backend.state),
+                backend.client.clone(),
+                uri.clone(),
+                0,
+                trigger,
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(5), pause.wait_arrived())
+                .await
+                .expect("worker owns the publish lock");
+            let close = backend.did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            });
+            tokio::pin!(close);
+            tokio::select! {
+                _ = &mut close => panic!("close committed while the worker owned the publish lock"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            let collector = tokio::spawn(async move {
+                loop {
+                    let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                        .await
+                        .expect("ordered diagnostics publication must arrive")
+                        .expect("client socket remains open");
+                    if message.method() != "textDocument/publishDiagnostics" {
+                        continue;
+                    }
+                    let params: PublishDiagnosticsParams =
+                        serde_json::from_value(message.params().unwrap().clone()).unwrap();
+                    if params.uri != uri {
+                        continue;
+                    }
+                    if params.diagnostics.is_empty() {
+                        return Some(params);
+                    }
+                }
+            });
+            pause.release();
+            worker.await.unwrap();
+            close.await;
+            let last = collector.await.unwrap();
+            assert!(
+                last.is_some_and(|params| params.diagnostics.is_empty()),
+                "the close-owned empty publication must be last"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn close_owning_publish_lock_orders_before_stale_worker_declines() {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("close-first.R");
+            std::fs::write(&path, "missing_close_first\n").unwrap();
+            let uri = Url::from_file_path(path).unwrap();
+            let (mut svc, mut socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            let backend = svc.inner();
+            {
+                let mut state = backend.state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: "missing_close_first\n".into(),
+                    },
+                })
+                .await;
+            wait_until_pending(backend, &uri).await;
+            let (worker_pause, close_pause, trigger) = {
+                let state = backend.state.write().await;
+                (
+                    state.diagnostics_test_pause.arm(uri.clone()),
+                    state
+                        .did_close_post_commit_pre_publish_test_pause
+                        .arm(uri.clone()),
+                    super::super::DiagnosticsTrigger::capture(&state, &uri),
+                )
+            };
+            let worker = tokio::spawn(super::super::run_debounced_diagnostics(
+                Arc::clone(&backend.state),
+                backend.client.clone(),
+                uri.clone(),
+                0,
+                trigger,
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(5), worker_pause.wait_arrived())
+                .await
+                .expect("worker reaches its pre-lock barrier");
+            let close = backend.did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            });
+            tokio::pin!(close);
+            tokio::select! {
+                _ = close_pause.wait_arrived() => {}
+                _ = &mut close => panic!("close skipped its postcommit barrier"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    panic!("close did not acquire the publish lock")
+                }
+            }
+            worker_pause.release();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !worker.is_finished(),
+                "worker must wait behind the close lock"
+            );
+            close_pause.release();
+            close.await;
+            worker.await.unwrap();
+
+            let mut publications = Vec::new();
+            while let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(100), socket.next()).await
+            {
+                if message.method() == "textDocument/publishDiagnostics" {
+                    let params: PublishDiagnosticsParams =
+                        serde_json::from_value(message.params().unwrap().clone()).unwrap();
+                    if params.uri == uri {
+                        publications.push(params);
+                    }
+                }
+            }
+            assert_eq!(publications.len(), 1);
+            assert!(publications[0].diagnostics.is_empty());
         }
 
         /// Clients that do not send Raven's VS Code-specific tab set retain
@@ -16714,14 +17069,12 @@ mod tests {
         }
     }
 
-    /// Regression tests for `collect_close_fanout_siblings`, which decides
-    /// which open package files get force-republished when a sibling closes
-    /// and the close changes package-mode visibility.
-    mod close_fanout_siblings {
+    /// Regression tests for package path and input helpers.
+    mod package_input_helpers {
         use super::super::{
-            collect_close_fanout_siblings, collect_package_r_file_inputs_from_disk,
-            extend_with_open_package_docs, initialize_package_inputs_from_state_with_exclusions,
-            is_package_data_path, is_package_relevant_open_uri, is_package_source_dir,
+            collect_package_r_file_inputs_from_disk, extend_with_open_package_docs,
+            initialize_package_inputs_from_state_with_exclusions, is_package_data_path,
+            is_package_relevant_open_uri, is_package_source_dir,
             package_scope_workspace_r_path_for_open_document, path_in_rprofile_sourced_set,
         };
         use crate::state::{Document, WorldState};
@@ -16749,108 +17102,6 @@ mod tests {
                     .insert(r_uri(name), Document::new("x <- 1\n", Some(1)));
             }
             state
-        }
-
-        #[test]
-        fn fanout_excludes_the_closing_uri() {
-            let state = make_state_with_open_pkg_docs(&["a.R", "b.R", "c.R"]);
-            let closing = r_uri("a.R");
-
-            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
-
-            assert_eq!(
-                fanout.len(),
-                2,
-                "should fan out to the two non-closing siblings"
-            );
-            assert!(
-                fanout.iter().all(|(u, _)| u != &closing),
-                "fanout must not include the closing URI"
-            );
-            assert!(fanout.iter().any(|(u, _)| u == &r_uri("b.R")));
-            assert!(fanout.iter().any(|(u, _)| u == &r_uri("c.R")));
-        }
-
-        #[test]
-        fn fanout_filters_out_files_outside_the_package_layout() {
-            let mut state = make_state_with_open_pkg_docs(&["a.R"]);
-            // Same workspace root, but not under R/ or tests/testthat/.
-            let scratch = Url::from_file_path(pkg_root().join("scratch.R")).unwrap();
-            state
-                .documents
-                .insert(scratch.clone(), Document::new("y <- 2\n", Some(1)));
-            // Different workspace entirely.
-            let outside = Url::from_file_path("/other/proj/foo.R").unwrap();
-            state
-                .documents
-                .insert(outside.clone(), Document::new("z <- 3\n", Some(1)));
-
-            let closing = r_uri("a.R");
-            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
-
-            assert!(
-                fanout.iter().all(|(u, _)| u != &scratch && u != &outside),
-                "files outside R/ and tests/testthat/ must not appear in fanout"
-            );
-        }
-
-        #[test]
-        fn fanout_includes_testthat_siblings() {
-            let mut state = make_state_with_open_pkg_docs(&["a.R"]);
-            let test_uri =
-                Url::from_file_path(pkg_root().join("tests").join("testthat").join("test-a.R"))
-                    .unwrap();
-            state.documents.insert(
-                test_uri.clone(),
-                Document::new("expect_equal(1, 1)\n", Some(1)),
-            );
-
-            let closing = r_uri("a.R");
-            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
-
-            assert!(
-                fanout.iter().any(|(u, _)| u == &test_uri),
-                "tests/testthat/ siblings should refresh on R/ close"
-            );
-        }
-
-        #[test]
-        fn fanout_respects_max_revalidations_per_trigger() {
-            let names: Vec<String> = (0..20).map(|i| format!("f{i}.R")).collect();
-            let names_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let mut state = make_state_with_open_pkg_docs(&names_refs);
-            state.cross_file_config.max_revalidations_per_trigger = 3;
-
-            let closing = r_uri("f0.R");
-            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
-
-            assert_eq!(
-                fanout.len(),
-                3,
-                "fanout must be capped at max_revalidations_per_trigger \
-                 to bound diagnostic bursts on close-all"
-            );
-        }
-
-        #[test]
-        fn fanout_snapshots_each_siblings_version_and_revision() {
-            let mut state = make_state_with_open_pkg_docs(&["a.R"]);
-            // Insert a sibling with a specific version/revision pair.
-            let b = r_uri("b.R");
-            let mut doc_b = Document::new("y <- 2\n", Some(7));
-            doc_b.revision = 42;
-            state.documents.insert(b.clone(), doc_b);
-
-            let closing = r_uri("a.R");
-            let fanout = collect_close_fanout_siblings(&state, &closing, &pkg_root());
-
-            let (got_uri, got_trigger) = fanout
-                .into_iter()
-                .find(|(u, _)| u == &b)
-                .expect("b.R in fanout");
-            assert_eq!(got_uri, b);
-            assert_eq!(got_trigger.version, Some(7));
-            assert_eq!(got_trigger.revision, Some(42));
         }
 
         #[test]
@@ -22843,43 +23094,7 @@ mod project_config_initialize_tests {
             );
         }
 
-        let (closed_authoritative_roots, old_meta, old_interface_hash) = {
-            let state = backend.state.read().await;
-            let mut roots = Vec::new();
-            if state
-                .open_document_uri_for_authoritative_uri(&alias_a)
-                .as_ref()
-                == Some(&alias_a)
-            {
-                roots.push(alias_a.clone());
-            }
-            for alias in state.canonical_uris_for_open_document(&alias_a) {
-                if state
-                    .open_document_uri_for_authoritative_uri(&alias)
-                    .as_ref()
-                    == Some(&alias_a)
-                {
-                    roots.push(alias);
-                }
-            }
-            let old_meta = state.get_enriched_metadata(&alias_a);
-            let old_interface_hash = state
-                .documents
-                .get_record(&alias_a)
-                .map(|record| record.artifacts().interface_hash);
-            (roots, old_meta, old_interface_hash)
-        };
-
-        {
-            let mut state = backend.state.write().await;
-            state.close_document(&alias_a);
-            remirror_authoritative_alias_roots_after_close(
-                &mut state,
-                &closed_authoritative_roots,
-                old_meta.as_deref(),
-                old_interface_hash,
-            );
-        }
+        close_doc(backend, &alias_a).await;
 
         let state = backend.state.read().await;
         assert_eq!(
@@ -33108,7 +33323,7 @@ infixContinuationStyle = "aligned"
             }
         }
         {
-            let mut state = backend.state.write().await;
+            let state = backend.state.read().await;
             assert!(!state.documents.contains_key(&uri));
             assert!(state.diagnostics_gate.current_epoch(&uri).is_none());
             assert!(state.cross_file_graph.get_dependencies(&uri).is_empty());
@@ -33117,10 +33332,16 @@ infixContinuationStyle = "aligned"
                     .open_document_uri_for_authoritative_uri(&uri)
                     .is_none()
             );
-            state.close_document(&uri);
+        }
+        let close = close_doc(backend, &uri);
+        tokio::pin!(close);
+        tokio::select! {
+            _ = &mut close => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
         }
         pause.release();
         handler.await;
+        close.await;
         assert!(!backend.state.read().await.documents.contains_key(&uri));
 
         open_doc(backend, &uri, "r", 1, "reopened <- 1\n").await;
@@ -34297,6 +34518,317 @@ infixContinuationStyle = "aligned"
                     .contains_key("fake_prose")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn did_close_target_edit_is_terminal_and_never_rebases() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "close-edit-owner.R", "r", "before <- 1\n").await;
+        let backend = svc.inner();
+        let pause = backend
+            .state
+            .write()
+            .await
+            .did_close_pre_commit_test_pause
+            .arm(uri.clone());
+        let close = close_doc(backend, &uri);
+        tokio::pin!(close);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut close => panic!("close skipped its pre-commit barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("close did not reach its pre-commit barrier")
+            }
+        }
+        change_doc(backend, &uri, 2, "edited <- 2\n").await;
+        pause.release();
+        close.await;
+        let state = backend.state.read().await;
+        let record = state.documents.get_record(&uri).expect("edit remains open");
+        assert_eq!(record.document().text(), "edited <- 2\n");
+        assert_eq!(record.document().version, Some(2));
+    }
+
+    #[tokio::test]
+    async fn did_close_target_metadata_replacement_is_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, uri) =
+            open_in_workspace(&tmp, "close-metadata-owner.R", "r", "owner <- 1\n").await;
+        let backend = svc.inner();
+        let pause = backend
+            .state
+            .write()
+            .await
+            .did_close_pre_commit_test_pause
+            .arm(uri.clone());
+        let close = close_doc(backend, &uri);
+        tokio::pin!(close);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut close => panic!("close skipped its pre-commit barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("close did not reach its pre-commit barrier")
+            }
+        }
+        {
+            let mut state = backend.state.write().await;
+            let generation = state.documents.get_record(&uri).unwrap().generation();
+            let mut metadata = crate::cross_file::CrossFileMetadata::default();
+            metadata.working_directory = Some("/new-metadata-owner".into());
+            state
+                .replace_open_document_metadata_if_current(&uri, generation, Arc::new(metadata))
+                .unwrap();
+        }
+        pause.release();
+        close.await;
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .documents
+                .get_record(&uri)
+                .unwrap()
+                .metadata()
+                .working_directory
+                .as_deref(),
+            Some("/new-metadata-owner")
+        );
+    }
+
+    #[tokio::test]
+    async fn did_close_duplicate_open_is_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "close-duplicate.R", "r", "first <- 1\n").await;
+        let backend = svc.inner();
+        let pause = backend
+            .state
+            .write()
+            .await
+            .did_close_pre_commit_test_pause
+            .arm(uri.clone());
+        let close = close_doc(backend, &uri);
+        tokio::pin!(close);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut close => panic!("close skipped its pre-commit barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("close did not reach its pre-commit barrier")
+            }
+        }
+        open_doc(backend, &uri, "r", 1, "duplicate <- 2\n").await;
+        pause.release();
+        close.await;
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .documents
+                .get(&uri)
+                .map(|document| document.text()),
+            Some("duplicate <- 2\n".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn did_close_second_ancillary_invalidation_stops_after_one_retry() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "close-retry-cap.R", "r", "owner <- 1\n").await;
+        let backend = svc.inner();
+        let first_pause = backend
+            .state
+            .write()
+            .await
+            .did_close_pre_commit_test_pause
+            .arm(uri.clone());
+        let close = close_doc(backend, &uri);
+        tokio::pin!(close);
+        tokio::select! {
+            _ = first_pause.wait_arrived() => {}
+            _ = &mut close => panic!("close skipped its first barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("close did not reach its first barrier")
+            }
+        }
+        let second_pause = {
+            let state = backend.state.write().await;
+            state.workspace_index.invalidate_all();
+            state.did_close_pre_commit_test_pause.arm(uri.clone())
+        };
+        first_pause.release();
+        tokio::select! {
+            _ = second_pause.wait_arrived() => {}
+            _ = &mut close => panic!("close did not retry after ancillary drift"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("close did not reach its second barrier")
+            }
+        }
+        backend.state.write().await.workspace_index.invalidate_all();
+        second_pause.release();
+        close.await;
+        assert!(
+            backend.state.read().await.documents.contains_key(&uri),
+            "the bounded close must stop instead of deriving a third attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_did_close_cannot_remove_same_version_reopen_aba() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "close-aba.R", "r", "first <- 1\n").await;
+        let backend = svc.inner();
+        let pause = backend
+            .state
+            .write()
+            .await
+            .did_close_pre_commit_test_pause
+            .arm(uri.clone());
+        let stale_close = close_doc(backend, &uri);
+        tokio::pin!(stale_close);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut stale_close => panic!("stale close skipped its barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("stale close did not reach its barrier")
+            }
+        }
+        close_doc(backend, &uri).await;
+        open_doc(backend, &uri, "r", 1, "reopened <- 2\n").await;
+        pause.release();
+        stale_close.await;
+        let state = backend.state.read().await;
+        let record = state
+            .documents
+            .get_record(&uri)
+            .expect("reopen remains authoritative");
+        assert_eq!(record.document().text(), "reopened <- 2\n");
+        assert_eq!(record.document().version, Some(1));
+        assert_eq!(record.document().revision, 0);
+    }
+
+    #[tokio::test]
+    async fn did_close_commit_is_all_or_none_before_empty_publish() {
+        let tmp = TempDir::new().unwrap();
+        let (svc, uri) = open_in_workspace(&tmp, "close-atomic.R", "r", "live <- 1\n").await;
+        let backend = svc.inner();
+        let pause = backend
+            .state
+            .write()
+            .await
+            .did_close_post_commit_pre_publish_test_pause
+            .arm(uri.clone());
+        let close = close_doc(backend, &uri);
+        tokio::pin!(close);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut close => panic!("close published before its post-commit barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("close did not reach its post-commit barrier")
+            }
+        }
+        {
+            let state = backend.state.read().await;
+            assert!(!state.documents.contains_key(&uri));
+            assert!(state.diagnostics_gate.current_epoch(&uri).is_none());
+            assert!(
+                state
+                    .open_document_uri_for_authoritative_uri(&uri)
+                    .is_none()
+            );
+            assert!(!state.workspace_index.contains(&uri));
+            assert!(state.cross_file_graph.get_dependencies(&uri).is_empty());
+        }
+        pause.release();
+        close.await;
+    }
+
+    async fn close_resync_fixture(name: &str) -> (tempfile::TempDir, LspService<Backend>, Url) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(name);
+        fs::write(&path, "disk_before <- 1\n").unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_scan_complete = true;
+            state.cross_file_config.packages_enabled = false;
+            state.cross_file_config.on_demand_indexing_enabled = false;
+            state.insert_workspace_document_for_test(
+                uri.clone(),
+                crate::state::Document::new_with_uri("disk_before <- 1\n", None, &uri),
+            );
+        }
+        open_doc(backend, &uri, "r", 1, "unsaved <- 2\n").await;
+        (tmp, svc, uri)
+    }
+
+    #[tokio::test]
+    async fn close_resync_pre_commit_reopen_vetoes_closed_install() {
+        let (_tmp, svc, uri) = close_resync_fixture("resync-reopen.R").await;
+        let backend = svc.inner();
+        let pause = backend
+            .state
+            .write()
+            .await
+            .close_resync_pre_commit_test_pause
+            .arm(uri.clone());
+        close_doc(backend, &uri).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
+            .await
+            .expect("close resync reaches pre-commit barrier");
+        open_doc(backend, &uri, "r", 1, "reopened <- 3\n").await;
+        pause.release();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .documents
+                .get(&uri)
+                .map(|document| document.text()),
+            Some("reopened <- 3\n".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn close_resync_pre_commit_rejects_changed_disk_snapshot() {
+        let (tmp, svc, uri) = close_resync_fixture("resync-snapshot.R").await;
+        let backend = svc.inner();
+        let pause = backend
+            .state
+            .write()
+            .await
+            .close_resync_pre_commit_test_pause
+            .arm(uri.clone());
+        close_doc(backend, &uri).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
+            .await
+            .expect("close resync reaches pre-commit barrier");
+        fs::write(tmp.path().join("resync-snapshot.R"), "disk_after <- 2\n").unwrap();
+        pause.release();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .workspace_index
+                .get(&uri)
+                .map(|entry| entry.contents.to_string()),
+            Some("disk_before <- 1\n".into()),
+            "the stale disk parse must not replace the retained shadow"
+        );
     }
 
     /// Close `uri` through the real `did_close` path.

@@ -18,6 +18,7 @@ use ropey::Rope;
 use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
 
 static NEXT_OPEN_INSTALL_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_OPEN_CLOSE_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Symbol provider configuration
 ///
@@ -831,6 +832,20 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) did_open_pre_commit_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic barriers around the OpenClose central CAS and empty
+    /// publication while the diagnostics publish lock is held.
+    #[cfg(test)]
+    pub(crate) did_close_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) did_close_post_commit_pre_publish_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) close_resync_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) diagnostics_post_publish_lock_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
     /// Deterministic barrier after alias-reconcile derivation and before its
     /// commit-time topology recheck.
     #[cfg(test)]
@@ -1019,6 +1034,8 @@ pub struct WorldState {
     /// absent→open→close cycle cannot make an older absent candidate current
     /// again. Every transition receives a process-wide never-reused identity.
     open_install_intents: HashMap<Url, OpenInstallIntentState>,
+    /// Persistent ownership tombstones for detached `didClose` transactions.
+    open_close_intents: HashMap<Url, OpenCloseIntentState>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) open_pin_recompute_count: usize,
     #[cfg(any(test, feature = "test-support"))]
@@ -1152,6 +1169,7 @@ enum AnalysisSubjectBasis {
     Observed(ClosedRecordToken),
     Open(OpenRecordToken),
     OpenInstall(Box<OpenInstallSubjectBasis>),
+    OpenClose(Box<OpenCloseSubjectBasis>),
 }
 
 /// Latest-arrival ownership for one detached `didOpen` install.
@@ -1180,6 +1198,35 @@ enum OpenInstallIntentState {
 #[derive(Clone)]
 struct OpenInstallSubjectBasis {
     intent: OpenInstallIntentToken,
+    target: OpenRecordToken,
+}
+
+/// Latest-arrival ownership for one detached `didClose` transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenCloseIntentToken {
+    uri: Url,
+    generation: u64,
+    /// Arrival-time record identity. Retries may refresh ancillary context but
+    /// must never rebase onto an edit, metadata replacement, or reopen.
+    target: OpenRecordToken,
+}
+
+impl OpenCloseIntentToken {
+    pub(crate) fn uri(&self) -> &Url {
+        &self.uri
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenCloseIntentState {
+    Pending(u64),
+    Closed(u64),
+    Cancelled(u64),
+}
+
+#[derive(Clone)]
+struct OpenCloseSubjectBasis {
+    intent: OpenCloseIntentToken,
     target: OpenRecordToken,
 }
 
@@ -1410,6 +1457,40 @@ impl PreparedOpenInstallAnalysis {
     }
 }
 
+impl PreparedOpenCloseAnalysis {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor makes every independently prepared close authority explicit"
+    )]
+    pub(crate) fn new(
+        basis: AnalysisBasis,
+        intent: OpenCloseIntentToken,
+        uri: Url,
+        expected_aliases: Vec<Url>,
+        package: Option<PreparedOpenPackageInstall>,
+        plan: PreparedOpenCommitPlan,
+        resync: Vec<OpenCloseResyncTicket>,
+        disk_observations: Vec<OpenCloseDiskObservation>,
+        watched_roots: Vec<(Url, ChunkKind)>,
+    ) -> Self {
+        Self {
+            basis,
+            intent,
+            uri,
+            expected_aliases,
+            package,
+            plan,
+            resync,
+            disk_observations,
+            watched_roots,
+        }
+    }
+
+    pub(crate) fn disk_observations(&self) -> &[OpenCloseDiskObservation] {
+        &self.disk_observations
+    }
+}
+
 pub(crate) enum PreparedAnalysisCommit {
     Upsert(Box<PreparedClosedAnalysis>),
     Remove { basis: Box<AnalysisBasis>, uri: Url },
@@ -1418,6 +1499,7 @@ pub(crate) enum PreparedAnalysisCommit {
     OpenMetadata(Box<PreparedOpenMetadataAnalysis>),
     OpenAliasReconcile(Box<PreparedOpenAliasReconcileAnalysis>),
     OpenInstall(Box<PreparedOpenInstallAnalysis>),
+    OpenClose(Box<PreparedOpenCloseAnalysis>),
 }
 
 pub(crate) struct PreparedOpenInstallAnalysis {
@@ -1432,11 +1514,61 @@ pub(crate) struct PreparedOpenInstallAnalysis {
     plan: PreparedOpenCommitPlan,
 }
 
+pub(crate) struct PreparedOpenCloseAnalysis {
+    basis: AnalysisBasis,
+    intent: OpenCloseIntentToken,
+    uri: Url,
+    expected_aliases: Vec<Url>,
+    package: Option<PreparedOpenPackageInstall>,
+    plan: PreparedOpenCommitPlan,
+    resync: Vec<OpenCloseResyncTicket>,
+    disk_observations: Vec<OpenCloseDiskObservation>,
+    watched_roots: Vec<(Url, ChunkKind)>,
+}
+
 /// Whole package-mode projection reduced off-lock for an OpenInstall.
 pub(crate) struct PreparedOpenPackageInstall {
     pub(crate) inputs: crate::package_state::PackageInputs,
     pub(crate) state: crate::package_state::PackageState,
 }
+
+/// Immutable fresh-disk convergence work released only after the close
+/// transaction and its empty diagnostic publication succeed.
+#[derive(Debug, Clone)]
+pub(crate) struct OpenCloseResyncTicket {
+    pub(crate) uri: Url,
+    pub(crate) chunk_kind: ChunkKind,
+    pub(crate) old_metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
+    pub(crate) old_interface_hash: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenCloseDiskObservation {
+    pub(crate) uri: Url,
+    pub(crate) snapshot: Option<crate::cross_file::file_cache::FileSnapshot>,
+}
+
+pub(crate) struct PreparedOpenCloseDiskInstall {
+    pub(crate) uri: Url,
+    pub(crate) entry: IndexEntry,
+    pub(crate) snapshot: crate::cross_file::file_cache::FileSnapshot,
+    pub(crate) content: String,
+}
+
+impl PartialEq for OpenCloseResyncTicket {
+    fn eq(&self, other: &Self) -> bool {
+        self.uri == other.uri
+            && self.chunk_kind == other.chunk_kind
+            && self.old_interface_hash == other.old_interface_hash
+            && match (&self.old_metadata, &other.old_metadata) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for OpenCloseResyncTicket {}
 
 pub(crate) struct PreparedOpenEditAnalysis {
     basis: AnalysisBasis,
@@ -1543,6 +1675,14 @@ pub(crate) struct PreparedOpenCommitPlan {
     /// Override for operations such as didOpen re-enrichment, whose subject
     /// uses the dependent debounce rather than the edited-file debounce.
     pub(crate) subject_debounce_ms: Option<u64>,
+    /// Close transitions remove the subject record before applying this plan.
+    /// The replacement interface comes from a surviving alias or retained
+    /// closed shadow, and the closed subject itself is never scheduled.
+    pub(crate) closing_subject: bool,
+    pub(crate) replacement_interface_hash: Option<u64>,
+    /// Fresh disk projections selected and parsed off-lock, then revalidated
+    /// under the diagnostics publish lock immediately before the close CAS.
+    pub(crate) close_disk_installs: Vec<PreparedOpenCloseDiskInstall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1550,6 +1690,11 @@ pub(crate) struct OpenAnalysisCommitOutcome {
     pub(crate) generation: AnalysisGeneration,
     pub(crate) provenance: crate::open_document_store::OpenDocumentProvenance,
     pub(crate) packages_to_prefetch: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenCloseCommitOutcome {
+    pub(crate) resync: Vec<OpenCloseResyncTicket>,
 }
 
 pub(crate) enum PreparedClosedMutation {
@@ -1572,6 +1717,7 @@ pub(crate) struct AnalysisCommitEffects {
     /// carries it into the one final reservation.
     pub(crate) affected_candidates: Vec<Url>,
     pub(crate) open: Option<OpenAnalysisCommitOutcome>,
+    pub(crate) close: Option<OpenCloseCommitOutcome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1974,6 +2120,18 @@ impl WorldState {
             did_open_pre_commit_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
+            did_close_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            did_close_post_commit_pre_publish_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            close_resync_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            diagnostics_post_publish_lock_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
             alias_reconcile_pre_commit_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
@@ -2023,6 +2181,7 @@ impl WorldState {
             workspace_graph_authority_generation: 0,
             open_context_authority_generation: OpenContextAuthorityGeneration(0),
             open_install_intents: HashMap::new(),
+            open_close_intents: HashMap::new(),
             #[cfg(any(test, feature = "test-support"))]
             open_pin_recompute_count: 0,
             #[cfg(any(test, feature = "test-support"))]
@@ -2071,6 +2230,7 @@ impl WorldState {
 
     /// Claim latest-arrival ownership for one `didOpen` request.
     pub(crate) fn begin_open_install_intent(&mut self, uri: &Url) -> OpenInstallIntentToken {
+        self.cancel_open_close_intent(uri);
         let generation = Self::mint_open_install_intent_generation();
         self.open_install_intents
             .insert(uri.clone(), OpenInstallIntentState::Pending(generation));
@@ -2111,6 +2271,66 @@ impl WorldState {
         self.open_install_intents.insert(
             token.uri().clone(),
             OpenInstallIntentState::Installed(generation),
+        );
+    }
+
+    fn mint_open_close_intent_generation() -> u64 {
+        NEXT_OPEN_CLOSE_INTENT_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("open-close intent generation counter exhausted")
+    }
+
+    /// Claim latest-arrival ownership for one `didClose` request and
+    /// immediately tombstone an invisible pending `didOpen`.
+    pub(crate) fn begin_open_close_intent(&mut self, uri: &Url) -> OpenCloseIntentToken {
+        self.cancel_open_install_intent(uri);
+        let generation = Self::mint_open_close_intent_generation();
+        self.open_close_intents
+            .insert(uri.clone(), OpenCloseIntentState::Pending(generation));
+        OpenCloseIntentToken {
+            uri: uri.clone(),
+            generation,
+            target: self.documents.record_token(uri),
+        }
+    }
+
+    pub(crate) fn open_close_intent_is_current(&self, token: &OpenCloseIntentToken) -> bool {
+        self.open_close_intents.get(token.uri())
+            == Some(&OpenCloseIntentState::Pending(token.generation))
+            && self.documents.record_token_is_current(&token.target)
+    }
+
+    /// Invalidate every pending close for `uri`, including while absent.
+    pub(crate) fn cancel_open_close_intent(&mut self, uri: &Url) {
+        let generation = Self::mint_open_close_intent_generation();
+        self.open_close_intents
+            .insert(uri.clone(), OpenCloseIntentState::Cancelled(generation));
+    }
+
+    pub(crate) fn cancel_open_close_intent_if_current(
+        &mut self,
+        token: &OpenCloseIntentToken,
+    ) -> bool {
+        if self.open_close_intents.get(token.uri())
+            != Some(&OpenCloseIntentState::Pending(token.generation))
+        {
+            return false;
+        }
+        self.cancel_open_close_intent(token.uri());
+        true
+    }
+
+    fn consume_open_close_intent(&mut self, token: &OpenCloseIntentToken) {
+        debug_assert!(
+            self.open_close_intents.get(token.uri())
+                == Some(&OpenCloseIntentState::Pending(token.generation))
+        );
+        let generation = Self::mint_open_close_intent_generation();
+        self.open_close_intents.insert(
+            token.uri().clone(),
+            OpenCloseIntentState::Closed(generation),
         );
     }
 
@@ -2900,6 +3120,23 @@ impl WorldState {
         )
     }
 
+    pub(crate) fn capture_open_close_analysis_basis(
+        &self,
+        intent: &OpenCloseIntentToken,
+    ) -> Option<AnalysisBasis> {
+        if !self.open_close_intent_is_current(intent) {
+            return None;
+        }
+        self.capture_open_transition_analysis_basis(
+            AnalysisSubjectBasis::OpenClose(Box::new(OpenCloseSubjectBasis {
+                intent: intent.clone(),
+                target: intent.target.clone(),
+            })),
+            intent.uri(),
+            self.canonical_uris_for_open_document(intent.uri()),
+        )
+    }
+
     fn capture_open_transition_analysis_basis(
         &self,
         subject: AnalysisSubjectBasis,
@@ -3136,10 +3373,17 @@ impl WorldState {
                     && self.open_install_intent_is_current(&install.intent)
                     && self.documents.record_token_is_current(&install.target)
             }
+            AnalysisSubjectBasis::OpenClose(close) => {
+                close.intent.uri() == uri
+                    && self.open_close_intent_is_current(&close.intent)
+                    && self.documents.record_token_is_current(&close.target)
+            }
         };
         let closed_subject = !matches!(
             &basis.subject,
-            AnalysisSubjectBasis::Open(_) | AnalysisSubjectBasis::OpenInstall(_)
+            AnalysisSubjectBasis::Open(_)
+                | AnalysisSubjectBasis::OpenInstall(_)
+                | AnalysisSubjectBasis::OpenClose(_)
         );
         if !subject_current
             || (closed_subject && self.is_document_open_or_alias(uri))
@@ -3239,6 +3483,7 @@ impl WorldState {
                 .collect(),
             affected_candidates: Vec::new(),
             open: None,
+            close: None,
         }
     }
 
@@ -3255,6 +3500,9 @@ impl WorldState {
         prepared: PreparedAnalysisCommit,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
         let mutations = match prepared {
+            PreparedAnalysisCommit::OpenClose(prepared) => {
+                return self.try_commit_open_close(*prepared);
+            }
             PreparedAnalysisCommit::OpenInstall(prepared) => {
                 return self.try_commit_open_install(*prepared);
             }
@@ -3276,6 +3524,67 @@ impl WorldState {
             PreparedAnalysisCommit::Batch(mutations) => mutations,
         };
         self.try_commit_closed_batch(mutations)
+    }
+
+    fn try_commit_open_close(
+        &mut self,
+        mut prepared: PreparedOpenCloseAnalysis,
+    ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        let targets = HashSet::from([prepared.uri.clone()]);
+        if !self.analysis_basis_is_current(&prepared.basis, &prepared.uri, &targets)
+            || !self.open_close_intent_is_current(&prepared.intent)
+            || self.canonical_uris_for_open_document(&prepared.uri) != prepared.expected_aliases
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+
+        let old_interface = self
+            .documents
+            .get_record(&prepared.uri)
+            .map(|record| record.artifacts().interface_hash);
+        for (root, chunk_kind) in &prepared.watched_roots {
+            self.record_editor_chunk_kind_override(root, *chunk_kind);
+            self.watched_file_resync_generation_counter =
+                self.watched_file_resync_generation_counter.wrapping_add(1);
+            self.watched_file_resync_generations
+                .insert(root.clone(), self.watched_file_resync_generation_counter);
+        }
+
+        self.advance_workspace_scan_generation();
+        self.retire_diagnostic_lifecycle(&prepared.uri);
+        self.cross_file_activity.remove(&prepared.uri);
+        let closed_aliases = self.open_document_aliases.close(&prepared.uri);
+        debug_assert_eq!(closed_aliases, prepared.expected_aliases);
+        self.documents.close(&prepared.uri);
+        if let Ok(mut cache) = self.effective_lint_config_cache.lock() {
+            cache.remove(prepared.uri.as_str());
+        }
+        if let Some(package) = prepared.package {
+            self.package_inputs = package.inputs;
+            self.package_state.set_from(package.state);
+            self.record_package_input_mutation();
+            self.refresh_local_dev_overlay();
+        }
+
+        for install in prepared.plan.close_disk_installs.drain(..) {
+            self.workspace_index
+                .install_complete_preserving_provenance(install.uri.clone(), install.entry);
+            self.cross_file_file_cache
+                .insert(install.uri, install.snapshot, install.content);
+        }
+        let revalidations =
+            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan);
+        self.consume_open_close_intent(&prepared.intent);
+        self.advance_workspace_graph_authority_generation();
+        self.advance_open_context_authority_generation();
+        Ok(AnalysisCommitEffects {
+            revalidations,
+            affected_candidates: Vec::new(),
+            open: None,
+            close: Some(OpenCloseCommitOutcome {
+                resync: prepared.resync,
+            }),
+        })
     }
 
     fn try_commit_open_install(
@@ -3344,6 +3653,7 @@ impl WorldState {
                 provenance: committed.provenance(),
                 packages_to_prefetch,
             }),
+            close: None,
         })
     }
 
@@ -3388,6 +3698,7 @@ impl WorldState {
                 provenance: committed.provenance(),
                 packages_to_prefetch,
             }),
+            close: None,
         })
     }
 
@@ -3426,6 +3737,7 @@ impl WorldState {
                 provenance: committed.provenance(),
                 packages_to_prefetch,
             }),
+            close: None,
         })
     }
 
@@ -3474,6 +3786,7 @@ impl WorldState {
                 provenance: record.provenance(),
                 packages_to_prefetch: Vec::new(),
             }),
+            close: None,
         })
     }
 
@@ -3483,6 +3796,8 @@ impl WorldState {
         old_interface: Option<u64>,
         plan: PreparedOpenCommitPlan,
     ) -> Vec<AnalysisRevalidationTicket> {
+        let closing_subject = plan.closing_subject;
+        let replacement_interface_hash = plan.replacement_interface_hash;
         // Preserve the pre-update neighborhood only when the prepared graph
         // inputs can change routing. This keeps private/body-only edits on the
         // selective fast path while still retaining a removed edge's endpoint,
@@ -3565,13 +3880,16 @@ impl WorldState {
             }
         }
 
-        let new_interface = self
-            .documents
-            .get_record(uri)
-            .map(|record| record.artifacts().interface_hash);
+        let new_interface = if closing_subject {
+            replacement_interface_hash
+        } else {
+            self.documents
+                .get_record(uri)
+                .map(|record| record.artifacts().interface_hash)
+        };
         let interface_changed = old_interface != new_interface;
         let mut affected: HashSet<Url> = plan.seed_revalidation_uris.into_iter().collect();
-        if plan.direct_subject_publish {
+        if plan.direct_subject_publish || closing_subject {
             affected.remove(uri);
         } else {
             affected.insert(uri.clone());
@@ -3617,6 +3935,7 @@ impl WorldState {
             .mark_force_republish_many(affected.iter().filter(|candidate| *candidate != uri));
         affected
             .into_iter()
+            .filter(|affected_uri| !closing_subject || affected_uri != uri)
             .map(|affected_uri| AnalysisRevalidationTicket {
                 debounce_ms: if affected_uri == *uri {
                     plan.subject_debounce_ms
@@ -3720,7 +4039,9 @@ impl WorldState {
                             );
                             true
                         }
-                        AnalysisSubjectBasis::Open(_) | AnalysisSubjectBasis::OpenInstall(_) => {
+                        AnalysisSubjectBasis::Open(_)
+                        | AnalysisSubjectBasis::OpenInstall(_)
+                        | AnalysisSubjectBasis::OpenClose(_) => {
                             unreachable!("open subjects never enter the closed commit path")
                         }
                     };

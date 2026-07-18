@@ -273,6 +273,24 @@ The shadowed closed artifact tier remains resident while the buffer is open:
 open-provider precedence hides it, closed commits still veto, and close can
 fall back to it without a transient empty-scope window before disk resync.
 
+`didClose` is the corresponding first-class `OpenClose` transaction. Its
+never-reused intent is bound to the arrival-time open record, lifecycle epoch,
+alias ownership, configuration, graph, closed-index, raw-cache, and package
+inputs; retries may refresh ancillary context once but never rebase onto an
+edit, metadata replacement, duplicate open, or close/reopen lifecycle. Disk
+roots are read and parsed off-lock, represented by exact content-hashed
+snapshots, and revalidated while the diagnostics publish lock is held
+immediately before the central state CAS. The commit atomically removes the
+open record and lifecycle, hands aliases to surviving owners, installs a
+retained shadow or validated fresh-disk projection (or removes a
+missing/excluded root), updates graph/cache/package/Rprofile/testthat state,
+refreshes pins, claims watched generations, and reserves one capped fanout.
+The same selected projection feeds every subsystem. The empty diagnostics
+publication completes while the publish lock remains held; only afterward are
+immutable dependent tickets and retained-shadow disk convergence released.
+Close-resync rereads and revalidates its disk snapshot before its own CAS, so a
+reopen or intervening write vetoes stale work.
+
 Watcher events on an exact open client URI also drive bounded alias-topology
 reconciliation. Alias candidates and graph mirrors are derived off-lock from
 an exact open-generation/config/owner basis; one commit swaps the alias map,
