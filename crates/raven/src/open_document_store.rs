@@ -59,6 +59,14 @@ impl OpenRecordToken {
     pub(crate) fn uri(&self) -> &Url {
         &self.uri
     }
+
+    #[cfg(test)]
+    pub(crate) fn absent_for_test(uri: Url) -> Self {
+        Self {
+            uri,
+            identity: None,
+        }
+    }
 }
 
 /// One coherent immutable open-document analysis snapshot.

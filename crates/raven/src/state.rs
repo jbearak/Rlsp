@@ -1705,6 +1705,20 @@ impl PreparedWorkspaceScanAnalysis {
             workspace_index_pins,
         }
     }
+
+    /// Corrupt only the final prepared open identity while leaving both
+    /// authority bases current, so atomic preflight tests reach the
+    /// per-target validation rather than an earlier global-basis rejection.
+    #[cfg(test)]
+    pub(crate) fn corrupt_last_open_token_for_test(&mut self) {
+        self.open_metadata
+            .sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
+        let last = self
+            .open_metadata
+            .last_mut()
+            .expect("test candidate has at least one open target");
+        last.token = OpenRecordToken::absent_for_test(last.uri.clone());
+    }
 }
 
 pub(crate) struct PreparedOpenInstallAnalysis {
@@ -2274,10 +2288,14 @@ impl WorldState {
         self.analysis_config_generation.0 = self.analysis_config_generation.0.wrapping_add(1);
     }
 
-    /// Retire detached scans captured before a closed-file or scan-input write.
+    /// Retire detached scan candidates captured before a closed-file or
+    /// scan-input write.
+    ///
+    /// A committed diagnostic transfer is not a candidate and deliberately
+    /// survives this bump while post-scan package/config work converges. Only
+    /// [`Self::begin_workspace_scan_intent`] supersedes that transfer.
     pub(crate) fn advance_workspace_scan_generation(&mut self) {
         self.workspace_scan_generation = self.workspace_scan_generation.wrapping_add(1);
-        self.workspace_scan_transfer = None;
     }
 
     /// Current operational generation of raw package inputs.
@@ -4240,7 +4258,6 @@ impl WorldState {
         };
         if state.claimed
             || state.identity != transferred.identity
-            || self.workspace_scan_generation != state.identity.committed_scan_generation
             || self.workspace_scan_intent
                 != Some(WorkspaceScanIntentState::Committed(
                     state.identity.intent_generation,

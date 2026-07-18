@@ -12322,22 +12322,18 @@ impl Backend {
 
         let mut package_inputs_initialized_by_exclusion_reload = false;
         let mut workspace_scan_transfer = None;
+        let mut workspace_scan_fallback_affected = Vec::new();
         if workspace_exclusions_changed {
-            let (affected_len, should_scan) = {
+            let (affected, should_scan) = {
                 let mut state = self.state.write().await;
                 let affected = remove_project_excluded_index_entries(&mut state);
-                if !affected.is_empty() {
-                    state
-                        .diagnostics_gate
-                        .mark_force_republish_many(affected.iter());
-                }
                 let should_scan =
                     state.cross_file_config.index_workspace && !state.workspace_folders.is_empty();
-                (affected.len(), should_scan)
+                (affected, should_scan)
             };
             log::info!(
                 "Workspace exclusions changed; removed {} affected indexed/open entries",
-                affected_len
+                affected.len()
             );
 
             if should_scan {
@@ -12408,20 +12404,25 @@ impl Backend {
                     }
                     WorkspaceScanRunOutcome::Disabled => {
                         log::debug!("Workspace exclusion reload scan became disabled");
+                        workspace_scan_fallback_affected = affected;
                     }
                     WorkspaceScanRunOutcome::Superseded => {
                         log::debug!("Workspace exclusion reload scan was superseded");
+                        workspace_scan_fallback_affected = affected;
                     }
                     WorkspaceScanRunOutcome::RetryExhausted => {
                         log::warn!(
                             "Workspace exclusion reload scan exhausted its two authority attempts"
                         );
+                        workspace_scan_fallback_affected = affected;
                     }
                     WorkspaceScanRunOutcome::ScanFailed => {
                         log::error!("Workspace exclusion reload scan failed");
+                        workspace_scan_fallback_affected = affected;
                     }
                 }
             } else {
+                workspace_scan_fallback_affected = affected;
                 if !self.state.read().await.cross_file_config.index_workspace {
                     self.state.write().await.workspace_scan_complete = true;
                 }
@@ -12651,11 +12652,15 @@ impl Backend {
             .await;
             Vec::new()
         } else {
+            let mut republish_uris = open_uris;
+            republish_uris.extend(workspace_scan_fallback_affected);
+            republish_uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+            republish_uris.dedup();
             let state = self.state.read().await;
             state
                 .diagnostics_gate
-                .mark_force_republish_many(open_uris.iter());
-            open_uris
+                .mark_force_republish_many(republish_uris.iter());
+            republish_uris
         }
     }
 
@@ -23050,6 +23055,11 @@ mod project_config_initialize_tests {
         workspace_scan_complete: bool,
         package_input_generation: u64,
         package_config_generation: u64,
+        system_file_routing: (
+            Option<String>,
+            Option<std::path::PathBuf>,
+            Vec<std::path::PathBuf>,
+        ),
         reservations: usize,
         force_markers: Vec<(Url, u32)>,
     }
@@ -23114,6 +23124,7 @@ mod project_config_initialize_tests {
             workspace_scan_complete: state.workspace_scan_complete,
             package_input_generation: state.package_input_generation(),
             package_config_generation: state.package_config_generation,
+            system_file_routing: state.snapshot_system_file_inputs(),
             reservations: state.analysis_revalidation_reservation_count,
             force_markers: uris
                 .iter()
@@ -23167,22 +23178,13 @@ mod project_config_initialize_tests {
             inputs.basis.max_chain_depth,
             &inputs.exclusions,
         );
-        let prepared = prepare_workspace_scan(&state, &inputs, scanned)
+        let mut prepared = prepare_workspace_scan(&state, &inputs, scanned)
             .await
             .unwrap();
+        prepared.corrupt_last_open_token_for_test();
 
         let expected = {
-            let mut state = state.write().await;
-            let generation = state.documents.get_record(&last_uri).unwrap().generation();
-            let mut metadata = crate::cross_file::CrossFileMetadata::default();
-            metadata.working_directory = Some("/last-target-changed".to_string());
-            state
-                .replace_open_document_metadata_if_current(
-                    &last_uri,
-                    generation,
-                    Arc::new(metadata),
-                )
-                .unwrap();
+            let state = state.read().await;
             workspace_scan_central_snapshot(&state, &uris)
         };
 
@@ -23347,6 +23349,149 @@ mod project_config_initialize_tests {
     }
 
     #[tokio::test]
+    async fn workspace_scan_prepared_open_edit_rejection_is_strict_noop() {
+        let tmp = TempDir::new().unwrap();
+        let uri = Url::from_file_path(tmp.path().join("edited.R")).unwrap();
+        let uris = vec![uri.clone()];
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let inputs = {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+            state.open_document(uri.clone(), "before <- 1\n", Some(1));
+            let intent = state.begin_workspace_scan_intent();
+            WorkspaceScanInputs::capture(&state, intent).unwrap()
+        };
+        let prepared = prepare_workspace_scan(&state, &inputs, HashMap::new())
+            .await
+            .unwrap();
+        let expected = {
+            let mut state = state.write().await;
+            let edit = state
+                .prepare_document_changes(
+                    &uri,
+                    [TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: "after <- 2\n".to_string(),
+                    }],
+                    2,
+                )
+                .unwrap();
+            state
+                .commit_document_changes(
+                    &uri,
+                    edit,
+                    Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                )
+                .unwrap();
+            workspace_scan_central_snapshot(&state, &uris)
+        };
+        let mut state = state.write().await;
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::WorkspaceScan(Box::new(prepared))),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(workspace_scan_central_snapshot(&state, &uris), expected);
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_prepared_close_reopen_rejection_is_strict_noop() {
+        let tmp = TempDir::new().unwrap();
+        let uri = Url::from_file_path(tmp.path().join("reopened.R")).unwrap();
+        let uris = vec![uri.clone()];
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let inputs = {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+            state.open_document(uri.clone(), "same <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+            let intent = state.begin_workspace_scan_intent();
+            WorkspaceScanInputs::capture(&state, intent).unwrap()
+        };
+        let prepared = prepare_workspace_scan(&state, &inputs, HashMap::new())
+            .await
+            .unwrap();
+        let expected = {
+            let mut state = state.write().await;
+            state.retire_diagnostic_lifecycle(&uri);
+            state.close_document(&uri);
+            state.open_document(uri.clone(), "same <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+            workspace_scan_central_snapshot(&state, &uris)
+        };
+        let mut state = state.write().await;
+        assert_eq!(
+            state.try_commit_analysis(PreparedAnalysisCommit::WorkspaceScan(Box::new(prepared))),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(workspace_scan_central_snapshot(&state, &uris), expected);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum WorkspaceScanAuthorityDrift {
+        PackageInput,
+        PackageConfig,
+        SystemRouting,
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_package_and_routing_drift_rejections_are_strict_noops() {
+        for drift in [
+            WorkspaceScanAuthorityDrift::PackageInput,
+            WorkspaceScanAuthorityDrift::PackageConfig,
+            WorkspaceScanAuthorityDrift::SystemRouting,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let uri = Url::from_file_path(tmp.path().join("open.R")).unwrap();
+            let uris = vec![uri.clone()];
+            let state = Arc::new(RwLock::new(WorldState::new()));
+            let inputs = {
+                let mut state = state.write().await;
+                state.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+                state.open_document(uri.clone(), "value <- 1\n", Some(1));
+                let intent = state.begin_workspace_scan_intent();
+                WorkspaceScanInputs::capture(&state, intent).unwrap()
+            };
+            let prepared = prepare_workspace_scan(&state, &inputs, HashMap::new())
+                .await
+                .unwrap();
+            let expected = {
+                let mut state = state.write().await;
+                match drift {
+                    WorkspaceScanAuthorityDrift::PackageInput => {
+                        state.record_package_input_mutation();
+                    }
+                    WorkspaceScanAuthorityDrift::PackageConfig => {
+                        state.bump_package_config_generation();
+                    }
+                    WorkspaceScanAuthorityDrift::SystemRouting => {
+                        let mut library = crate::package_library::PackageLibrary::new_empty();
+                        library.set_lib_paths(vec![tmp.path().join("library")]);
+                        state.package_library = Arc::new(library);
+                    }
+                }
+                workspace_scan_central_snapshot(&state, &uris)
+            };
+            let mut state = state.write().await;
+            assert_eq!(
+                state
+                    .try_commit_analysis(PreparedAnalysisCommit::WorkspaceScan(Box::new(prepared))),
+                Err(crate::state::AnalysisCommitRejected::StaleBasis),
+                "{drift:?} drift must reject the old candidate"
+            );
+            assert_eq!(
+                workspace_scan_central_snapshot(&state, &uris),
+                expected,
+                "{drift:?} rejection must not mutate another central tier"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn workspace_scan_transfer_does_not_attach_to_reopened_lifecycle() {
         let tmp = TempDir::new().unwrap();
         let uri = Url::from_file_path(tmp.path().join("reopened.R")).unwrap();
@@ -23403,6 +23548,175 @@ mod project_config_initialize_tests {
                 .provenance()
                 .lifecycle_epoch,
             Some(reopened_epoch)
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_transfer_survives_unrelated_watcher_and_filters_changed_open() {
+        let tmp = TempDir::new().unwrap();
+        let changed_uri = Url::from_file_path(tmp.path().join("changed-open.R")).unwrap();
+        let retained_uri = Url::from_file_path(tmp.path().join("retained-open.R")).unwrap();
+        let watched_path = tmp.path().join("unrelated-closed.R");
+        let watched_uri = Url::from_file_path(&watched_path).unwrap();
+        fs::write(&watched_path, "watched <- 1\n").unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let inputs = {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(tmp.path()).unwrap()];
+            for uri in [&changed_uri, &retained_uri] {
+                state.open_document(uri.clone(), "value <- 1\n", Some(1));
+                state.begin_open_document_diagnostic_lifecycle(uri).unwrap();
+            }
+            let intent = state.begin_workspace_scan_intent();
+            WorkspaceScanInputs::capture(&state, intent).unwrap()
+        };
+        let prepared = prepare_workspace_scan(&state, &inputs, HashMap::new())
+            .await
+            .unwrap();
+        let transfer = state
+            .write()
+            .await
+            .try_commit_analysis(PreparedAnalysisCommit::WorkspaceScan(Box::new(prepared)))
+            .unwrap()
+            .workspace_scan
+            .unwrap();
+
+        let watched_generation = {
+            let mut state = state.write().await;
+            let generation = bump_watched_file_resync_generation(&mut state, &watched_uri);
+            let open_generation = state
+                .documents
+                .get_record(&changed_uri)
+                .unwrap()
+                .generation();
+            let mut metadata = crate::cross_file::CrossFileMetadata::default();
+            metadata.working_directory = Some("/changed-after-scan".to_string());
+            state
+                .replace_open_document_metadata_if_current(
+                    &changed_uri,
+                    open_generation,
+                    Arc::new(metadata),
+                )
+                .unwrap();
+            generation
+        };
+        assert!(matches!(
+            resync_file_from_disk(
+                &state,
+                &watched_uri,
+                None,
+                None,
+                false,
+                Some(watched_generation),
+                ResyncCommitMode::Immediate,
+            )
+            .await,
+            ResyncOutcome::Updated { .. }
+        ));
+
+        let mut state = state.write().await;
+        let reservation_before = state.analysis_revalidation_reservation_count;
+        let retained_force_before = state
+            .diagnostics_gate
+            .force_republish_count_for_test(&retained_uri);
+        let tickets = state.claim_workspace_scan_transfer(&transfer);
+        assert_eq!(
+            tickets
+                .iter()
+                .map(|ticket| ticket.uri.clone())
+                .collect::<Vec<_>>(),
+            vec![retained_uri.clone()]
+        );
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservation_before + 1
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&retained_uri),
+            retained_force_before + 1
+        );
+        assert!(
+            tickets.iter().all(|ticket| ticket.uri != changed_uri),
+            "the later open owner must filter the stale transferred token"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_exclusion_reload_transfer_is_sole_marker_owner() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("generated")).unwrap();
+        fs::write(tmp.path().join("generated/helper.R"), "helper_value <- 1\n").unwrap();
+        let open_uri = Url::from_file_path(tmp.path().join("main.R")).unwrap();
+        let state_root = Url::from_file_path(tmp.path()).unwrap();
+        let (service, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = service.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_folders = vec![state_root];
+            state.raw_client_settings = serde_json::json!({
+                "packages": { "enabled": false }
+            });
+            state.raw_project_settings =
+                Some(serde_json::json!({ "workspace": { "exclude": [] } }));
+            crate::config_file::recompute_parsed_configs(&mut state);
+            state.open_document(
+                open_uri.clone(),
+                "source(\"generated/helper.R\")\nhelper_value\n",
+                Some(1),
+            );
+        }
+        let initial = run_workspace_scan_transaction(&backend.state)
+            .await
+            .expect_committed();
+        {
+            let mut state = backend.state.write().await;
+            assert!(
+                state
+                    .claim_workspace_scan_transfer(&initial.transfer)
+                    .is_empty(),
+                "the initial epochless open has no marker owner"
+            );
+            state
+                .begin_open_document_diagnostic_lifecycle(&open_uri)
+                .unwrap();
+            assert_eq!(
+                state
+                    .diagnostics_gate
+                    .force_republish_count_for_test(&open_uri),
+                0
+            );
+        }
+
+        let (previous, reservations_before) = {
+            let mut state = backend.state.write().await;
+            let previous = ConfigChangeSnapshot::capture(&state);
+            state.raw_project_settings =
+                Some(serde_json::json!({ "workspace": { "exclude": ["generated/**"] } }));
+            crate::config_file::recompute_parsed_configs(&mut state);
+            (previous, state.analysis_revalidation_reservation_count)
+        };
+        assert!(
+            backend
+                .reconcile_after_config_recompute(previous)
+                .await
+                .is_empty(),
+            "the committed scan transfer publishes its own exact tickets"
+        );
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservations_before + 1,
+            "the overlapping exclusion and scan effects must reserve once"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&open_uri),
+            0,
+            "the one transfer worker must consume the sole force marker"
         );
     }
 

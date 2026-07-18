@@ -197,9 +197,12 @@ no-scan commit.
 Diagnostics are deliberately not marked inside that transaction. The commit
 returns a one-shot transfer containing exact post-commit open-record tokens;
 startup or configuration orchestration claims it only after package/config
-convergence. Claiming validates the committed scan generation and current
-diagnostic lifecycle, drops closed/reopened/otherwise replaced records, and
-atomically creates the bounded reservations and force-republish markers once.
+convergence. Claiming validates the exact transfer and latest committed scan
+intent plus each current diagnostic lifecycle, drops
+closed/reopened/otherwise replaced records, and atomically creates the bounded
+reservations and force-republish markers once. Ordinary closed/open mutations
+may advance scan-input authority while this transfer waits; only a newer
+top-level scan intent tombstones it.
 Keep new scan inputs in the shared two-phase basis so startup, exclusion
 reloads, and package-mode rebuilds cannot drift or introduce blocking
 filesystem work under the state lock.
