@@ -2376,9 +2376,7 @@ async fn apply_watched_manifest_changes(
         .unwrap_or_default();
     drop(state);
 
-    let transfer = run_system_file_convergence_transaction(state_arc, None)
-        .await
-        .into_transfer();
+    let transfer = run_system_file_convergence_transfer(state_arc, None).await;
     affected_open_docs.extend(open_keys_filtered);
     affected_open_docs.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     affected_open_docs.dedup();
@@ -3841,13 +3839,34 @@ fn finalize_analysis_handoff_or_fallback(
 
 fn finalize_analysis_handoff_candidates_or_fallback(
     state: &mut WorldState,
-    mut handles: Vec<AnalysisTransferHandle>,
+    handles: Vec<AnalysisTransferHandle>,
     additional: Vec<AnalysisTransferCandidate>,
     fallback_uris: Vec<Url>,
 ) -> Vec<crate::state::AnalysisRevalidationTicket> {
+    finalize_analysis_handoff_candidates_excluding_or_fallback(
+        state,
+        handles,
+        additional,
+        fallback_uris,
+        &std::collections::HashSet::new(),
+    )
+}
+
+fn finalize_analysis_handoff_candidates_excluding_or_fallback(
+    state: &mut WorldState,
+    mut handles: Vec<AnalysisTransferHandle>,
+    additional: Vec<AnalysisTransferCandidate>,
+    fallback_uris: Vec<Url>,
+    excluded: &std::collections::HashSet<Url>,
+) -> Vec<crate::state::AnalysisRevalidationTicket> {
     let finalization = WorldState::begin_analysis_transfer_finalization();
     loop {
-        match state.finalize_analysis_transfers(finalization, &handles, additional.clone()) {
+        match state.finalize_analysis_transfers_excluding(
+            finalization,
+            &handles,
+            additional.clone(),
+            excluded,
+        ) {
             Ok(AnalysisTransferFinalization::Committed(tickets)) => return tickets,
             Ok(AnalysisTransferFinalization::AlreadyFinalized) => return Vec::new(),
             Err(AnalysisTransferRejection::Superseded {
@@ -3859,9 +3878,18 @@ fn finalize_analysis_handoff_candidates_or_fallback(
                 };
                 handles[index] = successor;
             }
-            Err(AnalysisTransferRejection::AlreadyConsumed) => return Vec::new(),
+            Err(AnalysisTransferRejection::AlreadyConsumed { handle }) => {
+                let Some(index) = handles.iter().position(|candidate| *candidate == handle) else {
+                    return Vec::new();
+                };
+                handles.remove(index);
+                if handles.is_empty() {
+                    return Vec::new();
+                }
+            }
             Err(AnalysisTransferRejection::MissingOrWrongOwner) => {
-                let fallback = state.capture_analysis_transfer_candidates(fallback_uris);
+                let mut fallback = state.capture_analysis_transfer_candidates(fallback_uris);
+                fallback.retain(|(uri, _)| !excluded.contains(uri));
                 return match state.finalize_analysis_transfer_fallback(finalization, fallback) {
                     AnalysisTransferFinalization::Committed(tickets) => tickets,
                     AnalysisTransferFinalization::AlreadyFinalized => Vec::new(),
@@ -3882,6 +3910,20 @@ async fn run_system_file_convergence_transaction(
         run_system_file_convergence_transaction_owned(state_arc, only_packages, None).await,
     )
     .await
+}
+
+/// Run generic current-owner convergence and preserve either the original
+/// owner's transfer or the explicitly validated successor transfer.
+///
+/// Ownership-bearing callers that do not need to distinguish those two cases
+/// must use this adapter rather than matching only `Committed`.
+async fn run_system_file_convergence_transfer(
+    state_arc: &Arc<RwLock<WorldState>>,
+    only_packages: Option<std::collections::HashSet<String>>,
+) -> Option<SystemFileTransferredEffects> {
+    run_system_file_convergence_transaction(state_arc, only_packages)
+        .await
+        .into_transfer()
 }
 
 async fn run_system_file_convergence_transaction_for_seed(
@@ -4047,12 +4089,9 @@ pub async fn run_system_file_convergence_for_test(
 ) -> Option<Vec<Url>> {
     let owned = std::mem::take(state);
     let shared = Arc::new(RwLock::new(owned));
-    let changed = match run_system_file_convergence_transaction(&shared, only_packages).await {
-        SystemFileConvergenceOutcome::Committed(effects) => Some(effects.changed_uris),
-        SystemFileConvergenceOutcome::Superseded(_) | SystemFileConvergenceOutcome::Deferred => {
-            None
-        }
-    };
+    let changed = run_system_file_convergence_transfer(&shared, only_packages)
+        .await
+        .map(|effects| effects.changed_uris);
     let owned = match Arc::try_unwrap(shared) {
         Ok(lock) => lock.into_inner(),
         Err(_) => panic!("system.file test adapter leaked shared state ownership"),
@@ -8597,19 +8636,27 @@ async fn run_watched_resync_batch(
     // guarantees the debounced diagnostic pass builds its snapshot from the
     // post-update graph, and prevents post-update edge fanout from bypassing
     // `max_revalidations_per_trigger`.
-    let reserved_uris: std::collections::HashSet<Url> = reserved_tickets
-        .iter()
-        .map(|ticket| ticket.uri.clone())
-        .collect();
-    affected_for_async.retain(|uri| !reserved_uris.contains(uri));
     let transfer_tickets = {
         let mut state = state_arc.write().await;
-        let fallback: Vec<_> = state.documents.keys().cloned().collect();
-        finalize_analysis_handoff_or_fallback(
+        let reserved_current_uris: std::collections::HashSet<Url> = reserved_tickets
+            .iter()
+            .filter(|ticket| !ticket.trigger.is_stale(&state, &ticket.uri))
+            .map(|ticket| ticket.uri.clone())
+            .collect();
+        let mut additional = state.capture_analysis_transfer_candidates(affected_for_async);
+        additional.retain(|(uri, _)| !reserved_current_uris.contains(uri));
+        let fallback: Vec<_> = state
+            .documents
+            .keys()
+            .filter(|uri| !reserved_current_uris.contains(*uri))
+            .cloned()
+            .collect();
+        finalize_analysis_handoff_candidates_excluding_or_fallback(
             &mut state,
             transfer_handles,
-            affected_for_async,
+            additional,
             fallback,
+            &reserved_current_uris,
         )
     };
     for ticket in reserved_tickets {
@@ -10389,8 +10436,7 @@ impl LanguageServer for Backend {
         // was ready, leaving branch-2 (installed-package) targets unresolved.
         // This detached convergence pass picks them up.
         if package_library_ready
-            && let SystemFileConvergenceOutcome::Committed(transfer) =
-                run_system_file_convergence_transaction(&self.state, None).await
+            && let Some(transfer) = run_system_file_convergence_transfer(&self.state, None).await
         {
             let tickets = {
                 let mut state = self.state.write().await;
@@ -10597,9 +10643,7 @@ impl LanguageServer for Backend {
                     state.install_package_library(new_lib, ready);
                 }
                 let system_file_transfer = if ready {
-                    run_system_file_convergence_transaction(&self.state, None)
-                        .await
-                        .into_transfer()
+                    run_system_file_convergence_transfer(&self.state, None).await
                 } else {
                     None
                 };
@@ -12977,8 +13021,8 @@ impl Backend {
                 state.install_package_library(new_package_library, package_library_ready);
             }
             if package_library_ready
-                && let SystemFileConvergenceOutcome::Committed(transfer) =
-                    run_system_file_convergence_transaction(&self.state, None).await
+                && let Some(transfer) =
+                    run_system_file_convergence_transfer(&self.state, None).await
             {
                 system_file_transfer = Some(transfer);
             }
@@ -15576,9 +15620,7 @@ async fn run_libpath_consumer(
                         })
                 };
                 let system_file_transfer = if touches_system_file {
-                    run_system_file_convergence_transaction(&state_arc, Some(affected.clone()))
-                        .await
-                        .into_transfer()
+                    run_system_file_convergence_transfer(&state_arc, Some(affected.clone())).await
                 } else {
                     None
                 };
@@ -25491,19 +25533,133 @@ mod project_config_initialize_tests {
         );
     }
 
-    #[test]
-    fn post_seed_candidate_close_reopen_before_finalization_is_dropped() {
-        let uri = Url::parse("file:///workspace/live.R").unwrap();
-        let mut state = WorldState::new();
-        state.open_document(uri.clone(), "old <- 1\n", Some(1));
-        state
-            .begin_open_document_diagnostic_lifecycle(&uri)
-            .unwrap();
-        let stale = state.capture_analysis_transfer_candidates([uri.clone()]);
+    #[tokio::test]
+    async fn consumed_system_handle_does_not_strand_valid_workspace_transfer() {
+        let workspace = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let package = library.path().join("otherpkg");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("helper.R"), "helper_value <- 1\n").unwrap();
+        let system_uri = Url::from_file_path(workspace.path().join("system.R")).unwrap();
+        let workspace_uri = Url::from_file_path(workspace.path().join("workspace.R")).unwrap();
+        let source = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+        fs::write(system_uri.to_file_path().unwrap(), source).unwrap();
+        fs::write(
+            workspace_uri.to_file_path().unwrap(),
+            "workspace_value <- 1\n",
+        )
+        .unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(workspace.path()).unwrap()];
+            state.open_document(system_uri.clone(), source, Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&system_uri)
+                .unwrap();
+            let generation = state
+                .documents
+                .get_record(&system_uri)
+                .unwrap()
+                .generation();
+            state
+                .replace_open_document_metadata_if_current(
+                    &system_uri,
+                    generation,
+                    Arc::new(crate::cross_file::extract_metadata(source)),
+                )
+                .unwrap();
+            state.open_document(workspace_uri.clone(), "workspace_value <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&workspace_uri)
+                .unwrap();
+            let mut package_library = crate::package_library::PackageLibrary::new_empty();
+            package_library.set_lib_paths(vec![library.path().to_path_buf()]);
+            state.install_package_library(Arc::new(package_library), true);
+        }
+        let system_handle = run_system_file_convergence_transfer(&state, None)
+            .await
+            .unwrap()
+            .handle;
+        {
+            let mut state = state.write().await;
+            let finalized = state
+                .finalize_analysis_transfers(
+                    WorldState::begin_analysis_transfer_finalization(),
+                    &[system_handle],
+                    Vec::new(),
+                )
+                .unwrap();
+            assert!(matches!(
+                finalized,
+                AnalysisTransferFinalization::Committed(ref tickets)
+                    if tickets.iter().any(|ticket| ticket.uri == system_uri)
+            ));
+            state.retire_diagnostic_lifecycle(&system_uri);
+            state.close_document(&system_uri);
+        }
 
+        let workspace_handle = run_workspace_scan_transaction(&state)
+            .await
+            .expect_committed()
+            .transfer
+            .handle;
+        let mut state = state.write().await;
+        let tickets = finalize_analysis_handoff_or_fallback(
+            &mut state,
+            vec![system_handle, workspace_handle],
+            Vec::new(),
+            vec![workspace_uri.clone()],
+        );
+        assert!(
+            tickets.iter().any(|ticket| ticket.uri == workspace_uri),
+            "the consumed system handle is terminal only for itself"
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&workspace_uri),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn post_seed_candidate_close_reopen_before_finalization_is_dropped() {
+        let workspace = TempDir::new().unwrap();
+        let root = workspace.path().to_path_buf();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let uri = Url::from_file_path(root.join("live.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(&root).unwrap()];
+            establish_package_event_translation_state(&mut state, root.clone());
+            state.open_document(rprofile_uri.clone(), "profile_value <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&rprofile_uri)
+                .unwrap();
+            state.open_document(uri.clone(), "old <- profile_value\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+        }
+        let stale = Backend::refresh_open_package_inputs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root,
+        )
+        .await;
+        assert!(
+            stale.iter().any(|(candidate, _)| candidate == &uri),
+            "the real post-seed refresh must capture the affected open consumer"
+        );
+
+        let mut state = backend.state.write().await;
         state.retire_diagnostic_lifecycle(&uri);
         state.close_document(&uri);
-        state.open_document(uri.clone(), "new <- 2\n", Some(1));
+        state.open_document(uri.clone(), "new <- profile_value\n", Some(1));
         state
             .begin_open_document_diagnostic_lifecycle(&uri)
             .unwrap();
@@ -25553,6 +25709,39 @@ mod project_config_initialize_tests {
         let SystemFileConvergenceOutcome::Superseded(successor) = task.await.unwrap() else {
             panic!("the stale seed must hand off to an explicit current-owner transfer");
         };
+        assert_eq!(
+            successor
+                .handle
+                .system_file_routing_owner_generation_for_test(),
+            Some(successor_owner)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_and_config_consumer_keep_current_successor_transfer() {
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let pause = state
+            .read()
+            .await
+            .system_file_pre_derivation_test_pause
+            .arm(Url::parse("raven-test://system-file-pre-derivation").unwrap());
+        let task_state = state.clone();
+        let task =
+            tokio::spawn(
+                async move { run_system_file_convergence_transfer(&task_state, None).await },
+            );
+        pause.wait_arrived().await;
+        let successor_owner = {
+            let mut state = state.write().await;
+            state.record_system_file_routing_owner_change();
+            state.system_file_routing_owner_generation()
+        };
+        pause.release();
+
+        let successor = task
+            .await
+            .unwrap()
+            .expect("the shared startup/config consumer must preserve a successor transfer");
         assert_eq!(
             successor
                 .handle
@@ -25869,6 +26058,7 @@ mod project_config_initialize_tests {
         ValidToMissing,
         ValidToInvalid,
         InvalidToMissing,
+        MissingToInvalid,
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -25879,6 +26069,7 @@ mod project_config_initialize_tests {
             SystemFileExternalDrift::ValidToMissing,
             SystemFileExternalDrift::ValidToInvalid,
             SystemFileExternalDrift::InvalidToMissing,
+            SystemFileExternalDrift::MissingToInvalid,
         ] {
             let workspace = TempDir::new().unwrap();
             let library = TempDir::new().unwrap();
@@ -25893,6 +26084,7 @@ mod project_config_initialize_tests {
                 | SystemFileExternalDrift::ValidToInvalid => {
                     fs::write(&target, "old <- 1\n").unwrap()
                 }
+                SystemFileExternalDrift::MissingToInvalid => {}
             }
             let uri = Url::from_file_path(workspace.path().join("main.R")).unwrap();
             let source = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
@@ -25930,7 +26122,8 @@ mod project_config_initialize_tests {
                 }
                 SystemFileExternalDrift::ValidToMissing
                 | SystemFileExternalDrift::InvalidToMissing => fs::remove_file(&target).unwrap(),
-                SystemFileExternalDrift::ValidToInvalid => fs::write(&target, [0xff]).unwrap(),
+                SystemFileExternalDrift::ValidToInvalid
+                | SystemFileExternalDrift::MissingToInvalid => fs::write(&target, [0xff]).unwrap(),
             }
             pause.release();
             assert!(matches!(
@@ -25969,7 +26162,8 @@ mod project_config_initialize_tests {
                         None
                     );
                 }
-                SystemFileExternalDrift::ValidToInvalid => {
+                SystemFileExternalDrift::ValidToInvalid
+                | SystemFileExternalDrift::MissingToInvalid => {
                     assert!(
                         !state.workspace_index.is_complete(&target_uri),
                         "an invalid external target must not remain indexed"
@@ -39630,6 +39824,139 @@ infixContinuationStyle = "aligned"
                 .any(|edge| edge.to.path().ends_with("/grand.R"))
         );
         assert!(state.documents.contains_key(&parent_uri));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_reserved_ticket_excludes_same_lifecycle_transfer_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let package = library.path().join("otherpkg");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("helper.R"), "helper_value <- 1\n").unwrap();
+        fs::write(tmp.path().join("child.R"), "child_value <- 1\n").unwrap();
+        let parent_text = concat!(
+            "source(\"child.R\")\n",
+            "source(system.file(\"helper.R\", package = \"otherpkg\"))\n",
+            "parent_value <- child_value + helper_value\n",
+        );
+        fs::write(tmp.path().join("parent.R"), parent_text).unwrap();
+        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent_text).await;
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            let mut package_library = crate::package_library::PackageLibrary::new_empty();
+            package_library.set_lib_paths(vec![library.path().to_path_buf()]);
+            state.install_package_library(Arc::new(package_library), true);
+        }
+        let transfer = run_system_file_convergence_transfer(&backend.state, None)
+            .await
+            .expect("system.file convergence should produce an overlapping transfer");
+        let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        fs::write(tmp.path().join("child.R"), "child_value <- 2\n").unwrap();
+        let (generation, reservations) = {
+            let mut state = backend.state.write().await;
+            (
+                bump_watched_file_resync_generation(&mut state, &child_uri),
+                state.analysis_revalidation_reservation_count,
+            )
+        };
+
+        run_watched_resync_batch(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            WatchedResyncBatch {
+                updates: vec![WatchedResyncItem {
+                    uri: child_uri,
+                    generation,
+                }],
+                affected: Vec::new(),
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                transfer_handles: vec![transfer.handle],
+                mode: WatchedResyncBatchMode::Immediate,
+                retry_remaining: true,
+            },
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.analysis_revalidation_reservation_count - reservations,
+            1,
+            "the watched commit ticket owns the URI; transfer finalization consumes its handle without reserving it again"
+        );
+        assert!(state.documents.contains_key(&parent_uri));
+        drop(state);
+        let mut state = backend.state.write().await;
+        assert_eq!(
+            state.finalize_analysis_transfers(
+                WorldState::begin_analysis_transfer_finalization(),
+                &[transfer.handle],
+                Vec::new(),
+            ),
+            Err(AnalysisTransferRejection::AlreadyConsumed {
+                handle: transfer.handle,
+            }),
+            "the transfer handle must still be consumed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn watched_reserved_ticket_does_not_exclude_reopened_lifecycle() {
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let uri = Url::parse("file:///workspace/reopened.R").unwrap();
+        let old_ticket = {
+            let mut state = backend.state.write().await;
+            state.open_document(uri.clone(), "old <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+            let candidate = state.capture_analysis_transfer_candidates([uri.clone()]);
+            let finalized = state.finalize_analysis_transfer_fallback(
+                WorldState::begin_analysis_transfer_finalization(),
+                candidate,
+            );
+            let AnalysisTransferFinalization::Committed(mut tickets) = finalized else {
+                panic!("fixture reservation must commit");
+            };
+            let ticket = tickets.pop().unwrap();
+            state.retire_diagnostic_lifecycle(&uri);
+            state.close_document(&uri);
+            state.open_document(uri.clone(), "new <- 2\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+            ticket
+        };
+        let reservations = {
+            let state = backend.state.read().await;
+            state.analysis_revalidation_reservation_count
+        };
+
+        run_watched_resync_batch(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            WatchedResyncBatch {
+                updates: Vec::new(),
+                affected: vec![uri.clone()],
+                deletions: Vec::new(),
+                reserved_tickets: vec![old_ticket],
+                transfer_handles: Vec::new(),
+                mode: WatchedResyncBatchMode::Immediate,
+                retry_remaining: true,
+            },
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.analysis_revalidation_reservation_count - reservations,
+            1,
+            "a retired ticket cannot URI-suppress the reopened lifecycle"
+        );
     }
 
     #[test]

@@ -2256,7 +2256,9 @@ pub(crate) struct AnalysisTransferFinalizationId(u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnalysisTransferRejection {
-    AlreadyConsumed,
+    AlreadyConsumed {
+        handle: AnalysisTransferHandle,
+    },
     Superseded {
         previous: AnalysisTransferHandle,
         successor: AnalysisTransferHandle,
@@ -2543,11 +2545,33 @@ impl WorldState {
     /// work and is terminal; only `MissingOrWrongOwner` permits an idempotent
     /// current-state fallback through
     /// [`Self::finalize_analysis_transfer_fallback`].
+    #[cfg(test)]
     pub(crate) fn finalize_analysis_transfers(
         &mut self,
         finalization: AnalysisTransferFinalizationId,
         handles: &[AnalysisTransferHandle],
+        additional_candidates: Vec<(Url, OpenRecordToken)>,
+    ) -> Result<AnalysisTransferFinalization, AnalysisTransferRejection> {
+        self.finalize_analysis_transfers_excluding(
+            finalization,
+            handles,
+            additional_candidates,
+            &HashSet::new(),
+        )
+    }
+
+    /// Finalize transfers while atomically dropping candidates already owned
+    /// by exact, still-current reservations.
+    ///
+    /// The caller derives `excluded` by validating each ticket trigger under
+    /// this same write lock. URI equality alone is insufficient because a
+    /// close/reopen can reuse the URI while changing lifecycle ownership.
+    pub(crate) fn finalize_analysis_transfers_excluding(
+        &mut self,
+        finalization: AnalysisTransferFinalizationId,
+        handles: &[AnalysisTransferHandle],
         mut additional_candidates: Vec<(Url, OpenRecordToken)>,
+        excluded: &HashSet<Url>,
     ) -> Result<AnalysisTransferFinalization, AnalysisTransferRejection> {
         if self.analysis_transfer_finalizations.contains(&finalization) {
             return Ok(AnalysisTransferFinalization::AlreadyFinalized);
@@ -2558,7 +2582,7 @@ impl WorldState {
                 return Err(AnalysisTransferRejection::MissingOrWrongOwner);
             }
             if self.analysis_transfers_consumed.contains(&handle.identity) {
-                return Err(AnalysisTransferRejection::AlreadyConsumed);
+                return Err(AnalysisTransferRejection::AlreadyConsumed { handle: *handle });
             }
             if let Some(successor) = self.analysis_transfer_successors.get(&handle.identity) {
                 return Err(AnalysisTransferRejection::Superseded {
@@ -2582,6 +2606,7 @@ impl WorldState {
             self.analysis_transfers_consumed.insert(handle.identity);
         }
         self.analysis_transfer_finalizations.insert(finalization);
+        additional_candidates.retain(|(uri, _)| !excluded.contains(uri));
         let uris = self.current_transfer_candidate_uris(additional_candidates);
         Ok(AnalysisTransferFinalization::Committed(
             self.reserve_analysis_revalidations(uris).revalidations,

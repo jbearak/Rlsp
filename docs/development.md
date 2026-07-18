@@ -211,8 +211,12 @@ the predecessor is rejected with proof naming that successor, while failed or
 pending attempts leave the predecessor claimable. Fallback uses the same
 finalization identity and is idempotent, but is permitted only for a genuinely
 missing/wrong owner. A handle already consumed by another finalization is a
-terminal no-op: treating it as fallback authority would double-mark candidates
-that the first finalization already owns.
+terminal no-op for that handle: it is removed from a mixed handoff while every
+remaining handle is still prevalidated all-or-none. Treating the consumed
+handle as fallback authority would double-mark candidates that the first
+finalization already owns. Watched batches likewise exclude a pre-reserved
+candidate from a transfer only when the ticket trigger still names the current
+open lifecycle; URI equality alone must not suppress a close/reopen.
 
 Workspace-scan finalization additionally validates the latest committed scan
 intent. Each candidate validates its current diagnostic lifecycle and exact
