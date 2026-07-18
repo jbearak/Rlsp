@@ -1554,6 +1554,8 @@ pub struct Backend {
     traversal_truncation: Arc<TraversalTruncationState>,
     #[cfg(test)]
     test_home_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
+    #[cfg(test)]
+    package_library_install_keys_for_test: std::sync::Mutex<Vec<PackageInitKey>>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1744,6 +1746,11 @@ impl Backend {
                 state.package_library = library;
                 state.refresh_local_dev_overlay();
                 state.package_library_ready = ready;
+                #[cfg(test)]
+                self.package_library_install_keys_for_test
+                    .lock()
+                    .unwrap()
+                    .push(basis.key.clone());
                 state.bump_package_config_generation();
                 true
             } else {
@@ -1801,6 +1808,8 @@ impl Backend {
             traversal_truncation: Arc::new(TraversalTruncationState::default()),
             #[cfg(test)]
             test_home_dir: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            package_library_install_keys_for_test: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -12745,13 +12754,15 @@ impl Backend {
     /// Warm direct and inherited packages from the fully committed OpenInstall
     /// graph before any of its diagnostic tickets can start.
     async fn prefetch_open_install_packages(&self, uri: &Url, direct_packages: Vec<String>) {
-        let packages_enabled = self.state.read().await.cross_file_config.packages_enabled;
-        if !packages_enabled {
-            return;
-        }
-        let _ = self.ensure_package_library_initialized().await;
-        let (probe, package_library, ready) = {
+        // OpenInstall already owns the bounded exact-key package-library
+        // convergence attempt. Prefetch must consume that committed result,
+        // never start a third post-commit initialization that can defeat the
+        // retry ceiling (especially when a degraded build remains not-ready).
+        let (probe, package_library) = {
             let state = self.state.read().await;
+            if !state.cross_file_config.packages_enabled || !state.package_library_ready {
+                return;
+            }
             let Some(document) = state.documents.get(uri) else {
                 return;
             };
@@ -12759,7 +12770,6 @@ impl Backend {
             (
                 state.build_package_scope_snapshot(&[(uri.clone(), last_line)]),
                 state.package_library.clone(),
-                state.package_library_ready,
             )
         };
 
@@ -12792,7 +12802,7 @@ impl Backend {
         });
         packages.sort_unstable();
         packages.dedup();
-        if ready && !packages.is_empty() {
+        if !packages.is_empty() {
             package_library.prefetch_packages(&packages).await;
         }
     }
@@ -34604,13 +34614,14 @@ infixContinuationStyle = "aligned"
             })
             .await
             .unwrap();
-        {
+        let degraded_key = {
             let mut state = backend.state.write().await;
             state.workspace_scan_complete = true;
             state.cross_file_config.packages_enabled = true;
             state.package_library_ready = false;
             state.force_package_library_not_ready_for_test = true;
-        }
+            PackageInitKey::capture(&state)
+        };
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -34627,6 +34638,16 @@ infixContinuationStyle = "aligned"
                 .get(&subject)
                 .map(|document| document.text()),
             Some("subject <- 1\n".into())
+        );
+        drop(state);
+        assert_eq!(
+            backend
+                .package_library_install_keys_for_test
+                .lock()
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&degraded_key),
+            "a stable degraded key gets one bounded didOpen attempt; post-commit prefetch must not retry it"
         );
     }
 
@@ -34649,7 +34670,12 @@ infixContinuationStyle = "aligned"
             })
             .await
             .unwrap();
-        let (first_pause, original_library) = {
+        let install_key_baseline = backend
+            .package_library_install_keys_for_test
+            .lock()
+            .unwrap()
+            .len();
+        let (first_pause, original_library, original_key) = {
             let mut state = backend.state.write().await;
             state.workspace_scan_complete = true;
             state.cross_file_config.packages_enabled = true;
@@ -34659,7 +34685,8 @@ infixContinuationStyle = "aligned"
                 state
                     .package_init_pre_commit_test_pause
                     .arm(pause_uri.clone()),
-                Arc::as_ptr(&state.package_library) as usize,
+                state.package_library.clone(),
+                PackageInitKey::capture(&state),
             )
         };
 
@@ -34672,15 +34699,22 @@ infixContinuationStyle = "aligned"
                 panic!("package initialization did not reach first CAS barrier")
             }
         }
-        let second_pause = {
+        let (second_pause, fresh_key) = {
             let mut state = backend.state.write().await;
             state.cross_file_config.packages_r_path = Some(fresh_workspace.join("different-R"));
             state.workspace_folders = vec![Url::from_file_path(&fresh_workspace).unwrap()];
             state.record_package_input_mutation();
-            state
-                .package_init_pre_commit_test_pause
-                .arm(pause_uri.clone())
+            (
+                state
+                    .package_init_pre_commit_test_pause
+                    .arm(pause_uri.clone()),
+                PackageInitKey::capture(&state),
+            )
         };
+        assert_ne!(
+            original_key, fresh_key,
+            "the forced config/workspace mutation must produce a distinct retry key"
+        );
         first_pause.release();
         tokio::select! {
             _ = second_pause.wait_arrived() => {}
@@ -34691,10 +34725,18 @@ infixContinuationStyle = "aligned"
         }
         {
             let state = backend.state.read().await;
-            assert_eq!(
-                Arc::as_ptr(&state.package_library) as usize,
-                original_library,
+            assert!(
+                Arc::ptr_eq(&state.package_library, &original_library),
                 "the stale first build must not replace package-library state"
+            );
+            assert_eq!(
+                backend
+                    .package_library_install_keys_for_test
+                    .lock()
+                    .unwrap()
+                    .len(),
+                install_key_baseline,
+                "the stale first build must not win a package-library CAS"
             );
             assert!(!state.documents.contains_key(&subject));
         }
@@ -34702,13 +34744,34 @@ infixContinuationStyle = "aligned"
         handler.await;
 
         let state = backend.state.read().await;
-        assert_ne!(
-            Arc::as_ptr(&state.package_library) as usize,
-            original_library,
-            "the exact fresh-key build must win the library CAS"
+        assert!(
+            !Arc::ptr_eq(&state.package_library, &original_library),
+            "the exact fresh-key build must replace the retained original library"
+        );
+        assert_eq!(
+            PackageInitKey::capture(&state),
+            fresh_key,
+            "the committed library must still correspond to the exact fresh key"
         );
         assert!(!state.package_library_ready);
         assert!(state.documents.contains_key(&subject));
+        drop(state);
+
+        let install_keys = backend
+            .package_library_install_keys_for_test
+            .lock()
+            .unwrap();
+        let committed_after_baseline = &install_keys[install_key_baseline..];
+        // Keep a strong original Arc above: a bare numeric address became
+        // allocator-history-sensitive when degraded post-commit prefetch
+        // retried the fresh key and reused the just-freed original address.
+        // The central-CAS key log proves both halves directly: stale never
+        // installs, and didOpen's one bounded fresh-key build is the sole win.
+        assert_eq!(
+            committed_after_baseline,
+            std::slice::from_ref(&fresh_key),
+            "exactly one fresh key and no stale key must win the library CAS"
+        );
     }
 
     #[tokio::test]
@@ -34762,6 +34825,10 @@ infixContinuationStyle = "aligned"
             }
         }
         let package_library = backend.state.read().await.package_library.clone();
+        assert!(
+            backend.state.read().await.package_library_ready,
+            "real didOpen package convergence must install a ready library before prefetch"
+        );
         assert!(
             package_library.is_cached("fakepkg").await,
             "inherited package must be cached before reservation barrier"
