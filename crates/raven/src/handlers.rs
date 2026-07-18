@@ -4672,9 +4672,9 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
         }
     }
 
-    // 2. New workspace index (closed files)
+    // 2. Closed-document authority
     if symbols.len() < max_results {
-        for (uri, entry) in state.workspace_index_new.iter() {
+        for (uri, entry) in state.workspace_index.artifact_iter() {
             if symbols.len() >= max_results {
                 break;
             }
@@ -4688,27 +4688,6 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
                 &lower_query,
                 &mut symbols,
             );
-        }
-    }
-
-    // 3. Cross-file workspace index
-    if symbols.len() < max_results {
-        for uri in state.cross_file_workspace_index.uris() {
-            if symbols.len() >= max_results {
-                break;
-            }
-            if seen_uris.contains(&uri) {
-                continue;
-            }
-            seen_uris.insert(uri.clone());
-            if let Some(artifacts) = state.cross_file_workspace_index.get_artifacts(&uri) {
-                collect_workspace_symbols_from_artifacts(
-                    &uri,
-                    &artifacts,
-                    &lower_query,
-                    &mut symbols,
-                );
-            }
         }
     }
 
@@ -21563,7 +21542,7 @@ pub fn goto_definition_with_cancel(
     let doc = if let Some(document) = state.get_document(uri) {
         document
     } else {
-        let entry = state.workspace_index_new.get(uri)?;
+        let entry = state.workspace_index.get(uri)?;
         closed_document = crate::state::document_from_workspace_entry(
             uri,
             &entry,
@@ -21780,7 +21759,7 @@ pub fn goto_definition_with_cancel(
                     root,
                     &content_provider,
                     &state.documents.uris(),
-                    &state.workspace_index_new,
+                    &state.workspace_index,
                     cancel,
                 );
             }
@@ -21887,7 +21866,7 @@ pub fn goto_definition_with_cancel(
                 root,
                 &content_provider,
                 &state.documents.uris(),
-                &state.workspace_index_new,
+                &state.workspace_index,
                 cancel,
             );
         }
@@ -21919,7 +21898,7 @@ pub fn goto_definition_with_cancel(
     }
 
     // Search workspace index using ContentProvider
-    for (file_uri, _) in state.workspace_index_new.iter() {
+    for (file_uri, _) in state.workspace_index.iter() {
         if cancel.is_cancelled() {
             return None;
         }
@@ -22077,7 +22056,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     let doc = if let Some(document) = state.get_document(uri) {
         document
     } else {
-        let entry = state.workspace_index_new.get(uri)?;
+        let entry = state.workspace_index.get(uri)?;
         closed_document = crate::state::document_from_workspace_entry(
             uri,
             &entry,
@@ -22122,7 +22101,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
         }
 
         // Search workspace index using new WorkspaceIndex.
-        for (file_uri, entry) in state.workspace_index_new.iter() {
+        for (file_uri, entry) in state.workspace_index.iter() {
             if &file_uri == uri
                 || state.documents.contains_key(&file_uri)
                 || file_type_from_uri(&file_uri) != FileType::Stan
@@ -22167,7 +22146,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
         }
 
         // Search workspace index.
-        for (file_uri, entry) in state.workspace_index_new.iter() {
+        for (file_uri, entry) in state.workspace_index.iter() {
             if &file_uri == uri
                 || state.documents.contains_key(&file_uri)
                 || file_type_from_uri(&file_uri) != FileType::Jags
@@ -22234,7 +22213,7 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     // parsed from the masked analysis text for Rmd/Quarto (on-demand indexing),
     // while `contents` is RAW — pair the tree with the masked analysis view so
     // byte offsets align (#343).
-    for (file_uri, entry) in state.workspace_index_new.iter() {
+    for (file_uri, entry) in state.workspace_index.iter() {
         if &file_uri == uri || state.documents.contains_key(&file_uri) {
             continue; // Already searched
         }
@@ -22511,7 +22490,7 @@ fn find_user_function_signature(
     }
 
     // 3. Search workspace index
-    for (uri, entry) in state.workspace_index_new.iter() {
+    for (uri, entry) in state.workspace_index.iter() {
         if let Some(tree) = &entry.tree {
             let raw = entry.contents.to_string();
             let text = state.analysis_text_for_uri(&uri, &raw);
@@ -48683,8 +48662,8 @@ setClass("{}", slots = c(value = "numeric"))
         #[test]
         /// Feature: document-workspace-symbols, Property 12: Workspace Deduplication
         ///
-        /// For any workspace symbol query where the same symbol exists in multiple sources
-        /// (open documents, workspace index, legacy indices), the symbol SHALL appear
+        /// For any workspace symbol query where the same URI exists in both authorities
+        /// (an open document plus its closed-file record), the symbol SHALL appear
         /// exactly once in the results.
         ///
         /// **Validates: Requirements 9.3**
@@ -51828,7 +51807,7 @@ result <- helper_func(42)"#;
         let mut state = WorldState::new();
         state.workspace_folders = vec![ws_root.clone()];
         let scan = crate::state::scan_workspace(&[ws_root], 20);
-        state.apply_workspace_index(scan.0, scan.1);
+        state.apply_workspace_index(scan);
         let open_code = files
             .iter()
             .find(|(rel, _)| *rel == open)
@@ -52792,9 +52771,9 @@ f(beta = 2)
             },
             metadata: helpers_metadata,
             artifacts: helpers_artifacts,
-            indexed_at_version: state.workspace_index_new.version(),
+            indexed_at_version: state.workspace_index.version(),
         };
-        assert!(state.workspace_index_new.insert(helpers_url.clone(), entry));
+        assert!(state.workspace_index.insert(helpers_url.clone(), entry));
 
         state.cross_file_graph.update_file(
             &main_url,
@@ -68347,9 +68326,9 @@ mod issue_459_backtick_navigation_tests {
             },
             metadata: lib_metadata,
             artifacts: lib_artifacts,
-            indexed_at_version: state.workspace_index_new.version(),
+            indexed_at_version: state.workspace_index.version(),
         };
-        assert!(state.workspace_index_new.insert(lib_uri.clone(), entry));
+        assert!(state.workspace_index.insert(lib_uri.clone(), entry));
 
         // Bare syntactic `my_func`: hits `exported_interface` via the unquoted
         // key (works pre-fix), proving the fallback path is actually reached.
@@ -68731,9 +68710,9 @@ mod load_all_internal_goto_tests {
             },
             metadata,
             artifacts,
-            indexed_at_version: state.workspace_index_new.version(),
+            indexed_at_version: state.workspace_index.version(),
         };
-        assert!(state.workspace_index_new.insert(uri.clone(), entry));
+        assert!(state.workspace_index.insert(uri.clone(), entry));
         uri
     }
 

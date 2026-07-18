@@ -2918,46 +2918,7 @@ proptest! {
 // ============================================================================
 
 use super::file_cache::{CrossFileFileCache, FileSnapshot};
-use super::workspace_index::{CrossFileWorkspaceIndex, IndexEntry};
 use std::time::SystemTime;
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
-
-    /// Property 44: For any sequence of workspace index updates, the version
-    /// counter SHALL be strictly increasing.
-    #[test]
-    fn prop_workspace_index_version_monotonicity(
-        num_updates in 1..10usize
-    ) {
-        let index = CrossFileWorkspaceIndex::new();
-        let mut versions = Vec::new();
-
-        versions.push(index.version());
-
-        for i in 0..num_updates {
-            let uri = make_url(&format!("file{}", i));
-            let entry = IndexEntry {
-                snapshot: FileSnapshot {
-                    mtime: SystemTime::UNIX_EPOCH,
-                    size: 0,
-                    content_hash: None,
-                },
-                metadata: std::sync::Arc::new(CrossFileMetadata::default()),
-                artifacts: Arc::new(ScopeArtifacts::default()),
-                indexed_at_version: index.version(),
-            };
-            index.insert(uri, entry);
-            versions.push(index.version());
-        }
-
-        // Each version should be greater than the previous
-        for i in 1..versions.len() {
-            prop_assert!(versions[i] > versions[i - 1]);
-        }
-    }
-}
-
 // ============================================================================
 // Property 45: Watched File Cache Invalidation
 // Validates: Requirements 13.2

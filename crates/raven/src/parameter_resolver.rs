@@ -390,7 +390,7 @@ pub fn resolve(
 ///
 /// Priority order (matching the `content_provider` pattern):
 /// 1. Authoritative open documents (`state.documents`)
-/// 2. New workspace index (`state.workspace_index_new`)
+/// 2. New workspace index (`state.workspace_index`)
 /// 3. File cache (`state.cross_file_file_cache`) — parse on demand
 pub(crate) fn get_text_and_tree(
     state: &WorldState,
@@ -411,16 +411,13 @@ pub(crate) fn get_text_and_tree(
     //    parsed from the masked analysis text for Rmd/Quarto (on-demand
     //    indexing), while `contents` is RAW — pair the tree with the masked
     //    analysis view so byte offsets align (#343).
-    if let Some(entry) = state.workspace_index_new.get(uri) {
+    if let Some(entry) = state.workspace_index.get(uri) {
         if let Some(tree) = &entry.tree {
             let raw = entry.contents.to_string();
             let text = state.analysis_text_for_uri(uri, &raw).into_owned();
             return Some((text, tree.clone()));
         } else {
-            log::debug!(
-                "Document in workspace_index_new has no parsed tree: {}",
-                uri
-            );
+            log::debug!("Document in workspace_index has no parsed tree: {}", uri);
         }
     }
 
@@ -1385,9 +1382,9 @@ f(beta = 2)
             },
             metadata: lib_metadata,
             artifacts: lib_artifacts,
-            indexed_at_version: state.workspace_index_new.version(),
+            indexed_at_version: state.workspace_index.version(),
         };
-        assert!(state.workspace_index_new.insert(lib_uri.clone(), entry));
+        assert!(state.workspace_index.insert(lib_uri.clone(), entry));
 
         // Build the dependency edge main.R -> lib.R via `source("lib.R")`.
         for (uri, code) in [(&main_uri, main_code), (&lib_uri, lib_code)] {
@@ -1466,9 +1463,9 @@ f(beta = 2)
             },
             metadata: lib_metadata,
             artifacts: lib_artifacts,
-            indexed_at_version: state.workspace_index_new.version(),
+            indexed_at_version: state.workspace_index.version(),
         };
-        assert!(state.workspace_index_new.insert(lib_uri.clone(), entry));
+        assert!(state.workspace_index.insert(lib_uri.clone(), entry));
 
         for (uri, code) in [(&main_uri, main_code), (&lib_uri, lib_code)] {
             state.cross_file_graph.update_file(
@@ -2263,7 +2260,7 @@ mod property_tests {
 
     #[tokio::test]
     async fn get_text_and_tree_pairs_masked_tree_with_masked_text_workspace_index_arm() {
-        // workspace_index_new arm (step 3): an on-demand-indexed (closed) `.Rmd`
+        // workspace_index arm (step 3): an on-demand-indexed (closed) `.Rmd`
         // pairs a masked `tree` with RAW `contents`. Mirror that construction
         // and confirm `get_text_and_tree` returns the masked analysis text so
         // the tree's byte offsets align.
@@ -2301,7 +2298,7 @@ mod property_tests {
             indexed_at_version: 0,
         };
         let state = WorldState::new();
-        state.workspace_index_new.insert(uri.clone(), entry);
+        state.workspace_index.insert(uri.clone(), entry);
 
         let params = extract_params_via_get_text_and_tree(&state, &uri);
         assert_eq!(

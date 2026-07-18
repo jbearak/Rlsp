@@ -465,12 +465,12 @@ fn build_indexed_state(
     // rayon-parallel internally; there's no lock contention here since the CLI
     // owns `state` exclusively.
     let max_chain_depth = state.cross_file_config.max_chain_depth;
-    let (cross_file_entries, new_index_entries) = crate::state::scan_workspace_with_exclusions(
+    let entries = crate::state::scan_workspace_with_exclusions(
         std::slice::from_ref(workspace_url),
         max_chain_depth,
         &state.workspace_exclusions,
     );
-    state.apply_workspace_index(cross_file_entries, new_index_entries);
+    state.apply_workspace_index(entries);
 
     // Derive package-mode scope (so `R/*.R` files in an R package see each
     // other's top-level definitions without explicit `source()`). This is
@@ -827,7 +827,7 @@ fn reported_packages_to_warm(
         let Ok(uri) = Url::from_file_path(path) else {
             continue;
         };
-        if let Some(entry) = state.workspace_index_new.get(&uri) {
+        if let Some(entry) = state.workspace_index.get(&uri) {
             packages.extend(entry.loaded_packages.iter().cloned());
             // Issue #429: warm packages named in `data(..., package = "pkg")`
             // so the diagnostics-time `data()` alias expansion can resolve the
@@ -1279,7 +1279,7 @@ async fn collect_target_diagnostics(
             let uri = Url::from_file_path(path).ok()?;
             // Reuse the already-parsed `Document` from the scan (tree included),
             // exactly as the sequential path did — no disk re-read / re-parse.
-            let entry = state.workspace_index_new.get(&uri)?;
+            let entry = state.workspace_index.get(&uri)?;
             let doc = crate::state::document_from_workspace_entry(
                 &uri,
                 &entry,
@@ -1335,7 +1335,7 @@ async fn collect_target_diagnostics(
             operator_error = true;
             continue;
         };
-        if state.workspace_index_new.contains(&uri) {
+        if state.workspace_index.contains(&uri) {
             continue; // already handled in the parallel phase
         }
         let text = match crate::state::read_source(path) {
@@ -2814,7 +2814,7 @@ infixContinuationStyle = "indented"
             let mut all = Vec::new();
             for path in &targets {
                 let uri = Url::from_file_path(path).unwrap();
-                if let Some(entry) = state.workspace_index_new.get(&uri) {
+                if let Some(entry) = state.workspace_index.get(&uri) {
                     let doc = crate::state::document_from_workspace_entry(
                         &uri,
                         &entry,

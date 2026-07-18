@@ -37,7 +37,7 @@ This PR adds native R package development support to Raven. When the workspace r
 
 2. **Performance of mutual visibility** — `collect_package_internal_symbols` iterates all workspace index entries on every snapshot build. For large packages (hundreds of R files), is this acceptable? Should results be cached?
 
-3. **Completions duplication** — The package-mode completions block iterates `workspace_index_new` entries. Could this produce duplicates with symbols already in scope via the dependency graph (e.g., if a file also has `source()` chains)?
+3. **Completions duplication** — The package-mode completions block iterates `workspace_index` entries. Could this produce duplicates with symbols already in scope via the dependency graph (e.g., if a file also has `source()` chains)?
 
 4. **NAMESPACE multiline parsing** — `normalize_multiline` in `package_namespace.rs` joins lines when the previous line has unbalanced parens. Verify this handles edge cases (comments inside multiline directives, nested parens).
 

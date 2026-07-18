@@ -16,7 +16,6 @@ use tower_lsp::lsp_types::Url;
 use crate::cross_file::file_cache::CrossFileFileCache;
 use crate::cross_file::scope::{self, ScopeArtifacts};
 use crate::cross_file::types::CrossFileMetadata;
-use crate::cross_file::workspace_index::CrossFileWorkspaceIndex;
 use crate::open_document_store::OpenDocumentStore;
 use crate::state::{Document, OpenDocumentAliases};
 use crate::workspace_index::WorkspaceIndex;
@@ -247,15 +246,13 @@ impl OpenDocumentsView for TestOpenDocuments {
 /// This implementation respects the open-docs-authoritative rule:
 /// 1. Check open-document authority first (open docs are authoritative)
 /// 2. Check WorkspaceIndex (closed files)
-/// 3. Check the transitional cross-file index for metadata/artifacts
-/// 4. Check file cache for content/existence (no synchronous disk I/O)
+/// 3. Check file cache for content/existence (no synchronous disk I/O)
 ///
 /// **Validates: Requirements 7.2, 13.2, 14.1, 14.2, 14.3, 14.4**
 pub struct DefaultContentProvider<'a> {
     open_documents: &'a dyn OpenDocumentsView,
     workspace_index: &'a WorkspaceIndex,
     file_cache: &'a CrossFileFileCache,
-    legacy_cross_file_workspace_index: Option<&'a CrossFileWorkspaceIndex>,
     open_aliases: Option<&'a OpenDocumentAliases>,
 }
 
@@ -275,30 +272,26 @@ impl<'a> DefaultContentProvider<'a> {
             open_documents,
             workspace_index,
             file_cache,
-            legacy_cross_file_workspace_index: None,
             open_aliases: None,
         }
     }
 
-    /// Create a provider with the transitional cross-file index and aliases.
+    /// Create a provider that recognizes aliases of open documents.
     ///
     /// # Arguments
     /// * `open-document authority` - Reference to the open-document authority for open documents
     /// * `workspace_index` - Reference to the WorkspaceIndex for closed files
     /// * `file_cache` - Reference to the CrossFileFileCache for disk file caching
-    /// * `legacy_cross_file_workspace_index` - Reference to the legacy CrossFileWorkspaceIndex
-    pub fn with_legacy(
+    pub fn with_aliases(
         open_documents: &'a impl OpenDocumentsView,
         workspace_index: &'a WorkspaceIndex,
         file_cache: &'a CrossFileFileCache,
-        legacy_cross_file_workspace_index: &'a CrossFileWorkspaceIndex,
         open_aliases: &'a OpenDocumentAliases,
     ) -> Self {
         Self {
             open_documents,
             workspace_index,
             file_cache,
-            legacy_cross_file_workspace_index: Some(legacy_cross_file_workspace_index),
             open_aliases: Some(open_aliases),
         }
     }
@@ -354,7 +347,6 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// Checks sources in order:
     /// 1. open-document authority (open docs are authoritative)
     /// 2. WorkspaceIndex (closed files)
-    /// 3. Transitional cross-file index
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
@@ -368,12 +360,6 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             return Some(metadata);
         }
 
-        if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index
-            && let Some(metadata) = legacy_cf_ws.get_metadata(uri)
-        {
-            return Some(metadata);
-        }
-
         None
     }
 
@@ -382,7 +368,6 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     /// Checks sources in order:
     /// 1. open-document authority (open docs are authoritative)
     /// 2. WorkspaceIndex (closed files)
-    /// 3. Transitional cross-file index
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
@@ -393,12 +378,6 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         }
 
         if let Some(artifacts) = self.workspace_index.get_artifacts(uri) {
-            return Some(artifacts);
-        }
-
-        if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index
-            && let Some(artifacts) = legacy_cf_ws.get_artifacts(uri)
-        {
             return Some(artifacts);
         }
 
@@ -416,10 +395,7 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             documents.contains(open_uri).then_some(())
         })
         .is_some()
-            || self.workspace_index.contains(uri)
-            || self
-                .legacy_cross_file_workspace_index
-                .is_some_and(|cf_ws| cf_ws.contains(uri))
+            || self.workspace_index.is_complete(uri)
             || self.file_cache.get(uri).is_some()
     }
 
@@ -745,7 +721,6 @@ mod tests {
         let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
-        let legacy_cross_file_workspace_index = CrossFileWorkspaceIndex::new();
         let mut open_aliases = OpenDocumentAliases::default();
 
         let canonical_uri = test_uri("canonical.R");
@@ -762,11 +737,10 @@ mod tests {
             .open(second_alias.clone(), "second store", 1)
             .await;
         let content = |doc_store: &TestOpenDocuments| {
-            DefaultContentProvider::with_legacy(
+            DefaultContentProvider::with_aliases(
                 doc_store,
                 &workspace_index,
                 &file_cache,
-                &legacy_cross_file_workspace_index,
                 &open_aliases,
             )
             .get_content(&canonical_uri)

@@ -7,7 +7,6 @@
 pub(crate) mod binding;
 pub mod cache;
 pub mod config;
-pub mod content_provider;
 pub mod dependency;
 pub mod directive;
 pub mod file_cache;
@@ -19,7 +18,6 @@ pub mod source_detect;
 pub mod standalone_cache;
 pub(crate) mod static_path;
 pub mod types;
-pub mod workspace_index;
 
 #[cfg(test)]
 mod property_tests;
@@ -29,7 +27,6 @@ pub mod integration_tests;
 
 pub use cache::*;
 pub use config::*;
-pub use content_provider::*;
 pub use dependency::*;
 pub use directive::*;
 pub use file_cache::*;
@@ -39,7 +36,6 @@ pub use revalidation::*;
 pub use scope::*;
 pub use source_detect::*;
 pub use types::*;
-pub use workspace_index::*;
 
 /// Extract cross-file metadata from R source by combining directive parsing with AST-detected `source()` and library-related calls.
 ///
@@ -171,7 +167,7 @@ pub fn extract_metadata_for_kind(
 ///
 /// For non-Rmd files this is identical to [`extract_metadata`]. Use this at any
 /// site that extracts metadata from a path-identified file's *raw* content
-/// (file-cache fallbacks, on-demand indexing, legacy-document arms) so that
+/// (file-cache fallbacks and on-demand indexing) so that
 /// `.Rmd` / `.Rmarkdown` / `.qmd` files contribute outgoing edges from their
 /// chunks rather than spurious prose-derived ones (issue #343). State-aware
 /// closed-file callers should prefer

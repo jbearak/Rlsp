@@ -192,14 +192,22 @@ package-mode rebuilds cannot drift or introduce blocking filesystem work under
 the state lock.
 
 Document analysis has one authority per lifecycle state. Open buffers live in
-`OpenDocumentStore`; closed full payloads live in `WorkspaceIndex`. A workspace
-scan records its owned URI set separately in `WorldState::workspace_scan_uris`
-so the next transactional replacement can remove only prior scan entries while
-retaining watcher/on-demand/external entries. That URI set is provenance only:
-consumers must never treat it as an analysis store. The transitional
-`CrossFileWorkspaceIndex` carries artifact-only entries beyond the full-payload
-LRU capacity; it is not a third document authority. CLI per-file overlays
-project an indexed payload without rereading or reparsing the file.
+`OpenDocumentStore`; all closed records live in `WorkspaceIndex`. The closed
+authority has two residency tiers under one lock: metadata/scope artifacts
+(default capacity 5000) and full Rope/tree payloads (default capacity 1000).
+Full residency always implies artifact residency; full eviction leaves a
+Complete artifact record, while artifact eviction also removes any matching
+full payload. One shared pin set protects both tiers.
+
+Each URI is explicitly Pending or Complete. On-demand workers atomically claim
+a never-reused Pending generation before disk I/O and only that generation may
+commit or abort. A full-record commit derives the artifact projection from the
+same `IndexEntry`, preserving shared `Arc` identity. Workspace-scan ownership is
+stored as record provenance (`WorkspaceScan { generation }` versus `Dynamic`);
+there is no parallel URI side set. Scan replacement installs both tiers, pins,
+and one version increment under the authority lock, retaining Dynamic
+artifact-only entries. CLI per-file overlays project an indexed payload without
+rereading or reparsing the file.
 
 The package-state-local static-source closure walker in `package_state/mod.rs`
 owns the traversal mechanics shared by `.Rprofile` and testthat preambles: LIFO
@@ -225,11 +233,13 @@ Key files under `crates/raven/src/cross_file/`:
 - `types.rs` — Shared types (`CrossFileMetadata`, `SymbolKind`, etc.)
 - `config.rs` — Cross-file configuration (cache sizes, debounce intervals, feature flags)
 - `parent_resolve.rs` — Parent-prefix scope resolution (backward-edge traversal)
-- `content_provider.rs` — Cross-file content provider (open-doc-authoritative reads)
 - `cache.rs` — `MetadataCache`
 - `file_cache.rs` — `CrossFileFileCache` (content + existence)
-- `workspace_index.rs` — `CrossFileWorkspaceIndex`
 - `property_tests.rs` / `integration_tests.rs` — Property-based and integration test suites
+
+The open-doc-authoritative provider and the closed two-tier authority live at
+`crates/raven/src/content_provider.rs` and
+`crates/raven/src/workspace_index.rs`, respectively.
 
 ### Path resolution invariant (forward vs backward)
 
@@ -294,8 +304,7 @@ Implication: eviction is effectively “LRU by insertion/update time”, not “
 Default capacities are defined close to each cache:
 - `MetadataCache`: `crates/raven/src/cross_file/cache.rs`
 - `CrossFileFileCache` (content + existence): `crates/raven/src/cross_file/file_cache.rs`
-- `CrossFileWorkspaceIndex`: `crates/raven/src/cross_file/workspace_index.rs`
-- `WorkspaceIndex`: `crates/raven/src/workspace_index.rs`
+- `WorkspaceIndex` (artifact and full tiers): `crates/raven/src/workspace_index.rs`
 
 Cache sizes are configurable via VS Code settings and applied during initialization/config change.
 
@@ -394,8 +403,8 @@ See `index_file_on_demand` / `index_forward_chain` / `index_backward_chain` in
 
 For `.Rmd` / `.Rmarkdown` / `.qmd` documents, everywhere we store or extract cross-file data we keep two views distinct (mirroring the `Document` type docs in `state.rs`):
 
-- **Raw content** — `DocumentStore::DocumentState.contents`, `IndexEntry.contents`, and the `cross_file_file_cache` entry stay verbatim. `ContentProvider::get_content` returns raw, serving snippets and non-R-language text scans.
-- **Masked analysis** — the `tree`, `metadata`, `artifacts`, and `loaded_packages` on those same entries are derived from `chunks::mask_to_r` (chunk bodies only). Byte offsets in the stored `tree` index into the masked text, exposed by `DocumentState::analysis_text()`; pairing the tree with raw content mis-slices.
+- **Raw content** — `OpenDocumentRecord::document().contents`, `IndexEntry.contents`, and the `cross_file_file_cache` entry stay verbatim. `ContentProvider::get_content` returns raw, serving snippets and non-R-language text scans.
+- **Masked analysis** — the `tree`, `metadata`, `artifacts`, and `loaded_packages` on those same records are derived from `chunks::mask_to_r` (chunk bodies only). Byte offsets in the stored `tree` index into `Document::analysis_text()`; pairing the tree with raw content mis-slices.
 
 The state-aware closed-file chokepoints live in `state.rs`: `WorldState::analysis_text_for_uri(uri, content)` and `WorldState::extract_metadata_for_uri(uri, content)`. They consult `WorldState::editor_chunk_kind_overrides` first, then fall back to path classification, so extension-mismatched Rmd/Quarto files keep masking after close. The pure path-based helpers in `cross_file/mod.rs` — `analysis_text_for_path(path, content)` and `extract_metadata_for_path(path, content)` — remain for call sites that have raw content but no `WorldState`; their classifier masks `.Rmd` / `.Rmarkdown` / `.qmd` documents and borrows raw otherwise. Raw-content fallbacks therefore still contribute outgoing edges from chunks, never spurious prose-derived ones. `.Rmd` / `.Rmarkdown` / `.qmd` are intentionally excluded from the proactive workspace scan (outgoing-only); incoming relationships come from an open Rmd/Quarto document or a `.R` file's `# raven: sourced-by` backward directive.
 

@@ -3429,7 +3429,7 @@ fn hydrate_package_r_files_from_state(
 ) -> std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput> {
     let open_uri_set: std::collections::HashSet<Url> = state.documents.keys().cloned().collect();
 
-    for uri in state.workspace_index_new.uris() {
+    for uri in state.workspace_index.uris() {
         let open_or_alias = if state.open_document_aliases.is_empty() {
             open_uri_set.contains(&uri)
         } else {
@@ -3443,7 +3443,7 @@ fn hydrate_package_r_files_from_state(
         }
         if let Ok(path) = uri.to_file_path()
             && let Some(kind) = crate::package_state::is_r_source_path(&path, root)
-            && let Some(entry) = state.workspace_index_new.get(&uri)
+            && let Some(entry) = state.workspace_index.get(&uri)
         {
             let text: std::sync::Arc<str> = entry.contents.to_string().into();
             r_files.insert(path, package_r_file_input_from_text(text, kind));
@@ -3528,8 +3528,8 @@ struct WorkspaceGraphAuthorityIdentity {
     workspace_index_version: u64,
     workspace_index_max_files: usize,
     workspace_index_max_file_size_bytes: usize,
+    workspace_index_artifact_capacity: usize,
     workspace_index_pinned: std::collections::HashSet<Url>,
-    cross_file_index_version: u64,
     package_input_generation: u64,
     package_config_generation: u64,
     open_documents: std::collections::BTreeMap<Url, OpenDocumentSeedIdentity>,
@@ -3537,17 +3537,17 @@ struct WorkspaceGraphAuthorityIdentity {
 }
 
 impl WorkspaceGraphAuthorityIdentity {
-    fn capture(state: &WorldState) -> Self {
+    fn capture_from_snapshot(
+        state: &WorldState,
+        index: &crate::workspace_index::WorkspaceIndexSnapshot,
+    ) -> Self {
         Self {
             graph_authority_generation: state.workspace_graph_authority_generation(),
-            workspace_index_version: state.workspace_index_new.version(),
-            workspace_index_max_files: state.workspace_index_new.config().max_files,
-            workspace_index_max_file_size_bytes: state
-                .workspace_index_new
-                .config()
-                .max_file_size_bytes,
-            workspace_index_pinned: state.workspace_index_new.pinned_uris(),
-            cross_file_index_version: state.cross_file_workspace_index.version(),
+            workspace_index_version: index.version,
+            workspace_index_max_files: state.workspace_index.config().max_files,
+            workspace_index_max_file_size_bytes: state.workspace_index.config().max_file_size_bytes,
+            workspace_index_artifact_capacity: index.artifact_capacity_limit,
+            workspace_index_pinned: index.pinned.clone(),
             package_input_generation: state.package_input_generation(),
             package_config_generation: state.package_config_generation,
             open_documents: snapshot_open_document_seed_identities(state),
@@ -3555,14 +3555,21 @@ impl WorkspaceGraphAuthorityIdentity {
         }
     }
 
+    #[cfg(test)]
+    fn capture(state: &WorldState) -> Self {
+        let index = state.workspace_index.authority_snapshot();
+        Self::capture_from_snapshot(state, &index)
+    }
+
     fn is_current_for(&self, state: &WorldState) -> bool {
+        let index = state.workspace_index.authority_snapshot();
         state.workspace_graph_authority_generation() == self.graph_authority_generation
-            && state.workspace_index_new.version() == self.workspace_index_version
-            && state.workspace_index_new.config().max_files == self.workspace_index_max_files
-            && state.workspace_index_new.config().max_file_size_bytes
+            && index.version == self.workspace_index_version
+            && state.workspace_index.config().max_files == self.workspace_index_max_files
+            && state.workspace_index.config().max_file_size_bytes
                 == self.workspace_index_max_file_size_bytes
-            && state.workspace_index_new.pinned_uris() == self.workspace_index_pinned
-            && state.cross_file_workspace_index.version() == self.cross_file_index_version
+            && index.artifact_capacity_limit == self.workspace_index_artifact_capacity
+            && index.pinned == self.workspace_index_pinned
             && state.package_input_generation() == self.package_input_generation
             && state.package_config_generation == self.package_config_generation
             && snapshot_open_document_seed_identities(state) == self.open_documents
@@ -3571,9 +3578,12 @@ impl WorkspaceGraphAuthorityIdentity {
 }
 
 struct PreparedWorkspaceScan {
-    cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
-    new_index_entries: Vec<(Url, crate::workspace_index::IndexEntry)>,
-    scanned_uris: std::collections::HashSet<Url>,
+    artifact_only: Vec<(Url, crate::workspace_index::ArtifactEntry)>,
+    full_records: Vec<(
+        Url,
+        crate::workspace_index::IndexEntry,
+        crate::workspace_index::ClosedProvenance,
+    )>,
     graph: crate::cross_file::dependency::DependencyGraph,
     open_metadata: HashMap<
         Url,
@@ -3632,6 +3642,33 @@ fn prepare_resident_workspace_entries(
     ordered_entries
 }
 
+/// Apply the artifact-tier admission policy off-lock and return the exact roots
+/// that can survive the atomic scan commit.
+fn prepare_resident_artifact_uris(
+    entries: &HashMap<Url, crate::workspace_index::IndexEntry>,
+    authority: &WorkspaceGraphAuthorityIdentity,
+    pins: &std::collections::HashSet<Url>,
+) -> std::collections::HashSet<Url> {
+    let config = crate::workspace_index::WorkspaceIndexConfig {
+        max_files: entries.len().max(1),
+        max_file_size_bytes: usize::MAX,
+        ..Default::default()
+    };
+    let prepared = crate::workspace_index::WorkspaceIndex::new(config);
+    prepared.resize_artifacts(authority.workspace_index_artifact_capacity);
+    prepared.set_pinned_uris(pins.clone());
+    let mut ordered: Vec<_> = entries.iter().collect();
+    ordered.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    for (uri, entry) in ordered {
+        prepared.install_complete(
+            uri.clone(),
+            entry.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        );
+    }
+    prepared.artifact_uris().into_iter().collect()
+}
+
 fn prospective_workspace_pins(
     graph: &crate::cross_file::dependency::DependencyGraph,
     open_overlays: &[WorkspaceGraphOverlay],
@@ -3666,28 +3703,63 @@ async fn prepare_workspace_scan(
         if !inputs.snapshot.is_current_for(&state) {
             return None;
         }
-        let retained_entries = state
-            .workspace_index_new
+        let index_snapshot = state.workspace_index.authority_snapshot();
+        let dynamic_artifact_uris: std::collections::HashSet<_> = index_snapshot
+            .artifacts
             .iter()
-            .into_iter()
-            .filter(|(uri, _)| {
-                !state.workspace_scan_uris.contains(uri) && !state.is_project_excluded_uri(uri)
+            .filter(|(_, artifact)| {
+                artifact.provenance == crate::workspace_index::ClosedProvenance::Dynamic
             })
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        let retained_entries = index_snapshot
+            .full
+            .iter()
+            .filter(|(uri, _)| dynamic_artifact_uris.contains(uri))
+            .filter(|(uri, _)| !state.is_project_excluded_uri(uri))
+            .cloned()
             .collect::<HashMap<_, _>>();
+        let retained_artifacts = index_snapshot
+            .artifacts
+            .iter()
+            .filter(|(uri, artifact)| {
+                artifact.provenance == crate::workspace_index::ClosedProvenance::Dynamic
+                    && !state.is_project_excluded_uri(uri)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         (
             snapshot_workspace_graph_overlays(&state),
-            WorkspaceGraphAuthorityIdentity::capture(&state),
-            retained_entries,
+            WorkspaceGraphAuthorityIdentity::capture_from_snapshot(&state, &index_snapshot),
+            (retained_entries, retained_artifacts),
             state.editor_chunk_kind_overrides.clone(),
         )
     };
 
     let mut result = result;
     crate::state::apply_workspace_scan_chunk_overrides(&mut result, &chunk_kind_overrides);
-    let (mut cross_file_entries, scanned_entries) = result;
-    let scanned_uris = scanned_entries.keys().cloned().collect();
+    let scanned_entries = result;
+    let scan_generation = inputs.snapshot.generation;
+    let (retained_entries, retained_artifacts) = retained_entries;
+    let retained_uris: std::collections::HashSet<_> = retained_entries.keys().cloned().collect();
+    let scanned_uris: std::collections::HashSet<_> = scanned_entries.keys().cloned().collect();
     let mut complete_entries = retained_entries;
     complete_entries.extend(scanned_entries);
+    let mut graph_entries = complete_entries.clone();
+    for (uri, artifact) in retained_artifacts {
+        graph_entries
+            .entry(uri)
+            .or_insert_with(|| crate::workspace_index::IndexEntry {
+                contents: ropey::Rope::new(),
+                tree: None,
+                loaded_packages: Vec::new(),
+                data_packages: Vec::new(),
+                snapshot: artifact.snapshot,
+                metadata: artifact.metadata,
+                artifacts: artifact.artifacts,
+                indexed_at_version: artifact.indexed_at_version,
+            });
+    }
     let routing = &authority.system_file_routing;
     let context = WorkspaceGraphDerivationContext {
         workspace_root: inputs.snapshot.workspace_folders.first().cloned(),
@@ -3698,23 +3770,19 @@ async fn prepare_workspace_scan(
         system_file_library_paths: routing.library_paths.clone(),
     };
     let (complete_graph, _) =
-        derive_workspace_dependency_graph(&mut complete_entries, None, &open_overlays, &context);
+        derive_workspace_dependency_graph(&mut graph_entries, None, &open_overlays, &context);
     let workspace_index_pins = prospective_workspace_pins(&complete_graph, &open_overlays, inputs);
-    let resident_entries = prepare_resident_workspace_entries(
-        complete_entries.clone(),
-        &authority,
-        &workspace_index_pins,
-    );
-    let resident_roots = resident_entries
-        .iter()
-        .map(|(uri, _)| uri.clone())
-        .collect::<std::collections::HashSet<_>>();
+    let artifact_roots =
+        prepare_resident_artifact_uris(&graph_entries, &authority, &workspace_index_pins);
     let (graph, derived_open_metadata) = derive_workspace_dependency_graph(
-        &mut complete_entries,
-        Some(&resident_roots),
+        &mut graph_entries,
+        Some(&artifact_roots),
         &open_overlays,
         &context,
     );
+    complete_entries.retain(|uri, _| artifact_roots.contains(uri));
+    let resident_entries =
+        prepare_resident_workspace_entries(complete_entries, &authority, &workspace_index_pins);
     let open_metadata = derived_open_metadata
         .into_iter()
         .filter_map(|(uri, metadata)| {
@@ -3724,31 +3792,57 @@ async fn prepare_workspace_scan(
                 .map(|identity| (uri, (identity.generation, metadata)))
         })
         .collect();
-    let new_index_entries = resident_entries
+    let full_records = resident_entries
         .into_iter()
         .map(|(uri, mut entry)| {
-            if let Some(derived) = complete_entries.get(&uri) {
+            if let Some(derived) = graph_entries.get(&uri) {
                 entry.metadata = derived.metadata.clone();
                 entry.artifacts = derived.artifacts.clone();
             }
-            (uri, entry)
+            let provenance = if scanned_uris.contains(&uri) {
+                crate::workspace_index::ClosedProvenance::WorkspaceScan {
+                    generation: scan_generation,
+                }
+            } else {
+                debug_assert!(retained_uris.contains(&uri));
+                crate::workspace_index::ClosedProvenance::Dynamic
+            };
+            (uri, entry, provenance)
         })
         .collect::<Vec<_>>();
-    for (uri, entry) in &complete_entries {
-        cross_file_entries.insert(
-            uri.clone(),
-            crate::cross_file::workspace_index::IndexEntry {
-                snapshot: entry.snapshot.clone(),
-                metadata: entry.metadata.clone(),
-                artifacts: entry.artifacts.clone(),
-                indexed_at_version: entry.indexed_at_version,
-            },
-        );
-    }
+    let full_provenance: HashMap<_, _> = full_records
+        .iter()
+        .map(|(uri, _, provenance)| (uri.clone(), *provenance))
+        .collect();
+    let artifact_only = graph_entries
+        .into_iter()
+        .filter(|(uri, _)| artifact_roots.contains(uri))
+        .map(|(uri, entry)| {
+            let provenance = full_provenance.get(&uri).copied().unwrap_or_else(|| {
+                if scanned_uris.contains(&uri) {
+                    crate::workspace_index::ClosedProvenance::WorkspaceScan {
+                        generation: scan_generation,
+                    }
+                } else {
+                    crate::workspace_index::ClosedProvenance::Dynamic
+                }
+            });
+            (
+                uri,
+                crate::workspace_index::ArtifactEntry {
+                    snapshot: entry.snapshot,
+                    metadata: entry.metadata,
+                    artifacts: entry.artifacts,
+                    indexed_at_version: entry.indexed_at_version,
+                    provenance,
+                    record_generation: 0,
+                },
+            )
+        })
+        .collect();
     Some(PreparedWorkspaceScan {
-        cross_file_entries,
-        new_index_entries,
-        scanned_uris,
+        artifact_only,
+        full_records,
         graph,
         open_metadata,
         workspace_index_pins,
@@ -3772,9 +3866,8 @@ async fn apply_workspace_scan_if_current(
         return false;
     }
     state.apply_prepared_workspace_index(
-        prepared.cross_file_entries,
-        prepared.new_index_entries,
-        prepared.scanned_uris,
+        prepared.artifact_only,
+        prepared.full_records,
         prepared.graph,
         prepared.open_metadata,
         prepared.workspace_index_pins,
@@ -3824,7 +3917,7 @@ async fn run_workspace_scan_until_current(
                 &inputs.exclusions,
             );
             let scan_duration = scan_start.elapsed();
-            let file_count = result.0.len();
+            let file_count = result.len();
             crate::perf::record_workspace_scan(scan_duration, file_count);
             log::info!(
                 "[Background] Workspace scan complete: {} files in {:?}",
@@ -4728,12 +4821,10 @@ pub(crate) fn sysdata_r_fallback_needed(state: &WorldState) -> bool {
 fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<Url> {
     let neighbors = state.affected_open_dependents_after_edit(uri, true, false);
 
-    state.workspace_index_new.invalidate(uri);
+    state.workspace_index.invalidate(uri);
     state.cross_file_graph.remove_file(uri);
     state.cross_file_file_cache.invalidate(uri);
-    state.cross_file_workspace_index.invalidate(uri);
     state.cross_file_meta.remove(uri);
-    state.workspace_scan_uris.remove(uri);
     state.prune_editor_chunk_kind_override(uri);
     // Prune the per-URI coalescing entry with the rest of the closed-file
     // state. A delayed retry that captured an older generation treats the
@@ -4756,8 +4847,7 @@ fn remove_project_excluded_file_from_cross_file_state(
 
 fn remove_project_excluded_index_entries(state: &mut WorldState) -> Vec<Url> {
     let mut candidates: std::collections::HashSet<Url> =
-        state.workspace_index_new.uris().into_iter().collect();
-    candidates.extend(state.cross_file_workspace_index.uris());
+        state.workspace_index.artifact_uris().into_iter().collect();
     candidates.extend(state.documents.keys().cloned());
 
     let mut affected = Vec::new();
@@ -4853,8 +4943,7 @@ fn source_targets_to_index_for_live_diagnostics(
         if let Some(source_uri) = source_uri
             && !state.is_project_excluded_uri(&source_uri)
             && !state.is_document_open_or_alias(&source_uri)
-            && !state.workspace_index_new.contains(&source_uri)
-            && !state.cross_file_workspace_index.contains(&source_uri)
+            && !state.workspace_index.is_complete(&source_uri)
             && !files_to_index.contains(&source_uri)
         {
             files_to_index.push(source_uri);
@@ -4862,6 +4951,41 @@ fn source_targets_to_index_for_live_diagnostics(
     }
 
     files_to_index
+}
+
+/// Commit one on-demand analysis before publishing its associated raw-content
+/// cache memo. A stale claim therefore mutates neither authority.
+fn commit_on_demand_record(
+    state: &mut WorldState,
+    uri: &Url,
+    claim: Option<&crate::workspace_index::EnrichmentClaim>,
+    refresh: Option<&crate::workspace_index::CompleteRefreshToken>,
+    entry: crate::workspace_index::IndexEntry,
+    snapshot: crate::cross_file::file_cache::FileSnapshot,
+    content: String,
+) -> bool {
+    if state.is_document_open_or_alias(uri) {
+        return false;
+    }
+    let committed = match (claim, refresh) {
+        (Some(claim), None) => state
+            .workspace_index
+            .commit_enrichment(claim, entry)
+            .is_ok(),
+        (None, Some(refresh)) => state
+            .workspace_index
+            .commit_complete_refresh(refresh, entry)
+            .is_ok(),
+        _ => false,
+    };
+    if !committed {
+        return false;
+    }
+    state.advance_workspace_scan_generation();
+    state
+        .cross_file_file_cache
+        .insert(uri.clone(), snapshot, content);
+    true
 }
 
 fn update_project_excluded_live_graph(
@@ -5431,7 +5555,7 @@ async fn resync_file_from_disk(
     }
 
     // Replace the unified-index entry IN PLACE with fresh disk state.
-    // `workspace_index_new` outranks `cross_file_workspace_index` in
+    // `workspace_index` outranks `workspace_index` in
     // `get_enriched_metadata` and the content provider, so a stale scan-time
     // entry would shadow the commit below — but merely invalidating it would
     // drop the file from reference search, which walks this index for closed
@@ -5451,24 +5575,14 @@ async fn resync_file_from_disk(
         artifacts: artifacts.clone(),
         indexed_at_version: 0,
     };
-    state.workspace_index_new.insert(uri.clone(), fresh_entry);
+    state
+        .workspace_index
+        .install_complete_preserving_provenance(uri.clone(), fresh_entry);
 
     // Cache RAW content for future match/inference resolution (readers mask).
     state
         .cross_file_file_cache
         .insert(uri.clone(), snapshot.clone(), content);
-
-    // `update_from_disk`'s open-document guard only ever tests THIS uri,
-    // which the veto above just proved closed — pass an empty set rather
-    // than cloning every open-document URI under the write lock.
-    let open_docs = std::collections::HashSet::new();
-    state.cross_file_workspace_index.update_from_disk(
-        uri,
-        &open_docs,
-        snapshot,
-        cross_file_meta.clone(),
-        artifacts,
-    );
 
     let workspace_root = state.workspace_folders.first().cloned();
 
@@ -7808,16 +7922,9 @@ impl LanguageServer for Backend {
             // Capture old interface_hash from workspace index (for selective invalidation)
             // This optimization avoids invalidating dependents when file content hasn't changed
             let old_interface_hash = state
-                .cross_file_workspace_index
+                .workspace_index
                 .get_artifacts(&uri)
-                .map(|a| a.interface_hash)
-                .or_else(|| {
-                    // Also check the new workspace index
-                    state
-                        .workspace_index_new
-                        .get_artifacts(&uri)
-                        .map(|a| a.interface_hash)
-                });
+                .map(|a| a.interface_hash);
 
             // Extract and enrich metadata with inherited working directory.
             // For Rmd/Quarto docs this masks the prose first so the graph,
@@ -7926,7 +8033,7 @@ impl LanguageServer for Backend {
                     if let Some(source_uri) = source_uri_opt {
                         // Check if file needs indexing (not open, not in workspace index)
                         if !state.is_document_open_or_alias(&source_uri)
-                            && !state.cross_file_workspace_index.contains(&source_uri)
+                            && !state.workspace_index.is_complete(&source_uri)
                         {
                             log::trace!(
                                 "Scheduling on-demand indexing for sourced file: {}",
@@ -7950,7 +8057,7 @@ impl LanguageServer for Backend {
                                 crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
                             && let Ok(parent_uri) = Url::from_file_path(resolved)
                             && !state.is_document_open_or_alias(&parent_uri)
-                            && !state.cross_file_workspace_index.contains(&parent_uri)
+                            && !state.workspace_index.is_complete(&parent_uri)
                         {
                             log::trace!(
                                 "Scheduling on-demand indexing for parent file: {}",
@@ -7975,7 +8082,7 @@ impl LanguageServer for Backend {
                                     )
                                 && let Ok(parent_uri) = Url::from_file_path(resolved)
                                 && !state.is_document_open_or_alias(&parent_uri)
-                                && !state.cross_file_workspace_index.contains(&parent_uri)
+                                && !state.workspace_index.is_complete(&parent_uri)
                                 && !files_to_index.iter().any(|(uri, category)| {
                                     *category == IndexCategory::BackwardDirective
                                         && uri == &parent_uri
@@ -8219,7 +8326,7 @@ impl LanguageServer for Backend {
             // Synchronously index the forward source chain so transitive
             // dependencies are available before diagnostics run.
             // index_forward_chain handles cycle detection, depth limits, and
-            // skips files already in documents or cross_file_workspace_index.
+            // skips files already in documents or workspace_index.
             let (workspace_root, max_backward_depth, max_forward_depth) = {
                 let state = self.state.read().await;
                 (
@@ -8367,7 +8474,7 @@ impl LanguageServer for Backend {
                     if let Some(child_uri) = child_uri_opt {
                         let needs_indexing = {
                             !state.is_document_open_or_alias(&child_uri)
-                                && !state.cross_file_workspace_index.contains(&child_uri)
+                                && !state.workspace_index.is_complete(&child_uri)
                         };
                         if needs_indexing {
                             log::trace!("did_open re-enrich: indexing direct source {}", child_uri);
@@ -8590,7 +8697,7 @@ impl LanguageServer for Backend {
     /// This method processes an LSP `textDocument/didChange` notification by updating the server's document store and dependency graph, determining which open documents are affected by the change, and scheduling debounced asynchronous diagnostics for those documents. If package indexing is enabled and package references are found, it also triggers background prefetching of package exports.
     ///
     /// Key observable behaviors:
-    /// - Updates the server's document store and legacy open-document map with the incoming changes.
+    /// - Applies the incoming changes once to the open-document authority.
     /// - Recomputes cross-file dependencies and selects affected open documents to revalidate (subject to configured caps and activity-based prioritization).
     /// - Schedules debounced diagnostic runs for each affected document; each scheduled run performs freshness checks before and after asynchronous work and respects the server's monotonic publishing gate.
     /// - If packages are enabled and package names were discovered, initiates background prefetch of referenced package exports without holding the main state lock.
@@ -9514,8 +9621,7 @@ impl LanguageServer for Backend {
                     .package_workspace()
                     .is_some_and(|pkg| is_package_source_dir(&p, &pkg.root))
             {
-                state.cross_file_workspace_index.invalidate(uri);
-                state.workspace_index_new.invalidate(uri);
+                state.workspace_index.invalidate(uri);
             }
 
             // Refresh the pin set now that the open set has shrunk; URIs reachable
@@ -9938,10 +10044,8 @@ impl LanguageServer for Backend {
 
                         // Invalidate disk-backed caches
                         state.cross_file_file_cache.invalidate(uri);
-                        state.cross_file_workspace_index.invalidate(uri);
-
                         // Schedule debounced update in new WorkspaceIndex (Requirement 5.1)
-                        state.workspace_index_new.schedule_update(uri.clone());
+                        state.workspace_index.schedule_update(uri.clone());
 
                         // Schedule for async update (legacy)
                         to_update.push(WatchedResyncItem {
@@ -11308,12 +11412,31 @@ impl Backend {
                 return None;
             }
         }
+        let claim = {
+            let state = self.state.read().await;
+            match state.workspace_index.claim_enrichment(
+                file_uri.clone(),
+                crate::workspace_index::ClosedProvenance::Dynamic,
+            ) {
+                crate::workspace_index::ClaimEnrichment::AlreadyComplete(_) => {
+                    return state.workspace_index.get_metadata(file_uri);
+                }
+                crate::workspace_index::ClaimEnrichment::AlreadyPending => return None,
+                crate::workspace_index::ClaimEnrichment::Claimed(claim) => claim,
+            }
+        };
 
         // Read file content
         let path = match file_uri.to_file_path() {
             Ok(p) => p,
             Err(_) => {
                 log::trace!("Failed to convert URI to path: {}", file_uri);
+                let _ = self
+                    .state
+                    .read()
+                    .await
+                    .workspace_index
+                    .abort_enrichment(&claim);
                 return None;
             }
         };
@@ -11322,6 +11445,12 @@ impl Backend {
             Ok(c) => c,
             Err(e) => {
                 log::trace!("Failed to read/decode file {}: {}", file_uri, e);
+                let _ = self
+                    .state
+                    .read()
+                    .await
+                    .workspace_index
+                    .abort_enrichment(&claim);
                 return None;
             }
         };
@@ -11330,6 +11459,12 @@ impl Backend {
             Ok(m) => m,
             Err(_) => {
                 log::trace!("Failed to get metadata for: {}", file_uri);
+                let _ = self
+                    .state
+                    .read()
+                    .await
+                    .workspace_index
+                    .abort_enrichment(&claim);
                 return None;
             }
         };
@@ -11361,7 +11496,6 @@ impl Backend {
         let (
             workspace_root,
             packages_enabled,
-            open_docs,
             workspace_index_version,
             parent_content,
             sys_file_ws_name,
@@ -11401,8 +11535,7 @@ impl Backend {
                 })
                 .collect();
 
-            let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
-            let workspace_index_version = state.workspace_index_new.version();
+            let workspace_index_version = state.workspace_index.version();
 
             // Capture system.file() resolution inputs for post-enrich resolve
             let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
@@ -11410,7 +11543,6 @@ impl Backend {
             (
                 workspace_root,
                 packages_enabled,
-                open_docs,
                 workspace_index_version,
                 parent_content,
                 ws_name,
@@ -11458,21 +11590,17 @@ impl Backend {
 
         {
             let mut state = self.state.write().await;
-            state.advance_workspace_scan_generation();
-            // RAW content cache (serves snippets / get_content), not masked.
-            state
-                .cross_file_file_cache
-                .insert(file_uri.clone(), snapshot.clone(), content.clone());
-            state
-                .workspace_index_new
-                .insert(file_uri.clone(), index_entry);
-            state.cross_file_workspace_index.update_from_disk(
+            if !commit_on_demand_record(
+                &mut state,
                 file_uri,
-                &open_docs,
-                snapshot,
-                (*cross_file_meta).clone(),
-                artifacts.clone(),
-            );
+                Some(&claim),
+                None,
+                index_entry,
+                snapshot.clone(),
+                content.clone(),
+            ) {
+                return state.workspace_index.get_metadata(file_uri);
+            }
             let graph_meta = state.metadata_for_dependency_graph(
                 file_uri,
                 &cross_file_meta,
@@ -11543,8 +11671,7 @@ impl Backend {
 
             let needs_indexing = {
                 let state = self.state.read().await;
-                !state.is_document_open_or_alias(&uri)
-                    && !state.cross_file_workspace_index.contains(&uri)
+                !state.is_document_open_or_alias(&uri) && !state.workspace_index.is_complete(&uri)
             };
 
             let meta = if needs_indexing {
@@ -11607,8 +11734,7 @@ impl Backend {
 
             let needs_indexing = {
                 let state = self.state.read().await;
-                !state.is_document_open_or_alias(&uri)
-                    && !state.cross_file_workspace_index.contains(&uri)
+                !state.is_document_open_or_alias(&uri) && !state.workspace_index.is_complete(&uri)
             };
 
             let meta = if needs_indexing {
@@ -11658,7 +11784,7 @@ impl Backend {
                             let state = self.state.read().await;
                             if state.is_document_open_or_alias(&child_uri) {
                                 false
-                            } else if !state.cross_file_workspace_index.contains(&child_uri) {
+                            } else if !state.workspace_index.is_complete(&child_uri) {
                                 // Not indexed yet → index it. (Same "indexed?"
                                 // predicate the pop-time `needs_indexing` check uses.)
                                 true
@@ -11726,11 +11852,32 @@ impl Backend {
                 return None;
             }
         }
+        let (claim, refresh) = {
+            let state = self.state.read().await;
+            match state.workspace_index.claim_enrichment(
+                file_uri.clone(),
+                crate::workspace_index::ClosedProvenance::Dynamic,
+            ) {
+                crate::workspace_index::ClaimEnrichment::AlreadyComplete(refresh) => {
+                    (None, Some(refresh))
+                }
+                crate::workspace_index::ClaimEnrichment::AlreadyPending => return None,
+                crate::workspace_index::ClaimEnrichment::Claimed(claim) => (Some(claim), None),
+            }
+        };
 
         let path = match file_uri.to_file_path() {
             Ok(p) => p,
             Err(_) => {
                 log::trace!("Failed to convert URI to path: {}", file_uri);
+                if let Some(claim) = &claim {
+                    let _ = self
+                        .state
+                        .read()
+                        .await
+                        .workspace_index
+                        .abort_enrichment(claim);
+                }
                 return None;
             }
         };
@@ -11739,6 +11886,14 @@ impl Backend {
             Ok(c) => c,
             Err(e) => {
                 log::trace!("Failed to read/decode file {}: {}", file_uri, e);
+                if let Some(claim) = &claim {
+                    let _ = self
+                        .state
+                        .read()
+                        .await
+                        .workspace_index
+                        .abort_enrichment(claim);
+                }
                 return None;
             }
         };
@@ -11747,6 +11902,14 @@ impl Backend {
             Ok(m) => m,
             Err(_) => {
                 log::trace!("Failed to get metadata for: {}", file_uri);
+                if let Some(claim) = &claim {
+                    let _ = self
+                        .state
+                        .read()
+                        .await
+                        .workspace_index
+                        .abort_enrichment(claim);
+                }
                 return None;
             }
         };
@@ -11784,7 +11947,6 @@ impl Backend {
         let (
             workspace_root,
             packages_enabled,
-            open_docs,
             workspace_index_version,
             parent_content,
             sys_file_ws_name,
@@ -11815,8 +11977,7 @@ impl Backend {
                 })
                 .collect();
 
-            let open_docs: std::collections::HashSet<_> = state.documents.keys().cloned().collect();
-            let workspace_index_version = state.workspace_index_new.version();
+            let workspace_index_version = state.workspace_index.version();
 
             // Capture system.file() resolution inputs for post-enrich resolve
             let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
@@ -11824,7 +11985,6 @@ impl Backend {
             (
                 workspace_root,
                 packages_enabled,
-                open_docs,
                 workspace_index_version,
                 parent_content,
                 ws_name,
@@ -11869,21 +12029,17 @@ impl Backend {
 
         {
             let mut state = self.state.write().await;
-            state.advance_workspace_scan_generation();
-            // RAW content cache (serves snippets / get_content), not masked.
-            state
-                .cross_file_file_cache
-                .insert(file_uri.clone(), snapshot.clone(), content.clone());
-            state
-                .workspace_index_new
-                .insert(file_uri.clone(), index_entry);
-            state.cross_file_workspace_index.update_from_disk(
+            if !commit_on_demand_record(
+                &mut state,
                 file_uri,
-                &open_docs,
-                snapshot,
-                (*cross_file_meta).clone(),
-                artifacts.clone(),
-            );
+                claim.as_ref(),
+                refresh.as_ref(),
+                index_entry,
+                snapshot.clone(),
+                content.clone(),
+            ) {
+                return state.workspace_index.get_metadata(file_uri);
+            }
             let graph_meta = state.metadata_for_dependency_graph(
                 file_uri,
                 &cross_file_meta,
@@ -13362,8 +13518,8 @@ async fn run_libpath_consumer(
                             .is_some_and(|sf| affected.contains(&sf.package))
                     };
                     state
-                        .workspace_index_new
-                        .any_entry(|entry| entry.metadata.sources.iter().any(selected))
+                        .workspace_index
+                        .any_artifact(|entry| entry.metadata.sources.iter().any(selected))
                         || state.documents.uris().iter().any(|uri| {
                             state.documents.get_record(uri).is_some_and(|record| {
                                 record.metadata().sources.iter().any(selected)
@@ -18159,7 +18315,7 @@ mod refresh_packages_tests {
             indexed_at_version: 0,
         };
         world
-            .workspace_index_new
+            .workspace_index
             .insert(parent_uri.clone(), parent_entry);
 
         // Child is an OPEN document that sources the parent
@@ -18536,7 +18692,7 @@ mod refresh_packages_tests {
         }
         let pkg_lib = Arc::new(lib);
 
-        // parent.R is CLOSED (only in workspace_index_new); it loads MASS and
+        // parent.R is CLOSED (only in workspace_index); it loads MASS and
         // then sources child.R. child.R is the OPEN document.
         let temp_dir = TempDir::new().unwrap();
         let parent_path = temp_dir.path().join("parent.R");
@@ -18594,7 +18750,7 @@ mod refresh_packages_tests {
         // perspective of child.R (parent.R sources it).
         let mut new_entries = std::collections::HashMap::new();
         new_entries.insert(parent_uri.clone(), parent_entry);
-        world.apply_workspace_index(std::collections::HashMap::new(), new_entries);
+        world.apply_workspace_index(new_entries);
 
         // Sanity: MASS uncached before any prefetch.
         assert!(
@@ -20065,7 +20221,7 @@ mod project_config_initialize_tests {
         assert!(state.cross_file_config.index_workspace);
         assert!(state.workspace_scan_complete);
         assert!(
-            state.workspace_index_new.contains(&helper_uri),
+            state.workspace_index.contains(&helper_uri),
             "re-enabling indexing must launch a fresh convergent scan"
         );
     }
@@ -20266,7 +20422,7 @@ mod project_config_initialize_tests {
             state_arc
                 .read()
                 .await
-                .workspace_index_new
+                .workspace_index
                 .get(&uri)
                 .map(|entry| entry.contents.to_string())
                 .as_deref(),
@@ -20314,19 +20470,19 @@ mod project_config_initialize_tests {
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(external.join("data")).unwrap();
         fs::write(root.join("main.R"), "workspace_value <- 1\n").unwrap();
-        let parent_path = external.join("parent.R");
         let external_path = external.join("helper.R");
         let leaf_path = external.join("data/leaf.R");
-        fs::write(&parent_path, "source(\"helper.R\")\n").unwrap();
+        let filler_path = external.join("filler.R");
         fs::write(
             &external_path,
-            "# raven: sourced-by parent.R\nsource(\"leaf.R\")\nexternal_value <- 1\n",
+            "source(\"data/leaf.R\")\nexternal_value <- 1\n",
         )
         .unwrap();
         fs::write(&leaf_path, "leaf_value <- 1\n").unwrap();
-        let parent_uri = Url::from_file_path(&parent_path).unwrap();
+        fs::write(&filler_path, "filler_value <- 1\n").unwrap();
         let external_uri = Url::from_file_path(&external_path).unwrap();
         let leaf_uri = Url::from_file_path(&leaf_path).unwrap();
+        let filler_uri = Url::from_file_path(&filler_path).unwrap();
 
         let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
         let backend = svc.inner();
@@ -20343,48 +20499,50 @@ mod project_config_initialize_tests {
             })
             .await
             .unwrap();
-        open_doc(
-            backend,
-            &parent_uri,
-            "r",
-            1,
-            "# raven: cd data\nsource(\"../helper.R\")\n",
-        )
-        .await;
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_index = crate::workspace_index::WorkspaceIndex::new(
+                crate::workspace_index::WorkspaceIndexConfig {
+                    max_files: 1,
+                    ..Default::default()
+                },
+            );
+        }
         backend
             .index_file_on_demand(&external_uri)
             .await
             .expect("external helper should index");
+        backend
+            .index_file_on_demand(&filler_uri)
+            .await
+            .expect("filler should displace only the helper full payload");
         {
-            // Model both retained representations before the candidate has
-            // inherited the dirty open parent's working directory.
-            let state = backend.state.write().await;
-            let mut retained = state
-                .workspace_index_new
-                .get(&external_uri)
-                .expect("external helper should be resident");
-            retained.metadata = Arc::new(crate::cross_file::extract_metadata(
-                "# raven: sourced-by parent.R\nsource(\"leaf.R\")\nexternal_value <- 1\n",
-            ));
-            state
-                .workspace_index_new
-                .insert(external_uri.clone(), retained.clone());
-            state.cross_file_workspace_index.insert(
-                external_uri.clone(),
-                crate::cross_file::workspace_index::IndexEntry {
-                    snapshot: retained.snapshot.clone(),
-                    metadata: retained.metadata.clone(),
-                    artifacts: retained.artifacts.clone(),
-                    indexed_at_version: retained.indexed_at_version,
-                },
+            let state = backend.state.read().await;
+            let snapshot = state.workspace_index.authority_snapshot();
+            assert!(
+                state.workspace_index.get(&external_uri).is_none(),
+                "expected artifact-only helper; full={:?}, artifacts={:?}, cap={}",
+                snapshot
+                    .full
+                    .iter()
+                    .map(|(uri, _)| uri.as_str())
+                    .collect::<Vec<_>>(),
+                snapshot
+                    .artifacts
+                    .iter()
+                    .map(|(uri, _)| uri.as_str())
+                    .collect::<Vec<_>>(),
+                state.workspace_index.cap(),
             );
+            assert!(state.workspace_index.is_complete(&external_uri));
         }
         run_workspace_scan_until_current(&backend.state)
             .await
             .expect("workspace scan should apply");
 
         let state = backend.state.read().await;
-        assert!(state.workspace_index_new.contains(&external_uri));
+        assert!(state.workspace_index.get(&external_uri).is_none());
+        assert!(state.workspace_index.is_complete(&external_uri));
         assert!(
             state
                 .cross_file_graph
@@ -20393,20 +20551,10 @@ mod project_config_initialize_tests {
                 .any(|edge| edge.to == leaf_uri),
             "retained non-scan roots must remain represented by the replacement graph"
         );
-        assert_eq!(
-            state
-                .cross_file_workspace_index
-                .get_metadata(&external_uri)
-                .expect("retained legacy metadata should be refreshed")
-                .inherited_working_directory
-                .as_deref(),
-            Some(external.join("data").to_string_lossy().as_ref()),
-            "retained entries must update the legacy metadata preferred by inheritance"
-        );
     }
 
     #[tokio::test]
-    async fn workspace_scan_graph_matches_installed_lru_entries() {
+    async fn workspace_scan_graph_matches_artifact_residency() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir_all(&root).unwrap();
@@ -20437,12 +20585,13 @@ mod project_config_initialize_tests {
             .unwrap();
         {
             let mut state = backend.state.write().await;
-            state.workspace_index_new = crate::workspace_index::WorkspaceIndex::new(
+            state.workspace_index = crate::workspace_index::WorkspaceIndex::new(
                 crate::workspace_index::WorkspaceIndexConfig {
                     max_files: 1,
                     ..Default::default()
                 },
             );
+            state.workspace_index.resize_artifacts(1);
             state.cross_file_config.index_workspace = true;
             state.advance_workspace_scan_generation();
         }
@@ -20451,22 +20600,72 @@ mod project_config_initialize_tests {
             .expect("workspace scan should apply");
 
         let state = backend.state.read().await;
-        let resident: std::collections::HashSet<_> =
-            state.workspace_index_new.uris().into_iter().collect();
-        assert_eq!(resident.len(), 1);
+        let full_resident: std::collections::HashSet<_> =
+            state.workspace_index.uris().into_iter().collect();
+        let artifact_resident: std::collections::HashSet<_> =
+            state.workspace_index.artifact_uris().into_iter().collect();
+        assert_eq!(full_resident.len(), 1);
+        assert_eq!(artifact_resident.len(), 1);
         for name in ["a", "b", "c"] {
             let uri = Url::from_file_path(root.join(format!("{name}.R"))).unwrap();
-            if !resident.contains(&uri) {
-                assert!(
-                    state.cross_file_graph.get_dependencies(&uri).is_empty(),
-                    "evicted entries must not remain as dependency-graph roots"
-                );
-            }
+            assert_eq!(
+                !state.cross_file_graph.get_dependencies(&uri).is_empty(),
+                artifact_resident.contains(&uri),
+                "graph roots must exactly match post-cap artifact residency"
+            );
         }
     }
 
     #[tokio::test]
-    async fn workspace_scan_resident_child_uses_complete_legacy_parent_metadata() {
+    async fn workspace_scan_collision_adopts_dynamic_record_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("owned.R");
+        fs::write(&path, "owned_value <- 1\n").unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let root_uri = Url::from_file_path(&root).unwrap();
+
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: root_uri.clone(),
+                    name: "workspace".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut dynamic = crate::state::scan_workspace(&[root_uri], 20);
+        let entry = dynamic.remove(&uri).unwrap();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_index.install_complete(
+                uri.clone(),
+                entry,
+                crate::workspace_index::ClosedProvenance::Dynamic,
+            );
+            state.cross_file_config.index_workspace = true;
+            state.advance_workspace_scan_generation();
+        }
+
+        run_workspace_scan_until_current(&backend.state)
+            .await
+            .expect("workspace scan should apply");
+        assert!(matches!(
+            backend.state.read().await.workspace_index.provenance(&uri),
+            Some(crate::workspace_index::ClosedProvenance::WorkspaceScan { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_scan_resident_child_uses_artifact_only_parent_metadata() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("workspace");
         fs::create_dir_all(root.join("data")).unwrap();
@@ -20499,7 +20698,7 @@ mod project_config_initialize_tests {
             .unwrap();
         {
             let mut state = backend.state.write().await;
-            state.workspace_index_new = crate::workspace_index::WorkspaceIndex::new(
+            state.workspace_index = crate::workspace_index::WorkspaceIndex::new(
                 crate::workspace_index::WorkspaceIndexConfig {
                     max_files: 1,
                     ..Default::default()
@@ -20513,18 +20712,15 @@ mod project_config_initialize_tests {
             .expect("workspace scan should apply");
 
         let state = backend.state.read().await;
-        assert!(!state.workspace_index_new.contains(&a_uri));
-        assert!(state.workspace_index_new.contains(&b_uri));
+        assert!(!state.workspace_index.contains(&a_uri));
+        assert!(state.workspace_index.contains(&b_uri));
         assert!(
-            state
-                .cross_file_workspace_index
-                .get_metadata(&a_uri)
-                .is_some(),
-            "evicted parent remains complete legacy metadata authority"
+            state.workspace_index.get_metadata(&a_uri).is_some(),
+            "evicted parent remains a Complete artifact-tier record"
         );
         assert_eq!(
             state
-                .workspace_index_new
+                .workspace_index
                 .get_metadata(&b_uri)
                 .and_then(|metadata| metadata.inherited_working_directory.clone()),
             Some(root.join("data").to_string_lossy().to_string())
@@ -20564,7 +20760,7 @@ mod project_config_initialize_tests {
             .unwrap();
         {
             let mut state = backend.state.write().await;
-            state.workspace_index_new = crate::workspace_index::WorkspaceIndex::new(
+            state.workspace_index = crate::workspace_index::WorkspaceIndex::new(
                 crate::workspace_index::WorkspaceIndexConfig {
                     max_files: 1,
                     ..Default::default()
@@ -20589,7 +20785,7 @@ mod project_config_initialize_tests {
         for name in ["A", "B", "C"] {
             let uri = Url::from_file_path(root.join(format!("{name}.R"))).unwrap();
             assert!(
-                state.workspace_index_new.contains(&uri),
+                state.workspace_index.contains(&uri),
                 "new transitive open neighborhood member {name} must be reserved before eviction"
             );
         }
@@ -20621,7 +20817,7 @@ mod project_config_initialize_tests {
             .await
             .unwrap();
         {
-            backend.state.write().await.workspace_index_new =
+            backend.state.write().await.workspace_index =
                 crate::workspace_index::WorkspaceIndex::new(
                     crate::workspace_index::WorkspaceIndexConfig {
                         max_files: 1,
@@ -20640,8 +20836,8 @@ mod project_config_initialize_tests {
             .expect("workspace scan should apply");
 
         let state = backend.state.read().await;
-        assert!(state.workspace_index_new.contains(&parent_uri));
-        assert!(state.workspace_index_new.contains(&child_uri));
+        assert!(state.workspace_index.contains(&parent_uri));
+        assert!(state.workspace_index.contains(&child_uri));
         assert!(
             state
                 .cross_file_graph
@@ -20868,7 +21064,7 @@ mod project_config_initialize_tests {
         let state = backend.state.read().await;
         assert_eq!(
             state
-                .workspace_index_new
+                .workspace_index
                 .get_metadata(&child_uri)
                 .and_then(|metadata| metadata.inherited_working_directory.clone()),
             None,
@@ -21000,7 +21196,7 @@ mod project_config_initialize_tests {
             let state = backend.state.read().await;
             assert!(state.workspace_exclusions.is_excluded_uri(&generated_uri));
             assert!(
-                state.workspace_index_new.get(&generated_uri).is_none(),
+                state.workspace_index.get(&generated_uri).is_none(),
                 "precondition: excluded file must not already be indexed"
             );
         }
@@ -21021,18 +21217,18 @@ mod project_config_initialize_tests {
             "reload must pick up the removed exclusion"
         );
         assert!(
-            state.workspace_index_new.get(&generated_uri).is_some(),
+            state.workspace_index.get(&generated_uri).is_some(),
             "newly re-included file must be merged into the unified workspace index"
         );
         assert!(
-            state
-                .cross_file_workspace_index
-                .get_metadata(&generated_uri)
-                .is_some(),
-            "newly re-included file must be merged into the legacy cross-file index"
+            state.workspace_index.get_metadata(&generated_uri).is_some(),
+            "newly re-included file must have an artifact projection"
         );
         assert!(
-            state.workspace_scan_uris.contains(&generated_uri),
+            state
+                .workspace_index
+                .artifact_uris()
+                .contains(&generated_uri),
             "newly re-included file must be owned by the workspace scan"
         );
     }
@@ -21247,8 +21443,8 @@ mod project_config_initialize_tests {
             "excluded buffer must not be a lending parent of the non-excluded helper"
         );
         assert!(
-            !state.workspace_index_new.contains(&excluded_uri)
-                && !state.cross_file_workspace_index.contains(&excluded_uri),
+            !state.workspace_index.contains(&excluded_uri)
+                && !state.workspace_index.contains(&excluded_uri),
             "excluded open buffer must stay out of workspace indexes"
         );
         assert!(
@@ -21309,7 +21505,7 @@ mod project_config_initialize_tests {
             crate::state::scan_workspace_with_exclusions(&folders, max_chain_depth, &exclusions);
         {
             let mut state = backend.state.write().await;
-            state.apply_workspace_index(scan_result.0, scan_result.1);
+            state.apply_workspace_index(scan_result);
             replay_open_documents_after_workspace_index_apply(&mut state).await;
         }
 
@@ -23234,7 +23430,7 @@ mod project_config_initialize_tests {
         let generation_before_apply = state_arc.read().await.package_input_generation();
 
         let mut state = state_arc.write().await;
-        state.apply_workspace_index(Default::default(), Default::default());
+        state.apply_workspace_index(Default::default());
         assert_eq!(
             state.package_input_generation(),
             generation_before_apply,
@@ -25935,7 +26131,7 @@ mod project_config_initialize_tests {
         );
         let state = backend.state.read().await;
         let meta = state
-            .cross_file_workspace_index
+            .workspace_index
             .get_metadata(&helper_uri)
             .expect("workspace index must hold disk-derived metadata for the changed file");
         assert_eq!(
@@ -26020,10 +26216,7 @@ mod project_config_initialize_tests {
             "deletion must clear the deleted file's backward edges"
         );
         assert!(
-            state
-                .cross_file_workspace_index
-                .get_metadata(&helper_uri)
-                .is_none(),
+            state.workspace_index.get_metadata(&helper_uri).is_none(),
             "deletion must invalidate the workspace-index entry"
         );
         assert_eq!(
@@ -26210,7 +26403,7 @@ mod project_config_initialize_tests {
 
         let closed_resync_finished = wait_for_state(backend, 5_000, |state| {
             state
-                .cross_file_workspace_index
+                .workspace_index
                 .get_metadata(&child_real_uri)
                 .is_some()
         })
@@ -26400,7 +26593,7 @@ mod project_config_initialize_tests {
     /// Issue #567 round 4: opening a child through a directory symlink must
     /// on-demand index backward-directive parents for every authoritative graph
     /// root. The canonical parent starts absent from open docs, the file cache,
-    /// and both indexes, so this exercises the production `did_open` path rather
+    /// and the closed index, so this exercises the production `did_open` path rather
     /// than the manual preloading path above.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -26453,12 +26646,12 @@ mod project_config_initialize_tests {
                     "precondition: parent must not be open before did_open: {parent_root}"
                 );
                 assert!(
-                    !state.workspace_index_new.contains(parent_root),
-                    "precondition: parent must not be in workspace_index_new before did_open: {parent_root}"
+                    !state.workspace_index.contains(parent_root),
+                    "precondition: parent must not be in workspace_index before did_open: {parent_root}"
                 );
                 assert!(
-                    !state.cross_file_workspace_index.contains(parent_root),
-                    "precondition: parent must not be in cross_file_workspace_index before did_open: {parent_root}"
+                    !state.workspace_index.contains(parent_root),
+                    "precondition: parent must not be in workspace_index before did_open: {parent_root}"
                 );
                 assert!(
                     state.cross_file_file_cache.get(parent_root).is_none(),
@@ -27228,7 +27421,7 @@ mod project_config_initialize_tests {
         );
         let state = backend.state.read().await;
         let meta = state
-            .cross_file_workspace_index
+            .workspace_index
             .get_metadata(&helper_uri)
             .expect("close resync must install disk-derived index metadata");
         assert!(
@@ -27333,10 +27526,7 @@ mod project_config_initialize_tests {
         // Wait for the resync to install disk-derived index metadata (the
         // edge itself is unchanged here, so it cannot signal completion).
         let resynced = wait_for_state(backend, 5_000, |state| {
-            state
-                .cross_file_workspace_index
-                .get_metadata(&child_uri)
-                .is_some()
+            state.workspace_index.get_metadata(&child_uri).is_some()
         })
         .await;
         assert!(
@@ -27740,11 +27930,8 @@ mod project_config_initialize_tests {
                 .get_dependencies(&main_uri)
                 .iter()
                 .any(|e| e.to == helper_uri)
-                && state
-                    .cross_file_workspace_index
-                    .get_metadata(&helper_uri)
-                    .is_none()
-                && !state.workspace_index_new.contains(&helper_uri)
+                && state.workspace_index.get_metadata(&helper_uri).is_none()
+                && !state.workspace_index.contains(&helper_uri)
                 && state.cross_file_file_cache.get(&helper_uri).is_none()
                 && !state.package_inputs.r_files.contains_key(&helper_path)
                 && !state
@@ -28332,14 +28519,11 @@ mod project_config_initialize_tests {
             "superseded R-file retry must not remove graph edges"
         );
         assert!(
-            state
-                .cross_file_workspace_index
-                .get_metadata(&helper_uri)
-                .is_some(),
+            state.workspace_index.get_metadata(&helper_uri).is_some(),
             "superseded R-file retry must not remove workspace-index metadata"
         );
         assert!(
-            state.workspace_index_new.contains(&helper_uri),
+            state.workspace_index.contains(&helper_uri),
             "superseded R-file retry must not remove unified index state"
         );
         assert_eq!(
@@ -28739,10 +28923,7 @@ mod project_config_initialize_tests {
                 .cross_file_graph
                 .get_dependencies(&helper_uri)
                 .is_empty()
-                && state
-                    .cross_file_workspace_index
-                    .get_metadata(&helper_uri)
-                    .is_none()
+                && state.workspace_index.get_metadata(&helper_uri).is_none()
         })
         .await;
         assert!(
@@ -28800,10 +28981,7 @@ mod project_config_initialize_tests {
         // The resync installs disk-derived index metadata; wait for it, then
         // assert the classification survived the close.
         let resynced = wait_for_state(backend, 5_000, |state| {
-            state
-                .cross_file_workspace_index
-                .get_metadata(&report_uri)
-                .is_some()
+            state.workspace_index.get_metadata(&report_uri).is_some()
         })
         .await;
         assert!(resynced, "close resync must install index metadata");
@@ -28858,10 +29036,7 @@ mod project_config_initialize_tests {
         let closed_resync_installed = wait_for_state(backend, 5_000, |state| {
             state.editor_chunk_kind_overrides.get(&report_uri).copied()
                 == Some(crate::chunks::ChunkKind::Rmd)
-                && state
-                    .cross_file_workspace_index
-                    .get_metadata(&report_uri)
-                    .is_some()
+                && state.workspace_index.get_metadata(&report_uri).is_some()
                 && state
                     .cross_file_graph
                     .get_dependencies(&report_uri)
@@ -28951,8 +29126,8 @@ mod project_config_initialize_tests {
 
         {
             let state = backend.state.write().await;
-            state.workspace_index_new.invalidate(&report_uri);
-            state.cross_file_workspace_index.invalidate(&report_uri);
+            state.workspace_index.invalidate(&report_uri);
+            state.workspace_index.invalidate(&report_uri);
         }
 
         let state = backend.state.read().await;
@@ -29042,10 +29217,7 @@ mod project_config_initialize_tests {
         let persisted = wait_for_state(backend, 5_000, |state| {
             state.editor_chunk_kind_overrides.get(&report_uri).copied()
                 == Some(crate::chunks::ChunkKind::Rmd)
-                && state
-                    .cross_file_workspace_index
-                    .get_metadata(&report_uri)
-                    .is_some()
+                && state.workspace_index.get_metadata(&report_uri).is_some()
         })
         .await;
         assert!(
@@ -29076,10 +29248,7 @@ mod project_config_initialize_tests {
             "deletion convergence must remove graph state too"
         );
         assert!(
-            state
-                .cross_file_workspace_index
-                .get_metadata(&report_uri)
-                .is_none(),
+            state.workspace_index.get_metadata(&report_uri).is_none(),
             "deletion convergence must remove workspace-index metadata"
         );
     }
@@ -29298,7 +29467,7 @@ mod project_config_initialize_tests {
 
         let installed = wait_for_state(backend, 5_000, |state| {
             state
-                .workspace_index_new
+                .workspace_index
                 .get(&helper_uri)
                 .is_some_and(|entry| entry.contents == "helper_fn <- function() 1\n")
         })
@@ -29350,10 +29519,7 @@ mod project_config_initialize_tests {
                 .cross_file_graph
                 .get_dependencies(&helper_uri)
                 .is_empty()
-                && state
-                    .cross_file_workspace_index
-                    .get_metadata(&helper_uri)
-                    .is_none()
+                && state.workspace_index.get_metadata(&helper_uri).is_none()
         })
         .await;
         assert!(
@@ -29467,10 +29633,7 @@ mod project_config_initialize_tests {
             "deleting a closed Rmd must remove its graph state"
         );
         assert!(
-            state
-                .cross_file_workspace_index
-                .get_metadata(&rmd_uri)
-                .is_none(),
+            state.workspace_index.get_metadata(&rmd_uri).is_none(),
             "deleting a closed Rmd must remove its index entry"
         );
     }
@@ -29683,8 +29846,8 @@ mod project_config_initialize_tests {
         );
     }
 
-    /// A stale `workspace_index_new` entry (planted by the startup scan or
-    /// on-demand indexing) outranks `cross_file_workspace_index` in
+    /// A stale `workspace_index` entry (planted by the startup scan or
+    /// on-demand indexing) outranks `workspace_index` in
     /// `get_enriched_metadata` and the content provider, so the resync's
     /// commit must invalidate it — otherwise the freshly committed disk
     /// state is shadowed and dependents keep resolving the pre-resync
@@ -29734,7 +29897,7 @@ mod project_config_initialize_tests {
                 indexed_at_version: 0,
             };
             let state = backend.state.read().await;
-            state.workspace_index_new.insert(helper_uri.clone(), entry);
+            state.workspace_index.insert(helper_uri.clone(), entry);
         }
         // Precondition: the stale entry shadows every lower tier, so the
         // parent cannot resolve helper_fn.
@@ -29936,7 +30099,7 @@ mod project_config_initialize_tests {
         );
         for uri in [&a_uri, &b_uri] {
             assert!(
-                state.cross_file_workspace_index.get_metadata(uri).is_none(),
+                state.workspace_index.get_metadata(uri).is_none(),
                 "index entry for {uri} must be invalidated"
             );
         }
@@ -30005,17 +30168,8 @@ mod project_config_initialize_tests {
                 artifacts: artifacts.clone(),
                 indexed_at_version: 0,
             };
-            let cross_entry = crate::cross_file::workspace_index::IndexEntry {
-                snapshot,
-                metadata,
-                artifacts,
-                indexed_at_version: 0,
-            };
             let state = backend.state.write().await;
-            state.workspace_index_new.insert(ignored_uri.clone(), entry);
-            state
-                .cross_file_workspace_index
-                .insert(ignored_uri.clone(), cross_entry);
+            state.workspace_index.insert(ignored_uri.clone(), entry);
         }
 
         backend
@@ -30029,15 +30183,12 @@ mod project_config_initialize_tests {
 
         let state = backend.state.read().await;
         assert!(
-            state.workspace_index_new.get(&ignored_uri).is_none(),
+            state.workspace_index.get(&ignored_uri).is_none(),
             "excluded watched-file change must remove stale unified index entry"
         );
         assert!(
-            state
-                .cross_file_workspace_index
-                .get_metadata(&ignored_uri)
-                .is_none(),
-            "excluded watched-file change must remove stale legacy cross-file entry"
+            state.workspace_index.get_metadata(&ignored_uri).is_none(),
+            "excluded watched-file change must remove stale artifact projection"
         );
     }
 
@@ -30716,8 +30867,8 @@ infixContinuationStyle = "aligned"
             "excluded buffer must not be a lending parent of the non-excluded helper"
         );
         assert!(
-            !state.workspace_index_new.contains(excluded_uri)
-                && !state.cross_file_workspace_index.contains(excluded_uri),
+            !state.workspace_index.contains(excluded_uri)
+                && !state.workspace_index.contains(excluded_uri),
             "excluded open buffer must stay out of workspace indexes"
         );
         let undefined_message = format!("{helper_symbol} is not defined");
@@ -31060,5 +31211,279 @@ infixContinuationStyle = "aligned"
                 .map(|d| (d.range.start.line, d.message.clone()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn on_demand_failed_read_aborts_claim_for_retry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("retry.R");
+        let uri = Url::from_file_path(&path).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+
+        assert!(backend.index_file_on_demand(&uri).await.is_none());
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .workspace_index
+                .enrichment_status(&uri),
+            None,
+            "a failed disk read must abort, not strand Pending"
+        );
+
+        fs::write(&path, "retry_value <- 1\n").unwrap();
+        assert!(backend.index_file_on_demand(&uri).await.is_some());
+        assert!(backend.state.read().await.workspace_index.is_complete(&uri));
+    }
+
+    #[tokio::test]
+    async fn concurrent_on_demand_indexing_deduplicates_pending_work() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("large.R");
+        let mut content = " ".repeat(4 * 1024 * 1024);
+        content.push_str("\nlarge_value <- 1\n");
+        fs::write(&path, content).unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+
+        let (first, second) = tokio::join!(
+            backend.index_file_on_demand(&uri),
+            backend.index_file_on_demand(&uri)
+        );
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1,
+            "only the worker owning the Pending generation may parse and commit"
+        );
+        assert!(backend.state.read().await.workspace_index.is_complete(&uri));
+    }
+
+    fn complete_refresh_test_record(
+        content: &str,
+    ) -> (
+        crate::workspace_index::IndexEntry,
+        crate::cross_file::file_cache::FileSnapshot,
+        String,
+    ) {
+        let content = content.to_string();
+        let snapshot = crate::cross_file::file_cache::FileSnapshot {
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: content.len() as u64,
+            content_hash: None,
+        };
+        (
+            crate::workspace_index::IndexEntry {
+                contents: ropey::Rope::from_str(&content),
+                tree: None,
+                loaded_packages: Vec::new(),
+                data_packages: Vec::new(),
+                snapshot: snapshot.clone(),
+                metadata: Arc::new(crate::cross_file::CrossFileMetadata::default()),
+                artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+                indexed_at_version: 0,
+            },
+            snapshot,
+            content,
+        )
+    }
+
+    fn complete_refresh_token(
+        state: &WorldState,
+        uri: &Url,
+    ) -> crate::workspace_index::CompleteRefreshToken {
+        match state.workspace_index.claim_enrichment(
+            uri.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        ) {
+            crate::workspace_index::ClaimEnrichment::AlreadyComplete(token) => token,
+            other => panic!("expected Complete refresh token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_on_demand_refresh_commits_exact_record_then_raw_cache() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///complete-refresh-success.R").unwrap();
+        let (old_entry, _, _) = complete_refresh_test_record("old_value <- 1\n");
+        state.workspace_index.install_complete(
+            uri.clone(),
+            old_entry,
+            crate::workspace_index::ClosedProvenance::WorkspaceScan { generation: 7 },
+        );
+        let token = complete_refresh_token(&state, &uri);
+        let (fresh_entry, snapshot, content) = complete_refresh_test_record("fresh_value <- 2\n");
+
+        assert!(commit_on_demand_record(
+            &mut state,
+            &uri,
+            None,
+            Some(&token),
+            fresh_entry,
+            snapshot,
+            content.clone(),
+        ));
+        assert_eq!(
+            state
+                .workspace_index
+                .get(&uri)
+                .expect("refreshed full record")
+                .contents
+                .to_string(),
+            content
+        );
+        assert_eq!(
+            state.cross_file_file_cache.get(&uri).as_deref(),
+            Some(content.as_str())
+        );
+        assert_eq!(
+            state.workspace_index.provenance(&uri),
+            Some(crate::workspace_index::ClosedProvenance::WorkspaceScan { generation: 7 })
+        );
+    }
+
+    #[test]
+    fn deleted_complete_record_rejects_refresh_without_raw_cache_publish() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///complete-refresh-deleted.R").unwrap();
+        let (old_entry, _, _) = complete_refresh_test_record("old_value <- 1\n");
+        state.workspace_index.insert(uri.clone(), old_entry);
+        let token = complete_refresh_token(&state, &uri);
+        state.workspace_index.invalidate(&uri);
+        let (stale_entry, snapshot, content) = complete_refresh_test_record("stale_value <- 2\n");
+
+        assert!(!commit_on_demand_record(
+            &mut state,
+            &uri,
+            None,
+            Some(&token),
+            stale_entry,
+            snapshot,
+            content,
+        ));
+        assert!(state.workspace_index.enrichment_status(&uri).is_none());
+        assert!(state.cross_file_file_cache.get(&uri).is_none());
+    }
+
+    #[test]
+    fn opened_complete_record_rejects_refresh_without_closed_or_raw_mutation() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///complete-refresh-opened.R").unwrap();
+        let (old_entry, _, _) = complete_refresh_test_record("closed_value <- 1\n");
+        state.workspace_index.insert(uri.clone(), old_entry);
+        let token = complete_refresh_token(&state, &uri);
+        state.open_document(uri.clone(), "open_value <- 3\n", Some(1));
+        let (stale_entry, snapshot, content) = complete_refresh_test_record("stale_value <- 2\n");
+
+        assert!(!commit_on_demand_record(
+            &mut state,
+            &uri,
+            None,
+            Some(&token),
+            stale_entry,
+            snapshot,
+            content,
+        ));
+        assert_eq!(
+            state
+                .workspace_index
+                .get(&uri)
+                .expect("closed record remains untouched")
+                .contents
+                .to_string(),
+            "closed_value <- 1\n"
+        );
+        assert_eq!(
+            state.get_document(&uri).unwrap().text(),
+            "open_value <- 3\n"
+        );
+        assert!(state.cross_file_file_cache.get(&uri).is_none());
+    }
+
+    #[test]
+    fn scan_replacement_rejects_complete_refresh_without_resurrection() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///complete-refresh-scanned.R").unwrap();
+        let (old_entry, _, _) = complete_refresh_test_record("old_value <- 1\n");
+        state.workspace_index.insert(uri.clone(), old_entry);
+        let token = complete_refresh_token(&state, &uri);
+        let (scan_entry, _, scan_content) = complete_refresh_test_record("scan_value <- 3\n");
+        state.workspace_index.replace_all_complete(
+            Vec::new(),
+            vec![(
+                uri.clone(),
+                scan_entry,
+                crate::workspace_index::ClosedProvenance::WorkspaceScan { generation: 11 },
+            )],
+            std::collections::HashSet::new(),
+        );
+        let (stale_entry, snapshot, content) = complete_refresh_test_record("stale_value <- 2\n");
+
+        assert!(!commit_on_demand_record(
+            &mut state,
+            &uri,
+            None,
+            Some(&token),
+            stale_entry,
+            snapshot,
+            content,
+        ));
+        assert_eq!(
+            state
+                .workspace_index
+                .get(&uri)
+                .expect("scan replacement remains authoritative")
+                .contents
+                .to_string(),
+            scan_content
+        );
+        assert_eq!(
+            state.workspace_index.provenance(&uri),
+            Some(crate::workspace_index::ClosedProvenance::WorkspaceScan { generation: 11 })
+        );
+        assert!(state.cross_file_file_cache.get(&uri).is_none());
+    }
+
+    #[test]
+    fn stale_on_demand_claim_cannot_publish_raw_cache_content() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///stale-on-demand.R").unwrap();
+        let claim = match state.workspace_index.claim_enrichment(
+            uri.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        ) {
+            crate::workspace_index::ClaimEnrichment::Claimed(claim) => claim,
+            other => panic!("expected claim, got {other:?}"),
+        };
+        state.workspace_index.invalidate(&uri);
+        let snapshot = crate::cross_file::file_cache::FileSnapshot {
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 16,
+            content_hash: None,
+        };
+        let entry = crate::workspace_index::IndexEntry {
+            contents: ropey::Rope::from_str("stale_value <- 1\n"),
+            tree: None,
+            loaded_packages: Vec::new(),
+            data_packages: Vec::new(),
+            snapshot: snapshot.clone(),
+            metadata: Arc::new(crate::cross_file::CrossFileMetadata::default()),
+            artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 0,
+        };
+
+        assert!(!commit_on_demand_record(
+            &mut state,
+            &uri,
+            Some(&claim),
+            None,
+            entry,
+            snapshot,
+            "stale_value <- 1\n".to_string(),
+        ));
+        assert!(state.cross_file_file_cache.get(&uri).is_none());
+        assert!(state.workspace_index.enrichment_status(&uri).is_none());
     }
 }

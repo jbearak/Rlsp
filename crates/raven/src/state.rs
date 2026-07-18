@@ -174,7 +174,7 @@ use crate::content_provider::{DefaultContentProvider, OpenDocumentsView};
 use crate::cross_file::revalidation::{CrossFileDiagnosticsGate, DiagnosticsEpoch};
 use crate::cross_file::{
     CrossFileActivityState, CrossFileConfig, CrossFileFileCache, CrossFileRevalidationState,
-    CrossFileWorkspaceIndex, DependencyGraph, MetadataCache,
+    DependencyGraph, MetadataCache,
 };
 use crate::file_type::{FileType, file_type_from_language_id_or_uri, file_type_from_uri};
 use crate::open_document_store::{
@@ -718,7 +718,7 @@ pub(crate) fn extract_data_packages(tree: &Option<Tree>, text: &str) -> Vec<Stri
 pub struct WorldState {
     /// Sole authority for editor-owned documents.
     pub(crate) documents: OpenDocumentStore,
-    pub workspace_index_new: WorkspaceIndex,
+    pub workspace_index: WorkspaceIndex,
 
     /// Open documents keyed by the exact URI spelling supplied by the client.
     ///
@@ -733,12 +733,6 @@ pub struct WorldState {
     /// aliases an open buffer is treated as open for revalidation, live content,
     /// and watched-file vetoes, but publish work still targets the client URI.
     pub open_document_aliases: OpenDocumentAliases,
-    /// Closed URIs owned by the most recently committed workspace scan.
-    ///
-    /// This is provenance for transactional replacement, not an analysis
-    /// authority; payloads live only in [`Self::workspace_index_new`].
-    pub(crate) workspace_scan_uris: HashSet<Url>,
-
     // Workspace configuration
     pub workspace_folders: Vec<Url>,
 
@@ -855,7 +849,6 @@ pub struct WorldState {
     /// receive diagnostics. `Some` keeps hidden client-created text models as
     /// analysis inputs while preventing them from acquiring Problems entries.
     pub editor_diagnostic_uris: Option<HashSet<Url>>,
-    pub cross_file_workspace_index: CrossFileWorkspaceIndex,
     /// Last-known editor-derived chunk classification for file-backed
     /// documents whose editor language made the file behave differently from
     /// path classification.
@@ -1284,7 +1277,7 @@ impl WorldState {
     ///
     /// The returned state is populated with:
     /// - default CrossFileConfig (logged at initialization),
-    /// - empty document and workspace indexes (legacy and new),
+    /// - one empty open-document store and one empty closed-file index,
     /// - an empty, concurrently accessible PackageLibrary,
     /// - all cross-file caches and auxiliary structures in their default state.
     ///
@@ -1332,10 +1325,9 @@ impl WorldState {
         Self {
             // Analysis authority
             documents: OpenDocumentStore::new(),
-            workspace_index_new: WorkspaceIndex::new(Default::default()),
+            workspace_index: WorkspaceIndex::new(Default::default()),
 
             open_document_aliases: OpenDocumentAliases::default(),
-            workspace_scan_uris: HashSet::new(),
 
             // Workspace configuration
             workspace_folders: Vec::new(),
@@ -1379,7 +1371,6 @@ impl WorldState {
             cross_file_revalidation: CrossFileRevalidationState::new(),
             cross_file_activity: CrossFileActivityState::new(),
             editor_diagnostic_uris: None,
-            cross_file_workspace_index: CrossFileWorkspaceIndex::new(),
             editor_chunk_kind_overrides: HashMap::new(),
             watched_file_resync_generation_counter: 0,
             watched_file_resync_generations: HashMap::new(),
@@ -1723,17 +1714,15 @@ impl WorldState {
     /// metadata, and artifacts. It respects the open-docs-authoritative rule:
     /// open documents always take precedence over indexed data.
     ///
-    /// This method creates a content provider with legacy field support for
-    /// migration compatibility. During the migration period, both old and new
-    /// fields are checked.
+    /// The provider is a thin view over the open-document authority, the
+    /// closed-file authority, and the non-authoritative raw-content memo.
     ///
     /// **Validates: Requirements 4.1, 13.1, 13.2**
     pub fn content_provider(&self) -> DefaultContentProvider<'_> {
-        DefaultContentProvider::with_legacy(
+        DefaultContentProvider::with_aliases(
             &self.documents,
-            &self.workspace_index_new,
+            &self.workspace_index,
             &self.cross_file_file_cache,
-            &self.cross_file_workspace_index,
             &self.open_document_aliases,
         )
     }
@@ -1750,11 +1739,10 @@ impl WorldState {
         &'a self,
         documents: &'a impl OpenDocumentsView,
     ) -> DefaultContentProvider<'a> {
-        DefaultContentProvider::with_legacy(
+        DefaultContentProvider::with_aliases(
             documents,
-            &self.workspace_index_new,
+            &self.workspace_index,
             &self.cross_file_file_cache,
-            &self.cross_file_workspace_index,
             &self.open_document_aliases,
         )
     }
@@ -1850,8 +1838,8 @@ impl WorldState {
     /// `CrossFileWorkspaceIndex`, so closed-but-reachable documents survive
     /// across edits to other files and avoid the `compute_artifacts_with_metadata`
     /// recomputation fallback. Open documents live in the non-evictable
-    /// open-document authority; closed neighbors live in the two workspace
-    /// indexes, so both closed caches share the same pin set.
+    /// open-document authority; closed neighbors live in the unified
+    /// workspace index, whose two tiers share this pin set.
     ///
     /// Call after the open set changes (`did_open` / `did_close`) or after a
     /// dependency-graph edge change touches an open file.
@@ -1866,9 +1854,7 @@ impl WorldState {
             }
         }
         if open_uris.is_empty() {
-            self.workspace_index_new.set_pinned_uris(HashSet::new());
-            self.cross_file_workspace_index
-                .set_pinned_uris(HashSet::new());
+            self.workspace_index.set_pinned_uris(HashSet::new());
             return;
         }
 
@@ -1889,13 +1875,7 @@ impl WorldState {
             effective_max_visited,
         );
 
-        // Mirror the same neighborhood across both closed-file caches. Cloning
-        // is cheap relative to the traversal and avoids `Arc<HashSet<Url>>`
-        // plumbing through the existing setter signature.
-        self.workspace_index_new
-            .set_pinned_uris(neighborhood.clone());
-        self.cross_file_workspace_index
-            .set_pinned_uris(neighborhood.clone());
+        self.workspace_index.set_pinned_uris(neighborhood);
     }
 
     /// Resize all LRU caches based on configuration.
@@ -1907,8 +1887,8 @@ impl WorldState {
             config.cache_file_content_max_entries,
             config.cache_existence_max_entries,
         );
-        self.cross_file_workspace_index
-            .resize(config.cache_workspace_index_max_entries);
+        self.workspace_index
+            .resize_artifacts(config.cache_workspace_index_max_entries);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2119,7 +2099,7 @@ impl WorldState {
                 &doc.analysis_text(),
             )));
         }
-        if let Some(meta) = self.cross_file_workspace_index.get_metadata(uri) {
+        if let Some(meta) = self.workspace_index.get_metadata(uri) {
             return Some(meta);
         }
         let content_provider = self.content_provider();
@@ -2139,16 +2119,14 @@ impl WorldState {
     /// Priority order:
     /// 1. open-document authority (open documents with enriched metadata)
     /// 2. WorkspaceIndex (closed-document authority)
-    /// 3. Transitional cross-file index
-    /// 4. File cache (re-extract metadata)
+    /// 3. File cache (re-extract metadata)
     ///
     /// Rmd/Quarto note (issue #343): every tier here is masked-correct for
     /// open R Markdown / Quarto documents. The open-document authority arm (tier 1)
     /// stores metadata extracted from the masked analysis text at
-    /// `did_open`/`did_change` time (`backend.rs` passes
-    /// `extract_metadata_for_path`, and the open-document authority re-derives
-    /// artifacts from the masked text); the file-cache arm likewise masks via
-    /// `extract_metadata_for_uri`. The state-aware file
+    /// `did_open`/`did_change` time (the open-document authority derives
+    /// artifacts from the same masked text); the file-cache arm likewise masks
+    /// via `extract_metadata_for_uri`. The state-aware file
     /// cache fallback consults persisted editor-language chunk classification
     /// before path classification, so extension-mismatched Rmd/Quarto files do
     /// not start treating prose as R after close (issue #563). So directives,
@@ -2168,8 +2146,7 @@ impl WorldState {
                         })
                     })
             })
-            .or_else(|| self.workspace_index_new.get_metadata(uri))
-            .or_else(|| self.cross_file_workspace_index.get_metadata(uri))
+            .or_else(|| self.workspace_index.get_metadata(uri))
             .or_else(|| {
                 // Cached content is RAW; mask Rmd/Quarto before extracting so
                 // directives/source()/library() come from chunk bodies, not
@@ -2221,40 +2198,23 @@ impl WorldState {
     /// **Validates: Requirements 11.1, 13.1**
     pub fn apply_workspace_index(
         &mut self,
-        cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
-        new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
+        entries: HashMap<Url, crate::workspace_index::IndexEntry>,
     ) {
-        for uri in self.workspace_scan_uris.drain() {
-            self.cross_file_workspace_index.invalidate(&uri);
-            self.workspace_index_new.invalidate(&uri);
-        }
-        self.workspace_scan_uris = new_index_entries.keys().cloned().collect();
+        let generation = self.workspace_scan_generation();
+        let records = entries
+            .into_iter()
+            .map(|(uri, entry)| {
+                (
+                    uri,
+                    entry,
+                    crate::workspace_index::ClosedProvenance::WorkspaceScan { generation },
+                )
+            })
+            .collect();
+        self.workspace_index
+            .replace_all_complete(Vec::new(), records, HashSet::new());
 
-        for (uri, entry) in cross_file_entries {
-            log::info!(
-                "Indexing cross-file entry: {} (exported symbols: {})",
-                uri,
-                entry.artifacts.exported_interface.len()
-            );
-            self.cross_file_workspace_index.insert(uri, entry);
-        }
-
-        // Populate the full-payload closed index.
-        for (uri, entry) in new_index_entries {
-            log::trace!(
-                "Indexing new workspace entry: {} (exported symbols: {})",
-                uri,
-                entry.artifacts.exported_interface.len()
-            );
-            self.workspace_index_new.insert(uri, entry);
-        }
-
-        log::info!(
-            "Applied {} workspace files, {} cross-file entries, {} full index entries",
-            self.workspace_scan_uris.len(),
-            self.cross_file_workspace_index.uris().len(),
-            self.workspace_index_new.len()
-        );
+        log::info!("Applied {} workspace files", self.workspace_index.len());
 
         // Build the dependency graph from all workspace entries so that
         // forward-created backward edges are available for auto-detect mode.
@@ -2279,11 +2239,7 @@ impl WorldState {
             content_hash: None,
         };
         let processed = processed_workspace_document(uri.clone(), document, snapshot);
-        self.cross_file_workspace_index
-            .insert(uri.clone(), processed.cross_file_entry);
-        self.workspace_index_new
-            .insert(uri.clone(), processed.new_index_entry);
-        self.workspace_scan_uris.insert(uri);
+        self.workspace_index.insert(uri, processed.entry);
     }
 
     /// Install a complete workspace-scan candidate whose graph was derived
@@ -2294,9 +2250,12 @@ impl WorldState {
     /// This method performs only in-memory replacement.
     pub(crate) fn apply_prepared_workspace_index(
         &mut self,
-        cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
-        new_index_entries: Vec<(Url, crate::workspace_index::IndexEntry)>,
-        scanned_uris: HashSet<Url>,
+        artifact_only: Vec<(Url, crate::workspace_index::ArtifactEntry)>,
+        full_records: Vec<(
+            Url,
+            crate::workspace_index::IndexEntry,
+            crate::workspace_index::ClosedProvenance,
+        )>,
         graph: DependencyGraph,
         open_metadata: HashMap<
             Url,
@@ -2307,23 +2266,8 @@ impl WorldState {
         >,
         prepared_pins: HashSet<Url>,
     ) {
-        for uri in self.workspace_scan_uris.drain() {
-            self.cross_file_workspace_index.invalidate(&uri);
-        }
-        self.workspace_scan_uris = scanned_uris;
-        self.cross_file_workspace_index
-            .set_pinned_uris(prepared_pins.clone());
-        for (uri, entry) in cross_file_entries {
-            self.cross_file_workspace_index.insert(uri, entry);
-        }
-
-        for uri in self.workspace_index_new.uris() {
-            self.workspace_index_new.invalidate(&uri);
-        }
-        self.workspace_index_new.set_pinned_uris(prepared_pins);
-        for (uri, entry) in new_index_entries {
-            self.workspace_index_new.insert(uri, entry);
-        }
+        self.workspace_index
+            .replace_all_complete(artifact_only, full_records, prepared_pins);
 
         self.cross_file_graph = graph;
         for (uri, (generation, metadata)) in open_metadata {
@@ -2354,8 +2298,8 @@ impl WorldState {
         // `entry.metadata` is `Arc<CrossFileMetadata>`, so the clone is a
         // refcount bump rather than a deep clone of Vec/HashSet/String fields.
         let mut entries: Vec<(Url, Arc<crate::cross_file::CrossFileMetadata>)> = Vec::new();
-        for (uri, entry) in self.workspace_index_new.iter() {
-            entries.push((uri.clone(), entry.metadata.clone()));
+        for (uri, entry) in self.workspace_index.artifact_iter() {
+            entries.push((uri, entry.metadata));
         }
         // Determinism (issue #476): `update_file` appends each file's incoming
         // edges to `backward[child]` in call order, and scope resolution's
@@ -2371,10 +2315,11 @@ impl WorldState {
         let workspace_exclusions = self.workspace_exclusions.clone();
 
         // Destructure self to split borrows: cross_file_graph (mutable) and
-        // workspace_index_new (shared) can coexist without pre-cloning all contents.
+        // workspace_index (shared) can coexist without pre-cloning all contents.
         let Self {
             cross_file_graph,
-            workspace_index_new,
+            workspace_index,
+            cross_file_file_cache,
             ..
         } = self;
 
@@ -2390,9 +2335,10 @@ impl WorldState {
                 );
             }
             let get_content = |parent_uri: &Url| -> Option<String> {
-                workspace_index_new
+                workspace_index
                     .get(parent_uri)
                     .map(|e| e.contents.to_string())
+                    .or_else(|| cross_file_file_cache.get(parent_uri))
             };
             let graph_meta = Self::metadata_for_dependency_graph_with_exclusions(
                 &workspace_exclusions,
@@ -2470,8 +2416,8 @@ impl WorldState {
         // `entries_matching` clones just that subset, so workspaces without
         // system.file sources (the common case) pay one predicate pass.
         let affected = self
-            .workspace_index_new
-            .entries_matching(|entry| entry.metadata.sources.iter().any(source_selected));
+            .workspace_index
+            .artifact_entries_matching(|entry| entry.metadata.sources.iter().any(source_selected));
 
         // Open buffers with a selected system.file source (authoritative
         // metadata lives in the document store, not the index).
@@ -2498,7 +2444,7 @@ impl WorldState {
         // references anymore.
         let mut changed_uris: Vec<Url> = Vec::new();
         let mut old_targets: std::collections::HashSet<Url> = std::collections::HashSet::new();
-        for (uri, mut entry) in affected {
+        for (uri, entry) in affected {
             let mut new_sources = entry.metadata.sources.clone();
             crate::cross_file::resolve_system_file_source_entries(
                 &mut new_sources,
@@ -2514,21 +2460,23 @@ impl WorldState {
                         .iter()
                         .filter_map(|s| s.resolved_uri.clone()),
                 );
-                Arc::make_mut(&mut entry.metadata).sources = new_sources;
+                let mut metadata = entry.metadata.clone();
+                Arc::make_mut(&mut metadata).sources = new_sources;
                 changed_uris.push(uri.clone());
-                self.workspace_index_new.insert(uri, entry);
+                self.workspace_index
+                    .replace_complete_metadata(&uri, metadata);
             }
         }
 
         // Rebuild graph edges for changed index entries
         let workspace_root = self.workspace_folders.first().cloned();
         for uri in &changed_uris {
-            if let Some(entry) = self.workspace_index_new.get(uri) {
-                let meta = entry.metadata.clone();
+            if let Some(meta) = self.workspace_index.get_metadata(uri) {
                 let get_content = |parent_uri: &Url| -> Option<String> {
-                    self.workspace_index_new
+                    self.workspace_index
                         .get(parent_uri)
                         .map(|e| e.contents.to_string())
+                        .or_else(|| self.cross_file_file_cache.get(parent_uri))
                 };
                 let graph_meta =
                     self.metadata_for_dependency_graph(uri, meta.as_ref(), workspace_root.as_ref());
@@ -2600,7 +2548,7 @@ impl WorldState {
                     workspace_root.as_ref(),
                 );
                 let get_content = |parent_uri: &Url| -> Option<String> {
-                    self.workspace_index_new
+                    self.workspace_index
                         .get(parent_uri)
                         .map(|e| e.contents.to_string())
                 };
@@ -2657,7 +2605,7 @@ impl WorldState {
             .filter_map(|f| f.to_file_path().ok())
             .collect();
         for uri in candidates {
-            if !self.workspace_index_new.contains(&uri) {
+            if !self.workspace_index.is_complete(&uri) {
                 continue;
             }
             if self.documents.contains_key(&uri) || self.is_document_open_or_alias(&uri) {
@@ -2668,7 +2616,7 @@ impl WorldState {
             {
                 continue;
             }
-            let referenced_from_index = self.workspace_index_new.any_entry(|entry| {
+            let referenced_from_index = self.workspace_index.any_artifact(|entry| {
                 entry
                     .metadata
                     .sources
@@ -2689,7 +2637,7 @@ impl WorldState {
             if referenced_from_index || referenced_from_open_doc() {
                 continue;
             }
-            self.workspace_index_new.invalidate(&uri);
+            self.workspace_index.invalidate(&uri);
             self.cross_file_graph.remove_file(&uri);
             self.prune_editor_chunk_kind_override(&uri);
         }
@@ -2734,10 +2682,10 @@ impl WorldState {
         // (open-document metadata is authoritative and may carry resolutions
         // the index does not — unsaved buffers, index_workspace = false).
         let mut external_uris: Vec<Url> = Vec::new();
-        for (_, entry) in self.workspace_index_new.iter() {
+        for (_, entry) in self.workspace_index.artifact_iter() {
             for source in &entry.metadata.sources {
                 if let Some(ref uri) = source.resolved_uri
-                    && !self.workspace_index_new.contains(uri)
+                    && self.workspace_index.enrichment_status(uri).is_none()
                 {
                     external_uris.push(uri.clone());
                 }
@@ -2747,7 +2695,7 @@ impl WorldState {
             if let Some(record) = self.documents.get_record(&doc_uri) {
                 for source in &record.metadata().sources {
                     if let Some(ref uri) = source.resolved_uri
-                        && !self.workspace_index_new.contains(uri)
+                        && self.workspace_index.enrichment_status(uri).is_none()
                     {
                         external_uris.push(uri.clone());
                     }
@@ -2761,7 +2709,7 @@ impl WorldState {
         parser.set_language(&tree_sitter_r::LANGUAGE.into()).ok();
 
         for uri in external_uris {
-            if self.workspace_index_new.contains(&uri) {
+            if self.workspace_index.enrichment_status(&uri).is_some() {
                 continue;
             }
             let Some(path) = uri.to_file_path().ok() else {
@@ -2802,7 +2750,7 @@ impl WorldState {
                 artifacts,
                 indexed_at_version: 0,
             };
-            self.workspace_index_new.insert(uri, entry);
+            self.workspace_index.insert(uri, entry);
         }
     }
 }
@@ -3244,16 +3192,12 @@ pub(crate) fn derive_workspace_dependency_graph(
 /// the caller populates `WorldState::package_inputs`.
 ///
 /// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
-pub type WorkspaceScanResult = (
-    HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
-    HashMap<Url, crate::workspace_index::IndexEntry>,
-);
+pub type WorkspaceScanResult = HashMap<Url, crate::workspace_index::IndexEntry>;
 
 /// Result of processing a single workspace file (used by parallel scan).
 struct ProcessedFile {
     uri: Url,
-    cross_file_entry: crate::cross_file::workspace_index::IndexEntry,
-    new_index_entry: crate::workspace_index::IndexEntry,
+    entry: crate::workspace_index::IndexEntry,
 }
 
 /// Recursively collect file paths under `dir` whose leaf matches `accept`
@@ -3531,14 +3475,7 @@ fn processed_workspace_document(
 
     let cross_file_meta = Arc::new(cross_file_meta);
 
-    let cross_file_entry = crate::cross_file::workspace_index::IndexEntry {
-        snapshot: snapshot.clone(),
-        metadata: cross_file_meta.clone(),
-        artifacts: artifacts.clone(),
-        indexed_at_version: 0,
-    };
-
-    let new_index_entry = crate::workspace_index::IndexEntry {
+    let entry = crate::workspace_index::IndexEntry {
         contents: doc.contents.clone(),
         tree: doc.tree.clone(),
         loaded_packages: doc.loaded_packages.clone(),
@@ -3549,11 +3486,7 @@ fn processed_workspace_document(
         indexed_at_version: 0,
     };
 
-    ProcessedFile {
-        uri,
-        cross_file_entry,
-        new_index_entry,
-    }
+    ProcessedFile { uri, entry }
 }
 
 /// Process a single file: read, parse, compute metadata and artifacts.
@@ -3582,17 +3515,15 @@ pub(crate) fn apply_workspace_scan_chunk_overrides(
     result: &mut WorkspaceScanResult,
     overrides: &HashMap<Url, ChunkKind>,
 ) {
-    let (legacy_entries, new_entries) = result;
     for (uri, chunk_kind) in overrides {
-        let Some(entry) = new_entries.get(uri) else {
+        let Some(entry) = result.get(uri) else {
             continue;
         };
         let snapshot = entry.snapshot.clone();
         let raw = entry.contents.to_string();
         let document = Document::new_with_kind(&raw, None, file_type_from_uri(uri), *chunk_kind);
         let processed = processed_workspace_document(uri.clone(), document, snapshot);
-        legacy_entries.insert(uri.clone(), processed.cross_file_entry);
-        new_entries.insert(uri.clone(), processed.new_index_entry);
+        result.insert(uri.clone(), processed.entry);
     }
 }
 
@@ -3631,38 +3562,29 @@ pub fn scan_workspace_with_exclusions(
     );
 
     // Type aliases for the thread-local accumulators used in fold/reduce.
-    type CrossFileMap = HashMap<Url, crate::cross_file::workspace_index::IndexEntry>;
-    type NewIndexMap = HashMap<Url, crate::workspace_index::IndexEntry>;
+    type IndexMap = HashMap<Url, crate::workspace_index::IndexEntry>;
 
     // Phase 2+3: Process files in parallel and accumulate directly into
     // thread-local HashMaps via fold, then merge with reduce. This avoids
     // an intermediate Vec<ProcessedFile> that would transiently hold all
     // file contents + ASTs and require two extra Url clones per file for
     // the serial insert loop.
-    let (mut cross_file_entries, mut new_index_entries): (CrossFileMap, NewIndexMap) = file_paths
+    let mut entries: IndexMap = file_paths
         .par_iter()
-        .fold(
-            || (CrossFileMap::new(), NewIndexMap::new()),
-            |(mut cfe, mut nie), path| {
-                if let Some(item) = process_workspace_file(path) {
-                    cfe.insert(item.uri.clone(), item.cross_file_entry);
-                    nie.insert(item.uri, item.new_index_entry);
-                }
-                (cfe, nie)
-            },
-        )
-        .reduce(
-            || (CrossFileMap::new(), NewIndexMap::new()),
-            |(mut cfe_a, mut nie_a), (cfe_b, nie_b)| {
-                cfe_a.extend(cfe_b);
-                nie_a.extend(nie_b);
-                (cfe_a, nie_a)
-            },
-        );
+        .fold(IndexMap::new, |mut entries, path| {
+            if let Some(item) = process_workspace_file(path) {
+                entries.insert(item.uri, item.entry);
+            }
+            entries
+        })
+        .reduce(IndexMap::new, |mut left, right| {
+            left.extend(right);
+            left
+        });
 
     // Second pass: iteratively enrich metadata with inherited_working_directory
     // Track only files that need enrichment to avoid O(n²) behavior
-    let mut files_needing_enrichment: HashSet<Url> = new_index_entries
+    let mut files_needing_enrichment: HashSet<Url> = entries
         .iter()
         .filter(|(_, entry)| {
             !entry.metadata.sourced_by.is_empty()
@@ -3682,17 +3604,16 @@ pub fn scan_workspace_with_exclusions(
         }
 
         // Build metadata map from current state
-        let metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>> =
-            new_index_entries
-                .iter()
-                .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
-                .collect();
+        let metadata_map: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>> = entries
+            .iter()
+            .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+            .collect();
 
         let mut newly_enriched = Vec::new();
 
         // Only process files that need enrichment
         for uri in &files_needing_enrichment {
-            if let Some(entry) = new_index_entries.get_mut(uri) {
+            if let Some(entry) = entries.get_mut(uri) {
                 let old_inherited = entry.metadata.inherited_working_directory.clone();
                 let meta = Arc::make_mut(&mut entry.metadata);
                 crate::cross_file::enrich_metadata_with_inherited_wd(
@@ -3705,17 +3626,6 @@ pub fn scan_workspace_with_exclusions(
                 if entry.metadata.inherited_working_directory != old_inherited {
                     newly_enriched.push(uri.clone());
                 }
-            }
-            // Also update legacy cross_file_entries
-            if let Some(entry) = cross_file_entries.get_mut(uri) {
-                let meta = Arc::make_mut(&mut entry.metadata);
-                crate::cross_file::enrich_metadata_with_inherited_wd(
-                    meta,
-                    uri,
-                    workspace_root.as_ref(),
-                    |parent_uri| metadata_map.get(parent_uri).cloned(),
-                    max_chain_depth,
-                );
             }
         }
 
@@ -3733,12 +3643,7 @@ pub fn scan_workspace_with_exclusions(
         }
     }
 
-    log::info!(
-        "Scanned {} workspace files ({} with cross-file metadata, {} full index entries)",
-        new_index_entries.len(),
-        cross_file_entries.len(),
-        new_index_entries.len()
-    );
+    log::info!("Scanned {} workspace files", entries.len());
 
     // Package-mode detection is *not* done here. `scan_workspace` used to
     // construct `PackageWorkspace` and a `PackageNamespaceModel` inline —
@@ -3750,7 +3655,7 @@ pub fn scan_workspace_with_exclusions(
     // The canonical derivation is now single-sourced through the event path
     // (`PackageInputs` → `derive_package_state`).
 
-    (cross_file_entries, new_index_entries)
+    entries
 }
 
 /// Directories to skip during workspace scanning.
@@ -3887,6 +3792,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_workspace_apply_builds_graph_from_artifact_only_entries() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        use crate::workspace_index::{IndexEntry, WorkspaceIndexConfig};
+
+        let parent = Url::parse("file:///workspace/main.R").unwrap();
+        let child = Url::parse("file:///workspace/lib.R").unwrap();
+        let make_entry = |metadata| IndexEntry {
+            contents: Rope::from_str("x <- 1\n"),
+            tree: None,
+            loaded_packages: Vec::new(),
+            data_packages: Vec::new(),
+            snapshot: FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: None,
+            },
+            metadata: Arc::new(metadata),
+            artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 0,
+        };
+        let mut entries = HashMap::new();
+        entries.insert(child.clone(), make_entry(CrossFileMetadata::default()));
+        entries.insert(
+            parent.clone(),
+            make_entry(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    resolved_uri: Some(child.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        );
+
+        let mut state = WorldState::new();
+        state.workspace_index = crate::workspace_index::WorkspaceIndex::new(WorkspaceIndexConfig {
+            max_files: 1,
+            ..Default::default()
+        });
+        state.workspace_index.resize_artifacts(2);
+        state.apply_workspace_index(entries);
+
+        assert_eq!(state.workspace_index.len(), 1);
+        assert_eq!(state.workspace_index.artifact_uris().len(), 2);
+        let dependencies = state.cross_file_graph.get_dependencies(&parent);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].to, child);
+    }
+
     #[cfg(unix)]
     #[test]
     fn collect_files_matching_skips_symlink_to_skiplisted_dir() {
@@ -3926,7 +3881,7 @@ mod tests {
         );
         let root = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
 
-        let (_, index) = scan_workspace_with_exclusions(&[root], 20, &exclusions);
+        let index = scan_workspace_with_exclusions(&[root], 20, &exclusions);
         let indexed_paths: Vec<_> = index
             .keys()
             .filter_map(|uri| uri.to_file_path().ok())
@@ -4565,7 +4520,7 @@ mod tests {
 
         // Artifacts derive from the masked analysis text: the chunk symbol is
         // exported, the prose symbol is not.
-        let interface = &processed.new_index_entry.artifacts.exported_interface;
+        let interface = &processed.entry.artifacts.exported_interface;
         assert!(
             interface.keys().any(|k| &**k == "chunk_symbol"),
             "chunk-defined symbol must be in the exported interface, got {:?}",
@@ -4579,11 +4534,11 @@ mod tests {
         // The document's tree must slice cleanly against its analysis text
         // (would panic on the multibyte prose if paired with raw text).
         let doc_tree = processed
-            .new_index_entry
+            .entry
             .tree
             .as_ref()
             .expect("Rmd doc must have a tree");
-        let raw = processed.new_index_entry.contents.to_string();
+        let raw = processed.entry.contents.to_string();
         let analysis =
             crate::cross_file::analysis_text_for_kind(crate::chunks::ChunkKind::Rmd, &raw);
         assert!(
@@ -4641,14 +4596,28 @@ mod tests {
             indexed_at_version: 1,
         };
 
+        let filler = entry.clone();
         let mut state = WorldState::new();
-        state.workspace_index_new.insert(uri.clone(), entry);
+        state.workspace_index = crate::workspace_index::WorkspaceIndex::new(
+            crate::workspace_index::WorkspaceIndexConfig {
+                max_files: 1,
+                ..Default::default()
+            },
+        );
+        state.workspace_index.insert(uri.clone(), entry);
+        state
+            .workspace_index
+            .insert(Url::parse("file:///workspace/filler.R").unwrap(), filler);
+        assert!(
+            state.workspace_index.get(&uri).is_none(),
+            "precondition: the system.file source is artifact-only"
+        );
 
         // Before the swap: lib_paths is empty, so the source stays deferred.
         state.resolve_system_file_in_workspace();
         let deferred = state
-            .workspace_index_new
-            .get(&uri)
+            .workspace_index
+            .get_artifact_entry(&uri)
             .expect("entry still indexed");
         assert!(
             deferred.metadata.sources[0].system_file.is_some(),
@@ -4664,8 +4633,8 @@ mod tests {
         state.resolve_system_file_in_workspace();
 
         let resolved = state
-            .workspace_index_new
-            .get(&uri)
+            .workspace_index
+            .get_artifact_entry(&uri)
             .expect("entry still indexed");
         assert_eq!(resolved.metadata.sources.len(), 1);
         assert!(
@@ -4682,6 +4651,111 @@ mod tests {
             resolved_path.ends_with("otherpkg/helper.R"),
             "must resolve into the new lib path, got {resolved_path:?}"
         );
+    }
+
+    #[test]
+    fn artifact_only_source_protects_resolved_external_target_from_orphan_cleanup() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        use crate::workspace_index::{IndexEntry, WorkspaceIndexConfig};
+
+        let target = Url::parse("file:///external/helper.R").unwrap();
+        let source = Url::parse("file:///workspace/source.R").unwrap();
+        let make_entry = |metadata| IndexEntry {
+            contents: Rope::from_str("x <- 1\n"),
+            tree: None,
+            loaded_packages: Vec::new(),
+            data_packages: Vec::new(),
+            snapshot: FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: None,
+            },
+            metadata: Arc::new(metadata),
+            artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 0,
+        };
+        let mut state = WorldState::new();
+        state.workspace_index = WorkspaceIndex::new(WorkspaceIndexConfig {
+            max_files: 1,
+            ..Default::default()
+        });
+        state.workspace_index.insert(
+            source.clone(),
+            make_entry(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    resolved_uri: Some(target.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        );
+        state
+            .workspace_index
+            .insert(target.clone(), make_entry(CrossFileMetadata::default()));
+        assert!(state.workspace_index.get(&source).is_none());
+        assert!(state.workspace_index.is_complete(&source));
+
+        state.drop_orphaned_external_entries(HashSet::from([target.clone()]));
+
+        assert!(
+            state.workspace_index.is_complete(&target),
+            "artifact-only sources must protect their resolved target"
+        );
+    }
+
+    #[test]
+    fn pending_external_target_is_not_synchronously_overwritten() {
+        use crate::cross_file::file_cache::FileSnapshot;
+        use crate::cross_file::types::{CrossFileMetadata, ForwardSource};
+        use crate::workspace_index::{ClaimEnrichment, ClosedProvenance, IndexEntry};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target_path = tmp.path().join("helper.R");
+        std::fs::write(&target_path, "helper_value <- 1\n").unwrap();
+        let target = Url::from_file_path(&target_path).unwrap();
+        let source = Url::parse("file:///workspace/source.R").unwrap();
+        let source_entry = IndexEntry {
+            contents: Rope::from_str("source(system.file(\"helper.R\", package=\"p\"))\n"),
+            tree: None,
+            loaded_packages: Vec::new(),
+            data_packages: Vec::new(),
+            snapshot: FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 1,
+                content_hash: None,
+            },
+            metadata: Arc::new(CrossFileMetadata {
+                sources: vec![ForwardSource {
+                    resolved_uri: Some(target.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            artifacts: Arc::new(crate::cross_file::scope::ScopeArtifacts::default()),
+            indexed_at_version: 0,
+        };
+        let mut state = WorldState::new();
+        state.workspace_index.insert(source, source_entry);
+        let claim = match state
+            .workspace_index
+            .claim_enrichment(target.clone(), ClosedProvenance::Dynamic)
+        {
+            ClaimEnrichment::Claimed(claim) => claim,
+            other => panic!("expected target claim, got {other:?}"),
+        };
+
+        state.index_cross_package_resolved_files();
+
+        assert_eq!(
+            state.workspace_index.enrichment_status(&target),
+            Some(crate::workspace_index::EnrichmentStatus::Pending)
+        );
+        assert!(state.workspace_index.get(&target).is_none());
+        state
+            .workspace_index
+            .abort_enrichment(&claim)
+            .expect("original worker still owns Pending");
     }
 
     /// Open buffers are authoritative for their canonical alias roots too. When

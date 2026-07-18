@@ -362,7 +362,7 @@ mod lifecycle {
 
         let mut state = state_with_lib(libdir.path());
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
         // Startup pass: lib_paths non-empty, otherpkg not installed.
@@ -371,7 +371,7 @@ mod lifecycle {
         // The source entry must survive the failed attempt — dropping it makes
         // the staleness unrecoverable.
         let entry = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed");
         assert_eq!(
@@ -388,7 +388,7 @@ mod lifecycle {
         state.resolve_system_file_in_workspace();
 
         let entry = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed");
         let resolved_uri = entry.metadata.sources[0]
@@ -423,12 +423,12 @@ mod lifecycle {
         let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
         let mut state = state_with_lib(libdir.path());
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
         state.resolve_system_file_in_workspace();
         let entry = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed");
         let resolved_uri = entry.metadata.sources[0]
@@ -441,7 +441,7 @@ mod lifecycle {
         state.resolve_system_file_in_workspace();
 
         let entry = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed");
         assert_eq!(
@@ -468,7 +468,7 @@ mod lifecycle {
         state.resolve_system_file_in_workspace();
 
         let entry = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed");
         assert!(
@@ -525,12 +525,12 @@ mod lifecycle {
         let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
         let mut state = state_with_lib(libdir.path());
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
         state.resolve_system_file_in_workspace();
         let target = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed")
             .metadata
@@ -539,7 +539,7 @@ mod lifecycle {
             .clone()
             .expect("source must resolve while the package is installed");
         assert!(
-            state.workspace_index_new.contains(&target),
+            state.workspace_index.contains(&target),
             "precondition: the cross-package target is indexed after resolution"
         );
 
@@ -547,7 +547,7 @@ mod lifecycle {
         state.resolve_system_file_in_workspace();
 
         assert!(
-            !state.workspace_index_new.contains(&target),
+            !state.workspace_index.contains(&target),
             "orphaned external index entry must be dropped once no resolution references it"
         );
     }
@@ -568,12 +568,12 @@ mod lifecycle {
         let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
         let mut state = state_with_lib(libdir_a.path());
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
         state.resolve_system_file_in_workspace();
         let old_target = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed")
             .metadata
@@ -582,7 +582,7 @@ mod lifecycle {
             .clone()
             .expect("source must resolve against libdir_a");
         assert!(
-            state.workspace_index_new.contains(&old_target),
+            state.workspace_index.contains(&old_target),
             "precondition: libdir_a target indexed"
         );
 
@@ -593,7 +593,7 @@ mod lifecycle {
         state.resolve_system_file_in_workspace();
 
         let new_target = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed")
             .metadata
@@ -606,11 +606,11 @@ mod lifecycle {
             "precondition: resolution re-targeted"
         );
         assert!(
-            state.workspace_index_new.contains(&new_target),
+            state.workspace_index.contains(&new_target),
             "the re-targeted external file must be indexed"
         );
         assert!(
-            !state.workspace_index_new.contains(&old_target),
+            !state.workspace_index.contains(&old_target),
             "the previous external target must be dropped after the re-target"
         );
     }
@@ -629,12 +629,12 @@ mod lifecycle {
         let uri = Url::parse("file:///workspace/uses_helper.R").unwrap();
         let mut state = state_with_lib(libdir.path());
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
         state.resolve_system_file_in_workspace();
         let target = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed")
             .metadata
@@ -643,7 +643,7 @@ mod lifecycle {
             .clone()
             .expect("source must resolve while the package is installed");
         assert!(
-            state.workspace_index_new.contains(&target),
+            state.workspace_index.contains(&target),
             "precondition: target indexed"
         );
 
@@ -651,7 +651,7 @@ mod lifecycle {
         // package is untouched by the filtered event below.
         let keeper_uri = Url::parse("file:///workspace/keeper.R").unwrap();
         state
-            .workspace_index_new
+            .workspace_index
             .insert(keeper_uri, resolved_entry("keeperpkg", &target));
 
         // otherpkg removed; the libpath-event consumer re-resolves only
@@ -663,7 +663,7 @@ mod lifecycle {
 
         assert!(
             state
-                .workspace_index_new
+                .workspace_index
                 .get(&uri)
                 .expect("entry still indexed")
                 .metadata
@@ -673,7 +673,7 @@ mod lifecycle {
             "precondition: the cleared resolution actually cleared"
         );
         assert!(
-            state.workspace_index_new.contains(&target),
+            state.workspace_index.contains(&target),
             "external entry must be retained while another resolved_uri still references it"
         );
     }
@@ -699,12 +699,12 @@ mod lifecycle {
             .workspace_folders
             .push(Url::from_directory_path(&ws_root).unwrap());
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
         state.resolve_system_file_in_workspace();
         let target = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed")
             .metadata
@@ -713,7 +713,7 @@ mod lifecycle {
             .clone()
             .expect("source must resolve while the package is installed");
         assert!(
-            state.workspace_index_new.contains(&target),
+            state.workspace_index.contains(&target),
             "precondition: target indexed"
         );
 
@@ -721,7 +721,7 @@ mod lifecycle {
         state.resolve_system_file_in_workspace();
 
         assert!(
-            state.workspace_index_new.contains(&target),
+            state.workspace_index.contains(&target),
             "entries under a workspace folder are owned by the workspace scan \
              and must not be dropped by the orphan cleanup"
         );
@@ -813,7 +813,7 @@ mod lifecycle {
 
         // A stale scan result lands in the index: unresolved, source at line 0.
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
         // Event pass: the index entry resolves (edge rebuild from index
@@ -845,7 +845,7 @@ mod lifecycle {
 
         let mut state = state_with_lib(libdir.path());
         state
-            .workspace_index_new
+            .workspace_index
             .insert(child_uri.clone(), system_file_entry("helper.R", "otherpkg"));
 
         // parent.R sources uses_helper.R (ordinary path source).
@@ -861,11 +861,17 @@ mod lifecycle {
             .update_file(&parent_uri, &parent_meta, None, |_| None);
 
         // Both files are open documents.
-        state.open_document(parent_uri.clone(), "source(\"uses_helper.R\")\n", None);
-        state.open_document(
+        state.open_document_with_language_id(
+            parent_uri.clone(),
+            "source(\"uses_helper.R\")\n",
+            None,
+            Some("r"),
+        );
+        state.open_document_with_language_id(
             child_uri.clone(),
             "source(system.file(\"helper.R\", package = \"otherpkg\"))\n",
             None,
+            Some("r"),
         );
 
         // Startup pass fails (otherpkg not installed), then the install event.
@@ -909,16 +915,16 @@ mod lifecycle {
         let uri_b = Url::parse("file:///workspace/b.R").unwrap();
         let mut state = state_with_lib(libdir.path());
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri_a.clone(), system_file_entry("helper.R", "pkga"));
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri_b.clone(), system_file_entry("helper.R", "pkgb"));
 
         state.resolve_system_file_in_workspace();
         for uri in [&uri_a, &uri_b] {
             assert!(
-                state.workspace_index_new.get(uri).unwrap().metadata.sources[0]
+                state.workspace_index.get(uri).unwrap().metadata.sources[0]
                     .resolved_uri
                     .is_some(),
                 "both packages installed → both entries resolve"
@@ -937,23 +943,13 @@ mod lifecycle {
             "only the entry referencing the filtered package may change"
         );
         assert!(
-            state
-                .workspace_index_new
-                .get(&uri_a)
-                .unwrap()
-                .metadata
-                .sources[0]
+            state.workspace_index.get(&uri_a).unwrap().metadata.sources[0]
                 .resolved_uri
                 .is_some(),
             "entry for a package outside the filter must not be re-probed"
         );
         assert!(
-            state
-                .workspace_index_new
-                .get(&uri_b)
-                .unwrap()
-                .metadata
-                .sources[0]
+            state.workspace_index.get(&uri_b).unwrap().metadata.sources[0]
                 .resolved_uri
                 .is_none(),
             "entry for the filtered package must be re-resolved (cleared)"
@@ -964,12 +960,7 @@ mod lifecycle {
         let changed = state.resolve_system_file_in_workspace_for_packages(Some(&only_a));
         assert_eq!(changed, vec![uri_a.clone()]);
         assert!(
-            state
-                .workspace_index_new
-                .get(&uri_a)
-                .unwrap()
-                .metadata
-                .sources[0]
+            state.workspace_index.get(&uri_a).unwrap().metadata.sources[0]
                 .resolved_uri
                 .is_none()
         );
@@ -1004,13 +995,13 @@ mod lifecycle {
 
         let uri = Url::from_file_path(workspace.path().join("R").join("main.R")).unwrap();
         state
-            .workspace_index_new
+            .workspace_index
             .insert(uri.clone(), system_file_entry("helper.R", "newpkg"));
 
         // Under "Package: oldpkg" the reference to "newpkg" cannot resolve.
         state.resolve_system_file_in_workspace();
         let entry = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed");
         assert_eq!(
@@ -1027,7 +1018,7 @@ mod lifecycle {
         state.resolve_system_file_in_workspace();
 
         let entry = state
-            .workspace_index_new
+            .workspace_index
             .get(&uri)
             .expect("entry still indexed");
         assert_eq!(

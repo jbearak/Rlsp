@@ -691,7 +691,7 @@ fn scan_workspace_referenced_packages(root: &std::path::Path) -> Vec<String> {
     let Ok(workspace_url) = Url::from_file_path(root) else {
         return Vec::new();
     };
-    let (_, index) = crate::state::scan_workspace(std::slice::from_ref(&workspace_url), 0);
+    let index = crate::state::scan_workspace(std::slice::from_ref(&workspace_url), 0);
     let mut names = std::collections::BTreeSet::new();
     for doc in index.values() {
         if let Some(tree) = &doc.tree {
