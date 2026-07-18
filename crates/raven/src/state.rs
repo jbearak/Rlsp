@@ -2558,21 +2558,27 @@ impl WorldState {
             handles,
             additional_candidates,
             &HashSet::new(),
+            &HashSet::new(),
         )
     }
 
-    /// Finalize transfers while atomically dropping candidates already owned
-    /// by exact, still-current reservations.
+    /// Finalize transfers while atomically dropping transfer candidates already
+    /// owned by exact, still-current reservations.
     ///
-    /// The caller derives `excluded` by validating each ticket trigger under
-    /// this same write lock. URI equality alone is insufficient because a
-    /// close/reopen can reuse the URI while changing lifecycle ownership.
+    /// `transfer_excluded` applies only to candidates inherited from handles;
+    /// independent `additional_candidates` may represent later semantic work on
+    /// the same open lifecycle. `all_excluded` is reserved for an exact current
+    /// ticket (such as watched-batch pre-reservation) that already owns both
+    /// categories. The caller validates ticket triggers under this same write
+    /// lock. URI equality alone is insufficient because close/reopen can reuse
+    /// the URI while changing lifecycle ownership.
     pub(crate) fn finalize_analysis_transfers_excluding(
         &mut self,
         finalization: AnalysisTransferFinalizationId,
         handles: &[AnalysisTransferHandle],
         mut additional_candidates: Vec<(Url, OpenRecordToken)>,
-        excluded: &HashSet<Url>,
+        transfer_excluded: &HashSet<Url>,
+        all_excluded: &HashSet<Url>,
     ) -> Result<AnalysisTransferFinalization, AnalysisTransferRejection> {
         if self.analysis_transfer_finalizations.contains(&finalization) {
             return Ok(AnalysisTransferFinalization::AlreadyFinalized);
@@ -2602,15 +2608,19 @@ impl WorldState {
         }
 
         let consumed_identities: Vec<_> = handles.iter().map(|handle| handle.identity).collect();
+        let mut transfer_candidates = Vec::new();
         for handle in handles {
             let state = self
                 .analysis_transfers
                 .remove(&handle.identity)
                 .expect("all analysis transfer handles were prevalidated");
-            additional_candidates.extend(state.candidates);
+            transfer_candidates.extend(state.candidates);
         }
         self.analysis_transfer_finalizations.insert(finalization);
-        additional_candidates.retain(|(uri, _)| !excluded.contains(uri));
+        transfer_candidates
+            .retain(|(uri, _)| !transfer_excluded.contains(uri) && !all_excluded.contains(uri));
+        additional_candidates.retain(|(uri, _)| !all_excluded.contains(uri));
+        additional_candidates.extend(transfer_candidates);
         let uris = self.current_transfer_candidate_uris(additional_candidates);
         let tickets = self.reserve_analysis_revalidations(uris).revalidations;
         let owned_candidates: Vec<_> = tickets

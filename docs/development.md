@@ -216,8 +216,10 @@ remaining handle is still prevalidated all-or-none. Treating the consumed
 handle as fallback authority would double-mark candidates that the first
 finalization already owns. The consumed-owner ledger retains only triggers that
 survived exact-record filtering and the cap; a later mixed handoff excludes
-those still-current triggers while allowing cap-dropped, independent, or
-reopened-lifecycle candidates to reserve normally. Watched batches likewise
+those still-current triggers only from remaining transfer handles, while
+independent direct candidates may represent later semantic work on the same
+lifecycle and still reserve. Cap-dropped and reopened-lifecycle candidates also
+reserve normally. Watched batches likewise
 exclude a pre-reserved candidate from a transfer only when the ticket trigger
 still names the current open lifecycle; URI equality alone must not suppress a
 close/reopen.

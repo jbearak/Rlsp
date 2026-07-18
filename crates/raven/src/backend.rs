@@ -3860,13 +3860,15 @@ fn finalize_analysis_handoff_candidates_excluding_or_fallback(
     excluded: &std::collections::HashSet<Url>,
 ) -> Vec<crate::state::AnalysisRevalidationTicket> {
     let finalization = WorldState::begin_analysis_transfer_finalization();
-    let mut excluded = excluded.clone();
+    let all_excluded = excluded.clone();
+    let mut transfer_excluded = all_excluded.clone();
     loop {
         match state.finalize_analysis_transfers_excluding(
             finalization,
             &handles,
             additional.clone(),
-            &excluded,
+            &transfer_excluded,
+            &all_excluded,
         ) {
             Ok(AnalysisTransferFinalization::Committed(tickets)) => return tickets,
             Ok(AnalysisTransferFinalization::AlreadyFinalized) => return Vec::new(),
@@ -3880,7 +3882,8 @@ fn finalize_analysis_handoff_candidates_excluding_or_fallback(
                 handles[index] = successor;
             }
             Err(AnalysisTransferRejection::AlreadyConsumed { handle }) => {
-                excluded.extend(state.current_consumed_analysis_transfer_candidate_uris(handle));
+                transfer_excluded
+                    .extend(state.current_consumed_analysis_transfer_candidate_uris(handle));
                 let Some(index) = handles.iter().position(|candidate| *candidate == handle) else {
                     return Vec::new();
                 };
@@ -3888,7 +3891,7 @@ fn finalize_analysis_handoff_candidates_excluding_or_fallback(
             }
             Err(AnalysisTransferRejection::MissingOrWrongOwner) => {
                 let mut fallback = state.capture_analysis_transfer_candidates(fallback_uris);
-                fallback.retain(|(uri, _)| !excluded.contains(uri));
+                fallback.retain(|(uri, _)| !all_excluded.contains(uri));
                 return match state.finalize_analysis_transfer_fallback(finalization, fallback) {
                     AnalysisTransferFinalization::Committed(tickets) => tickets,
                     AnalysisTransferFinalization::AlreadyFinalized => Vec::new(),
@@ -25524,8 +25527,8 @@ mod project_config_initialize_tests {
         let tickets = finalize_analysis_handoff_or_fallback(
             &mut state,
             vec![handle],
-            vec![uri.clone(), independent.clone()],
-            vec![uri.clone(), independent.clone()],
+            vec![independent.clone()],
+            vec![independent.clone()],
         );
 
         assert_eq!(
@@ -25712,6 +25715,22 @@ mod project_config_initialize_tests {
                     .collect::<Vec<_>>(),
                 vec![dropped.clone()],
                 "a cap-dropped candidate was not owned by the consumed finalization"
+            );
+
+            state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+            let later_semantic_tickets = finalize_analysis_handoff_or_fallback(
+                &mut state,
+                vec![handle],
+                vec![reserved.clone()],
+                vec![reserved.clone()],
+            );
+            assert_eq!(
+                later_semantic_tickets
+                    .iter()
+                    .map(|ticket| ticket.uri.clone())
+                    .collect::<Vec<_>>(),
+                vec![reserved.clone()],
+                "independent later semantic work on the same lifecycle is not transfer overlap"
             );
 
             state.retire_diagnostic_lifecycle(&reserved);
