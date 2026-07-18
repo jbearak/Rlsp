@@ -30,16 +30,16 @@ use crate::content_provider::ContentProvider;
 use crate::handlers;
 use crate::indentation;
 use crate::state::{
-    AnalysisBasis, AnalysisTransferFinalization, AnalysisTransferHandle, AnalysisTransferRejection,
-    DiagnosticsTrigger, IndentationSettings, OpenCloseDiskObservation, OpenCloseIntentToken,
-    OpenCloseResyncTicket, OpenInstallIntentToken, PackageSeedInstalledIdentity,
-    PreparedAnalysisCommit, PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis,
-    PreparedOpenCloseDiskInstall, PreparedOpenCommitPlan, PreparedOpenEditAnalysis,
-    PreparedOpenGraphProjection, PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch,
-    PreparedOpenPackageInstall, PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis,
-    SymbolConfig, SystemFileTransferredEffects, WorkspaceGraphDerivationContext,
-    WorkspaceGraphOverlay, WorkspaceScanDerivationBasis, WorkspaceScanInputBasis,
-    WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
+    AnalysisBasis, AnalysisTransferCandidate, AnalysisTransferFinalization, AnalysisTransferHandle,
+    AnalysisTransferRejection, DiagnosticsTrigger, IndentationSettings, OpenCloseDiskObservation,
+    OpenCloseIntentToken, OpenCloseResyncTicket, OpenInstallIntentToken,
+    PackageSeedInstalledIdentity, PreparedAnalysisCommit, PreparedOpenAliasReconcileAnalysis,
+    PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall, PreparedOpenCommitPlan,
+    PreparedOpenEditAnalysis, PreparedOpenGraphProjection, PreparedOpenInstallAnalysis,
+    PreparedOpenLifecycleBatch, PreparedOpenPackageInstall, PreparedWorkspaceOpenMetadata,
+    PreparedWorkspaceScanAnalysis, SymbolConfig, SystemFileTransferredEffects,
+    WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorkspaceScanDerivationBasis,
+    WorkspaceScanInputBasis, WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
     derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
@@ -2376,12 +2376,9 @@ async fn apply_watched_manifest_changes(
         .unwrap_or_default();
     drop(state);
 
-    let transfer = match run_system_file_convergence_transaction(state_arc, None).await {
-        SystemFileConvergenceOutcome::Committed(transfer) => Some(transfer),
-        SystemFileConvergenceOutcome::Superseded | SystemFileConvergenceOutcome::RetryExhausted => {
-            None
-        }
-    };
+    let transfer = run_system_file_convergence_transaction(state_arc, None)
+        .await
+        .into_transfer();
     affected_open_docs.extend(open_keys_filtered);
     affected_open_docs.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     affected_open_docs.dedup();
@@ -3813,18 +3810,42 @@ async fn run_workspace_scan_transaction(
 
 enum SystemFileConvergenceOutcome {
     Committed(SystemFileTransferredEffects),
+    Superseded(SystemFileTransferredEffects),
+    Deferred,
+}
+
+impl SystemFileConvergenceOutcome {
+    fn into_transfer(self) -> Option<SystemFileTransferredEffects> {
+        match self {
+            Self::Committed(transfer) | Self::Superseded(transfer) => Some(transfer),
+            Self::Deferred => None,
+        }
+    }
+}
+
+enum SystemFileOwnerOutcome {
+    Committed(SystemFileTransferredEffects),
     Superseded,
-    RetryExhausted,
+    Deferred,
 }
 
 fn finalize_analysis_handoff_or_fallback(
     state: &mut WorldState,
-    mut handles: Vec<AnalysisTransferHandle>,
+    handles: Vec<AnalysisTransferHandle>,
     additional_uris: Vec<Url>,
     fallback_uris: Vec<Url>,
 ) -> Vec<crate::state::AnalysisRevalidationTicket> {
-    let finalization = WorldState::begin_analysis_transfer_finalization();
     let additional = state.capture_analysis_transfer_candidates(additional_uris);
+    finalize_analysis_handoff_candidates_or_fallback(state, handles, additional, fallback_uris)
+}
+
+fn finalize_analysis_handoff_candidates_or_fallback(
+    state: &mut WorldState,
+    mut handles: Vec<AnalysisTransferHandle>,
+    additional: Vec<AnalysisTransferCandidate>,
+    fallback_uris: Vec<Url>,
+) -> Vec<crate::state::AnalysisRevalidationTicket> {
+    let finalization = WorldState::begin_analysis_transfer_finalization();
     loop {
         match state.finalize_analysis_transfers(finalization, &handles, additional.clone()) {
             Ok(AnalysisTransferFinalization::Committed(tickets)) => return tickets,
@@ -3838,10 +3859,8 @@ fn finalize_analysis_handoff_or_fallback(
                 };
                 handles[index] = successor;
             }
-            Err(
-                AnalysisTransferRejection::AlreadyConsumed
-                | AnalysisTransferRejection::MissingOrWrongOwner,
-            ) => {
+            Err(AnalysisTransferRejection::AlreadyConsumed) => return Vec::new(),
+            Err(AnalysisTransferRejection::MissingOrWrongOwner) => {
                 let fallback = state.capture_analysis_transfer_candidates(fallback_uris);
                 return match state.finalize_analysis_transfer_fallback(finalization, fallback) {
                     AnalysisTransferFinalization::Committed(tickets) => tickets,
@@ -3858,15 +3877,73 @@ async fn run_system_file_convergence_transaction(
     state_arc: &Arc<RwLock<WorldState>>,
     only_packages: Option<std::collections::HashSet<String>>,
 ) -> SystemFileConvergenceOutcome {
-    let owner = state_arc
-        .read()
-        .await
-        .system_file_routing_owner_generation();
+    lift_system_file_owner_outcome(
+        state_arc,
+        run_system_file_convergence_transaction_owned(state_arc, only_packages, None).await,
+    )
+    .await
+}
+
+async fn run_system_file_convergence_transaction_for_seed(
+    state_arc: &Arc<RwLock<WorldState>>,
+    identity: PackageSeedInstalledIdentity,
+) -> SystemFileConvergenceOutcome {
+    lift_system_file_owner_outcome(
+        state_arc,
+        run_system_file_convergence_transaction_owned(state_arc, None, Some(identity)).await,
+    )
+    .await
+}
+
+async fn lift_system_file_owner_outcome(
+    state_arc: &Arc<RwLock<WorldState>>,
+    outcome: SystemFileOwnerOutcome,
+) -> SystemFileConvergenceOutcome {
+    match outcome {
+        SystemFileOwnerOutcome::Committed(transfer) => {
+            SystemFileConvergenceOutcome::Committed(transfer)
+        }
+        SystemFileOwnerOutcome::Deferred => SystemFileConvergenceOutcome::Deferred,
+        SystemFileOwnerOutcome::Superseded => {
+            match run_system_file_convergence_transaction_owned(state_arc, None, None).await {
+                SystemFileOwnerOutcome::Committed(successor) => {
+                    SystemFileConvergenceOutcome::Superseded(successor)
+                }
+                SystemFileOwnerOutcome::Superseded | SystemFileOwnerOutcome::Deferred => {
+                    SystemFileConvergenceOutcome::Deferred
+                }
+            }
+        }
+    }
+}
+
+async fn run_system_file_convergence_transaction_owned(
+    state_arc: &Arc<RwLock<WorldState>>,
+    only_packages: Option<std::collections::HashSet<String>>,
+    required_seed: Option<PackageSeedInstalledIdentity>,
+) -> SystemFileOwnerOutcome {
+    let owner = if let Some(identity) = required_seed {
+        let state = state_arc.read().await;
+        if !state.package_seed_installed_identity_is_current(identity) {
+            return SystemFileOwnerOutcome::Superseded;
+        }
+        identity.system_file_routing_owner_generation
+    } else {
+        state_arc
+            .read()
+            .await
+            .system_file_routing_owner_generation()
+    };
+    let owner_is_current = |state: &WorldState| {
+        state.system_file_routing_owner_generation() == owner
+            && required_seed
+                .is_none_or(|identity| state.package_seed_installed_identity_is_current(identity))
+    };
     for attempt in 0..2 {
         let captured = {
             let state = state_arc.read().await;
-            if state.system_file_routing_owner_generation() != owner {
-                return SystemFileConvergenceOutcome::Superseded;
+            if !owner_is_current(&state) {
+                return SystemFileOwnerOutcome::Superseded;
             }
             state.capture_system_file_analysis(only_packages.clone())
         };
@@ -3891,13 +3968,13 @@ async fn run_system_file_convergence_transaction(
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
             Err(error) => {
                 log::warn!("system.file convergence worker was cancelled: {error}");
-                return SystemFileConvergenceOutcome::RetryExhausted;
+                return SystemFileOwnerOutcome::Deferred;
             }
         };
         let prepared = {
             let state = state_arc.read().await;
-            if state.system_file_routing_owner_generation() != owner {
-                return SystemFileConvergenceOutcome::Superseded;
+            if !owner_is_current(&state) {
+                return SystemFileOwnerOutcome::Superseded;
             }
             state.finish_system_file_analysis(draft)
         };
@@ -3916,13 +3993,16 @@ async fn run_system_file_convergence_transaction(
             }
             if !prepared.external_observations_are_current() {
                 if attempt == 1 {
-                    return SystemFileConvergenceOutcome::RetryExhausted;
+                    return SystemFileOwnerOutcome::Deferred;
                 }
                 tokio::task::yield_now().await;
                 continue;
             }
             let committed = state_arc.write().await;
             let mut state = committed;
+            if !owner_is_current(&state) {
+                return SystemFileOwnerOutcome::Superseded;
+            }
             #[cfg(test)]
             {
                 state.system_file_test_commit_attempts += 1;
@@ -3936,19 +4016,17 @@ async fn run_system_file_convergence_transaction(
                 .ok()
                 .and_then(|effects| effects.system_file);
             if let Some(transfer) = committed {
-                return SystemFileConvergenceOutcome::Committed(transfer);
+                return SystemFileOwnerOutcome::Committed(transfer);
             }
         }
-        if state_arc
-            .read()
-            .await
-            .system_file_routing_owner_generation()
-            != owner
         {
-            return SystemFileConvergenceOutcome::Superseded;
+            let state = state_arc.read().await;
+            if !owner_is_current(&state) {
+                return SystemFileOwnerOutcome::Superseded;
+            }
         }
         if attempt == 1 {
-            return SystemFileConvergenceOutcome::RetryExhausted;
+            return SystemFileOwnerOutcome::Deferred;
         }
         tokio::task::yield_now().await;
     }
@@ -3971,7 +4049,7 @@ pub async fn run_system_file_convergence_for_test(
     let shared = Arc::new(RwLock::new(owned));
     let changed = match run_system_file_convergence_transaction(&shared, only_packages).await {
         SystemFileConvergenceOutcome::Committed(effects) => Some(effects.changed_uris),
-        SystemFileConvergenceOutcome::Superseded | SystemFileConvergenceOutcome::RetryExhausted => {
+        SystemFileConvergenceOutcome::Superseded(_) | SystemFileConvergenceOutcome::Deferred => {
             None
         }
     };
@@ -4054,7 +4132,7 @@ async fn complete_startup_without_workspace_scan(
     };
 
     handles.state.write().await.workspace_scan_complete = true;
-    let (seeded_root, installed) = if let (Some(root), Some(seed)) = (root, package_seed) {
+    let (seeded_root, mut installed) = if let (Some(root), Some(seed)) = (root, package_seed) {
         let installed =
             install_package_seed_with_retry(handles, root.clone(), exclusions, true, Some(seed))
                 .await;
@@ -4063,22 +4141,34 @@ async fn complete_startup_without_workspace_scan(
         (None, None)
     };
     if let Some(root) = seeded_root {
-        Backend::refresh_open_package_inputs_after_seed(
+        let affected = Backend::refresh_open_package_inputs_after_seed(
             handles.state.clone(),
             handles.client.clone(),
             handles.traversal_truncation.clone(),
             root,
         )
         .await;
+        if let Some(installed) = installed.as_mut() {
+            installed.post_seed_candidates = affected;
+        }
     }
     let tickets = {
         let mut state = handles.state.write().await;
         let open_uris: Vec<_> = state.documents.keys().cloned().collect();
-        let handles = installed
-            .and_then(|installed| installed.system_file)
+        let transfer_handles = installed
+            .as_ref()
+            .and_then(|installed| installed.system_file.as_ref())
             .map(|transfer| vec![transfer.handle])
             .unwrap_or_default();
-        finalize_analysis_handoff_or_fallback(&mut state, handles, open_uris.clone(), open_uris)
+        let mut additional = state.capture_analysis_transfer_candidates(open_uris.clone());
+        additional.extend(
+            installed
+                .as_ref()
+                .into_iter()
+                .flat_map(|installed| installed.post_seed_candidates.iter().cloned()),
+        );
+        let handles = transfer_handles;
+        finalize_analysis_handoff_candidates_or_fallback(&mut state, handles, additional, open_uris)
     };
     tokio::spawn(Backend::publish_diagnostics_for_tickets_bounded(
         handles.state.clone(),
@@ -4356,6 +4446,22 @@ const PACKAGE_SEED_RETRY_DELAY: std::time::Duration = std::time::Duration::from_
 struct SeedInstalled {
     _identity: PackageSeedInstalledIdentity,
     system_file: Option<SystemFileTransferredEffects>,
+    deferred_system_file: Option<PackageSeedInstalledIdentity>,
+    post_seed_candidates: Vec<AnalysisTransferCandidate>,
+}
+
+struct PackageRefreshApply {
+    applied: bool,
+    candidates: Vec<AnalysisTransferCandidate>,
+}
+
+impl PackageRefreshApply {
+    fn empty(applied: bool) -> Self {
+        Self {
+            applied,
+            candidates: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -4373,6 +4479,63 @@ impl PackageSeedTaskHandles {
             traversal_truncation: backend.traversal_truncation.clone(),
         }
     }
+}
+
+async fn schedule_system_file_seed_retry(
+    handles: PackageSeedTaskHandles,
+    identity: PackageSeedInstalledIdentity,
+) {
+    if !handles
+        .state
+        .write()
+        .await
+        .begin_system_file_seed_retry(identity)
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+            if !handles
+                .state
+                .read()
+                .await
+                .system_file_seed_retry_is_current(identity)
+            {
+                return;
+            }
+            let Some(transfer) =
+                run_system_file_convergence_transaction_for_seed(&handles.state, identity)
+                    .await
+                    .into_transfer()
+            else {
+                continue;
+            };
+            let tickets = {
+                let mut state = handles.state.write().await;
+                if !state.system_file_seed_retry_is_current(identity) {
+                    return;
+                }
+                let open_uris: Vec<_> = state.documents.keys().cloned().collect();
+                let tickets = finalize_analysis_handoff_or_fallback(
+                    &mut state,
+                    vec![transfer.handle],
+                    open_uris.clone(),
+                    open_uris,
+                );
+                state.complete_system_file_seed_retry(identity);
+                tickets
+            };
+            Backend::publish_diagnostics_for_tickets_bounded(
+                handles.state.clone(),
+                handles.client.clone(),
+                tickets,
+                Some(handles.traversal_truncation.clone()),
+            )
+            .await;
+            return;
+        }
+    });
 }
 
 /// Recompute a failed or rejected detached seed off-lock until one installs
@@ -4419,6 +4582,12 @@ where
     let installed =
         attempt_package_seed_install_using(&handles.state, root, initial_attempt, compute, None)
             .await;
+    if let Some(identity) = installed
+        .as_ref()
+        .and_then(|installed| installed.deferred_system_file)
+    {
+        schedule_system_file_seed_retry(handles.clone(), identity).await;
+    }
     if installed.is_none() {
         schedule_package_seed_retry(handles.clone()).await;
     }
@@ -4508,14 +4677,17 @@ where
         if let Some(identity) = installed {
             // Once the seed is installed, cancellation no longer discards
             // ownership. Finish or hand off its system-file convergence.
-            let system_file = match run_system_file_convergence_transaction(state_arc, None).await {
-                SystemFileConvergenceOutcome::Committed(transfer) => Some(transfer),
-                SystemFileConvergenceOutcome::Superseded
-                | SystemFileConvergenceOutcome::RetryExhausted => None,
-            };
+            let (system_file, deferred_system_file) =
+                match run_system_file_convergence_transaction_for_seed(state_arc, identity).await {
+                    SystemFileConvergenceOutcome::Committed(transfer) => (Some(transfer), None),
+                    SystemFileConvergenceOutcome::Superseded(successor) => (Some(successor), None),
+                    SystemFileConvergenceOutcome::Deferred => (None, Some(identity)),
+                };
             return Some(SeedInstalled {
                 _identity: identity,
                 system_file,
+                deferred_system_file,
+                post_seed_candidates: Vec::new(),
             });
         }
         if attempt + 1 < PACKAGE_SEED_MAX_ATTEMPTS {
@@ -4574,7 +4746,7 @@ async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
                 Some(&token),
             )
             .await;
-            let Some(installed) = installed else {
+            let Some(mut installed) = installed else {
                 if token.is_cancelled() {
                     return;
                 }
@@ -4584,8 +4756,11 @@ async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
                 );
                 continue;
             };
+            if let Some(identity) = installed.deferred_system_file {
+                schedule_system_file_seed_retry(handles.clone(), identity).await;
+            }
 
-            Backend::refresh_open_package_inputs_after_seed(
+            installed.post_seed_candidates = Backend::refresh_open_package_inputs_after_seed(
                 handles.state.clone(),
                 handles.client.clone(),
                 handles.traversal_truncation.clone(),
@@ -4597,12 +4772,15 @@ async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
                 let open_uris: Vec<_> = state.documents.keys().cloned().collect();
                 let transfer_handles = installed
                     .system_file
+                    .as_ref()
                     .map(|transfer| vec![transfer.handle])
                     .unwrap_or_default();
-                finalize_analysis_handoff_or_fallback(
+                let mut additional = state.capture_analysis_transfer_candidates(open_uris.clone());
+                additional.extend(installed.post_seed_candidates.iter().cloned());
+                finalize_analysis_handoff_candidates_or_fallback(
                     &mut state,
                     transfer_handles,
-                    open_uris.clone(),
+                    additional,
                     open_uris,
                 )
             };
@@ -9973,7 +10151,7 @@ impl LanguageServer for Backend {
                             None
                         };
 
-                        let package_seed_installed = if let (Some(root), Some(seed)) =
+                        let mut package_seed_installed = if let (Some(root), Some(seed)) =
                             (root_for_pkg_inputs.clone(), package_seed)
                         {
                             let seed_handles = PackageSeedTaskHandles {
@@ -10010,13 +10188,16 @@ impl LanguageServer for Backend {
                         if package_seed_installed.is_some()
                             && let Some(root) = root_for_pkg_inputs.clone()
                         {
-                            Backend::refresh_open_package_inputs_after_seed(
+                            let affected = Backend::refresh_open_package_inputs_after_seed(
                                 state_clone.clone(),
                                 client_clone.clone(),
                                 traversal_truncation.clone(),
                                 root,
                             )
                             .await;
+                            if let Some(installed) = package_seed_installed.as_mut() {
+                                installed.post_seed_candidates = affected;
+                            }
                         }
 
                         // Warm the package cache for inherited packages newly visible
@@ -10060,17 +10241,19 @@ impl LanguageServer for Backend {
                         let tickets = {
                             let mut state = state_clone.write().await;
                             let mut handles = vec![applied_scan.transfer.handle];
-                            if let Some(transfer) =
-                                package_seed_installed.and_then(|installed| installed.system_file)
+                            if let Some(transfer) = package_seed_installed
+                                .as_ref()
+                                .and_then(|installed| installed.system_file.as_ref())
                             {
                                 handles.push(transfer.handle);
                             }
+                            let additional = package_seed_installed
+                                .as_ref()
+                                .map(|installed| installed.post_seed_candidates.clone())
+                                .unwrap_or_default();
                             let fallback: Vec<_> = state.documents.keys().cloned().collect();
-                            finalize_analysis_handoff_or_fallback(
-                                &mut state,
-                                handles,
-                                Vec::new(),
-                                fallback,
+                            finalize_analysis_handoff_candidates_or_fallback(
+                                &mut state, handles, additional, fallback,
                             )
                         };
                         tokio::spawn(Backend::publish_diagnostics_for_tickets_bounded(
@@ -10414,11 +10597,9 @@ impl LanguageServer for Backend {
                     state.install_package_library(new_lib, ready);
                 }
                 let system_file_transfer = if ready {
-                    match run_system_file_convergence_transaction(&self.state, None).await {
-                        SystemFileConvergenceOutcome::Committed(transfer) => Some(transfer),
-                        SystemFileConvergenceOutcome::Superseded
-                        | SystemFileConvergenceOutcome::RetryExhausted => None,
-                    }
+                    run_system_file_convergence_transaction(&self.state, None)
+                        .await
+                        .into_transfer()
                 } else {
                     None
                 };
@@ -12509,6 +12690,7 @@ impl Backend {
         let mut workspace_scan_transfer = None;
         let mut system_file_transfer = None;
         let mut workspace_scan_fallback_affected = Vec::new();
+        let mut post_seed_candidates: Vec<AnalysisTransferCandidate> = Vec::new();
         if workspace_exclusions_changed {
             let (affected, should_scan) = {
                 let mut state = self.state.write().await;
@@ -12554,10 +12736,11 @@ impl Backend {
                             )
                             .await;
                             package_inputs_initialized_by_exclusion_reload = installed.is_some();
-                            if let Some(transfer) =
-                                installed.and_then(|installed| installed.system_file)
+                            if let Some(transfer) = installed
+                                .as_ref()
+                                .and_then(|installed| installed.system_file.as_ref())
                             {
-                                system_file_transfer = Some(transfer);
+                                system_file_transfer = Some(transfer.clone());
                             }
                         } else {
                             self.state.write().await.apply_package_event(
@@ -12579,13 +12762,15 @@ impl Backend {
                         if package_inputs_initialized_by_exclusion_reload
                             && let Some(root) = root_for_pkg_inputs
                         {
-                            Backend::refresh_open_package_inputs_after_seed(
-                                self.state.clone(),
-                                self.client.clone(),
-                                self.traversal_truncation.clone(),
-                                root,
-                            )
-                            .await;
+                            post_seed_candidates.extend(
+                                Backend::refresh_open_package_inputs_after_seed(
+                                    self.state.clone(),
+                                    self.client.clone(),
+                                    self.traversal_truncation.clone(),
+                                    root,
+                                )
+                                .await,
+                            );
                         }
 
                         if packages_enabled {
@@ -12630,8 +12815,11 @@ impl Backend {
                     .reseed_package_inputs_and_refresh(root, workspace_exclusions, true)
                     .await;
                 package_inputs_initialized_by_exclusion_reload = installed.is_some();
-                if let Some(transfer) = installed.and_then(|installed| installed.system_file) {
-                    system_file_transfer = Some(transfer);
+                if let Some(installed) = installed {
+                    post_seed_candidates.extend(installed.post_seed_candidates);
+                    if let Some(transfer) = installed.system_file {
+                        system_file_transfer = Some(transfer);
+                    }
                 }
             }
         }
@@ -12686,12 +12874,14 @@ impl Backend {
             // the background workspace index has not populated yet. (Re-setting
             // package_mode is a no-op: `translate(SettingChanged)` above already
             // set it to this same mode.)
-            if let Some(transfer) = self
+            if let Some(installed) = self
                 .reseed_package_inputs_and_refresh(root, workspace_exclusions, true)
                 .await
-                .and_then(|installed| installed.system_file)
             {
-                system_file_transfer = Some(transfer);
+                post_seed_candidates.extend(installed.post_seed_candidates);
+                if let Some(transfer) = installed.system_file {
+                    system_file_transfer = Some(transfer);
+                }
             }
             log::info!("Rebuilt package state after packageMode change (event-driven)");
         }
@@ -12839,7 +13029,11 @@ impl Backend {
                 }
                 let mut additional = open_uris.clone();
                 additional.extend(workspace_scan_fallback_affected.clone());
-                finalize_analysis_handoff_or_fallback(&mut state, handles, additional, open_uris)
+                let mut additional = state.capture_analysis_transfer_candidates(additional);
+                additional.extend(post_seed_candidates);
+                finalize_analysis_handoff_candidates_or_fallback(
+                    &mut state, handles, additional, open_uris,
+                )
             };
             Backend::publish_diagnostics_for_tickets_bounded(
                 self.state.clone(),
@@ -14014,9 +14208,9 @@ impl Backend {
             PackageSeedInputSnapshot,
             crate::config_file::CompiledWorkspaceExclusions,
         )>,
-    ) -> bool {
+    ) -> PackageRefreshApply {
         let publish = expected_open.is_none();
-        let affected: Vec<Url> = {
+        let (affected, candidates) = {
             let mut state = state_arc.write().await;
             if let Some((uri, identity, root, package_inputs, exclusions)) = expected_open.as_ref()
                 && (open_document_seed_identity(&state, uri).as_ref() != Some(identity)
@@ -14024,13 +14218,13 @@ impl Backend {
                         != Some(root)
                     || !package_inputs.is_current_for(&state, root, exclusions))
             {
-                return false;
+                return PackageRefreshApply::empty(false);
             }
             // Pure in-memory apply — safe under the lock. `None` means modeling
             // is disabled and nothing was cleared, so there's no re-derive or
             // fanout to do.
             let Some(delta) = apply_rprofile_scan_to_state(&mut state, Some(scan)) else {
-                return true;
+                return PackageRefreshApply::empty(true);
             };
             state.apply_package_event(&delta);
             // Fan out to every open workspace R file that consumes the prelude
@@ -14039,7 +14233,7 @@ impl Backend {
             // and the edited buffer's own diagnostics are republished by the
             // normal did_change/did_close flow.
             let Some(ws_root) = state.package_inputs.workspace_root.clone() else {
-                return true;
+                return PackageRefreshApply::empty(true);
             };
             let affected: Vec<Url> = state
                 .documents
@@ -14055,11 +14249,15 @@ impl Backend {
                     .diagnostics_gate
                     .mark_force_republish_many(affected.iter());
             }
-            affected
+            let candidates = state.capture_analysis_transfer_candidates(affected.iter().cloned());
+            (affected, candidates)
         };
 
         if affected.is_empty() || !publish {
-            return true;
+            return PackageRefreshApply {
+                applied: true,
+                candidates,
+            };
         }
         // Publish via the bounded, concurrency-capped fanout — and SPAWN it
         // rather than await, so this live-edit refresh does not block the
@@ -14068,10 +14266,13 @@ impl Backend {
         tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
             state_arc.clone(),
             client,
-            affected,
+            affected.clone(),
             Some(traversal_truncation),
         ));
-        true
+        PackageRefreshApply {
+            applied: true,
+            candidates,
+        }
     }
 
     /// Refresh the affected testthat preamble sourced closures from a snapshot
@@ -14106,7 +14307,7 @@ impl Backend {
         affected_paths: Vec<std::path::PathBuf>,
         scheduled_uris: &std::collections::HashSet<Url>,
         expected_open_documents: Option<&std::collections::BTreeMap<Url, OpenDocumentSeedIdentity>>,
-    ) -> bool {
+    ) -> PackageRefreshApply {
         let publish = expected_open_documents.is_none();
         let (previous, overrides, exclusions, package_inputs) = {
             let state = state_arc.read().await;
@@ -14136,7 +14337,7 @@ impl Backend {
         })
         .await
         else {
-            return false;
+            return PackageRefreshApply::empty(false);
         };
         Self::apply_testthat_preamble_rescan(
             &state_arc,
@@ -14170,8 +14371,8 @@ impl Backend {
             crate::config_file::CompiledWorkspaceExclusions,
         )>,
         publish: bool,
-    ) -> bool {
-        let affected: Vec<Url> = {
+    ) -> PackageRefreshApply {
+        let (affected, candidates) = {
             let mut state = state_arc.write().await;
             if let Some(expected) = expected_open_documents
                 && snapshot_open_document_seed_identities(&state) != *expected
@@ -14179,26 +14380,26 @@ impl Backend {
                 // The off-lock scan belongs to an older edit or document
                 // lifecycle. In particular, close/reopen at the same LSP version
                 // changes the epoch even though version and revision can repeat.
-                return false;
+                return PackageRefreshApply::empty(false);
             }
             if let Some((expected, exclusions)) = expected_package_inputs
                 && !expected.is_current_for(&state, root, exclusions)
             {
                 // A watcher/config/reseed installed newer package inputs while
                 // this off-lock post-seed scan was running.
-                return false;
+                return PackageRefreshApply::empty(false);
             }
             if state.package_inputs.package_mode == crate::cross_file::config::PackageMode::Disabled
             {
                 let Some(delta) = apply_preamble_scan_to_state(&mut state, None) else {
-                    return true;
+                    return PackageRefreshApply::empty(true);
                 };
                 state.apply_package_event(&delta);
             } else {
                 // The common no-change case compares only rescanned roots by
                 // reference and avoids touching the live maps under the lock.
                 if scan.rescanned_match_inputs(&rescanned, &state.package_inputs) {
-                    return true;
+                    return PackageRefreshApply::empty(true);
                 }
                 // The scan ran off-lock against a snapshot; a concurrent writer
                 // may have updated OTHER preambles since. Mutate only rescanned
@@ -14210,7 +14411,7 @@ impl Backend {
                     &rescanned,
                 );
                 if !changed {
-                    return true;
+                    return PackageRefreshApply::empty(true);
                 }
                 state.record_package_input_mutation();
                 state.apply_package_event(
@@ -14236,19 +14437,26 @@ impl Backend {
                     .diagnostics_gate
                     .mark_force_republish_many(affected.iter());
             }
-            affected
+            let candidates = state.capture_analysis_transfer_candidates(affected.iter().cloned());
+            (affected, candidates)
         };
 
         if affected.is_empty() || !publish {
-            return true;
+            return PackageRefreshApply {
+                applied: true,
+                candidates,
+            };
         }
         tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
             state_arc.clone(),
             client,
-            affected,
+            affected.clone(),
             Some(traversal_truncation),
         ));
-        true
+        PackageRefreshApply {
+            applied: true,
+            candidates,
+        }
     }
 
     /// Recompute and install package inputs, then converge open source-following
@@ -14270,9 +14478,9 @@ impl Backend {
             None,
         )
         .await;
-        let installed = installed?;
+        let mut installed = installed?;
 
-        Self::refresh_open_package_inputs_after_seed(
+        installed.post_seed_candidates = Self::refresh_open_package_inputs_after_seed(
             self.state.clone(),
             self.client.clone(),
             self.traversal_truncation.clone(),
@@ -14292,16 +14500,26 @@ impl Backend {
         client: Client,
         traversal_truncation: Arc<TraversalTruncationState>,
         root: std::path::PathBuf,
-    ) {
-        Self::refresh_open_rprofile_after_seed(
+    ) -> Vec<AnalysisTransferCandidate> {
+        let mut affected = Self::refresh_open_rprofile_after_seed(
             &state_arc,
             client.clone(),
             traversal_truncation.clone(),
             &root,
         )
         .await;
-        Self::refresh_open_preamble_docs_after_seed(state_arc, client, traversal_truncation, root)
-            .await;
+        affected.extend(
+            Self::refresh_open_preamble_docs_after_seed(
+                state_arc,
+                client,
+                traversal_truncation,
+                root,
+            )
+            .await,
+        );
+        affected.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        affected.dedup();
+        affected
     }
 
     /// Converge an `.Rprofile` opened during seed computation to its current
@@ -14313,12 +14531,12 @@ impl Backend {
         client: Client,
         traversal_truncation: Arc<TraversalTruncationState>,
         root: &std::path::Path,
-    ) {
+    ) -> Vec<AnalysisTransferCandidate> {
         for _attempt in 0..3 {
             let snapshot = {
                 let state = state_arc.read().await;
                 if !state.package_inputs.model_rprofile {
-                    return;
+                    return Vec::new();
                 }
                 snapshot_authoritative_open_rprofile(&state, root).map(
                     |(uri, contents, identity)| {
@@ -14329,7 +14547,7 @@ impl Backend {
                 )
             };
             let Some((uri, contents, identity, exclusions, package_inputs)) = snapshot else {
-                return;
+                return Vec::new();
             };
             let root_for_scan = root.to_path_buf();
             let scan_exclusions = exclusions.clone();
@@ -14343,9 +14561,9 @@ impl Backend {
             })
             .await
             else {
-                return;
+                return Vec::new();
             };
-            if Self::apply_rprofile_prelude_rescan_with(
+            let outcome = Self::apply_rprofile_prelude_rescan_with(
                 state_arc,
                 client.clone(),
                 traversal_truncation.clone(),
@@ -14358,11 +14576,12 @@ impl Backend {
                     exclusions,
                 )),
             )
-            .await
-            {
-                return;
+            .await;
+            if outcome.applied {
+                return outcome.candidates;
             }
         }
+        Vec::new()
     }
 
     /// Close the seed-install TOCTOU window (issue #638): a preamble (or
@@ -14377,16 +14596,17 @@ impl Backend {
         client: Client,
         traversal_truncation: Arc<TraversalTruncationState>,
         root: std::path::PathBuf,
-    ) {
+    ) -> Vec<AnalysisTransferCandidate> {
+        let mut affected = Vec::new();
         for _attempt in 0..3 {
             let (affected_paths, identities_before) = {
                 let state = state_arc.read().await;
                 snapshot_open_preamble_documents(&state)
             };
             if affected_paths.is_empty() {
-                return;
+                return affected;
             }
-            let applied = Self::refresh_testthat_preambles_for_paths_with(
+            let outcome = Self::refresh_testthat_preambles_for_paths_with(
                 state_arc.clone(),
                 client.clone(),
                 traversal_truncation.clone(),
@@ -14396,14 +14616,21 @@ impl Backend {
                 Some(&identities_before),
             )
             .await;
+            affected.extend(outcome.candidates);
             let identities_after = {
                 let state = state_arc.read().await;
                 snapshot_open_document_seed_identities(&state)
             };
-            if applied && identities_after == identities_before {
-                return;
+            if outcome.applied && identities_after == identities_before {
+                affected
+                    .sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+                affected.dedup();
+                return affected;
             }
         }
+        affected.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        affected.dedup();
+        affected
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -15349,16 +15576,9 @@ async fn run_libpath_consumer(
                         })
                 };
                 let system_file_transfer = if touches_system_file {
-                    match run_system_file_convergence_transaction(
-                        &state_arc,
-                        Some(affected.clone()),
-                    )
-                    .await
-                    {
-                        SystemFileConvergenceOutcome::Committed(transfer) => Some(transfer),
-                        SystemFileConvergenceOutcome::Superseded
-                        | SystemFileConvergenceOutcome::RetryExhausted => None,
-                    }
+                    run_system_file_convergence_transaction(&state_arc, Some(affected.clone()))
+                        .await
+                        .into_transfer()
                 } else {
                     None
                 };
@@ -25091,8 +25311,10 @@ mod project_config_initialize_tests {
         }
         let transfer = match run_system_file_convergence_transaction(&backend.state, None).await {
             SystemFileConvergenceOutcome::Committed(transfer) => transfer,
-            SystemFileConvergenceOutcome::Superseded => panic!("convergence was superseded"),
-            SystemFileConvergenceOutcome::RetryExhausted => {
+            SystemFileConvergenceOutcome::Superseded(_) => {
+                panic!("convergence was superseded")
+            }
+            SystemFileConvergenceOutcome::Deferred => {
                 panic!("convergence exhausted its retries")
             }
         };
@@ -25160,17 +25382,19 @@ mod project_config_initialize_tests {
         }
         let first = match run_system_file_convergence_transaction(&state, None).await {
             SystemFileConvergenceOutcome::Committed(effects) => effects.handle,
-            SystemFileConvergenceOutcome::Superseded => panic!("first convergence was superseded"),
-            SystemFileConvergenceOutcome::RetryExhausted => {
+            SystemFileConvergenceOutcome::Superseded(_) => {
+                panic!("first convergence was superseded")
+            }
+            SystemFileConvergenceOutcome::Deferred => {
                 panic!("first convergence exhausted retries")
             }
         };
         let second = match run_system_file_convergence_transaction(&state, None).await {
             SystemFileConvergenceOutcome::Committed(effects) => effects.handle,
-            SystemFileConvergenceOutcome::Superseded => {
+            SystemFileConvergenceOutcome::Superseded(_) => {
                 panic!("second convergence was superseded")
             }
-            SystemFileConvergenceOutcome::RetryExhausted => {
+            SystemFileConvergenceOutcome::Deferred => {
                 panic!("second convergence exhausted retries")
             }
         };
@@ -25200,6 +25424,216 @@ mod project_config_initialize_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn consumed_transfer_under_distinct_finalization_never_falls_back() {
+        let workspace = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let package = library.path().join("otherpkg");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("helper.R"), "helper_value <- 1\n").unwrap();
+        let uri = Url::from_file_path(workspace.path().join("live.R")).unwrap();
+        let source = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(workspace.path()).unwrap()];
+            state.open_document(uri.clone(), source, Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+            let generation = state.documents.get_record(&uri).unwrap().generation();
+            state
+                .replace_open_document_metadata_if_current(
+                    &uri,
+                    generation,
+                    Arc::new(crate::cross_file::extract_metadata(source)),
+                )
+                .unwrap();
+            let mut package_library = crate::package_library::PackageLibrary::new_empty();
+            package_library.set_lib_paths(vec![library.path().to_path_buf()]);
+            state.install_package_library(Arc::new(package_library), true);
+        }
+        let handle = match run_system_file_convergence_transaction(&state, None).await {
+            SystemFileConvergenceOutcome::Committed(transfer) => transfer.handle,
+            SystemFileConvergenceOutcome::Superseded(_) => {
+                panic!("fixture convergence was superseded")
+            }
+            SystemFileConvergenceOutcome::Deferred => panic!("fixture convergence was deferred"),
+        };
+        let mut state = state.write().await;
+        let first = state
+            .finalize_analysis_transfers(
+                WorldState::begin_analysis_transfer_finalization(),
+                &[handle],
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            AnalysisTransferFinalization::Committed(ref tickets) if tickets.len() == 1
+        ));
+        let reservations = state.analysis_revalidation_reservation_count;
+        let markers = state.diagnostics_gate.force_republish_count_for_test(&uri);
+
+        let tickets = finalize_analysis_handoff_or_fallback(
+            &mut state,
+            vec![handle],
+            vec![uri.clone()],
+            vec![uri.clone()],
+        );
+
+        assert!(tickets.is_empty());
+        assert_eq!(state.analysis_revalidation_reservation_count, reservations);
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            markers,
+            "AlreadyConsumed under another finalization is terminal, not fallback authority"
+        );
+    }
+
+    #[test]
+    fn post_seed_candidate_close_reopen_before_finalization_is_dropped() {
+        let uri = Url::parse("file:///workspace/live.R").unwrap();
+        let mut state = WorldState::new();
+        state.open_document(uri.clone(), "old <- 1\n", Some(1));
+        state
+            .begin_open_document_diagnostic_lifecycle(&uri)
+            .unwrap();
+        let stale = state.capture_analysis_transfer_candidates([uri.clone()]);
+
+        state.retire_diagnostic_lifecycle(&uri);
+        state.close_document(&uri);
+        state.open_document(uri.clone(), "new <- 2\n", Some(1));
+        state
+            .begin_open_document_diagnostic_lifecycle(&uri)
+            .unwrap();
+
+        let tickets = finalize_analysis_handoff_candidates_or_fallback(
+            &mut state,
+            Vec::new(),
+            stale,
+            vec![uri.clone()],
+        );
+        assert!(tickets.is_empty());
+        assert_eq!(state.analysis_revalidation_reservation_count, 0);
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            0,
+            "a refresh candidate is authority for only its captured open lifecycle"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_seed_convergence_returns_current_successor_owner() {
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let old_seed = {
+            let mut state = state.write().await;
+            state.record_system_file_routing_owner_change();
+            state.record_package_seed_installed()
+        };
+        let pause = state
+            .read()
+            .await
+            .system_file_pre_derivation_test_pause
+            .arm(Url::parse("raven-test://system-file-pre-derivation").unwrap());
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            run_system_file_convergence_transaction_for_seed(&task_state, old_seed).await
+        });
+        pause.wait_arrived().await;
+        let successor_owner = {
+            let mut state = state.write().await;
+            state.record_system_file_routing_owner_change();
+            let newer_seed = state.record_package_seed_installed();
+            assert_ne!(newer_seed, old_seed);
+            newer_seed.system_file_routing_owner_generation
+        };
+        pause.release();
+
+        let SystemFileConvergenceOutcome::Superseded(successor) = task.await.unwrap() else {
+            panic!("the stale seed must hand off to an explicit current-owner transfer");
+        };
+        assert_eq!(
+            successor
+                .handle
+                .system_file_routing_owner_generation_for_test(),
+            Some(successor_owner)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_scan_and_system_file_overlap_finalize_one_open_reservation() {
+        let workspace = TempDir::new().unwrap();
+        let library = TempDir::new().unwrap();
+        let package = library.path().join("otherpkg");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("helper.R"), "helper_value <- 1\n").unwrap();
+        let source = "source(system.file(\"helper.R\", package = \"otherpkg\"))\n";
+        let uri = Url::from_file_path(workspace.path().join("main.R")).unwrap();
+        fs::write(uri.to_file_path().unwrap(), source).unwrap();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(workspace.path()).unwrap()];
+            state.open_document(uri.clone(), source, Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+            let generation = state.documents.get_record(&uri).unwrap().generation();
+            state
+                .replace_open_document_metadata_if_current(
+                    &uri,
+                    generation,
+                    Arc::new(crate::cross_file::extract_metadata(source)),
+                )
+                .unwrap();
+            let mut package_library = crate::package_library::PackageLibrary::new_empty();
+            package_library.set_lib_paths(vec![library.path().to_path_buf()]);
+            state.install_package_library(Arc::new(package_library), true);
+        }
+        let pause = state
+            .read()
+            .await
+            .system_file_pre_commit_test_pause
+            .arm(Url::parse("raven-test://system-file-pre-commit").unwrap());
+        let task_state = state.clone();
+        let system_task = tokio::spawn(async move {
+            run_system_file_convergence_transaction(&task_state, None).await
+        });
+        pause.wait_arrived().await;
+        let workspace_transfer = run_workspace_scan_transaction(&state)
+            .await
+            .expect_committed()
+            .transfer;
+        pause.release();
+        let system_transfer = match system_task.await.unwrap() {
+            SystemFileConvergenceOutcome::Committed(transfer)
+            | SystemFileConvergenceOutcome::Superseded(transfer) => transfer,
+            SystemFileConvergenceOutcome::Deferred => {
+                panic!("the overlapping system.file owner must converge")
+            }
+        };
+
+        let mut state = state.write().await;
+        let reservations_before = state.analysis_revalidation_reservation_count;
+        let markers_before = state.diagnostics_gate.force_republish_count_for_test(&uri);
+        let tickets = finalize_analysis_handoff_or_fallback(
+            &mut state,
+            vec![workspace_transfer.handle, system_transfer.handle],
+            Vec::new(),
+            vec![uri.clone()],
+        );
+        assert_eq!(tickets.iter().filter(|ticket| ticket.uri == uri).count(), 1);
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservations_before + 1
+        );
+        assert_eq!(
+            state.diagnostics_gate.force_republish_count_for_test(&uri),
+            markers_before + 1
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn system_file_routing_change_supersedes_paused_owner() {
         let state = Arc::new(RwLock::new(WorldState::new()));
@@ -25220,7 +25654,7 @@ mod project_config_initialize_tests {
         pause.release();
         assert!(matches!(
             task.await.unwrap(),
-            SystemFileConvergenceOutcome::Superseded
+            SystemFileConvergenceOutcome::Superseded(_)
         ));
     }
 
@@ -25244,7 +25678,7 @@ mod project_config_initialize_tests {
         pause.release();
         assert!(matches!(
             task.await.unwrap(),
-            SystemFileConvergenceOutcome::Superseded
+            SystemFileConvergenceOutcome::Superseded(_)
         ));
     }
 
@@ -25432,6 +25866,9 @@ mod project_config_initialize_tests {
     enum SystemFileExternalDrift {
         InvalidToValid,
         ValidContentChange,
+        ValidToMissing,
+        ValidToInvalid,
+        InvalidToMissing,
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -25439,6 +25876,9 @@ mod project_config_initialize_tests {
         for drift in [
             SystemFileExternalDrift::InvalidToValid,
             SystemFileExternalDrift::ValidContentChange,
+            SystemFileExternalDrift::ValidToMissing,
+            SystemFileExternalDrift::ValidToInvalid,
+            SystemFileExternalDrift::InvalidToMissing,
         ] {
             let workspace = TempDir::new().unwrap();
             let library = TempDir::new().unwrap();
@@ -25446,8 +25886,11 @@ mod project_config_initialize_tests {
             fs::create_dir_all(&package).unwrap();
             let target = package.join("helper.R");
             match drift {
-                SystemFileExternalDrift::InvalidToValid => fs::write(&target, [0xff]).unwrap(),
-                SystemFileExternalDrift::ValidContentChange => {
+                SystemFileExternalDrift::InvalidToValid
+                | SystemFileExternalDrift::InvalidToMissing => fs::write(&target, [0xff]).unwrap(),
+                SystemFileExternalDrift::ValidContentChange
+                | SystemFileExternalDrift::ValidToMissing
+                | SystemFileExternalDrift::ValidToInvalid => {
                     fs::write(&target, "old <- 1\n").unwrap()
                 }
             }
@@ -25480,24 +25923,65 @@ mod project_config_initialize_tests {
                 run_system_file_convergence_transaction(&task_state, None).await
             });
             pause.wait_arrived().await;
-            fs::write(&target, "new_value <- 12345\n").unwrap();
+            match drift {
+                SystemFileExternalDrift::InvalidToValid
+                | SystemFileExternalDrift::ValidContentChange => {
+                    fs::write(&target, "new_value <- 12345\n").unwrap()
+                }
+                SystemFileExternalDrift::ValidToMissing
+                | SystemFileExternalDrift::InvalidToMissing => fs::remove_file(&target).unwrap(),
+                SystemFileExternalDrift::ValidToInvalid => fs::write(&target, [0xff]).unwrap(),
+            }
             pause.release();
             assert!(matches!(
                 task.await.unwrap(),
                 SystemFileConvergenceOutcome::Committed(_)
             ));
             let target_uri = Url::from_file_path(&target).unwrap();
-            assert_eq!(
-                state
-                    .read()
-                    .await
-                    .workspace_index
-                    .get(&target_uri)
-                    .unwrap()
-                    .contents
-                    .to_string(),
-                "new_value <- 12345\n"
-            );
+            let state = state.read().await;
+            match drift {
+                SystemFileExternalDrift::InvalidToValid
+                | SystemFileExternalDrift::ValidContentChange => {
+                    assert_eq!(
+                        state
+                            .workspace_index
+                            .get(&target_uri)
+                            .unwrap()
+                            .contents
+                            .to_string(),
+                        "new_value <- 12345\n"
+                    );
+                    assert_eq!(
+                        state.documents.get_record(&uri).unwrap().metadata().sources[0]
+                            .resolved_uri,
+                        Some(target_uri)
+                    );
+                }
+                SystemFileExternalDrift::ValidToMissing
+                | SystemFileExternalDrift::InvalidToMissing => {
+                    assert!(
+                        !state.workspace_index.is_complete(&target_uri),
+                        "a missing or invalid external target must not remain indexed"
+                    );
+                    assert_eq!(
+                        state.documents.get_record(&uri).unwrap().metadata().sources[0]
+                            .resolved_uri,
+                        None
+                    );
+                }
+                SystemFileExternalDrift::ValidToInvalid => {
+                    assert!(
+                        !state.workspace_index.is_complete(&target_uri),
+                        "an invalid external target must not remain indexed"
+                    );
+                    assert_eq!(
+                        state.documents.get_record(&uri).unwrap().metadata().sources[0]
+                            .resolved_uri,
+                        Some(target_uri),
+                        "path routing still resolves an existing file even when its contents are invalid"
+                    );
+                }
+            }
         }
     }
 
@@ -28050,6 +28534,58 @@ mod project_config_initialize_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_after_package_seed_install_does_not_abandon_system_file_owner() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("DESCRIPTION"), "Package: installed\n").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let seed = PrecomputedPackageSeed::compute(&root, &exclusions, &Default::default(), true);
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        let pause = state
+            .read()
+            .await
+            .system_file_pre_derivation_test_pause
+            .arm(Url::parse("raven-test://system-file-pre-derivation").unwrap());
+        let cancel = CancellationToken::new();
+        let task_state = state.clone();
+        let task_cancel = cancel.clone();
+        let task_root = root.clone();
+        let task = tokio::spawn(async move {
+            attempt_package_seed_install_using(
+                &task_state,
+                task_root,
+                Some(Ok(seed)),
+                || {
+                    std::future::ready(Err(PackageSeedComputeError {
+                        message: "the installed first attempt must not recompute".into(),
+                    }))
+                },
+                Some(&task_cancel),
+            )
+            .await
+        });
+
+        pause.wait_arrived().await;
+        cancel.cancel();
+        pause.release();
+        let installed = task
+            .await
+            .unwrap()
+            .expect("post-install cancellation cannot discard ownership");
+        assert!(
+            installed.system_file.is_some() || installed.deferred_system_file.is_some(),
+            "an installed seed must return either its transfer or typed deferred ownership"
+        );
+        let state = state.read().await;
+        assert_eq!(
+            state
+                .package_workspace()
+                .map(|workspace| workspace.name.as_str()),
+            Some("installed")
+        );
+    }
+
     #[tokio::test]
     async fn package_seed_compute_failure_retries_then_installs() {
         let tmp = TempDir::new().unwrap();
@@ -28860,7 +29396,7 @@ mod project_config_initialize_tests {
             )),
         )
         .await;
-        assert!(!rprofile_applied);
+        assert!(!rprofile_applied.applied);
 
         let expected_package_inputs = (package_inputs, captured_exclusions);
         let preamble_applied = Backend::apply_testthat_preamble_rescan(
@@ -28877,7 +29413,7 @@ mod project_config_initialize_tests {
             false,
         )
         .await;
-        assert!(!preamble_applied);
+        assert!(!preamble_applied.applied);
 
         let state = backend.state.read().await;
         assert_eq!(
@@ -29086,7 +29622,10 @@ mod project_config_initialize_tests {
             false,
         )
         .await;
-        assert!(!applied, "the retired lifecycle's scan must be vetoed");
+        assert!(
+            !applied.applied,
+            "the retired lifecycle's scan must be vetoed"
+        );
         {
             let state = backend.state.read().await;
             let symbols = state

@@ -178,6 +178,10 @@ then install a concrete, fully in-memory seed under one write lock. Disabled
 modeling choices are represented by empty scans before construction; the central
 installation transaction never traverses the filesystem. After installation,
 callers refresh open preamble documents to close the snapshot-to-install race.
+Those silent refreshes return exact open-record candidates captured by the
+write-lock apply itself; orchestration carries the tokens to finalization rather
+than recapturing URIs later, so a close/reopen between refresh and publication
+cannot transfer diagnostics ownership to the new lifecycle.
 
 Background workspace scans use a process-wide latest-arrival intent and a
 complete immutable candidate rather than merging a raw disk scan at commit
@@ -205,7 +209,10 @@ Overlapping handles therefore cannot double-mark a URI. A successful newer
 commit inherits an unclaimed predecessor before recording a typed successor;
 the predecessor is rejected with proof naming that successor, while failed or
 pending attempts leave the predecessor claimable. Fallback uses the same
-finalization identity and is idempotent.
+finalization identity and is idempotent, but is permitted only for a genuinely
+missing/wrong owner. A handle already consumed by another finalization is a
+terminal no-op: treating it as fallback authority would double-mark candidates
+that the first finalization already owns.
 
 Workspace-scan finalization additionally validates the latest committed scan
 intent. Each candidate validates its current diagnostic lifecycle and exact
@@ -1062,11 +1069,11 @@ change list through both strict folds.
 
 `system.file(package = "pkg", "path/to/file.R")` calls are used by packages to reference installed data files. Raven resolves these to concrete paths and adds them as forward-source edges so cross-file analysis works across package boundaries.
 
-**Lifecycle:** Resolution is deferred until `lib_paths` are ready — the workspace scan may run before the package library is initialized. Startup, library replacement, every `LibpathEvent::Changed` (package install/removal under a watched libpath), and DESCRIPTION/NAMESPACE manifest changes run one detached convergence transaction (`backend.rs`). Each exact routing owner gets at most two complete attempts; a newer routing/library owner supersedes old work immediately.
+**Lifecycle:** Resolution is deferred until `lib_paths` are ready — the workspace scan may run before the package library is initialized. Startup, library replacement, every `LibpathEvent::Changed` (package install/removal under a watched libpath), and DESCRIPTION/NAMESPACE manifest changes run one detached convergence transaction (`backend.rs`). Each exact routing owner gets at most two complete attempts; a newer routing/library owner supersedes old work immediately. Package-seed callers additionally carry the exact installed-seed identity (raw-input, derived package-state, routing, and library generations plus a unique install ID) through capture and commit. Once a seed installs, cancellation cannot abandon its owner: contention returns a typed deferred result and schedules one coalesced exact-seed retry, while supersession returns a transfer owned by an explicitly validated current successor.
 
 **Retention:** `resolve_system_file_sources()` never clears `ForwardSource.system_file` and never drops unresolved entries — resolution state (`path`, `resolved_uri`) is recomputed from scratch on every pass. This is what makes the lifecycle events above recoverable without re-extracting metadata: an edge to a not-yet-installed package forms once the package appears, a stale edge to a removed package is cleared, and a workspace `Package:` rename re-targets self-package (branch 1) references. An unresolved entry is inert (empty `path`, no `resolved_uri`): the dependency graph and scope resolution produce no edge for it and the missing-file collectors skip it (`ForwardSource::exempt_from_missing_file_diagnostics` is the single predicate). Convergence covers both metadata stores — the workspace index (closed files) and the authoritative document store (open buffers) — and commits metadata, external installs/removals, graph edges, pins, and open metadata as one validated unit. The libpath consumer supplies a package filter, so unrelated sources are neither resolved nor disk-probed.
 
-**Ownership and locking:** Capture clones the exact routing/library/package, index, graph, configuration, and open-record authorities under a short read lock. Resolution, external reads/parsing, and graph derivation run on owned data in a blocking worker with no `WorldState` guard. Every external candidate is opened and read once; its valid/missing/invalid identity and any parsed artifacts come from those same bytes. Immediately before the central CAS, Raven rereads and compares every identity, then validates all central authorities and final open targets before mutating any tier. Raw file-cache contents are inputs only, never freshness authority. `raven check` retains one explicitly named CLI compatibility writer until CLI index installation is migrated as a separate ownership family; LSP callers and lifecycle tests do not use it.
+**Ownership and locking:** Capture clones the exact routing/library/package, index, graph, configuration, and open-record authorities under a short read lock. Resolution, external reads/parsing, and graph derivation run on owned data in a blocking worker with no `WorldState` guard. Every external candidate is opened and read once; its valid/missing/invalid identity and any parsed artifacts come from those same bytes. Immediately before the central CAS, Raven rereads and compares every identity, then validates all central authorities and final open targets before mutating any tier. Index admission receives the pin set derived from the prepared graph, not the pre-transaction graph, so a tight LRU cap cannot evict newly reachable external targets before their graph edges commit. Raw file-cache contents are inputs only, never freshness authority. `raven check` retains one explicitly named CLI compatibility writer until CLI index installation is migrated as a separate ownership family; LSP callers and lifecycle tests do not use it.
 
 **Re-resolution:** If a `system.file()` source edge resolves to a path that was previously reported as an error (`unresolved-source-path`), the diagnostic is retracted once resolution succeeds.
 
