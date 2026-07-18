@@ -127,6 +127,30 @@ pub(crate) fn scan_workspace_rprofile_with_overrides_and_exclusions(
         root_text,
         Some(exclusions),
         Some(overrides),
+        true,
+    )
+}
+
+/// Scan a detached seed's exact captured text projection without reopening
+/// missing or invalid source targets from disk.
+pub(crate) fn scan_workspace_rprofile_from_captured_texts_and_exclusions(
+    workspace_root: &Path,
+    overrides: &super::preamble::PreambleTextOverrides,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> RprofileScan {
+    let rprofile_path = workspace_root.join(".Rprofile");
+    if exclusions.is_excluded_path(&rprofile_path) {
+        return RprofileScan::default();
+    }
+    let Some(root_text) = overrides.get(&rprofile_path).map(ToString::to_string) else {
+        return RprofileScan::default();
+    };
+    scan_rprofile_worklist_with_overrides(
+        workspace_root,
+        root_text,
+        Some(exclusions),
+        Some(overrides),
+        false,
     )
 }
 
@@ -139,7 +163,7 @@ fn scan_rprofile_worklist(
     root_text: String,
     exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
 ) -> RprofileScan {
-    scan_rprofile_worklist_with_overrides(workspace_root, root_text, exclusions, None)
+    scan_rprofile_worklist_with_overrides(workspace_root, root_text, exclusions, None, true)
 }
 
 fn scan_rprofile_worklist_with_overrides(
@@ -147,6 +171,7 @@ fn scan_rprofile_worklist_with_overrides(
     root_text: String,
     exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
     overrides: Option<&super::preamble::PreambleTextOverrides>,
+    allow_disk_fallback: bool,
 ) -> RprofileScan {
     let rprofile_path = workspace_root.join(".Rprofile");
     let workspace_url = Url::from_file_path(workspace_root).ok();
@@ -154,6 +179,7 @@ fn scan_rprofile_worklist_with_overrides(
     let mut policy = RprofileClosurePolicy {
         exclusions,
         overrides,
+        allow_disk_fallback,
         renv_activate: super::preamble::canonicalize_for_routing(&renv_activate),
         scan: RprofileScan::default(),
     };
@@ -170,6 +196,7 @@ fn scan_rprofile_worklist_with_overrides(
 struct RprofileClosurePolicy<'a> {
     exclusions: Option<&'a crate::config_file::CompiledWorkspaceExclusions>,
     overrides: Option<&'a super::preamble::PreambleTextOverrides>,
+    allow_disk_fallback: bool,
     renv_activate: PathBuf,
     scan: RprofileScan,
 }
@@ -190,7 +217,11 @@ impl super::StaticSourceClosurePolicy for RprofileClosurePolicy<'_> {
         self.overrides
             .and_then(|overrides| overrides.get(resolved))
             .map(ToString::to_string)
-            .or_else(|| crate::state::read_source(resolved).ok())
+            .or_else(|| {
+                self.allow_disk_fallback
+                    .then(|| crate::state::read_source(resolved).ok())
+                    .flatten()
+            })
     }
 
     fn harvest(&mut self, facts: &crate::cross_file::source_detect::StaticScriptFacts) {

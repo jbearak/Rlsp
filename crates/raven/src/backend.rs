@@ -33,14 +33,14 @@ use crate::state::{
     AnalysisBasis, AnalysisTransferCandidate, AnalysisTransferFinalization, AnalysisTransferHandle,
     AnalysisTransferRejection, DiagnosticsTrigger, IndentationSettings, OpenCloseCommitOutcome,
     OpenCloseDiskObservation, OpenCloseIntentToken, OpenCloseResyncTicket, OpenInstallIntentToken,
-    PackageRoutingCommitEffects, PackageSeedInstalledIdentity, PreparedAnalysisCommit,
-    PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall,
-    PreparedOpenCommitPlan, PreparedOpenEditAnalysis, PreparedOpenGraphProjection,
-    PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch, PreparedPackageProjection,
-    PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis, SymbolConfig,
-    SystemFileRoutingOwnerIdentity, SystemFileTransferredEffects, WorkspaceGraphDerivationContext,
-    WorkspaceGraphOverlay, WorkspaceScanDerivationBasis, WorkspaceScanInputBasis,
-    WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
+    PackageProjectionBasis, PackageRoutingCommitEffects, PackageSeedInstalledIdentity,
+    PreparedAnalysisCommit, PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis,
+    PreparedOpenCloseDiskInstall, PreparedOpenCommitPlan, PreparedOpenEditAnalysis,
+    PreparedOpenGraphProjection, PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch,
+    PreparedPackageProjection, PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis,
+    SymbolConfig, SystemFileRoutingOwnerIdentity, SystemFileTransferredEffects,
+    WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorkspaceScanDerivationBasis,
+    WorkspaceScanInputBasis, WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
     derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
@@ -3319,6 +3319,16 @@ fn snapshot_open_document_seed_identities(
     open_document_seed_identities(state).collect()
 }
 
+fn snapshot_open_record_tokens(
+    state: &WorldState,
+) -> std::collections::BTreeMap<Url, crate::open_document_store::OpenRecordToken> {
+    state
+        .documents
+        .keys()
+        .map(|uri| (uri.clone(), state.documents.record_token(uri)))
+        .collect()
+}
+
 fn snapshot_open_preamble_documents(
     state: &WorldState,
 ) -> (
@@ -4302,7 +4312,8 @@ async fn complete_startup_without_workspace_scan(
     let (seeded_root, mut installed) = if let (Some(root), Some(seed)) = (root, package_seed) {
         let installed =
             install_package_seed_with_retry(handles, root.clone(), exclusions, true, Some(seed))
-                .await;
+                .await
+                .into_committed();
         (installed.as_ref().map(|_| root), installed)
     } else {
         (None, None)
@@ -4380,14 +4391,67 @@ impl PackageSeedInputSnapshot {
         root: &std::path::Path,
         exclusions: &crate::config_file::CompiledWorkspaceExclusions,
     ) -> bool {
+        self.target_is_current_for(state, root, exclusions)
+            && state.package_input_generation() == self.generation
+    }
+
+    fn target_is_current_for(
+        &self,
+        state: &WorldState,
+        root: &std::path::Path,
+        exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    ) -> bool {
         self.workspace_root.as_deref() == Some(root)
             && state.package_inputs.workspace_root == self.workspace_root
-            && state.package_input_generation() == self.generation
             && state.workspace_exclusions.patterns() == self.exclusion_patterns.as_slice()
             && exclusions.patterns() == self.exclusion_patterns.as_slice()
             && state.workspace_folders == self.workspace_folders
             && state.cross_file_config.package_mode == self.package_mode
             && state.cross_file_config.model_rprofile == self.model_rprofile
+    }
+}
+
+enum StandalonePackageOutcome<T> {
+    Committed(T),
+    Superseded,
+    Deferred,
+}
+
+impl<T> StandalonePackageOutcome<T> {
+    fn into_committed(self) -> Option<T> {
+        match self {
+            Self::Committed(value) => Some(value),
+            Self::Superseded | Self::Deferred => None,
+        }
+    }
+
+    fn as_committed(&self) -> Option<&T> {
+        match self {
+            Self::Committed(value) => Some(value),
+            Self::Superseded | Self::Deferred => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_none(&self) -> bool {
+        !matches!(self, Self::Committed(_))
+    }
+}
+
+enum PackageSeedCandidateInstall {
+    Committed(PackageSeedInstalledIdentity),
+    StaleBasis,
+    Superseded,
+}
+
+#[cfg(test)]
+impl PackageSeedCandidateInstall {
+    fn is_some(&self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
+
+    fn is_none(&self) -> bool {
+        !self.is_some()
     }
 }
 
@@ -4408,6 +4472,37 @@ struct PackageSeedInstall {
     preamble_scan: crate::package_state::preamble::PreambleScan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PackageSeedDiskIdentity {
+    Missing,
+    Directory,
+    Valid {
+        snapshot: crate::cross_file::file_cache::FileSnapshot,
+        text: Arc<str>,
+    },
+    Invalid(Option<crate::cross_file::file_cache::FileSnapshot>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageSeedDiskProjection {
+    recursive_roots: Vec<std::path::PathBuf>,
+    exact_paths: Vec<std::path::PathBuf>,
+    ignored_open_paths: std::collections::BTreeSet<std::path::PathBuf>,
+    entries: std::collections::BTreeMap<std::path::PathBuf, PackageSeedDiskIdentity>,
+}
+
+impl PackageSeedDiskProjection {
+    fn is_current(&self) -> bool {
+        capture_package_seed_disk_projection(
+            self.recursive_roots.clone(),
+            self.exact_paths.clone(),
+            self.ignored_open_paths.clone(),
+        )
+        .entries
+            == self.entries
+    }
+}
+
 /// Filesystem-backed inputs computed before a package-state seed is installed.
 ///
 /// Every LSP seed path uses [`Self::compute_from_state`] off the `WorldState`
@@ -4422,6 +4517,21 @@ struct PrecomputedPackageSeed {
     exclusions: crate::config_file::CompiledWorkspaceExclusions,
     input_snapshot: Option<PackageSeedInputSnapshot>,
     install: PackageSeedInstall,
+    prepared: Option<(PackageProjectionBasis, PreparedPackageProjection)>,
+    disk_projection: Option<PackageSeedDiskProjection>,
+    open_records:
+        Option<std::collections::BTreeMap<Url, crate::open_document_store::OpenRecordToken>>,
+}
+
+struct PackageSeedProjectionCapture {
+    basis: PackageProjectionBasis,
+    inputs: crate::package_state::PackageInputs,
+    package_state: crate::package_state::PackageState,
+    indexed_r_files:
+        std::collections::BTreeMap<std::path::PathBuf, crate::package_state::RFileInput>,
+    open_events: Vec<crate::package_state::event::HandlerEvent>,
+    rprofile_open: bool,
+    open_records: std::collections::BTreeMap<Url, crate::open_document_store::OpenRecordToken>,
 }
 
 #[derive(Debug)]
@@ -4436,6 +4546,12 @@ impl std::fmt::Display for PackageSeedComputeError {
 }
 
 impl PrecomputedPackageSeed {
+    fn disk_is_current(&self) -> bool {
+        self.disk_projection
+            .as_ref()
+            .is_none_or(PackageSeedDiskProjection::is_current)
+    }
+
     /// Snapshot authoritative preamble buffers and the cohesive raw-input
     /// generation under a brief read lock, then compute every filesystem-backed
     /// seed input on the blocking pool.
@@ -4477,13 +4593,28 @@ impl PrecomputedPackageSeed {
             + Send
             + 'static,
     {
-        let (preamble_overrides, input_snapshot, package_mode, model_rprofile) = {
+        let (preamble_overrides, input_snapshot, package_mode, model_rprofile, projection_capture) = {
             let state = state_arc.read().await;
             (
                 snapshot_preamble_text_overrides(&state),
                 PackageSeedInputSnapshot::capture(&state, exclusions),
                 state.cross_file_config.package_mode,
                 state.cross_file_config.model_rprofile,
+                PackageSeedProjectionCapture {
+                    basis: state.capture_package_projection_basis(),
+                    inputs: state.package_inputs.clone(),
+                    package_state: state.package_state.clone(),
+                    indexed_r_files: hydrate_package_r_files_from_state(
+                        &state,
+                        root,
+                        Default::default(),
+                    ),
+                    open_events: snapshot_open_package_input_events(&state, root),
+                    rprofile_open: authoritative_open_rprofile_uris(&state, root)
+                        .next()
+                        .is_some(),
+                    open_records: snapshot_open_record_tokens(&state),
+                },
             )
         };
         let root = root.to_path_buf();
@@ -4491,31 +4622,78 @@ impl PrecomputedPackageSeed {
         let compute_root = root.clone();
         let compute_exclusions = exclusions.clone();
 
-        let install = match tokio::task::spawn_blocking(move || {
-            compute_install(
-                &compute_root,
-                &compute_exclusions,
-                &preamble_overrides,
-                scan_r_files,
-                package_mode,
-                model_rprofile,
-            )
-        })
-        .await
-        {
-            Ok(install) => install,
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => {
-                return Err(PackageSeedComputeError {
-                    message: error.to_string(),
-                });
-            }
-        };
+        let (install, prepared, disk_projection, open_records) =
+            match tokio::task::spawn_blocking(move || {
+                let discovery = compute_install(
+                    &compute_root,
+                    &compute_exclusions,
+                    &preamble_overrides,
+                    scan_r_files,
+                    package_mode,
+                    model_rprofile,
+                );
+                let disk_projection = capture_package_seed_projection_for_install(
+                    &compute_root,
+                    &discovery,
+                    &projection_capture.open_events,
+                    &preamble_overrides,
+                    scan_r_files,
+                );
+                let install = compute_package_seed_install_from_projection(
+                    &compute_root,
+                    &disk_projection,
+                    &preamble_overrides,
+                    &compute_exclusions,
+                    scan_r_files,
+                    package_mode,
+                    model_rprofile,
+                    projection_capture.rprofile_open,
+                );
+                if !package_seed_projection_covers_sources(&disk_projection, &install) {
+                    return Err(PackageSeedComputeError {
+                        message: format!(
+                            "package seed discovered an uncaptured source while scanning {}",
+                            compute_root.display()
+                        ),
+                    });
+                }
+                let stable_projection = capture_package_seed_disk_projection(
+                    disk_projection.recursive_roots.clone(),
+                    disk_projection.exact_paths.clone(),
+                    disk_projection.ignored_open_paths.clone(),
+                );
+                if stable_projection != disk_projection {
+                    return Err(PackageSeedComputeError {
+                        message: format!(
+                            "package seed disk inputs changed while scanning {}",
+                            compute_root.display()
+                        ),
+                    });
+                }
+                let open_records = projection_capture.open_records.clone();
+                let prepared =
+                    prepare_package_seed_projection(&compute_root, &install, projection_capture);
+                Ok((install, prepared, disk_projection, open_records))
+            })
+            .await
+            {
+                Ok(Ok(install)) => install,
+                Ok(Err(error)) => return Err(error),
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => {
+                    return Err(PackageSeedComputeError {
+                        message: error.to_string(),
+                    });
+                }
+            };
         Ok(Self {
             root,
             exclusions,
             input_snapshot: Some(input_snapshot),
             install,
+            prepared: Some(prepared),
+            disk_projection: Some(disk_projection),
+            open_records: Some(open_records),
         })
     }
 
@@ -4538,6 +4716,9 @@ impl PrecomputedPackageSeed {
                 crate::cross_file::config::PackageMode::Auto,
                 true,
             ),
+            prepared: None,
+            disk_projection: None,
+            open_records: None,
         }
     }
 
@@ -4596,14 +4777,55 @@ impl PrecomputedPackageSeed {
     /// Install only if every raw package input still belongs to the captured
     /// lifecycle. A `None` result means nothing was mutated and the caller must
     /// recompute off-lock before retrying.
-    fn install(self, state: &mut WorldState) -> Option<PackageSeedInstalledIdentity> {
+    fn install(self, state: &mut WorldState) -> PackageSeedCandidateInstall {
         let Self {
             root,
             exclusions,
             input_snapshot,
             install,
+            prepared,
+            disk_projection: _,
+            open_records,
         } = self;
-        install_package_seed(state, root, install, input_snapshot, &exclusions)
+        if let Some((basis, prepared)) = prepared {
+            if open_records
+                .as_ref()
+                .is_some_and(|expected| snapshot_open_record_tokens(state) != *expected)
+            {
+                return PackageSeedCandidateInstall::StaleBasis;
+            }
+            if let Some(snapshot) = input_snapshot.as_ref() {
+                if !snapshot.target_is_current_for(state, &root, &exclusions) {
+                    return PackageSeedCandidateInstall::Superseded;
+                }
+                if !snapshot.is_current_for(state, &root, &exclusions) {
+                    return PackageSeedCandidateInstall::StaleBasis;
+                }
+            }
+            if state
+                .try_install_prepared_package_projection(&basis, prepared)
+                .is_err()
+            {
+                return PackageSeedCandidateInstall::StaleBasis;
+            }
+            return PackageSeedCandidateInstall::Committed(state.record_package_seed_installed());
+        }
+        match install_package_seed(
+            state,
+            root.clone(),
+            install,
+            input_snapshot.clone(),
+            &exclusions,
+        ) {
+            Some(identity) => PackageSeedCandidateInstall::Committed(identity),
+            None if input_snapshot.as_ref().is_some_and(|snapshot| {
+                !snapshot.target_is_current_for(state, &root, &exclusions)
+            }) =>
+            {
+                PackageSeedCandidateInstall::Superseded
+            }
+            None => PackageSeedCandidateInstall::StaleBasis,
+        }
     }
 }
 
@@ -4717,7 +4939,7 @@ async fn install_package_seed_with_retry(
     exclusions: crate::config_file::CompiledWorkspaceExclusions,
     scan_r_files: bool,
     initial_attempt: Option<std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>>,
-) -> Option<SeedInstalled> {
+) -> StandalonePackageOutcome<SeedInstalled> {
     let compute_state = Arc::clone(&handles.state);
     let compute_root = root.clone();
     let compute_exclusions = exclusions.clone();
@@ -4738,7 +4960,7 @@ async fn install_package_seed_with_retry_using<F, Fut>(
     root: std::path::PathBuf,
     initial_attempt: Option<std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>>,
     compute: F,
-) -> Option<SeedInstalled>
+) -> StandalonePackageOutcome<SeedInstalled>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>>,
@@ -4746,19 +4968,19 @@ where
     // A foreground transaction supersedes any sleeping follow-up. A running
     // worker observes cancellation before installing its detached candidate.
     handles.state.read().await.package_seed_retry.cancel();
-    let installed =
+    let outcome =
         attempt_package_seed_install_using(&handles.state, root, initial_attempt, compute, None)
             .await;
-    if let Some(identity) = installed
-        .as_ref()
+    if let Some(identity) = outcome
+        .as_committed()
         .and_then(|installed| installed.deferred_system_file)
     {
         schedule_system_file_seed_retry(handles.clone(), identity).await;
     }
-    if installed.is_none() {
+    if matches!(outcome, StandalonePackageOutcome::Deferred) {
         schedule_package_seed_retry(handles.clone()).await;
     }
-    installed
+    outcome
 }
 
 async fn attempt_package_seed_install(
@@ -4767,7 +4989,7 @@ async fn attempt_package_seed_install(
     exclusions: crate::config_file::CompiledWorkspaceExclusions,
     scan_r_files: bool,
     cancel: Option<&CancellationToken>,
-) -> Option<SeedInstalled> {
+) -> StandalonePackageOutcome<SeedInstalled> {
     let compute_state = Arc::clone(state_arc);
     let compute_root = root.clone();
     let compute_exclusions = exclusions.clone();
@@ -4802,14 +5024,14 @@ async fn attempt_package_seed_install_using<F, Fut>(
     >,
     mut compute: F,
     cancel: Option<&CancellationToken>,
-) -> Option<SeedInstalled>
+) -> StandalonePackageOutcome<SeedInstalled>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::result::Result<PrecomputedPackageSeed, PackageSeedComputeError>>,
 {
     for attempt in 0..PACKAGE_SEED_MAX_ATTEMPTS {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
-            return None;
+            return StandalonePackageOutcome::Superseded;
         }
         let candidate = match initial_attempt.take() {
             Some(result) => result,
@@ -4832,30 +5054,60 @@ where
             }
         };
         if cancel.is_some_and(CancellationToken::is_cancelled) {
-            return None;
+            return StandalonePackageOutcome::Superseded;
+        }
+        let (disk_is_current, candidate) =
+            match tokio::task::spawn_blocking(move || (candidate.disk_is_current(), candidate))
+                .await
+            {
+                Ok(result) => result,
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => {
+                    log::debug!("Retrying package seed after disk validation failed: {error}");
+                    if attempt + 1 < PACKAGE_SEED_MAX_ATTEMPTS {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
+            };
+        if !disk_is_current {
+            if attempt + 1 < PACKAGE_SEED_MAX_ATTEMPTS {
+                tokio::task::yield_now().await;
+            }
+            continue;
         }
         let installed = {
             let mut state = state_arc.write().await;
             if cancel.is_some_and(CancellationToken::is_cancelled) {
-                return None;
+                return StandalonePackageOutcome::Superseded;
             }
             candidate.install(&mut state)
         };
-        if let Some(identity) = installed {
-            // Once the seed is installed, cancellation no longer discards
-            // ownership. Finish or hand off its system-file convergence.
-            let (system_file, deferred_system_file) =
-                match run_system_file_convergence_transaction_for_seed(state_arc, identity).await {
-                    SystemFileConvergenceOutcome::Committed(transfer) => (Some(transfer), None),
-                    SystemFileConvergenceOutcome::Superseded(successor) => (Some(successor), None),
-                    SystemFileConvergenceOutcome::Deferred => (None, Some(identity)),
-                };
-            return Some(SeedInstalled {
-                _identity: identity,
-                system_file,
-                deferred_system_file,
-                post_seed_candidates: Vec::new(),
-            });
+        match installed {
+            PackageSeedCandidateInstall::Superseded => {
+                return StandalonePackageOutcome::Superseded;
+            }
+            PackageSeedCandidateInstall::StaleBasis => {}
+            PackageSeedCandidateInstall::Committed(identity) => {
+                // Once the seed is installed, cancellation no longer discards
+                // ownership. Finish or hand off its system-file convergence.
+                let (system_file, deferred_system_file) =
+                    match run_system_file_convergence_transaction_for_seed(state_arc, identity)
+                        .await
+                    {
+                        SystemFileConvergenceOutcome::Committed(transfer) => (Some(transfer), None),
+                        SystemFileConvergenceOutcome::Superseded(successor) => {
+                            (Some(successor), None)
+                        }
+                        SystemFileConvergenceOutcome::Deferred => (None, Some(identity)),
+                    };
+                return StandalonePackageOutcome::Committed(SeedInstalled {
+                    _identity: identity,
+                    system_file,
+                    deferred_system_file,
+                    post_seed_candidates: Vec::new(),
+                });
+            }
         }
         if attempt + 1 < PACKAGE_SEED_MAX_ATTEMPTS {
             tokio::task::yield_now().await;
@@ -4866,7 +5118,7 @@ where
         root.display(),
         PACKAGE_SEED_MAX_ATTEMPTS
     );
-    None
+    StandalonePackageOutcome::Deferred
 }
 
 /// Coalesce package-seed exhaustion into one delayed convergence worker. Each
@@ -4905,7 +5157,7 @@ async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
                 return;
             };
 
-            let installed = attempt_package_seed_install(
+            let outcome = attempt_package_seed_install(
                 &handles.state,
                 root.clone(),
                 exclusions,
@@ -4913,15 +5165,27 @@ async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
                 Some(&token),
             )
             .await;
-            let Some(mut installed) = installed else {
-                if token.is_cancelled() {
+            let mut installed = match outcome {
+                StandalonePackageOutcome::Committed(installed) => installed,
+                StandalonePackageOutcome::Superseded => {
+                    handles
+                        .state
+                        .read()
+                        .await
+                        .package_seed_retry
+                        .complete(generation);
                     return;
                 }
-                log::warn!(
-                    "Delayed package seed for {} exhausted another bounded transaction; retrying after debounce",
-                    root.display()
-                );
-                continue;
+                StandalonePackageOutcome::Deferred => {
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    log::warn!(
+                        "Delayed package seed for {} exhausted another bounded transaction; retrying after debounce",
+                        root.display()
+                    );
+                    continue;
+                }
             };
             if let Some(identity) = installed.deferred_system_file {
                 schedule_system_file_seed_retry(handles.clone(), identity).await;
@@ -4989,10 +5253,10 @@ fn establish_package_event_translation_state(state: &mut WorldState, root: std::
     state.record_package_input_mutation();
 }
 
-/// Replay every authoritative open manifest/package-R buffer into freshly
-/// installed disk inputs. This is pure in-memory work under the state lock; the
-/// final `Initial` derive below observes the complete converged input set.
-fn replay_open_package_inputs_after_seed(state: &mut WorldState, root: &std::path::Path) {
+fn snapshot_open_package_input_events(
+    state: &WorldState,
+    root: &std::path::Path,
+) -> Vec<crate::package_state::event::HandlerEvent> {
     let mut open_uris: Vec<Url> = state.documents.keys().cloned().collect();
     open_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     let mut events = Vec::new();
@@ -5016,8 +5280,384 @@ fn replay_open_package_inputs_after_seed(state: &mut WorldState, root: &std::pat
             text: Arc::from(document.text()),
         });
     }
+    events
+}
 
-    for event in events {
+fn observe_package_seed_disk_path(path: &std::path::Path) -> PackageSeedDiskIdentity {
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return PackageSeedDiskIdentity::Missing;
+        }
+        Err(_) => return PackageSeedDiskIdentity::Invalid(None),
+    };
+    let Ok(metadata) = file.metadata() else {
+        return PackageSeedDiskIdentity::Invalid(None);
+    };
+    if metadata.is_dir() {
+        return PackageSeedDiskIdentity::Directory;
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return PackageSeedDiskIdentity::Invalid(None);
+    }
+    let snapshot = file_snapshot_with_bytes_hash(&metadata, &bytes);
+    match crate::state::decode_source(bytes) {
+        Ok(text) => PackageSeedDiskIdentity::Valid {
+            snapshot,
+            text: text.into(),
+        },
+        Err(_) => PackageSeedDiskIdentity::Invalid(Some(snapshot)),
+    }
+}
+
+fn capture_package_seed_disk_projection(
+    mut recursive_roots: Vec<std::path::PathBuf>,
+    mut exact_paths: Vec<std::path::PathBuf>,
+    ignored_open_paths: std::collections::BTreeSet<std::path::PathBuf>,
+) -> PackageSeedDiskProjection {
+    recursive_roots.sort();
+    recursive_roots.dedup();
+    exact_paths.sort();
+    exact_paths.dedup();
+    let mut paths: std::collections::BTreeSet<std::path::PathBuf> =
+        exact_paths.iter().cloned().collect();
+    for root in &recursive_roots {
+        paths.insert(root.clone());
+        if root.is_dir() {
+            paths.extend(
+                walkdir::WalkDir::new(root)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_map(|entry| entry.ok())
+                    .map(walkdir::DirEntry::into_path),
+            );
+        }
+    }
+    let entries = paths
+        .into_iter()
+        .filter(|path| !ignored_open_paths.contains(path))
+        .map(|path| {
+            let identity = observe_package_seed_disk_path(&path);
+            (path, identity)
+        })
+        .collect();
+    PackageSeedDiskProjection {
+        recursive_roots,
+        exact_paths,
+        ignored_open_paths,
+        entries,
+    }
+}
+
+fn capture_package_seed_projection_for_install(
+    root: &std::path::Path,
+    install: &PackageSeedInstall,
+    open_events: &[crate::package_state::event::HandlerEvent],
+    open_overrides: &crate::package_state::preamble::PreambleTextOverrides,
+    scan_r_files: bool,
+) -> PackageSeedDiskProjection {
+    let mut recursive_roots = vec![
+        root.join("data"),
+        root.join("data-raw"),
+        root.join("tests").join("testthat"),
+    ];
+    if scan_r_files {
+        recursive_roots.push(root.join("R"));
+    }
+    let mut exact_paths = vec![
+        root.join("DESCRIPTION"),
+        root.join("NAMESPACE"),
+        root.join(".Rprofile"),
+    ];
+    exact_paths.extend(install.rprofile_scan.sourced_files.iter().cloned());
+    exact_paths.extend(install.preamble_scan.sourced_files.iter().cloned());
+
+    let mut ignored_open_paths = std::collections::BTreeSet::new();
+    for event in open_events {
+        let uri = match event {
+            crate::package_state::event::HandlerEvent::DidOpen { uri, .. }
+            | crate::package_state::event::HandlerEvent::DidChange { uri, .. } => uri,
+            _ => continue,
+        };
+        if let Ok(path) = uri.to_file_path() {
+            ignored_open_paths.insert(path);
+        }
+    }
+    let mut open_source_authorities: std::collections::BTreeSet<std::path::PathBuf> =
+        install.rprofile_scan.sourced_files.clone();
+    open_source_authorities.extend(install.preamble_scan.sourced_files.iter().cloned());
+    open_source_authorities.extend(install.preamble_scan.symbols.keys().cloned());
+    open_source_authorities.insert(root.join(".Rprofile"));
+    for path in open_overrides.keys() {
+        if open_source_authorities.contains(path)
+            || open_source_authorities.contains(
+                &crate::package_state::preamble::canonicalize_for_routing(path),
+            )
+        {
+            ignored_open_paths.insert(path.clone());
+        }
+    }
+    capture_package_seed_disk_projection(recursive_roots, exact_paths, ignored_open_paths)
+}
+
+fn package_seed_projection_text(
+    projection: &PackageSeedDiskProjection,
+    path: &std::path::Path,
+) -> Option<String> {
+    match projection.entries.get(path) {
+        Some(PackageSeedDiskIdentity::Valid { text, .. }) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
+fn package_seed_projection_covers_sources(
+    projection: &PackageSeedDiskProjection,
+    install: &PackageSeedInstall,
+) -> bool {
+    install
+        .rprofile_scan
+        .sourced_files
+        .iter()
+        .chain(install.preamble_scan.sourced_files.iter())
+        .all(|path| {
+            projection.entries.contains_key(path)
+                || projection.ignored_open_paths.contains(path)
+                || {
+                    let routing = crate::package_state::preamble::canonicalize_for_routing(path);
+                    projection.entries.contains_key(&routing)
+                        || projection.ignored_open_paths.contains(&routing)
+                }
+        })
+}
+
+fn package_seed_dataset_names(
+    root: &std::path::Path,
+    projection: &PackageSeedDiskProjection,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> std::collections::BTreeSet<String> {
+    const SERIALIZED_EXTS: &[&str] = &["rda", "rdata", "rds"];
+    const TABULAR_EXTS: &[&str] = &["csv", "tab", "txt"];
+    const COMPRESSION_EXTS: &[&str] = &["gz", "bz2", "xz"];
+    const SKIP_FILES: &[&str] = &["Rdata.rdb", "Rdata.rdx", "Rdata.rds", "datalist"];
+
+    let data = root.join("data");
+    let mut names = std::collections::BTreeSet::new();
+    let datalist = data.join("datalist");
+    if !exclusions.is_excluded_path(&datalist)
+        && let Some(text) = package_seed_projection_text(projection, &datalist)
+    {
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((primary, rest)) = line.split_once(':') {
+                if !primary.trim().is_empty() {
+                    names.insert(primary.trim().to_string());
+                }
+                names.extend(rest.split_whitespace().map(str::to_string));
+            } else {
+                names.insert(line.to_string());
+            }
+        }
+    }
+    for path in projection.entries.keys().filter(|path| {
+        path.parent() == Some(data.as_path())
+            && !exclusions.is_excluded_path(path)
+            && matches!(
+                projection.entries.get(*path),
+                Some(PackageSeedDiskIdentity::Valid { .. })
+                    | Some(PackageSeedDiskIdentity::Invalid(Some(_)))
+            )
+    }) {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if SKIP_FILES.contains(&file_name) {
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if extension == "r" {
+            if let Some(text) = package_seed_projection_text(projection, path) {
+                names.extend(crate::roxygen::extract_top_level_defs(&text));
+            }
+        } else if SERIALIZED_EXTS.contains(&extension.as_str())
+            || TABULAR_EXTS.contains(&extension.as_str())
+        {
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                names.insert(stem.to_string());
+            }
+        } else if COMPRESSION_EXTS.contains(&extension.as_str()) {
+            let outer = file_name
+                .rsplit_once('.')
+                .map(|(stem, _)| stem)
+                .unwrap_or("");
+            if let Some((stem, inner_extension)) = outer.rsplit_once('.')
+                && TABULAR_EXTS.contains(&inner_extension.to_ascii_lowercase().as_str())
+            {
+                names.insert(stem.to_string());
+            }
+        }
+    }
+    names
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps the frozen disk/open/config authorities explicit.
+fn compute_package_seed_install_from_projection(
+    root: &std::path::Path,
+    projection: &PackageSeedDiskProjection,
+    open_overrides: &crate::package_state::preamble::PreambleTextOverrides,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+    scan_r_files: bool,
+    package_mode: crate::cross_file::config::PackageMode,
+    model_rprofile: bool,
+    rprofile_open: bool,
+) -> PackageSeedInstall {
+    let mut disk_r_files = std::collections::BTreeMap::new();
+    if scan_r_files {
+        for path in projection.entries.keys() {
+            if exclusions.is_excluded_path(path) {
+                continue;
+            }
+            let Some(kind) = crate::package_state::is_r_source_path(path, root) else {
+                continue;
+            };
+            let Some(text) = package_seed_projection_text(projection, path) else {
+                continue;
+            };
+            let text: Arc<str> = text.into();
+            disk_r_files.insert(path.clone(), package_r_file_input_from_text(text, kind));
+        }
+    }
+    let mut source_overrides = crate::package_state::preamble::PreambleTextOverrides::new();
+    for path in projection.entries.keys() {
+        if let Some(text) = package_seed_projection_text(projection, path) {
+            source_overrides.insert(path.clone(), ropey::Rope::from_str(&text));
+        }
+    }
+    source_overrides.extend(open_overrides.clone());
+    let rprofile_scan = if model_rprofile && !rprofile_open {
+        crate::package_state::rprofile::scan_workspace_rprofile_from_captured_texts_and_exclusions(
+            root,
+            &source_overrides,
+            exclusions,
+        )
+    } else {
+        Default::default()
+    };
+    let preamble_scan = if package_mode != crate::cross_file::config::PackageMode::Disabled {
+        let mut preamble_paths: Vec<_> = projection
+            .entries
+            .keys()
+            .chain(source_overrides.keys())
+            .filter(|path| crate::package_state::preamble::is_testthat_preamble_path(path, root))
+            .cloned()
+            .collect();
+        preamble_paths.sort();
+        preamble_paths.dedup();
+        crate::package_state::preamble::scan_testthat_preambles_from_captured_texts_and_exclusions(
+            root,
+            preamble_paths,
+            &source_overrides,
+            exclusions,
+        )
+    } else {
+        Default::default()
+    };
+    let mut sysdata_names = std::collections::BTreeSet::new();
+    let data_raw = root.join("data-raw");
+    for path in projection
+        .entries
+        .keys()
+        .filter(|path| path.starts_with(&data_raw))
+    {
+        if !exclusions.is_excluded_path(path)
+            && matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("R" | "r")
+            )
+            && let Some(text) = package_seed_projection_text(projection, path)
+        {
+            crate::package_state::sysdata::extract_sysdata_names_from_source(
+                &text,
+                &mut sysdata_names,
+            );
+        }
+    }
+    PackageSeedInstall {
+        description: package_seed_projection_text(projection, &root.join("DESCRIPTION"))
+            .map(Arc::from),
+        namespace: package_seed_projection_text(projection, &root.join("NAMESPACE")).map(Arc::from),
+        disk_r_files,
+        dataset_names: package_seed_dataset_names(root, projection, exclusions),
+        sysdata_names,
+        rprofile_scan,
+        preamble_scan,
+    }
+}
+
+fn prepare_package_seed_projection(
+    root: &std::path::Path,
+    install: &PackageSeedInstall,
+    capture: PackageSeedProjectionCapture,
+) -> (PackageProjectionBasis, PreparedPackageProjection) {
+    let PackageSeedProjectionCapture {
+        basis,
+        mut inputs,
+        package_state,
+        indexed_r_files,
+        open_events,
+        rprofile_open,
+        open_records: _,
+    } = capture;
+    inputs.workspace_root = Some(root.to_path_buf());
+    inputs.description = install
+        .description
+        .clone()
+        .map(|text| crate::package_state::DescriptionInput { text });
+    inputs.namespace = install
+        .namespace
+        .clone()
+        .map(|text| crate::package_state::NamespaceInput { text });
+    inputs.r_files = install.disk_r_files.clone();
+    inputs.r_files.extend(indexed_r_files);
+    inputs.dataset_names = install.dataset_names.clone();
+    inputs.sysdata_names = install.sysdata_names.clone();
+    for event in open_events {
+        let _ = crate::package_state::event::translate(&mut inputs, event);
+    }
+    if !(inputs.model_rprofile && rprofile_open) {
+        let rprofile_scan = if inputs.model_rprofile {
+            install.rprofile_scan.clone()
+        } else {
+            crate::package_state::rprofile::RprofileScan::default()
+        };
+        inputs.rprofile_symbols = rprofile_scan.symbols;
+        inputs.rprofile_attached_packages = rprofile_scan.attached_packages;
+        inputs.rprofile_sourced_files = rprofile_scan.sourced_files;
+    }
+    let preamble_scan = (inputs.package_mode != crate::cross_file::config::PackageMode::Disabled)
+        .then_some(install.preamble_scan.clone());
+    let _ = crate::package_state::event::apply_preamble_scan(&mut inputs, preamble_scan);
+    let derived = crate::package_state::derive_package_state(
+        &package_state,
+        &inputs,
+        &crate::package_state::PackageInputDelta::Initial,
+    );
+    (basis, PreparedPackageProjection::new_seed(inputs, derived))
+}
+
+/// Replay every authoritative open manifest/package-R buffer into freshly
+/// installed disk inputs. This is pure in-memory work under the state lock; the
+/// final `Initial` derive below observes the complete converged input set.
+fn replay_open_package_inputs_after_seed(state: &mut WorldState, root: &std::path::Path) {
+    for event in snapshot_open_package_input_events(state, root) {
         let _ = translate_package_event(state, event);
     }
 }
@@ -10416,6 +11056,7 @@ impl LanguageServer for Backend {
                                 Some(seed),
                             )
                             .await
+                            .into_committed()
                         } else {
                             state_clone.write().await.apply_package_event(
                                 &crate::package_state::PackageInputDelta::Initial,
@@ -13025,7 +13666,8 @@ impl Backend {
                                 false,
                                 Some(seed),
                             )
-                            .await;
+                            .await
+                            .into_committed();
                             package_inputs_initialized_by_exclusion_reload = installed.is_some();
                             if let Some(transfer) = installed
                                 .as_ref()
@@ -14768,7 +15410,8 @@ impl Backend {
             scan_r_files,
             None,
         )
-        .await;
+        .await
+        .into_committed();
         let mut installed = installed?;
 
         installed.post_seed_candidates = Self::refresh_open_package_inputs_after_seed(
@@ -29082,6 +29725,7 @@ mod project_config_initialize_tests {
                 None,
             )
             .await
+            .into_committed()
             .is_some()
         );
         let state = state_arc.read().await;
@@ -29099,6 +29743,309 @@ mod project_config_initialize_tests {
                 .map(|workspace| workspace.name.as_str()),
             Some("after")
         );
+    }
+
+    #[tokio::test]
+    async fn package_seed_disk_projection_rejects_content_and_membership_drift_without_watchers() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("R")).unwrap();
+        fs::write(root.join("DESCRIPTION"), "Package: diskbasis\n").unwrap();
+        let original = root.join("R/original.R");
+        fs::write(&original, "original <- 1\n").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+        }
+
+        let content_seed =
+            PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+                .await
+                .unwrap();
+        fs::write(&original, "replacement <- 2\n").unwrap();
+        assert!(
+            !content_seed.disk_is_current(),
+            "same-path byte changes must invalidate the consumed projection"
+        );
+
+        let addition_seed =
+            PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+                .await
+                .unwrap();
+        let added = root.join("R/added.R");
+        fs::write(&added, "added <- 1\n").unwrap();
+        assert!(
+            !addition_seed.disk_is_current(),
+            "new recursive members must invalidate the consumed projection"
+        );
+
+        let removal_seed =
+            PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+                .await
+                .unwrap();
+        fs::remove_file(&added).unwrap();
+        assert!(
+            !removal_seed.disk_is_current(),
+            "removed recursive members must invalidate the consumed projection"
+        );
+
+        fs::write(root.join(".Rprofile"), "source(\"later.R\")\n").unwrap();
+        let missing_source_seed =
+            PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+                .await
+                .unwrap();
+        fs::write(root.join("later.R"), "created_later <- 1\n").unwrap();
+        assert!(
+            !missing_source_seed.disk_is_current(),
+            "a captured-missing transitive helper becoming valid must invalidate the attempt"
+        );
+
+        fs::write(root.join(".Rprofile"), "source(\"invalid.R\")\n").unwrap();
+        fs::write(root.join("invalid.R"), [0xff, 0xfe, 0xfd]).unwrap();
+        let invalid_source_seed =
+            PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+                .await
+                .unwrap();
+        fs::write(root.join("invalid.R"), "now_valid <- 1\n").unwrap();
+        assert!(
+            !invalid_source_seed.disk_is_current(),
+            "an invalid captured helper becoming valid must invalidate the attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn package_seed_retries_a_shadowless_disk_change_then_commits_current_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("DESCRIPTION"), "Package: beforedisk\n").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+        }
+        let stale = PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+            .await
+            .unwrap();
+        fs::write(root.join("DESCRIPTION"), "Package: afterdisk\n").unwrap();
+
+        let computes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retry_computes = computes.clone();
+        let compute_state = state.clone();
+        let compute_root = root.clone();
+        let compute_exclusions = exclusions.clone();
+        let outcome = attempt_package_seed_install_using(
+            &state,
+            root,
+            Some(Ok(stale)),
+            move || {
+                retry_computes.fetch_add(1, Ordering::SeqCst);
+                let state = compute_state.clone();
+                let root = compute_root.clone();
+                let exclusions = compute_exclusions.clone();
+                async move {
+                    PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+                        .await
+                }
+            },
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, StandalonePackageOutcome::Committed(_)));
+        assert_eq!(computes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .read()
+                .await
+                .package_workspace()
+                .map(|workspace| workspace.name.as_str()),
+            Some("afterdisk")
+        );
+    }
+
+    #[tokio::test]
+    async fn package_seed_open_record_and_projection_bases_reject_exact_authority_drift() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("DESCRIPTION"), "Package: openbasis\n").unwrap();
+        let source = root.join("R/open.R");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "disk_value <- 1\n").unwrap();
+        let uri = Url::from_file_path(&source).unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state.write().await;
+            establish_package_event_translation_state(&mut state, root.clone());
+            state.open_document(uri.clone(), "buffer_value <- 1\n", Some(1));
+        }
+        let edited = PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+            .await
+            .unwrap();
+        {
+            let mut state = state.write().await;
+            state.open_document(uri.clone(), "edited_value <- 1\n", Some(2));
+            assert!(matches!(
+                edited.install(&mut state),
+                PackageSeedCandidateInstall::StaleBasis
+            ));
+        }
+
+        let reopened = PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+            .await
+            .unwrap();
+        {
+            let mut state = state.write().await;
+            state.close_document(&uri);
+            state.open_document(uri, "edited_value <- 1\n", Some(2));
+            assert!(matches!(
+                reopened.install(&mut state),
+                PackageSeedCandidateInstall::StaleBasis
+            ));
+        }
+
+        let config = PrecomputedPackageSeed::compute_from_state(&state, &root, &exclusions, true)
+            .await
+            .unwrap();
+        let mut state = state.write().await;
+        state.bump_package_config_generation();
+        assert!(matches!(
+            config.install(&mut state),
+            PackageSeedCandidateInstall::StaleBasis
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn package_seed_alias_retarget_rejects_unchanged_open_record_then_fresh_seed_commits() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let r_dir = root.join("R");
+        fs::create_dir_all(&r_dir).unwrap();
+        fs::write(root.join("DESCRIPTION"), "Package: aliasbasis\n").unwrap();
+        let first = r_dir.join("first.R");
+        let second = r_dir.join("second.R");
+        let alias = r_dir.join("active.R");
+        fs::write(&first, "first_disk <- 1\n").unwrap();
+        fs::write(&second, "second_disk <- 1\n").unwrap();
+        symlink(&first, &alias).unwrap();
+        let uri = Url::from_file_path(&alias).unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let (service, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = service.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.workspace_folders = vec![Url::from_file_path(&root).unwrap()];
+            establish_package_event_translation_state(&mut state, root.clone());
+            state.open_document(uri.clone(), "buffer_owner <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&uri)
+                .unwrap();
+        }
+        backend.reconcile_open_alias_topology(&uri).await;
+        let stale =
+            PrecomputedPackageSeed::compute_from_state(&backend.state, &root, &exclusions, true)
+                .await
+                .unwrap();
+        let token = backend.state.read().await.documents.record_token(&uri);
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        backend.reconcile_open_alias_topology(&uri).await;
+
+        let mut state = backend.state.write().await;
+        assert!(
+            state.documents.record_token_is_current(&token),
+            "alias reconciliation must preserve the exact open record token"
+        );
+        let before = (
+            format!("{:?}", state.package_inputs),
+            state.package_state.clone(),
+            state.package_input_generation(),
+            state.package_state_record_generation_for_test(),
+            state.system_file_routing_owner_identity(),
+            state.analysis_revalidation_reservation_count,
+        );
+        assert!(matches!(
+            stale.install(&mut state),
+            PackageSeedCandidateInstall::StaleBasis
+        ));
+        assert_eq!(
+            (
+                format!("{:?}", state.package_inputs),
+                state.package_state.clone(),
+                state.package_input_generation(),
+                state.package_state_record_generation_for_test(),
+                state.system_file_routing_owner_identity(),
+                state.analysis_revalidation_reservation_count,
+            ),
+            before,
+            "alias-authority rejection must be a package/routing/ledger strict no-op"
+        );
+        drop(state);
+
+        let fresh =
+            PrecomputedPackageSeed::compute_from_state(&backend.state, &root, &exclusions, true)
+                .await
+                .unwrap();
+        let mut state = backend.state.write().await;
+        assert!(matches!(
+            fresh.install(&mut state),
+            PackageSeedCandidateInstall::Committed(_)
+        ));
+        assert_eq!(
+            state
+                .package_inputs
+                .r_files
+                .get(&second)
+                .map(|input| &*input.text),
+            Some("buffer_owner <- 1\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn obsolete_package_root_supersedes_without_spending_retry_attempts() {
+        let tmp = TempDir::new().unwrap();
+        let old_root = tmp.path().join("old");
+        let new_root = tmp.path().join("new");
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir_all(&new_root).unwrap();
+        fs::write(old_root.join("DESCRIPTION"), "Package: old\n").unwrap();
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        let state = Arc::new(RwLock::new(WorldState::new()));
+        {
+            let mut state = state.write().await;
+            establish_package_event_translation_state(&mut state, old_root.clone());
+        }
+        let obsolete =
+            PrecomputedPackageSeed::compute_from_state(&state, &old_root, &exclusions, true)
+                .await
+                .unwrap();
+        {
+            let mut state = state.write().await;
+            establish_package_event_translation_state(&mut state, new_root);
+        }
+        let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retry_count = retries.clone();
+        let outcome = attempt_package_seed_install_using(
+            &state,
+            old_root,
+            Some(Ok(obsolete)),
+            move || {
+                retry_count.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(PackageSeedComputeError {
+                    message: "superseded work must not recompute".into(),
+                }))
+            },
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, StandalonePackageOutcome::Superseded));
+        assert_eq!(retries.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -29131,6 +30078,7 @@ mod project_config_initialize_tests {
                 Some(&task_cancel),
             )
             .await
+            .into_committed()
         });
 
         pause.wait_arrived().await;
@@ -29188,7 +30136,8 @@ mod project_config_initialize_tests {
             },
             None,
         )
-        .await;
+        .await
+        .into_committed();
 
         assert!(
             installed.is_some(),
@@ -29241,7 +30190,7 @@ mod project_config_initialize_tests {
         let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let retry_counter = Arc::clone(&retries);
 
-        let installed = attempt_package_seed_install_using(
+        let outcome = attempt_package_seed_install_using(
             &state_arc,
             root,
             Some(Err(PackageSeedComputeError {
@@ -29258,8 +30207,8 @@ mod project_config_initialize_tests {
         .await;
 
         assert!(
-            installed.is_none(),
-            "exhausted compute failures must abandon"
+            matches!(outcome, StandalonePackageOutcome::Deferred),
+            "exhausted compute failures must return typed deferred ownership"
         );
         assert_eq!(
             retries.load(Ordering::SeqCst),

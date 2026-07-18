@@ -1974,6 +1974,34 @@ impl PreparedPackageProjection {
             routing_owner: PackageRoutingOwnerPolicy::IfChanged,
         }
     }
+
+    pub(crate) fn new_seed(
+        inputs: crate::package_state::PackageInputs,
+        state: crate::package_state::PackageState,
+    ) -> Self {
+        Self {
+            inputs,
+            state,
+            routing_owner: PackageRoutingOwnerPolicy::FreshSeedOwner,
+        }
+    }
+}
+
+/// Exact raw+derived package authority captured by a detached standalone
+/// package projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackageProjectionBasis {
+    package_input_generation: u64,
+    package_state_record_generation: u64,
+    workspace_scan_generation: u64,
+    package_config_generation: u64,
+    open_context_authority_generation: OpenContextAuthorityGeneration,
+    workspace_root: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackageProjectionInstallRejected {
+    StaleBasis,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2992,12 +3020,11 @@ impl WorldState {
             .apply_package_event_with_routing_policy(delta, PackageRoutingOwnerPolicy::IfChanged);
     }
 
-    /// Compatibility tail for the current seed writer.
+    /// Compatibility tail for the single-owner CLI seed adapter.
     ///
-    /// The prepared seed migration will replace the preceding in-place raw
-    /// writes with a complete [`PreparedPackageProjection`]. Until then this
-    /// keeps the seed-only fresh-routing policy inside the shared derived
-    /// installer instead of minting ownership as a detached side effect.
+    /// LSP seed/reseed callers install a complete
+    /// [`PreparedPackageProjection`]; the CLI retains its synchronous in-place
+    /// adapter and shares only this fresh-routing policy tail.
     pub(crate) fn apply_package_seed_event(
         &mut self,
         delta: &crate::package_state::PackageInputDelta,
@@ -3035,6 +3062,34 @@ impl WorldState {
         self.package_inputs = prepared.inputs;
         self.record_package_input_mutation();
         self.install_derived_package_state(prepared.state, prepared.routing_owner)
+    }
+
+    pub(crate) fn capture_package_projection_basis(&self) -> PackageProjectionBasis {
+        PackageProjectionBasis {
+            package_input_generation: self.package_input_generation(),
+            package_state_record_generation: self.package_state_record_generation,
+            workspace_scan_generation: self.workspace_scan_generation,
+            package_config_generation: self.package_config_generation,
+            open_context_authority_generation: self.open_context_authority_generation,
+            workspace_root: self.package_inputs.workspace_root.clone(),
+        }
+    }
+
+    pub(crate) fn try_install_prepared_package_projection(
+        &mut self,
+        basis: &PackageProjectionBasis,
+        prepared: PreparedPackageProjection,
+    ) -> Result<Option<SystemFileRoutingOwnerIdentity>, PackageProjectionInstallRejected> {
+        if self.package_input_generation() != basis.package_input_generation
+            || self.package_state_record_generation != basis.package_state_record_generation
+            || self.workspace_scan_generation != basis.workspace_scan_generation
+            || self.package_config_generation != basis.package_config_generation
+            || self.open_context_authority_generation != basis.open_context_authority_generation
+            || self.package_inputs.workspace_root != basis.workspace_root
+        {
+            return Err(PackageProjectionInstallRejected::StaleBasis);
+        }
+        Ok(self.install_prepared_package_projection(prepared))
     }
 
     /// Shared derived-record tail for both legacy in-place input adapters and
@@ -7677,7 +7732,7 @@ pub(crate) async fn read_source_async(path: &Path) -> Result<String, SourceReadE
 /// (async, via `tokio::fs::read`) share the exact same decode regardless of how
 /// they read the bytes. Takes an owned `Vec` so the common no-BOM UTF-8 path
 /// moves the buffer straight into the `String` without copying.
-fn decode_source(bytes: Vec<u8>) -> Result<String, SourceReadError> {
+pub(crate) fn decode_source(bytes: Vec<u8>) -> Result<String, SourceReadError> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         // UTF-8 BOM: strip it; an error's file offset is then `3 + valid_up_to`.
         return decode_utf8_slice(&bytes[3..], 3);

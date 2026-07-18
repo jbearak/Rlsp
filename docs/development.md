@@ -171,13 +171,21 @@ Rough pipeline:
 5. Revalidate dependents on relevant changes (interface hash / edges / working directory changes)
 
 Package-state seeds follow the same snapshot/off-lock/install discipline as
-cross-file diagnostics. Callers snapshot authoritative open-buffer overlays
-under the `WorldState` lock, run DESCRIPTION/NAMESPACE, package-R, `.Rprofile`,
-and testthat-preamble scans off-lock through the shared package-seed helper,
-then install a concrete, fully in-memory seed under one write lock. Disabled
-modeling choices are represented by empty scans before construction; the central
-installation transaction never traverses the filesystem. After installation,
-callers refresh open preamble documents to close the snapshot-to-install race.
+cross-file diagnostics. Callers snapshot the exact raw/derived/config/root
+basis and open-record tokens under the `WorldState` lock, then capture a sorted
+filesystem projection for DESCRIPTION/NAMESPACE, tracked package directories,
+and the complete `.Rprofile`/testthat source closure. Each observed path is
+Missing, Invalid, or Valid with the exact bytes/text consumed by detached
+derivation; recursive membership catches additions, removals, and renames.
+Open-authoritative inputs bind their record token and are omitted from the
+shadow-disk projection. Missing/invalid/unknown closure targets never fall back
+to a later disk read. The projection is checked after derivation and immediately
+before the shared package-projection CAS. Contention gets three complete
+attempts; obsolete root/config work is typed Superseded, stable exhaustion is
+typed Deferred and coalesces into one exact-owner follow-up. Disabled modeling
+choices are represented by empty scans before construction, and no filesystem
+work occurs under the `WorldState` lock. After installation, callers refresh
+open preamble documents to close the snapshot-to-install race.
 Those silent refreshes return exact open-record candidates captured by the
 write-lock apply itself; orchestration carries the tokens to finalization rather
 than recapturing URIs later, so a close/reopen between refresh and publication
