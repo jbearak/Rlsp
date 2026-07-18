@@ -124,25 +124,6 @@ pub(crate) fn masked_analysis_text(
     }
 }
 
-/// Classify a `did_open`'d document by its editor `language_id`-then-URI and
-/// return its [`ChunkKind`](crate::chunks::ChunkKind) paired with the R-analysis
-/// view of `text` ([`analysis_text_for_kind`]).
-///
-/// This is the chokepoint for the `did_open` branches in `backend.rs`, which all
-/// classify the same way before extracting metadata and opening the
-/// `open-document authority`. `language_id`-then-URI classification (not path-only) is what
-/// lets untitled `.Rmd`/`.qmd` buffers — which have no file extension — mask
-/// correctly (#343).
-pub(crate) fn classify_and_mask<'a>(
-    language_id: Option<&str>,
-    uri: &tower_lsp::lsp_types::Url,
-    text: &'a str,
-) -> (crate::chunks::ChunkKind, std::borrow::Cow<'a, str>) {
-    let chunk_kind = crate::chunks::classify_chunk_document_for(language_id, uri.path());
-    let analysis_text = analysis_text_for_kind(chunk_kind, text);
-    (chunk_kind, analysis_text)
-}
-
 /// Extract cross-file metadata from `content` using an already-resolved chunk
 /// kind, masking R Markdown / Quarto prose first so directives, `source()`
 /// calls, and `library()` calls are taken from R chunk bodies only (never from

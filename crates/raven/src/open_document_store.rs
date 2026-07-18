@@ -226,6 +226,19 @@ impl OpenDocumentStore {
         record
     }
 
+    /// Install a detached open candidate whose document, metadata, and
+    /// metadata-dependent artifacts were derived from the same snapshot.
+    pub(crate) fn open_prepared(
+        &mut self,
+        uri: Url,
+        document: Document,
+        metadata: Arc<CrossFileMetadata>,
+        artifacts: Arc<ScopeArtifacts>,
+        lifecycle_epoch: Option<DiagnosticsEpoch>,
+    ) -> Arc<OpenDocumentRecord> {
+        self.install_with_artifacts(uri, document, metadata, artifacts, lifecycle_epoch)
+    }
+
     /// Install a newly opened editor document as the URI's authority.
     pub fn open(
         &mut self,

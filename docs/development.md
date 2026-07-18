@@ -227,10 +227,16 @@ fixpoint as workspace scans. Thus a changed child never commits metadata
 derived from the pre-batch version of a parent changed or removed in the same
 watcher group. Authority rejection permits one fresh reread/rederive retry.
 
-Open-buffer edits and detached `didOpen` re-enrichment use the same
+Open-buffer edits, metadata refreshes, and `didOpen` installation use the same
 `WorldState::try_commit_analysis` boundary. Their basis includes the exact
 open-record generation and provenance, editor/lifecycle eligibility,
 closed-index and raw-cache generations, and bounded alias/context identities.
+Every family also captures the typed `AnalysisConfigGeneration` advanced by
+the sole parsed-config writer after a complete recompute. This closes the
+interval before later asynchronous reconciliation: depth/budget, on-demand,
+package-enable, debounce, exclusion, and other parsed-analysis changes reject
+old work immediately. Workspace folders and per-file chunk classification
+retain their separate exact stamps.
 Parsing and inherited-context derivation may run off-lock, but document,
 metadata, graph, cache, pin, package, and fanout effects become visible only
 after one write-lock validation. If an edit's context set exceeds the internal
@@ -239,6 +245,42 @@ local projection; one context-only retry is allowed when unrelated authority
 changes, but a changed target token or a second invalidation discards the work.
 Every dependent ticket returned by the commit owns a force-republish marker and
 must be scheduled exactly once.
+
+`didOpen` additionally owns a never-reused per-URI intent generation, whose
+arrival-time target record cannot rebase across an edit, close/reopen, metadata
+replacement, or newer duplicate open. It resolves alias topology off-lock,
+validates the intent/target/topology under the diagnostics-publish/write-lock
+commit order, and only then mints the diagnostics epoch and installs the
+record, aliases, lifecycle, raw-cache invalidations, graph, pins, package
+projection, and final capped reservation. Direct/forward/backward
+prerequisites converge before that commit: dynamic Pending enrichment reports
+unmarked affected candidates, any already-owned tickets are drained, and a
+fresh final capture reserves the complete union once. `.Rprofile` and testthat
+scans overlay all authoritative buffers plus only package routes the candidate
+will authoritatively own, and reduce with its package `DidOpen` event into one
+package state. Package-library initialization precedes every derivation that
+can resolve `system.file()`. Each on-demand library build owns an exact key
+(R path, additional paths, workspace root, and package-input generation) plus
+the package-config generation and not-ready state it observed. Its final swap
+is a CAS on that basis; stale builds are discarded and `didOpen` performs one
+bounded fresh-key retry. A stable degraded/unavailable build is remembered by
+its winning key so opening continues fail-closed with unresolved package
+sources instead of looping. After commit, direct and converged-scope inherited
+packages are warmed synchronously before any diagnostic ticket starts. A
+bounded convergence overflow clears foreign Rprofile/preamble provenance and
+commits only candidate-local facts; there is no delayed stabilization publish.
+The shadowed closed artifact tier remains resident while the buffer is open:
+open-provider precedence hides it, closed commits still veto, and close can
+fall back to it without a transient empty-scope window before disk resync.
+
+Watcher events on an exact open client URI also drive bounded alias-topology
+reconciliation. Alias candidates and graph mirrors are derived off-lock from
+an exact open-generation/config/owner basis; one commit swaps the alias map,
+invalidates old and new raw identities, hands released canonical roots to the
+next open owner, refreshes pins, and reserves one capped fanout. A released
+root with no remaining owner is immediately resynced to disk. Canonical-target
+events do not mutate alias topology: only the uniquely keyed opened spelling
+can have been retargeted, so one event affects at most one open record.
 
 The package-state-local static-source closure walker in `package_state/mod.rs`
 owns the traversal mechanics shared by `.Rprofile` and testthat preambles: LIFO

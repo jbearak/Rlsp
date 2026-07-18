@@ -27,6 +27,16 @@ pub struct RprofileScan {
     pub sourced_files: BTreeSet<PathBuf>,
 }
 
+/// Harvest only the supplied buffer's own prelude facts. No source target is
+/// followed; used by fail-closed OpenInstall fallback after foreign
+/// Rprofile/preamble provenance has been cleared.
+pub(crate) fn scan_rprofile_text_local_only(text: &str) -> RprofileScan {
+    let facts = crate::cross_file::source_detect::StaticScriptFacts::from_text(text);
+    let mut scan = RprofileScan::default();
+    super::merge_static_script_prelude(&facts, &mut scan.symbols, &mut scan.attached_packages);
+    scan
+}
+
 /// Synchronously scan `<workspace_root>/.Rprofile` (never executing it) into a
 /// script-scope prelude. Returns empty when the file is absent or unreadable.
 pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
@@ -94,6 +104,32 @@ pub fn scan_workspace_rprofile_with_root_text_and_exclusions(
     scan_rprofile_worklist(workspace_root, root_text.to_string(), Some(exclusions))
 }
 
+/// Scan `.Rprofile` while preferring authoritative open-buffer text for both
+/// the root and every transitively sourced helper.
+pub(crate) fn scan_workspace_rprofile_with_overrides_and_exclusions(
+    workspace_root: &Path,
+    overrides: &super::preamble::PreambleTextOverrides,
+    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
+) -> RprofileScan {
+    let rprofile_path = workspace_root.join(".Rprofile");
+    if exclusions.is_excluded_path(&rprofile_path) {
+        return RprofileScan::default();
+    }
+    let root_text = overrides
+        .get(&rprofile_path)
+        .map(ToString::to_string)
+        .or_else(|| crate::state::read_source(&rprofile_path).ok());
+    let Some(root_text) = root_text else {
+        return RprofileScan::default();
+    };
+    scan_rprofile_worklist_with_overrides(
+        workspace_root,
+        root_text,
+        Some(exclusions),
+        Some(overrides),
+    )
+}
+
 /// Shared scan runner: harvest top-level defs + attached packages from the root
 /// `.Rprofile` text, then follow its transitive literal `source()` targets from
 /// disk through the package-state static-source closure walker. Both public entry
@@ -103,11 +139,21 @@ fn scan_rprofile_worklist(
     root_text: String,
     exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
 ) -> RprofileScan {
+    scan_rprofile_worklist_with_overrides(workspace_root, root_text, exclusions, None)
+}
+
+fn scan_rprofile_worklist_with_overrides(
+    workspace_root: &Path,
+    root_text: String,
+    exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
+    overrides: Option<&super::preamble::PreambleTextOverrides>,
+) -> RprofileScan {
     let rprofile_path = workspace_root.join(".Rprofile");
     let workspace_url = Url::from_file_path(workspace_root).ok();
     let renv_activate = workspace_root.join("renv").join("activate.R");
     let mut policy = RprofileClosurePolicy {
         exclusions,
+        overrides,
         renv_activate: super::preamble::canonicalize_for_routing(&renv_activate),
         scan: RprofileScan::default(),
     };
@@ -123,6 +169,7 @@ fn scan_rprofile_worklist(
 
 struct RprofileClosurePolicy<'a> {
     exclusions: Option<&'a crate::config_file::CompiledWorkspaceExclusions>,
+    overrides: Option<&'a super::preamble::PreambleTextOverrides>,
     renv_activate: PathBuf,
     scan: RprofileScan,
 }
@@ -140,7 +187,10 @@ impl super::StaticSourceClosurePolicy for RprofileClosurePolicy<'_> {
     }
 
     fn read_source(&mut self, resolved: &Path) -> Option<String> {
-        crate::state::read_source(resolved).ok()
+        self.overrides
+            .and_then(|overrides| overrides.get(resolved))
+            .map(ToString::to_string)
+            .or_else(|| crate::state::read_source(resolved).ok())
     }
 
     fn harvest(&mut self, facts: &crate::cross_file::source_detect::StaticScriptFacts) {
