@@ -331,6 +331,7 @@ mod lifecycle {
             )),
             tree: None,
             loaded_packages: Vec::new(),
+            data_packages: vec![],
             snapshot: FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 1,
@@ -497,6 +498,7 @@ mod lifecycle {
             )),
             tree: None,
             loaded_packages: Vec::new(),
+            data_packages: vec![],
             snapshot: FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 1,

@@ -465,13 +465,12 @@ fn build_indexed_state(
     // rayon-parallel internally; there's no lock contention here since the CLI
     // owns `state` exclusively.
     let max_chain_depth = state.cross_file_config.max_chain_depth;
-    let (index, cross_file_entries, new_index_entries) =
-        crate::state::scan_workspace_with_exclusions(
-            std::slice::from_ref(workspace_url),
-            max_chain_depth,
-            &state.workspace_exclusions,
-        );
-    state.apply_workspace_index(index, cross_file_entries, new_index_entries);
+    let (cross_file_entries, new_index_entries) = crate::state::scan_workspace_with_exclusions(
+        std::slice::from_ref(workspace_url),
+        max_chain_depth,
+        &state.workspace_exclusions,
+    );
+    state.apply_workspace_index(cross_file_entries, new_index_entries);
 
     // Derive package-mode scope (so `R/*.R` files in an R package see each
     // other's top-level definitions without explicit `source()`). This is
@@ -828,13 +827,13 @@ fn reported_packages_to_warm(
         let Ok(uri) = Url::from_file_path(path) else {
             continue;
         };
-        if let Some(doc) = state.workspace_index.get(&uri) {
-            packages.extend(doc.loaded_packages.iter().cloned());
+        if let Some(entry) = state.workspace_index_new.get(&uri) {
+            packages.extend(entry.loaded_packages.iter().cloned());
             // Issue #429: warm packages named in `data(..., package = "pkg")`
             // so the diagnostics-time `data()` alias expansion can resolve the
             // dataset object names. Unlike `library()` these are not attached,
             // but their `data/` enumeration must be cached.
-            packages.extend(doc.data_packages.iter().cloned());
+            packages.extend(entry.data_packages.iter().cloned());
         } else if is_chunk_file(path) {
             // Chunk files are outside the R-only scan, so they have no index
             // entry. Read + construct a throwaway Document best-effort so its
@@ -1280,7 +1279,12 @@ async fn collect_target_diagnostics(
             let uri = Url::from_file_path(path).ok()?;
             // Reuse the already-parsed `Document` from the scan (tree included),
             // exactly as the sequential path did — no disk re-read / re-parse.
-            let doc = state.workspace_index.get(&uri).cloned()?;
+            let entry = state.workspace_index_new.get(&uri)?;
+            let doc = crate::state::document_from_workspace_entry(
+                &uri,
+                &entry,
+                crate::chunks::classify_chunk_document(uri.path()),
+            );
             let loaded_packages: Vec<String> = doc.loaded_packages.to_vec();
             let mut open_documents = std::collections::HashMap::new();
             open_documents.insert(uri.clone(), doc);
@@ -1331,7 +1335,7 @@ async fn collect_target_diagnostics(
             operator_error = true;
             continue;
         };
-        if state.workspace_index.contains_key(&uri) {
+        if state.workspace_index_new.contains(&uri) {
             continue; // already handled in the parallel phase
         }
         let text = match crate::state::read_source(path) {
@@ -2810,7 +2814,12 @@ infixContinuationStyle = "indented"
             let mut all = Vec::new();
             for path in &targets {
                 let uri = Url::from_file_path(path).unwrap();
-                if let Some(doc) = state.workspace_index.get(&uri).cloned() {
+                if let Some(entry) = state.workspace_index_new.get(&uri) {
+                    let doc = crate::state::document_from_workspace_entry(
+                        &uri,
+                        &entry,
+                        crate::chunks::classify_chunk_document(uri.path()),
+                    );
                     state.documents.insert(uri.clone(), doc);
                 } else {
                     let text = crate::state::read_source(path).unwrap();

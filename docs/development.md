@@ -191,6 +191,16 @@ Keep new seed inputs in that shared helper so startup, exclusion reloads, and
 package-mode rebuilds cannot drift or introduce blocking filesystem work under
 the state lock.
 
+Document analysis has one authority per lifecycle state. Open buffers live in
+`OpenDocumentStore`; closed full payloads live in `WorkspaceIndex`. A workspace
+scan records its owned URI set separately in `WorldState::workspace_scan_uris`
+so the next transactional replacement can remove only prior scan entries while
+retaining watcher/on-demand/external entries. That URI set is provenance only:
+consumers must never treat it as an analysis store. The transitional
+`CrossFileWorkspaceIndex` carries artifact-only entries beyond the full-payload
+LRU capacity; it is not a third document authority. CLI per-file overlays
+project an indexed payload without rereading or reparsing the file.
+
 The package-state-local static-source closure walker in `package_state/mod.rs`
 owns the traversal mechanics shared by `.Rprofile` and testthat preambles: LIFO
 order, visited/routing deduplication, rich forward path resolution, and the common

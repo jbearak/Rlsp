@@ -170,6 +170,7 @@ fn measure_scan_phases(workspace: &Path) -> ScanPhaseTimings {
                 contents: doc.contents.clone(),
                 tree: doc.tree.clone(),
                 loaded_packages: doc.loaded_packages.clone(),
+                data_packages: vec![],
                 snapshot,
                 metadata: xf_meta_arc,
                 artifacts,
@@ -300,13 +301,13 @@ fn main() {
     println!("[2] scan_workspace (end-to-end, includes dependency-graph buildup):");
     let folder = Url::from_file_path(&workspace).unwrap();
     let mut runs = Vec::new();
-    let mut last: Option<(usize, usize, usize)> = None;
+    let mut last: Option<(usize, usize)> = None;
     for _ in 0..3 {
         let t = Instant::now();
-        let (index, cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
+        let (cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
         let elapsed = t.elapsed();
         runs.push(elapsed);
-        last = Some((index.len(), cf.len(), new_idx.len()));
+        last = Some((cf.len(), new_idx.len()));
     }
     runs.sort();
     let median = runs[runs.len() / 2];
@@ -315,11 +316,8 @@ fn main() {
         "    runs: {:?}",
         runs.iter().map(|d| ms(*d)).collect::<Vec<_>>()
     );
-    if let Some((idx, cf, new_idx)) = last {
-        println!(
-            "    files: {}, cross_file_entries: {}, new_index: {}",
-            idx, cf, new_idx
-        );
+    if let Some((cf, new_idx)) = last {
+        println!("    cross_file_entries: {}, full_index: {}", cf, new_idx);
     }
     println!();
 
@@ -330,10 +328,10 @@ fn main() {
     let mut apply_runs = Vec::new();
     for _ in 0..3 {
         // Fresh scan each time so the inputs aren't moved
-        let (index, cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
+        let (cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
         let mut state = make_state(&workspace);
         let t = Instant::now();
-        state.apply_workspace_index(index, cf, new_idx);
+        state.apply_workspace_index(cf, new_idx);
         apply_runs.push(t.elapsed());
     }
     apply_runs.sort();
@@ -439,8 +437,8 @@ fn main() {
     // Phase 6: scripts/data.r diagnostics — POST-scan (workspace index applied)
     // ------------------------------------------------------------------
     println!("[6] scripts/data.r diagnostics — POST-scan (workspace_scan_complete=true):");
-    let (index, cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
-    state.apply_workspace_index(index, cf, new_idx);
+    let (cf, new_idx) = scan_workspace(std::slice::from_ref(&folder), 20);
+    state.apply_workspace_index(cf, new_idx);
     // Warmup
     for _ in 0..3 {
         let _ = diagnostics_via_snapshot_profile(&state, &target_uri, &cancel);
@@ -630,6 +628,7 @@ fn main() {
                                     contents: doc.contents.clone(),
                                     tree: doc.tree.clone(),
                                     loaded_packages: doc.loaded_packages.clone(),
+                                    data_packages: vec![],
                                     snapshot: snap,
                                     metadata: xf_meta_arc,
                                     artifacts,

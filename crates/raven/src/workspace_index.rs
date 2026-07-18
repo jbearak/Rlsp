@@ -88,6 +88,8 @@ pub struct IndexEntry {
     pub tree: Option<Tree>,
     /// Packages loaded via library() calls
     pub loaded_packages: Vec<String>,
+    /// Packages named by `data(..., package = ...)` calls.
+    pub data_packages: Vec<String>,
     /// File snapshot for freshness checking
     pub snapshot: FileSnapshot,
     /// Cross-file metadata (source() calls, directives)
@@ -104,6 +106,7 @@ impl Clone for IndexEntry {
             contents: self.contents.clone(),
             tree: self.tree.clone(),
             loaded_packages: self.loaded_packages.clone(),
+            data_packages: self.data_packages.clone(),
             snapshot: self.snapshot.clone(),
             metadata: self.metadata.clone(),
             artifacts: self.artifacts.clone(),
@@ -769,6 +772,7 @@ mod tests {
             contents: Rope::from_str("x <- 1"),
             tree: None,
             loaded_packages: vec!["dplyr".to_string()],
+            data_packages: vec![],
             snapshot: make_test_snapshot(),
             metadata: std::sync::Arc::new(CrossFileMetadata::default()),
             artifacts: Arc::new(ScopeArtifacts::default()),
@@ -1760,6 +1764,7 @@ mod tests {
             contents: Rope::from_str("x <- 1"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: FileSnapshot {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: 6,

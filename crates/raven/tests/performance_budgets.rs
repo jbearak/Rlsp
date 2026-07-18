@@ -521,8 +521,8 @@ fn budget_single_file_completion() {
     }
 
     // Run workspace scan and apply index (populates cross-file state)
-    let (index, cross_file_entries, new_index_entries) = scan_workspace(&[folder_url], 20);
-    state.apply_workspace_index(index, cross_file_entries, new_index_entries);
+    let (cross_file_entries, new_index_entries) = scan_workspace(&[folder_url], 20);
+    state.apply_workspace_index(cross_file_entries, new_index_entries);
 
     let uri = Url::from_file_path(workspace_path.join("file_0.R")).unwrap();
     // Position inside the first function body (line 5, col 4 — on `result`)

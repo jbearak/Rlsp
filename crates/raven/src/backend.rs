@@ -3571,9 +3571,9 @@ impl WorkspaceGraphAuthorityIdentity {
 }
 
 struct PreparedWorkspaceScan {
-    index: HashMap<Url, crate::state::Document>,
     cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
     new_index_entries: Vec<(Url, crate::workspace_index::IndexEntry)>,
+    scanned_uris: std::collections::HashSet<Url>,
     graph: crate::cross_file::dependency::DependencyGraph,
     open_metadata: HashMap<
         Url,
@@ -3666,13 +3666,13 @@ async fn prepare_workspace_scan(
         if !inputs.snapshot.is_current_for(&state) {
             return None;
         }
-        let scan_owned: std::collections::HashSet<_> =
-            state.workspace_index.keys().cloned().collect();
         let retained_entries = state
             .workspace_index_new
             .iter()
             .into_iter()
-            .filter(|(uri, _)| !scan_owned.contains(uri) && !state.is_project_excluded_uri(uri))
+            .filter(|(uri, _)| {
+                !state.workspace_scan_uris.contains(uri) && !state.is_project_excluded_uri(uri)
+            })
             .collect::<HashMap<_, _>>();
         (
             snapshot_workspace_graph_overlays(&state),
@@ -3684,7 +3684,8 @@ async fn prepare_workspace_scan(
 
     let mut result = result;
     crate::state::apply_workspace_scan_chunk_overrides(&mut result, &chunk_kind_overrides);
-    let (index, mut cross_file_entries, scanned_entries) = result;
+    let (mut cross_file_entries, scanned_entries) = result;
+    let scanned_uris = scanned_entries.keys().cloned().collect();
     let mut complete_entries = retained_entries;
     complete_entries.extend(scanned_entries);
     let routing = &authority.system_file_routing;
@@ -3745,9 +3746,9 @@ async fn prepare_workspace_scan(
         );
     }
     Some(PreparedWorkspaceScan {
-        index,
         cross_file_entries,
         new_index_entries,
+        scanned_uris,
         graph,
         open_metadata,
         workspace_index_pins,
@@ -3771,9 +3772,9 @@ async fn apply_workspace_scan_if_current(
         return false;
     }
     state.apply_prepared_workspace_index(
-        prepared.index,
         prepared.cross_file_entries,
         prepared.new_index_entries,
+        prepared.scanned_uris,
         prepared.graph,
         prepared.open_metadata,
         prepared.workspace_index_pins,
@@ -4732,6 +4733,7 @@ fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<U
     state.cross_file_file_cache.invalidate(uri);
     state.cross_file_workspace_index.invalidate(uri);
     state.cross_file_meta.remove(uri);
+    state.workspace_scan_uris.remove(uri);
     state.prune_editor_chunk_kind_override(uri);
     // Prune the per-URI coalescing entry with the rest of the closed-file
     // state. A delayed retry that captured an older generation treats the
@@ -4739,11 +4741,6 @@ fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<U
     // generation comes from the state-wide counter and cannot reuse the old
     // value.
     state.watched_file_resync_generations.remove(uri);
-    // The legacy startup-scan document map is a content-provider tier of its
-    // own (`DefaultContentProvider` consults it before the file cache) and an
-    // `exists_cached` source; leaving the entry would keep reporting a
-    // deleted file as present.
-    state.workspace_index.remove(uri);
     neighbors
 }
 
@@ -4761,7 +4758,6 @@ fn remove_project_excluded_index_entries(state: &mut WorldState) -> Vec<Url> {
     let mut candidates: std::collections::HashSet<Url> =
         state.workspace_index_new.uris().into_iter().collect();
     candidates.extend(state.cross_file_workspace_index.uris());
-    candidates.extend(state.workspace_index.keys().cloned());
     candidates.extend(state.documents.keys().cloned());
 
     let mut affected = Vec::new();
@@ -5376,6 +5372,9 @@ async fn resync_file_from_disk(
         None => crate::cross_file::scope::ScopeArtifacts::default(),
     });
     let new_interface_hash = artifacts.interface_hash;
+    let loaded_packages =
+        extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
+    let data_packages = crate::state::extract_data_packages(&tree, &analysis);
 
     let snapshot =
         crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
@@ -5437,16 +5436,16 @@ async fn resync_file_from_disk(
     // entry would shadow the commit below — but merely invalidating it would
     // drop the file from reference search, which walks this index for closed
     // files and nothing repopulates it outside the scan / on-demand
-    // indexing. Mirrors the on-demand insert (including its empty
-    // `loaded_packages` precedent); raw contents + analysis-tree pair is the
-    // scan's own convention (masking is geometry-preserving). State-aware
+    // indexing. Raw contents + analysis-tree pair is the scan's own convention
+    // (masking is geometry-preserving). State-aware
     // readers that reconstruct the analysis text from RAW contents consult
     // `WorldState::chunk_kind_for_closed_file`, so a persisted editor-language
     // classification keeps this tree/text pair aligned after close (#563).
     let fresh_entry = crate::workspace_index::IndexEntry {
         contents: ropey::Rope::from_str(&content),
         tree,
-        loaded_packages: Vec::new(),
+        loaded_packages,
+        data_packages,
         snapshot: snapshot.clone(),
         metadata: std::sync::Arc::new(cross_file_meta.clone()),
         artifacts: artifacts.clone(),
@@ -5458,12 +5457,6 @@ async fn resync_file_from_disk(
     state
         .cross_file_file_cache
         .insert(uri.clone(), snapshot.clone(), content);
-
-    // Drop the legacy startup-scan document map entry:
-    // `DefaultContentProvider` consults it above the file cache, so a stale
-    // scan-time entry would shadow the fresh content committed above. The
-    // fresh unified-index entry keeps reference search fed.
-    state.workspace_index.remove(uri);
 
     // `update_from_disk`'s open-document guard only ever tests THIS uri,
     // which the veto above just proved closed — pass an empty set rather
@@ -9200,7 +9193,7 @@ impl LanguageServer for Backend {
     ///
     /// Raven publishes diagnostics only for live documents. LSP push
     /// diagnostics are server-owned, so removing the document from
-    /// [`WorldState::documents`] is not enough: the client may retain the last
+    /// `WorldState::documents` is not enough: the client may retain the last
     /// published Problems entries indefinitely. Publishing an empty list after
     /// the close commit prevents those stale entries from causing VS Code to
     /// load the closed resources as hidden text documents, which would send a
@@ -11440,6 +11433,7 @@ impl Backend {
 
         let loaded_packages =
             extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
+        let data_packages = crate::state::extract_data_packages(&tree, analysis_text);
         let packages_to_prefetch = if packages_enabled {
             loaded_packages.clone()
         } else {
@@ -11455,6 +11449,7 @@ impl Backend {
             contents: ropey::Rope::from_str(&content),
             tree,
             loaded_packages,
+            data_packages,
             snapshot: snapshot.clone(),
             metadata: cross_file_meta.clone(),
             artifacts: artifacts.clone(),
@@ -11849,6 +11844,7 @@ impl Backend {
 
         let loaded_packages =
             extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
+        let data_packages = crate::state::extract_data_packages(&tree, analysis_text);
         let packages_to_prefetch = if packages_enabled {
             loaded_packages.clone()
         } else {
@@ -11864,6 +11860,7 @@ impl Backend {
             contents: ropey::Rope::from_str(&content),
             tree,
             loaded_packages,
+            data_packages,
             snapshot: snapshot.clone(),
             metadata: cross_file_meta.clone(),
             artifacts: artifacts.clone(),
@@ -18151,6 +18148,7 @@ mod refresh_packages_tests {
             contents: ropey::Rope::from_str(parent_code),
             tree: Some(parent_tree),
             loaded_packages: vec!["dplyr".into()],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 0,
@@ -18580,6 +18578,7 @@ mod refresh_packages_tests {
             contents: ropey::Rope::from_str(parent_code),
             tree: Some(parent_tree),
             loaded_packages: vec!["MASS".into()],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 0,
@@ -18595,11 +18594,7 @@ mod refresh_packages_tests {
         // perspective of child.R (parent.R sources it).
         let mut new_entries = std::collections::HashMap::new();
         new_entries.insert(parent_uri.clone(), parent_entry);
-        world.apply_workspace_index(
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            new_entries,
-        );
+        world.apply_workspace_index(std::collections::HashMap::new(), new_entries);
 
         // Sanity: MASS uncached before any prefetch.
         assert!(
@@ -21037,8 +21032,8 @@ mod project_config_initialize_tests {
             "newly re-included file must be merged into the legacy cross-file index"
         );
         assert!(
-            state.workspace_index.contains_key(&generated_uri),
-            "newly re-included file must be merged into the legacy document index"
+            state.workspace_scan_uris.contains(&generated_uri),
+            "newly re-included file must be owned by the workspace scan"
         );
     }
 
@@ -21253,8 +21248,7 @@ mod project_config_initialize_tests {
         );
         assert!(
             !state.workspace_index_new.contains(&excluded_uri)
-                && !state.cross_file_workspace_index.contains(&excluded_uri)
-                && !state.workspace_index.contains_key(&excluded_uri),
+                && !state.cross_file_workspace_index.contains(&excluded_uri),
             "excluded open buffer must stay out of workspace indexes"
         );
         assert!(
@@ -21315,7 +21309,7 @@ mod project_config_initialize_tests {
             crate::state::scan_workspace_with_exclusions(&folders, max_chain_depth, &exclusions);
         {
             let mut state = backend.state.write().await;
-            state.apply_workspace_index(scan_result.0, scan_result.1, scan_result.2);
+            state.apply_workspace_index(scan_result.0, scan_result.1);
             replay_open_documents_after_workspace_index_apply(&mut state).await;
         }
 
@@ -23240,7 +23234,7 @@ mod project_config_initialize_tests {
         let generation_before_apply = state_arc.read().await.package_input_generation();
 
         let mut state = state_arc.write().await;
-        state.apply_workspace_index(Default::default(), Default::default(), Default::default());
+        state.apply_workspace_index(Default::default(), Default::default());
         assert_eq!(
             state.package_input_generation(),
             generation_before_apply,
@@ -27737,18 +27731,6 @@ mod project_config_initialize_tests {
             "precondition: helper disk state installed"
         );
         seed_package_r_file_input(backend, tmp.path(), "R/helper.R", helper).await;
-        {
-            let mut state = backend.state.write().await;
-            state.workspace_index.insert(
-                helper_uri.clone(),
-                crate::state::Document::new("legacy_helper <- function() 0\n", None),
-            );
-            assert!(
-                state.workspace_index.contains_key(&helper_uri),
-                "precondition: legacy workspace index entry is present"
-            );
-        }
-
         std::fs::write(&helper_path, [0x78u8, 0x80, 0x79]).unwrap();
         send_watched_change(backend, &helper_uri).await;
 
@@ -27763,7 +27745,6 @@ mod project_config_initialize_tests {
                     .get_metadata(&helper_uri)
                     .is_none()
                 && !state.workspace_index_new.contains(&helper_uri)
-                && !state.workspace_index.contains_key(&helper_uri)
                 && state.cross_file_file_cache.get(&helper_uri).is_none()
                 && !state.package_inputs.r_files.contains_key(&helper_path)
                 && !state
@@ -29295,11 +29276,10 @@ mod project_config_initialize_tests {
         );
     }
 
-    /// The legacy startup-scan document map (`state.workspace_index`) is a
-    /// content-provider tier above the file cache; the resync must drop its
-    /// entry or stale scan-time content shadows the fresh disk commit.
+    /// Closing an unchanged buffer resyncs its disk state into the single
+    /// closed-document authority.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn close_resync_drops_stale_legacy_workspace_index_entry() {
+    async fn close_resync_installs_disk_content_in_closed_index() {
         use tower_lsp::lsp_types::{DidCloseTextDocumentParams, TextDocumentIdentifier};
 
         let tmp = TempDir::new().unwrap();
@@ -29307,12 +29287,6 @@ mod project_config_initialize_tests {
         let (svc, helper_uri) =
             open_in_workspace(&tmp, "helper.R", "r", "helper_fn <- function() 1\n").await;
         let backend = svc.inner();
-
-        // Plant a stale legacy-index entry, as the startup scan would have.
-        backend.state.write().await.workspace_index.insert(
-            helper_uri.clone(),
-            crate::state::Document::new("old_fn <- function() 1\n", None),
-        );
 
         backend
             .did_close(DidCloseTextDocumentParams {
@@ -29322,13 +29296,16 @@ mod project_config_initialize_tests {
             })
             .await;
 
-        let dropped = wait_for_state(backend, 5_000, |state| {
-            !state.workspace_index.contains_key(&helper_uri)
+        let installed = wait_for_state(backend, 5_000, |state| {
+            state
+                .workspace_index_new
+                .get(&helper_uri)
+                .is_some_and(|entry| entry.contents == "helper_fn <- function() 1\n")
         })
         .await;
         assert!(
-            dropped,
-            "the resync commit must drop the stale legacy workspace-index entry"
+            installed,
+            "the resync commit must install current disk content in the closed index"
         );
     }
 
@@ -29748,6 +29725,7 @@ mod project_config_initialize_tests {
                 contents: ropey::Rope::from_str(stale),
                 tree,
                 loaded_packages: Vec::new(),
+                data_packages: vec![],
                 snapshot: crate::cross_file::file_cache::FileSnapshot::with_content_hash(
                     &fs_meta, stale,
                 ),
@@ -30021,6 +29999,7 @@ mod project_config_initialize_tests {
                 contents: ropey::Rope::from_str(stale),
                 tree,
                 loaded_packages: Vec::new(),
+                data_packages: vec![],
                 snapshot: snapshot.clone(),
                 metadata: metadata.clone(),
                 artifacts: artifacts.clone(),
@@ -30032,15 +30011,11 @@ mod project_config_initialize_tests {
                 artifacts,
                 indexed_at_version: 0,
             };
-            let mut state = backend.state.write().await;
+            let state = backend.state.write().await;
             state.workspace_index_new.insert(ignored_uri.clone(), entry);
             state
                 .cross_file_workspace_index
                 .insert(ignored_uri.clone(), cross_entry);
-            state.workspace_index.insert(
-                ignored_uri.clone(),
-                crate::state::Document::new(stale, None),
-            );
         }
 
         backend
@@ -30063,10 +30038,6 @@ mod project_config_initialize_tests {
                 .get_metadata(&ignored_uri)
                 .is_none(),
             "excluded watched-file change must remove stale legacy cross-file entry"
-        );
-        assert!(
-            !state.workspace_index.contains_key(&ignored_uri),
-            "excluded watched-file change must remove stale legacy document entry"
         );
     }
 
@@ -30746,8 +30717,7 @@ infixContinuationStyle = "aligned"
         );
         assert!(
             !state.workspace_index_new.contains(excluded_uri)
-                && !state.cross_file_workspace_index.contains(excluded_uri)
-                && !state.workspace_index.contains_key(excluded_uri),
+                && !state.cross_file_workspace_index.contains(excluded_uri),
             "excluded open buffer must stay out of workspace indexes"
         );
         let undefined_message = format!("{helper_symbol} is not defined");

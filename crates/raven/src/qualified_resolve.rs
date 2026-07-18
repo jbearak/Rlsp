@@ -2059,6 +2059,7 @@ mod tests {
             contents: doc.contents.clone(),
             tree: doc.tree.clone(),
             loaded_packages: doc.loaded_packages.clone(),
+            data_packages: vec![],
             snapshot,
             metadata,
             artifacts,

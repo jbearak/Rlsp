@@ -427,6 +427,28 @@ impl Document {
     }
 }
 
+/// Project a full closed-index entry into an owned document view without
+/// reading or parsing the file again.
+pub(crate) fn document_from_workspace_entry(
+    uri: &Url,
+    entry: &crate::workspace_index::IndexEntry,
+    chunk_kind: ChunkKind,
+) -> Document {
+    let masked_text = (chunk_kind == ChunkKind::Rmd)
+        .then(|| crate::chunks::mask_to_r(&entry.contents.to_string()));
+    Document {
+        contents: entry.contents.clone(),
+        tree: entry.tree.clone(),
+        loaded_packages: entry.loaded_packages.clone(),
+        data_packages: entry.data_packages.clone(),
+        file_type: file_type_from_uri(uri),
+        chunk_kind,
+        masked_text,
+        version: None,
+        revision: 0,
+    }
+}
+
 /// Alias map for open file documents whose client URI is not the spelling used
 /// by the source graph or closed-file indexes.
 ///
@@ -573,7 +595,7 @@ fn parse_document_text(text: &str, file_type: FileType) -> Option<Tree> {
     }
 }
 
-fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
+pub(crate) fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
     let Some(tree) = tree else {
         return Vec::new();
     };
@@ -625,7 +647,7 @@ fn extract_loaded_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
 /// warm those packages' `data/` enumeration for alias expansion. Only
 /// string-literal `package =` values are collected (a variable package arg
 /// can't be resolved statically).
-fn extract_data_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
+pub(crate) fn extract_data_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
     let Some(tree) = tree else {
         return Vec::new();
     };
@@ -679,8 +701,8 @@ fn extract_data_packages(tree: &Option<Tree>, text: &str) -> Vec<String> {
 ///
 /// Raven's LSP document identity is the raw file `Url` supplied by the client
 /// or path-resolution caller. `WorldState` keeps that convention consistently:
-/// open documents, legacy document maps, workspace indexes, the cross-file file
-/// cache, the dependency graph, and diagnostic publication gates are all keyed
+/// open documents, workspace indexes, the cross-file file cache, the dependency
+/// graph, and diagnostic publication gates are all keyed
 /// by the uncanonicalized `Url`.
 ///
 /// Symlink aliases and alternate case spellings are therefore distinct document
@@ -698,7 +720,6 @@ pub struct WorldState {
     pub(crate) documents: OpenDocumentStore,
     pub workspace_index_new: WorkspaceIndex,
 
-    // Legacy fields (kept for migration compatibility)
     /// Open documents keyed by the exact URI spelling supplied by the client.
     ///
     /// # Raw URI Identity
@@ -712,7 +733,11 @@ pub struct WorldState {
     /// aliases an open buffer is treated as open for revalidation, live content,
     /// and watched-file vetoes, but publish work still targets the client URI.
     pub open_document_aliases: OpenDocumentAliases,
-    pub workspace_index: HashMap<Url, Document>,
+    /// Closed URIs owned by the most recently committed workspace scan.
+    ///
+    /// This is provenance for transactional replacement, not an analysis
+    /// authority; payloads live only in [`Self::workspace_index_new`].
+    pub(crate) workspace_scan_uris: HashSet<Url>,
 
     // Workspace configuration
     pub workspace_folders: Vec<Url>,
@@ -1309,9 +1334,8 @@ impl WorldState {
             documents: OpenDocumentStore::new(),
             workspace_index_new: WorkspaceIndex::new(Default::default()),
 
-            // Legacy fields (kept for migration compatibility)
             open_document_aliases: OpenDocumentAliases::default(),
-            workspace_index: HashMap::new(),
+            workspace_scan_uris: HashSet::new(),
 
             // Workspace configuration
             workspace_folders: Vec::new(),
@@ -1567,7 +1591,7 @@ impl WorldState {
         self.open_document_aliases
             .open_uris_for_canonical(uri)?
             .iter()
-            .find(|open_uri| self.documents.contains_key(*open_uri))
+            .find(|open_uri| self.documents.contains_key(open_uri))
             .cloned()
     }
 
@@ -1709,7 +1733,6 @@ impl WorldState {
             &self.documents,
             &self.workspace_index_new,
             &self.cross_file_file_cache,
-            &self.workspace_index,
             &self.cross_file_workspace_index,
             &self.open_document_aliases,
         )
@@ -1731,7 +1754,6 @@ impl WorldState {
             documents,
             &self.workspace_index_new,
             &self.cross_file_file_cache,
-            &self.workspace_index,
             &self.cross_file_workspace_index,
             &self.open_document_aliases,
         )
@@ -2116,19 +2138,17 @@ impl WorldState {
     ///
     /// Priority order:
     /// 1. open-document authority (open documents with enriched metadata)
-    /// 2. WorkspaceIndex (new unified index)
-    /// 3. Legacy cross_file_workspace_index
-    /// 4. Legacy documents HashMap (re-extract metadata)
-    /// 5. File cache (re-extract metadata)
+    /// 2. WorkspaceIndex (closed-document authority)
+    /// 3. Transitional cross-file index
+    /// 4. File cache (re-extract metadata)
     ///
     /// Rmd/Quarto note (issue #343): every tier here is masked-correct for
     /// open R Markdown / Quarto documents. The open-document authority arm (tier 1)
     /// stores metadata extracted from the masked analysis text at
     /// `did_open`/`did_change` time (`backend.rs` passes
     /// `extract_metadata_for_path`, and the open-document authority re-derives
-    /// artifacts from the masked text); the legacy-documents arm
-    /// (tier 4) and the file-cache arm (tier 5) likewise mask via
-    /// `analysis_text()` / `extract_metadata_for_uri`. The state-aware file
+    /// artifacts from the masked text); the file-cache arm likewise masks via
+    /// `extract_metadata_for_uri`. The state-aware file
     /// cache fallback consults persisted editor-language chunk classification
     /// before path classification, so extension-mismatched Rmd/Quarto files do
     /// not start treating prose as R after close (issue #563). So directives,
@@ -2150,14 +2170,6 @@ impl WorldState {
             })
             .or_else(|| self.workspace_index_new.get_metadata(uri))
             .or_else(|| self.cross_file_workspace_index.get_metadata(uri))
-            .or_else(|| {
-                // `analysis_text()`: masked for Rmd/Quarto (directives/source()/
-                // library() come from chunk bodies, not prose), raw otherwise
-                // (behavior-neutral for plain R / JAGS / Stan).
-                self.documents
-                    .get(uri)
-                    .map(|doc| Arc::new(crate::cross_file::extract_metadata(&doc.analysis_text())))
-            })
             .or_else(|| {
                 // Cached content is RAW; mask Rmd/Quarto before extracting so
                 // directives/source()/library() come from chunk bodies, not
@@ -2209,13 +2221,15 @@ impl WorldState {
     /// **Validates: Requirements 11.1, 13.1**
     pub fn apply_workspace_index(
         &mut self,
-        index: HashMap<Url, Document>,
         cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
     ) {
-        self.workspace_index = index;
+        for uri in self.workspace_scan_uris.drain() {
+            self.cross_file_workspace_index.invalidate(&uri);
+            self.workspace_index_new.invalidate(&uri);
+        }
+        self.workspace_scan_uris = new_index_entries.keys().cloned().collect();
 
-        // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
             log::info!(
                 "Indexing cross-file entry: {} (exported symbols: {})",
@@ -2225,7 +2239,7 @@ impl WorldState {
             self.cross_file_workspace_index.insert(uri, entry);
         }
 
-        // Populate new unified WorkspaceIndex
+        // Populate the full-payload closed index.
         for (uri, entry) in new_index_entries {
             log::trace!(
                 "Indexing new workspace entry: {} (exported symbols: {})",
@@ -2236,8 +2250,8 @@ impl WorldState {
         }
 
         log::info!(
-            "Applied {} workspace files, {} cross-file entries, {} new index entries",
-            self.workspace_index.len(),
+            "Applied {} workspace files, {} cross-file entries, {} full index entries",
+            self.workspace_scan_uris.len(),
             self.cross_file_workspace_index.uris().len(),
             self.workspace_index_new.len()
         );
@@ -2256,6 +2270,22 @@ impl WorldState {
         self.recompute_open_neighborhood_pins();
     }
 
+    /// Test-fixture seam for a closed document in the unified index.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_workspace_document_for_test(&mut self, uri: Url, document: Document) {
+        let snapshot = crate::cross_file::file_cache::FileSnapshot {
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: document.contents.len_bytes() as u64,
+            content_hash: None,
+        };
+        let processed = processed_workspace_document(uri.clone(), document, snapshot);
+        self.cross_file_workspace_index
+            .insert(uri.clone(), processed.cross_file_entry);
+        self.workspace_index_new
+            .insert(uri.clone(), processed.new_index_entry);
+        self.workspace_scan_uris.insert(uri);
+    }
+
     /// Install a complete workspace-scan candidate whose graph was derived
     /// off-lock from the exact post-commit unified entry set.
     ///
@@ -2264,9 +2294,9 @@ impl WorldState {
     /// This method performs only in-memory replacement.
     pub(crate) fn apply_prepared_workspace_index(
         &mut self,
-        index: HashMap<Url, Document>,
         cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
         new_index_entries: Vec<(Url, crate::workspace_index::IndexEntry)>,
+        scanned_uris: HashSet<Url>,
         graph: DependencyGraph,
         open_metadata: HashMap<
             Url,
@@ -2277,11 +2307,10 @@ impl WorldState {
         >,
         prepared_pins: HashSet<Url>,
     ) {
-        let old_scan_uris: Vec<Url> = self.workspace_index.keys().cloned().collect();
-        for uri in old_scan_uris {
+        for uri in self.workspace_scan_uris.drain() {
             self.cross_file_workspace_index.invalidate(&uri);
         }
-        self.workspace_index = index;
+        self.workspace_scan_uris = scanned_uris;
         self.cross_file_workspace_index
             .set_pinned_uris(prepared_pins.clone());
         for (uri, entry) in cross_file_entries {
@@ -2760,11 +2789,14 @@ impl WorldState {
             );
             let snapshot =
                 crate::cross_file::file_cache::FileSnapshot::with_content_hash(&fs_meta, &content);
+            let loaded_packages = extract_loaded_packages(&tree, &content);
+            let data_packages = extract_data_packages(&tree, &content);
 
             let entry = crate::workspace_index::IndexEntry {
                 contents: Rope::from_str(&content),
                 tree,
-                loaded_packages: Vec::new(),
+                loaded_packages,
+                data_packages,
                 snapshot,
                 metadata,
                 artifacts,
@@ -3203,10 +3235,8 @@ pub(crate) fn derive_workspace_dependency_graph(
 
 /// Scan workspace folders for R files without holding any locks (Requirement 13a)
 ///
-/// Returns:
-/// - `HashMap<Url, Document>` - Legacy index for backward compatibility
-/// - `HashMap<Url, crate::cross_file::workspace_index::IndexEntry>` - Cross-file entries (legacy)
-/// - `HashMap<Url, crate::workspace_index::IndexEntry>` - New unified WorkspaceIndex entries
+/// Returns the artifact-only compatibility entries and the authoritative full
+/// closed-file entries. Phase B merges those two payload tiers.
 ///
 /// Package-mode state (workspace/namespace model, roxygen cache, NAMESPACE
 /// imports) is intentionally **not** produced here. The canonical derivation
@@ -3215,7 +3245,6 @@ pub(crate) fn derive_workspace_dependency_graph(
 ///
 /// **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5**
 pub type WorkspaceScanResult = (
-    HashMap<Url, Document>,
     HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
     HashMap<Url, crate::workspace_index::IndexEntry>,
 );
@@ -3223,7 +3252,6 @@ pub type WorkspaceScanResult = (
 /// Result of processing a single workspace file (used by parallel scan).
 struct ProcessedFile {
     uri: Url,
-    document: Document,
     cross_file_entry: crate::cross_file::workspace_index::IndexEntry,
     new_index_entry: crate::workspace_index::IndexEntry,
 }
@@ -3514,6 +3542,7 @@ fn processed_workspace_document(
         contents: doc.contents.clone(),
         tree: doc.tree.clone(),
         loaded_packages: doc.loaded_packages.clone(),
+        data_packages: doc.data_packages.clone(),
         snapshot,
         metadata: cross_file_meta,
         artifacts,
@@ -3522,7 +3551,6 @@ fn processed_workspace_document(
 
     ProcessedFile {
         uri,
-        document: doc,
         cross_file_entry,
         new_index_entry,
     }
@@ -3554,21 +3582,15 @@ pub(crate) fn apply_workspace_scan_chunk_overrides(
     result: &mut WorkspaceScanResult,
     overrides: &HashMap<Url, ChunkKind>,
 ) {
-    let (documents, legacy_entries, new_entries) = result;
+    let (legacy_entries, new_entries) = result;
     for (uri, chunk_kind) in overrides {
-        let Some(document) = documents.get(uri) else {
+        let Some(entry) = new_entries.get(uri) else {
             continue;
         };
-        if document.chunk_kind == *chunk_kind {
-            continue;
-        }
-        let Some(snapshot) = new_entries.get(uri).map(|entry| entry.snapshot.clone()) else {
-            continue;
-        };
-        let raw = document.contents.to_string();
+        let snapshot = entry.snapshot.clone();
+        let raw = entry.contents.to_string();
         let document = Document::new_with_kind(&raw, None, file_type_from_uri(uri), *chunk_kind);
         let processed = processed_workspace_document(uri.clone(), document, snapshot);
-        documents.insert(uri.clone(), processed.document);
         legacy_entries.insert(uri.clone(), processed.cross_file_entry);
         new_entries.insert(uri.clone(), processed.new_index_entry);
     }
@@ -3609,7 +3631,6 @@ pub fn scan_workspace_with_exclusions(
     );
 
     // Type aliases for the thread-local accumulators used in fold/reduce.
-    type IndexMap = HashMap<Url, Document>;
     type CrossFileMap = HashMap<Url, crate::cross_file::workspace_index::IndexEntry>;
     type NewIndexMap = HashMap<Url, crate::workspace_index::IndexEntry>;
 
@@ -3618,30 +3639,24 @@ pub fn scan_workspace_with_exclusions(
     // an intermediate Vec<ProcessedFile> that would transiently hold all
     // file contents + ASTs and require two extra Url clones per file for
     // the serial insert loop.
-    let (index, mut cross_file_entries, mut new_index_entries): (
-        IndexMap,
-        CrossFileMap,
-        NewIndexMap,
-    ) = file_paths
+    let (mut cross_file_entries, mut new_index_entries): (CrossFileMap, NewIndexMap) = file_paths
         .par_iter()
         .fold(
-            || (IndexMap::new(), CrossFileMap::new(), NewIndexMap::new()),
-            |(mut idx, mut cfe, mut nie), path| {
+            || (CrossFileMap::new(), NewIndexMap::new()),
+            |(mut cfe, mut nie), path| {
                 if let Some(item) = process_workspace_file(path) {
                     cfe.insert(item.uri.clone(), item.cross_file_entry);
-                    nie.insert(item.uri.clone(), item.new_index_entry);
-                    idx.insert(item.uri, item.document);
+                    nie.insert(item.uri, item.new_index_entry);
                 }
-                (idx, cfe, nie)
+                (cfe, nie)
             },
         )
         .reduce(
-            || (IndexMap::new(), CrossFileMap::new(), NewIndexMap::new()),
-            |(mut idx_a, mut cfe_a, mut nie_a), (idx_b, cfe_b, nie_b)| {
-                idx_a.extend(idx_b);
+            || (CrossFileMap::new(), NewIndexMap::new()),
+            |(mut cfe_a, mut nie_a), (cfe_b, nie_b)| {
                 cfe_a.extend(cfe_b);
                 nie_a.extend(nie_b);
-                (idx_a, cfe_a, nie_a)
+                (cfe_a, nie_a)
             },
         );
 
@@ -3719,8 +3734,8 @@ pub fn scan_workspace_with_exclusions(
     }
 
     log::info!(
-        "Scanned {} workspace files ({} with cross-file metadata, {} new index entries)",
-        index.len(),
+        "Scanned {} workspace files ({} with cross-file metadata, {} full index entries)",
+        new_index_entries.len(),
         cross_file_entries.len(),
         new_index_entries.len()
     );
@@ -3735,7 +3750,7 @@ pub fn scan_workspace_with_exclusions(
     // The canonical derivation is now single-sourced through the event path
     // (`PackageInputs` → `derive_package_state`).
 
-    (index, cross_file_entries, new_index_entries)
+    (cross_file_entries, new_index_entries)
 }
 
 /// Directories to skip during workspace scanning.
@@ -3911,7 +3926,7 @@ mod tests {
         );
         let root = tower_lsp::lsp_types::Url::from_file_path(tmp.path()).unwrap();
 
-        let (index, _, _) = scan_workspace_with_exclusions(&[root], 20, &exclusions);
+        let (_, index) = scan_workspace_with_exclusions(&[root], 20, &exclusions);
         let indexed_paths: Vec<_> = index
             .keys()
             .filter_map(|uri| uri.to_file_path().ok())
@@ -4564,11 +4579,13 @@ mod tests {
         // The document's tree must slice cleanly against its analysis text
         // (would panic on the multibyte prose if paired with raw text).
         let doc_tree = processed
-            .document
+            .new_index_entry
             .tree
             .as_ref()
             .expect("Rmd doc must have a tree");
-        let analysis = processed.document.analysis_text();
+        let raw = processed.new_index_entry.contents.to_string();
+        let analysis =
+            crate::cross_file::analysis_text_for_kind(crate::chunks::ChunkKind::Rmd, &raw);
         assert!(
             tree_has_identifier(doc_tree, &analysis, "chunk_symbol"),
             "masked tree must contain the chunk-defined identifier"
@@ -4613,6 +4630,7 @@ mod tests {
             ),
             tree: None,
             loaded_packages: Vec::new(),
+            data_packages: vec![],
             snapshot: FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 1,

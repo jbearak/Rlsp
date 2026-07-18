@@ -246,18 +246,15 @@ impl OpenDocumentsView for TestOpenDocuments {
 ///
 /// This implementation respects the open-docs-authoritative rule:
 /// 1. Check open-document authority first (open docs are authoritative)
-/// 2. Check legacy documents HashMap (for migration compatibility)
-/// 3. Check WorkspaceIndex (closed files)
-/// 4. Check legacy workspace_index and cross_file_workspace_index (for migration compatibility)
-/// 5. Check file cache (no synchronous disk I/O)
+/// 2. Check WorkspaceIndex (closed files)
+/// 3. Check the transitional cross-file index for metadata/artifacts
+/// 4. Check file cache for content/existence (no synchronous disk I/O)
 ///
 /// **Validates: Requirements 7.2, 13.2, 14.1, 14.2, 14.3, 14.4**
 pub struct DefaultContentProvider<'a> {
     open_documents: &'a dyn OpenDocumentsView,
     workspace_index: &'a WorkspaceIndex,
     file_cache: &'a CrossFileFileCache,
-    // Legacy fields for migration compatibility
-    legacy_workspace_index: Option<&'a HashMap<Url, Document>>,
     legacy_cross_file_workspace_index: Option<&'a CrossFileWorkspaceIndex>,
     open_aliases: Option<&'a OpenDocumentAliases>,
 }
@@ -278,29 +275,22 @@ impl<'a> DefaultContentProvider<'a> {
             open_documents,
             workspace_index,
             file_cache,
-            legacy_workspace_index: None,
             legacy_cross_file_workspace_index: None,
             open_aliases: None,
         }
     }
 
-    /// Create a new DefaultContentProvider with legacy field support
-    ///
-    /// This constructor includes references to legacy fields for migration compatibility.
-    /// Use this during the migration period when both old and new fields are in use.
+    /// Create a provider with the transitional cross-file index and aliases.
     ///
     /// # Arguments
     /// * `open-document authority` - Reference to the open-document authority for open documents
     /// * `workspace_index` - Reference to the WorkspaceIndex for closed files
     /// * `file_cache` - Reference to the CrossFileFileCache for disk file caching
-    /// * `legacy_documents` - Reference to the legacy documents HashMap
-    /// * `legacy_workspace_index` - Reference to the legacy workspace_index HashMap
     /// * `legacy_cross_file_workspace_index` - Reference to the legacy CrossFileWorkspaceIndex
     pub fn with_legacy(
         open_documents: &'a impl OpenDocumentsView,
         workspace_index: &'a WorkspaceIndex,
         file_cache: &'a CrossFileFileCache,
-        legacy_workspace_index: &'a HashMap<Url, Document>,
         legacy_cross_file_workspace_index: &'a CrossFileWorkspaceIndex,
         open_aliases: &'a OpenDocumentAliases,
     ) -> Self {
@@ -308,7 +298,6 @@ impl<'a> DefaultContentProvider<'a> {
             open_documents,
             workspace_index,
             file_cache,
-            legacy_workspace_index: Some(legacy_workspace_index),
             legacy_cross_file_workspace_index: Some(legacy_cross_file_workspace_index),
             open_aliases: Some(open_aliases),
         }
@@ -341,10 +330,8 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// Checks sources in order:
     /// 1. open-document authority (open docs are authoritative)
-    /// 2. Legacy documents HashMap (for migration compatibility)
-    /// 3. WorkspaceIndex (closed files)
-    /// 4. Legacy workspace_index (for migration compatibility)
-    /// 5. File cache (no synchronous disk I/O)
+    /// 2. WorkspaceIndex (closed files)
+    /// 3. File cache (no synchronous disk I/O)
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_content(&self, uri: &Url) -> Option<String> {
@@ -354,19 +341,11 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
             return Some(content);
         }
 
-        // 3. Check WorkspaceIndex
         if let Some(entry) = self.workspace_index.get(uri) {
             return Some(entry.contents.to_string());
         }
 
-        // 4. Check legacy workspace_index (for migration compatibility)
-        if let Some(legacy_ws) = self.legacy_workspace_index
-            && let Some(doc) = legacy_ws.get(uri)
-        {
-            return Some(doc.text());
-        }
-
-        // 5. Check file cache (no synchronous disk I/O)
+        // Check file cache (no synchronous disk I/O)
         self.file_cache.get(uri)
     }
 
@@ -374,41 +353,25 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// Checks sources in order:
     /// 1. open-document authority (open docs are authoritative)
-    /// 2. Legacy documents HashMap (for migration compatibility)
-    /// 3. WorkspaceIndex (closed files)
-    /// 4. Legacy cross_file_workspace_index (for migration compatibility)
-    /// 5. Legacy workspace_index (for migration compatibility)
+    /// 2. WorkspaceIndex (closed files)
+    /// 3. Transitional cross-file index
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
-        // Legacy documents use analysis text (masked for Rmd/Quarto, raw
-        // otherwise) so metadata comes from chunk bodies and byte offsets stay
-        // consistent with downstream uses (#343).
         if let Some(metadata) =
             self.project_open_document(uri, |documents, open_uri| documents.metadata(open_uri))
         {
             return Some(metadata);
         }
 
-        // 3. Check WorkspaceIndex
         if let Some(metadata) = self.workspace_index.get_metadata(uri) {
             return Some(metadata);
         }
 
-        // 4. Check legacy cross_file_workspace_index (for migration compatibility)
         if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index
             && let Some(metadata) = legacy_cf_ws.get_metadata(uri)
         {
             return Some(metadata);
-        }
-
-        // 5. Check legacy workspace_index (for migration compatibility).
-        //    Analysis text (masked for Rmd/Quarto, raw otherwise) — see step 2.
-        if let Some(legacy_ws) = self.legacy_workspace_index
-            && let Some(doc) = legacy_ws.get(uri)
-        {
-            let text = doc.analysis_text();
-            return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
         }
 
         None
@@ -418,49 +381,25 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// Checks sources in order:
     /// 1. open-document authority (open docs are authoritative)
-    /// 2. Legacy documents HashMap (for migration compatibility)
-    /// 3. WorkspaceIndex (closed files)
-    /// 4. Legacy cross_file_workspace_index (for migration compatibility)
-    /// 5. Legacy workspace_index (for migration compatibility)
+    /// 2. WorkspaceIndex (closed files)
+    /// 3. Transitional cross-file index
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
-        // Legacy documents pair the tree with its analysis text (masked for
-        // Rmd/Quarto, raw otherwise) so artifact byte offsets stay aligned.
         if let Some(artifacts) =
             self.project_open_document(uri, |documents, open_uri| documents.artifacts(open_uri))
         {
             return Some(artifacts);
         }
 
-        // 3. Check WorkspaceIndex
         if let Some(artifacts) = self.workspace_index.get_artifacts(uri) {
             return Some(artifacts);
         }
 
-        // 4. Check legacy cross_file_workspace_index (for migration compatibility)
         if let Some(legacy_cf_ws) = self.legacy_cross_file_workspace_index
             && let Some(artifacts) = legacy_cf_ws.get_artifacts(uri)
         {
             return Some(artifacts);
-        }
-
-        // 5. Check legacy workspace_index (for migration compatibility).
-        //    Analysis text matches the tree's byte offsets (see step 2).
-        if let Some(legacy_ws) = self.legacy_workspace_index
-            && let Some(doc) = legacy_ws.get(uri)
-            && let Some(tree) = &doc.tree
-        {
-            let text = doc.analysis_text();
-            // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
-            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            let metadata = crate::cross_file::extract_metadata(&text);
-            return Some(Arc::new(scope::compute_artifacts_with_metadata(
-                uri,
-                tree,
-                &text,
-                Some(&metadata),
-            )));
         }
 
         None
@@ -478,9 +417,6 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
         })
         .is_some()
             || self.workspace_index.contains(uri)
-            || self
-                .legacy_workspace_index
-                .is_some_and(|ws: &HashMap<Url, Document>| ws.contains_key(uri))
             || self
                 .legacy_cross_file_workspace_index
                 .is_some_and(|cf_ws| cf_ws.contains(uri))
@@ -732,6 +668,7 @@ mod tests {
             contents: ropey::Rope::from_str("workspace_content"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 17,
@@ -767,6 +704,7 @@ mod tests {
             contents: ropey::Rope::from_str("workspace_content"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 17,
@@ -807,7 +745,6 @@ mod tests {
         let mut doc_store = make_test_open_documents();
         let workspace_index = make_test_workspace_index();
         let file_cache = CrossFileFileCache::new();
-        let legacy_workspace_index = HashMap::new();
         let legacy_cross_file_workspace_index = CrossFileWorkspaceIndex::new();
         let mut open_aliases = OpenDocumentAliases::default();
 
@@ -829,7 +766,6 @@ mod tests {
                 doc_store,
                 &workspace_index,
                 &file_cache,
-                &legacy_workspace_index,
                 &legacy_cross_file_workspace_index,
                 &open_aliases,
             )
@@ -864,6 +800,7 @@ mod tests {
             contents: ropey::Rope::from_str("indexed"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 7,
@@ -909,6 +846,7 @@ mod tests {
             contents: ropey::Rope::from_str("content"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 7,
@@ -959,6 +897,7 @@ mod tests {
             contents: ropey::Rope::from_str("workspace_func <- function() {}"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 31,
@@ -1000,6 +939,7 @@ mod tests {
             contents: ropey::Rope::from_str("indexed"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 7,
@@ -1126,6 +1066,7 @@ mod tests {
             contents: ropey::Rope::from_str(content),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: content.len() as u64,
@@ -1225,6 +1166,7 @@ mod tests {
                     contents: ropey::Rope::from_str("x <- 1"),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: 6,
@@ -1299,6 +1241,7 @@ mod tests {
                     contents: ropey::Rope::from_str(&index_content),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: index_content.len() as u64,
@@ -1382,6 +1325,7 @@ mod tests {
                     contents: ropey::Rope::from_str(&index_content),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: index_content.len() as u64,
@@ -1594,6 +1538,7 @@ mod tests {
                     contents: ropey::Rope::from_str(&content),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: content.len() as u64,
@@ -1742,6 +1687,7 @@ mod tests {
                     contents: ropey::Rope::from_str(&index_content),
                     tree: None,
                     loaded_packages: vec![],
+                    data_packages: vec![],
                     snapshot: crate::cross_file::file_cache::FileSnapshot {
                         mtime: std::time::SystemTime::UNIX_EPOCH,
                         size: index_content.len() as u64,
@@ -1899,6 +1845,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("workspace_func <- function() {}"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 31,
@@ -1950,6 +1897,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("helper_func <- function() {}"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 28,
@@ -2002,6 +1950,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("x <- 1"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 6,
@@ -2041,6 +1990,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("old_content"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 11,
@@ -2165,6 +2115,7 @@ mod integration_tests {
             ),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 50,
@@ -2279,6 +2230,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("# @lsp-var old_declared\nx <- 1"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 30,
@@ -2407,6 +2359,7 @@ mod integration_tests {
             contents: ropey::Rope::from_str("# @lsp-func child_declared\nz <- 3"),
             tree: None,
             loaded_packages: vec![],
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: 35,

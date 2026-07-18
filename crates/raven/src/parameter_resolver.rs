@@ -391,8 +391,7 @@ pub fn resolve(
 /// Priority order (matching the `content_provider` pattern):
 /// 1. Authoritative open documents (`state.documents`)
 /// 2. New workspace index (`state.workspace_index_new`)
-/// 3. Legacy workspace index (`state.workspace_index`)
-/// 4. File cache (`state.cross_file_file_cache`) — parse on demand
+/// 3. File cache (`state.cross_file_file_cache`) — parse on demand
 pub(crate) fn get_text_and_tree(
     state: &WorldState,
     uri: &Url,
@@ -425,16 +424,7 @@ pub(crate) fn get_text_and_tree(
         }
     }
 
-    // 3. Legacy workspace index (analysis text, see step 1).
-    if let Some(doc) = state.workspace_index.get(uri) {
-        if let Some(tree) = &doc.tree {
-            return Some((doc.analysis_text(), tree.clone()));
-        } else {
-            log::debug!("Document in workspace_index has no parsed tree: {}", uri);
-        }
-    }
-
-    // 4. File cache — content available but no pre-parsed tree; parse on demand.
+    // 3. File cache — content available but no pre-parsed tree; parse on demand.
     //    The cache stores RAW content; parse (and return) the masked analysis
     //    text for Rmd/Quarto so a closed `.Rmd` resolves chunk-defined symbols
     //    rather than failing closed, and the (text, tree) pair stays aligned
@@ -1387,6 +1377,7 @@ f(beta = 2)
             contents: lib_doc.contents.clone(),
             tree: lib_doc.tree.clone(),
             loaded_packages: lib_doc.loaded_packages.clone(),
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: lib_code.len() as u64,
@@ -1467,6 +1458,7 @@ f(beta = 2)
             contents: lib_doc.contents.clone(),
             tree: lib_doc.tree.clone(),
             loaded_packages: lib_doc.loaded_packages.clone(),
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: lib_code.len() as u64,
@@ -2298,6 +2290,7 @@ mod property_tests {
             contents: ropey::Rope::from_str(MULTIBYTE_RMD),
             tree,
             loaded_packages: Vec::new(),
+            data_packages: vec![],
             snapshot: FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: MULTIBYTE_RMD.len() as u64,

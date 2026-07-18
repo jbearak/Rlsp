@@ -4527,6 +4527,7 @@ fn flatten_document_symbols_recursive(
 /// // assert!(symbols.iter().any(|s| s.name == "my_function"));
 /// ```
 #[allow(deprecated)]
+#[cfg(test)]
 fn collect_symbols(node: Node, text: &str, symbols: &mut Vec<SymbolInformation>) {
     // Look for assignments: identifier <- value or identifier = value
     if node.kind() == "binary_operator" {
@@ -4617,9 +4618,10 @@ fn extract_container_name(uri: &Url) -> Option<String> {
 
 /// Collects workspace symbols whose names contain the given query as a case-insensitive substring.
 ///
-/// Searches symbols in this priority order: open documents, the new workspace index (closed files),
-/// the cross-file workspace index, legacy open documents (AST fallback), and the legacy workspace index
-/// (AST fallback). Files already seen in a higher-priority source are not re-scanned (deduplicated by URI).
+/// Searches symbols in this priority order: authoritative open documents, the
+/// full-payload closed index, then the transitional artifact-only cross-file
+/// index. Files already seen in a higher-priority source are not re-scanned
+/// (deduplicated by URI).
 /// Virtual symbols declared via directive annotations are skipped by the artifact collector.
 /// Reserved words are filtered out to avoid polluting results.
 /// Results are truncated to the configured `workspace_max_results` limit.
@@ -4710,61 +4712,9 @@ pub fn workspace_symbol(state: &WorldState, query: &str) -> Option<Vec<SymbolInf
         }
     }
 
-    // 4. Legacy workspace index (AST fallback)
-    if symbols.len() < max_results {
-        collect_legacy_ast_symbols(
-            &state.workspace_index,
-            &lower_query,
-            max_results,
-            &mut seen_uris,
-            &mut symbols,
-        );
-    }
-
     // Apply configurable limit as final guard (Requirement 9.2, 11.2)
     symbols.truncate(max_results);
     Some(symbols)
-}
-
-/// Collect matching workspace symbols from a legacy `HashMap<Url, Document>` (AST fallback).
-///
-/// Iterates the map, skips URIs already in `seen_uris`, and collects symbols whose names
-/// (case-insensitively) contain `lower_query`, stopping once `max_results` is reached.
-fn collect_legacy_ast_symbols(
-    docs: &std::collections::HashMap<Url, crate::state::Document>,
-    lower_query: &str,
-    max_results: usize,
-    seen_uris: &mut std::collections::HashSet<Url>,
-    symbols: &mut Vec<SymbolInformation>,
-) {
-    for (uri, doc) in docs {
-        if symbols.len() >= max_results {
-            break;
-        }
-        if seen_uris.contains(uri) {
-            continue;
-        }
-        seen_uris.insert(uri.clone());
-        if let Some(tree) = &doc.tree {
-            // Pair the tree with the analysis text it was parsed from (masked
-            // for Rmd docs) so byte-offset slices in `collect_symbols` align.
-            let text = doc.analysis_text();
-            let mut file_symbols = Vec::new();
-            collect_symbols(tree.root_node(), &text, &mut file_symbols);
-            let container_name = extract_container_name(uri);
-            for mut sym in file_symbols {
-                // Filter reserved words (Requirement 7.2)
-                if is_reserved_word(&sym.name) {
-                    continue;
-                }
-                if sym.name.to_lowercase().contains(lower_query) {
-                    sym.location.uri = uri.clone();
-                    sym.container_name = container_name.clone();
-                    symbols.push(sym);
-                }
-            }
-        }
-    }
 }
 
 /// Collect matching symbols from precomputed `ScopeArtifacts` and append them to `symbols`.
@@ -21609,9 +21559,18 @@ pub fn goto_definition_with_cancel(
     let content_provider = state.content_provider();
 
     // Try open document first, then workspace index
-    let doc = state
-        .get_document(uri)
-        .or_else(|| state.workspace_index.get(uri))?;
+    let closed_document;
+    let doc = if let Some(document) = state.get_document(uri) {
+        document
+    } else {
+        let entry = state.workspace_index_new.get(uri)?;
+        closed_document = crate::state::document_from_workspace_entry(
+            uri,
+            &entry,
+            state.chunk_kind_for_closed_file(uri),
+        );
+        &closed_document
+    };
     let tree = doc.tree.as_ref()?;
     // For Rmd the tree is parsed from the masked analysis text; pair byte
     // offsets with it. A prose position maps to a blank masked line, so the
@@ -21984,79 +21943,6 @@ pub fn goto_definition_with_cancel(
         }
     }
 
-    // Fallback: Search legacy workspace index
-    for (file_uri, doc) in &state.workspace_index {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        if file_uri == uri {
-            continue;
-        }
-        if let Some(tree) = &doc.tree {
-            // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
-            let file_text = doc.analysis_text();
-            if let Some(def_range) =
-                find_definition_try_both(tree.root_node(), name, scope_key, &file_text)
-            {
-                return Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: file_uri.clone(),
-                    range: def_range,
-                }));
-            }
-        }
-    }
-
-    None
-}
-
-/// Look up a definition for `name` in `root`, falling back to `scope_key` (the
-/// unquoted spelling) only when it differs from `name`. Skipping the second
-/// walk when `scope_key == name` (the common bare-callee case:
-/// `unquote_backtick_name` returns `None`, so `scope_key == name`) avoids a
-/// byte-for-byte identical full tree walk guaranteed to also miss — pure wasted
-/// work on the not-found path, doubled per scanned file.
-fn find_definition_try_both(
-    root: tree_sitter::Node,
-    name: &str,
-    scope_key: &str,
-    text: &str,
-) -> Option<Range> {
-    find_definition_in_tree(root, name, text).or_else(|| {
-        (scope_key != name)
-            .then(|| find_definition_in_tree(root, scope_key, text))
-            .flatten()
-    })
-}
-
-fn find_definition_in_tree(node: Node, name: &str, text: &str) -> Option<Range> {
-    if node.kind() == "binary_operator" {
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.children(&mut cursor).collect();
-
-        if children.len() >= 3 {
-            let lhs = children[0];
-            let op = children[1];
-
-            let op_text = node_text(op, text);
-            if matches!(op_text, "<-" | "=" | "<<-")
-                && lhs.kind() == "identifier"
-                && node_text(lhs, text) == name
-            {
-                return Some(Range {
-                    start: ts_point_to_lsp_position(text, lhs.start_position()),
-                    end: ts_point_to_lsp_position(text, lhs.end_position()),
-                });
-            }
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if let Some(range) = find_definition_in_tree(child, name, text) {
-            return Some(range);
-        }
-    }
-
     None
 }
 
@@ -22187,9 +22073,18 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
     let content_provider = state.content_provider();
 
     // Try open document first, then workspace index
-    let doc = state
-        .get_document(uri)
-        .or_else(|| state.workspace_index.get(uri))?;
+    let closed_document;
+    let doc = if let Some(document) = state.get_document(uri) {
+        document
+    } else {
+        let entry = state.workspace_index_new.get(uri)?;
+        closed_document = crate::state::document_from_workspace_entry(
+            uri,
+            &entry,
+            state.chunk_kind_for_closed_file(uri),
+        );
+        &closed_document
+    };
     // For Rmd the current-document tree is parsed from the masked analysis
     // text; pair byte offsets with it (the cross-file/workspace arms below
     // already use each document's analysis text or the content provider). A
@@ -22240,20 +22135,6 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
             collect_stan_references(&file_occurrences, name, &file_uri, &mut locations);
         }
 
-        // Fallback: Search legacy workspace index.
-        for (file_uri, doc) in &state.workspace_index {
-            if file_uri == uri
-                || state.workspace_index_new.contains(file_uri)
-                || doc.file_type != FileType::Stan
-            {
-                continue;
-            }
-
-            let file_text = doc.text();
-            let file_occurrences = collect_stan_identifier_occurrences(&file_text);
-            collect_stan_references(&file_occurrences, name, file_uri, &mut locations);
-        }
-
         return Some(locations);
     }
 
@@ -22297,20 +22178,6 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
             let file_text = entry.contents.to_string();
             let file_occurrences = collect_jags_identifier_occurrences(&file_text);
             collect_jags_references(&file_occurrences, name, &file_uri, &mut locations);
-        }
-
-        // Fallback: Search legacy workspace index.
-        for (file_uri, doc) in &state.workspace_index {
-            if file_uri == uri
-                || state.workspace_index_new.contains(file_uri)
-                || doc.file_type != FileType::Jags
-            {
-                continue;
-            }
-
-            let file_text = doc.text();
-            let file_occurrences = collect_jags_identifier_occurrences(&file_text);
-            collect_jags_references(&file_occurrences, name, file_uri, &mut locations);
         }
 
         return Some(locations);
@@ -22381,22 +22248,6 @@ pub fn references(state: &WorldState, uri: &Url, position: Position) -> Option<V
                 &file_uri,
                 &mut locations,
             );
-        }
-    }
-
-    // Fallback: Search legacy workspace index
-    for (file_uri, doc) in &state.workspace_index {
-        if file_uri == uri {
-            continue; // Already searched
-        }
-        // Skip if already found in new stores
-        if state.workspace_index_new.contains(file_uri) {
-            continue;
-        }
-        if let Some(tree) = &doc.tree {
-            // Analysis text (masked for Rmd) matches `tree`'s byte offsets.
-            let file_text = doc.analysis_text();
-            find_references_in_tree(tree.root_node(), name, &file_text, file_uri, &mut locations);
         }
     }
 
@@ -22660,9 +22511,10 @@ fn find_user_function_signature(
     }
 
     // 3. Search workspace index
-    for doc in state.workspace_index.values() {
-        if let Some(tree) = &doc.tree {
-            let text = doc.analysis_text();
+    for (uri, entry) in state.workspace_index_new.iter() {
+        if let Some(tree) = &entry.tree {
+            let raw = entry.contents.to_string();
+            let text = state.analysis_text_for_uri(&uri, &raw);
             if let Some(func_node) = find_function_definition_node(tree.root_node(), name, &text) {
                 return Some(extract_function_signature(func_node, name, &text));
             }
@@ -42876,7 +42728,10 @@ mod proptests {
             let mut state = WorldState::new();
             state.documents.insert(current_uri.clone(), Document::new(&current_code, None));
             state.documents.insert(other_uri.clone(), Document::new(&other_code, None));
-            state.workspace_index.insert(workspace_uri.clone(), Document::new(&workspace_code, None));
+            state.insert_workspace_document_for_test(
+                workspace_uri.clone(),
+                Document::new(&workspace_code, None),
+            );
 
             // Search should return current document's definition first
             let signature = find_user_function_signature(&state, &current_uri, &func_name);
@@ -48842,9 +48697,9 @@ setClass("{}", slots = c(value = "numeric"))
             let uri = Url::parse("file:///test.R").unwrap();
 
             let mut state = WorldState::new();
-            // Add to both documents (open) and workspace_index (closed)
+            // Add to both open and closed authorities to exercise deduplication.
             state.documents.insert(uri.clone(), Document::new(&code, None));
-            state.workspace_index.insert(uri.clone(), Document::new(&code, None));
+            state.insert_workspace_document_for_test(uri.clone(), Document::new(&code, None));
 
             let response = super::workspace_symbol(&state, "");
             prop_assert!(response.is_some());
@@ -51973,7 +51828,7 @@ result <- helper_func(42)"#;
         let mut state = WorldState::new();
         state.workspace_folders = vec![ws_root.clone()];
         let scan = crate::state::scan_workspace(&[ws_root], 20);
-        state.apply_workspace_index(scan.0, scan.1, scan.2);
+        state.apply_workspace_index(scan.0, scan.1);
         let open_code = files
             .iter()
             .find(|(rel, _)| *rel == open)
@@ -52929,6 +52784,7 @@ f(beta = 2)
             contents: helpers_doc.contents.clone(),
             tree: helpers_doc.tree.clone(),
             loaded_packages: helpers_doc.loaded_packages.clone(),
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: std::time::SystemTime::UNIX_EPOCH,
                 size: helpers_code.len() as u64,
@@ -61479,8 +61335,7 @@ my_func <- function(a = default_value) {
 
         let child_code = "summary_table <- data.frame(x = 1)\n";
         state
-            .workspace_index
-            .insert(child_uri.clone(), Document::new(child_code, None));
+            .insert_workspace_document_for_test(child_uri.clone(), Document::new(child_code, None));
 
         let main_code = "source(\"helpers.R\")\nsummary_table\n";
         state
@@ -61512,8 +61367,8 @@ my_func <- function(a = default_value) {
         // NOT perform synchronous disk I/O during diagnostics, so a child file
         // that exists only on disk is no longer auto-discovered. To preserve the
         // intent of this test (suppression when a sourced file's exports are
-        // available cross-file), the child file is now seeded into the legacy
-        // `workspace_index` AND the workspace-root fallback is exercised via
+        // available cross-file), the child file is now seeded into the closed
+        // index AND the workspace-root fallback is exercised via
         // `state.workspace_folders`.
         let mut state = create_test_state();
         let workspace_dir = tempfile::tempdir().expect("tempdir should be created");
@@ -61527,14 +61382,13 @@ my_func <- function(a = default_value) {
         let child_uri = Url::from_file_path(&child_path).expect("child uri should be valid");
 
         let child_code = "summary_table <- data.frame(x = 1)\n";
-        // Seed both disk and the in-memory workspace_index. The disk write is
+        // Seed both disk and the in-memory closed index. The disk write is
         // retained to keep the workspace-root fallback resolution legitimate;
-        // the workspace_index entry is what enables snapshot-path artifact
+        // the closed-index entry is what enables snapshot-path artifact
         // lookup without synchronous disk I/O.
         std::fs::write(&child_path, child_code).expect("child file should be written");
         state
-            .workspace_index
-            .insert(child_uri.clone(), Document::new(child_code, None));
+            .insert_workspace_document_for_test(child_uri.clone(), Document::new(child_code, None));
 
         let main_code = "source(\"helpers.R\")\nsummary_table\n";
         state
@@ -68485,6 +68339,7 @@ mod issue_459_backtick_navigation_tests {
             contents: lib_doc.contents.clone(),
             tree: lib_doc.tree.clone(),
             loaded_packages: lib_doc.loaded_packages.clone(),
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: lib_code.len() as u64,
@@ -68529,42 +68384,6 @@ mod issue_459_backtick_navigation_tests {
             l.uri.as_str(),
             "file:///a.R",
             "`my fn` resolves to a.R via the RAW tree-text fallback"
-        );
-        assert_eq!(l.range.start.line, 0);
-    }
-
-    /// Issue #459 regression: the SECOND (unquoted) walk in the legacy
-    /// tree-text fallback. A redundantly backtick-quoted *syntactic* use
-    /// `` `my_func`() `` of a BARE regular definition `my_func <- function() 1`
-    /// is reachable ONLY through `find_definition_in_tree`'s `scope_key`
-    /// fallback: the def's LHS is the bare identifier `my_func`, but the
-    /// use-site `name` is the still-backticked raw `` `my_func` ``. The first
-    /// walk searches RAW and misses the bare LHS; only the second walk on the
-    /// unquoted `scope_key` (`my_func`) matches.
-    ///
-    /// The defining file is added via the legacy `add_doc` harness (writes only
-    /// `state.documents`, not the workspace index / `open-document authority`) and has NO
-    /// `source()` link to the using file. So the in-scope primary
-    /// `scope.symbols` lookup misses, BOTH `exported_interface` arms miss (the
-    /// def was never indexed), and resolution falls through to the legacy
-    /// tree-text fallback — where the syntactic name lands on the second walk.
-    ///
-    /// It BITES: reverting `find_definition_try_both` to a raw-only single walk
-    /// (`find_definition_in_tree(root, name, text)` with no `scope_key`
-    /// fallback) leaves the backticked `name` missing the bare LHS, so goto
-    /// returns `None` and `scalar(..)` panics.
-    #[test]
-    fn goto_backtick_syntactic_resolves_via_tree_text_fallback() {
-        let mut state = create_state();
-        // Both files are plain open documents; no `source()` edge between them.
-        let main_uri = add_doc(&mut state, "file:///b.R", "`my_func`()\n");
-        let _lib_uri = add_doc(&mut state, "file:///a.R", "my_func <- function() 1\n");
-
-        let l = scalar(goto_definition(&state, &main_uri, Position::new(0, 3)));
-        assert_eq!(
-            l.uri.as_str(),
-            "file:///a.R",
-            "`my_func` resolves to a.R via the unquoted `scope_key` tree-text walk"
         );
         assert_eq!(l.range.start.line, 0);
     }
@@ -68904,6 +68723,7 @@ mod load_all_internal_goto_tests {
             contents: doc.contents.clone(),
             tree: doc.tree.clone(),
             loaded_packages: doc.loaded_packages.clone(),
+            data_packages: vec![],
             snapshot: crate::cross_file::file_cache::FileSnapshot {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: content.len() as u64,

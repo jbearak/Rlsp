@@ -51,11 +51,11 @@ mod workspace_scan_tests {
         };
 
         let build = || {
-            let (index, cfe, nie) =
+            let (cfe, nie) =
                 scan_workspace(std::slice::from_ref(&workspace_url), TEST_MAX_CHAIN_DEPTH);
             let mut state = WorldState::new();
             state.workspace_folders = vec![workspace_url.clone()];
-            state.apply_workspace_index(index, cfe, nie);
+            state.apply_workspace_index(cfe, nie);
             state
         };
 
@@ -78,9 +78,9 @@ mod workspace_scan_tests {
         fs::write(&test_file, "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
-        assert_eq!(index.len(), 1, "Should find 1 .R file");
+        assert_eq!(new_index_entries.len(), 1, "Should find 1 .R file");
         assert_eq!(cross_file_entries.len(), 1, "Should have 1 cross-file entry");
         assert_eq!(new_index_entries.len(), 1, "Should have 1 new index entry");
     }
@@ -92,9 +92,9 @@ mod workspace_scan_tests {
         fs::write(&test_file, "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
-        assert_eq!(index.len(), 1, "Should find 1 .r file");
+        assert_eq!(new_index_entries.len(), 1, "Should find 1 .r file");
         assert_eq!(cross_file_entries.len(), 1, "Should have 1 cross-file entry");
         assert_eq!(new_index_entries.len(), 1, "Should have 1 new index entry");
     }
@@ -108,14 +108,14 @@ mod workspace_scan_tests {
         fs::write(temp_dir.path().join("lowercase.r"), "y <- 2").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
-        assert_eq!(index.len(), 2, "Should find both .R and .r files");
+        assert_eq!(new_index_entries.len(), 2, "Should find both .R and .r files");
         assert_eq!(cross_file_entries.len(), 2, "Should have 2 cross-file entries");
         assert_eq!(new_index_entries.len(), 2, "Should have 2 new index entries");
         
         // Verify both files are indexed
-        let uris: Vec<String> = index.keys().map(|u| u.to_string()).collect();
+        let uris: Vec<String> = new_index_entries.keys().map(|u| u.to_string()).collect();
         assert!(uris.iter().any(|u| u.contains("uppercase.R")), "Should find uppercase.R");
         assert!(uris.iter().any(|u| u.contains("lowercase.r")), "Should find lowercase.r");
     }
@@ -129,7 +129,7 @@ mod workspace_scan_tests {
         fs::write(&test_file, "my_func <- function() { 42 }").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (_, cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (cross_file_entries, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(cross_file_entries.len(), 1);
         assert_eq!(new_index_entries.len(), 1);
@@ -157,9 +157,9 @@ mod workspace_scan_tests {
         fs::write(subdir.join("nested.r"), "y <- 2").unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (_, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
-        assert_eq!(index.len(), 2, "Should find files in root and subdirectory");
+        assert_eq!(new_index_entries.len(), 2, "Should find files in root and subdirectory");
         assert_eq!(new_index_entries.len(), 2, "Should have 2 new index entries");
     }
 
@@ -171,11 +171,12 @@ mod workspace_scan_tests {
         let test_file = temp_dir.path().join("complete.r");
         fs::write(&test_file, r#"
 library(dplyr)
+data("flights", package = "nycflights13")
 my_func <- function(x) { x + 1 }
 "#).unwrap();
         
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (_, _, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (_, new_index_entries) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(new_index_entries.len(), 1);
         
@@ -185,6 +186,11 @@ my_func <- function(x) { x + 1 }
         assert!(!entry.contents.to_string().is_empty(), "Should have contents");
         assert!(entry.tree.is_some(), "Should have parsed tree");
         assert!(entry.loaded_packages.contains(&"dplyr".to_string()), "Should have loaded packages");
+        assert_eq!(
+            entry.data_packages,
+            vec!["nycflights13"],
+            "Should preserve data() package hints for CLI warming"
+        );
         assert!(entry.snapshot.size > 0, "Should have valid snapshot");
         assert!(entry.artifacts.exported_interface.contains_key("my_func"), 
             "Should have exported symbols in artifacts");
@@ -211,11 +217,11 @@ my_func <- function(x) { x + 1 }
         fs::write(temp_dir.path().join("main.R"), "x <- 1").unwrap();
 
         let workspace_url = Url::from_file_path(temp_dir.path()).unwrap();
-        let (index, cross_file_entries, new_index_entries) =
+        let (cross_file_entries, new_index_entries) =
             scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
-        assert_eq!(index.len(), 1, "Only root main.R should be indexed, not .github/");
-        let uris: Vec<String> = index.keys().map(|u| u.to_string()).collect();
+        assert_eq!(new_index_entries.len(), 1, "Only root main.R should be indexed, not .github/");
+        let uris: Vec<String> = new_index_entries.keys().map(|u| u.to_string()).collect();
         assert!(uris.iter().any(|u| u.contains("main.R")));
         assert!(!uris.iter().any(|u| u.contains(".github")),
             ".github/ R files must not be scanned");
@@ -260,16 +266,16 @@ mod jags_stan_indexing_tests {
         fs::write(dir.join("readme.txt"), "not indexed").unwrap();
 
         let workspace_url = Url::from_file_path(dir).unwrap();
-        let (index, cross_file_entries, new_index_entries) =
+        let (cross_file_entries, new_index_entries) =
             scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         // All R, JAGS, and Stan files should be indexed (4 total), .txt excluded
-        assert_eq!(index.len(), 4, "Should index .jags, .bugs, .stan, and .R files");
+        assert_eq!(new_index_entries.len(), 4, "Should index .jags, .bugs, .stan, and .R files");
         assert_eq!(cross_file_entries.len(), 4, "Should have 4 cross-file entries");
         assert_eq!(new_index_entries.len(), 4, "Should have 4 new index entries");
 
         // Verify specific files are indexed by checking URIs
-        let uris: Vec<String> = index.keys().map(|u| u.to_string()).collect();
+        let uris: Vec<String> = new_index_entries.keys().map(|u| u.to_string()).collect();
         assert!(uris.iter().any(|u| u.contains("model.jags")), "Should index .jags files");
         assert!(uris.iter().any(|u| u.contains("model.bugs")), "Should index .bugs files");
         assert!(uris.iter().any(|u| u.contains("model.stan")), "Should index .stan files");
@@ -288,7 +294,7 @@ mod jags_stan_indexing_tests {
         fs::write(dir.join("upper.STAN"), "data { int N; }").unwrap();
 
         let workspace_url = Url::from_file_path(dir).unwrap();
-        let (index, _, _) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
+        let (_, index) = scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
         assert_eq!(index.len(), 3, "Should index uppercase JAGS/BUGS/STAN extensions");
     }
@@ -347,12 +353,12 @@ mod jags_stan_indexing_property_tests {
             fs::write(&file_path, "model { x ~ dnorm(0, 1) }").unwrap();
 
             let workspace_url = Url::from_file_path(dir).unwrap();
-            let (index, _, new_index_entries) =
+            let (_, new_index_entries) =
                 scan_workspace(&[workspace_url], TEST_MAX_CHAIN_DEPTH);
 
             // The file must be present in the index
             prop_assert_eq!(
-                index.len(), 1,
+                new_index_entries.len(), 1,
                 "File '{}' should be indexed", filename
             );
             prop_assert_eq!(
@@ -361,7 +367,7 @@ mod jags_stan_indexing_property_tests {
             );
 
             // Verify the indexed URI matches the exact file path
-            let uri = index.keys().next().unwrap();
+            let uri = new_index_entries.keys().next().unwrap();
             let expected_uri = Url::from_file_path(&file_path).unwrap();
             prop_assert_eq!(
                 uri, &expected_uri,
@@ -1618,4 +1624,3 @@ mod package_testthat_visibility_tests {
         );
     }
 }
-

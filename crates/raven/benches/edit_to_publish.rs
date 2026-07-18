@@ -152,9 +152,9 @@ fn build_state(workspace: &Path) -> (WorldState, Arc<Url>) {
         state.open_document_with_language_id(uri.clone(), &content, Some(1), Some("r"));
     }
 
-    let (index, cross_file_entries, new_index_entries) =
+    let (cross_file_entries, new_index_entries) =
         scan_workspace(std::slice::from_ref(&folder_url), 20);
-    state.apply_workspace_index(index, cross_file_entries, new_index_entries);
+    state.apply_workspace_index(cross_file_entries, new_index_entries);
 
     (state, Arc::new(folder_url))
 }
