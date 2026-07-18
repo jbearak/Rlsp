@@ -304,11 +304,15 @@ changes. Full seed/reseed installation deliberately mints a fresh routing owner
 even for value-equal routing so detached convergence cannot attach to a prior
 seed lifecycle. `OpenInstall` and `OpenClose` derive their complete package
 projection off-lock and install it only after the surrounding open-analysis
-basis passes preflight; `OpenEdit` applies its already-translated package delta
-inside the same outer commit seam. Package state therefore cannot become
-visible without the matching document, graph, lifecycle, and fanout
-transaction. When any of those projections changes routing, the open commit
-returns its exact routing owner plus unmarked record/diagnostic candidates.
+basis passes preflight. `OpenEdit` does the same for live `.Rprofile`, an
+already-known Rprofile sourced helper, and testthat preamble/source-closure
+edits: it overlays the exact prepared Rope, scans both source-following inputs
+off-lock, batches those deltas with any ordinary package-file event, derives
+once, and installs the complete projection with the document and graph CAS.
+Package state therefore cannot become visible without the matching document,
+graph, lifecycle, and fanout transaction. When any of those projections
+changes routing, the open commit returns its exact routing owner plus unmarked
+record/diagnostic candidates.
 `didOpen`/`didChange`/`didClose` converge `system.file()` for that owner before
 one shared cap-and-reservation step unions the routing transfer with the outer
 fanout. Candidates retain their outer reservation policy through that union:
@@ -317,6 +321,18 @@ force-marked, while dependent/system candidates keep dependent priority,
 debounce, and force ownership. Retry exhaustion transfers those same exact
 identities and policies to delayed work, so closing and reopening a URI cannot
 redirect an old transaction's marker into the new lifecycle.
+
+After a detached package seed installs, Rprofile and testthat preamble replay
+also form one projection rather than two tails. One package/open-context basis
+owns both scans and the single CAS, so observers see old/old before it and
+new/new afterward. Three rejected whole-pair attempts transfer ownership to one
+coalesced worker keyed by the exact seed identity. A newer seed or an
+authoritative live/config successor cancels that owner; otherwise the worker
+retains both groups and their exact candidates until a stable CAS succeeds,
+then hands them to the usual capped finalizer once. If the same seed still has
+deferred `system.file()` convergence, the tail waits behind that routing owner:
+advancing the package generations first would otherwise invalidate the seed
+identity while its routing transfer is still live.
 
 `didOpen` additionally owns a never-reused per-URI intent generation, whose
 arrival-time target record cannot rebase across an edit, close/reopen, metadata

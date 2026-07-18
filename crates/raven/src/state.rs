@@ -821,6 +821,9 @@ pub struct WorldState {
     /// Exact seed owner currently assigned to the coalesced deferred
     /// system-file convergence worker.
     pending_system_file_seed_retry: Option<PackageSeedInstalledIdentity>,
+    /// Exact seed owner currently assigned to the coalesced deferred
+    /// Rprofile+preamble convergence worker.
+    pending_post_seed_refresh_retry: Option<PackageSeedInstalledIdentity>,
     /// Dedicated latest-owner identity for all `system.file()` routing inputs.
     ///
     /// This is deliberately narrower than `package_input_generation`: unrelated
@@ -925,6 +928,17 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) open_edit_fallback_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic barriers for detached live/post-seed package projections.
+    #[cfg(test)]
+    pub(crate) live_package_open_edit_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) post_seed_refresh_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) post_seed_refresh_test_reject_remaining: usize,
+    #[cfg(test)]
+    pub(crate) post_seed_refresh_test_commit_attempts: usize,
     #[cfg(test)]
     pub(crate) force_open_edit_overflow_for_test: bool,
     #[cfg(test)]
@@ -1587,7 +1601,32 @@ impl PreparedOpenEditAnalysis {
             uri: edit.uri,
             prepared: edit.prepared,
             metadata,
+            package: None,
             plan,
+        }
+    }
+
+    pub(crate) fn with_package(
+        edit: PreparedOpenEdit,
+        metadata: Arc<crate::cross_file::CrossFileMetadata>,
+        package: PreparedPackageProjection,
+        plan: PreparedOpenCommitPlan,
+    ) -> Self {
+        Self {
+            basis: edit.basis,
+            uri: edit.uri,
+            prepared: edit.prepared,
+            metadata,
+            package: Some(package),
+            plan,
+        }
+    }
+
+    pub(crate) fn into_prepared_edit(self) -> PreparedOpenEdit {
+        PreparedOpenEdit {
+            basis: self.basis,
+            uri: self.uri,
+            prepared: self.prepared,
         }
     }
 }
@@ -2099,6 +2138,7 @@ pub(crate) struct PreparedOpenEditAnalysis {
     uri: Url,
     prepared: PreparedOpenDocument,
     metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    package: Option<PreparedPackageProjection>,
     plan: PreparedOpenCommitPlan,
 }
 
@@ -2336,6 +2376,33 @@ impl WorldState {
     ) {
         if self.pending_system_file_seed_retry == Some(identity) {
             self.pending_system_file_seed_retry = None;
+        }
+    }
+
+    pub(crate) fn begin_post_seed_refresh_retry(
+        &mut self,
+        identity: PackageSeedInstalledIdentity,
+    ) -> bool {
+        if self.pending_post_seed_refresh_retry == Some(identity) {
+            return false;
+        }
+        self.pending_post_seed_refresh_retry = Some(identity);
+        true
+    }
+
+    pub(crate) fn post_seed_refresh_retry_is_current(
+        &self,
+        identity: PackageSeedInstalledIdentity,
+    ) -> bool {
+        self.pending_post_seed_refresh_retry == Some(identity)
+    }
+
+    pub(crate) fn complete_post_seed_refresh_retry(
+        &mut self,
+        identity: PackageSeedInstalledIdentity,
+    ) {
+        if self.pending_post_seed_refresh_retry == Some(identity) {
+            self.pending_post_seed_refresh_retry = None;
         }
     }
 }
@@ -3394,6 +3461,7 @@ impl WorldState {
             package_library_content_generation: 0,
             package_seed_install_id: 0,
             pending_system_file_seed_retry: None,
+            pending_post_seed_refresh_retry: None,
             system_file_routing_owner_generation: Self::mint_system_file_routing_owner_generation(),
 
             // Caches
@@ -3473,6 +3541,16 @@ impl WorldState {
             #[cfg(test)]
             open_edit_fallback_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            live_package_open_edit_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            post_seed_refresh_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            post_seed_refresh_test_reject_remaining: 0,
+            #[cfg(test)]
+            post_seed_refresh_test_commit_attempts: 0,
             #[cfg(test)]
             force_open_edit_overflow_for_test: false,
             #[cfg(test)]
@@ -4705,6 +4783,13 @@ impl WorldState {
         self.analysis_basis_is_current(&edit.basis, &edit.uri, &HashSet::new())
     }
 
+    pub(crate) fn open_edit_analysis_basis_is_current(
+        &self,
+        edit: &PreparedOpenEditAnalysis,
+    ) -> bool {
+        self.analysis_basis_is_current(&edit.basis, &edit.uri, &HashSet::from([edit.uri.clone()]))
+    }
+
     pub(crate) fn rebase_open_edit_if_subject_current(
         &self,
         mut edit: PreparedOpenEdit,
@@ -5538,10 +5623,17 @@ impl WorldState {
         for raw_uri in raw_uris {
             self.cross_file_file_cache.invalidate(&raw_uri);
         }
+        let package_routing_owner = prepared
+            .package
+            .and_then(|package| self.install_prepared_package_projection(package));
         let packages_to_prefetch = prepared.plan.packages_to_prefetch.clone();
-        let plan_effects =
-            self.apply_open_commit_plan(&prepared.uri, old_interface, prepared.plan, false);
-        let package_routing_owner = plan_effects.package_routing_owner;
+        let plan_effects = self.apply_open_commit_plan(
+            &prepared.uri,
+            old_interface,
+            prepared.plan,
+            package_routing_owner.is_some(),
+        );
+        let package_routing_owner = plan_effects.package_routing_owner.or(package_routing_owner);
         self.advance_workspace_graph_authority_generation();
         self.advance_open_context_authority_generation();
         Ok(AnalysisCommitEffects {

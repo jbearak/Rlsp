@@ -140,6 +140,8 @@ const OPEN_LIFECYCLE_ADDED_EFFECTS_COMPLETE_PAUSE_URI: &str =
     "raven-test://open-lifecycle/added-effects-complete";
 #[cfg(test)]
 const WORKSPACE_SCAN_PRE_COMMIT_PAUSE_URI: &str = "raven-test://workspace-scan/pre-commit";
+#[cfg(test)]
+const POST_SEED_REFRESH_PRE_COMMIT_PAUSE_URI: &str = "raven-test://post-seed-refresh/pre-commit";
 
 /// Parse the VS Code client's initial tab/peek resource set.
 ///
@@ -2087,6 +2089,7 @@ fn translate_package_event(
     })
 }
 
+#[cfg(test)]
 fn apply_rprofile_scan_to_state(
     state: &mut WorldState,
     scan: Option<crate::package_state::rprofile::RprofileScan>,
@@ -2843,6 +2846,7 @@ fn is_package_scope_workspace_r_open_document(
     package_scope_workspace_r_path_for_open_document(state, open_uri, root).is_some()
 }
 
+#[cfg(test)]
 fn authoritative_rprofile_root_for_open_document(
     state: &WorldState,
     open_uri: &Url,
@@ -2852,6 +2856,28 @@ fn authoritative_rprofile_root_for_open_document(
     state
         .authoritative_open_uri_for_path(open_uri, &rprofile_path)
         .map(|_| root.clone())
+}
+
+/// Return the package root when an open document owns either the root
+/// `.Rprofile` route or a member of its last committed sourced closure.
+///
+/// The closure membership check is deliberately based on the committed input
+/// projection. A live edit then recomputes the whole closure and installs it in
+/// the same OpenEdit transaction, so a helper cannot expose new document facts
+/// while leaving the old Rprofile prelude visible.
+fn rprofile_sourced_root_for_open_document(
+    state: &WorldState,
+    open_uri: &Url,
+) -> Option<std::path::PathBuf> {
+    if !state.package_inputs.model_rprofile {
+        return None;
+    }
+    let root = state.package_inputs.workspace_root.as_ref()?;
+    let sourced = &state.package_inputs.rprofile_sourced_files;
+    file_paths_for_open_document(state, open_uri)
+        .into_iter()
+        .any(|path| path == root.join(".Rprofile") || path_in_rprofile_sourced_set(&path, sourced))
+        .then(|| root.clone())
 }
 
 fn file_paths_for_open_document(state: &WorldState, open_uri: &Url) -> Vec<std::path::PathBuf> {
@@ -2974,6 +3000,7 @@ fn authoritative_open_rprofile_uris<'a>(
     })
 }
 
+#[cfg(test)]
 fn snapshot_authoritative_open_rprofile(
     state: &WorldState,
     root: &std::path::Path,
@@ -4001,17 +4028,16 @@ async fn complete_startup_without_workspace_scan(
     } else {
         (None, None)
     };
-    if let Some(root) = seeded_root {
+    if let (Some(root), Some(seed)) = (seeded_root, installed.as_mut()) {
         let affected = Backend::refresh_open_package_inputs_after_seed(
             handles.state.clone(),
             handles.client.clone(),
             handles.traversal_truncation.clone(),
             root,
+            seed.identity,
         )
         .await;
-        if let Some(installed) = installed.as_mut() {
-            installed.post_seed_candidates = affected;
-        }
+        seed.post_seed_candidates = affected;
     }
     let tickets = {
         let mut state = handles.state.write().await;
@@ -4563,17 +4589,23 @@ const PACKAGE_SEED_MAX_ATTEMPTS: usize = 3;
 const PACKAGE_SEED_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 struct SeedInstalled {
-    _identity: PackageSeedInstalledIdentity,
+    identity: PackageSeedInstalledIdentity,
     system_file: Option<SystemFileTransferredEffects>,
     deferred_system_file: Option<PackageSeedInstalledIdentity>,
     post_seed_candidates: Vec<AnalysisTransferCandidate>,
 }
 
+#[cfg(test)]
 struct PackageRefreshApply {
     applied: bool,
+    #[allow(
+        dead_code,
+        reason = "retained for low-level stale-scan ownership probes"
+    )]
     candidates: Vec<AnalysisTransferCandidate>,
 }
 
+#[cfg(test)]
 impl PackageRefreshApply {
     fn empty(applied: bool) -> Self {
         Self {
@@ -4581,6 +4613,152 @@ impl PackageRefreshApply {
             candidates: Vec::new(),
         }
     }
+}
+
+struct CapturedCombinedPostSeedRefresh {
+    basis: PackageProjectionBasis,
+    inputs: crate::package_state::PackageInputs,
+    state: crate::package_state::PackageState,
+    root: std::path::PathBuf,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    overrides: crate::package_state::preamble::PreambleTextOverrides,
+    preamble_paths: Vec<std::path::PathBuf>,
+    refresh_rprofile: bool,
+    rprofile_fanout_uris: Vec<Url>,
+    preamble_fanout_uris: Vec<Url>,
+}
+
+struct DerivedCombinedPostSeedRefresh {
+    basis: PackageProjectionBasis,
+    package: PreparedPackageProjection,
+    affected_uris: Vec<Url>,
+}
+
+enum CombinedPostSeedRefreshOutcome {
+    NotApplicable,
+    Committed(Vec<AnalysisTransferCandidate>),
+    Superseded,
+    Deferred,
+}
+
+fn capture_combined_post_seed_refresh(
+    state: &WorldState,
+    root: &std::path::Path,
+) -> Option<CapturedCombinedPostSeedRefresh> {
+    let (preamble_paths, _) = snapshot_open_preamble_documents(state);
+    let refresh_rprofile = state.package_inputs.model_rprofile
+        && state.documents.keys().any(|uri| {
+            file_paths_for_open_document(state, uri)
+                .into_iter()
+                .any(|path| {
+                    path == root.join(".Rprofile")
+                        || path_in_rprofile_sourced_set(
+                            &path,
+                            &state.package_inputs.rprofile_sourced_files,
+                        )
+                })
+        });
+    if !refresh_rprofile && preamble_paths.is_empty() {
+        return None;
+    }
+    let rprofile_fanout_uris = if refresh_rprofile {
+        state
+            .documents
+            .keys()
+            .filter(|uri| is_package_scope_workspace_r_open_document(state, uri, root))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let preamble_fanout_uris = if preamble_paths.is_empty() {
+        Vec::new()
+    } else {
+        let testthat = root.join("tests/testthat");
+        state
+            .documents
+            .keys()
+            .filter(|uri| {
+                package_scope_workspace_r_path_for_open_document(state, uri, root).is_some_and(
+                    |path| path.starts_with(&testthat) && !preamble_paths.contains(&path),
+                )
+            })
+            .cloned()
+            .collect()
+    };
+    Some(CapturedCombinedPostSeedRefresh {
+        basis: state.capture_package_projection_basis(),
+        inputs: state.package_inputs.clone(),
+        state: state.package_state.clone(),
+        root: root.to_path_buf(),
+        exclusions: state.workspace_exclusions.clone(),
+        overrides: snapshot_preamble_text_overrides(state),
+        preamble_paths,
+        refresh_rprofile,
+        rprofile_fanout_uris,
+        preamble_fanout_uris,
+    })
+}
+
+fn derive_combined_post_seed_refresh(
+    mut captured: CapturedCombinedPostSeedRefresh,
+) -> Option<DerivedCombinedPostSeedRefresh> {
+    let mut deltas = Vec::new();
+    let mut rprofile_changed = false;
+    if captured.refresh_rprofile {
+        let scan =
+            crate::package_state::rprofile::scan_workspace_rprofile_with_overrides_and_exclusions(
+                &captured.root,
+                &captured.overrides,
+                &captured.exclusions,
+            );
+        if let Some(delta) =
+            crate::package_state::event::apply_rprofile_scan(&mut captured.inputs, Some(scan))
+        {
+            deltas.push(delta);
+            rprofile_changed = true;
+        }
+    }
+    let mut preamble_changed = false;
+    if !captured.preamble_paths.is_empty() {
+        let (scan, _) = crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+            &captured.root,
+            crate::package_state::preamble::PreambleSnapshot::from_inputs(&captured.inputs),
+            &captured.preamble_paths,
+            &captured.overrides,
+            &captured.exclusions,
+        );
+        if let Some(delta) =
+            crate::package_state::event::apply_preamble_scan(&mut captured.inputs, Some(scan))
+        {
+            deltas.push(delta);
+            preamble_changed = true;
+        }
+    }
+    if deltas.is_empty() {
+        return None;
+    }
+    let delta = if deltas.len() == 1 {
+        deltas.pop().expect("one post-seed package delta")
+    } else {
+        crate::package_state::PackageInputDelta::Batch(deltas)
+    };
+    let next =
+        crate::package_state::derive_package_state(&captured.state, &captured.inputs, &delta);
+    let mut affected_uris = Vec::new();
+    if rprofile_changed {
+        affected_uris.extend(captured.rprofile_fanout_uris);
+    }
+    if preamble_changed {
+        affected_uris.extend(captured.preamble_fanout_uris);
+    }
+    affected_uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    affected_uris.dedup();
+    Some(DerivedCombinedPostSeedRefresh {
+        basis: captured.basis,
+        package: PreparedPackageProjection::new(captured.inputs, next),
+        affected_uris,
+    })
 }
 
 #[derive(Clone)]
@@ -4598,6 +4776,159 @@ impl PackageSeedTaskHandles {
             traversal_truncation: backend.traversal_truncation.clone(),
         }
     }
+}
+
+async fn attempt_combined_post_seed_refresh(
+    state_arc: &Arc<RwLock<WorldState>>,
+    root: &std::path::Path,
+    identity: PackageSeedInstalledIdentity,
+) -> CombinedPostSeedRefreshOutcome {
+    for _attempt in 0..3 {
+        let captured = {
+            let state = state_arc.read().await;
+            if !state.package_seed_installed_identity_is_current(identity) {
+                return CombinedPostSeedRefreshOutcome::Superseded;
+            }
+            if state.system_file_seed_retry_is_current(identity) {
+                // This exact seed still owns unfinished routing convergence.
+                // Installing the tail projection would advance package record
+                // generations and make the seed-scoped routing worker look
+                // stale. Retain both source-following groups behind that owner;
+                // the coalesced post-seed worker retries after routing clears.
+                return CombinedPostSeedRefreshOutcome::Deferred;
+            }
+            if state.package_inputs.workspace_root.as_deref() != Some(root) {
+                return CombinedPostSeedRefreshOutcome::Superseded;
+            }
+            capture_combined_post_seed_refresh(&state, root)
+        };
+        let Some(captured) = captured else {
+            return CombinedPostSeedRefreshOutcome::NotApplicable;
+        };
+        let Ok(derived) =
+            tokio::task::spawn_blocking(move || derive_combined_post_seed_refresh(captured)).await
+        else {
+            continue;
+        };
+        let Some(derived) = derived else {
+            return CombinedPostSeedRefreshOutcome::NotApplicable;
+        };
+        #[cfg(test)]
+        {
+            let pause = {
+                let state = state_arc.read().await;
+                state
+                    .post_seed_refresh_pre_commit_test_pause
+                    .take_armed(&Url::parse(POST_SEED_REFRESH_PRE_COMMIT_PAUSE_URI).unwrap())
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+        let mut state = state_arc.write().await;
+        #[cfg(test)]
+        {
+            state.post_seed_refresh_test_commit_attempts = state
+                .post_seed_refresh_test_commit_attempts
+                .saturating_add(1);
+            if state.post_seed_refresh_test_reject_remaining > 0 {
+                state.post_seed_refresh_test_reject_remaining -= 1;
+                continue;
+            }
+        }
+        if !state.package_seed_installed_identity_is_current(identity) {
+            return CombinedPostSeedRefreshOutcome::Superseded;
+        }
+        if state
+            .try_install_prepared_package_projection(&derived.basis, derived.package)
+            .is_err()
+        {
+            continue;
+        }
+        let candidates = state.capture_analysis_transfer_candidates(derived.affected_uris);
+        return CombinedPostSeedRefreshOutcome::Committed(candidates);
+    }
+    if state_arc
+        .read()
+        .await
+        .package_seed_installed_identity_is_current(identity)
+    {
+        CombinedPostSeedRefreshOutcome::Deferred
+    } else {
+        CombinedPostSeedRefreshOutcome::Superseded
+    }
+}
+
+async fn schedule_post_seed_refresh_retry(
+    handles: PackageSeedTaskHandles,
+    root: std::path::PathBuf,
+    identity: PackageSeedInstalledIdentity,
+) {
+    {
+        let mut state = handles.state.write().await;
+        if !state.package_seed_installed_identity_is_current(identity)
+            || !state.begin_post_seed_refresh_retry(identity)
+        {
+            return;
+        }
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+            {
+                let mut state = handles.state.write().await;
+                if !state.post_seed_refresh_retry_is_current(identity) {
+                    return;
+                }
+                if !state.package_seed_installed_identity_is_current(identity) {
+                    state.complete_post_seed_refresh_retry(identity);
+                    return;
+                }
+            }
+            match attempt_combined_post_seed_refresh(&handles.state, &root, identity).await {
+                CombinedPostSeedRefreshOutcome::Deferred => continue,
+                CombinedPostSeedRefreshOutcome::Superseded => {
+                    handles
+                        .state
+                        .write()
+                        .await
+                        .complete_post_seed_refresh_retry(identity);
+                    return;
+                }
+                CombinedPostSeedRefreshOutcome::NotApplicable => {
+                    handles
+                        .state
+                        .write()
+                        .await
+                        .complete_post_seed_refresh_retry(identity);
+                    return;
+                }
+                CombinedPostSeedRefreshOutcome::Committed(candidates) => {
+                    let tickets = {
+                        let mut state = handles.state.write().await;
+                        if !state.post_seed_refresh_retry_is_current(identity) {
+                            return;
+                        }
+                        let tickets = finalize_exact_analysis_handoff_candidates(
+                            &mut state,
+                            Vec::new(),
+                            candidates,
+                        );
+                        state.complete_post_seed_refresh_retry(identity);
+                        tickets
+                    };
+                    Backend::publish_diagnostics_for_tickets_bounded(
+                        handles.state.clone(),
+                        handles.client.clone(),
+                        tickets,
+                        Some(handles.traversal_truncation.clone()),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    });
 }
 
 async fn schedule_system_file_seed_retry(
@@ -4832,7 +5163,7 @@ where
                         SystemFileConvergenceOutcome::Deferred => (None, Some(identity)),
                     };
                 return StandalonePackageOutcome::Committed(SeedInstalled {
-                    _identity: identity,
+                    identity,
                     system_file,
                     deferred_system_file,
                     post_seed_candidates: Vec::new(),
@@ -4926,6 +5257,7 @@ async fn schedule_package_seed_retry(handles: PackageSeedTaskHandles) {
                 handles.client.clone(),
                 handles.traversal_truncation.clone(),
                 root,
+                installed.identity,
             )
             .await;
             let tickets = {
@@ -6042,6 +6374,351 @@ fn derive_open_edit_fallback(
     plan.reset_closed_roots = captured.graph_roots;
     plan.refresh_pins = true;
     (local_metadata, plan)
+}
+
+struct CapturedLivePackageOpenEdit {
+    prepared: crate::state::PreparedOpenEdit,
+    metadata: crate::cross_file::CrossFileMetadata,
+    plan: PreparedOpenCommitPlan,
+    package_inputs: crate::package_state::PackageInputs,
+    package_state: crate::package_state::PackageState,
+    package_text_overrides: crate::package_state::preamble::PreambleTextOverrides,
+    candidate_paths: Vec<std::path::PathBuf>,
+    exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    root: Option<std::path::PathBuf>,
+    package_fanout_uris: Vec<Url>,
+    rprofile_fanout_uris: Vec<Url>,
+    preamble_fanout_uris: Vec<Url>,
+}
+
+fn capture_live_package_open_edit(
+    state: &WorldState,
+    uri: &Url,
+    prepared: crate::state::PreparedOpenEdit,
+) -> CapturedLivePackageOpenEdit {
+    let old_meta = state.get_enriched_metadata(uri);
+    let text = prepared.document().analysis_text();
+    let (metadata, mut attempted_contexts) =
+        extract_enriched_live_metadata_with_contexts(state, uri, &text);
+    let workspace_root = state.workspace_folders.first().cloned();
+    let packages_to_prefetch = if state.cross_file_config.packages_enabled {
+        let mut packages =
+            edited_document_warm_packages(&metadata.library_calls, prepared.document());
+        packages.extend(namespace_warm_packages(&metadata));
+        packages
+    } else {
+        Vec::new()
+    };
+    let (graph, _graph_roots, graph_contexts) = prepare_open_graph_plan(
+        state,
+        uri,
+        old_meta.as_deref(),
+        &metadata,
+        workspace_root.as_ref(),
+        false,
+    );
+    attempted_contexts.extend(graph_contexts);
+
+    let package_event_uri = state
+        .package_inputs
+        .workspace_root
+        .as_ref()
+        .and_then(|root| {
+            authoritative_package_input_uri_for_open_document(state, uri, root)
+                .map(|package_input| package_input.uri().clone())
+        });
+    let package_text = package_event_uri
+        .as_ref()
+        .map(|_| Arc::<str>::from(prepared.document().text()));
+    let (package_fanout_uris, package_source_interface_fanout) =
+        if let Some(package) = state.package_workspace() {
+            let fanout = state
+                .documents
+                .keys()
+                .filter(|open_uri| {
+                    is_authoritative_package_source_open_uri(state, open_uri, &package.root)
+                })
+                .cloned()
+                .collect();
+            let source_edit =
+                authoritative_package_r_file_kind_for_open_document(state, uri, &package.root)
+                    == Some(crate::package_state::RFileKind::Source);
+            (fanout, source_edit)
+        } else {
+            (Vec::new(), false)
+        };
+    let mut plan = PreparedOpenCommitPlan {
+        graph,
+        package_event: package_event_uri.zip(package_text),
+        package_fanout_uris: package_fanout_uris.clone(),
+        package_source_interface_fanout,
+        packages_to_prefetch,
+        ..PreparedOpenCommitPlan::default()
+    };
+    let prepared = match state.attach_open_edit_context_authorities(prepared, attempted_contexts) {
+        Ok(prepared) => prepared,
+        Err(prepared) => {
+            log::warn!(
+                "didChange for {uri} exceeded the open-analysis authority ceiling; \
+                 deriving local graph facts while retaining the atomic package projection"
+            );
+            let captured =
+                capture_open_edit_fallback(state, uri, &prepared, state.get_enriched_metadata(uri));
+            let (local_metadata, local_plan) = derive_open_edit_fallback(captured);
+            plan = local_plan;
+            return capture_live_package_open_edit_tail(
+                state,
+                uri,
+                *prepared,
+                local_metadata,
+                plan,
+                package_fanout_uris,
+            );
+        }
+    };
+    capture_live_package_open_edit_tail(state, uri, prepared, metadata, plan, package_fanout_uris)
+}
+
+fn capture_live_package_open_edit_tail(
+    state: &WorldState,
+    uri: &Url,
+    prepared: crate::state::PreparedOpenEdit,
+    metadata: crate::cross_file::CrossFileMetadata,
+    plan: PreparedOpenCommitPlan,
+    package_fanout_uris: Vec<Url>,
+) -> CapturedLivePackageOpenEdit {
+    let root = state.package_inputs.workspace_root.clone();
+    let mut package_text_overrides = snapshot_preamble_text_overrides(state);
+    let mut candidate_paths = file_paths_for_open_document(state, uri);
+    candidate_paths.sort();
+    candidate_paths.dedup();
+    for path in &candidate_paths {
+        package_text_overrides.insert(path.clone(), prepared.document().contents.clone());
+        package_text_overrides.insert(
+            crate::package_state::preamble::canonicalize_for_routing(path),
+            prepared.document().contents.clone(),
+        );
+    }
+    let rprofile_fanout_uris = root
+        .as_deref()
+        .map(|root| {
+            state
+                .documents
+                .keys()
+                .filter(|open_uri| {
+                    is_package_scope_workspace_r_open_document(state, open_uri, root)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let preamble_fanout_uris = root
+        .as_deref()
+        .map(|root| {
+            let testthat = root.join("tests/testthat");
+            state
+                .documents
+                .keys()
+                .filter(|open_uri| {
+                    package_scope_workspace_r_path_for_open_document(state, open_uri, root)
+                        .is_some_and(|path| path.starts_with(&testthat))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    CapturedLivePackageOpenEdit {
+        prepared,
+        metadata,
+        plan,
+        package_inputs: state.package_inputs.clone(),
+        package_state: state.package_state.clone(),
+        package_text_overrides,
+        candidate_paths,
+        exclusions: state.workspace_exclusions.clone(),
+        root,
+        package_fanout_uris,
+        rprofile_fanout_uris,
+        preamble_fanout_uris,
+    }
+}
+
+fn derive_live_package_open_edit(
+    mut captured: CapturedLivePackageOpenEdit,
+) -> PreparedOpenEditAnalysis {
+    let Some(root) = captured.root.as_ref() else {
+        return PreparedOpenEditAnalysis::new(
+            captured.prepared,
+            Arc::new(captured.metadata),
+            captured.plan,
+        );
+    };
+    let affects_rprofile = captured.package_inputs.model_rprofile
+        && captured.candidate_paths.iter().any(|path| {
+            path == &root.join(".Rprofile")
+                || path_in_rprofile_sourced_set(
+                    path,
+                    &captured.package_inputs.rprofile_sourced_files,
+                )
+        });
+    let affects_preamble = captured.package_inputs.package_mode
+        != crate::cross_file::config::PackageMode::Disabled
+        && captured.candidate_paths.iter().any(|path| {
+            crate::package_state::preamble::is_testthat_preamble_path(path, root)
+                || path_in_rprofile_sourced_set(
+                    path,
+                    &captured.package_inputs.preamble_sourced_files,
+                )
+        });
+    if !affects_rprofile && !affects_preamble {
+        return PreparedOpenEditAnalysis::new(
+            captured.prepared,
+            Arc::new(captured.metadata),
+            captured.plan,
+        );
+    }
+
+    let mut deltas = Vec::new();
+    if let Some((event_uri, text)) = captured.plan.package_event.take()
+        && let Some(delta) = crate::package_state::event::translate(
+            &mut captured.package_inputs,
+            crate::package_state::event::HandlerEvent::DidChange {
+                uri: event_uri,
+                text,
+            },
+        )
+    {
+        deltas.push(delta);
+    }
+
+    let mut rprofile_changed = false;
+    if affects_rprofile {
+        let scan =
+            crate::package_state::rprofile::scan_workspace_rprofile_with_overrides_and_exclusions(
+                root,
+                &captured.package_text_overrides,
+                &captured.exclusions,
+            );
+        if let Some(delta) = crate::package_state::event::apply_rprofile_scan(
+            &mut captured.package_inputs,
+            Some(scan),
+        ) {
+            deltas.push(delta);
+            rprofile_changed = true;
+        }
+    }
+
+    let mut preamble_changed = false;
+    if affects_preamble {
+        let (scan, _) = crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
+            root,
+            crate::package_state::preamble::PreambleSnapshot::from_inputs(
+                &captured.package_inputs,
+            ),
+            &captured.candidate_paths,
+            &captured.package_text_overrides,
+            &captured.exclusions,
+        );
+        if let Some(delta) = crate::package_state::event::apply_preamble_scan(
+            &mut captured.package_inputs,
+            Some(scan),
+        ) {
+            deltas.push(delta);
+            preamble_changed = true;
+        }
+    }
+
+    if deltas.is_empty() {
+        return PreparedOpenEditAnalysis::new(
+            captured.prepared,
+            Arc::new(captured.metadata),
+            captured.plan,
+        );
+    }
+    let delta = if deltas.len() == 1 {
+        deltas.pop().expect("one live package delta")
+    } else {
+        crate::package_state::PackageInputDelta::Batch(deltas)
+    };
+    let next = crate::package_state::derive_package_state(
+        &captured.package_state,
+        &captured.package_inputs,
+        &delta,
+    );
+    let package_visibility_changed = next.namespace_model()
+        != captured.package_state.namespace_model()
+        || next.scope_contribution() != captured.package_state.scope_contribution();
+    if package_visibility_changed {
+        captured
+            .plan
+            .seed_revalidation_uris
+            .extend(captured.package_fanout_uris);
+    }
+    if rprofile_changed {
+        captured
+            .plan
+            .seed_revalidation_uris
+            .extend(captured.rprofile_fanout_uris);
+    }
+    if preamble_changed {
+        captured
+            .plan
+            .seed_revalidation_uris
+            .extend(captured.preamble_fanout_uris);
+    }
+    PreparedOpenEditAnalysis::with_package(
+        captured.prepared,
+        Arc::new(captured.metadata),
+        PreparedPackageProjection::new(captured.package_inputs, next),
+        captured.plan,
+    )
+}
+
+/// Prepare source-following package inputs off-lock and commit them with the
+/// exact OpenEdit that supplied the buffer override.
+///
+/// Any package/config/open-context drift rebases the still-current edit and
+/// recomputes the complete projection. A newer edit or close/reopen changes the
+/// subject token and supersedes this transaction wholesale.
+async fn commit_detached_live_package_open_edit(
+    state_arc: &Arc<RwLock<WorldState>>,
+    uri: &Url,
+    mut prepared: crate::state::PreparedOpenEdit,
+) -> Option<crate::state::AnalysisCommitEffects> {
+    for _attempt in 0..3 {
+        let captured = {
+            let state = state_arc.read().await;
+            prepared = state.rebase_open_edit_if_subject_current(prepared)?;
+            capture_live_package_open_edit(&state, uri, prepared)
+        };
+        let derived = tokio::task::spawn_blocking(move || derive_live_package_open_edit(captured))
+            .await
+            .ok()?;
+
+        #[cfg(test)]
+        {
+            let pause = {
+                let state = state_arc.read().await;
+                state
+                    .live_package_open_edit_pre_commit_test_pause
+                    .take_armed(uri)
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+        let mut state = state_arc.write().await;
+        if !state.open_edit_analysis_basis_is_current(&derived) {
+            prepared = derived.into_prepared_edit();
+            continue;
+        }
+        let effects = state
+            .try_commit_analysis(PreparedAnalysisCommit::OpenEdit(Box::new(derived)))
+            .expect("live package OpenEdit basis was checked under the same write lock");
+        state.cross_file_activity.record_recent(uri.clone());
+        return Some(effects);
+    }
+    None
 }
 
 /// Commit one over-ceiling edit with at most one fresh detached retry.
@@ -10931,6 +11608,10 @@ impl LanguageServer for Backend {
                                 client_clone.clone(),
                                 traversal_truncation.clone(),
                                 root,
+                                package_seed_installed
+                                    .as_ref()
+                                    .expect("checked installed seed")
+                                    .identity,
                             )
                             .await;
                             if let Some(installed) = package_seed_installed.as_mut() {
@@ -11563,14 +12244,29 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
         let changes = params.content_changes;
 
-        // When the edited document is the workspace-root `.Rprofile`, capture
-        // its (post-change) in-memory text so we can refresh the prelude from
-        // the live buffer AFTER releasing the lock (see
-        // `refresh_rprofile_prelude_from_buffer`). `.Rprofile` is a live R
-        // document, but its prelude is package-state rather than a graph edge,
-        // so the normal dependent fanout below does not cover it.
-        let mut rprofile_live_edit: Option<(std::path::PathBuf, Arc<str>)> = None;
-        let mut preamble_live_edit: Option<(std::path::PathBuf, Vec<std::path::PathBuf>)> = None;
+        // Source-following Rprofile/preamble scans can touch the filesystem and
+        // therefore run off-lock. Prepare the exact post-change document now;
+        // the detached helper recomputes graph and package projections from one
+        // basis and commits them together.
+        let detached_live_package_edit = {
+            let state = self.state.read().await;
+            (!state.is_project_excluded_uri(&uri)
+                && (rprofile_sourced_root_for_open_document(&state, &uri).is_some()
+                    || preamble_sourced_root_for_open_document(&state, &uri).is_some()))
+            .then(|| state.prepare_document_changes(&uri, changes.clone(), version))
+            .flatten()
+        };
+        let detached_live_effects = if let Some(prepared) = detached_live_package_edit {
+            let Some(effects) =
+                commit_detached_live_package_open_edit(&self.state, &uri, prepared).await
+            else {
+                log::trace!("discarding superseded live package didChange for {uri}");
+                return;
+            };
+            Some(effects)
+        } else {
+            None
+        };
 
         // Compute affected files and debounce config while holding write lock
         let (
@@ -11579,7 +12275,25 @@ impl LanguageServer for Backend {
             packages_enabled,
             package_library,
             package_routing,
-        ) = {
+        ) = if let Some(mut effects) = detached_live_effects {
+            let state = self.state.read().await;
+            let packages_enabled = state.cross_file_config.packages_enabled;
+            let package_library = state.package_library.clone();
+            let packages_to_prefetch = effects
+                .open
+                .as_ref()
+                .expect("open edit returns its immutable outcome")
+                .packages_to_prefetch
+                .clone();
+            let package_routing = effects.package_routing.take();
+            (
+                effects.revalidations,
+                packages_to_prefetch,
+                packages_enabled,
+                package_library,
+                package_routing,
+            )
+        } else {
             let mut state = self.state.write().await;
 
             if state.is_project_excluded_uri(&uri) {
@@ -11718,15 +12432,6 @@ impl LanguageServer for Backend {
                 log::warn!("Ignoring didChange for unopened document {uri}");
                 return;
             };
-            // Snapshot the post-change buffer text if this is the workspace-root
-            // `.Rprofile`, for the off-lock prelude refresh after this block.
-            if let Some(root) = authoritative_rprofile_root_for_open_document(&state, &uri) {
-                rprofile_live_edit = Some((root, Arc::<str>::from(prepared.document().text())));
-            }
-            if let Some(root) = preamble_sourced_root_for_open_document(&state, &uri) {
-                preamble_live_edit = Some((root, file_paths_for_open_document(&state, &uri)));
-            }
-
             // Capture package settings for background prefetch
             let packages_enabled = state.cross_file_config.packages_enabled;
             let package_library = state.package_library.clone();
@@ -11853,17 +12558,6 @@ impl LanguageServer for Backend {
                 .iter()
                 .map(|ticket| (ticket.uri.clone(), ticket.debounce_ms))
                 .collect();
-        }
-
-        // Live `.Rprofile` edit: refresh the prelude from the in-memory buffer
-        // (off-lock scan + apply + fanout) so open scripts/ update as you type.
-        if let Some((root, text)) = rprofile_live_edit {
-            self.refresh_rprofile_prelude_from_buffer(root, text).await;
-        }
-        if let Some((root, paths)) = preamble_live_edit {
-            let scheduled_uris = work_items.iter().map(|ticket| ticket.uri.clone()).collect();
-            self.refresh_testthat_preambles_for_paths(root, paths, &scheduled_uris)
-                .await;
         }
 
         // Background prefetch package exports (without holding WorldState lock)
@@ -13361,6 +14055,7 @@ impl Backend {
                     WorkspaceScanRunOutcome::Committed(applied_scan) => {
                         let root_for_pkg_inputs = applied_scan.workspace_root;
                         let workspace_exclusions = applied_scan.exclusions;
+                        let mut package_seed_identity = None;
                         workspace_scan_transfer = Some(applied_scan.transfer);
                         let package_seed = if let Some(root) = root_for_pkg_inputs.as_ref() {
                             Some(
@@ -13389,6 +14084,8 @@ impl Backend {
                             .await
                             .into_committed();
                             package_inputs_initialized_by_exclusion_reload = installed.is_some();
+                            package_seed_identity =
+                                installed.as_ref().map(|installed| installed.identity);
                             if let Some(transfer) = installed
                                 .as_ref()
                                 .and_then(|installed| installed.system_file.as_ref())
@@ -13413,7 +14110,8 @@ impl Backend {
                         // Close the seed-install TOCTOU window for preamble
                         // buffers opened/edited while the reseed was in flight.
                         if package_inputs_initialized_by_exclusion_reload
-                            && let Some(root) = root_for_pkg_inputs
+                            && let (Some(root), Some(identity)) =
+                                (root_for_pkg_inputs, package_seed_identity)
                         {
                             post_seed_candidates.extend(
                                 Backend::refresh_open_package_inputs_after_seed(
@@ -13421,6 +14119,7 @@ impl Backend {
                                     self.client.clone(),
                                     self.traversal_truncation.clone(),
                                     root,
+                                    identity,
                                 )
                                 .await,
                             );
@@ -14798,57 +15497,12 @@ impl Backend {
         self.check_and_warn_traversal_truncation().await;
     }
 
-    /// Live `.Rprofile` prelude refresh from the in-memory buffer
-    /// (`did_change`). `.Rprofile` is a live R document, but the prelude it
-    /// feeds into open `scripts/` and other non-namespace workspace R files is
-    /// package-state, not a cross-file graph edge — so an unsaved `.Rprofile`
-    /// edit is not picked up by the normal dependent fanout. Scans the prelude
-    /// from the buffer `text` OFF the write lock (the scan follows transitive
-    /// `source()` from disk), then applies + fans out. Mirrors the watched-file
-    /// (`did_change_watched_files`) `.Rprofile` fanout, but sourced from the
-    /// buffer instead of disk so the prelude tracks edits as you type.
-    async fn refresh_rprofile_prelude_from_buffer(&self, root: std::path::PathBuf, text: Arc<str>) {
-        let root_for_scan = root.clone();
-        let workspace_exclusions = self.state.read().await.workspace_exclusions.clone();
-        let Ok(scan) = tokio::task::spawn_blocking(move || {
-            crate::package_state::rprofile::scan_workspace_rprofile_with_root_text_and_exclusions(
-                &root_for_scan,
-                &text,
-                &workspace_exclusions,
-            )
-        })
-        .await
-        else {
-            return;
-        };
-        self.apply_rprofile_prelude_rescan(scan).await;
-    }
-
-    /// Shared tail of the live `.Rprofile` refresh: apply the already-scanned
-    /// (off-lock) prelude under the write lock via the lock-safe seam
-    /// ([`apply_rprofile_scan`]), then republish every open workspace R file
-    /// that consumes the prelude.
-    ///
-    /// [`apply_rprofile_scan`]: crate::package_state::event::apply_rprofile_scan
-    async fn apply_rprofile_prelude_rescan(
-        &self,
-        scan: crate::package_state::rprofile::RprofileScan,
-    ) {
-        let _ = Self::apply_rprofile_prelude_rescan_with(
-            &self.state,
-            self.client.clone(),
-            self.traversal_truncation.clone(),
-            scan,
-            None,
-        )
-        .await;
-    }
-
     /// Apply a completed `.Rprofile` scan, optionally only if the authoritative
     /// open buffer and package inputs still belong to the captured lifecycles.
     /// The commit-time check prevents a seed refresh scanned for a closed
     /// lifecycle, older package generation, root, or exclusion/config identity
     /// from overwriting current state.
+    #[cfg(test)]
     async fn apply_rprofile_prelude_rescan_with(
         state_arc: &Arc<RwLock<WorldState>>,
         client: Client,
@@ -14928,87 +15582,8 @@ impl Backend {
         }
     }
 
-    /// Refresh the affected testthat preamble sourced closures from a snapshot
-    /// that overlays all authoritative open buffers on disk. The scan runs
-    /// off-lock; only the already-built result is applied under the write lock.
-    async fn refresh_testthat_preambles_for_paths(
-        &self,
-        root: std::path::PathBuf,
-        affected_paths: Vec<std::path::PathBuf>,
-        scheduled_uris: &std::collections::HashSet<Url>,
-    ) {
-        let _ = Self::refresh_testthat_preambles_for_paths_with(
-            self.state.clone(),
-            self.client.clone(),
-            self.traversal_truncation.clone(),
-            root,
-            affected_paths,
-            scheduled_uris,
-            None,
-        )
-        .await;
-    }
-
-    /// Handle-based body of [`Self::refresh_testthat_preambles_for_paths`],
-    /// callable from detached tasks (e.g. the startup seeding task) that hold
-    /// clones of the backend's handles rather than `&self`.
-    async fn refresh_testthat_preambles_for_paths_with(
-        state_arc: Arc<RwLock<WorldState>>,
-        client: Client,
-        traversal_truncation: Arc<TraversalTruncationState>,
-        root: std::path::PathBuf,
-        affected_paths: Vec<std::path::PathBuf>,
-        scheduled_uris: &std::collections::HashSet<Url>,
-        expected_open_documents: Option<&std::collections::BTreeMap<Url, OpenDocumentSeedIdentity>>,
-    ) -> PackageRefreshApply {
-        let publish = expected_open_documents.is_none();
-        let (previous, overrides, exclusions, package_inputs) = {
-            let state = state_arc.read().await;
-            let exclusions = state.workspace_exclusions.clone();
-            (
-                crate::package_state::preamble::PreambleSnapshot::from_inputs(
-                    &state.package_inputs,
-                ),
-                snapshot_preamble_text_overrides(&state),
-                exclusions.clone(),
-                PackageSeedInputSnapshot::capture(&state, &exclusions),
-            )
-        };
-        let expected_package_inputs = expected_open_documents
-            .is_some()
-            .then(|| (package_inputs, exclusions.clone()));
-        let root_for_scan = root.clone();
-        let affected_for_scan = affected_paths.clone();
-        let Ok((scan, rescanned)) = tokio::task::spawn_blocking(move || {
-            crate::package_state::preamble::rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
-                &root_for_scan,
-                previous,
-                &affected_for_scan,
-                &overrides,
-                &exclusions,
-            )
-        })
-        .await
-        else {
-            return PackageRefreshApply::empty(false);
-        };
-        Self::apply_testthat_preamble_rescan(
-            &state_arc,
-            client,
-            traversal_truncation,
-            scan,
-            rescanned,
-            &root,
-            &affected_paths,
-            scheduled_uris,
-            expected_open_documents,
-            expected_package_inputs.as_ref(),
-            publish,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn apply_testthat_preamble_rescan(
         state_arc: &Arc<RwLock<WorldState>>,
         client: Client,
@@ -15139,6 +15714,7 @@ impl Backend {
             self.client.clone(),
             self.traversal_truncation.clone(),
             root,
+            installed.identity,
         )
         .await;
         Some(installed)
@@ -15154,136 +15730,44 @@ impl Backend {
         client: Client,
         traversal_truncation: Arc<TraversalTruncationState>,
         root: std::path::PathBuf,
+        identity: PackageSeedInstalledIdentity,
     ) -> Vec<AnalysisTransferCandidate> {
-        let mut affected = Self::refresh_open_rprofile_after_seed(
-            &state_arc,
-            client.clone(),
-            traversal_truncation.clone(),
-            &root,
-        )
-        .await;
-        affected.extend(
-            Self::refresh_open_preamble_docs_after_seed(
-                state_arc,
-                client,
-                traversal_truncation,
-                root,
-            )
-            .await,
-        );
-        affected.sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
-        affected.dedup();
-        affected
-    }
-
-    /// Converge an `.Rprofile` opened during seed computation to its current
-    /// authoritative buffer. The scan is off-lock and the apply is guarded by
-    /// version/revision/epoch plus O(1) Rope instance identity, so a stale
-    /// lifecycle cannot win even when diagnostics eligibility supplied no epoch.
-    async fn refresh_open_rprofile_after_seed(
-        state_arc: &Arc<RwLock<WorldState>>,
-        client: Client,
-        traversal_truncation: Arc<TraversalTruncationState>,
-        root: &std::path::Path,
-    ) -> Vec<AnalysisTransferCandidate> {
-        for _attempt in 0..3 {
-            let snapshot = {
-                let state = state_arc.read().await;
-                if !state.package_inputs.model_rprofile {
-                    return Vec::new();
-                }
-                snapshot_authoritative_open_rprofile(&state, root).map(
-                    |(uri, contents, identity)| {
-                        let exclusions = state.workspace_exclusions.clone();
-                        let package_inputs = PackageSeedInputSnapshot::capture(&state, &exclusions);
-                        (uri, contents, identity, exclusions, package_inputs)
+        match attempt_combined_post_seed_refresh(&state_arc, &root, identity).await {
+            CombinedPostSeedRefreshOutcome::Committed(candidates) => candidates,
+            CombinedPostSeedRefreshOutcome::NotApplicable
+            | CombinedPostSeedRefreshOutcome::Superseded => Vec::new(),
+            CombinedPostSeedRefreshOutcome::Deferred => {
+                schedule_post_seed_refresh_retry(
+                    PackageSeedTaskHandles {
+                        state: state_arc,
+                        client,
+                        traversal_truncation,
                     },
-                )
-            };
-            let Some((uri, contents, identity, exclusions, package_inputs)) = snapshot else {
-                return Vec::new();
-            };
-            let root_for_scan = root.to_path_buf();
-            let scan_exclusions = exclusions.clone();
-            let Ok(scan) = tokio::task::spawn_blocking(move || {
-                let text = contents.to_string();
-                crate::package_state::rprofile::scan_workspace_rprofile_with_root_text_and_exclusions(
-                    &root_for_scan,
-                    &text,
-                    &scan_exclusions,
-                )
-            })
-            .await
-            else {
-                return Vec::new();
-            };
-            let outcome = Self::apply_rprofile_prelude_rescan_with(
-                state_arc,
-                client.clone(),
-                traversal_truncation.clone(),
-                scan,
-                Some((
-                    uri,
+                    root,
                     identity,
-                    root.to_path_buf(),
-                    package_inputs,
-                    exclusions,
-                )),
-            )
-            .await;
-            if outcome.applied {
-                return outcome.candidates;
+                )
+                .await;
+                Vec::new()
             }
         }
-        Vec::new()
     }
 
-    /// Close the seed-install TOCTOU window (issue #638): a preamble (or
-    /// sourced-closure member) opened or edited after a seeding path snapshotted
-    /// its buffer overrides but before the scan was installed must win over that
-    /// stale result. Each off-lock scan carries all open documents'
-    /// version/revision/epoch plus O(1) Rope instance identity into the write-lock
-    /// apply; a close/reopen at the same LSP version therefore vetoes the stale
-    /// graft, and this bounded loop retries from the new lifecycle.
-    async fn refresh_open_preamble_docs_after_seed(
+    #[cfg(test)]
+    async fn refresh_open_package_inputs_after_seed_for_test(
         state_arc: Arc<RwLock<WorldState>>,
         client: Client,
         traversal_truncation: Arc<TraversalTruncationState>,
         root: std::path::PathBuf,
     ) -> Vec<AnalysisTransferCandidate> {
-        let mut affected = Vec::new();
-        for _attempt in 0..3 {
-            let (affected_paths, identities_before) = {
-                let state = state_arc.read().await;
-                snapshot_open_preamble_documents(&state)
-            };
-            if affected_paths.is_empty() {
-                return affected;
-            }
-            let outcome = Self::refresh_testthat_preambles_for_paths_with(
-                state_arc.clone(),
-                client.clone(),
-                traversal_truncation.clone(),
-                root.clone(),
-                affected_paths,
-                &std::collections::HashSet::new(),
-                Some(&identities_before),
-            )
-            .await;
-            affected.extend(outcome.candidates);
-            let identities_after = {
-                let state = state_arc.read().await;
-                snapshot_open_document_seed_identities(&state)
-            };
-            if outcome.applied && identities_after == identities_before {
-                affected.sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
-                affected.dedup();
-                return affected;
-            }
-        }
-        affected.sort_unstable_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
-        affected.dedup();
-        affected
+        let identity = state_arc.write().await.record_package_seed_installed();
+        Self::refresh_open_package_inputs_after_seed(
+            state_arc,
+            client,
+            traversal_truncation,
+            root,
+            identity,
+        )
+        .await
     }
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
@@ -26339,7 +26823,7 @@ mod project_config_initialize_tests {
                 .begin_open_document_diagnostic_lifecycle(&uri)
                 .unwrap();
         }
-        let stale = Backend::refresh_open_package_inputs_after_seed(
+        let stale = Backend::refresh_open_package_inputs_after_seed_for_test(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -28786,6 +29270,159 @@ mod project_config_initialize_tests {
                 .get(&preamble)
                 .is_some_and(|packages| packages.contains("stats"))
         );
+        drop(state);
+        let (routing_before, reservations_before) = {
+            let mut state = backend.state.write().await;
+            state.cross_file_config.max_revalidations_per_trigger = 1;
+            (
+                state.system_file_routing_owner_identity(),
+                state.analysis_revalidation_reservation_count,
+            )
+        };
+
+        backend
+            .did_change(tower_lsp::lsp_types::DidChangeTextDocumentParams {
+                text_document: tower_lsp::lsp_types::VersionedTextDocumentIdentifier {
+                    uri: helper_uri,
+                    version: 2,
+                },
+                content_changes: vec![tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "edited_buffer <- 1\nlibrary(utils)\n".into(),
+                }],
+            })
+            .await;
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.system_file_routing_owner_identity(),
+            routing_before,
+            "source-following edits must not mint a package-routing owner"
+        );
+        assert!(
+            state.did_change_reservation_snapshot_for_test.len() <= 1,
+            "the combined OpenEdit must apply the activity cap once"
+        );
+        assert!(
+            state
+                .analysis_revalidation_reservation_count
+                .saturating_sub(reservations_before)
+                <= 1,
+            "the combined OpenEdit must own one capped reservation ledger"
+        );
+        assert!(
+            state
+                .package_inputs
+                .rprofile_symbols
+                .contains("edited_buffer")
+        );
+        assert!(
+            !state
+                .package_inputs
+                .rprofile_symbols
+                .contains("buffer_only")
+        );
+        assert!(
+            state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("edited_buffer"))
+        );
+        assert!(
+            !state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("buffer_only"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paused_live_tail_loses_to_same_version_close_reopen_as_one_open_edit() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: combinedtail\nVersion: 0.0.1\nSuggests: testthat\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"scripts/shared.R\")\n").unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/shared.R\")\n").unwrap();
+        let helper = root.join("scripts/shared.R");
+        fs::write(&helper, "disk_shared <- 1\n").unwrap();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let preamble_uri = Url::from_file_path(&preamble).unwrap();
+        let helper_uri = Url::from_file_path(&helper).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let pause = {
+            let mut state = backend.state.write().await;
+            establish_combined_post_seed_fixture(&mut state, &root, &rprofile_uri, &preamble_uri);
+            state
+                .live_package_open_edit_pre_commit_test_pause
+                .arm(helper_uri.clone())
+        };
+
+        let stale = backend.did_change(tower_lsp::lsp_types::DidChangeTextDocumentParams {
+            text_document: tower_lsp::lsp_types::VersionedTextDocumentIdentifier {
+                uri: helper_uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "stale_shared <- 1\n".into(),
+            }],
+        });
+        tokio::pin!(stale);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut stale => panic!("live tail skipped the pre-commit barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("live tail did not reach the pre-commit barrier")
+            }
+        }
+
+        close_doc(backend, &helper_uri).await;
+        open_doc(backend, &helper_uri, "r", 1, "reopened_shared <- 1\n").await;
+        pause.release();
+        stale.await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.documents.get(&helper_uri).map(|doc| doc.text()),
+            Some("reopened_shared <- 1\n".to_string())
+        );
+        assert!(
+            state
+                .package_inputs
+                .rprofile_symbols
+                .contains("reopened_shared")
+        );
+        assert!(
+            !state
+                .package_inputs
+                .rprofile_symbols
+                .contains("stale_shared")
+        );
+        assert!(
+            state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("reopened_shared"))
+        );
+        assert!(
+            !state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("stale_shared"))
+        );
     }
 
     /// A newer alias of an already-owned sourced helper keeps its own local
@@ -30468,7 +31105,7 @@ mod project_config_initialize_tests {
             );
         }
 
-        Backend::refresh_open_package_inputs_after_seed(
+        Backend::refresh_open_package_inputs_after_seed_for_test(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -30489,6 +31126,360 @@ mod project_config_initialize_tests {
                 .rprofile_symbols
                 .contains("disk_profile")
         );
+    }
+
+    fn establish_combined_post_seed_fixture(
+        state: &mut WorldState,
+        root: &std::path::Path,
+        rprofile_uri: &Url,
+        preamble_uri: &Url,
+    ) -> PackageSeedInstalledIdentity {
+        establish_package_event_translation_state(state, root.to_path_buf());
+        let exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
+        initialize_package_inputs_from_state_with_exclusions(
+            state,
+            root.to_path_buf(),
+            Some(Arc::from(
+                "Package: combinedtail\nVersion: 0.0.1\nSuggests: testthat\n",
+            )),
+            None,
+            Default::default(),
+            Some(
+                crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
+                    root,
+                    &exclusions,
+                ),
+            ),
+            Some(
+                crate::package_state::preamble::scan_testthat_preambles_with_exclusions(
+                    root,
+                    &exclusions,
+                ),
+            ),
+            &exclusions,
+        );
+        state.documents.insert(
+            rprofile_uri.clone(),
+            crate::state::Document::new(
+                "source(\"scripts/shared.R\")\nprofile_live <- 1\n",
+                Some(1),
+            ),
+        );
+        state.begin_diagnostic_lifecycle(rprofile_uri);
+        state.documents.insert(
+            preamble_uri.clone(),
+            crate::state::Document::new(
+                "source(\"../../scripts/shared.R\")\npreamble_live <- 1\n",
+                Some(1),
+            ),
+        );
+        state.begin_diagnostic_lifecycle(preamble_uri);
+        let shared_uri = Url::from_file_path(root.join("scripts/shared.R")).unwrap();
+        state.documents.insert(
+            shared_uri.clone(),
+            crate::state::Document::new("live_shared <- 1\n", Some(1)),
+        );
+        state.begin_diagnostic_lifecycle(&shared_uri);
+        state.record_package_seed_installed()
+    }
+
+    #[tokio::test]
+    async fn combined_post_seed_projection_rejects_both_halves_on_basis_drift() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: combinedtail\nVersion: 0.0.1\nSuggests: testthat\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"scripts/shared.R\")\n").unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/shared.R\")\n").unwrap();
+        fs::write(root.join("scripts/shared.R"), "disk_shared <- 1\n").unwrap();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let preamble_uri = Url::from_file_path(&preamble).unwrap();
+        let mut state = WorldState::new();
+        establish_combined_post_seed_fixture(&mut state, &root, &rprofile_uri, &preamble_uri);
+
+        let captured =
+            capture_combined_post_seed_refresh(&state, &root).expect("both tails are live");
+        let derived =
+            derive_combined_post_seed_refresh(captured).expect("both scans change the seed");
+        state.package_inputs.rprofile_symbols =
+            std::collections::BTreeSet::from(["newer_profile_owner".to_string()]);
+        state.package_inputs.preamble_sourced_symbols.insert(
+            preamble.clone(),
+            std::collections::BTreeSet::from(["newer_preamble_owner".to_string()]),
+        );
+        state.record_package_input_mutation();
+
+        assert!(
+            state
+                .try_install_prepared_package_projection(&derived.basis, derived.package)
+                .is_err(),
+            "one stale basis must veto the complete Rprofile+preamble projection"
+        );
+        assert_eq!(
+            state.package_inputs.rprofile_symbols,
+            std::collections::BTreeSet::from(["newer_profile_owner".to_string()])
+        );
+        assert_eq!(
+            state.package_inputs.preamble_sourced_symbols.get(&preamble),
+            Some(&std::collections::BTreeSet::from([
+                "newer_preamble_owner".to_string()
+            ]))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn combined_post_seed_exhaustion_defers_and_completes_under_exact_seed_owner() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: combinedtail\nVersion: 0.0.1\nSuggests: testthat\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"scripts/shared.R\")\n").unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/shared.R\")\n").unwrap();
+        fs::write(root.join("scripts/shared.R"), "disk_shared <- 1\n").unwrap();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let preamble_uri = Url::from_file_path(&preamble).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let identity = {
+            let mut state = backend.state.write().await;
+            let identity = establish_combined_post_seed_fixture(
+                &mut state,
+                &root,
+                &rprofile_uri,
+                &preamble_uri,
+            );
+            state.post_seed_refresh_test_reject_remaining = 3;
+            identity
+        };
+
+        let candidates = Backend::refresh_open_package_inputs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root.clone(),
+            identity,
+        )
+        .await;
+        assert!(candidates.is_empty(), "deferred work owns candidates later");
+        {
+            let state = backend.state.read().await;
+            assert_eq!(state.post_seed_refresh_test_commit_attempts, 3);
+            assert!(state.post_seed_refresh_retry_is_current(identity));
+            assert!(
+                !state
+                    .package_inputs
+                    .rprofile_symbols
+                    .contains("profile_live")
+            );
+            assert!(
+                !state
+                    .package_inputs
+                    .preamble_sourced_symbols
+                    .get(&preamble)
+                    .is_some_and(|symbols| symbols.contains("live_shared"))
+            );
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = backend.state.read().await;
+                if !state.post_seed_refresh_retry_is_current(identity) {
+                    break;
+                }
+                drop(state);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the coalesced post-seed worker must converge");
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .package_inputs
+                .rprofile_symbols
+                .contains("profile_live")
+        );
+        assert!(
+            state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("live_shared"))
+        );
+        assert_eq!(state.post_seed_refresh_test_commit_attempts, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn combined_post_seed_deferred_owner_cancels_when_a_new_seed_takes_over() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: combinedtail\nVersion: 0.0.1\nSuggests: testthat\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"scripts/shared.R\")\n").unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/shared.R\")\n").unwrap();
+        fs::write(root.join("scripts/shared.R"), "disk_shared <- 1\n").unwrap();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let preamble_uri = Url::from_file_path(&preamble).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let old_identity = {
+            let mut state = backend.state.write().await;
+            let identity = establish_combined_post_seed_fixture(
+                &mut state,
+                &root,
+                &rprofile_uri,
+                &preamble_uri,
+            );
+            state.post_seed_refresh_test_reject_remaining = 3;
+            identity
+        };
+        Backend::refresh_open_package_inputs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root,
+            old_identity,
+        )
+        .await;
+        {
+            let mut state = backend.state.write().await;
+            assert!(state.post_seed_refresh_retry_is_current(old_identity));
+            let successor = state.record_package_seed_installed();
+            assert_ne!(successor, old_identity);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = backend.state.read().await;
+                if !state.post_seed_refresh_retry_is_current(old_identity) {
+                    break;
+                }
+                drop(state);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the superseded deferred owner must terminate");
+        let state = backend.state.read().await;
+        assert!(
+            !state
+                .package_inputs
+                .rprofile_symbols
+                .contains("profile_live")
+        );
+        assert!(
+            !state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("live_shared"))
+        );
+        assert_eq!(
+            state.post_seed_refresh_test_commit_attempts, 3,
+            "the successor cancels before the delayed worker attempts a commit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn combined_post_seed_waits_for_same_seed_system_file_owner() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::create_dir_all(root.join("tests/testthat")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: combinedtail\nVersion: 0.0.1\nSuggests: testthat\n",
+        )
+        .unwrap();
+        fs::write(root.join(".Rprofile"), "source(\"scripts/shared.R\")\n").unwrap();
+        let preamble = root.join("tests/testthat/helper-project.R");
+        fs::write(&preamble, "source(\"../../scripts/shared.R\")\n").unwrap();
+        fs::write(root.join("scripts/shared.R"), "disk_shared <- 1\n").unwrap();
+        let rprofile_uri = Url::from_file_path(root.join(".Rprofile")).unwrap();
+        let preamble_uri = Url::from_file_path(&preamble).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        let identity = {
+            let mut state = backend.state.write().await;
+            let identity = establish_combined_post_seed_fixture(
+                &mut state,
+                &root,
+                &rprofile_uri,
+                &preamble_uri,
+            );
+            assert!(state.begin_system_file_seed_retry(identity));
+            identity
+        };
+        Backend::refresh_open_package_inputs_after_seed(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            root,
+            identity,
+        )
+        .await;
+        {
+            let state = backend.state.read().await;
+            assert!(state.system_file_seed_retry_is_current(identity));
+            assert!(state.post_seed_refresh_retry_is_current(identity));
+            assert_eq!(state.post_seed_refresh_test_commit_attempts, 0);
+            assert!(
+                !state
+                    .package_inputs
+                    .rprofile_symbols
+                    .contains("profile_live")
+            );
+        }
+
+        backend
+            .state
+            .write()
+            .await
+            .complete_system_file_seed_retry(identity);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = backend.state.read().await;
+                if !state.post_seed_refresh_retry_is_current(identity) {
+                    break;
+                }
+                drop(state);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("post-seed convergence must resume after routing ownership clears");
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .package_inputs
+                .rprofile_symbols
+                .contains("profile_live")
+        );
+        assert!(
+            state
+                .package_inputs
+                .preamble_sourced_symbols
+                .get(&preamble)
+                .is_some_and(|symbols| symbols.contains("live_shared"))
+        );
+        assert_eq!(state.post_seed_refresh_test_commit_attempts, 1);
     }
 
     #[tokio::test]
@@ -30702,7 +31693,7 @@ mod project_config_initialize_tests {
             );
         }
 
-        Backend::refresh_open_package_inputs_after_seed(
+        Backend::refresh_open_package_inputs_after_seed_for_test(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
@@ -30836,7 +31827,7 @@ mod project_config_initialize_tests {
             assert!(!symbols.contains("from_a"), "got {symbols:?}");
         }
 
-        Backend::refresh_open_package_inputs_after_seed(
+        Backend::refresh_open_package_inputs_after_seed_for_test(
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),

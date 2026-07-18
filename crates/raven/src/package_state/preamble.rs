@@ -118,6 +118,10 @@ impl PreambleScan {
     /// Conversely, when this returns false, [`apply_rescanned_preambles`] must
     /// change at least one keyed live entry because it replaces every rescanned
     /// key with this scan's corresponding entry.
+    #[allow(
+        dead_code,
+        reason = "retained as a keyed-rescan invariant probe for unit tests"
+    )]
     pub(crate) fn rescanned_match_inputs(
         &self,
         rescanned: &BTreeSet<PathBuf>,
@@ -297,6 +301,10 @@ pub(crate) fn rescan_testthat_preambles_for_paths_with_overrides_and_exclusions(
 /// The derived routing union is always rebuilt from the resulting *live* keyed
 /// state so concurrent updates to unrelated preambles participate in it.
 /// Returns whether any keyed field or the derived union changed.
+#[allow(
+    dead_code,
+    reason = "retained as a keyed-rescan invariant probe for unit tests"
+)]
 pub(crate) fn apply_rescanned_preambles(
     inputs: &mut super::PackageInputs,
     scan: PreambleScan,
