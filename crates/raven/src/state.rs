@@ -2374,14 +2374,18 @@ impl WorldState {
             && self.package_seed_install_id == identity.seed_install_id
     }
 
-    /// Whether `identity` still owns post-seed convergence even when ordinary
-    /// same-configuration package inputs have advanced since installation.
+    /// Whether `identity` still owns post-seed convergence after package,
+    /// library, or configuration generations have advanced.
+    ///
+    /// Only a new seed installation transfers this ownership. Broader
+    /// generations may change without an orchestrator that owns a successor
+    /// source-following tail, so they require current-basis recapture instead
+    /// of terminal cancellation.
     pub(crate) fn package_seed_tail_owner_is_current(
         &self,
         identity: PackageSeedInstalledIdentity,
     ) -> bool {
         self.package_seed_install_id == identity.seed_install_id
-            && self.package_config_generation == identity.package_config_generation
     }
 
     pub(crate) fn begin_system_file_seed_retry(

@@ -32221,6 +32221,11 @@ mod project_config_initialize_tests {
             )
             .expect("unrelated package-R drift invalidates the exact seed");
             state.apply_package_event(&delta);
+            // Package-library installation also advances this broad cache
+            // generation without necessarily creating a successor seed/tail
+            // caller. It must force current-basis recapture, not terminally
+            // abandon this coordinator's source-following work.
+            state.bump_package_config_generation();
         }
         pause.release();
         let tickets = tokio::time::timeout(std::time::Duration::from_secs(5), coordinator)

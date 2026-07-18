@@ -343,10 +343,13 @@ callers retain theirs and retry after the predecessor completes. An unrelated
 authoritative live package edit does not silently cancel the tail: the
 coordinator recaptures the whole pair against the current package basis while
 retaining the outer seed/system handles and exact diagnostic candidates. A
-different never-reused seed owner, root, or package configuration is a terminal
-handoff boundary: the predecessor still consumes its retained ledger exactly
-once, while the successor caller owns current-basis convergence. The
-package-projection basis carries an explicit foreground or
+different never-reused seed owner or root is a terminal handoff boundary: the
+predecessor still consumes its retained ledger exactly once, while the
+successor caller owns current-basis convergence. Package configuration and
+library generations are broader: they invalidate the exact projection, but
+rebase against the current basis because not every such change creates a
+successor seed caller. The package-projection basis carries an explicit
+foreground or
 exact-coordinator ownership expectation, so registration or routing ownership
 that changes after a tail capture rejects the whole projection at the central
 CAS. A coordinator whose registration requires routing convergence cannot
