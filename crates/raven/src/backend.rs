@@ -39,10 +39,10 @@ use crate::state::{
     PreparedOpenEditAnalysis, PreparedOpenGraphProjection, PreparedOpenInstallAnalysis,
     PreparedOpenLifecycleBatch, PreparedPackageProjection, PreparedWatchedBatchAnalysis,
     PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis, SymbolConfig,
-    SystemFileRoutingOwnerIdentity, SystemFileTransferredEffects, WorkspaceGraphDerivationContext,
-    WorkspaceGraphOverlay, WorkspaceScanDerivationBasis, WorkspaceScanInputBasis,
-    WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
-    derive_workspace_dependency_graph,
+    SysdataFallbackBasis, SysdataFallbackOwner, SystemFileRoutingOwnerIdentity,
+    SystemFileTransferredEffects, WorkspaceGraphDerivationContext, WorkspaceGraphOverlay,
+    WorkspaceScanDerivationBasis, WorkspaceScanInputBasis, WorkspaceScanIntentToken,
+    WorkspaceScanTransferredEffects, WorldState, derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
 tokio::task_local! {
@@ -6290,6 +6290,619 @@ pub(crate) fn sysdata_r_fallback_needed(state: &WorldState) -> bool {
     state.package_inputs.sysdata_names.is_empty() && has_sysdata_rda
 }
 
+const SYSDATA_FALLBACK_MAX_ATTEMPTS: usize = 3;
+
+struct CapturedSysdataFallback {
+    basis: SysdataFallbackBasis,
+    inputs: crate::package_state::PackageInputs,
+    state: crate::package_state::PackageState,
+    observation: crate::package_state::sysdata::SysdataFileObservation,
+    r_path: std::path::PathBuf,
+    affected_uris: Vec<Url>,
+}
+
+enum SysdataFallbackAttempt {
+    Committed {
+        candidates: Vec<AnalysisTransferCandidate>,
+        routing_owner: Option<SystemFileRoutingOwnerIdentity>,
+    },
+    NotApplicable,
+    Failed,
+    Stale,
+    Superseded,
+    Deferred,
+}
+
+fn capture_sysdata_fallback(
+    state: &WorldState,
+    owner: &SysdataFallbackOwner,
+) -> Option<CapturedSysdataFallback> {
+    let (basis, r_path) = state.capture_sysdata_fallback_basis(owner)?;
+    if !state.package_inputs.sysdata_names.is_empty() {
+        return None;
+    }
+    let observation =
+        crate::package_state::sysdata::SysdataFileObservation::capture(&owner.workspace_root);
+    if !matches!(
+        observation,
+        crate::package_state::sysdata::SysdataFileObservation::Valid { .. }
+    ) {
+        return None;
+    }
+    Some(CapturedSysdataFallback {
+        basis,
+        inputs: state.package_inputs.clone(),
+        state: state.package_state.clone(),
+        observation,
+        r_path,
+        affected_uris: state.documents.keys().cloned().collect(),
+    })
+}
+
+async fn attempt_sysdata_fallback_using<F, Fut>(
+    state_arc: &Arc<RwLock<WorldState>>,
+    owner: &SysdataFallbackOwner,
+    load: &mut F,
+) -> SysdataFallbackAttempt
+where
+    F: FnMut(std::path::PathBuf, crate::package_state::ContentDigest, Arc<[u8]>) -> Fut,
+    Fut: Future<Output = std::result::Result<std::collections::BTreeSet<String>, String>>,
+{
+    let captured = {
+        let state = state_arc.read().await;
+        if !state.sysdata_fallback_owner_is_current(owner) {
+            return SysdataFallbackAttempt::Superseded;
+        }
+        capture_sysdata_fallback(&state, owner)
+    };
+    let Some(mut captured) = captured else {
+        return SysdataFallbackAttempt::NotApplicable;
+    };
+    let crate::package_state::sysdata::SysdataFileObservation::Valid { digest, bytes } =
+        &captured.observation
+    else {
+        return SysdataFallbackAttempt::NotApplicable;
+    };
+    let loaded = load(captured.r_path.clone(), *digest, Arc::clone(bytes)).await;
+
+    #[cfg(test)]
+    {
+        let pause = {
+            let state = state_arc.read().await;
+            state
+                .sysdata_fallback_pre_commit_test_pause
+                .take_armed(&Url::parse("raven-test://sysdata-fallback-pre-commit").unwrap())
+        };
+        if let Some(pause) = pause {
+            pause.pause().await;
+        }
+    }
+
+    // The subprocess loaded an immutable temporary copy. Re-read the workspace
+    // path immediately before the state CAS so rewrite/delete/recreate/repair
+    // races reject the whole result.
+    if !captured.observation.is_current(&owner.workspace_root) {
+        return SysdataFallbackAttempt::Stale;
+    }
+    {
+        let state = state_arc.read().await;
+        if !state.sysdata_fallback_owner_is_current(owner) {
+            return SysdataFallbackAttempt::Superseded;
+        }
+        if !state.sysdata_fallback_basis_is_current(&captured.basis) {
+            return SysdataFallbackAttempt::Stale;
+        }
+    }
+    let names = match loaded {
+        Ok(names) => names,
+        Err(_) => return SysdataFallbackAttempt::Failed,
+    };
+    if names.is_empty() {
+        return SysdataFallbackAttempt::NotApplicable;
+    }
+    captured.inputs.sysdata_names = names;
+    let next = crate::package_state::derive_package_state(
+        &captured.state,
+        &captured.inputs,
+        &crate::package_state::PackageInputDelta::SysdataNamesChanged,
+    );
+    let prepared = PreparedPackageProjection::new(captured.inputs, next);
+    let mut state = state_arc.write().await;
+    #[cfg(test)]
+    {
+        state.sysdata_fallback_test_commit_attempts = state
+            .sysdata_fallback_test_commit_attempts
+            .saturating_add(1);
+        if state.sysdata_fallback_test_reject_remaining > 0 {
+            state.sysdata_fallback_test_reject_remaining -= 1;
+            return SysdataFallbackAttempt::Stale;
+        }
+    }
+    if !state.sysdata_fallback_owner_is_current(owner) {
+        return SysdataFallbackAttempt::Superseded;
+    }
+    match state.try_install_sysdata_fallback_projection(
+        &captured.basis,
+        prepared,
+        captured.affected_uris,
+    ) {
+        Ok(effects) => SysdataFallbackAttempt::Committed {
+            candidates: effects.candidates,
+            routing_owner: effects.routing_owner,
+        },
+        Err(_) if state.sysdata_fallback_owner_is_current(owner) => SysdataFallbackAttempt::Stale,
+        Err(_) => SysdataFallbackAttempt::Superseded,
+    }
+}
+
+async fn run_sysdata_fallback_transaction_using<F, Fut>(
+    state_arc: &Arc<RwLock<WorldState>>,
+    owner: &SysdataFallbackOwner,
+    mut load: F,
+) -> SysdataFallbackAttempt
+where
+    F: FnMut(std::path::PathBuf, crate::package_state::ContentDigest, Arc<[u8]>) -> Fut,
+    Fut: Future<Output = std::result::Result<std::collections::BTreeSet<String>, String>>,
+{
+    let mut saw_stale = false;
+    for attempt in 0..SYSDATA_FALLBACK_MAX_ATTEMPTS {
+        match attempt_sysdata_fallback_using(state_arc, owner, &mut load).await {
+            SysdataFallbackAttempt::Stale => {
+                saw_stale = true;
+                if attempt + 1 < SYSDATA_FALLBACK_MAX_ATTEMPTS {
+                    tokio::task::yield_now().await;
+                }
+            }
+            SysdataFallbackAttempt::NotApplicable if saw_stale => {
+                if attempt + 1 < SYSDATA_FALLBACK_MAX_ATTEMPTS {
+                    tokio::task::yield_now().await;
+                }
+            }
+            outcome => return outcome,
+        }
+    }
+    SysdataFallbackAttempt::Deferred
+}
+
+async fn run_sysdata_fallback_transaction(
+    state_arc: &Arc<RwLock<WorldState>>,
+    owner: &SysdataFallbackOwner,
+) -> SysdataFallbackAttempt {
+    run_sysdata_fallback_transaction_using(state_arc, owner, |r_path, digest, bytes| async move {
+        let Some(r) = crate::r_subprocess::RSubprocess::new(Some(r_path)) else {
+            return Err("R runtime is no longer available".to_string());
+        };
+        crate::package_state::sysdata::load_frozen_sysdata_via_r(&r, digest, &bytes).await
+    })
+    .await
+}
+
+async fn finish_sysdata_fallback_commit(
+    handles: PackageSeedTaskHandles,
+    candidates: Vec<AnalysisTransferCandidate>,
+    routing_owner: Option<SystemFileRoutingOwnerIdentity>,
+) {
+    let mut transfer_handles = Vec::new();
+    if let Some(owner) = routing_owner {
+        loop {
+            tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+            let Some(transfer) =
+                run_system_file_convergence_transaction_for_routing_owner(&handles.state, owner)
+                    .await
+                    .into_transfer()
+            else {
+                continue;
+            };
+            transfer_handles.push(transfer.handle);
+            break;
+        }
+    }
+    let tickets = {
+        let mut state = handles.state.write().await;
+        finalize_exact_analysis_handoff_candidates(&mut state, transfer_handles, candidates)
+    };
+    Backend::publish_diagnostics_for_tickets_bounded(
+        handles.state,
+        handles.client,
+        tickets,
+        Some(handles.traversal_truncation),
+    )
+    .await;
+}
+
+async fn schedule_sysdata_fallback(handles: PackageSeedTaskHandles, owner: SysdataFallbackOwner) {
+    let (generation, cancel) = handles.state.read().await.sysdata_fallback_retry.schedule();
+    tokio::spawn(async move {
+        loop {
+            if cancel.is_cancelled() {
+                handles
+                    .state
+                    .read()
+                    .await
+                    .sysdata_fallback_retry
+                    .complete(generation);
+                return;
+            }
+            match run_sysdata_fallback_transaction(&handles.state, &owner).await {
+                SysdataFallbackAttempt::Committed {
+                    candidates,
+                    routing_owner,
+                } => {
+                    finish_sysdata_fallback_commit(handles.clone(), candidates, routing_owner)
+                        .await;
+                    handles
+                        .state
+                        .read()
+                        .await
+                        .sysdata_fallback_retry
+                        .complete(generation);
+                    return;
+                }
+                SysdataFallbackAttempt::Deferred | SysdataFallbackAttempt::Stale => {
+                    tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+                }
+                SysdataFallbackAttempt::NotApplicable
+                | SysdataFallbackAttempt::Failed
+                | SysdataFallbackAttempt::Superseded => {
+                    handles
+                        .state
+                        .read()
+                        .await
+                        .sysdata_fallback_retry
+                        .complete(generation);
+                    return;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod sysdata_fallback_transaction_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const PAUSE_URI: &str = "raven-test://sysdata-fallback-pre-commit";
+
+    fn loaded_names() -> BTreeSet<String> {
+        BTreeSet::from(["internal_value".to_string()])
+    }
+
+    fn fixture(
+        root: &std::path::Path,
+        bytes: &[u8],
+    ) -> (Arc<RwLock<WorldState>>, SysdataFallbackOwner) {
+        fs::create_dir_all(root.join("R")).unwrap();
+        fs::write(root.join("R").join("sysdata.rda"), bytes).unwrap();
+
+        let mut state = WorldState::new();
+        establish_package_event_translation_state(&mut state, root.to_path_buf());
+        state.package_inputs.description = Some(crate::package_state::DescriptionInput {
+            text: Arc::from("Package: testpkg\nVersion: 0.0.1\n"),
+        });
+        state.record_package_input_mutation();
+        state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+        state.record_package_seed_installed();
+        let runtime_path = root.join("R-test");
+        fs::write(&runtime_path, b"test runtime").unwrap();
+        let runtime = crate::r_subprocess::RSubprocess::new_for_test(runtime_path);
+        state.install_package_library(
+            Arc::new(crate::package_library::PackageLibrary::with_subprocess(
+                Some(runtime),
+            )),
+            true,
+        );
+        let owner = state.current_sysdata_fallback_owner().unwrap();
+        (Arc::new(RwLock::new(state)), owner)
+    }
+
+    async fn paused_attempt<M>(
+        state: &Arc<RwLock<WorldState>>,
+        owner: &SysdataFallbackOwner,
+        result: std::result::Result<BTreeSet<String>, String>,
+        mutate: M,
+    ) -> SysdataFallbackAttempt
+    where
+        M: FnOnce(&mut WorldState),
+    {
+        let pause = state
+            .read()
+            .await
+            .sysdata_fallback_pre_commit_test_pause
+            .arm(Url::parse(PAUSE_URI).unwrap());
+        let task_state = Arc::clone(state);
+        let task_owner = owner.clone();
+        let task = tokio::spawn(async move {
+            let mut load = move |_, _, _| std::future::ready(result.clone());
+            attempt_sysdata_fallback_using(&task_state, &task_owner, &mut load).await
+        });
+        pause.wait_arrived().await;
+        let mut current = state.write().await;
+        mutate(&mut current);
+        drop(current);
+        pause.release();
+        task.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn sysdata_fallback_rejects_workspace_file_transition_matrix() {
+        enum Transition {
+            Rewrite,
+            Delete,
+            Recreate,
+            InvalidRepair,
+        }
+
+        for transition in [
+            Transition::Rewrite,
+            Transition::Delete,
+            Transition::Recreate,
+            Transition::InvalidRepair,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let (state, owner) = fixture(tmp.path(), b"captured bytes");
+            let path = tmp.path().join("R").join("sysdata.rda");
+            let failed_load = matches!(transition, Transition::InvalidRepair);
+            let outcome = paused_attempt(
+                &state,
+                &owner,
+                if failed_load {
+                    Err("invalid RData".to_string())
+                } else {
+                    Ok(loaded_names())
+                },
+                |_| match transition {
+                    Transition::Rewrite => fs::write(&path, b"rewritten bytes").unwrap(),
+                    Transition::Delete => fs::remove_file(&path).unwrap(),
+                    Transition::Recreate => {
+                        fs::remove_file(&path).unwrap();
+                        fs::write(&path, b"recreated bytes").unwrap();
+                    }
+                    Transition::InvalidRepair => fs::write(&path, b"repaired bytes").unwrap(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, SysdataFallbackAttempt::Stale),
+                "workspace transition must reject the frozen R result"
+            );
+            assert!(state.read().await.package_inputs.sysdata_names.is_empty());
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let (state, owner) = fixture(tmp.path(), b"same bytes");
+        let path = tmp.path().join("R").join("sysdata.rda");
+        let outcome = paused_attempt(&state, &owner, Ok(loaded_names()), |_| {
+            fs::remove_file(&path).unwrap();
+            fs::write(&path, b"same bytes").unwrap();
+        })
+        .await;
+        assert!(
+            matches!(outcome, SysdataFallbackAttempt::Committed { .. }),
+            "same-byte recreation preserves the frozen content identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn sysdata_fallback_rejects_authority_drift_matrix() {
+        enum Drift {
+            Seed,
+            Root,
+            Library,
+            LibraryContent,
+            RuntimeIdentity,
+            RConfig,
+            PackageInput,
+            AnalysisConfig,
+            Exclusions,
+            OpenContext,
+        }
+
+        for drift in [
+            Drift::Seed,
+            Drift::Root,
+            Drift::Library,
+            Drift::LibraryContent,
+            Drift::RuntimeIdentity,
+            Drift::RConfig,
+            Drift::PackageInput,
+            Drift::AnalysisConfig,
+            Drift::Exclusions,
+            Drift::OpenContext,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let (state, owner) = fixture(tmp.path(), b"authority bytes");
+            let root = tmp.path().to_path_buf();
+            let outcome = paused_attempt(&state, &owner, Ok(loaded_names()), |state| match drift {
+                Drift::Seed => {
+                    state.record_package_seed_installed();
+                }
+                Drift::Root => {
+                    establish_package_event_translation_state(state, root.join("successor"));
+                }
+                Drift::Library => {
+                    let runtime =
+                        crate::r_subprocess::RSubprocess::new_for_test(root.join("replacement-R"));
+                    state.install_package_library(
+                        Arc::new(crate::package_library::PackageLibrary::with_subprocess(
+                            Some(runtime),
+                        )),
+                        true,
+                    );
+                }
+                Drift::LibraryContent => state.record_package_library_content_change(),
+                Drift::RuntimeIdentity => {
+                    fs::write(root.join("R-test"), b"replacement test runtime executable").unwrap();
+                }
+                Drift::RConfig => {
+                    state.cross_file_config.packages_r_path = Some(root.join("configured-R"));
+                }
+                Drift::PackageInput => state.record_package_input_mutation(),
+                Drift::AnalysisConfig => state.advance_analysis_config_generation(),
+                Drift::Exclusions => {
+                    state.workspace_exclusions = crate::config_file::compile_workspace_exclusions(
+                        &serde_json::json!({
+                            "workspace": { "exclude": ["generated/**"] }
+                        }),
+                        vec![root.clone()],
+                    );
+                }
+                Drift::OpenContext => {
+                    state.open_document(
+                        Url::from_file_path(root.join("R").join("live.R")).unwrap(),
+                        "live <- 1\n",
+                        Some(1),
+                    );
+                }
+            })
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    SysdataFallbackAttempt::Stale | SysdataFallbackAttempt::Superseded
+                ),
+                "authority drift must reject the frozen R result"
+            );
+            assert!(state.read().await.package_inputs.sysdata_names.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn sysdata_fallback_has_exact_bounded_deferred_owner() {
+        let tmp = TempDir::new().unwrap();
+        let (state, owner) = fixture(tmp.path(), b"retry bytes");
+        let (generation, cancel) = state.read().await.sysdata_fallback_retry.schedule();
+        state.write().await.sysdata_fallback_test_reject_remaining = SYSDATA_FALLBACK_MAX_ATTEMPTS;
+
+        let outcome = run_sysdata_fallback_transaction_using(&state, &owner, |_, _, _| {
+            std::future::ready(Ok(loaded_names()))
+        })
+        .await;
+
+        assert!(matches!(outcome, SysdataFallbackAttempt::Deferred));
+        let state = state.read().await;
+        assert_eq!(
+            state.sysdata_fallback_test_commit_attempts,
+            SYSDATA_FALLBACK_MAX_ATTEMPTS
+        );
+        assert!(state.sysdata_fallback_retry.has_pending());
+        assert!(!cancel.is_cancelled());
+        assert!(state.package_inputs.sysdata_names.is_empty());
+        state.sysdata_fallback_retry.complete(generation);
+        assert!(!state.sysdata_fallback_retry.has_pending());
+    }
+
+    #[tokio::test]
+    async fn sysdata_fallback_stale_then_missing_remains_deferred() {
+        let tmp = TempDir::new().unwrap();
+        let (state, owner) = fixture(tmp.path(), b"transient bytes");
+        let (generation, _) = state.read().await.sysdata_fallback_retry.schedule();
+        state.write().await.sysdata_fallback_test_reject_remaining = 1;
+        let path = tmp.path().join("R").join("sysdata.rda");
+        let mut calls = 0;
+
+        let outcome = run_sysdata_fallback_transaction_using(&state, &owner, |_, _, _| {
+            calls += 1;
+            if calls == 2 {
+                fs::remove_file(&path).unwrap();
+            }
+            std::future::ready(Ok(loaded_names()))
+        })
+        .await;
+
+        assert!(matches!(outcome, SysdataFallbackAttempt::Deferred));
+        let state = state.read().await;
+        assert_eq!(calls, 2, "the missing third capture must not invoke R");
+        assert!(state.package_inputs.sysdata_names.is_empty());
+        assert!(state.sysdata_fallback_retry.has_pending());
+        state.sysdata_fallback_retry.complete(generation);
+    }
+
+    #[tokio::test]
+    async fn sysdata_fallback_commits_one_capped_diagnostic_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let (state, owner) = fixture(tmp.path(), b"ledger bytes");
+        let first = Url::from_file_path(tmp.path().join("R").join("first.R")).unwrap();
+        let second = Url::from_file_path(tmp.path().join("R").join("second.R")).unwrap();
+        {
+            let mut state = state.write().await;
+            state.open_document(first.clone(), "first <- 1\n", Some(1));
+            state.open_document(second.clone(), "second <- 1\n", Some(1));
+            state
+                .begin_open_document_diagnostic_lifecycle(&first)
+                .unwrap();
+            state
+                .begin_open_document_diagnostic_lifecycle(&second)
+                .unwrap();
+            state.cross_file_config.max_revalidations_per_trigger = 1;
+        }
+
+        let outcome = run_sysdata_fallback_transaction_using(&state, &owner, |_, _, _| {
+            std::future::ready(Ok(loaded_names()))
+        })
+        .await;
+        let SysdataFallbackAttempt::Committed {
+            candidates,
+            routing_owner: _,
+        } = outcome
+        else {
+            panic!("current fallback must commit");
+        };
+
+        let mut state = state.write().await;
+        let reservations_before = state.analysis_revalidation_reservation_count;
+        let markers_before = [&first, &second]
+            .into_iter()
+            .map(|uri| state.diagnostics_gate.force_republish_count_for_test(uri))
+            .sum::<u32>();
+        let tickets =
+            finalize_exact_analysis_handoff_candidates(&mut state, Vec::new(), candidates);
+        let markers_after = [&first, &second]
+            .into_iter()
+            .map(|uri| state.diagnostics_gate.force_republish_count_for_test(uri))
+            .sum::<u32>();
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(
+            state.analysis_revalidation_reservation_count,
+            reservations_before + 1
+        );
+        assert_eq!(markers_after, markers_before + 1);
+        assert_eq!(state.package_inputs.sysdata_names, loaded_names());
+    }
+
+    #[tokio::test]
+    async fn sysdata_fallback_r_failure_has_no_partial_commit() {
+        let tmp = TempDir::new().unwrap();
+        let (state, owner) = fixture(tmp.path(), b"invalid bytes");
+        let before = {
+            let state = state.read().await;
+            (
+                state.package_input_generation(),
+                state.package_state_record_generation_for_test(),
+                state.analysis_revalidation_reservation_count,
+            )
+        };
+        let outcome = run_sysdata_fallback_transaction_using(&state, &owner, |_, _, _| {
+            std::future::ready(Err("R load failed".to_string()))
+        })
+        .await;
+        assert!(matches!(outcome, SysdataFallbackAttempt::Failed));
+        let state = state.read().await;
+        assert!(state.package_inputs.sysdata_names.is_empty());
+        assert_eq!(
+            (
+                state.package_input_generation(),
+                state.package_state_record_generation_for_test(),
+                state.analysis_revalidation_reservation_count,
+            ),
+            before
+        );
+        assert_eq!(state.sysdata_fallback_test_commit_attempts, 0);
+    }
+}
+
 /// Remove a file that no longer exists on disk from every cross-file
 /// structure: the dependency graph (all edges in both directions), the
 /// disk-content cache, both workspace indexes, the metadata cache, and the
@@ -12361,62 +12974,14 @@ impl LanguageServer for Backend {
         // R fallback for sysdata: when the AST scan found nothing AND
         // R/sysdata.rda exists, try loading via an R subprocess.
         {
-            let needs_fallback = {
+            let owner = {
                 let state = self.state.read().await;
                 sysdata_r_fallback_needed(&state)
+                    .then(|| state.current_sysdata_fallback_owner())
+                    .flatten()
             };
-            if needs_fallback {
-                let state_arc = self.state.clone();
-                let client = self.client.clone();
-                let traversal_truncation = self.traversal_truncation.clone();
-                tokio::spawn(async move {
-                    let (r_path, workspace_root) = {
-                        let state = state_arc.read().await;
-                        let r = state
-                            .package_library
-                            .r_subprocess()
-                            .map(|r| r.r_path().clone());
-                        let root = state.package_inputs.workspace_root.clone();
-                        (r, root)
-                    };
-                    if let (Some(r_path), Some(root)) = (r_path, workspace_root)
-                        && let Some(r) = crate::r_subprocess::RSubprocess::new(Some(r_path))
-                    {
-                        let names =
-                            crate::package_state::sysdata::load_sysdata_via_r(&r, &root).await;
-                        if !names.is_empty() {
-                            // Apply the fallback names under the write lock, then
-                            // snapshot the open URIs to republish. Without this,
-                            // open package buffers keep their pre-fallback
-                            // diagnostics (e.g. undefined-variable on sysdata
-                            // symbols) until the next edit.
-                            let open_uris: Vec<tower_lsp::lsp_types::Url> = {
-                                let mut state = state_arc.write().await;
-                                state.package_inputs.sysdata_names = names;
-                                state.record_package_input_mutation();
-                                state.apply_package_event(
-                                    &crate::package_state::PackageInputDelta::SysdataNamesChanged,
-                                );
-                                let uris: Vec<_> = state.documents.keys().cloned().collect();
-                                state
-                                    .diagnostics_gate
-                                    .mark_force_republish_many(uris.iter());
-                                uris
-                            };
-                            // Route through the same debounced, bounded pipeline
-                            // the watcher consumer and `raven.refreshPackages`
-                            // use, so the republish cooperates with revalidation
-                            // cancellation/freshness gates.
-                            Backend::publish_diagnostics_for_uris_bounded(
-                                state_arc.clone(),
-                                client,
-                                open_uris,
-                                Some(traversal_truncation),
-                            )
-                            .await;
-                        }
-                    }
-                });
+            if let Some(owner) = owner {
+                schedule_sysdata_fallback(PackageSeedTaskHandles::from_backend(self), owner).await;
             }
         }
 

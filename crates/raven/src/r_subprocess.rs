@@ -82,7 +82,50 @@ pub struct RSubprocess {
     working_dir: Option<PathBuf>,
 }
 
+/// Stable identity of the executable backing one configured R runtime.
+///
+/// The requested path alone is insufficient: an installer can replace the
+/// executable in place, and a symlink can be retargeted without changing the
+/// configured string. Detached R consumers capture this identity before
+/// spawning and compare it again at commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RRuntimeIdentity {
+    requested_path: PathBuf,
+    canonical_path: Option<PathBuf>,
+    disk: RRuntimeDiskIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RRuntimeDiskIdentity {
+    Present {
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+        created: Option<std::time::SystemTime>,
+        readonly: bool,
+        #[cfg(unix)]
+        device: u64,
+        #[cfg(unix)]
+        inode: u64,
+        #[cfg(unix)]
+        mode: u32,
+        #[cfg(unix)]
+        change_seconds: i64,
+        #[cfg(unix)]
+        change_nanoseconds: i64,
+    },
+    Missing,
+    Invalid,
+}
+
 impl RSubprocess {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(r_path: PathBuf) -> Self {
+        Self {
+            r_path,
+            working_dir: None,
+        }
+    }
+
     /// Creates a configured RSubprocess when an R executable path can be validated or discovered.
     ///
     /// If `r_path` is `Some(path)`, the provided path is validated as an R executable and used on success.
@@ -129,6 +172,76 @@ impl RSubprocess {
     /// Get the path to the R executable
     pub fn r_path(&self) -> &PathBuf {
         &self.r_path
+    }
+
+    pub(crate) fn runtime_identity(&self) -> RRuntimeIdentity {
+        let canonical_path = match std::fs::canonicalize(&self.r_path) {
+            Ok(path) => Some(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return RRuntimeIdentity {
+                    requested_path: self.r_path.clone(),
+                    canonical_path: None,
+                    disk: RRuntimeDiskIdentity::Missing,
+                };
+            }
+            Err(_) => {
+                return RRuntimeIdentity {
+                    requested_path: self.r_path.clone(),
+                    canonical_path: None,
+                    disk: RRuntimeDiskIdentity::Invalid,
+                };
+            }
+        };
+        let metadata = match std::fs::metadata(
+            canonical_path
+                .as_ref()
+                .expect("successful canonicalization has a path"),
+        ) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => {
+                return RRuntimeIdentity {
+                    requested_path: self.r_path.clone(),
+                    canonical_path,
+                    disk: RRuntimeDiskIdentity::Invalid,
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return RRuntimeIdentity {
+                    requested_path: self.r_path.clone(),
+                    canonical_path,
+                    disk: RRuntimeDiskIdentity::Missing,
+                };
+            }
+            Err(_) => {
+                return RRuntimeIdentity {
+                    requested_path: self.r_path.clone(),
+                    canonical_path,
+                    disk: RRuntimeDiskIdentity::Invalid,
+                };
+            }
+        };
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        RRuntimeIdentity {
+            requested_path: self.r_path.clone(),
+            canonical_path,
+            disk: RRuntimeDiskIdentity::Present {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                created: metadata.created().ok(),
+                readonly: metadata.permissions().readonly(),
+                #[cfg(unix)]
+                device: metadata.dev(),
+                #[cfg(unix)]
+                inode: metadata.ino(),
+                #[cfg(unix)]
+                mode: metadata.mode(),
+                #[cfg(unix)]
+                change_seconds: metadata.ctime(),
+                #[cfg(unix)]
+                change_nanoseconds: metadata.ctime_nsec(),
+            },
+        }
     }
 
     /// Locate an R executable on the system by searching common locations.

@@ -951,6 +951,13 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) post_seed_refresh_test_commit_attempts: usize,
     #[cfg(test)]
+    pub(crate) sysdata_fallback_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) sysdata_fallback_test_reject_remaining: usize,
+    #[cfg(test)]
+    pub(crate) sysdata_fallback_test_commit_attempts: usize,
+    #[cfg(test)]
     pub(crate) force_open_edit_overflow_for_test: bool,
     #[cfg(test)]
     pub(crate) force_open_install_local_only_for_test: bool,
@@ -1183,6 +1190,7 @@ pub struct WorldState {
     /// Coalescing lifecycle for the one delayed package-seed convergence task.
     pub(crate) package_seed_retry: crate::package_state::PackageSeedRetryLifecycle,
     pub(crate) watched_package_retry: crate::package_state::PackageSeedRetryLifecycle,
+    pub(crate) sysdata_fallback_retry: crate::package_state::PackageSeedRetryLifecycle,
 }
 
 /// A snapshot of the lifecycle state a diagnostics run was triggered
@@ -2085,6 +2093,31 @@ pub(crate) struct PackageProjectionBasis {
     package_mode: crate::cross_file::config::PackageMode,
     model_rprofile: bool,
     post_seed_ownership: PostSeedPackageProjectionOwnership,
+}
+
+/// Exact authorities consumed by one detached startup sysdata fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SysdataFallbackBasis {
+    seed_install_id: u64,
+    workspace_root: std::path::PathBuf,
+    package: PackageProjectionBasis,
+    package_library_install_id: u64,
+    package_library_content_generation: u64,
+    configured_r_path: Option<std::path::PathBuf>,
+    runtime_r_path: std::path::PathBuf,
+    runtime_identity: crate::r_subprocess::RRuntimeIdentity,
+    analysis_config_generation: AnalysisConfigGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SysdataFallbackOwner {
+    seed_install_id: u64,
+    pub(crate) workspace_root: std::path::PathBuf,
+}
+
+pub(crate) struct SysdataFallbackCommitEffects {
+    pub(crate) routing_owner: Option<SystemFileRoutingOwnerIdentity>,
+    pub(crate) candidates: Vec<AnalysisTransferCandidate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3339,6 +3372,50 @@ impl WorldState {
         }
     }
 
+    pub(crate) fn current_sysdata_fallback_owner(&self) -> Option<SysdataFallbackOwner> {
+        let workspace_root = self.package_inputs.workspace_root.clone()?;
+        (self.package_seed_install_id != 0).then_some(SysdataFallbackOwner {
+            seed_install_id: self.package_seed_install_id,
+            workspace_root,
+        })
+    }
+
+    pub(crate) fn sysdata_fallback_owner_is_current(&self, owner: &SysdataFallbackOwner) -> bool {
+        self.package_seed_install_id == owner.seed_install_id
+            && self.package_inputs.workspace_root.as_ref() == Some(&owner.workspace_root)
+    }
+
+    pub(crate) fn capture_sysdata_fallback_basis(
+        &self,
+        owner: &SysdataFallbackOwner,
+    ) -> Option<(SysdataFallbackBasis, std::path::PathBuf)> {
+        if !self.sysdata_fallback_owner_is_current(owner) {
+            return None;
+        }
+        let runtime_r_path = self
+            .package_library
+            .r_subprocess()
+            .map(|runtime| runtime.r_path().clone())?;
+        let runtime_identity = self
+            .package_library
+            .r_subprocess()
+            .map(|runtime| runtime.runtime_identity())?;
+        Some((
+            SysdataFallbackBasis {
+                seed_install_id: self.package_seed_install_id,
+                workspace_root: owner.workspace_root.clone(),
+                package: self.capture_package_projection_basis(),
+                package_library_install_id: self.package_library_install_id,
+                package_library_content_generation: self.package_library_content_generation,
+                configured_r_path: self.cross_file_config.packages_r_path.clone(),
+                runtime_r_path: runtime_r_path.clone(),
+                runtime_identity,
+                analysis_config_generation: self.analysis_config_generation,
+            },
+            runtime_r_path,
+        ))
+    }
+
     pub(crate) fn capture_exact_foreground_post_seed_package_projection_basis(
         &self,
         identity: PackageSeedInstalledIdentity,
@@ -3375,6 +3452,47 @@ impl WorldState {
             return Err(PackageProjectionInstallRejected::StaleBasis);
         }
         Ok(self.install_prepared_package_projection(prepared))
+    }
+
+    pub(crate) fn try_install_sysdata_fallback_projection(
+        &mut self,
+        basis: &SysdataFallbackBasis,
+        prepared: PreparedPackageProjection,
+        affected_uris: impl IntoIterator<Item = Url>,
+    ) -> Result<SysdataFallbackCommitEffects, PackageProjectionInstallRejected> {
+        if !self.sysdata_fallback_basis_is_current(basis) {
+            return Err(PackageProjectionInstallRejected::StaleBasis);
+        }
+        let routing_owner = self.install_prepared_package_projection(prepared);
+        let candidates = self.capture_analysis_transfer_candidates(affected_uris);
+        Ok(SysdataFallbackCommitEffects {
+            routing_owner,
+            candidates,
+        })
+    }
+
+    pub(crate) fn sysdata_fallback_basis_is_current(&self, basis: &SysdataFallbackBasis) -> bool {
+        let runtime_r_path = self
+            .package_library
+            .r_subprocess()
+            .map(|runtime| runtime.r_path());
+        let runtime_identity = self
+            .package_library
+            .r_subprocess()
+            .map(|runtime| runtime.runtime_identity());
+        if self.package_seed_install_id != basis.seed_install_id
+            || self.package_inputs.workspace_root.as_ref() != Some(&basis.workspace_root)
+            || self.package_library_install_id != basis.package_library_install_id
+            || self.package_library_content_generation != basis.package_library_content_generation
+            || self.cross_file_config.packages_r_path != basis.configured_r_path
+            || runtime_r_path != Some(&basis.runtime_r_path)
+            || runtime_identity.as_ref() != Some(&basis.runtime_identity)
+            || self.analysis_config_generation != basis.analysis_config_generation
+            || !self.package_projection_basis_is_current(&basis.package)
+        {
+            return false;
+        }
+        true
     }
 
     fn package_projection_basis_is_current(&self, basis: &PackageProjectionBasis) -> bool {
@@ -3762,6 +3880,13 @@ impl WorldState {
             #[cfg(test)]
             post_seed_refresh_test_commit_attempts: 0,
             #[cfg(test)]
+            sysdata_fallback_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            sysdata_fallback_test_reject_remaining: 0,
+            #[cfg(test)]
+            sysdata_fallback_test_commit_attempts: 0,
+            #[cfg(test)]
             force_open_edit_overflow_for_test: false,
             #[cfg(test)]
             force_open_install_local_only_for_test: false,
@@ -3831,6 +3956,7 @@ impl WorldState {
             package_input_lifecycle: crate::package_state::PackageInputLifecycle::default(),
             package_seed_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
             watched_package_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
+            sysdata_fallback_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
         }
     }
 
@@ -4168,12 +4294,11 @@ impl WorldState {
         self.diagnostics_gate.clear_all();
     }
 
-    /// Cancel the delayed package-seed convergence task, if one is pending.
-    /// Called during server shutdown so a sleeping retry cannot resume disk I/O
-    /// after the shutdown response.
+    /// Cancel delayed package convergence tasks during server shutdown.
     pub(crate) fn cancel_package_seed_retry(&self) {
         self.package_seed_retry.cancel();
         self.watched_package_retry.cancel();
+        self.sysdata_fallback_retry.cancel();
     }
 
     fn open_alias_candidates_for_uri(&self, uri: &Url) -> Vec<Url> {
