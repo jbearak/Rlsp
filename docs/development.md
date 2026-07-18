@@ -332,20 +332,26 @@ redirect an old transaction's marker into the new lifecycle.
 After a detached package seed installs, Rprofile and testthat preamble replay
 also form one projection rather than two tails. One package/open-context basis
 owns both scans and the single CAS, so observers see old/old before it and
-new/new afterward. Three rejected whole-pair attempts transfer ownership to one
-coalesced worker keyed by the exact seed identity. A newer seed or authoritative
-live package edit does not silently cancel the tail: the worker recaptures the
-whole pair against the current package basis while retaining the outer
-seed/system handles and exact diagnostic candidates. A root/config successor
-is terminal for that pair but still consumes the retained outer ledger exactly
-once; a later seed fails its install CAS as a strict no-op and transfers to the
-coalesced retry lifecycle while the predecessor coordinator is pending, so it
-cannot overwrite and orphan that ledger. The coordinator unions
-the stable tail candidates with every retained handle and applies the cap,
-reservations, and force markers in one finalization. If the same seed still has
-deferred `system.file()` convergence, its worker transfers the routing handle
-to this coordinator rather than independently finalizing or fresh-capturing
-open URIs.
+new/new afterward. Three rejected whole-pair attempts return inert deferred
+work keyed by the exact seed identity; no worker starts at that point.
+Orchestration first registers the post-seed owner, its complete outer
+handle/candidate bundle, and any exact pending `system.file()` dependency under
+one write lock, then starts the workers. Registration distinguishes a new
+owner, the same owner, and a different owner without replacing either ledger;
+same-owner callers deposit their complete bundle, while different-owner
+callers retain theirs and retry after the predecessor completes. A newer seed
+or unrelated authoritative live package edit does not silently cancel the
+tail: the coordinator recaptures the whole pair against the current package
+basis while retaining the outer seed/system handles and exact diagnostic
+candidates. A root/config successor is terminal for that pair but still
+consumes the retained outer ledger exactly once; a later seed fails its install
+CAS as a strict no-op and transfers to the coalesced retry lifecycle while the
+predecessor coordinator is pending, so it cannot overwrite and orphan that
+ledger. The coordinator waits for every registered routing dependency, unions
+the stable tail candidates with every retained handle, and applies the cap,
+reservations, and force markers in one finalization. Deferred `system.file()`
+convergence transfers its routing handle to this coordinator rather than
+independently finalizing or fresh-capturing open URIs.
 
 `didOpen` additionally owns a never-reused per-URI intent generation, whose
 arrival-time target record cannot rebase across an edit, close/reopen, metadata

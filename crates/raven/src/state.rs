@@ -828,6 +828,10 @@ pub struct WorldState {
     /// post-seed owner was retaining the outer diagnostic ledger.
     pending_post_seed_system_transfer:
         Option<(PackageSeedInstalledIdentity, AnalysisTransferHandle)>,
+    /// Exact outer ledgers deposited by the deferred owner's callers before
+    /// any post-seed or system worker is allowed to run.
+    pending_post_seed_outer_handles: Vec<AnalysisTransferHandle>,
+    pending_post_seed_outer_candidates: Vec<AnalysisTransferCandidate>,
     /// Dedicated latest-owner identity for all `system.file()` routing inputs.
     ///
     /// This is deliberately narrower than `package_input_generation`: unrelated
@@ -2360,7 +2364,7 @@ impl WorldState {
         &mut self,
         identity: PackageSeedInstalledIdentity,
     ) -> bool {
-        if self.pending_system_file_seed_retry == Some(identity) {
+        if self.pending_system_file_seed_retry.is_some() {
             return false;
         }
         self.pending_system_file_seed_retry = Some(identity);
@@ -2372,6 +2376,10 @@ impl WorldState {
         identity: PackageSeedInstalledIdentity,
     ) -> bool {
         self.pending_system_file_seed_retry == Some(identity)
+    }
+
+    pub(crate) fn system_file_seed_retry_owner(&self) -> Option<PackageSeedInstalledIdentity> {
+        self.pending_system_file_seed_retry
     }
 
     pub(crate) fn complete_system_file_seed_retry(
@@ -2386,12 +2394,47 @@ impl WorldState {
     pub(crate) fn begin_post_seed_refresh_retry(
         &mut self,
         identity: PackageSeedInstalledIdentity,
-    ) -> bool {
-        if self.pending_post_seed_refresh_retry == Some(identity) {
-            return false;
+    ) -> PostSeedRefreshOwnerRegistration {
+        match self.pending_post_seed_refresh_retry {
+            None => {
+                self.pending_post_seed_refresh_retry = Some(identity);
+                PostSeedRefreshOwnerRegistration::Added
+            }
+            Some(current) if current == identity => PostSeedRefreshOwnerRegistration::ExistingSame,
+            Some(current) => PostSeedRefreshOwnerRegistration::ExistingDifferent(current),
         }
-        self.pending_post_seed_refresh_retry = Some(identity);
-        true
+    }
+
+    /// Registers one post-seed coordinator and its exact routing dependency.
+    ///
+    /// Both ownership records are inspected and, for a new coordinator, installed
+    /// under the caller's single `WorldState` write lock. A different existing
+    /// owner is never replaced, so no worker can observe a post-seed owner without
+    /// the routing dependency that must complete before its tail may finalize.
+    pub(crate) fn begin_post_seed_refresh_retry_with_system_dependency(
+        &mut self,
+        identity: PackageSeedInstalledIdentity,
+        requires_system_file_retry: bool,
+    ) -> PostSeedRefreshOwnerRegistration {
+        match self.pending_post_seed_refresh_retry {
+            Some(current) if current != identity => {
+                return PostSeedRefreshOwnerRegistration::ExistingDifferent(current);
+            }
+            _ => {}
+        }
+        if requires_system_file_retry
+            && let Some(current) = self.pending_system_file_seed_retry
+            && current != identity
+        {
+            return PostSeedRefreshOwnerRegistration::ExistingDifferent(current);
+        }
+
+        let registration = self.begin_post_seed_refresh_retry(identity);
+        if registration == PostSeedRefreshOwnerRegistration::Added && requires_system_file_retry {
+            let added = self.begin_system_file_seed_retry(identity);
+            debug_assert!(added || self.system_file_seed_retry_is_current(identity));
+        }
+        registration
     }
 
     pub(crate) fn post_seed_refresh_retry_is_current(
@@ -2411,6 +2454,8 @@ impl WorldState {
     ) {
         if self.pending_post_seed_refresh_retry == Some(identity) {
             self.pending_post_seed_refresh_retry = None;
+            self.pending_post_seed_outer_handles.clear();
+            self.pending_post_seed_outer_candidates.clear();
         }
         if self
             .pending_post_seed_system_transfer
@@ -2419,6 +2464,32 @@ impl WorldState {
         {
             self.pending_post_seed_system_transfer = None;
         }
+    }
+
+    pub(crate) fn retain_post_seed_outer_finalization(
+        &mut self,
+        identity: PackageSeedInstalledIdentity,
+        handles: impl IntoIterator<Item = AnalysisTransferHandle>,
+        candidates: impl IntoIterator<Item = AnalysisTransferCandidate>,
+    ) -> bool {
+        if self.pending_post_seed_refresh_retry != Some(identity) {
+            return false;
+        }
+        self.pending_post_seed_outer_handles.extend(handles);
+        self.pending_post_seed_outer_candidates.extend(candidates);
+        true
+    }
+
+    pub(crate) fn take_post_seed_outer_finalization(
+        &mut self,
+        identity: PackageSeedInstalledIdentity,
+    ) -> Option<(Vec<AnalysisTransferHandle>, Vec<AnalysisTransferCandidate>)> {
+        (self.pending_post_seed_refresh_retry == Some(identity)).then(|| {
+            (
+                std::mem::take(&mut self.pending_post_seed_outer_handles),
+                std::mem::take(&mut self.pending_post_seed_outer_candidates),
+            )
+        })
     }
 
     pub(crate) fn retain_post_seed_system_transfer(
@@ -2466,6 +2537,13 @@ enum AnalysisTransferIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct AnalysisTransferHandle {
     identity: AnalysisTransferIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostSeedRefreshOwnerRegistration {
+    Added,
+    ExistingSame,
+    ExistingDifferent(PackageSeedInstalledIdentity),
 }
 
 #[cfg(test)]
@@ -3507,6 +3585,8 @@ impl WorldState {
             pending_system_file_seed_retry: None,
             pending_post_seed_refresh_retry: None,
             pending_post_seed_system_transfer: None,
+            pending_post_seed_outer_handles: Vec::new(),
+            pending_post_seed_outer_candidates: Vec::new(),
             system_file_routing_owner_generation: Self::mint_system_file_routing_owner_generation(),
 
             // Caches
