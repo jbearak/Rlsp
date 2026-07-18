@@ -450,6 +450,18 @@ Diff editors expose both sides through `window.visibleTextEditors`, so the tab c
 
 Eligibility is checked both before diagnostic computation and at the final atomic gate commit. `WorldState::diagnostics_publish_lock` serializes the final check + client send with tab-removal and `did_close` empty publications; do not remove that serialization in favor of cancellation alone, because a worker can otherwise pass its last state check, lose the clear race, and publish stale Problems afterward. A URI removed from the editor-resource set has pending revalidation cancelled and its diagnostics gate cleared; adding it back explicitly schedules diagnostics because a background text model that remained LSP-open will not send another `didOpen`.
 
+Each `raven/activeDocumentsChanged` arrival owns a process-wide, never-reused
+intent; the client timestamp is activity payload, not transaction ordering.
+`WorldState::commit_open_lifecycle_batch_if_current` validates that intent and
+atomically replaces the diagnostic-resource policy, retires removed epochs,
+mints added epochs, and captures immutable added-work triggers from the same
+commit. The handler sends every removal clear while still holding
+`diagnostics_publish_lock`, then releases it before starting bounded work from
+those exact triggers. Do not route the added set through the URI-only fanout:
+its later fresh capture could attach delayed work to a remove/re-add lifecycle
+that did not exist when the batch committed. An activity-only notification
+uses the same arrival sequencer but changes only activity hints.
+
 Raven intentionally keeps `tower-lsp` at `.concurrency_level(1)` so text-sync notifications remain ordered. Do not use global LSP concurrency to speed up diagnostics. Dependency-triggered fan-out is localized in `crates/raven/src/backend.rs`: `publish_diagnostics_for_uris_bounded` runs the normal debounced diagnostic pipeline for an already-computed URI set with a small fixed concurrency limit (`DIAGNOSTIC_FANOUT_CONCURRENCY`). Each worker rebuilds its own snapshot and commits through the monotonic gate.
 
 ### Closed-file disk resync and commit (#558, #650)

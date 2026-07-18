@@ -19,6 +19,7 @@ use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
 
 static NEXT_OPEN_INSTALL_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPEN_CLOSE_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_OPEN_LIFECYCLE_INTENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Symbol provider configuration
 ///
@@ -849,6 +850,18 @@ pub struct WorldState {
     pub(crate) close_resync_post_attempt_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
     #[cfg(test)]
+    pub(crate) open_lifecycle_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) open_lifecycle_post_commit_pre_clear_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) open_lifecycle_post_unlock_pre_spawn_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) open_lifecycle_added_effects_complete_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
     pub(crate) diagnostics_post_publish_lock_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
     /// Deterministic barrier after alias-reconcile derivation and before its
@@ -1041,6 +1054,8 @@ pub struct WorldState {
     open_install_intents: HashMap<Url, OpenInstallIntentState>,
     /// Persistent ownership tombstones for detached `didClose` transactions.
     open_close_intents: HashMap<Url, OpenCloseIntentState>,
+    /// Latest-arrival ownership for `raven/activeDocumentsChanged`.
+    open_lifecycle_intent: Option<OpenLifecycleIntentState>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) open_pin_recompute_count: usize,
     #[cfg(any(test, feature = "test-support"))]
@@ -1214,6 +1229,20 @@ pub(crate) struct OpenCloseIntentToken {
     /// Arrival-time record identity. Retries may refresh ancillary context but
     /// must never rebase onto an edit, metadata replacement, or reopen.
     target: OpenRecordToken,
+}
+
+/// Process-wide never-reused arrival identity for one active-document
+/// notification. `timestamp_ms` is payload only and never participates in
+/// ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenLifecycleIntentToken {
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenLifecycleIntentState {
+    Pending(u64),
+    Committed(u64),
 }
 
 impl OpenCloseIntentToken {
@@ -1719,6 +1748,43 @@ pub(crate) struct AnalysisRevalidationTicket {
     pub(crate) debounce_ms: u64,
 }
 
+/// Parsed payload owned by one active-document notification arrival.
+pub(crate) struct PreparedOpenLifecycleBatch {
+    intent: OpenLifecycleIntentToken,
+    active_uri: Option<Url>,
+    visible_uris: Vec<Url>,
+    timestamp_ms: u64,
+    diagnostic_uris: Option<HashSet<Url>>,
+}
+
+impl PreparedOpenLifecycleBatch {
+    pub(crate) fn new(
+        intent: OpenLifecycleIntentToken,
+        active_uri: Option<Url>,
+        visible_uris: Vec<Url>,
+        timestamp_ms: u64,
+        diagnostic_uris: Option<HashSet<Url>>,
+    ) -> Self {
+        Self {
+            intent,
+            active_uri,
+            visible_uris,
+            timestamp_ms,
+            diagnostic_uris,
+        }
+    }
+
+    pub(crate) fn has_lifecycle_transition(&self) -> bool {
+        self.diagnostic_uris.is_some()
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct OpenLifecycleBatchEffects {
+    pub(crate) removed_clears: Vec<Url>,
+    pub(crate) added_tickets: Vec<AnalysisRevalidationTicket>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AnalysisCommitEffects {
     pub(crate) revalidations: Vec<AnalysisRevalidationTicket>,
@@ -2142,6 +2208,18 @@ impl WorldState {
             close_resync_post_attempt_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
+            open_lifecycle_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            open_lifecycle_post_commit_pre_clear_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            open_lifecycle_post_unlock_pre_spawn_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            open_lifecycle_added_effects_complete_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
             diagnostics_post_publish_lock_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
@@ -2195,6 +2273,7 @@ impl WorldState {
             open_context_authority_generation: OpenContextAuthorityGeneration(0),
             open_install_intents: HashMap::new(),
             open_close_intents: HashMap::new(),
+            open_lifecycle_intent: None,
             #[cfg(any(test, feature = "test-support"))]
             open_pin_recompute_count: 0,
             #[cfg(any(test, feature = "test-support"))]
@@ -2231,6 +2310,120 @@ impl WorldState {
         self.editor_diagnostic_uris
             .as_ref()
             .is_none_or(|uris| uris.contains(uri))
+    }
+
+    fn mint_open_lifecycle_intent_generation() -> u64 {
+        NEXT_OPEN_LIFECYCLE_INTENT_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("open-lifecycle intent generation counter exhausted")
+    }
+
+    /// Claim latest-arrival ownership for one active-document notification.
+    /// Both activity-only and diagnostic-policy payloads use this sequencer,
+    /// so a newer activity hint can supersede an older paused lifecycle batch.
+    pub(crate) fn begin_open_lifecycle_intent(&mut self) -> OpenLifecycleIntentToken {
+        let generation = Self::mint_open_lifecycle_intent_generation();
+        self.open_lifecycle_intent = Some(OpenLifecycleIntentState::Pending(generation));
+        OpenLifecycleIntentToken { generation }
+    }
+
+    /// Commit one active-document payload atomically if it is still the most
+    /// recently arrived notification.
+    ///
+    /// Lifecycle transitions are derived only after intent validation from
+    /// the final open-document set and current editor policy. The returned
+    /// tickets carry exact post-mint triggers; callers must not fresh-capture
+    /// them later, because a remove/re-add may already have retired the epoch.
+    pub(crate) fn commit_open_lifecycle_batch_if_current(
+        &mut self,
+        prepared: PreparedOpenLifecycleBatch,
+    ) -> Option<OpenLifecycleBatchEffects> {
+        if self.open_lifecycle_intent
+            != Some(OpenLifecycleIntentState::Pending(
+                prepared.intent.generation,
+            ))
+        {
+            return None;
+        }
+
+        let Some(new_uris) = prepared.diagnostic_uris else {
+            self.cross_file_activity.update(
+                prepared.active_uri,
+                prepared.visible_uris,
+                prepared.timestamp_ms,
+            );
+            self.open_lifecycle_intent = Some(OpenLifecycleIntentState::Committed(
+                prepared.intent.generation,
+            ));
+            return Some(OpenLifecycleBatchEffects::default());
+        };
+
+        let previously_eligible: HashSet<Url> = self
+            .documents
+            .keys()
+            .filter(|uri| self.diagnostics_publish_allowed(uri))
+            .cloned()
+            .collect();
+        let newly_eligible: HashSet<Url> = self
+            .documents
+            .keys()
+            .filter(|uri| new_uris.contains(*uri))
+            .cloned()
+            .collect();
+        let mut removed_clears: Vec<Url> = previously_eligible
+            .difference(&newly_eligible)
+            .cloned()
+            .collect();
+        let mut added: Vec<Url> = newly_eligible
+            .difference(&previously_eligible)
+            .cloned()
+            .collect();
+        removed_clears.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        added.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+
+        self.cross_file_activity.update(
+            prepared.active_uri,
+            prepared.visible_uris,
+            prepared.timestamp_ms,
+        );
+        self.replace_editor_diagnostic_uris(Some(new_uris));
+        for uri in &removed_clears {
+            self.retire_open_document_diagnostic_lifecycle(uri);
+        }
+        for uri in &added {
+            self.begin_open_document_diagnostic_lifecycle(uri);
+        }
+        let debounce_ms = self.cross_file_config.revalidation_debounce_ms;
+        let added_tickets = added
+            .into_iter()
+            .map(|uri| AnalysisRevalidationTicket {
+                trigger: DiagnosticsTrigger::capture(self, &uri),
+                debounce_ms,
+                uri,
+            })
+            .collect();
+        self.open_lifecycle_intent = Some(OpenLifecycleIntentState::Committed(
+            prepared.intent.generation,
+        ));
+        Some(OpenLifecycleBatchEffects {
+            removed_clears,
+            added_tickets,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_lifecycle_intent_for_test(&self) -> Option<(&'static str, u64)> {
+        self.open_lifecycle_intent.map(|intent| match intent {
+            OpenLifecycleIntentState::Pending(generation) => ("pending", generation),
+            OpenLifecycleIntentState::Committed(generation) => ("committed", generation),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn editor_eligibility_generation_for_test(&self) -> u64 {
+        self.editor_eligibility_generation.0
     }
 
     fn mint_open_install_intent_generation() -> u64 {

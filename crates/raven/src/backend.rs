@@ -34,8 +34,8 @@ use crate::state::{
     OpenCloseIntentToken, OpenCloseResyncTicket, OpenInstallIntentToken, PreparedAnalysisCommit,
     PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis, PreparedOpenCloseDiskInstall,
     PreparedOpenCommitPlan, PreparedOpenEditAnalysis, PreparedOpenGraphProjection,
-    PreparedOpenInstallAnalysis, PreparedOpenPackageInstall, SymbolConfig,
-    WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorldState,
+    PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch, PreparedOpenPackageInstall,
+    SymbolConfig, WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorldState,
     derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
@@ -121,6 +121,18 @@ struct ActiveDocumentsChangedParams {
     diagnostic_uris: Option<Vec<String>>,
     timestamp_ms: u64,
 }
+
+#[cfg(test)]
+const OPEN_LIFECYCLE_PRE_COMMIT_PAUSE_URI: &str = "raven-test://open-lifecycle/pre-commit";
+#[cfg(test)]
+const OPEN_LIFECYCLE_POST_COMMIT_PRE_CLEAR_PAUSE_URI: &str =
+    "raven-test://open-lifecycle/post-commit-pre-clear";
+#[cfg(test)]
+const OPEN_LIFECYCLE_POST_UNLOCK_PRE_SPAWN_PAUSE_URI: &str =
+    "raven-test://open-lifecycle/post-unlock-pre-spawn";
+#[cfg(test)]
+const OPEN_LIFECYCLE_ADDED_EFFECTS_COMPLETE_PAUSE_URI: &str =
+    "raven-test://open-lifecycle/added-effects-complete";
 
 /// Parse the VS Code client's initial tab/peek resource set.
 ///
@@ -13698,6 +13710,52 @@ impl Backend {
         .await;
     }
 
+    /// Publish immutable tickets returned by a central lifecycle commit.
+    ///
+    /// Unlike the URI-only fanout above, this must not fresh-capture triggers:
+    /// a delayed ticket belongs to the exact epoch minted by its batch and
+    /// must fail stale after any later remove/re-add lifecycle.
+    async fn publish_diagnostics_for_tickets_bounded(
+        state_arc: Arc<RwLock<WorldState>>,
+        client: Client,
+        tickets: Vec<crate::state::AnalysisRevalidationTicket>,
+        traversal_truncation: Option<Arc<TraversalTruncationState>>,
+    ) {
+        #[cfg(test)]
+        let completion_state = Arc::clone(&state_arc);
+        run_bounded_fanout(tickets, DIAGNOSTIC_FANOUT_CONCURRENCY, move |ticket| {
+            let state_arc = Arc::clone(&state_arc);
+            let client = client.clone();
+            let traversal_truncation = traversal_truncation.clone();
+            async move {
+                run_debounced_diagnostics(
+                    state_arc,
+                    client,
+                    ticket.uri,
+                    ticket.debounce_ms,
+                    ticket.trigger,
+                    traversal_truncation,
+                )
+                .await;
+            }
+        })
+        .await;
+        #[cfg(test)]
+        {
+            let pause = {
+                let state = completion_state.read().await;
+                state
+                    .open_lifecycle_added_effects_complete_test_pause
+                    .take_armed(
+                        &Url::parse(OPEN_LIFECYCLE_ADDED_EFFECTS_COMPLETE_PAUSE_URI).unwrap(),
+                    )
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+    }
+
     async fn publish_diagnostics(&self, uri: &Url) {
         publish_diagnostics_inner(&self.state, &self.client, uri).await;
         self.check_and_warn_traversal_truncation().await;
@@ -14153,6 +14211,10 @@ impl Backend {
 
     /// Handle the raven/activeDocumentsChanged notification (Requirement 15)
     async fn handle_active_documents_changed(&self, params: ActiveDocumentsChangedParams) {
+        // Arrival order, not the client timestamp, owns this transition. Mint
+        // before parsing or awaiting the publish lock so a newer activity-only
+        // notification can supersede an older lifecycle batch parked there.
+        let intent = self.state.write().await.begin_open_lifecycle_intent();
         log::trace!(
             "Received activeDocumentsChanged: active={:?}, visible={}, diagnostic_resources={:?}, timestamp={}",
             params.active_uri,
@@ -14173,14 +14235,19 @@ impl Backend {
                 .filter_map(|uri| Url::parse(&uri).ok())
                 .collect::<std::collections::HashSet<_>>()
         });
+        let prepared = PreparedOpenLifecycleBatch::new(
+            intent,
+            active_uri,
+            visible_uris,
+            params.timestamp_ms,
+            diagnostic_uris,
+        );
 
-        let Some(new_uris) = diagnostic_uris else {
+        if !prepared.has_lifecycle_transition() {
             let mut state = self.state.write().await;
-            state
-                .cross_file_activity
-                .update(active_uri, visible_uris, params.timestamp_ms);
+            state.commit_open_lifecycle_batch_if_current(prepared);
             return;
-        };
+        }
 
         // Serialize a tab-set transition and its empty publications with the
         // final commit+send tail of every diagnostic computation.
@@ -14189,56 +14256,42 @@ impl Backend {
             Arc::clone(&state.diagnostics_publish_lock)
         };
         let diagnostics_publish_guard = diagnostics_publish_lock.lock().await;
+        #[cfg(test)]
+        {
+            let pause = {
+                let state = self.state.read().await;
+                state
+                    .open_lifecycle_pre_commit_test_pause
+                    .take_armed(&Url::parse(OPEN_LIFECYCLE_PRE_COMMIT_PAUSE_URI).unwrap())
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
 
-        let (removed, added) = {
+        let effects = {
             let mut state = self.state.write().await;
-            state
-                .cross_file_activity
-                .update(active_uri, visible_uris, params.timestamp_ms);
-
-            let previously_eligible: std::collections::HashSet<Url> = state
-                .documents
-                .keys()
-                .filter(|uri| state.diagnostics_publish_allowed(uri))
-                .cloned()
-                .collect();
-            let newly_eligible: std::collections::HashSet<Url> = state
-                .documents
-                .keys()
-                .filter(|uri| new_uris.contains(*uri))
-                .cloned()
-                .collect();
-
-            let removed: Vec<Url> = previously_eligible
-                .difference(&newly_eligible)
-                .cloned()
-                .collect();
-            let added: Vec<Url> = newly_eligible
-                .difference(&previously_eligible)
-                .cloned()
-                .collect();
-
-            state.replace_editor_diagnostic_uris(Some(new_uris));
-            for uri in &removed {
-                // In-flight work also re-checks eligibility at commit.
-                // Retiring the lifecycle (cancel + gate clear, including the
-                // epoch — #603) retracts Problems now, lets a later tab-open
-                // publish the same document version without a force marker,
-                // and dooms in-flight workers this cancel cannot reach.
-                state.retire_open_document_diagnostic_lifecycle(uri);
-            }
-            for uri in &added {
-                // Fresh lifecycle for each re-added tab. Must run AFTER the
-                // `editor_diagnostic_uris` replacement above: eligibility is
-                // read from it, and minting before the replacement would be
-                // a silent no-op that fails every subsequent publish closed.
-                state.begin_open_document_diagnostic_lifecycle(uri);
-            }
-
-            (removed, added)
+            state.commit_open_lifecycle_batch_if_current(prepared)
         };
+        let Some(effects) = effects else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            let pause = {
+                let state = self.state.read().await;
+                state
+                    .open_lifecycle_post_commit_pre_clear_test_pause
+                    .take_armed(
+                        &Url::parse(OPEN_LIFECYCLE_POST_COMMIT_PRE_CLEAR_PAUSE_URI).unwrap(),
+                    )
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
 
-        for uri in removed {
+        for uri in effects.removed_clears {
             log::trace!(
                 "diagnostics lifecycle: publish uri={} count=0 path=tab-clear open=true",
                 uri
@@ -14247,14 +14300,28 @@ impl Backend {
         }
         drop(diagnostics_publish_guard);
 
-        if !added.is_empty() {
+        #[cfg(test)]
+        {
+            let pause = {
+                let state = self.state.read().await;
+                state
+                    .open_lifecycle_post_unlock_pre_spawn_test_pause
+                    .take_armed(
+                        &Url::parse(OPEN_LIFECYCLE_POST_UNLOCK_PRE_SPAWN_PAUSE_URI).unwrap(),
+                    )
+            };
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+        if !effects.added_tickets.is_empty() {
             // A tab can appear for a document that another extension already
             // kept LSP-open, so there may be no new didOpen to trigger this.
-            // Run the normal bounded pipeline explicitly.
-            tokio::spawn(Backend::publish_diagnostics_for_uris_bounded(
+            // Run the bounded pipeline with the exact committed triggers.
+            tokio::spawn(Backend::publish_diagnostics_for_tickets_bounded(
                 Arc::clone(&self.state),
                 self.client.clone(),
-                added,
+                effects.added_tickets,
                 Some(Arc::clone(&self.traversal_truncation)),
             ));
         }
@@ -15250,7 +15317,7 @@ mod tests {
             Diagnostic, DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
             PublishDiagnosticsParams, Range, TextDocumentIdentifier, TextDocumentItem, Url,
         };
-        use tower_lsp::{LanguageServer, LspService};
+        use tower_lsp::{ClientSocket, LanguageServer, LspService};
 
         /// Poll until a pending revalidation entry exists for `uri` — i.e.
         /// the document's own spawned debounced worker has `schedule()`d and
@@ -15276,6 +15343,661 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        }
+
+        async fn lifecycle_service(
+            diagnostic_uris: &[Url],
+        ) -> (LspService<super::super::Backend>, ClientSocket) {
+            let (mut svc, socket) = LspService::new(super::super::Backend::new);
+            let initialize = Request::build("initialize")
+                .id(1)
+                .params(
+                    serde_json::to_value(InitializeParams {
+                        initialization_options: Some(serde_json::json!({
+                            "diagnosticUris": diagnostic_uris
+                                .iter()
+                                .map(Url::to_string)
+                                .collect::<Vec<_>>(),
+                        })),
+                        ..InitializeParams::default()
+                    })
+                    .unwrap(),
+                )
+                .finish();
+            let response = svc.ready().await.unwrap().call(initialize).await.unwrap();
+            assert!(response.is_some_and(|response| response.is_ok()));
+            {
+                let mut state = svc.inner().state.write().await;
+                state.workspace_scan_complete = true;
+                state.cross_file_config.packages_enabled = false;
+                state.cross_file_config.on_demand_indexing_enabled = false;
+                state.cross_file_config.revalidation_debounce_ms = 60_000;
+            }
+            (svc, socket)
+        }
+
+        async fn open_lifecycle_doc(backend: &super::super::Backend, uri: &Url, text: &str) {
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "r".into(),
+                        version: 1,
+                        text: text.into(),
+                    },
+                })
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn active_documents_activity_only_is_a_lifecycle_noop() {
+            let tmp = TempDir::new().unwrap();
+            let uri = Url::from_file_path(tmp.path().join("activity.R")).unwrap();
+            std::fs::write(tmp.path().join("activity.R"), "x <- (\n").unwrap();
+            let (svc, mut socket) = lifecycle_service(std::slice::from_ref(&uri)).await;
+            let backend = svc.inner();
+            open_lifecycle_doc(backend, &uri, "x <- (\n").await;
+            wait_until_pending(backend, &uri).await;
+
+            let before = {
+                let mut state = backend.state.write().await;
+                state
+                    .cross_file_activity
+                    .record_recent(Url::parse("file:///recent.R").unwrap());
+                let record = state.documents.get_record(&uri).unwrap();
+                (
+                    state.editor_diagnostic_uris.clone(),
+                    state.editor_eligibility_generation_for_test(),
+                    record.generation(),
+                    record.provenance().lifecycle_epoch,
+                    state.diagnostics_gate.current_epoch(&uri),
+                    state.diagnostics_gate.force_republish_count_for_test(&uri),
+                    state
+                        .cross_file_revalidation
+                        .pending_generation_for_test(&uri),
+                    state.analysis_revalidation_reservation_count,
+                    state.cross_file_activity.recent_uris.clone(),
+                )
+            };
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some("not a uri".into()),
+                    visible_uris: vec![uri.to_string(), "also not a uri".into(), uri.to_string()],
+                    diagnostic_uris: None,
+                    timestamp_ms: 1,
+                })
+                .await;
+
+            let state = backend.state.read().await;
+            let record = state.documents.get_record(&uri).unwrap();
+            assert_eq!(state.cross_file_activity.active_uri, None);
+            assert_eq!(
+                state.cross_file_activity.visible_uris,
+                vec![uri.clone(), uri.clone()],
+                "visible parsing preserves valid order and duplicates"
+            );
+            assert_eq!(state.cross_file_activity.timestamp_ms, 1);
+            assert_eq!(state.cross_file_activity.recent_uris, before.8);
+            assert_eq!(state.editor_diagnostic_uris, before.0);
+            assert_eq!(state.editor_eligibility_generation_for_test(), before.1);
+            assert_eq!(record.generation(), before.2);
+            assert_eq!(record.provenance().lifecycle_epoch, before.3);
+            assert_eq!(state.diagnostics_gate.current_epoch(&uri), before.4);
+            assert_eq!(
+                state.diagnostics_gate.force_republish_count_for_test(&uri),
+                before.5
+            );
+            assert_eq!(
+                state
+                    .cross_file_revalidation
+                    .pending_generation_for_test(&uri),
+                before.6
+            );
+            assert_eq!(state.analysis_revalidation_reservation_count, before.7);
+            assert!(matches!(
+                state.open_lifecycle_intent_for_test(),
+                Some(("committed", _))
+            ));
+            drop(state);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err(),
+                "activity-only notifications never publish"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn active_documents_mixed_batch_commits_before_clear_and_added_spawn() {
+            let tmp = TempDir::new().unwrap();
+            let a = Url::from_file_path(tmp.path().join("a.R")).unwrap();
+            let b = Url::from_file_path(tmp.path().join("b.R")).unwrap();
+            let c = Url::from_file_path(tmp.path().join("c.R")).unwrap();
+            let absent = Url::from_file_path(tmp.path().join("absent.R")).unwrap();
+            for name in ["a.R", "b.R", "c.R"] {
+                std::fs::write(tmp.path().join(name), "x <- (\n").unwrap();
+            }
+            let (svc, mut socket) = lifecycle_service(&[a.clone(), c.clone()]).await;
+            let backend = svc.inner();
+            for uri in [&a, &b, &c] {
+                open_lifecycle_doc(backend, uri, "x <- (\n").await;
+            }
+            let (a_generation, b_generation, c_generation, a_epoch, c_epoch, recent) = {
+                let mut state = backend.state.write().await;
+                state
+                    .cross_file_activity
+                    .record_recent(Url::parse("file:///recent.R").unwrap());
+                (
+                    state.documents.get_record(&a).unwrap().generation(),
+                    state.documents.get_record(&b).unwrap().generation(),
+                    state.documents.get_record(&c).unwrap().generation(),
+                    state.diagnostics_gate.current_epoch(&a).unwrap(),
+                    state.diagnostics_gate.current_epoch(&c).unwrap(),
+                    state.cross_file_activity.recent_uris.clone(),
+                )
+            };
+            let pause_uri =
+                Url::parse(super::super::OPEN_LIFECYCLE_POST_COMMIT_PRE_CLEAR_PAUSE_URI).unwrap();
+            let pause = backend
+                .state
+                .read()
+                .await
+                .open_lifecycle_post_commit_pre_clear_test_pause
+                .arm(pause_uri);
+            let handler = backend.handle_active_documents_changed(
+                super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(b.to_string()),
+                    visible_uris: vec![b.to_string(), c.to_string()],
+                    diagnostic_uris: Some(vec![
+                        b.to_string(),
+                        c.to_string(),
+                        absent.to_string(),
+                        b.to_string(),
+                        "invalid".into(),
+                    ]),
+                    timestamp_ms: 7,
+                },
+            );
+            tokio::pin!(handler);
+            tokio::select! {
+                _ = pause.wait_arrived() => {}
+                _ = &mut handler => panic!("mixed lifecycle batch skipped postcommit barrier"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("mixed batch timed out"),
+            }
+            {
+                let state = backend.state.read().await;
+                assert_eq!(
+                    state.editor_diagnostic_uris,
+                    Some(std::collections::HashSet::from([
+                        b.clone(),
+                        c.clone(),
+                        absent.clone(),
+                    ]))
+                );
+                assert_eq!(state.cross_file_activity.active_uri, Some(b.clone()));
+                assert_eq!(state.cross_file_activity.recent_uris, recent);
+                assert_eq!(state.diagnostics_gate.current_epoch(&a), None);
+                let b_epoch = state.diagnostics_gate.current_epoch(&b).unwrap();
+                assert_eq!(
+                    state
+                        .documents
+                        .get_record(&b)
+                        .unwrap()
+                        .provenance()
+                        .lifecycle_epoch,
+                    Some(b_epoch)
+                );
+                assert_ne!(b_epoch, a_epoch);
+                assert_ne!(b_epoch, c_epoch);
+                assert_eq!(state.diagnostics_gate.current_epoch(&c), Some(c_epoch));
+                assert_eq!(state.diagnostics_gate.current_epoch(&absent), None);
+                assert!(state.documents.get_record(&a).unwrap().generation() > a_generation);
+                assert!(state.documents.get_record(&b).unwrap().generation() > b_generation);
+                assert_eq!(
+                    state.documents.get_record(&c).unwrap().generation(),
+                    c_generation
+                );
+                assert!(
+                    !state.cross_file_revalidation.has_pending_for_test(&b),
+                    "added work cannot spawn before the atomic state is inspectable"
+                );
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err(),
+                "clear cannot cross the postcommit barrier"
+            );
+            pause.release();
+            handler.await;
+            let clear = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let clear: PublishDiagnosticsParams =
+                serde_json::from_value(clear.params().unwrap().clone()).unwrap();
+            assert_eq!(clear.uri, a);
+            assert!(clear.diagnostics.is_empty());
+            wait_until_pending(backend, &b).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn active_documents_latest_arrival_supersedes_paused_some_with_some_and_none() {
+            let tmp = TempDir::new().unwrap();
+            let a = Url::from_file_path(tmp.path().join("a.R")).unwrap();
+            let b = Url::from_file_path(tmp.path().join("b.R")).unwrap();
+            for name in ["a.R", "b.R"] {
+                std::fs::write(tmp.path().join(name), "x <- 1\n").unwrap();
+            }
+            let (svc, mut socket) = lifecycle_service(std::slice::from_ref(&a)).await;
+            let backend = svc.inner();
+            open_lifecycle_doc(backend, &a, "x <- 1\n").await;
+            open_lifecycle_doc(backend, &b, "x <- 1\n").await;
+            let lifecycle_snapshot = || async {
+                let state = backend.state.read().await;
+                (
+                    state.editor_diagnostic_uris.clone(),
+                    state.editor_eligibility_generation_for_test(),
+                    state.documents.get_record(&a).unwrap().generation(),
+                    state.documents.get_record(&b).unwrap().generation(),
+                    state.diagnostics_gate.current_epoch(&a),
+                    state.diagnostics_gate.current_epoch(&b),
+                    state.diagnostics_gate.force_republish_count_for_test(&a),
+                    state.diagnostics_gate.force_republish_count_for_test(&b),
+                    state
+                        .cross_file_revalidation
+                        .pending_generation_for_test(&a),
+                    state
+                        .cross_file_revalidation
+                        .pending_generation_for_test(&b),
+                    state.analysis_revalidation_reservation_count,
+                )
+            };
+            let baseline = lifecycle_snapshot().await;
+            let pause_uri = Url::parse(super::super::OPEN_LIFECYCLE_PRE_COMMIT_PAUSE_URI).unwrap();
+            let first_pause = backend
+                .state
+                .read()
+                .await
+                .open_lifecycle_pre_commit_test_pause
+                .arm(pause_uri.clone());
+            let old = backend.handle_active_documents_changed(
+                super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(a.to_string()),
+                    visible_uris: vec![a.to_string()],
+                    diagnostic_uris: Some(vec![b.to_string()]),
+                    timestamp_ms: 999,
+                },
+            );
+            tokio::pin!(old);
+            tokio::select! {
+                _ = first_pause.wait_arrived() => {}
+                _ = &mut old => panic!("older Some skipped precommit pause"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("older Some timed out"),
+            }
+            let old_intent = backend
+                .state
+                .read()
+                .await
+                .open_lifecycle_intent_for_test()
+                .unwrap()
+                .1;
+            let newer = backend.handle_active_documents_changed(
+                super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(b.to_string()),
+                    visible_uris: vec![b.to_string()],
+                    diagnostic_uris: Some(vec![a.to_string()]),
+                    timestamp_ms: 1,
+                },
+            );
+            tokio::pin!(newer);
+            tokio::select! {
+                _ = async {
+                    loop {
+                        if backend.state.read().await.open_lifecycle_intent_for_test().unwrap().1
+                            != old_intent
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+                _ = &mut newer => panic!("newer Some cannot pass the older publish lock"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("newer Some did not claim arrival"),
+            }
+            first_pause.release();
+            old.await;
+            newer.await;
+            assert_eq!(lifecycle_snapshot().await, baseline);
+            {
+                let state = backend.state.read().await;
+                assert_eq!(state.cross_file_activity.active_uri, Some(b.clone()));
+                assert_eq!(state.cross_file_activity.timestamp_ms, 1);
+            }
+
+            let second_pause = backend
+                .state
+                .read()
+                .await
+                .open_lifecycle_pre_commit_test_pause
+                .arm(pause_uri);
+            let old = backend.handle_active_documents_changed(
+                super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(a.to_string()),
+                    visible_uris: vec![a.to_string()],
+                    diagnostic_uris: Some(vec![b.to_string()]),
+                    timestamp_ms: 1_000,
+                },
+            );
+            tokio::pin!(old);
+            tokio::select! {
+                _ = second_pause.wait_arrived() => {}
+                _ = &mut old => panic!("second older Some skipped precommit pause"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("second older Some timed out"),
+            }
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: None,
+                    visible_uris: vec![a.to_string(), a.to_string()],
+                    diagnostic_uris: None,
+                    timestamp_ms: 2,
+                })
+                .await;
+            second_pause.release();
+            old.await;
+            assert_eq!(lifecycle_snapshot().await, baseline);
+            {
+                let state = backend.state.read().await;
+                assert_eq!(state.cross_file_activity.active_uri, None);
+                assert_eq!(
+                    state.cross_file_activity.visible_uris,
+                    vec![a.clone(), a.clone()]
+                );
+                assert_eq!(state.cross_file_activity.timestamp_ms, 2);
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err(),
+                "superseded lifecycle batches publish nothing"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn active_documents_old_added_ticket_cannot_touch_readded_lifecycle() {
+            let tmp = TempDir::new().unwrap();
+            let uri = Url::from_file_path(tmp.path().join("readded.R")).unwrap();
+            std::fs::write(tmp.path().join("readded.R"), "x <- (\n").unwrap();
+            let (svc, mut socket) = lifecycle_service(&[]).await;
+            let backend = svc.inner();
+            open_lifecycle_doc(backend, &uri, "x <- (\n").await;
+            backend
+                .state
+                .write()
+                .await
+                .cross_file_config
+                .revalidation_debounce_ms = 0;
+
+            let post_unlock = backend
+                .state
+                .read()
+                .await
+                .open_lifecycle_post_unlock_pre_spawn_test_pause
+                .arm(
+                    Url::parse(super::super::OPEN_LIFECYCLE_POST_UNLOCK_PRE_SPAWN_PAUSE_URI)
+                        .unwrap(),
+                );
+            let old_add = backend.handle_active_documents_changed(
+                super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(uri.to_string()),
+                    visible_uris: vec![uri.to_string()],
+                    diagnostic_uris: Some(vec![uri.to_string()]),
+                    timestamp_ms: 1,
+                },
+            );
+            tokio::pin!(old_add);
+            tokio::select! {
+                _ = post_unlock.wait_arrived() => {}
+                _ = &mut old_add => panic!("old add skipped postunlock barrier"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("old add timed out"),
+            }
+            let old_epoch = backend
+                .state
+                .read()
+                .await
+                .diagnostics_gate
+                .current_epoch(&uri)
+                .unwrap();
+
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: None,
+                    visible_uris: Vec::new(),
+                    diagnostic_uris: Some(Vec::new()),
+                    timestamp_ms: 2,
+                })
+                .await;
+            let clear = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let clear: PublishDiagnosticsParams =
+                serde_json::from_value(clear.params().unwrap().clone()).unwrap();
+            assert_eq!(clear.uri, uri);
+            assert!(clear.diagnostics.is_empty());
+
+            let fresh_worker_pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_test_pause
+                .arm(uri.clone());
+            backend
+                .handle_active_documents_changed(super::super::ActiveDocumentsChangedParams {
+                    active_uri: Some(uri.to_string()),
+                    visible_uris: vec![uri.to_string()],
+                    diagnostic_uris: Some(vec![uri.to_string()]),
+                    timestamp_ms: 3,
+                })
+                .await;
+            tokio::time::timeout(Duration::from_secs(5), fresh_worker_pause.wait_arrived())
+                .await
+                .expect("fresh re-add ticket reaches its prepublish barrier");
+            let (fresh_epoch, fresh_pending, fresh_force, reservation_count) = {
+                let state = backend.state.read().await;
+                (
+                    state.diagnostics_gate.current_epoch(&uri).unwrap(),
+                    state
+                        .cross_file_revalidation
+                        .pending_generation_for_test(&uri)
+                        .unwrap(),
+                    state.diagnostics_gate.force_republish_count_for_test(&uri),
+                    state.analysis_revalidation_reservation_count,
+                )
+            };
+            assert_ne!(fresh_epoch, old_epoch);
+
+            let old_attempt_complete = backend
+                .state
+                .read()
+                .await
+                .open_lifecycle_added_effects_complete_test_pause
+                .arm(
+                    Url::parse(super::super::OPEN_LIFECYCLE_ADDED_EFFECTS_COMPLETE_PAUSE_URI)
+                        .unwrap(),
+                );
+            post_unlock.release();
+            old_add.await;
+            tokio::time::timeout(Duration::from_secs(5), old_attempt_complete.wait_arrived())
+                .await
+                .expect("old exact ticket acknowledges its stale attempt");
+            {
+                let state = backend.state.read().await;
+                assert_eq!(
+                    state.diagnostics_gate.current_epoch(&uri),
+                    Some(fresh_epoch)
+                );
+                assert_eq!(
+                    state
+                        .cross_file_revalidation
+                        .pending_generation_for_test(&uri),
+                    Some(fresh_pending),
+                    "old ticket must decline before schedule and cannot cancel fresh work"
+                );
+                assert_eq!(
+                    state.diagnostics_gate.force_republish_count_for_test(&uri),
+                    fresh_force
+                );
+                assert_eq!(
+                    state.analysis_revalidation_reservation_count,
+                    reservation_count
+                );
+            }
+            old_attempt_complete.release();
+            fresh_worker_pause.release();
+            let fresh = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let fresh: PublishDiagnosticsParams =
+                serde_json::from_value(fresh.params().unwrap().clone()).unwrap();
+            assert_eq!(fresh.uri, uri);
+            assert!(!fresh.diagnostics.is_empty());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err(),
+                "old exact ticket never publishes into the new epoch"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn active_documents_worker_first_publishes_nonempty_then_clear() {
+            let tmp = TempDir::new().unwrap();
+            let uri = Url::from_file_path(tmp.path().join("worker-first.R")).unwrap();
+            std::fs::write(tmp.path().join("worker-first.R"), "x <- (\n").unwrap();
+            let (svc, mut socket) = lifecycle_service(std::slice::from_ref(&uri)).await;
+            let backend = svc.inner();
+            open_lifecycle_doc(backend, &uri, "x <- (\n").await;
+
+            let worker_pause = backend
+                .state
+                .read()
+                .await
+                .diagnostics_post_publish_lock_test_pause
+                .arm(uri.clone());
+            let worker = backend.publish_diagnostics(&uri);
+            tokio::pin!(worker);
+            tokio::select! {
+                _ = worker_pause.wait_arrived() => {}
+                _ = &mut worker => panic!("worker skipped publish-lock barrier"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("worker timed out"),
+            }
+            let old_intent = backend
+                .state
+                .read()
+                .await
+                .open_lifecycle_intent_for_test()
+                .map(|(_, generation)| generation);
+            let remove = backend.handle_active_documents_changed(
+                super::super::ActiveDocumentsChangedParams {
+                    active_uri: None,
+                    visible_uris: Vec::new(),
+                    diagnostic_uris: Some(Vec::new()),
+                    timestamp_ms: 1,
+                },
+            );
+            tokio::pin!(remove);
+            tokio::select! {
+                _ = async {
+                    loop {
+                        if backend.state.read().await.open_lifecycle_intent_for_test().map(|(_, generation)| generation)
+                            != old_intent
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+                _ = &mut remove => panic!("remove cannot pass the worker-owned publish lock"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("remove did not claim arrival"),
+            }
+            worker_pause.release();
+            worker.await;
+            let first = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let first: PublishDiagnosticsParams =
+                serde_json::from_value(first.params().unwrap().clone()).unwrap();
+            remove.await;
+            let second = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let second: PublishDiagnosticsParams =
+                serde_json::from_value(second.params().unwrap().clone()).unwrap();
+            assert_eq!(first.uri, uri);
+            assert_eq!(first.version, None);
+            assert!(!first.diagnostics.is_empty());
+            assert_eq!(second.uri, uri);
+            assert_eq!(second.version, None);
+            assert!(second.diagnostics.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn active_documents_batch_first_clears_and_stale_worker_never_publishes() {
+            let tmp = TempDir::new().unwrap();
+            let uri = Url::from_file_path(tmp.path().join("batch-first.R")).unwrap();
+            std::fs::write(tmp.path().join("batch-first.R"), "x <- (\n").unwrap();
+            let (svc, mut socket) = lifecycle_service(std::slice::from_ref(&uri)).await;
+            let backend = svc.inner();
+            open_lifecycle_doc(backend, &uri, "x <- (\n").await;
+
+            let batch_pause = backend
+                .state
+                .read()
+                .await
+                .open_lifecycle_post_commit_pre_clear_test_pause
+                .arm(
+                    Url::parse(super::super::OPEN_LIFECYCLE_POST_COMMIT_PRE_CLEAR_PAUSE_URI)
+                        .unwrap(),
+                );
+            let remove = backend.handle_active_documents_changed(
+                super::super::ActiveDocumentsChangedParams {
+                    active_uri: None,
+                    visible_uris: Vec::new(),
+                    diagnostic_uris: Some(Vec::new()),
+                    timestamp_ms: 1,
+                },
+            );
+            tokio::pin!(remove);
+            tokio::select! {
+                _ = batch_pause.wait_arrived() => {}
+                _ = &mut remove => panic!("batch skipped postcommit barrier"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("batch timed out"),
+            }
+            let worker = backend.publish_diagnostics(&uri);
+            tokio::pin!(worker);
+            batch_pause.release();
+            remove.await;
+            worker.await;
+
+            let clear = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let clear: PublishDiagnosticsParams =
+                serde_json::from_value(clear.params().unwrap().clone()).unwrap();
+            assert_eq!(clear.uri, uri);
+            assert_eq!(clear.version, None);
+            assert!(clear.diagnostics.is_empty());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), socket.next())
+                    .await
+                    .is_err(),
+                "worker that loses the publish lock must fail closed"
+            );
         }
 
         /// Push diagnostics are server-owned. Closing Raven's last live buffer
