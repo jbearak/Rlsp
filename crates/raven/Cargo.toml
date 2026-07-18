@@ -59,6 +59,9 @@ globset = "0.4"
 libc = "0.2"
 xdg = "2.5.2"
 
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1"
+
 [features]
 # Expose test_utils for integration tests and benchmarks (kept out of production builds)
 test-support = []

@@ -1648,6 +1648,7 @@ dependencies = [
  "tree-sitter-r",
  "url",
  "walkdir",
+ "winapi-util",
  "xdg",
 ]
 

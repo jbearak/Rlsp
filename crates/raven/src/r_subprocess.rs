@@ -113,15 +113,15 @@ enum RRuntimeDiskIdentity {
         #[cfg(unix)]
         change_nanoseconds: i64,
         #[cfg(windows)]
-        volume_serial_number: Option<u32>,
+        volume_serial_number: u64,
         #[cfg(windows)]
-        file_index: Option<u64>,
+        file_index: u64,
         #[cfg(windows)]
-        file_attributes: u32,
+        file_attributes: u64,
         #[cfg(windows)]
-        creation_time: u64,
+        creation_time: Option<u64>,
         #[cfg(windows)]
-        last_write_time: u64,
+        last_write_time: Option<u64>,
     },
     Missing,
     Invalid,
@@ -233,7 +233,32 @@ impl RSubprocess {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         #[cfg(windows)]
-        use std::os::windows::fs::MetadataExt;
+        let windows_identity = {
+            let handle = match winapi_util::Handle::from_path(
+                canonical_path
+                    .as_ref()
+                    .expect("successful canonicalization has a path"),
+            ) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    return RRuntimeIdentity {
+                        requested_path: self.r_path.clone(),
+                        canonical_path,
+                        disk: RRuntimeDiskIdentity::Invalid,
+                    };
+                }
+            };
+            match winapi_util::file::information(&handle) {
+                Ok(info) => info,
+                Err(_) => {
+                    return RRuntimeIdentity {
+                        requested_path: self.r_path.clone(),
+                        canonical_path,
+                        disk: RRuntimeDiskIdentity::Invalid,
+                    };
+                }
+            }
+        };
         RRuntimeIdentity {
             requested_path: self.r_path.clone(),
             canonical_path,
@@ -253,15 +278,15 @@ impl RSubprocess {
                 #[cfg(unix)]
                 change_nanoseconds: metadata.ctime_nsec(),
                 #[cfg(windows)]
-                volume_serial_number: metadata.volume_serial_number(),
+                volume_serial_number: windows_identity.volume_serial_number(),
                 #[cfg(windows)]
-                file_index: metadata.file_index(),
+                file_index: windows_identity.file_index(),
                 #[cfg(windows)]
-                file_attributes: metadata.file_attributes(),
+                file_attributes: windows_identity.file_attributes(),
                 #[cfg(windows)]
-                creation_time: metadata.creation_time(),
+                creation_time: windows_identity.creation_time(),
                 #[cfg(windows)]
-                last_write_time: metadata.last_write_time(),
+                last_write_time: windows_identity.last_write_time(),
             },
         }
     }
