@@ -843,6 +843,11 @@ pub struct WorldState {
     #[cfg(test)]
     pub(crate) close_resync_pre_commit_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
+    /// Deterministic acknowledgement after a close resync has either
+    /// committed or rejected its prepared disk observation.
+    #[cfg(test)]
+    pub(crate) close_resync_post_attempt_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
     #[cfg(test)]
     pub(crate) diagnostics_post_publish_lock_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
@@ -2132,6 +2137,9 @@ impl WorldState {
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
             close_resync_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            close_resync_post_attempt_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
             diagnostics_post_publish_lock_test_pause:
@@ -3559,19 +3567,6 @@ impl WorldState {
             .documents
             .get_record(&prepared.uri)
             .map(|record| record.artifacts().interface_hash);
-        let changed_authoritative_roots: Vec<Url> = prepared
-            .plan
-            .graph
-            .iter()
-            .map(|projection| projection.uri.clone())
-            .filter(|root| root != &prepared.uri)
-            .collect();
-        for root in changed_authoritative_roots {
-            prepared
-                .plan
-                .seed_revalidation_uris
-                .extend(self.affected_open_dependents_after_edit(&root, true, true));
-        }
         self.advance_workspace_scan_generation();
         self.retire_diagnostic_lifecycle(&prepared.uri);
         self.cross_file_activity.remove(&prepared.uri);
@@ -3836,6 +3831,31 @@ impl WorldState {
     ) -> Vec<AnalysisRevalidationTicket> {
         let closing_subject = plan.closing_subject;
         let replacement_interface_hash = plan.replacement_interface_hash;
+        // A close can change several authoritative spellings at once: the
+        // raw subject, canonical alias roots that are remirrored, and
+        // canonical roots that are reset or retired. Collect their
+        // dependents both before and after applying the graph plan. The
+        // pre-walk retains removed/existing incoming edges; the post-walk
+        // discovers edges introduced by a surviving alias (notably a new
+        // backward directive). Both sets flow through the single cap below.
+        let changed_authoritative_roots = if closing_subject {
+            let mut roots: Vec<Url> = plan
+                .graph
+                .iter()
+                .map(|projection| projection.uri.clone())
+                .chain(plan.reset_closed_roots.iter().cloned())
+                .chain(plan.retire_closed_roots.iter().cloned())
+                .collect();
+            roots.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+            roots.dedup();
+            roots
+        } else {
+            Vec::new()
+        };
+        let close_pre_graph_neighbors: Vec<Url> = changed_authoritative_roots
+            .iter()
+            .flat_map(|root| self.affected_open_dependents_after_edit(root, true, true))
+            .collect();
         // Preserve the pre-update neighborhood only when the prepared graph
         // inputs can change routing. This keeps private/body-only edits on the
         // selective fast path while still retaining a removed edge's endpoint,
@@ -3898,6 +3918,10 @@ impl WorldState {
                 ),
             );
         }
+        let close_post_graph_neighbors: Vec<Url> = changed_authoritative_roots
+            .iter()
+            .flat_map(|root| self.affected_open_dependents_after_edit(root, true, true))
+            .collect();
 
         let mut package_visibility_changed = false;
         if let Some((event_uri, text)) = plan.package_event {
@@ -3927,6 +3951,8 @@ impl WorldState {
         };
         let interface_changed = old_interface != new_interface;
         let mut affected: HashSet<Url> = plan.seed_revalidation_uris.into_iter().collect();
+        affected.extend(close_pre_graph_neighbors);
+        affected.extend(close_post_graph_neighbors);
         if plan.direct_subject_publish || closing_subject {
             affected.remove(uri);
         } else {

@@ -7862,6 +7862,16 @@ async fn run_close_resync(
             (Vec::new(), false, false)
         }
     };
+    #[cfg(test)]
+    {
+        let armed = {
+            let state = state_arc.read().await;
+            state.close_resync_post_attempt_test_pause.take_armed(&uri)
+        };
+        if let Some(pause_gate) = armed {
+            pause_gate.pause().await;
+        }
+    }
 
     let mut affected: Vec<Url> = Vec::new();
     let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
@@ -23355,6 +23365,175 @@ mod project_config_initialize_tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alias_close_remirror_new_backward_edge_revalidates_new_dependent() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("b")).unwrap();
+        fs::write(real.join("parent.R"), "a_value <- 1\n").unwrap();
+        fs::write(tmp.path().join("consumer.R"), "b_value\n").unwrap();
+
+        let alias_a = Url::from_file_path(tmp.path().join("a/parent.R")).unwrap();
+        let alias_b = Url::from_file_path(tmp.path().join("b/parent.R")).unwrap();
+        let canonical_uri = Url::from_file_path(real.join("parent.R")).unwrap();
+        let consumer_uri = Url::from_file_path(tmp.path().join("consumer.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        backend
+            .state
+            .write()
+            .await
+            .cross_file_config
+            .revalidation_debounce_ms = 60_000;
+
+        open_doc(backend, &alias_a, "r", 1, "a_value <- 1\n").await;
+        open_doc(
+            backend,
+            &alias_b,
+            "r",
+            1,
+            "# raven: sourced-by ../consumer.R\nb_value <- 2\n",
+        )
+        .await;
+        open_doc(backend, &consumer_uri, "r", 1, "b_value\n").await;
+
+        let reservation_baseline = {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.open_document_uri_for_authoritative_uri(&canonical_uri),
+                Some(alias_a.clone())
+            );
+            assert!(
+                !has_dependency_edge(&state, &consumer_uri, &canonical_uri),
+                "precondition: owner A does not expose alias B's backward edge"
+            );
+            state.analysis_revalidation_reservation_count
+        };
+
+        close_doc(backend, &alias_a).await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.open_document_uri_for_authoritative_uri(&canonical_uri),
+            Some(alias_b)
+        );
+        assert!(
+            has_dependency_edge(&state, &consumer_uri, &canonical_uri),
+            "remirroring B must install its newly introduced backward edge"
+        );
+        assert!(
+            state.analysis_revalidation_reservation_count > reservation_baseline,
+            "the post-apply canonical walk must reserve the new dependent"
+        );
+        assert!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&consumer_uri)
+                >= 1,
+            "the newly introduced dependent must own a close-handoff marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alias_close_remove_reset_only_canonical_revalidates_existing_dependent() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+        fs::write(real.join("parent.R"), "disk_value <- 1\n").unwrap();
+
+        let alias_uri = Url::from_file_path(tmp.path().join("link/parent.R")).unwrap();
+        let canonical_uri = Url::from_file_path(real.join("parent.R")).unwrap();
+        let consumer_uri = Url::from_file_path(tmp.path().join("consumer.R")).unwrap();
+        let (svc, _socket) = tower_lsp::LspService::new(Backend::new);
+        let backend = svc.inner();
+        backend
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![WorkspaceFolder {
+                    uri: Url::from_file_path(tmp.path()).unwrap(),
+                    name: "t".into(),
+                }]),
+                initialization_options: Some(serde_json::json!({
+                    "crossFile": { "indexWorkspace": false },
+                    "packages": { "enabled": false }
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        backend
+            .state
+            .write()
+            .await
+            .cross_file_config
+            .revalidation_debounce_ms = 60_000;
+
+        open_doc(backend, &alias_uri, "r", 1, "buffer_value <- 2\n").await;
+        open_doc(
+            backend,
+            &consumer_uri,
+            "r",
+            1,
+            "source(\"real/parent.R\")\nbuffer_value\n",
+        )
+        .await;
+
+        let reservation_baseline = {
+            let state = backend.state.read().await;
+            assert_eq!(
+                state.open_document_uri_for_authoritative_uri(&canonical_uri),
+                Some(alias_uri.clone())
+            );
+            assert!(has_dependency_edge(&state, &consumer_uri, &canonical_uri));
+            assert!(
+                !state.workspace_index.contains(&canonical_uri),
+                "precondition: the canonical root has no retained closed shadow"
+            );
+            state.analysis_revalidation_reservation_count
+        };
+        fs::remove_file(real.join("parent.R")).unwrap();
+
+        close_doc(backend, &alias_uri).await;
+
+        let state = backend.state.read().await;
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&canonical_uri)
+                .is_empty(),
+            "the reset-only canonical root must be removed"
+        );
+        assert!(
+            state.analysis_revalidation_reservation_count > reservation_baseline,
+            "removing a reset-only canonical root must reserve its existing dependent"
+        );
+        assert!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&consumer_uri)
+                >= 1,
+            "the existing canonical dependent must own a close-removal marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn non_excluded_alias_with_project_excluded_canonical_root_is_non_lending() {
         let tmp = TempDir::new().unwrap();
         let generated = tmp.path().join("generated");
@@ -35114,13 +35293,21 @@ infixContinuationStyle = "aligned"
             .await
             .close_resync_pre_commit_test_pause
             .arm(uri.clone());
+        let completed = backend
+            .state
+            .write()
+            .await
+            .close_resync_post_attempt_test_pause
+            .arm(uri.clone());
         close_doc(backend, &uri).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
             .await
             .expect("close resync reaches pre-commit barrier");
         open_doc(backend, &uri, "r", 1, "reopened <- 3\n").await;
         pause.release();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed.wait_arrived())
+            .await
+            .expect("close resync acknowledges its reopen veto");
         assert_eq!(
             backend
                 .state
@@ -35131,6 +35318,7 @@ infixContinuationStyle = "aligned"
                 .map(|document| document.text()),
             Some("reopened <- 3\n".into())
         );
+        completed.release();
     }
 
     #[tokio::test]
@@ -35143,13 +35331,21 @@ infixContinuationStyle = "aligned"
             .await
             .close_resync_pre_commit_test_pause
             .arm(uri.clone());
+        let completed = backend
+            .state
+            .write()
+            .await
+            .close_resync_post_attempt_test_pause
+            .arm(uri.clone());
         close_doc(backend, &uri).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
             .await
             .expect("close resync reaches pre-commit barrier");
         fs::write(tmp.path().join("resync-snapshot.R"), "disk_after <- 2\n").unwrap();
         pause.release();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed.wait_arrived())
+            .await
+            .expect("close resync acknowledges its changed-snapshot rejection");
         assert_eq!(
             backend
                 .state
@@ -35161,6 +35357,7 @@ infixContinuationStyle = "aligned"
             Some("disk_before <- 1\n".into()),
             "the stale disk parse must not replace the retained shadow"
         );
+        completed.release();
     }
 
     #[tokio::test]
@@ -35191,6 +35388,12 @@ infixContinuationStyle = "aligned"
             .await
             .close_resync_pre_commit_test_pause
             .arm(uri.clone());
+        let completed = backend
+            .state
+            .write()
+            .await
+            .close_resync_post_attempt_test_pause
+            .arm(uri.clone());
         close_doc(backend, &uri).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.wait_arrived())
             .await
@@ -35201,7 +35404,9 @@ infixContinuationStyle = "aligned"
         )
         .unwrap();
         pause.release();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed.wait_arrived())
+            .await
+            .expect("close resync acknowledges its stale-missing rejection");
 
         assert_eq!(
             backend
@@ -35214,6 +35419,7 @@ infixContinuationStyle = "aligned"
             Some("disk_before <- 1\n".into()),
             "a newly created valid file must veto the stale missing removal"
         );
+        completed.release();
     }
 
     #[cfg(unix)]
