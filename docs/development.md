@@ -170,6 +170,35 @@ Rough pipeline:
 4. Resolve scope at a position by traversing edges and applying call-site filtering
 5. Revalidate dependents on relevant changes (interface hash / edges / working directory changes)
 
+Package-state seeds follow the same snapshot/off-lock/install discipline as
+cross-file diagnostics. Callers snapshot authoritative open-buffer overlays
+under the `WorldState` lock, run DESCRIPTION/NAMESPACE, package-R, `.Rprofile`,
+and testthat-preamble scans off-lock through the shared package-seed helper,
+then install a concrete, fully in-memory seed under one write lock. Disabled
+modeling choices are represented by empty scans before construction; the central
+installation transaction never traverses the filesystem. After installation,
+callers refresh open preamble documents to close the snapshot-to-install race.
+
+Background workspace scans use a complete immutable candidate rather than
+merging a raw disk scan at commit time. A brief snapshot captures scan inputs,
+retained non-scan entries (including on-demand/external files), authoritative
+open-buffer overlays, and package/system-file routing identity. Metadata and
+the complete dependency graph are derived off-lock. The final write-lock
+boundary validates that authority snapshot, atomically claims the monotonic
+scan generation, and installs the indexes, graph, and refreshed open-document
+metadata together; a stale candidate mutates nothing and is recomputed.
+Keep new seed inputs in that shared helper so startup, exclusion reloads, and
+package-mode rebuilds cannot drift or introduce blocking filesystem work under
+the state lock.
+
+The package-state-local static-source closure walker in `package_state/mod.rs`
+owns the traversal mechanics shared by `.Rprofile` and testthat preambles: LIFO
+order, visited/routing deduplication, rich forward path resolution, and the common
+depth/file budgets. Caller policies only decide root harvesting, open-buffer text
+overrides, exclusions, and the `.Rprofile` `renv/activate.R` exception. Accepted
+missing or unreadable targets remain in the routing closure so a later create or
+recreate watcher event can rescan them.
+
 ### Module map
 
 Key files under `crates/raven/src/cross_file/`:
@@ -180,6 +209,8 @@ Key files under `crates/raven/src/cross_file/`:
 - `path_resolve.rs` — Path resolution (forward vs backward invariant)
 - `revalidation.rs` — Real-time updates, diagnostics gating, debounce
 - `source_detect.rs` — AST-based detection of `source()`, `sys.source()`, and related calls
+- `binding.rs` — Shared conservative binding-count and `assign()` argument-matching walk used by static path and package-vector inference
+- `static_path.rs` — Strict folding of computed `source()` path expressions
 - `directive.rs` — Parsing of `# raven:` / `@lsp-` directive comments
 - `types.rs` — Shared types (`CrossFileMetadata`, `SymbolKind`, etc.)
 - `config.rs` — Cross-file configuration (cache sizes, debounce intervals, feature flags)
@@ -223,8 +254,8 @@ In `resolve_path_rich`, the `try_workspace_fallback` bool now gates **only** the
 ### Parent-prefix scope and forward-source traversal
 
 Scope resolution has two distinct graph traversals:
-- **Parent prefix**: when resolving a file, Raven first walks backward edges to model symbols available at the start of that file. Symbols introduced only by this prefix are tracked separately so they can be filtered when a child is re-exported through a forward `source()` edge.
-- **Forward sources**: Raven then applies the file's local timeline. When following `source()` calls, real forward-source execution uses a path-local copy of the visited map so one sourced sibling's recursive walk cannot make a later sibling source look already visited. Parent-prefix discovery keeps shared visited pruning to avoid expanding every possible parent/forward path while collecting inherited context.
+- **Parent prefix**: when resolving a file, Raven first walks backward edges to model symbols available at the start of that file. Symbols introduced only by this prefix are tracked separately so they can be filtered when a child is re-exported through a forward `source()` edge. `ForwardSource` and `DependencyEdge` carry `SourceLocality` end to end: `Global` and `CurrentFrame` lend ordinary bindings available through their global/call environments, while `NonInheriting` is declared-only and a hard package barrier. `CurrentFrame` is composed with evaluated capture frames before metadata is stored: caller remains current-frame, global promotes to global, and external/unknown becomes non-inheriting. `ForwardSource` stores only this enum at runtime; custom serde projects the legacy `local`/`sys_source_global_env` booleans on output and normalizes them on input for metadata compatibility.
+- **Forward sources**: Raven then applies the file's local timeline. When following `source()` calls, real forward-source execution uses a path-local copy of the visited map so one sourced sibling's recursive walk cannot make a later sibling source look already visited. Parent-prefix discovery keeps shared visited pruning to avoid expanding every possible parent/forward path while collecting inherited context. Non-inheriting targets retain graph edges for diagnostics and revalidation but never enter the lending timeline.
 
 The cached/streaming parent prefix is seeded with the queried URI at `(u32::MAX, u32::MAX)` so a single cache slot covers all positions in that file within a snapshot, whereas the uncached point resolver (`scope_at_position_with_graph`) seeds the visited map at the real `(line, column)`. For acyclic graphs the two seeds are identical. In a cyclic graph the cached prefix is a deliberate over-approximation: a back-edge can re-enter the queried file at `(MAX, MAX)` and so could "see" symbols defined later in that file, but the same-file leak filter (a symbol whose `source_uri` equals the queried URI is dropped from a parent prefix) plus `entry().or_insert()` merging keep the result sound at the symbol level, so those later symbols never surface. Tightening this would require position-dependent cache keys, which would defeat the cache; it is therefore pinned as intentional — `test_cyclic_cached_overapproximates_vs_uncached_point_query` observes the cached and uncached resolvers agreeing on every field at the boundary query (issue #374).
 
@@ -236,6 +267,7 @@ The hash is deterministic and includes:
 - Exported symbols — each hashed through `impl Hash for ScopedSymbol`, which covers that type's full identity field set (`name`, `kind`, `source_uri`, `defined_line`, `defined_column`, `signature`, `is_declared`) and deliberately excludes only `defined_end_column` (positional highlight metadata). `Hash` must mirror `PartialEq` field-for-field: a field present in one but not the other makes the hash blind to that kind of edit. The `signature` inclusion (issue #482) is what makes a formals-only edit (`f <- function(a)` → `f <- function(a, b)`) bust the hash and revalidate dependents; `scoped_symbol_hash_eq_field_parity` pins the two impls' field sets together.
 - Loaded packages (from `library()` / `require()` / `loadNamespace()`)
 - Declared symbols (from `# raven: var` / `# raven: func` directives)
+- Source-edge inputs, including precise `SourceLocality`, call site, path, `chdir`, function scope, and resolved URI. `CurrentFrame` and `NonInheriting` remain distinct runtime/hash values even though old serialized readers see the same lossy `local = true` compatibility projection for regular `source()` calls.
 
 The backend uses `old_interface_hash` vs `new_interface_hash` to decide whether to revalidate dependents.
 

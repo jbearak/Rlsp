@@ -9,8 +9,47 @@
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Tree};
 
+use super::binding::RuntimeFunctionScope;
 use super::scope::FunctionScopeInterval;
-use super::types::{ForwardSource, byte_offset_to_utf16_column};
+use super::types::{ForwardSource, SourceLocality, byte_offset_to_utf16_column};
+
+/// Maximum depth followed by suppressive-only static source-closure scans.
+pub(crate) const STATIC_SOURCE_MAX_DEPTH: usize = 64;
+
+/// Maximum distinct files visited by one suppressive-only static source scan.
+pub(crate) const STATIC_SOURCE_MAX_FILES: usize = 1000;
+
+/// Static facts consumed together by Rprofile and preamble worklist scans.
+///
+/// Each instance is built from one parse tree and one shared lazy binding
+/// collection. This keeps definition/removal, package, source, and capture-trust
+/// decisions aligned while avoiding the former parser-per-helper pipeline.
+#[derive(Debug, Default)]
+pub(crate) struct StaticScriptFacts {
+    pub(crate) top_level_defs: std::collections::BTreeSet<String>,
+    pub(crate) attached_packages: std::collections::BTreeSet<String>,
+    pub(crate) source_targets: Vec<String>,
+    pub(crate) calls_dev_load_all: bool,
+}
+
+impl StaticScriptFacts {
+    pub(crate) fn from_text(text: &str) -> Self {
+        let Some(tree) = crate::parser_pool::with_parser(|parser| parser.parse(text, None)) else {
+            return Self::default();
+        };
+        let mut bindings = super::static_path::LazyStaticBindings::new(tree.root_node(), text);
+        let (top_level_defs, calls_dev_load_all) =
+            super::scope::static_script_definitions_and_load_all(&tree, text, &mut bindings);
+        let attached_packages = extract_attached_packages_with_bindings(&tree, text, &mut bindings);
+        let source_targets = static_source_targets_with_bindings(&tree, text, &mut bindings);
+        Self {
+            top_level_defs,
+            attached_packages,
+            source_targets,
+            calls_dev_load_all,
+        }
+    }
+}
 
 /// A statically-extracted `system.file(...)` call used as the path argument
 /// to `source()`. Contains the string-literal positional parts and the
@@ -34,6 +73,24 @@ pub struct RmCall {
     pub symbols: Vec<String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct FramedRmCall {
+    pub(crate) call: RmCall,
+    pub(crate) runtime_function_scope: RuntimeFunctionScope,
+    /// A conservative earlier effect anchor used only by the scope timeline when
+    /// capture runtime order cannot be represented by source coordinates.
+    conservative_effect_position: Option<(u32, u32)>,
+}
+
+impl FramedRmCall {
+    fn normalize_scope_effect_position(&mut self) {
+        if let Some((line, column)) = self.conservative_effect_position {
+            self.call.line = line;
+            self.call.column = column;
+        }
+    }
+}
+
 /// Detected `exists("name")` call with the statically-extracted name.
 ///
 /// An `exists("name")` call is a runtime existence probe, but a user who writes
@@ -52,6 +109,18 @@ pub struct ExistsCall {
     pub name: String,
     /// 0-based line of the `exists()` call.
     pub line: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct FramedExistsCall {
+    pub(crate) call: ExistsCall,
+    pub(crate) runtime_function_scope: RuntimeFunctionScope,
+}
+
+#[derive(Debug)]
+pub(crate) struct FramedLibraryCall {
+    pub(crate) call: LibraryCall,
+    pub(crate) runtime_function_scope: RuntimeFunctionScope,
 }
 
 /// Detected library/require/loadNamespace call
@@ -124,14 +193,17 @@ pub struct NamespaceReference {
 /// This function traverses the given tree-sitter `Tree` of R source code and collects each `source()`
 /// or `sys.source()` call that has a statically determinable file path. For each detected call it
 /// records the file path, the end-position line and UTF-16 column, whether the call is `sys.source`,
-/// and the boolean `local` and `chdir` argument values when they are statically resolvable. Calls with
-/// non-string or otherwise non-determinable file arguments are ignored.
+/// its precise [`SourceLocality`], and a statically recognized `chdir` state. Unshadowed `F`,
+/// `.GlobalEnv`, and `globalenv()` are recognized as global-source equivalents; every other
+/// explicit value not statically known to be global is `NonInheriting` so an uncertain call cannot
+/// lend global symbols. Calls with non-string or otherwise non-determinable file arguments are
+/// ignored.
 ///
 /// # Returns
 ///
 /// A `Vec<ForwardSource>` containing one entry per detected `source()`/`sys.source()` call in document
-/// order, with fields populated for path, line, column, is_sys_source, local, chdir, and (for
-/// `sys.source`) `sys_source_global_env`.
+/// order, with fields populated for path, line, column, `is_sys_source`, precise `locality`, and
+/// `chdir`.
 ///
 /// # Examples
 ///
@@ -145,55 +217,305 @@ pub struct NamespaceReference {
 /// let sources = detect_source_calls(&tree, source);
 /// assert_eq!(sources.len(), 1);
 /// assert_eq!(sources[0].path, "utils.R");
-/// assert!(sources[0].local);
+/// assert_eq!(sources[0].locality, raven::cross_file::SourceLocality::CurrentFrame);
 /// ```
 pub fn detect_source_calls(tree: &Tree, content: &str) -> Vec<ForwardSource> {
+    let root = tree.root_node();
+    let mut bindings = super::static_path::LazyStaticBindings::new(root, content);
+    detect_source_calls_with_bindings(tree, content, &mut bindings)
+}
+
+/// Internal source detector that reuses an artifact build's shared lazy binding
+/// cache. Standalone callers use [`detect_source_calls`].
+pub(crate) fn detect_source_calls_with_bindings<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<ForwardSource> {
+    detect_source_calls_with_bindings_and_frames(tree, content, bindings)
+        .into_iter()
+        .map(|detected| detected.source)
+        .collect()
+}
+
+#[derive(Debug)]
+pub(crate) struct FramedSource {
+    pub(crate) source: ForwardSource,
+    pub(crate) runtime_function_scope: RuntimeFunctionScope,
+    /// Whether source-coordinate timeline application can safely order this
+    /// call's effects. Dependency detection retains the call regardless.
+    pub(crate) scope_lending: bool,
+}
+
+impl FramedSource {
+    pub(crate) fn contributes_to_timeline(&self) -> bool {
+        self.scope_lending
+    }
+}
+
+pub(crate) fn detect_source_calls_with_bindings_and_frames<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<FramedSource> {
     log::trace!("Starting tree-sitter parsing for source() call detection");
     let mut sources = Vec::new();
-    let root = tree.root_node();
-    // Single-assignment variable bindings for static path folding (issue
-    // #638): collected once per document, consulted per source() call.
-    let bindings = super::static_path::StaticBindings::collect(root, content);
-    visit_node(root, content, &bindings, &mut sources);
+    visit_node(
+        tree.root_node(),
+        content,
+        bindings,
+        CaptureEvaluationFrame::Caller,
+        RuntimeFunctionScope::Lexical,
+        true,
+        &mut sources,
+    );
     log::trace!(
         "Completed source() call detection, found {} calls",
         sources.len()
     );
-    for source in &sources {
+    for detected in &sources {
+        let source = &detected.source;
         log::trace!(
-            "  Detected source() call: path='{}' at line {} column {} (is_sys_source={}, local={}, chdir={})",
+            "  Detected source() call: path='{}' at line {} column {} (is_sys_source={}, locality={:?}, chdir={})",
             source.path,
             source.line,
             source.column,
             source.is_sys_source,
-            source.local,
+            source.locality,
             source.chdir
         );
     }
     sources
 }
 
-fn visit_node(
-    node: Node,
-    content: &str,
-    bindings: &super::static_path::StaticBindings,
-    sources: &mut Vec<ForwardSource>,
+/// Return statically known `source()` targets that contribute symbols to the
+/// surrounding script scope.
+///
+/// This is the shared filter policy for `.Rprofile` and test-preamble closure
+/// scans. It accepts literal or strictly folded computed paths and excludes
+/// directives, non-inheriting calls, function-scoped calls, and unresolved
+/// paths. Keeping all filters here prevents the two suppressive scans from
+/// drifting as source detection evolves.
+fn static_source_targets_with_bindings<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<String> {
+    detect_source_calls_with_bindings_and_frames(tree, content, bindings)
+        .into_iter()
+        .filter(|detected| {
+            !detected.source.is_directive
+                && detected.scope_lending
+                && detected.source.locality == SourceLocality::Global
+                && !detected.source.is_function_scoped
+                && !detected.source.path.is_empty()
+        })
+        .map(|detected| detected.source.path)
+        .collect()
+}
+
+fn visit_node<'tree, 'text>(
+    node: Node<'tree>,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+    evaluation_frame: CaptureEvaluationFrame,
+    runtime_function_scope: RuntimeFunctionScope,
+    scope_orderable: bool,
+    sources: &mut Vec<FramedSource>,
 ) {
-    if node.kind() == "call"
-        && let Some(source) = try_parse_source_call(node, content, bindings)
-    {
-        sources.push(source);
+    if node.kind() == "call" {
+        if let Some(source) = try_parse_source_call(
+            node,
+            content,
+            capture_bindings,
+            evaluation_frame,
+            runtime_function_scope,
+        ) {
+            sources.push(FramedSource {
+                source,
+                runtime_function_scope,
+                scope_lending: scope_orderable,
+            });
+        }
+        if let Some(capture) = capture_bindings.capturing_call_kind_at(node) {
+            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
+            let capture_scope_orderable = scope_orderable
+                && !super::binding::capture_evaluation_order_has_source_inversion_with_effect(
+                    node,
+                    content,
+                    capture,
+                    evaluation_frame,
+                    &mut |root, frame| {
+                        capture_root_has_global_source_effect(
+                            root,
+                            content,
+                            capture_bindings,
+                            frame,
+                            captured_runtime_scope,
+                        )
+                    },
+                );
+            super::binding::visit_evaluated_capture_parts(
+                node,
+                content,
+                capture,
+                &mut |evaluated, relative_frame, _role| {
+                    visit_node(
+                        evaluated,
+                        content,
+                        capture_bindings,
+                        relative_frame.relative_to(evaluation_frame),
+                        captured_runtime_scope,
+                        capture_scope_orderable,
+                        sources,
+                    )
+                },
+            );
+            return;
+        }
     }
 
+    let enters_function = node.kind() == "function_definition";
+    let child_frame = if enters_function {
+        // Closure creation happens in the surrounding capture frame, while
+        // formals, defaults, and the body execute later in the function frame.
+        CaptureEvaluationFrame::Caller
+    } else {
+        evaluation_frame
+    };
+    let child_runtime_scope = if enters_function {
+        runtime_function_scope.enter_function()
+    } else {
+        runtime_function_scope
+    };
     for child in node.children(&mut node.walk()) {
-        visit_node(child, content, bindings, sources);
+        visit_node(
+            child,
+            content,
+            capture_bindings,
+            child_frame,
+            child_runtime_scope,
+            scope_orderable,
+            sources,
+        );
     }
 }
 
-fn try_parse_source_call(
-    node: Node,
+/// Whether a runtime-evaluated capture root contains a modeled source effect
+/// that targets the process global environment.
+///
+/// This follows the same trusted capture boundaries as source detection itself,
+/// so quoted syntax stays inert and nested evaluated capture parts keep their
+/// composed evaluation frames. Function bodies are deferred and therefore do
+/// not affect the current capture timeline.
+fn capture_root_has_global_source_effect<'tree, 'text>(
+    node: Node<'tree>,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+    evaluation_frame: CaptureEvaluationFrame,
+    runtime_function_scope: RuntimeFunctionScope,
+) -> bool {
+    if node.kind() == "function_definition" {
+        return false;
+    }
+
+    if node.kind() == "call" {
+        if try_parse_source_call(
+            node,
+            content,
+            capture_bindings,
+            evaluation_frame,
+            runtime_function_scope,
+        )
+        .is_some_and(|source| source.locality == SourceLocality::Global)
+        {
+            return true;
+        }
+
+        if let Some(capture) = capture_bindings.capturing_call_kind_at(node) {
+            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
+            let mut found = false;
+            super::binding::visit_evaluated_capture_parts(
+                node,
+                content,
+                capture,
+                &mut |evaluated, relative_frame, _role| {
+                    found |= capture_root_has_global_source_effect(
+                        evaluated,
+                        content,
+                        capture_bindings,
+                        relative_frame.relative_to(evaluation_frame),
+                        captured_runtime_scope,
+                    );
+                },
+            );
+            return found;
+        }
+    }
+
+    node.children(&mut node.walk()).any(|child| {
+        capture_root_has_global_source_effect(
+            child,
+            content,
+            capture_bindings,
+            evaluation_frame,
+            runtime_function_scope,
+        )
+    })
+}
+
+const SOURCE_FORMALS: [&str; 17] = [
+    "file",
+    "local",
+    "echo",
+    "print.eval",
+    "exprs",
+    "spaced",
+    "verbose",
+    "prompt.echo",
+    "max.deparse.length",
+    "width.cutoff",
+    "deparseCtrl",
+    "chdir",
+    "catch.aborts",
+    "encoding",
+    "continue.echo",
+    "skip.echo",
+    "keep.source",
+];
+
+const SYS_SOURCE_FORMALS: [&str; 6] = [
+    "file",
+    "envir",
+    "chdir",
+    "keep.source",
+    "keep.parse.data",
+    "toplevel.env",
+];
+
+fn source_formals(is_sys_source: bool) -> &'static [&'static str] {
+    if is_sys_source {
+        SYS_SOURCE_FORMALS.as_slice()
+    } else {
+        SOURCE_FORMALS.as_slice()
+    }
+}
+
+fn match_source_call_arguments<'tree>(
+    args_node: Node<'tree>,
     content: &str,
-    bindings: &super::static_path::StaticBindings,
+    is_sys_source: bool,
+    mode: CallMatchMode,
+) -> Option<Vec<Option<CallActual<'tree>>>> {
+    super::binding::match_call_arguments(args_node, content, source_formals(is_sys_source), mode)
+}
+
+fn try_parse_source_call<'tree, 'text>(
+    node: Node<'tree>,
+    content: &'text str,
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+    evaluation_frame: CaptureEvaluationFrame,
+    runtime_function_scope: RuntimeFunctionScope,
 ) -> Option<ForwardSource> {
     let func_node = node.child_by_field_name("function")?;
     let func_text = node_text(func_node, content);
@@ -205,14 +527,19 @@ fn try_parse_source_call(
     };
 
     let args_node = node.child_by_field_name("arguments")?;
-    let value_node = super::static_path::source_call_file_value_node(&args_node, content);
+    let formals = source_formals(is_sys_source);
+    let matched_arguments =
+        match_source_call_arguments(args_node, content, is_sys_source, CallMatchMode::Strict)?;
+    let Some(CallActual::Value(value_node)) = matched_arguments.first().copied().flatten() else {
+        return None;
+    };
 
     // Try normal string-literal path first
-    let path = value_node.and_then(|v| extract_string_literal(v, content));
+    let path = extract_string_literal(value_node, content);
 
     // If no string literal, try system.file() call in the path position
     let system_file = if path.is_none() {
-        value_node.and_then(|v| try_parse_system_file_call(v, content))
+        try_parse_system_file_call(value_node, content)
     } else {
         None
     };
@@ -220,7 +547,7 @@ fn try_parse_source_call(
     // If neither, statically fold computed path expressions —
     // file.path()/normalizePath()/single-assignment variables (issue #638).
     let path = if path.is_none() && system_file.is_none() {
-        value_node.and_then(|v| super::static_path::fold_string_expr(v, content, bindings))
+        super::static_path::fold_string_expr(value_node, content, bindings.get())
     } else {
         path
     };
@@ -230,15 +557,54 @@ fn try_parse_source_call(
         return None;
     }
 
-    let local = find_bool_argument(&args_node, content, "local").unwrap_or(false);
-    let chdir = find_bool_argument(&args_node, content, "chdir").unwrap_or(false);
-
-    // For sys.source, check if envir is globalenv()/.GlobalEnv
-    let sys_source_global_env = if is_sys_source {
-        find_envir_is_global(&args_node, content)
-    } else {
-        true // Not sys.source, so this field doesn't matter
+    let deferred_use = !super::binding::is_known_immediate_context(node);
+    let mut alias_is_unshadowed = |name: &str| {
+        !bindings
+            .get()
+            .named_alias_may_shadow_at(name, node, deferred_use)
     };
+
+    // Preserve the destination class beyond parsing. A proven current-frame
+    // value (`TRUE` or trusted `T`) can later compose with a proven Global
+    // capture frame; unknown/environment-valued expressions remain
+    // non-inheriting even in that frame.
+    let locality = if is_sys_source {
+        if matched_global_env_binding(&matched_arguments, content, formals, "envir")
+            .is_some_and(|binding| binding.is_trusted_by(&mut alias_is_unshadowed))
+        {
+            SourceLocality::Global
+        } else {
+            SourceLocality::NonInheriting
+        }
+    } else {
+        let bool_state = classify_matched_bool(
+            &matched_arguments,
+            content,
+            formals,
+            "local",
+            &mut alias_is_unshadowed,
+        );
+        let explicit_global_env =
+            matched_global_env_binding(&matched_arguments, content, formals, "local")
+                .is_some_and(|binding| binding.is_trusted_by(&mut alias_is_unshadowed));
+        match bool_state {
+            BoolArgument::Omitted | BoolArgument::Known(false) => SourceLocality::Global,
+            BoolArgument::Known(true) => SourceLocality::CurrentFrame,
+            BoolArgument::Unknown if explicit_global_env => SourceLocality::Global,
+            BoolArgument::Unknown => SourceLocality::NonInheriting,
+        }
+    };
+    let locality = locality.relative_to(evaluation_frame);
+    let chdir = matches!(
+        classify_matched_bool(
+            &matched_arguments,
+            content,
+            formals,
+            "chdir",
+            &mut alias_is_unshadowed,
+        ),
+        BoolArgument::Known(true)
+    );
 
     let start = node.start_position();
     let line_text = content.lines().nth(start.row).unwrap_or("");
@@ -249,55 +615,16 @@ fn try_parse_source_call(
         line: start.row as u32,
         column,
         is_directive: false,
-        local,
+        locality,
         chdir,
         is_sys_source,
-        sys_source_global_env,
         explicit_line: false,  // AST-detected sources never have explicit line=N
         directive_line: 0,     // Not applicable for AST-detected sources
         user_line_zero: false, // Not applicable for AST-detected sources
-        is_function_scoped: has_function_definition_ancestor(node),
+        is_function_scoped: runtime_function_scope.is_function_scoped_at(node),
         system_file,
         resolved_uri: None,
     })
-}
-
-/// Walk up the AST from `node` to determine whether any ancestor is a
-/// `function_definition`. Used to mark source() calls that only execute
-/// when their enclosing function is invoked, so they are not load-time
-/// ordering constraints. Tree-sitter normalizes R 4.1+ lambdas (`\(x) ...`)
-/// into `function_definition` nodes too, so no separate handling is needed.
-fn has_function_definition_ancestor(node: Node) -> bool {
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if n.kind() == "function_definition" {
-            return true;
-        }
-        current = n.parent();
-    }
-    false
-}
-
-/// Check if the envir argument is globalenv() or .GlobalEnv
-fn find_envir_is_global(args_node: &Node, content: &str) -> bool {
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        if child.kind() == "argument"
-            && let Some(name_node) = child.child_by_field_name("name")
-        {
-            let name = node_text(name_node, content);
-            if name == "envir"
-                && let Some(value_node) = child.child_by_field_name("value")
-            {
-                let value = node_text(value_node, content).trim();
-                // Check for globalenv() or .GlobalEnv
-                return value == "globalenv()" || value == ".GlobalEnv";
-            }
-        }
-    }
-    // If envir is not specified, sys.source defaults to baseenv() which is NOT global
-    // So we return false (conservative: no symbol inheritance)
-    false
 }
 
 /// Parse a `system.file(part1, part2, ..., package = "P")` call node.
@@ -372,26 +699,115 @@ fn try_parse_system_file_call(node: Node, content: &str) -> Option<SystemFileCal
     Some(SystemFileCall { parts, package })
 }
 
-fn find_bool_argument(args_node: &Node, content: &str, param_name: &str) -> Option<bool> {
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        if child.kind() == "argument"
-            && let Some(name_node) = child.child_by_field_name("name")
-        {
-            let name = node_text(name_node, content);
-            if name == param_name
-                && let Some(value_node) = child.child_by_field_name("value")
-            {
-                let value = node_text(value_node, content);
-                return match value {
-                    "TRUE" | "T" => Some(true),
-                    "FALSE" | "F" => Some(false),
-                    _ => None,
-                };
-            }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoolArgument {
+    Omitted,
+    Known(bool),
+    Unknown,
+}
+
+use super::binding::{CallActual, CallMatchMode, CaptureEvaluationFrame};
+
+/// Return the authoritative `file` value node for a valid `source()` or
+/// `sys.source()` argument list.
+///
+/// Detection and file-path intellisense both route through the same R-style
+/// exact/partial/positional matcher, including its conservative rejection of
+/// invalid and ambiguous shapes, so the two surfaces cannot select different
+/// path arguments.
+#[cfg_attr(not(test), allow(dead_code))] // Shared strict selector used by static-path tests.
+pub(crate) fn source_call_file_value_node<'tree>(
+    args_node: &Node<'tree>,
+    content: &str,
+    is_sys_source: bool,
+) -> Option<Node<'tree>> {
+    source_call_file_value_node_mode(args_node, content, is_sys_source, CallMatchMode::Strict)
+}
+
+pub(crate) fn source_call_file_value_node_recovering<'tree>(
+    args_node: &Node<'tree>,
+    content: &str,
+    is_sys_source: bool,
+) -> Option<Node<'tree>> {
+    source_call_file_value_node_mode(
+        args_node,
+        content,
+        is_sys_source,
+        CallMatchMode::RecoverIncomplete,
+    )
+}
+
+fn source_call_file_value_node_mode<'tree>(
+    args_node: &Node<'tree>,
+    content: &str,
+    is_sys_source: bool,
+    mode: CallMatchMode,
+) -> Option<Node<'tree>> {
+    let matched = match_source_call_arguments(*args_node, content, is_sys_source, mode)?;
+    match matched[0]? {
+        CallActual::Value(value) => Some(value),
+        CallActual::Missing => None,
+    }
+}
+
+fn classify_matched_bool(
+    matched: &[Option<CallActual>],
+    content: &str,
+    formals: &[&str],
+    param_name: &str,
+    alias_is_unshadowed: &mut impl FnMut(&str) -> bool,
+) -> BoolArgument {
+    let Some(index) = formals.iter().position(|formal| *formal == param_name) else {
+        return BoolArgument::Unknown;
+    };
+    let Some(actual) = matched[index] else {
+        return BoolArgument::Omitted;
+    };
+    let CallActual::Value(value_node) = actual else {
+        // Both `local` and `chdir` have FALSE defaults. In R an explicit
+        // missing actual invokes that default just like omission.
+        return BoolArgument::Known(false);
+    };
+    match node_text(value_node, content) {
+        "TRUE" => BoolArgument::Known(true),
+        "FALSE" => BoolArgument::Known(false),
+        "T" if alias_is_unshadowed("T") => BoolArgument::Known(true),
+        "F" if alias_is_unshadowed("F") => BoolArgument::Known(false),
+        _ => BoolArgument::Unknown,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GlobalEnvBinding {
+    Bare(&'static str),
+    Qualified,
+}
+
+impl GlobalEnvBinding {
+    fn is_trusted_by(self, alias_is_unshadowed: &mut impl FnMut(&str) -> bool) -> bool {
+        match self {
+            Self::Bare(name) => alias_is_unshadowed(name),
+            Self::Qualified => true,
         }
     }
-    None
+}
+
+fn matched_global_env_binding(
+    matched: &[Option<CallActual>],
+    content: &str,
+    formals: &[&str],
+    param_name: &str,
+) -> Option<GlobalEnvBinding> {
+    let index = formals.iter().position(|formal| *formal == param_name)?;
+    let Some(CallActual::Value(value_node)) = matched[index] else {
+        return None;
+    };
+    match node_text(value_node, content).trim() {
+        "globalenv()" => Some(GlobalEnvBinding::Bare("globalenv")),
+        ".GlobalEnv" => Some(GlobalEnvBinding::Bare(".GlobalEnv")),
+        "base::globalenv()" => Some(GlobalEnvBinding::Qualified),
+        _ => None,
+    }
 }
 
 fn extract_string_literal(node: Node, content: &str) -> Option<String> {
@@ -427,44 +843,169 @@ fn node_text<'a>(node: Node<'a>, content: &'a str) -> &'a str {
     &content[node.byte_range()]
 }
 
+fn node_start_position_utf16(node: Node, content: &str) -> (u32, u32) {
+    let start = node.start_position();
+    let line_text = content.lines().nth(start.row).unwrap_or("");
+    (
+        start.row as u32,
+        byte_offset_to_utf16_column(line_text, start.column),
+    )
+}
+
 /// Detect rm() and remove() calls in R code.
 /// Returns calls that should affect scope (excludes those with non-default envir=).
 /// Extracts bare symbols from positional args and string-literal symbols from list=.
 pub fn detect_rm_calls(tree: &Tree, content: &str) -> Vec<RmCall> {
+    let root = tree.root_node();
+    let mut capture_bindings = super::static_path::LazyStaticBindings::new(root, content);
+    detect_rm_calls_with_bindings(tree, content, &mut capture_bindings)
+}
+
+/// Internal removal detector that reuses an artifact build's shared lazy binding
+/// cache. Standalone callers use [`detect_rm_calls`].
+pub(crate) fn detect_rm_calls_with_bindings<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<RmCall> {
+    detect_rm_calls_with_bindings_and_frames(tree, content, capture_bindings)
+        .into_iter()
+        .map(|detected| detected.call)
+        .collect()
+}
+
+pub(crate) fn detect_rm_calls_with_bindings_for_scope<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<FramedRmCall> {
+    let mut calls = detect_rm_calls_with_bindings_and_frames(tree, content, capture_bindings);
+    for call in &mut calls {
+        call.normalize_scope_effect_position();
+    }
+    calls
+}
+
+fn detect_rm_calls_with_bindings_and_frames<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<FramedRmCall> {
     log::trace!("Starting tree-sitter parsing for rm() call detection");
     let mut rm_calls = Vec::new();
-    let root = tree.root_node();
-    visit_node_for_rm(root, content, &mut rm_calls);
+    visit_node_for_rm(
+        tree.root_node(),
+        content,
+        capture_bindings,
+        CaptureEvaluationFrame::Caller,
+        RuntimeFunctionScope::Lexical,
+        None,
+        &mut rm_calls,
+    );
     log::trace!(
         "Completed rm() call detection, found {} calls",
         rm_calls.len()
     );
-    for rm_call in &rm_calls {
+    for detected in &rm_calls {
+        let call = &detected.call;
         log::trace!(
             "  Detected rm() call at line {} column {} with symbols: {:?}",
-            rm_call.line,
-            rm_call.column,
-            rm_call.symbols
+            call.line,
+            call.column,
+            call.symbols
         );
     }
     rm_calls
 }
 
-fn visit_node_for_rm(node: Node, content: &str, rm_calls: &mut Vec<RmCall>) {
+fn visit_node_for_rm(
+    node: Node,
+    content: &str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings,
+    evaluation_frame: CaptureEvaluationFrame,
+    runtime_function_scope: RuntimeFunctionScope,
+    conservative_effect_position: Option<(u32, u32)>,
+    rm_calls: &mut Vec<FramedRmCall>,
+) {
     if node.kind() == "identifier" {
         return;
     }
-    if node.kind() == "call"
-        && let Some(rm_call) = try_parse_rm_call(node, content)
-    {
-        // Only add if there are symbols to remove
-        if !rm_call.symbols.is_empty() {
-            rm_calls.push(rm_call);
+    if node.kind() == "call" {
+        if let Some(capture) = capture_bindings.capturing_call_kind_at(node) {
+            let conservative_effect_position = conservative_effect_position.or_else(|| {
+                super::binding::capture_runtime_order_has_source_inversion(node, content, capture)
+                    .then(|| node_start_position_utf16(node, content))
+            });
+            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
+            super::binding::visit_evaluated_capture_parts(
+                node,
+                content,
+                capture,
+                &mut |evaluated, relative_frame, _role| {
+                    visit_node_for_rm(
+                        evaluated,
+                        content,
+                        capture_bindings,
+                        relative_frame.relative_to(evaluation_frame),
+                        captured_runtime_scope,
+                        conservative_effect_position,
+                        rm_calls,
+                    )
+                },
+            );
+            return;
+        }
+        let external_global_escape = evaluation_frame == CaptureEvaluationFrame::ExternalOrUnknown
+            && node
+                .child_by_field_name("arguments")
+                .is_some_and(|arguments| {
+                    super::binding::arguments_explicitly_target_global(arguments, content)
+                })
+            && node
+                .child_by_field_name("function")
+                .is_some_and(|function| {
+                    let name = node_text(function, content);
+                    !capture_bindings.get().named_alias_may_shadow_at(
+                        name,
+                        node,
+                        !super::binding::is_known_immediate_context(node),
+                    )
+                });
+        if (evaluation_frame.is_caller_or_global() || external_global_escape)
+            && let Some(rm_call) = try_parse_rm_call(node, content)
+        {
+            // Only add if there are symbols to remove.
+            if !rm_call.symbols.is_empty() {
+                rm_calls.push(FramedRmCall {
+                    call: rm_call,
+                    runtime_function_scope,
+                    conservative_effect_position,
+                });
+            }
         }
     }
 
+    let enters_function = node.kind() == "function_definition";
+    let child_frame = if enters_function {
+        CaptureEvaluationFrame::Caller
+    } else {
+        evaluation_frame
+    };
+    let child_runtime_scope = if enters_function {
+        runtime_function_scope.enter_function()
+    } else {
+        runtime_function_scope
+    };
     for child in node.children(&mut node.walk()) {
-        visit_node_for_rm(child, content, rm_calls);
+        visit_node_for_rm(
+            child,
+            content,
+            capture_bindings,
+            child_frame,
+            child_runtime_scope,
+            conservative_effect_position,
+            rm_calls,
+        );
     }
 }
 
@@ -583,7 +1124,7 @@ fn has_non_default_envir_for_rm(args_node: &Node, content: &str) -> bool {
             {
                 let value = node_text(value_node, content).trim();
                 // Default-equivalent values: globalenv() or .GlobalEnv
-                if value == "globalenv()" || value == ".GlobalEnv" {
+                if matches!(value, "globalenv()" | "base::globalenv()" | ".GlobalEnv") {
                     return false;
                 }
                 // Any other value means non-default
@@ -684,22 +1225,93 @@ fn extract_list_value_symbols(value_node: Node, content: &str) -> Vec<String> {
 /// bare `exists` callee is matched (not `pkg::exists`), matching the
 /// conservative shape of [`detect_rm_calls`].
 pub fn detect_exists_calls(tree: &Tree, content: &str) -> Vec<ExistsCall> {
+    let root = tree.root_node();
+    let mut capture_bindings = super::static_path::LazyStaticBindings::new(root, content);
+    detect_exists_calls_with_bindings(tree, content, &mut capture_bindings)
+        .into_iter()
+        .map(|detected| detected.call)
+        .collect()
+}
+
+/// Internal existence-probe detector that reuses an artifact build's shared
+/// lazy binding cache. Standalone callers use [`detect_exists_calls`].
+pub(crate) fn detect_exists_calls_with_bindings<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<FramedExistsCall> {
     let mut calls = Vec::new();
-    visit_node_for_exists(tree.root_node(), content, &mut calls);
+    visit_node_for_exists(
+        tree.root_node(),
+        content,
+        capture_bindings,
+        CaptureEvaluationFrame::Caller,
+        RuntimeFunctionScope::Lexical,
+        &mut calls,
+    );
     calls
 }
 
-fn visit_node_for_exists(node: Node, content: &str, calls: &mut Vec<ExistsCall>) {
+fn visit_node_for_exists(
+    node: Node,
+    content: &str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings,
+    evaluation_frame: CaptureEvaluationFrame,
+    runtime_function_scope: RuntimeFunctionScope,
+    calls: &mut Vec<FramedExistsCall>,
+) {
     if node.kind() == "identifier" {
         return;
     }
-    if node.kind() == "call"
-        && let Some(call) = try_parse_exists_call(node, content)
-    {
-        calls.push(call);
+    if node.kind() == "call" {
+        if let Some(capture) = capture_bindings.capturing_call_kind_at(node) {
+            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
+            super::binding::visit_evaluated_capture_parts(
+                node,
+                content,
+                capture,
+                &mut |evaluated, relative_frame, _role| {
+                    visit_node_for_exists(
+                        evaluated,
+                        content,
+                        capture_bindings,
+                        relative_frame.relative_to(evaluation_frame),
+                        captured_runtime_scope,
+                        calls,
+                    )
+                },
+            );
+            return;
+        }
+        if evaluation_frame.is_caller_or_global()
+            && let Some(call) = try_parse_exists_call(node, content)
+        {
+            calls.push(FramedExistsCall {
+                call,
+                runtime_function_scope,
+            });
+        }
     }
+    let enters_function = node.kind() == "function_definition";
+    let child_frame = if enters_function {
+        CaptureEvaluationFrame::Caller
+    } else {
+        evaluation_frame
+    };
+    let child_runtime_scope = if enters_function {
+        runtime_function_scope.enter_function()
+    } else {
+        runtime_function_scope
+    };
     for child in node.children(&mut node.walk()) {
-        visit_node_for_exists(child, content, calls);
+        visit_node_for_exists(
+            child,
+            content,
+            capture_bindings,
+            child_frame,
+            child_runtime_scope,
+            calls,
+        );
     }
 }
 
@@ -809,7 +1421,10 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 /// bare and `purrr::`-qualified `map`/`walk`/`map_chr`/etc.), `character.only =
 /// TRUE` is *required* and the X argument must resolve statically to a vector
 /// of string literals — either an inline `c("a","b",...)` or a same-file
-/// variable assigned exactly once via `<-`, `=`, or `assign("name", c(...))`.
+/// variable assigned exactly once at the top level via `<-`/`=`, or via an
+/// eligible bare/base-qualified `assign("name", c(...))` with its default
+/// destination. Nested, conditional, destination-qualified, reassigned, or
+/// removed bindings cannot supply candidates.
 /// Each apply emits one `LibraryCall` per package, all sharing the apply
 /// call's end position.
 ///
@@ -817,11 +1432,11 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 /// only when the same file also attaches targets (`library(targets)` /
 /// `require(targets)` anywhere in the file); `targets::` / `targets:::`
 /// qualified spellings are honored unconditionally. See
-/// `append_gated_tar_option_set_calls` for the gate. A `tar_option_set()`
-/// nested inside a non-evaluating quoting wrapper (`quote(...)`, rlang's
-/// `expr(...)`, …) is NOT detected — it never evaluates — while a quoted
-/// `library()`/`require()` still is (pre-existing leniency; see the gate
-/// note in `visit_node_for_library`).
+/// `append_gated_tar_option_set_calls` for the gate. Calls nested in a proven
+/// capture wrapper (`quote(...)`, `expression(...)`, qualified rlang `expr(...)`,
+/// and related forms) are not detected. Evaluated portions remain visible:
+/// `substitute()` environment arguments, `bquote()` controls and `.()` splices,
+/// and rlang `!!`/`!!!` operands are traversed.
 ///
 /// The returned Vec is sorted in document order by `(line, column)`.
 ///
@@ -841,38 +1456,79 @@ fn extract_c_string_args(node: Node, content: &str) -> Vec<String> {
 /// assert!(calls[1].attaches);
 /// ```
 pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
-    log::trace!("Starting tree-sitter parsing for library() call detection");
-    let mut library_calls = Vec::new();
-    let mut tar_candidates = Vec::new();
     let root = tree.root_node();
-    let var_lookup = collect_var_bindings(root, content);
+    let mut capture_bindings = super::static_path::LazyStaticBindings::new(root, content);
+    detect_library_calls_with_bindings(tree, content, &mut capture_bindings)
+}
+
+/// Internal package detector that reuses an artifact build's shared lazy binding
+/// cache for trusted-capture classification and package-vector resolution.
+/// Standalone callers use [`detect_library_calls`].
+pub(crate) fn detect_library_calls_with_bindings<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<LibraryCall> {
+    detect_library_calls_with_bindings_and_order(tree, content, capture_bindings)
+        .into_iter()
+        .map(|detected| detected.call)
+        .collect()
+}
+
+pub(crate) fn detect_library_calls_with_bindings_for_scope<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<FramedLibraryCall> {
+    detect_library_calls_with_bindings_and_order(tree, content, capture_bindings)
+        .into_iter()
+        .filter_map(|detected| {
+            detected.scope_orderable.then_some(FramedLibraryCall {
+                call: detected.call,
+                runtime_function_scope: detected.runtime_function_scope,
+            })
+        })
+        .collect()
+}
+
+fn detect_library_calls_with_bindings_and_order<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    capture_bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> Vec<LibraryWalkCall> {
+    log::trace!("Starting tree-sitter parsing for library() call detection");
+    let mut output = LibraryWalkOutput::default();
+    let root = tree.root_node();
     visit_node_for_library(
         root,
         content,
-        &var_lookup,
+        capture_bindings,
         false,
-        &mut library_calls,
-        &mut tar_candidates,
+        RuntimeFunctionScope::Lexical,
+        true,
+        &mut output,
     );
-    append_gated_tar_option_set_calls(&mut library_calls, tar_candidates);
+    append_gated_tar_option_set_calls(&mut output);
     // Restore document order: gated tar_option_set entries are appended after
     // the walk, so sort by position. The sort is stable, keeping same-position
     // entries (an apply-family call's per-package fan-out all shares the apply
     // call's end position) in emission order.
-    library_calls.sort_by_key(|call| (call.line, call.column));
+    output
+        .library_calls
+        .sort_by_key(|detected| (detected.call.line, detected.call.column));
     log::trace!(
         "Completed library() call detection, found {} calls",
-        library_calls.len()
+        output.library_calls.len()
     );
-    for lib_call in &library_calls {
+    for detected in &output.library_calls {
         log::trace!(
             "  Detected library() call: package='{}' at line {} column {}",
-            lib_call.package,
-            lib_call.line,
-            lib_call.column
+            detected.call.package,
+            detected.call.line,
+            detected.call.column
         );
     }
-    library_calls
+    output.library_calls
 }
 
 /// Parse `text` and return the set of packages it *attaches* via a
@@ -882,9 +1538,8 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
 /// qualified `pkg::fn` access but does not put exports on the search path —
 /// see [`LibraryCall::attaches`]). "Top-level" excludes calls nested inside a
 /// function body, which do not attach until that function runs. Calls inside a
-/// non-evaluating quoting wrapper (`quote`/`bquote`/`substitute`/`expression`,
-/// rlang's `expr`/`quo`/…) are likewise excluded — they capture code without
-/// evaluating it.
+/// proven captured argument are likewise excluded, while evaluated `bquote()`
+/// splices and `substitute()` environment arguments remain visible.
 ///
 /// This models a testthat preamble file (`tests/testthat/helper*.R` /
 /// `setup*.R`): testthat sources such files at the top level before any test
@@ -920,214 +1575,171 @@ pub fn detect_library_calls(tree: &Tree, content: &str) -> Vec<LibraryCall> {
 /// assert!(none.is_empty());
 /// ```
 pub fn extract_attached_packages(text: &str) -> std::collections::BTreeSet<String> {
-    use tree_sitter::Parser;
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_r::LANGUAGE.into())
-        .is_err()
-    {
-        return std::collections::BTreeSet::new();
-    }
-    let Some(tree) = parser.parse(text, None) else {
+    let Some(tree) = crate::parser_pool::with_parser(|parser| parser.parse(text, None)) else {
         return std::collections::BTreeSet::new();
     };
-    let root = tree.root_node();
-    let var_lookup = collect_var_bindings(root, text);
-    let mut calls = Vec::new();
-    let mut tar_candidates = Vec::new();
-    visit_node_for_top_level_library(
-        root,
-        text,
-        &var_lookup,
-        false,
-        false,
-        &mut calls,
-        &mut tar_candidates,
+    let mut bindings = super::static_path::LazyStaticBindings::new(tree.root_node(), text);
+    extract_attached_packages_with_bindings(&tree, text, &mut bindings)
+}
+
+fn extract_attached_packages_with_bindings<'tree, 'text>(
+    tree: &'tree Tree,
+    content: &'text str,
+    bindings: &mut super::static_path::LazyStaticBindings<'tree, 'text>,
+) -> std::collections::BTreeSet<String> {
+    let mut output = LibraryWalkOutput::default();
+    visit_node_for_library(
+        tree.root_node(),
+        content,
+        bindings,
+        true,
+        RuntimeFunctionScope::Lexical,
+        true,
+        &mut output,
     );
-    append_gated_tar_option_set_calls(&mut calls, tar_candidates);
-    calls
+    append_gated_tar_option_set_calls(&mut output);
+    output
+        .library_calls
         .into_iter()
-        .filter(|call| call.attaches && !call.package.is_empty())
-        .map(|call| call.package)
+        .filter(|detected| detected.call.attaches && !detected.call.package.is_empty())
+        .map(|detected| detected.call.package)
         .collect()
 }
 
-/// Like [`visit_node_for_library`], but only collects package loads that are
-/// NOT lexically inside a `function_definition` and NOT inside a non-evaluating
-/// quoting wrapper (`quote`/`bquote`/`substitute`/`expression`, rlang's
-/// `expr`/`quo`/…). Function-body calls don't attach until the enclosing
-/// function is called, and quoted expressions capture code without evaluating
-/// it, so neither attaches when testthat sources the preamble file's top-level
-/// code (`local({ ... })` blocks DO attach — they evaluate immediately).
-/// `inside_fn` latches once an ancestor `function_definition` is entered;
-/// `inside_quote` latches once an ancestor quoting call is entered.
+struct LibraryWalkCall {
+    call: LibraryCall,
+    runtime_function_scope: RuntimeFunctionScope,
+    scope_orderable: bool,
+}
+
+#[derive(Default)]
+struct LibraryWalkOutput {
+    library_calls: Vec<LibraryWalkCall>,
+    tar_candidates: Vec<TarOptionSetCandidate>,
+}
+
+impl LibraryWalkOutput {
+    fn push_call(
+        &mut self,
+        call: LibraryCall,
+        runtime_function_scope: RuntimeFunctionScope,
+        scope_orderable: bool,
+    ) {
+        self.library_calls.push(LibraryWalkCall {
+            call,
+            runtime_function_scope,
+            scope_orderable,
+        });
+    }
+
+    fn extend_calls(
+        &mut self,
+        calls: impl IntoIterator<Item = LibraryCall>,
+        runtime_function_scope: RuntimeFunctionScope,
+        scope_orderable: bool,
+    ) {
+        for call in calls {
+            self.push_call(call, runtime_function_scope, scope_orderable);
+        }
+    }
+}
+
+/// Recursively traverse an AST subtree and collect statically determinable
+/// package loads: direct `library`/`require`/`loadNamespace` calls, apply-family
+/// calls whose FUN is `library`/`require`, and {targets}
+/// `tar_option_set(packages = ...)` candidates.
 ///
-/// `tar_option_set(packages = ...)` candidates found at the top level are
-/// pushed into `tar_candidates` rather than `library_calls`; the caller
-/// applies the targets-in-play gate afterwards via
-/// [`append_gated_tar_option_set_calls`].
-fn visit_node_for_top_level_library(
+/// When `top_level_only` is true, calls lexically inside a
+/// `function_definition` are excluded because they do not attach until the
+/// function runs. `inside_fn` is recursive state that latches after entering a
+/// function; tree-sitter represents R 4.1+ lambdas as `function_definition`
+/// nodes too. Full detection passes `top_level_only = false`, preserving calls
+/// inside function bodies. Proven capture wrappers are traversed only through
+/// their evaluated controls and splices, with the same state as ordinary child
+/// recursion.
+///
+/// Direct calls push at most one [`LibraryCall`]; apply calls may push one entry
+/// per package. `tar_option_set` calls are collected separately so the caller
+/// can apply [`append_gated_tar_option_set_calls`] after the walk.
+fn visit_node_for_library(
     node: Node,
     content: &str,
-    var_lookup: &HashMap<String, VarBinding>,
-    inside_fn: bool,
-    inside_quote: bool,
-    library_calls: &mut Vec<LibraryCall>,
-    tar_candidates: &mut Vec<TarOptionSetCandidate>,
+    capture_bindings: &mut super::static_path::LazyStaticBindings,
+    top_level_only: bool,
+    runtime_function_scope: RuntimeFunctionScope,
+    scope_orderable: bool,
+    output: &mut LibraryWalkOutput,
 ) {
     // Identifier nodes have no children and cannot be calls.
     if node.kind() == "identifier" {
         return;
     }
-    // Tree-sitter normalizes R 4.1+ lambdas (`\(x) ...`) into
-    // `function_definition` nodes too, so this single check covers both.
-    let inside_fn = inside_fn || node.kind() == "function_definition";
-    // A `library()` nested inside a quoting call (e.g. `quote(library(x))`)
-    // captures code but never evaluates it, so it does not attach at source
-    // time. Latch so all descendants are likewise excluded.
-    let inside_quote = inside_quote || is_nonevaluating_quote_call(node, content);
-    if !inside_fn && !inside_quote && node.kind() == "call" {
-        if let Some(lib_call) = try_parse_library_call(node, content) {
-            library_calls.push(lib_call);
-        } else {
-            // The apply-family and tar_option_set callee name-sets are
-            // disjoint, so at most one of these can match.
-            library_calls.extend(try_parse_apply_library_call(node, content, var_lookup));
-            collect_tar_option_set_candidates(node, content, var_lookup, tar_candidates);
-        }
-    }
-    for child in node.children(&mut node.walk()) {
-        visit_node_for_top_level_library(
-            child,
-            content,
-            var_lookup,
-            inside_fn,
-            inside_quote,
-            library_calls,
-            tar_candidates,
-        );
-    }
-}
 
-/// Whether `node` is a call to a quoting/capturing function that does NOT
-/// evaluate its arguments — `quote`, `bquote`, `substitute`, `expression`, and
-/// rlang's `expr`/`quo`/`quos`/`exprs`/`enquo`/`enquos`/`enexpr`/`enexprs`. A
-/// `library()`/`require()` syntactically nested inside one of these is captured
-/// as unevaluated code and never attaches at source time, so
-/// [`visit_node_for_top_level_library`] must not record it.
-///
-/// Any namespace qualifier (`rlang::expr`, `base::quote`) is stripped before
-/// matching. This is deliberately limited to statically recognizable quoting
-/// wrappers; expressions built dynamically (e.g. `eval(parse(text = …))`) are
-/// out of scope.
-pub(crate) fn is_nonevaluating_quote_call(node: Node, content: &str) -> bool {
-    if node.kind() != "call" {
-        return false;
-    }
-    let Some(func_node) = node.child_by_field_name("function") else {
-        return false;
-    };
-    let func_text = node_text(func_node, content);
-    // Strip an optional `pkg::` / `pkg:::` namespace qualifier (the trailing
-    // segment after the last colon is the bare function name).
-    let name = func_text.rsplit(':').next().unwrap_or(func_text);
-    matches!(
-        name,
-        "quote"
-            | "bquote"
-            | "substitute"
-            | "expression"
-            | "expr"
-            | "quo"
-            | "quos"
-            | "exprs"
-            | "enquo"
-            | "enquos"
-            | "enexpr"
-            | "enexprs"
-    )
-}
-
-/// Recursively traverses an AST subtree and collects statically determinable
-/// package loads — direct `library`/`require`/`loadNamespace` calls and
-/// apply-family calls whose FUN is `library`/`require`. Direct calls push at
-/// most one `LibraryCall`; apply calls may push one entry per package, all
-/// sharing the apply call's end position. {targets}
-/// `tar_option_set(packages = ...)` calls are collected separately into
-/// `tar_candidates` so the caller can apply the targets-in-play gate after
-/// the walk via [`append_gated_tar_option_set_calls`].
-///
-/// # Parameters
-///
-/// - `node`: the current AST node to visit (will recurse into its children).
-/// - `content`: source text for extracting node-local values when parsing calls.
-/// - `var_lookup`: name→binding map (built once via [`collect_var_bindings`])
-///   used by apply and tar_option_set detection to resolve same-file variable
-///   references like `libs <- c(...); sapply(libs, library, character.only = TRUE)`.
-/// - `inside_quote`: latched to `true` once an ancestor non-evaluating quoting
-///   call (see [`is_nonevaluating_quote_call`]) is entered; gates ONLY the
-///   tar_option_set candidate collection below.
-/// - `library_calls`: mutable collector that receives discovered `LibraryCall`
-///   entries in document order.
-/// - `tar_candidates`: mutable collector for gate-pending
-///   `tar_option_set(packages = ...)` package attachments.
-///
-/// # Examples
-///
-/// Traverse the whole tree and collect library-like calls:
-///
-/// ```text
-/// let mut library_calls = Vec::new();
-/// let mut tar_candidates = Vec::new();
-/// let root = tree.root_node();
-/// let var_lookup = collect_var_bindings(root, source_text);
-/// visit_node_for_library(root, source_text, &var_lookup, false, &mut library_calls, &mut tar_candidates);
-/// assert!(library_calls.iter().all(|c| !c.package.is_empty()));
-/// ```
-fn visit_node_for_library(
-    node: Node,
-    content: &str,
-    var_lookup: &HashMap<String, VarBinding>,
-    inside_quote: bool,
-    library_calls: &mut Vec<LibraryCall>,
-    tar_candidates: &mut Vec<TarOptionSetCandidate>,
-) {
-    // Skip identifier nodes - they have no children
-    if node.kind() == "identifier" {
-        return;
-    }
-    // A call nested inside a quoting wrapper (e.g. `quote(...)`) is captured
-    // as unevaluated code; latch so all descendants see `inside_quote`.
-    let inside_quote = inside_quote || is_nonevaluating_quote_call(node, content);
     if node.kind() == "call" {
-        if let Some(lib_call) = try_parse_library_call(node, content) {
-            library_calls.push(lib_call);
-        } else {
-            // Not a direct library/require/loadNamespace call; try the
-            // apply-family form (sapply/map/etc. of bare library/require) and
-            // the tar_option_set form. The two callee name-sets are disjoint,
-            // so at most one of these can match.
-            library_calls.extend(try_parse_apply_library_call(node, content, var_lookup));
-            // Deliberate asymmetry: only tar_option_set is quote-gated on
-            // this position-aware path. `library()`/`require()` and
-            // apply-family calls inside `quote()` are still recorded here —
-            // that leniency predates tar_option_set detection and changing
-            // it is out of scope. A quoted `tar_option_set()` never
-            // evaluates, so it must not record attachments.
-            if !inside_quote {
-                collect_tar_option_set_candidates(node, content, var_lookup, tar_candidates);
+        if let Some(capture) = capture_bindings.capturing_call_kind_at(node) {
+            let capture_scope_orderable = scope_orderable
+                && !super::binding::capture_evaluation_order_has_source_inversion(
+                    node,
+                    content,
+                    capture,
+                    CaptureEvaluationFrame::Caller,
+                );
+            let captured_runtime_scope = runtime_function_scope.for_evaluated_capture_part(node);
+            super::binding::visit_evaluated_capture_parts(
+                node,
+                content,
+                capture,
+                &mut |evaluated, _frame, _role| {
+                    visit_node_for_library(
+                        evaluated,
+                        content,
+                        capture_bindings,
+                        top_level_only,
+                        captured_runtime_scope,
+                        capture_scope_orderable,
+                        output,
+                    );
+                },
+            );
+            return;
+        }
+        if !top_level_only || !runtime_function_scope.is_function_scoped_at(node) {
+            if let Some(lib_call) = try_parse_library_call(node, content) {
+                output.push_call(lib_call, runtime_function_scope, scope_orderable);
+            } else {
+                // The apply-family and tar_option_set callee name-sets are
+                // disjoint, so at most one of these can match.
+                output.extend_calls(
+                    try_parse_apply_library_call(node, content, capture_bindings),
+                    runtime_function_scope,
+                    scope_orderable,
+                );
+                collect_tar_option_set_candidates(
+                    node,
+                    content,
+                    capture_bindings,
+                    runtime_function_scope,
+                    scope_orderable,
+                    &mut output.tar_candidates,
+                );
             }
         }
     }
 
+    let child_runtime_scope = if node.kind() == "function_definition" {
+        runtime_function_scope.enter_function()
+    } else {
+        runtime_function_scope
+    };
     for child in node.children(&mut node.walk()) {
         visit_node_for_library(
             child,
             content,
-            var_lookup,
-            inside_quote,
-            library_calls,
-            tar_candidates,
+            capture_bindings,
+            top_level_only,
+            child_runtime_scope,
+            scope_orderable,
+            output,
         );
     }
 }
@@ -1390,229 +2002,6 @@ fn extract_package_value(node: Node, content: &str) -> Option<String> {
 // Apply-Family Library Detection (issue #172)
 // ============================================================================
 
-use std::collections::HashMap;
-
-/// Information collected for an identifier appearing on the LHS of any
-/// binding form (assignment operator, `assign("name", ...)` call, or function
-/// parameter) anywhere in the file. Used by apply-family detection to resolve
-/// X arguments that are variable references.
-///
-/// `assignment_count` increments for *every* binding form: `<-`, `=`, `<<-`,
-/// `->`, `->>`, `assign(...)`, and function parameters. Only `<-`, `=`, or
-/// `assign("name", ...)` whose RHS is a `c(...)` of string literals populates
-/// `static_packages`.
-#[derive(Debug, Default)]
-struct VarBinding {
-    assignment_count: u32,
-    /// `(packages, byte_offset_of_assignment_node)` from the first supported,
-    /// statically-resolved assignment.
-    static_packages: Option<(Vec<String>, usize)>,
-}
-
-impl VarBinding {
-    /// Return packages iff `count == 1`, we extracted a static c-of-strings,
-    /// and that assignment started before `before_byte`.
-    fn resolved_before(&self, before_byte: usize) -> Option<&[String]> {
-        if self.assignment_count != 1 {
-            return None;
-        }
-        let (pkgs, off) = self.static_packages.as_ref()?;
-        if *off < before_byte {
-            Some(pkgs.as_slice())
-        } else {
-            None
-        }
-    }
-}
-
-fn collect_var_bindings(root: Node, content: &str) -> HashMap<String, VarBinding> {
-    let mut map: HashMap<String, VarBinding> = HashMap::new();
-    visit_var_bindings(root, content, &mut map);
-    map
-}
-
-fn visit_var_bindings(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
-    match node.kind() {
-        "binary_operator" => record_binary_assignment(node, content, map),
-        "call" => record_assign_call(node, content, map),
-        "function_definition" => record_function_params(node, content, map),
-        _ => {}
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        visit_var_bindings(child, content, map);
-    }
-}
-
-fn record_binary_assignment(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
-    let mut cursor = node.walk();
-    let named: Vec<Node> = node
-        .children(&mut cursor)
-        .filter(|c| c.is_named())
-        .collect();
-    if named.len() != 2 {
-        return;
-    }
-    let mut op_walker = node.walk();
-    let op_text = node.children(&mut op_walker).find_map(|c| {
-        let t = node_text(c, content);
-        if matches!(t, "<-" | "=" | "<<-" | "->" | "->>") {
-            Some(t.to_string())
-        } else {
-            None
-        }
-    });
-    drop(op_walker);
-    let Some(op) = op_text else { return };
-
-    let (name_node, value_node) = match op.as_str() {
-        "<-" | "=" | "<<-" => (named[0], named[1]),
-        "->" | "->>" => (named[1], named[0]),
-        _ => return,
-    };
-    if name_node.kind() != "identifier" {
-        return;
-    }
-    let name = node_text(name_node, content).to_string();
-    let entry = map.entry(name).or_default();
-    entry.assignment_count = entry.assignment_count.saturating_add(1);
-
-    if matches!(op.as_str(), "<-" | "=")
-        && let Some(packages) = extract_c_strings_strict(value_node, content)
-        && entry.static_packages.is_none()
-    {
-        entry.static_packages = Some((packages, node.start_byte()));
-    }
-}
-
-/// Returns true if `name` is a non-empty prefix of `assign()`'s `value`
-/// formal that is *not* also a prefix of any other formal — i.e. an
-/// unambiguous partial match for `value`. Excludes the exact name "value"
-/// itself; that's handled by the exact-match pass.
-fn is_partial_prefix_of_value(name: &str) -> bool {
-    if name.is_empty() || name == "value" {
-        return false;
-    }
-    if !"value".starts_with(name) {
-        return false;
-    }
-    // assign()'s other formals: x, pos, envir, inherits, immediate.
-    // (`x` is a single character so partial-matching `x` just means name == "x".)
-    !"x".starts_with(name)
-        && !"pos".starts_with(name)
-        && !"envir".starts_with(name)
-        && !"inherits".starts_with(name)
-        && !"immediate".starts_with(name)
-}
-
-fn record_assign_call(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
-    let Some(func_node) = node.child_by_field_name("function") else {
-        return;
-    };
-    if node_text(func_node, content) != "assign" {
-        return;
-    }
-    let Some(args_node) = node.child_by_field_name("arguments") else {
-        return;
-    };
-    if args_node.has_error() {
-        return;
-    }
-
-    // Bucketize args. R argument matching is two passes (exact, then partial)
-    // followed by positional fill. We only track the `x` and `value` formals
-    // — other formals (`pos`/`envir`/`inherits`/`immediate`) and unknown
-    // names are ignored and don't consume positional slots.
-    let mut exact_x: Vec<Node> = Vec::new();
-    let mut exact_value: Vec<Node> = Vec::new();
-    let mut partial_to_value: Vec<Node> = Vec::new();
-    let mut positional: Vec<Node> = Vec::new();
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        if child.kind() != "argument" {
-            continue;
-        }
-        let Some(value) = child.child_by_field_name("value") else {
-            continue;
-        };
-        if let Some(name_node) = child.child_by_field_name("name") {
-            let arg_name = node_text(name_node, content);
-            if arg_name == "x" {
-                exact_x.push(value);
-            } else if arg_name == "value" {
-                exact_value.push(value);
-            } else if is_partial_prefix_of_value(arg_name) {
-                partial_to_value.push(value);
-            }
-        } else {
-            positional.push(value);
-        }
-    }
-
-    // If any of the rules R uses would error — duplicate exact, multiple
-    // partials matching the same formal, or a partial colliding with an exact
-    // — the call itself errors and never assigns. Skip the call entirely so
-    // we don't record a static binding R never produced.
-    let value_collision = (exact_value.len() == 1 && !partial_to_value.is_empty())
-        || exact_value.len() > 1
-        || partial_to_value.len() > 1;
-    if exact_x.len() > 1 || value_collision {
-        return;
-    }
-
-    // Resolve x (exact > positional[0]) and value (exact > partial > next
-    // positional after x).
-    let x_value = exact_x
-        .first()
-        .copied()
-        .or_else(|| positional.first().copied());
-    let value_node = exact_value
-        .first()
-        .copied()
-        .or_else(|| partial_to_value.first().copied())
-        .or_else(|| {
-            let next_idx = if exact_x.is_empty() { 1 } else { 0 };
-            positional.get(next_idx).copied()
-        });
-
-    let Some(x_value) = x_value else { return };
-    let Some(name) = extract_string_literal(x_value, content) else {
-        return;
-    };
-
-    let entry = map.entry(name).or_default();
-    entry.assignment_count = entry.assignment_count.saturating_add(1);
-    if let Some(value_node) = value_node
-        && let Some(packages) = extract_c_strings_strict(value_node, content)
-        && entry.static_packages.is_none()
-    {
-        entry.static_packages = Some((packages, node.start_byte()));
-    }
-}
-
-fn record_function_params(node: Node, content: &str, map: &mut HashMap<String, VarBinding>) {
-    let parameters = match node.child_by_field_name("parameters") {
-        Some(n) => n,
-        None => return,
-    };
-    let mut cursor = parameters.walk();
-    for child in parameters.children(&mut cursor) {
-        if child.kind() != "parameter" {
-            continue;
-        }
-        let mut param_cursor = child.walk();
-        let Some(ident) = child
-            .children(&mut param_cursor)
-            .find(|c| c.kind() == "identifier")
-        else {
-            continue;
-        };
-        let name = node_text(ident, content).to_string();
-        let entry = map.entry(name).or_default();
-        entry.assignment_count = entry.assignment_count.saturating_add(1);
-    }
-}
-
 /// Apply-family functions whose bare-identifier form may load packages
 /// dynamically when paired with `library`/`require` and `character.only = TRUE`.
 ///
@@ -1676,52 +2065,10 @@ fn apply_arg_positions(func_node: Node, content: &str) -> Option<(usize, usize)>
     }
 }
 
-/// Strict variant of `extract_c_string_args`: returns `Some(packages)` only
-/// when `node` is `c(arg1, arg2, ...)` where every argument is a positional
-/// string literal and at least one argument is present. Returns `None` for any
-/// non-string element, named argument, or empty `c()` — anything but a fully
-/// static character vector is treated as dynamic.
+/// Return the strings from a strict bare `c()` character vector.
 fn extract_c_strings_strict(node: Node, content: &str) -> Option<Vec<String>> {
-    extract_c_string_nodes_strict(node, content)
-        .map(|pairs| pairs.into_iter().map(|(s, _)| s).collect())
-}
-
-/// Like [`extract_c_strings_strict`], but pairs each extracted string with its
-/// own string-literal `Node` so callers can anchor per-package positions (see
-/// `try_parse_tar_option_set_call`). This is the single implementation; the
-/// string-only variant delegates here.
-fn extract_c_string_nodes_strict<'tree>(
-    node: Node<'tree>,
-    content: &str,
-) -> Option<Vec<(String, Node<'tree>)>> {
-    if !is_c_call(node, content) {
-        return None;
-    }
-    let args_node = node.child_by_field_name("arguments")?;
-    if args_node.has_error() {
-        return None;
-    }
-    let mut strings = Vec::new();
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        if child.kind() != "argument" {
-            continue;
-        }
-        if child.child_by_field_name("name").is_some() {
-            return None;
-        }
-        let value_node = child.child_by_field_name("value")?;
-        if value_node.kind() != "string" {
-            return None;
-        }
-        let s = extract_string_literal(value_node, content)?;
-        strings.push((s, value_node));
-    }
-    if strings.is_empty() {
-        None
-    } else {
-        Some(strings)
-    }
+    super::binding::extract_bare_c_plain_strings(node, content)
+        .map(|pairs| pairs.into_iter().map(|(string, _)| string).collect())
 }
 
 /// Try to interpret `node` as an apply-family call that loads a static vector
@@ -1735,13 +2082,13 @@ fn extract_c_string_nodes_strict<'tree>(
 ///   `sapply(c("dplyr"), identity, library, ...)` where library is just a
 ///   `...`-passthrough),
 /// - the positional arg at `x_position` resolves to a static `Vec<String>`
-///   via inline `c(...)` or a same-file variable in `var_lookup`.
+///   via inline `c(...)` or a same-file variable in `bindings`.
 ///
 /// All emitted entries share the apply call's end position.
 fn try_parse_apply_library_call(
     node: Node,
     content: &str,
-    var_lookup: &HashMap<String, VarBinding>,
+    bindings: &mut super::static_path::LazyStaticBindings,
 ) -> Vec<LibraryCall> {
     let Some(func_node) = node.child_by_field_name("function") else {
         return Vec::new();
@@ -1796,19 +2143,23 @@ fn try_parse_apply_library_call(
     };
     let packages: Vec<String> = match x_value.kind() {
         "identifier" => {
-            let text = node_text(x_value, content);
-            match var_lookup
-                .get(text)
-                .and_then(|b| b.resolved_before(node.start_byte()))
-            {
-                Some(pkgs) => pkgs.to_vec(),
+            let Some(text) = super::binding::plain_identifier_name(x_value, content) else {
+                return Vec::new();
+            };
+            match bindings.resolve_package_vector(text, node) {
+                Some(packages) => packages,
                 None => return Vec::new(),
             }
         }
-        _ => match extract_c_strings_strict(x_value, content) {
-            Some(v) => v,
-            None => return Vec::new(),
-        },
+        _ => {
+            let Some(packages) = extract_c_strings_strict(x_value, content) else {
+                return Vec::new();
+            };
+            if !bindings.package_c_is_trusted_at(node) {
+                return Vec::new();
+            }
+            packages
+        }
     };
 
     let end = node.end_position();
@@ -1846,6 +2197,8 @@ fn try_parse_apply_library_call(
 struct TarOptionSetCandidate {
     call: LibraryCall,
     bare: bool,
+    runtime_function_scope: RuntimeFunctionScope,
+    scope_orderable: bool,
 }
 
 /// Whether `func_node` (a call's `function` child) names {targets}'
@@ -1877,7 +2230,9 @@ fn is_tar_option_set_callee(func_node: Node, content: &str) -> bool {
 fn collect_tar_option_set_candidates(
     node: Node,
     content: &str,
-    var_lookup: &HashMap<String, VarBinding>,
+    bindings: &mut super::static_path::LazyStaticBindings,
+    runtime_function_scope: RuntimeFunctionScope,
+    scope_orderable: bool,
     tar_candidates: &mut Vec<TarOptionSetCandidate>,
 ) {
     let Some(func_node) = node.child_by_field_name("function") else {
@@ -1888,9 +2243,14 @@ fn collect_tar_option_set_candidates(
     }
     let bare = func_node.kind() == "identifier";
     tar_candidates.extend(
-        try_parse_tar_option_set_call(node, content, var_lookup)
+        try_parse_tar_option_set_call(node, content, bindings)
             .into_iter()
-            .map(|call| TarOptionSetCandidate { call, bare }),
+            .map(|call| TarOptionSetCandidate {
+                call,
+                bare,
+                runtime_function_scope,
+                scope_orderable,
+            }),
     );
 }
 
@@ -1917,19 +2277,20 @@ fn collect_tar_option_set_candidates(
 /// collected `library_calls`), and must stay the single shared post-filter for
 /// both `detect_library_calls` and `extract_attached_packages` so the two
 /// walkers cannot drift.
-fn append_gated_tar_option_set_calls(
-    library_calls: &mut Vec<LibraryCall>,
-    tar_candidates: Vec<TarOptionSetCandidate>,
-) {
-    let targets_attached = library_calls
+fn append_gated_tar_option_set_calls(output: &mut LibraryWalkOutput) {
+    let targets_attached = output
+        .library_calls
         .iter()
-        .any(|call| call.attaches && call.package == "targets");
-    library_calls.extend(
-        tar_candidates
-            .into_iter()
-            .filter(|candidate| !candidate.bare || targets_attached)
-            .map(|candidate| candidate.call),
-    );
+        .any(|detected| detected.call.attaches && detected.call.package == "targets");
+    for candidate in std::mem::take(&mut output.tar_candidates) {
+        if !candidate.bare || targets_attached {
+            output.push_call(
+                candidate.call,
+                candidate.runtime_function_scope,
+                candidate.scope_orderable,
+            );
+        }
+    }
 }
 
 /// Try to interpret `node` as a {targets} `tar_option_set(packages = ...)`
@@ -1949,12 +2310,11 @@ fn append_gated_tar_option_set_calls(
 ///   `packages = c("dplyr", "tidyr")`
 /// - an identifier resolving to a same-file, assigned-exactly-once static
 ///   `c()` of string literals bound before this call (the same
-///   `VarBinding::resolved_before` machinery apply-family detection uses)
+///   shared `StaticBindings::resolve_package_vector` machinery apply-family detection uses)
 ///
-/// The variable resolution is lexical-scope-blind — inherited from the
-/// apply-family `VarBinding` heuristic — so an assignment inside an unrelated
-/// function body can satisfy it; this is deliberate and favors false negatives
-/// in diagnostics.
+/// Variable candidates must be unconditional top-level bindings. Nested,
+/// conditional, removed, reassigned, or destination-qualified bindings still
+/// invalidate the name but cannot supply a package vector.
 ///
 /// Anything else (dynamic calls, `character(0)`, empty `c()`) yields nothing.
 ///
@@ -1979,7 +2339,7 @@ fn append_gated_tar_option_set_calls(
 fn try_parse_tar_option_set_call(
     node: Node,
     content: &str,
-    var_lookup: &HashMap<String, VarBinding>,
+    bindings: &mut super::static_path::LazyStaticBindings,
 ) -> Vec<LibraryCall> {
     let Some(func_node) = node.child_by_field_name("function") else {
         return Vec::new();
@@ -2035,27 +2395,32 @@ fn try_parse_tar_option_set_call(
         // `pkgs <- c("a", "b"); tar_option_set(packages = pkgs)` — no literal
         // at the call site, so anchor at the call's end position.
         "identifier" => {
-            let text = node_text(*value_node, content);
-            match var_lookup
-                .get(text)
-                .and_then(|b| b.resolved_before(node.start_byte()))
-            {
-                Some(pkgs) => pkgs
-                    .iter()
-                    .map(|package| call_at(package.clone(), node))
+            let Some(text) = super::binding::plain_identifier_name(*value_node, content) else {
+                return Vec::new();
+            };
+            match bindings.resolve_package_vector(text, node) {
+                Some(packages) => packages
+                    .into_iter()
+                    .map(|package| call_at(package, node))
                     .collect(),
                 None => Vec::new(),
             }
         }
         // `packages = c("dplyr", "tidyr")` — one call per package, each
         // anchored at its own string-literal node.
-        _ => match extract_c_string_nodes_strict(*value_node, content) {
-            Some(pairs) => pairs
+        _ => {
+            let Some(pairs) = super::binding::extract_bare_c_plain_strings(*value_node, content)
+            else {
+                return Vec::new();
+            };
+            if !bindings.package_c_is_trusted_at(node) {
+                return Vec::new();
+            }
+            pairs
                 .into_iter()
                 .map(|(package, literal)| call_at(package, literal))
-                .collect(),
-            None => Vec::new(),
-        },
+                .collect()
+        }
     }
 }
 
@@ -2078,7 +2443,7 @@ mod tests {
         let sources = detect_source_calls(&parse_r(code), code);
         assert_eq!(sources.len(), 1, "got: {sources:?}");
         assert_eq!(sources[0].path, "scripts/helpers.R");
-        assert!(sources[0].local);
+        assert!(sources[0].locality != SourceLocality::Global);
         assert!(!sources[0].is_directive);
         assert!(sources[0].system_file.is_none());
     }
@@ -2099,6 +2464,46 @@ source(file.path(repo_root, "scripts/helpers.R"))
     }
 
     #[test]
+    fn computed_source_respects_load_invalidation_destination_and_runtime_scope() {
+        let cases = [
+            (
+                "p <- \"good.R\"\nbase::load(\"state.RData\")\nsource(p)\n",
+                false,
+            ),
+            (
+                "base::load(\"state.RData\")\np <- \"good.R\"\nsource(p)\n",
+                true,
+            ),
+            (
+                "p <- \"good.R\"\nbase::load(\"state.RData\", envir = base::new.env())\nsource(p)\n",
+                true,
+            ),
+            (
+                "p <- \"good.R\"\nf <- function() base::load(\"state.RData\")\nsource(p)\n",
+                true,
+            ),
+            (
+                "p <- \"good.R\"\nf <- function() { base::load(\"state.RData\"); source(p) }\n",
+                false,
+            ),
+            (
+                "p <- \"good.R\"\nf <- function() base::load(\"state.RData\", envir = .GlobalEnv)\nsource(p)\n",
+                false,
+            ),
+        ];
+        for (code, detected) in cases {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(!sources.is_empty(), detected, "{code}\n{sources:?}");
+            if detected {
+                assert_eq!(
+                    sources.last().map(|source| source.path.as_str()),
+                    Some("good.R")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn computed_source_with_unfoldable_path_still_ignored() {
         let code = r#"source(file.path(Sys.getenv("ROOT"), "x.R"))"#;
         let sources = detect_source_calls(&parse_r(code), code);
@@ -2112,7 +2517,7 @@ source(file.path(repo_root, "scripts/helpers.R"))
         assert_eq!(sources.len(), 1, "got: {sources:?}");
         assert_eq!(sources[0].path, "R/utils.R");
         assert!(sources[0].is_sys_source);
-        assert!(sources[0].sys_source_global_env);
+        assert!(sources[0].locality == SourceLocality::Global);
     }
 
     #[test]
@@ -2329,7 +2734,7 @@ source(file.path(repo_root, "scripts/helpers.R"))
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].path, "utils.R");
         assert!(!sources[0].is_sys_source);
-        assert!(!sources[0].local);
+        assert!(sources[0].locality == SourceLocality::Global);
         assert!(!sources[0].chdir);
     }
 
@@ -2343,12 +2748,1008 @@ source(file.path(repo_root, "scripts/helpers.R"))
     }
 
     #[test]
+    fn source_detection_excludes_proven_captured_code() {
+        for code in [
+            r#"quote(source("quote.R"))"#,
+            r#"base::quote(source("base-quote.R"))"#,
+            r#"expression(source("expression.R"))"#,
+            r#"rlang::expr(source("expr.R"))"#,
+            r#"rlang::quo(source("quo.R"))"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert!(sources.is_empty(), "{code}: {sources:?}");
+        }
+    }
+
+    #[test]
+    fn source_detection_traverses_evaluated_capture_parts() {
+        let cases = [
+            (r#"bquote(.(source("splice.R")))"#, "splice.R"),
+            (
+                r#"bquote(list(..(source("splice-list.R"))), splice = TRUE)"#,
+                "splice-list.R",
+            ),
+            (
+                r#"bquote(x, where = { source("where.R"); parent.frame() })"#,
+                "where.R",
+            ),
+            (
+                r#"substitute(x, env = { source("env.R"); globalenv() })"#,
+                "env.R",
+            ),
+            (r#"rlang::expr(!!source("unquote.R"))"#, "unquote.R"),
+        ];
+        for (code, expected) in cases {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_eq!(sources[0].path, expected, "{code}");
+        }
+
+        for code in [
+            r#"bquote(source("captured.R"))"#,
+            r#"substitute(source("captured.R"), env = globalenv())"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert!(sources.is_empty(), "{code}: {sources:?}");
+        }
+    }
+
+    #[test]
+    fn source_detection_preserves_unshadowed_quote_inside_immediate_bquote_operand() {
+        let code = r#"
+            p <- "good.R"
+            bquote(.(quote(p <- "bad.R")))
+            source(p)
+        "#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].path, "good.R");
+
+        let code = r#"
+            quote <- function(x) force(x)
+            p <- "good.R"
+            bquote(.(quote(p <- "bad.R")))
+            source(p)
+        "#;
+        assert!(detect_source_calls(&parse_r(code), code).is_empty());
+    }
+
+    #[test]
+    fn root_bquote_splice_keeps_where_source_before_operand_error() {
+        let code = r#"bquote(..(source("operand.R")), where = { source("where.R"); parent.frame() }, splice = TRUE)"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].path, "where.R");
+    }
+
+    #[test]
+    fn bquote_where_removal_prevents_computed_source_edge() {
+        let code = r#"
+        p <- "child.R"
+        bquote(.(source(p)), where = { rm(p); parent.frame() })
+        "#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert!(sources.is_empty(), "{sources:?}");
+    }
+
+    #[test]
+    fn source_detection_validates_rlang_capture_contracts() {
+        for helper in ["expr", "quo", "enquo", "enexpr"] {
+            let code = format!(r#"rlang::{helper}(!!source("{helper}.R"), unused = 2)"#);
+            let sources = detect_source_calls(&parse_r(&code), &code);
+            assert!(sources.is_empty(), "{helper}: {sources:?}");
+        }
+
+        let malformed = r#"rlang::exprs(!!source("bad.R"), .named = FALSE, .named = TRUE)"#;
+        assert!(detect_source_calls(&parse_r(malformed), malformed).is_empty());
+
+        let valid =
+            r#"rlang::exprs(.named = { source("control.R"); FALSE }, !!source("operand.R"))"#;
+        let sources = detect_source_calls(&parse_r(valid), valid);
+        assert_eq!(
+            sources
+                .into_iter()
+                .map(|source| source.path)
+                .collect::<Vec<_>>(),
+            vec!["control.R", "operand.R"]
+        );
+    }
+
+    #[test]
+    fn source_detection_respects_bquote_splice_control() {
+        for code in [
+            r#"bquote(..(source("default.R")))"#,
+            r#"bquote(..(source("false.R")), splice = FALSE)"#,
+            r#"bquote(..(source("unknown.R")), splice = flag)"#,
+            r#"bquote(..(source("short-alias.R")), splice = T)"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert!(sources.is_empty(), "{code}: {sources:?}");
+        }
+
+        let code = r#"bquote(..(source("root-error.R")), splice = TRUE)"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert!(sources.is_empty(), "{code}: {sources:?}");
+
+        let code = r#"bquote(list(..(source("nested.R"))), splice = TRUE)"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+        assert_eq!(sources[0].path, "nested.R");
+
+        for code in [
+            r#"bquote(.(source("dot-default.R")))"#,
+            r#"bquote(.(source("dot-false.R")), splice = FALSE)"#,
+            r#"bquote(.(source("dot-unknown.R")), splice = flag)"#,
+            r#"bquote(.(source("dot-lazy.R")), splice = source("not-forced.R"))"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_ne!(sources[0].path, "not-forced.R", "{code}");
+        }
+
+        let code = r#"bquote(symbol, splice = source("not-forced.R"))"#;
+        assert!(detect_source_calls(&parse_r(code), code).is_empty());
+
+        let code = r#"bquote(list(symbol), splice = source("forced.R"))"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].path, "forced.R");
+    }
+
+    #[test]
+    fn bquote_source_and_scope_detectors_follow_where_frame() {
+        for (code, expected_locality) in [
+            (
+                r#"bquote(.(source("external.R", local = TRUE)), where = new.env())"#,
+                SourceLocality::NonInheriting,
+            ),
+            (
+                r#"bquote(.(source("global.R", local = TRUE)), where = .GlobalEnv)"#,
+                SourceLocality::Global,
+            ),
+            (
+                r#"bquote(.(source("global-call.R", local = TRUE)), where = globalenv())"#,
+                SourceLocality::Global,
+            ),
+            (
+                r#"bquote(.(source("base-global-call.R", local = TRUE)), where = base::globalenv())"#,
+                SourceLocality::Global,
+            ),
+            (
+                r#"bquote(.(source("caller.R", local = TRUE)))"#,
+                SourceLocality::CurrentFrame,
+            ),
+            (
+                r#"bquote(where = parent.frame(), expr = .(source("parent.R", local = TRUE)))"#,
+                SourceLocality::CurrentFrame,
+            ),
+            (
+                r#"bquote(where = new.env(), expr = .(source("global-default.R")))"#,
+                SourceLocality::Global,
+            ),
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_eq!(
+                sources[0].locality, expected_locality,
+                "{code}: {sources:?}"
+            );
+            assert_eq!(
+                sources[0].locality != SourceLocality::Global,
+                expected_locality != SourceLocality::Global,
+                "{code}: {sources:?}"
+            );
+        }
+
+        let external = r#"bquote(where = new.env(), expr = .({ rm(x); exists("declared") }))"#;
+        assert!(detect_rm_calls(&parse_r(external), external).is_empty());
+        assert!(detect_exists_calls(&parse_r(external), external).is_empty());
+
+        for where_value in [
+            "parent.frame()",
+            "environment()",
+            ".GlobalEnv",
+            "globalenv()",
+            "base::globalenv()",
+        ] {
+            let code = format!(
+                "bquote(where = {where_value}, expr = .({{ rm(x); exists(\"declared\") }}))"
+            );
+            assert_eq!(detect_rm_calls(&parse_r(&code), &code).len(), 1, "{code}");
+            assert_eq!(
+                detect_exists_calls(&parse_r(&code), &code).len(),
+                1,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_bquote_source_locality_composes_capture_frames() {
+        let cases = [
+            (
+                r#"
+                    env <- new.env(parent = emptyenv())
+                    base::bquote(
+                        where = env,
+                        expr = .(base::bquote(.(source("external-caller.R", local = TRUE))))
+                    )
+                "#,
+                CaptureEvaluationFrame::ExternalOrUnknown,
+                SourceLocality::NonInheriting,
+                true,
+            ),
+            (
+                r#"
+                    env <- new.env(parent = emptyenv())
+                    base::bquote(
+                        where = env,
+                        expr = .(base::bquote(
+                            where = base::globalenv(),
+                            expr = .(source("external-global.R", local = TRUE))
+                        ))
+                    )
+                "#,
+                CaptureEvaluationFrame::Global,
+                SourceLocality::Global,
+                true,
+            ),
+            (
+                r#"
+                    base::bquote(
+                        where = base::globalenv(),
+                        expr = .(base::bquote(.(source("global-caller.R", local = TRUE))))
+                    )
+                "#,
+                CaptureEvaluationFrame::Global,
+                SourceLocality::Global,
+                true,
+            ),
+            (
+                r#"base::bquote(.(base::bquote(.(source("caller-caller.R", local = TRUE)))))"#,
+                CaptureEvaluationFrame::Caller,
+                SourceLocality::CurrentFrame,
+                true,
+            ),
+            (
+                r#"
+                    env <- new.env(parent = emptyenv())
+                    base::bquote(
+                        where = base::globalenv(),
+                        expr = .(base::bquote(
+                            where = env,
+                            expr = .(source("global-external.R", local = TRUE))
+                        ))
+                    )
+                "#,
+                CaptureEvaluationFrame::ExternalOrUnknown,
+                SourceLocality::NonInheriting,
+                true,
+            ),
+        ];
+
+        for (code, _expected_frame, expected_locality, expected_timeline_contribution) in cases {
+            let tree = parse_r(code);
+            let mut bindings =
+                crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), code);
+            let detected = detect_source_calls_with_bindings_and_frames(&tree, code, &mut bindings);
+            assert_eq!(detected.len(), 1, "{code}: {detected:?}");
+            assert_eq!(
+                detected[0].source.locality, expected_locality,
+                "{code}: {detected:?}"
+            );
+            assert_eq!(
+                detected[0].contributes_to_timeline(),
+                expected_timeline_contribution,
+                "{code}: {detected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_external_global_sources_disable_timeline_lending_on_inversion() {
+        let code = r#"
+            base::bquote(
+                where = base::new.env(),
+                expr = .(base::bquote(
+                    expr = .(source("late.R")),
+                    where = { source("early.R"); base::new.env() }
+                ))
+            )
+        "#;
+        let tree = parse_r(code);
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), code);
+        let detected = detect_source_calls_with_bindings_and_frames(&tree, code, &mut bindings);
+
+        assert_eq!(
+            detected
+                .iter()
+                .map(|source| source.source.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["early.R", "late.R"],
+            "capture traversal must retain runtime source order: {detected:?}"
+        );
+        assert!(
+            detected
+                .iter()
+                .all(|source| source.source.locality == SourceLocality::Global),
+            "default source destinations remain global: {detected:?}"
+        );
+        assert!(
+            detected
+                .iter()
+                .all(|source| !source.contributes_to_timeline()),
+            "source-coordinate inversion must suppress global timeline effects: {detected:?}"
+        );
+    }
+
+    #[test]
+    fn nested_external_source_inversion_ignores_inert_and_non_global_effects() {
+        let inert = r#"
+            base::bquote(
+                where = base::new.env(),
+                expr = .(base::bquote(
+                    expr = .(base::quote(source("late.R"))),
+                    where = { source("early.R"); base::new.env() }
+                ))
+            )
+        "#;
+        let tree = parse_r(inert);
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), inert);
+        let detected = detect_source_calls_with_bindings_and_frames(&tree, inert, &mut bindings);
+        assert_eq!(detected.len(), 1, "{detected:?}");
+        assert_eq!(detected[0].source.path, "early.R");
+        assert!(detected[0].contributes_to_timeline(), "{detected:?}");
+
+        let non_global = r#"
+            base::bquote(
+                where = base::new.env(),
+                expr = .(base::bquote(
+                    expr = .(source("late.R", local = base::new.env())),
+                    where = {
+                        source("early.R", local = base::new.env())
+                        base::new.env()
+                    }
+                ))
+            )
+        "#;
+        let tree = parse_r(non_global);
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), non_global);
+        let detected =
+            detect_source_calls_with_bindings_and_frames(&tree, non_global, &mut bindings);
+        assert_eq!(detected.len(), 2, "{detected:?}");
+        assert!(
+            detected
+                .iter()
+                .all(|source| source.source.locality == SourceLocality::NonInheriting),
+            "{detected:?}"
+        );
+        assert!(
+            detected.iter().all(FramedSource::contributes_to_timeline),
+            "explicit non-global destinations must not widen the external-effect predicate: {detected:?}"
+        );
+    }
+
+    #[test]
+    fn external_bquote_function_execution_resets_source_rm_and_exists_frames() {
+        let code = r#"
+            bquote(
+                .(function(
+                    default = source("default.R", local = TRUE),
+                    declared = exists("default_decl")
+                ) {
+                    source("body.R", local = TRUE)
+                    library(bodypkg)
+                    rm(body_name)
+                    function() {
+                        source("nested.R", local = TRUE)
+                        library(nestedpkg)
+                        exists("nested_decl")
+                    }
+                }),
+                where = new.env()
+            )
+        "#;
+        let tree = parse_r(code);
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), code);
+        let detected = detect_source_calls_with_bindings_and_frames(&tree, code, &mut bindings);
+        assert_eq!(
+            detected
+                .iter()
+                .map(|source| source.source.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default.R", "body.R", "nested.R"]
+        );
+        assert!(
+            detected
+                .iter()
+                .all(|source| source.source.locality != SourceLocality::Global
+                    && source.source.is_function_scoped)
+        );
+        assert_eq!(detect_rm_calls(&tree, code).len(), 1);
+        assert_eq!(detect_exists_calls(&tree, code).len(), 2);
+        assert_eq!(
+            detect_library_calls(&tree, code)
+                .into_iter()
+                .map(|call| call.package)
+                .collect::<Vec<_>>(),
+            vec!["bodypkg", "nestedpkg"]
+        );
+        assert!(
+            extract_attached_packages(code).is_empty(),
+            "function-body package loads must remain execution-guarded"
+        );
+
+        let direct_external = r#"bquote(.(source("external.R", local = TRUE)), where = new.env())"#;
+        let tree = parse_r(direct_external);
+        let mut bindings = crate::cross_file::static_path::LazyStaticBindings::new(
+            tree.root_node(),
+            direct_external,
+        );
+        let detected =
+            detect_source_calls_with_bindings_and_frames(&tree, direct_external, &mut bindings);
+        assert_eq!(detected[0].source.locality, SourceLocality::NonInheriting);
+
+        let global_closure = r#"
+            bquote(
+                .(function() source("global-closure-local.R", local = TRUE)),
+                where = .GlobalEnv
+            )
+        "#;
+        let sources = detect_source_calls(&parse_r(global_closure), global_closure);
+        assert_eq!(sources.len(), 1);
+        assert!(
+            sources[0].locality != SourceLocality::Global,
+            "function execution must not inherit Global"
+        );
+    }
+
+    #[test]
+    fn bquote_function_syntax_uses_runtime_scope_for_sources_and_packages() {
+        let top_level = r#"
+            bquote(function() .({
+                source("top.R", local = TRUE)
+                library(toppkg)
+            }))
+        "#;
+        let top_sources = detect_source_calls(&parse_r(top_level), top_level);
+        assert_eq!(top_sources.len(), 1);
+        assert!(!top_sources[0].is_function_scoped, "{top_sources:?}");
+        assert!(extract_attached_packages(top_level).contains("toppkg"));
+
+        let outer_function = r#"
+            outer <- function() {
+                bquote(function() .({
+                    source("outer.R", local = TRUE)
+                    library(outerpkg)
+                }))
+            }
+        "#;
+        let outer_sources = detect_source_calls(&parse_r(outer_function), outer_function);
+        assert_eq!(outer_sources.len(), 1);
+        assert!(outer_sources[0].is_function_scoped, "{outer_sources:?}");
+        assert!(!extract_attached_packages(outer_function).contains("outerpkg"));
+
+        let nested_closure = r#"
+            bquote(function() .(function() {
+                source("nested.R", local = TRUE)
+                library(nestedpkg)
+            }))
+        "#;
+        let nested_sources = detect_source_calls(&parse_r(nested_closure), nested_closure);
+        assert_eq!(nested_sources.len(), 1);
+        assert!(nested_sources[0].is_function_scoped, "{nested_sources:?}");
+        assert!(!extract_attached_packages(nested_closure).contains("nestedpkg"));
+
+        let ordinary = r#"
+            ordinary <- function() {
+                source("ordinary.R", local = TRUE)
+                library(ordinarypkg)
+            }
+        "#;
+        let ordinary_sources = detect_source_calls(&parse_r(ordinary), ordinary);
+        assert_eq!(ordinary_sources.len(), 1);
+        assert!(ordinary_sources[0].is_function_scoped);
+        assert!(!extract_attached_packages(ordinary).contains("ordinarypkg"));
+    }
+
+    #[test]
+    fn source_detection_requires_identifier_bquote_macros() {
+        for code in [
+            r#"bquote("."(source("literal-dot.R")))"#,
+            r#"bquote(list(".."(source("literal-dot-dot.R"))), splice = TRUE)"#,
+        ] {
+            assert!(
+                detect_source_calls(&parse_r(code), code).is_empty(),
+                "{code}"
+            );
+        }
+
+        for (code, expected) in [
+            (r#"bquote(`.`(source("backtick-dot.R")))"#, "backtick-dot.R"),
+            (
+                r#"bquote(list(`..`(source("backtick-dot-dot.R"))), splice = TRUE)"#,
+                "backtick-dot-dot.R",
+            ),
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_eq!(sources[0].path, expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn bquote_package_loads_remain_visible_across_where_frames() {
+        let code = r#"
+            bquote(
+                where = { library(controlpkg); new.env() },
+                expr = .({
+                    library(operandpkg)
+                    libs <- c("fabricatedpkg")
+                    sapply(libs, library, character.only = TRUE)
+                })
+            )
+        "#;
+        let packages: Vec<_> = detect_library_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|call| call.package)
+            .collect();
+        assert_eq!(packages, vec!["controlpkg", "operandpkg"]);
+    }
+
+    #[test]
+    fn inverted_capture_packages_remain_reachable_but_do_not_lend_to_scope() {
+        let code = r#"bquote(
+            expr = .(library(dplyr)),
+            where = { library(controlpkg); parent.frame() }
+        )"#;
+        let tree = parse_r(code);
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), code);
+        let reachable: Vec<_> = detect_library_calls_with_bindings(&tree, code, &mut bindings)
+            .into_iter()
+            .map(|call| call.package)
+            .collect();
+        assert_eq!(reachable, vec!["dplyr", "controlpkg"]);
+
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), code);
+        assert!(
+            detect_library_calls_with_bindings_for_scope(&tree, code, &mut bindings).is_empty()
+        );
+    }
+
+    #[test]
+    fn inverted_capture_removal_uses_scope_boundary_anchor() {
+        let code = "x <- 1\nbquote(expr = .(x), where = { rm(x); parent.frame() })";
+        let tree = parse_r(code);
+        let public = detect_rm_calls(&tree, code);
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].line, 1);
+        assert!(public[0].column > 0);
+
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), code);
+        let scoped = detect_rm_calls_with_bindings_for_scope(&tree, code, &mut bindings);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!((scoped[0].call.line, scoped[0].call.column), (1, 0));
+    }
+
+    #[test]
+    fn static_script_facts_share_one_parse_and_binding_collection() {
+        let code = r#"
+            path <- "child.R"
+            libs <- c("dplyr")
+            quote(captured)
+            source(path)
+            sapply(libs, library, character.only = TRUE)
+        "#;
+        let before = crate::cross_file::static_path::collection_count_for_current_thread();
+        let facts = StaticScriptFacts::from_text(code);
+        let after = crate::cross_file::static_path::collection_count_for_current_thread();
+        assert_eq!(after, before + 1);
+        assert!(facts.top_level_defs.contains("path"));
+        assert!(facts.top_level_defs.contains("libs"));
+        assert!(facts.attached_packages.contains("dplyr"));
+        assert_eq!(facts.source_targets, vec!["child.R"]);
+    }
+
+    #[test]
+    fn package_detection_requires_identifier_bquote_macros() {
+        for code in [
+            r#"bquote("."(library(literaldot)))"#,
+            r#"bquote(list(".."(library(literaldotdot))), splice = TRUE)"#,
+        ] {
+            assert!(
+                detect_library_calls(&parse_r(code), code).is_empty(),
+                "{code}"
+            );
+        }
+
+        for (code, expected) in [
+            (r#"bquote(`.`(library(backtickdot)))"#, "backtickdot"),
+            (
+                r#"bquote(list(`..`(library(backtickdotdot))), splice = TRUE)"#,
+                "backtickdotdot",
+            ),
+        ] {
+            let packages = detect_library_calls(&parse_r(code), code);
+            assert_eq!(packages.len(), 1, "{code}: {packages:?}");
+            assert_eq!(packages[0].package, expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn source_detection_traverses_nested_dot_inside_disabled_dot_dot() {
+        for (code, expected) in [
+            (r#"bquote(..(.(source("omitted.R"))))"#, "omitted.R"),
+            (
+                r#"bquote(list(..(list(.(source("nested-false.R"))))), splice = FALSE)"#,
+                "nested-false.R",
+            ),
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_eq!(sources[0].path, expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn source_detection_ignores_extra_bquote_macro_actuals() {
+        for (code, expected) in [
+            (
+                r#"bquote(.(source("dot-first.R"), source("dot-extra.R")))"#,
+                "dot-first.R",
+            ),
+            (
+                r#"bquote(list(..(source("splice-first.R"), source("splice-extra.R"))), splice = TRUE)"#,
+                "splice-first.R",
+            ),
+            (
+                r#"bquote(list(.(list(.(source("nested-first.R"))), source("nested-extra.R"))))"#,
+                "nested-first.R",
+            ),
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_eq!(sources[0].path, expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn source_detection_uses_direct_splice_runtime_order_prefix() {
+        let code = r#"bquote(list(.(source("head.R")), ..(source("splice.R"))), splice = TRUE)"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].path, "splice.R");
+
+        // A direct enabled splice evaluates its operand before the syntactically
+        // preceding prefix; a non-vector result aborts before that prefix runs.
+        let code = r#"bquote(list(.(source("prefix.R")), ..({ source("operand.R"); function() {} })), splice = TRUE)"#;
+        let paths: Vec<_> = detect_source_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(paths, vec!["operand.R"]);
+    }
+
+    #[test]
+    fn unknown_bquote_splice_suppresses_later_source_effects() {
+        let code = r#"base::bquote(list(..(unknown), .(source("tail.R"))), splice = { source("control.R"); flag })"#;
+        let paths: Vec<_> = detect_source_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(paths, vec!["control.R"]);
+    }
+
+    #[test]
+    fn unknown_bquote_splice_extra_actuals_do_not_fabricate_source_edges() {
+        let code = r#"base::bquote(list(..(1, .(source("extra.R")))), splice = flag)"#;
+        assert!(detect_source_calls(&parse_r(code), code).is_empty());
+
+        let code = r#"base::bquote(list(..(1, .(source("extra.R")))), splice = TRUE)"#;
+        assert!(detect_source_calls(&parse_r(code), code).is_empty());
+
+        let code = r#"base::bquote(list(..(1, .(source("extra.R")))), splice = FALSE)"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].path, "extra.R");
+    }
+
+    #[test]
+    fn named_bquote_splice_before_expr_respects_direct_splice_order() {
+        let code = r#"base::bquote(splice = flag, expr = list(.(source("prefix.R")), ..(source("operand.R")), .(source("tail.R"))))"#;
+        assert!(detect_source_calls(&parse_r(code), code).is_empty());
+
+        let code = r#"base::bquote(splice = { source("control.R"); flag }, expr = list(.(source("prefix.R")), ..(source("operand.R")), .(source("tail.R"))))"#;
+        let paths: Vec<_> = detect_source_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(paths, vec!["control.R"]);
+
+        let code = r#"base::bquote(splice = TRUE, expr = list(.(source("prefix.R")), ..(source("operand.R")), .(source("tail.R"))))"#;
+        let paths: Vec<_> = detect_source_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(paths, vec!["operand.R"]);
+
+        let code = r#"base::bquote(splice = FALSE, expr = list(.(source("prefix.R")), ..(.(source("operand.R"))), .(source("tail.R"))))"#;
+        let paths: Vec<_> = detect_source_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(paths, vec!["prefix.R", "operand.R", "tail.R"]);
+
+        let code = r#"base::bquote(splice = flag, expr = list(.(source("prefix.R")), list(.(source("tail.R")))))"#;
+        let paths: Vec<_> = detect_source_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(paths, vec!["prefix.R", "tail.R"]);
+    }
+
+    #[test]
+    fn bquote_splice_result_gates_later_source_effects() {
+        let code = r#"base::bquote(..({ source("operand.R"); function() {} }) + .(source("tail.R")), splice = TRUE)"#;
+        let paths: Vec<_> = detect_source_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(paths, vec!["operand.R"]);
+
+        let code = r#"base::bquote(..(unknown) + .(source("tail.R")), splice = TRUE)"#;
+        assert!(detect_source_calls(&parse_r(code), code).is_empty());
+
+        for operand in ["1", r#""value""#, "list(1)", "c(1)", "base::c(1)"] {
+            let code =
+                format!(r#"base::bquote(..({operand}) + .(source("tail.R")), splice = TRUE)"#);
+            let sources = detect_source_calls(&parse_r(&code), &code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_eq!(sources[0].path, "tail.R", "{code}");
+        }
+
+        for setup in [
+            "c <- function(...) function() {}",
+            "list <- function(...) function() {}",
+        ] {
+            let helper = setup.split_whitespace().next().unwrap();
+            let code = format!(
+                "{setup}\nbase::bquote(..({helper}(1)) + .(source(\"tail.R\")), splice = TRUE)"
+            );
+            assert!(
+                detect_source_calls(&parse_r(&code), &code).is_empty(),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn definite_bquote_aborts_stop_source_detection() {
+        let code = r#"bquote(list(.(source("head.R")), ..(), .(source("tail.R"))), where = { source("where.R"); parent.frame() }, splice = TRUE)"#;
+        let paths: Vec<_> = detect_source_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(paths, vec!["where.R"]);
+
+        let code = r#"bquote(list(.(source("before.R")), list(.(), .(source("inner-tail.R"))), .(source("outer-tail.R"))))"#;
+        let paths: Vec<_> = detect_source_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|source| source.path)
+            .collect();
+        assert_eq!(paths, vec!["before.R"]);
+    }
+
+    #[test]
+    fn definite_bquote_aborts_stop_package_detection() {
+        let code = r#"bquote(list(.(library(headpkg)), ..(), .(library(tailpkg))), where = { library(wherepkg); parent.frame() }, splice = TRUE)"#;
+        let packages: Vec<_> = detect_library_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|call| call.package)
+            .collect();
+        assert_eq!(packages, vec!["wherepkg"]);
+
+        let code = r#"bquote(list(.(library(beforepkg)), list(.(), .(library(inner_tail_pkg))), .(library(outer_tail_pkg))))"#;
+        let packages: Vec<_> = detect_library_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|call| call.package)
+            .collect();
+        assert_eq!(packages, vec!["beforepkg"]);
+    }
+
+    #[test]
+    fn definite_bquote_aborts_stop_rm_and_exists_detection() {
+        let code = r#"bquote(list(.(rm(before)), .(), .(rm(after))))"#;
+        let removals = detect_rm_calls(&parse_r(code), code);
+        assert_eq!(removals.len(), 1, "{removals:?}");
+        assert_eq!(removals[0].symbols, vec!["before"]);
+
+        let code = r#"bquote(list(.(exists("before")), .(), .(exists("after"))))"#;
+        let exists: Vec<_> = detect_exists_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|call| call.name)
+            .collect();
+        assert_eq!(exists, vec!["before"]);
+    }
+
+    #[test]
+    fn source_detection_emits_nothing_when_capture_formal_matching_fails() {
+        for code in [
+            r#"substitute(expr = source("substitute.R"), expr = x)"#,
+            r#"bquote(expr = source("bquote.R"), expr = x)"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert!(sources.is_empty(), "{code}: {sources:?}");
+        }
+    }
+
+    #[test]
+    fn bquote_unknown_splice_conservatively_invalidates_source_bindings() {
+        for (capture, preserves) in [
+            (
+                r#"bquote(..(base::assign("p", "bad.R", envir = .GlobalEnv)))"#,
+                true,
+            ),
+            (
+                r#"bquote(..(base::assign("p", "bad.R", envir = .GlobalEnv)), splice = FALSE)"#,
+                true,
+            ),
+            (
+                r#"bquote(..(base::assign("p", "bad.R", envir = .GlobalEnv)), splice = flag)"#,
+                true,
+            ),
+            (
+                r#"bquote(list(..(base::assign("p", "bad.R", envir = .GlobalEnv))), splice = flag)"#,
+                false,
+            ),
+            (
+                r#"bquote(..(base::assign("p", "bad.R", envir = .GlobalEnv)), splice = TRUE)"#,
+                true,
+            ),
+            (
+                r#"bquote(list(..(base::assign("p", "bad.R", envir = .GlobalEnv))), splice = TRUE)"#,
+                false,
+            ),
+        ] {
+            let code = format!("p <- \"good.R\"\n{capture}\nsource(p)");
+            let sources = detect_source_calls(&parse_r(&code), &code);
+            assert_eq!(
+                sources.iter().any(|source| source.path == "good.R"),
+                preserves,
+                "{capture}: {sources:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_detection_does_not_trust_shadowed_or_arbitrary_capture_names() {
+        let code = r#"
+quote <- function(x) force(x)
+quote(source("forced.R"))
+"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "got: {sources:?}");
+        assert_eq!(sources[0].path, "forced.R");
+
+        let code = r#"other::quote(source("conservative.R"))"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "got: {sources:?}");
+        assert_eq!(sources[0].path, "conservative.R");
+    }
+
+    #[test]
+    fn indirect_unknown_helper_mutations_respect_capture_order_and_scope() {
+        let earlier = r#"
+x <- get("assign", baseenv())("quote", get("identity", baseenv()), envir = .GlobalEnv)
+quote(source("forced.R"))
+"#;
+        let sources = detect_source_calls(&parse_r(earlier), earlier);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].path, "forced.R");
+
+        let later = r#"
+quote(source("captured.R"))
+x <- get("assign", baseenv())("quote", get("identity", baseenv()), envir = .GlobalEnv)
+"#;
+        assert!(
+            detect_source_calls(&parse_r(later), later).is_empty(),
+            "a later immediate mutation must not affect an earlier use"
+        );
+
+        let unrelated_scope = r#"
+f <- function() {
+  x <- get("assign", baseenv())("quote", get("identity", baseenv()), envir = .GlobalEnv)
+}
+quote(source("captured.R"))
+"#;
+        assert!(
+            detect_source_calls(&parse_r(unrelated_scope), unrelated_scope).is_empty(),
+            "an unrelated function scope must not affect a top-level use"
+        );
+
+        let deferred = r#"
+f <- function() {
+  quote(source("forced.R"))
+  x <- get("assign", baseenv())("quote", get("identity", baseenv()), envir = .GlobalEnv)
+}
+"#;
+        let sources = detect_source_calls(&parse_r(deferred), deferred);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].path, "forced.R");
+    }
+
+    #[test]
+    fn indirect_unknown_helper_mutation_exposes_quoted_package_effects() {
+        let code = r#"
+x <- get("assign", baseenv())("quote", get("identity", baseenv()), envir = .GlobalEnv)
+quote(library(dplyr))
+"#;
+        let calls = detect_library_calls(&parse_r(code), code);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].package, "dplyr");
+        assert!(extract_attached_packages(code).contains("dplyr"));
+    }
+
+    #[test]
+    fn evaluated_capture_mutations_invalidate_static_source_bindings() {
+        for evaluated in [
+            r#"bquote(.(base::assign("p", "bad.R", envir = .GlobalEnv)))"#,
+            r#"substitute(x, env = base::assign("p", "bad.R", envir = .GlobalEnv))"#,
+            r#"quote <- function(x) force(x)
+quote(base::assign("p", "bad.R", envir = .GlobalEnv))"#,
+        ] {
+            let code = format!("p <- \"good.R\"\n{evaluated}\nsource(p)");
+            let sources = detect_source_calls(&parse_r(&code), &code);
+            assert!(sources.is_empty(), "{evaluated}: {sources:?}");
+        }
+
+        let code = r#"
+p <- "good.R"
+quote(base::assign("p", "bad.R", envir = .GlobalEnv))
+source(p)
+"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "got: {sources:?}");
+        assert_eq!(sources[0].path, "good.R");
+    }
+
+    #[test]
     fn test_source_named_argument() {
         let code = r#"source(file = "utils.R")"#;
         let tree = parse_r(code);
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].path, "utils.R");
+    }
+
+    #[test]
+    fn test_source_backtick_named_arguments() {
+        for code in [
+            r#"source(`file` = "utils.R", `local` = FALSE)"#,
+            r#"source("file" = "utils.R", "local" = FALSE)"#,
+            r#"source(r"(file)" = "utils.R", r"(local)" = FALSE)"#,
+        ] {
+            let tree = parse_r(code);
+            let sources = detect_source_calls(&tree, code);
+            assert_eq!(sources.len(), 1, "{code}");
+            assert_eq!(sources[0].path, "utils.R");
+            assert!(sources[0].locality == SourceLocality::Global);
+            assert!(sources[0].inherits_symbols());
+        }
+
+        let code = r#"sys.source(`file` = "utils.R", `envir` = globalenv())"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_sys_source);
+        assert!(sources[0].locality == SourceLocality::Global);
     }
 
     #[test]
@@ -2363,20 +3764,180 @@ source(file.path(repo_root, "scripts/helpers.R"))
 
     #[test]
     fn test_source_with_local_true() {
-        let code = r#"source("utils.R", local = TRUE)"#;
+        for code in [
+            r#"source("utils.R", local = TRUE)"#,
+            r#"source("utils.R", local = T)"#,
+            r#"source("utils.R", TRUE)"#,
+        ] {
+            let tree = parse_r(code);
+            let sources = detect_source_calls(&tree, code);
+            assert_eq!(sources.len(), 1, "{code}");
+            assert!(sources[0].locality != SourceLocality::Global, "{code}");
+            assert_eq!(sources[0].locality, SourceLocality::CurrentFrame, "{code}");
+        }
+    }
+
+    #[test]
+    fn test_source_with_unknown_local_is_conservatively_non_inheriting() {
+        for code in [
+            r#"source("utils.R", local = flag)"#,
+            r#"source("utils.R", local = new.env())"#,
+            r#"source("utils.R", flag)"#,
+            r#"source("utils.R", loc = flag)"#,
+        ] {
+            let tree = parse_r(code);
+            let sources = detect_source_calls(&tree, code);
+            assert_eq!(sources.len(), 1, "{code}");
+            assert!(sources[0].locality != SourceLocality::Global, "{code}");
+            assert_eq!(sources[0].locality, SourceLocality::NonInheriting, "{code}");
+            assert!(!sources[0].inherits_symbols(), "{code}");
+        }
+
+        for code in [
+            r#"source("utils.R")"#,
+            r#"source("utils.R", local = FALSE)"#,
+            r#"source("utils.R", local = F)"#,
+            r#"source("utils.R", local = .GlobalEnv)"#,
+            r#"source("utils.R", local = globalenv())"#,
+            r#"source("utils.R", local = base::globalenv())"#,
+            r#"source("utils.R", FALSE)"#,
+            r#"source("utils.R", loc = FALSE)"#,
+            r#"source("utils.R", local = )"#,
+            r#"source("utils.R", , echo = FALSE)"#,
+            r#"source(f = "utils.R", local = FALSE)"#,
+        ] {
+            let tree = parse_r(code);
+            let sources = detect_source_calls(&tree, code);
+            assert_eq!(sources.len(), 1, "{code}");
+            assert_eq!(sources[0].path, "utils.R", "{code}");
+            assert!(sources[0].locality == SourceLocality::Global, "{code}");
+            assert_eq!(sources[0].locality, SourceLocality::Global, "{code}");
+            assert!(sources[0].inherits_symbols(), "{code}");
+        }
+    }
+
+    #[test]
+    fn global_capture_promotes_only_proven_current_frame_locality() {
+        let code = r#"
+            bquote(where = .GlobalEnv, expr = .(source("external.R", local = e, chdir = TRUE)))
+            bquote(where = .GlobalEnv, expr = .(source("true.R", local = TRUE)))
+            bquote(where = .GlobalEnv, expr = .(source("short-true.R", local = T)))
+            bquote(where = .GlobalEnv, expr = .(source("false.R", local = FALSE)))
+            bquote(where = .GlobalEnv, expr = .(source("global-env.R", local = base::globalenv())))
+        "#;
         let tree = parse_r(code);
-        let sources = detect_source_calls(&tree, code);
-        assert_eq!(sources.len(), 1);
-        assert!(sources[0].local);
+        let mut bindings =
+            crate::cross_file::static_path::LazyStaticBindings::new(tree.root_node(), code);
+        let detected = detect_source_calls_with_bindings_and_frames(&tree, code, &mut bindings);
+        assert_eq!(detected.len(), 5, "{detected:?}");
+
+        let external = &detected[0];
+        assert_eq!(external.source.path, "external.R");
+        assert_eq!(external.source.locality, SourceLocality::NonInheriting);
+        assert!(external.source.locality != SourceLocality::Global);
+        assert!(external.source.chdir, "chdir metadata must be preserved");
+        assert!(external.contributes_to_timeline());
+
+        for source in &detected[1..] {
+            assert_eq!(source.source.locality, SourceLocality::Global, "{source:?}");
+            assert!(
+                source.source.locality == SourceLocality::Global,
+                "{source:?}"
+            );
+            assert!(source.contributes_to_timeline(), "{source:?}");
+        }
+
+        assert_eq!(
+            StaticScriptFacts::from_text(code).source_targets,
+            vec![
+                "true.R".to_string(),
+                "short-true.R".to_string(),
+                "false.R".to_string(),
+                "global-env.R".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_invalid_or_ambiguous_source_argument_matching_is_skipped() {
+        for code in [
+            r#"source("utils.R", local = FALSE, local = FALSE)"#,
+            r#"source(, "utils.R", local = FALSE)"#,
+            r#"sys.source(, "utils.R", envir = globalenv())"#,
+            r#"sys.source("utils.R", envir = globalenv(), envir = globalenv())"#,
+        ] {
+            let tree = parse_r(code);
+            assert!(detect_source_calls(&tree, code).is_empty(), "{code}");
+        }
+    }
+
+    #[test]
+    fn test_partial_file_name_with_positional_arguments_uses_r_matching() {
+        for (code, path) in [
+            (r#"source(f = "child.R", FALSE)"#, "child.R"),
+            (
+                r#"source(f = "real.R", "value-for-echo", local = FALSE)"#,
+                "real.R",
+            ),
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_eq!(sources[0].path, path, "{code}");
+            assert!(sources[0].locality == SourceLocality::Global, "{code}");
+        }
+    }
+
+    #[test]
+    fn incomplete_source_calls_remain_strictly_ignored_by_detection() {
+        for code in [
+            r#"source("uti"#,
+            r#"source("utils.R""#,
+            r#"source(f = "uti"#,
+        ] {
+            assert!(
+                detect_source_calls(&parse_r(code), code).is_empty(),
+                "{code}"
+            );
+        }
     }
 
     #[test]
     fn test_source_with_chdir_true() {
-        let code = r#"source("utils.R", chdir = TRUE)"#;
+        for code in [
+            r#"source("utils.R", chdir = TRUE)"#,
+            r#"source("utils.R", chdir = T)"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}");
+            assert!(sources[0].chdir, "{code}");
+        }
+
+        for code in [
+            r#"source("utils.R", chdir = FALSE)"#,
+            r#"source("utils.R", chdir = F)"#,
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}");
+            assert!(!sources[0].chdir, "{code}");
+        }
+    }
+
+    #[test]
+    fn test_source_with_positional_chdir_true() {
+        let code = r#"source("utils.R", FALSE, FALSE, FALSE, NULL, FALSE, FALSE, "", 60, 60, "keepInteger", TRUE)"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].locality == SourceLocality::Global);
+        assert!(sources[0].chdir);
+
+        let code = r#"sys.source("utils.R", globalenv(), TRUE)"#;
         let tree = parse_r(code);
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 1);
         assert!(sources[0].chdir);
+        assert!(sources[0].locality == SourceLocality::Global);
+        assert!(sources[0].inherits_symbols());
     }
 
     #[test]
@@ -2438,6 +3999,7 @@ source("b.R")"#;
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 1);
         assert!(sources[0].is_function_scoped);
+        assert_eq!(sources[0].locality, SourceLocality::Global);
     }
 
     /// Regression coverage for issue #138: walking ancestors must catch
@@ -2454,6 +4016,86 @@ source("b.R")"#;
     }
 
     #[test]
+    fn function_scoped_sources_preserve_current_frame_vs_non_inheriting() {
+        let code = r#"
+            outer <- function() {
+                source("current.R", local = TRUE)
+                inner <- function() source("unknown.R", local = new.env(emptyenv()))
+            }
+        "#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources.iter().all(|source| source.is_function_scoped));
+        assert_eq!(sources[0].locality, SourceLocality::CurrentFrame);
+        assert_eq!(sources[1].locality, SourceLocality::NonInheriting);
+    }
+
+    #[test]
+    fn static_script_facts_source_targets_apply_all_scope_filters() {
+        let code = r#"
+source("global.R")
+source("false.R", local = FALSE)
+source(f = "partial-file.R", local = FALSE)
+source("short-false.R", local = F)
+source(file.path("computed", "helper.R"))
+source("local.R", local = TRUE)
+source("short-local.R", local = T)
+source("dynamic-local.R", local = flag)
+source("environment-local.R", local = new.env())
+source("positional-local.R", flag)
+source("partial-local.R", loc = flag)
+source("missing-local.R", local = )
+source("duplicate-local.R", local = FALSE, local = FALSE)
+source(, "missing-file.R", local = FALSE)
+sys.source("base.R")
+sys.source(, "missing-sys-file.R", envir = globalenv())
+sys.source("duplicate-sys-envir.R", envir = globalenv(), envir = globalenv())
+f <- function() source("deferred.R")
+"#;
+        assert_eq!(
+            StaticScriptFacts::from_text(code).source_targets,
+            vec![
+                "global.R",
+                "false.R",
+                "partial-file.R",
+                "short-false.R",
+                "computed/helper.R",
+                "missing-local.R"
+            ]
+        );
+    }
+
+    #[test]
+    fn static_script_facts_source_targets_respect_capture_locality_and_runtime_order() {
+        let code = r#"
+            bquote(where = .GlobalEnv, expr = .(source("captured-environment.R", local = e)))
+            bquote(where = .GlobalEnv, expr = .(source("captured-current.R", local = TRUE)))
+            bquote(where = { source("captured-orderable.R"); parent.frame() }, expr = .(NULL))
+            bquote(expr = .(rm(x)), where = { source("captured-inverted.R"); parent.frame() })
+        "#;
+        assert_eq!(
+            StaticScriptFacts::from_text(code).source_targets,
+            vec![
+                "captured-current.R".to_string(),
+                "captured-orderable.R".to_string(),
+            ]
+        );
+        assert_eq!(
+            detect_source_calls(&parse_r(code), code)
+                .into_iter()
+                .map(|source| source.path)
+                .collect::<Vec<_>>(),
+            vec![
+                "captured-environment.R",
+                "captured-current.R",
+                "captured-orderable.R",
+                "captured-inverted.R",
+            ],
+            "dependency-oriented detection must retain every executed source"
+        );
+    }
+
+    #[test]
     fn test_non_source_call_ignored() {
         let code = "print(\"hello\")";
         let tree = parse_r(code);
@@ -2463,13 +4105,17 @@ source("b.R")"#;
 
     #[test]
     fn test_sys_source_with_globalenv() {
-        let code = r#"sys.source("utils.R", envir = globalenv())"#;
-        let tree = parse_r(code);
-        let sources = detect_source_calls(&tree, code);
-        assert_eq!(sources.len(), 1);
-        assert!(sources[0].is_sys_source);
-        assert!(sources[0].sys_source_global_env);
-        assert!(sources[0].inherits_symbols());
+        for code in [
+            r#"sys.source("utils.R", envir = globalenv())"#,
+            "result <- helper(1)\nsys.source(\"utils.R\", envir = globalenv())",
+        ] {
+            let tree = parse_r(code);
+            let sources = detect_source_calls(&tree, code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert!(sources[0].is_sys_source);
+            assert!(sources[0].locality == SourceLocality::Global, "{code}");
+            assert!(sources[0].inherits_symbols(), "{code}");
+        }
     }
 
     #[test]
@@ -2479,8 +4125,201 @@ source("b.R")"#;
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 1);
         assert!(sources[0].is_sys_source);
-        assert!(sources[0].sys_source_global_env);
+        assert!(sources[0].locality == SourceLocality::Global);
         assert!(sources[0].inherits_symbols());
+    }
+
+    #[test]
+    fn test_sys_source_shadowed_global_environment_is_not_global() {
+        for code in [
+            ".GlobalEnv <- new.env()\nsys.source(\"utils.R\", envir = .GlobalEnv)",
+            "globalenv <- function() new.env()\nsys.source(\"utils.R\", envir = globalenv())",
+            "name <- \"globalenv\"\nassign(name, function() new.env())\nsys.source(\"utils.R\", envir = globalenv())",
+        ] {
+            let tree = parse_r(code);
+            let sources = detect_source_calls(&tree, code);
+            assert_eq!(sources.len(), 1);
+            assert!(sources[0].locality != SourceLocality::Global);
+            assert!(!sources[0].inherits_symbols());
+        }
+
+        let code = r#"later <- function(x) function() x
+g <- later(sys.source("utils.R", envir = globalenv()))
+globalenv <- function() new.env()
+g()"#;
+        let tree = parse_r(code);
+        let sources = detect_source_calls(&tree, code);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].locality != SourceLocality::Global);
+    }
+
+    #[test]
+    fn unrelated_function_bindings_do_not_shadow_top_level_source_aliases() {
+        let code = r#"
+f <- function(globalenv, T) {
+  .GlobalEnv <- new.env()
+  F <- TRUE
+}
+sys.source("sys.R", envir = globalenv())
+source("local.R", local = F, chdir = T)
+"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources[0].locality == SourceLocality::Global);
+        assert!(sources[1].locality == SourceLocality::Global);
+        assert!(sources[1].chdir);
+    }
+
+    #[test]
+    fn relevant_scope_bindings_keep_aliases_conservative() {
+        for code in [
+            "T <- FALSE\nsource(\"utils.R\", local = T)",
+            "F <- TRUE\nsource(\"utils.R\", local = F)",
+            ".GlobalEnv <- new.env()\nsource(\"utils.R\", local = .GlobalEnv)",
+            "globalenv <- function() new.env()\nsource(\"utils.R\", local = globalenv())",
+            "mutate <- function() assign(\"F\", TRUE, envir = .GlobalEnv)\nmutate()\nsource(\"utils.R\", local = F)",
+            "mutate <- function() F <<- TRUE\nmutate()\nsource(\"utils.R\", local = F)",
+            r#"mutate <- function() `\x46` <<- TRUE
+mutate()
+source("utils.R", local = F)"#,
+            "f <- function(T) source(\"utils.R\", local = T)",
+            "f <- function() { x <- helper(); source(\"utils.R\", local = F) }",
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert!(sources[0].locality != SourceLocality::Global, "{code}");
+        }
+
+        let code = "mutate <- function() assign(\"globalenv\", function() new.env(), envir = .GlobalEnv)\nmutate()\nsys.source(\"utils.R\", envir = globalenv())";
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert!(sources[0].locality != SourceLocality::Global);
+
+        // Deferred calls consider later bindings and mutation uncertainty.
+        let code = "f <- function() {\n  sys.source(\"utils.R\", envir = globalenv())\n  globalenv <- function() new.env()\n}";
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert!(sources[0].locality != SourceLocality::Global);
+    }
+
+    #[test]
+    fn trusted_immediate_removals_restore_base_aliases() {
+        let code = "F <- TRUE\nrm(F)\nsource(\"utils.R\", local = F)";
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert!(sources[0].locality == SourceLocality::Global);
+
+        let code = "T <- FALSE\nrm(T)\nsource(\"utils.R\", chdir = T)";
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert!(sources[0].chdir);
+
+        let code = "globalenv <- function() new.env()\nrm(globalenv)\nsys.source(\"utils.R\", envir = globalenv())";
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert!(sources[0].locality == SourceLocality::Global);
+
+        let code = ".GlobalEnv <- NULL\nrm(.GlobalEnv)\nsource(\"utils.R\", local = .GlobalEnv)";
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert!(sources[0].locality == SourceLocality::Global);
+
+        for code in [
+            "F <- TRUE\nf <- function() rm(F)\nsource(\"utils.R\", local = F)",
+            "F <- TRUE\nrm(F, envir = other)\nsource(\"utils.R\", local = F)",
+        ] {
+            let sources = detect_source_calls(&parse_r(code), code);
+            assert!(sources[0].locality != SourceLocality::Global, "{code}");
+        }
+    }
+
+    #[test]
+    fn unknown_bquote_splice_branch_removals_do_not_restore_local_aliases() {
+        for (splice, expected_local) in [("TRUE", false), ("FALSE", true), ("flag", true)] {
+            let code = format!(
+                "F <- TRUE\nbase::bquote(list(..(base::rm(F))), splice = {splice})\nsource(\"utils.R\", local = F)"
+            );
+            let sources = detect_source_calls(&parse_r(&code), &code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_eq!(
+                sources[0].locality != SourceLocality::Global,
+                expected_local,
+                "{code}: {sources:?}"
+            );
+        }
+
+        for splice in ["TRUE", "FALSE", "flag"] {
+            let code = format!(
+                "F <- FALSE\nbase::bquote(list(.(F <- TRUE), ..(base::rm(F))), splice = {splice})\nsource(\"utils.R\", local = F)"
+            );
+            let sources = detect_source_calls(&parse_r(&code), &code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert!(
+                sources[0].locality != SourceLocality::Global,
+                "{code}: {sources:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_certainty_capture_inversion_keeps_source_local_conservative() {
+        for (splice, expected_local) in [("TRUE", false), ("FALSE", true), ("flag", true)] {
+            let code = format!(
+                r#"
+base::bquote(
+  where = {{ rm(F); .GlobalEnv }},
+  expr = list(..(1, .(F <- TRUE))),
+  splice = {splice}
+)
+source("child.R", local = F)
+"#
+            );
+            let sources = detect_source_calls(&parse_r(&code), &code);
+            assert_eq!(sources.len(), 1, "{code}: {sources:?}");
+            assert_eq!(
+                sources[0].locality != SourceLocality::Global,
+                expected_local,
+                "{code}: {sources:?}"
+            );
+            assert_eq!(
+                sources[0].inherits_symbols(),
+                !expected_local,
+                "{code}: {sources:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_parameters_shadow_aliases_only_in_their_function_scope() {
+        let code = r#"f <- function(`\x46`) source("utils.R", local = F)"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert!(sources[0].locality != SourceLocality::Global);
+
+        let code = r#"f <- function(`\x54`) source("utils.R", chdir = T)"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert!(!sources[0].chdir);
+
+        let code = r#"f <- function(`.Global\x45nv`) source("utils.R", local = .GlobalEnv)"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert!(sources[0].locality != SourceLocality::Global);
+
+        let code = r#"f <- function(`global\x65nv`) sys.source("utils.R", envir = globalenv())"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert!(sources[0].locality != SourceLocality::Global);
+    }
+
+    #[test]
+    fn later_immediate_unknown_mutation_does_not_retroactively_shadow_aliases() {
+        let code = r#"
+source("local.R", local = F, chdir = T)
+sys.source("sys.R", envir = globalenv())
+x <- get("assign", baseenv())("F", TRUE, envir = .GlobalEnv)
+"#;
+        let sources = detect_source_calls(&parse_r(code), code);
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources[0].locality == SourceLocality::Global);
+        assert!(sources[0].chdir);
+        assert!(sources[1].locality == SourceLocality::Global);
     }
 
     #[test]
@@ -2490,7 +4329,8 @@ source("b.R")"#;
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 1);
         assert!(sources[0].is_sys_source);
-        assert!(!sources[0].sys_source_global_env);
+        assert!(sources[0].locality != SourceLocality::Global);
+        assert_eq!(sources[0].locality, SourceLocality::NonInheriting);
         assert!(!sources[0].inherits_symbols());
     }
 
@@ -2502,7 +4342,8 @@ source("b.R")"#;
         let sources = detect_source_calls(&tree, code);
         assert_eq!(sources.len(), 1);
         assert!(sources[0].is_sys_source);
-        assert!(!sources[0].sys_source_global_env);
+        assert!(sources[0].locality != SourceLocality::Global);
+        assert_eq!(sources[0].locality, SourceLocality::NonInheriting);
         assert!(!sources[0].inherits_symbols());
     }
 
@@ -2774,6 +4615,27 @@ source("b.R")"#;
         assert_eq!(calls[0].line, 0);
         assert_eq!(calls[1].name, "b");
         assert_eq!(calls[1].line, 1);
+    }
+
+    #[test]
+    fn capture_detectors_ignore_extra_bquote_macro_actuals() {
+        for code in [
+            r#"bquote(.(exists("kept"), exists("extra")))"#,
+            r#"bquote(list(..(exists("kept"), exists("extra"))), splice = TRUE)"#,
+        ] {
+            let calls = detect_exists_calls(&parse_r(code), code);
+            assert_eq!(calls.len(), 1, "{code}: {calls:?}");
+            assert_eq!(calls[0].name, "kept", "{code}");
+        }
+
+        for code in [
+            r#"bquote(.(rm(kept), rm(extra)))"#,
+            r#"bquote(list(..(rm(kept), rm(extra))), splice = TRUE)"#,
+        ] {
+            let calls = detect_rm_calls(&parse_r(code), code);
+            assert_eq!(calls.len(), 1, "{code}: {calls:?}");
+            assert_eq!(calls[0].symbols, vec!["kept"], "{code}");
+        }
     }
 
     #[test]
@@ -3522,6 +5384,430 @@ library(ggplot2)"#;
     }
 
     #[test]
+    fn package_vector_bindings_are_collected_only_on_demand() {
+        let code = "x <- 1\nlibrary(dplyr)\nrequire(tidyr)";
+        let tree = parse_r(code);
+        let root = tree.root_node();
+        let mut bindings = super::super::static_path::LazyStaticBindings::new(root, code);
+        let mut output = LibraryWalkOutput::default();
+        visit_node_for_library(
+            root,
+            code,
+            &mut bindings,
+            false,
+            RuntimeFunctionScope::Lexical,
+            true,
+            &mut output,
+        );
+        assert!(!bindings.is_collected());
+
+        let code = "libs <- c(\"dplyr\")\nsapply(libs, library, character.only = TRUE)\nlapply(libs, require, character.only = TRUE)";
+        let tree = parse_r(code);
+        let root = tree.root_node();
+        let mut bindings = super::super::static_path::LazyStaticBindings::new(root, code);
+        let mut output = LibraryWalkOutput::default();
+        visit_node_for_library(
+            root,
+            code,
+            &mut bindings,
+            false,
+            RuntimeFunctionScope::Lexical,
+            true,
+            &mut output,
+        );
+        assert!(bindings.is_collected());
+        assert_eq!(output.library_calls.len(), 2);
+    }
+
+    #[test]
+    fn artifact_detectors_share_one_static_binding_collection() {
+        let code = r#"
+path <- "child.R"
+libs <- c("dplyr")
+source(path)
+sapply(libs, library, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let root = tree.root_node();
+        let mut bindings = super::super::static_path::LazyStaticBindings::new(root, code);
+
+        let sources = detect_source_calls_with_bindings(&tree, code, &mut bindings);
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        let collection = bindings.collection_address().unwrap();
+
+        let libraries = detect_library_calls_with_bindings(&tree, code, &mut bindings);
+        assert_eq!(libraries.len(), 1, "{libraries:?}");
+        assert_eq!(libraries[0].package, "dplyr");
+        assert_eq!(bindings.collection_address(), Some(collection));
+    }
+
+    #[test]
+    fn later_deferred_helper_uncertainty_does_not_hide_tar_option_packages() {
+        let code = r#"
+library(targets)
+tar_option_set(packages = c("shiny"))
+server <- function(input, output, session) {
+  output$plot <- renderPlot({ inner <- 1 })
+}
+"#;
+        let calls = detect_library_calls(&parse_r(code), code);
+        assert!(
+            calls.iter().any(|call| call.package == "shiny"),
+            "got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn proven_non_mutating_constructs_preserve_package_candidates() {
+        for intervening in [
+            "for (i in NULL) libs <- c(\"tidyr\")",
+            "rm(list = NULL)",
+            "rm(list = base::character())",
+            "rm(list = base::character(0))",
+            "rm(list = base::character(length = 0))",
+            "rm(list = character())",
+            "rm(list = character(0))",
+            "x <- base::paste0(\"a\", \"b\")",
+            "x <- base::paste(\"a\", \"b\")",
+            "quote(rm(libs))",
+            "quote(libs <- c(\"tidyr\"))",
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{intervening}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().any(|call| call.package == "dplyr"),
+                "{intervening}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_bquote_splice_keeps_where_package_before_operand_error() {
+        let code = r#"bquote(..(library(operandpkg)), where = { library(wherepkg); parent.frame() }, splice = TRUE)"#;
+        let calls = detect_library_calls(&parse_r(code), code);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].package, "wherepkg");
+        assert_eq!(
+            extract_attached_packages(code)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["wherepkg"]
+        );
+    }
+
+    #[test]
+    fn bquote_splice_result_gates_later_package_effects() {
+        let code = r#"base::bquote(..(function() {}) + .(library(dplyr)), splice = TRUE)"#;
+        assert!(detect_library_calls(&parse_r(code), code).is_empty());
+        assert!(extract_attached_packages(code).is_empty());
+
+        let code = r#"base::bquote(..(unknown) + .(library(dplyr)), splice = TRUE)"#;
+        assert!(detect_library_calls(&parse_r(code), code).is_empty());
+        assert!(extract_attached_packages(code).is_empty());
+
+        for operand in ["1", r#""value""#, "list(1)", "c(1)", "base::list(1)"] {
+            let code = format!("base::bquote(..({operand}) + .(library(dplyr)), splice = TRUE)");
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert_eq!(calls.len(), 1, "{code}: {calls:?}");
+            assert_eq!(calls[0].package, "dplyr", "{code}");
+            assert_eq!(
+                extract_attached_packages(&code)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                vec!["dplyr"],
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn bquote_where_removal_prevents_computed_package_effect() {
+        let code = r#"
+        libs <- c("tidyr")
+        bquote(
+            .(sapply(libs, library, character.only = TRUE)),
+            where = { rm(libs); parent.frame() }
+        )
+        "#;
+        let calls = detect_library_calls(&parse_r(code), code);
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn package_detection_validates_rlang_capture_contracts() {
+        for helper in ["expr", "quo", "enquo", "enexpr"] {
+            let code = format!(r#"rlang::{helper}(!!library({helper}pkg), unused = 2)"#);
+            assert!(
+                detect_library_calls(&parse_r(&code), &code).is_empty(),
+                "{helper}"
+            );
+            assert!(extract_attached_packages(&code).is_empty(), "{helper}");
+        }
+
+        let malformed = r#"rlang::quos(!!library(badpkg), .named = FALSE, .named = TRUE)"#;
+        assert!(detect_library_calls(&parse_r(malformed), malformed).is_empty());
+        assert!(extract_attached_packages(malformed).is_empty());
+    }
+
+    #[test]
+    fn package_detection_respects_bquote_splice_control() {
+        for (code, expected) in [
+            (r#"bquote(..(library(defaultpkg)))"#, false),
+            (r#"bquote(..(library(falsepkg)), splice = FALSE)"#, false),
+            (r#"bquote(..(library(unknownpkg)), splice = flag)"#, false),
+            (r#"bquote(..(library(rooterrorpkg)), splice = TRUE)"#, false),
+            (
+                r#"bquote(list(..(library(nestedpkg))), splice = TRUE)"#,
+                true,
+            ),
+            (r#"bquote(.(library(dotpkg)), splice = FALSE)"#, true),
+        ] {
+            let calls = detect_library_calls(&parse_r(code), code);
+            assert_eq!(!calls.is_empty(), expected, "{code}: {calls:?}");
+            let attached = extract_attached_packages(code);
+            assert_eq!(!attached.is_empty(), expected, "{code}: {attached:?}");
+        }
+    }
+
+    #[test]
+    fn package_detection_traverses_nested_dot_inside_disabled_dot_dot() {
+        for (code, expected) in [
+            (r#"bquote(..(.(library(omittedpkg))))"#, "omittedpkg"),
+            (
+                r#"bquote(list(..(list(.(library(nestedfalsepkg))))), splice = FALSE)"#,
+                "nestedfalsepkg",
+            ),
+        ] {
+            let calls = detect_library_calls(&parse_r(code), code);
+            assert_eq!(calls.len(), 1, "{code}: {calls:?}");
+            assert_eq!(calls[0].package, expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn package_detection_ignores_extra_bquote_macro_actuals() {
+        for (code, expected) in [
+            (
+                r#"bquote(.(library(dotfirstpkg), library(dotextrapkg)))"#,
+                "dotfirstpkg",
+            ),
+            (
+                r#"bquote(list(..(library(splicefirstpkg), library(spliceextrapkg))), splice = TRUE)"#,
+                "splicefirstpkg",
+            ),
+            (
+                r#"bquote(list(.(list(.(library(nestedfirstpkg))), library(nestedextrapkg))))"#,
+                "nestedfirstpkg",
+            ),
+        ] {
+            let calls = detect_library_calls(&parse_r(code), code);
+            assert_eq!(calls.len(), 1, "{code}: {calls:?}");
+            assert_eq!(calls[0].package, expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn package_detection_uses_direct_splice_runtime_order_prefix() {
+        let code = r#"bquote(list(.(library(headpkg)), ..(library(splicepkg))), splice = TRUE)"#;
+        let calls = detect_library_calls(&parse_r(code), code);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].package, "splicepkg");
+    }
+
+    #[test]
+    fn unknown_bquote_splice_suppresses_later_package_effects() {
+        let code = r#"base::bquote(list(..(unknown), .(library(tailpkg))), splice = { library(controlpkg); flag })"#;
+        let packages: Vec<_> = detect_library_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|call| call.package)
+            .collect();
+        assert_eq!(packages, vec!["controlpkg"]);
+        assert_eq!(
+            extract_attached_packages(code)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["controlpkg"]
+        );
+    }
+
+    #[test]
+    fn named_unknown_bquote_splice_before_expr_suppresses_package_effects() {
+        let code = r#"base::bquote(splice = flag, expr = list(.(library(prefixpkg)), ..(library(operandpkg)), .(library(tailpkg))))"#;
+        assert!(detect_library_calls(&parse_r(code), code).is_empty());
+        assert!(extract_attached_packages(code).is_empty());
+
+        let code = r#"base::bquote(splice = { library(controlpkg); flag }, expr = list(.(library(prefixpkg)), ..(library(operandpkg)), .(library(tailpkg))))"#;
+        let packages: Vec<_> = detect_library_calls(&parse_r(code), code)
+            .into_iter()
+            .map(|call| call.package)
+            .collect();
+        assert_eq!(packages, vec!["controlpkg"]);
+        assert_eq!(
+            extract_attached_packages(code)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["controlpkg"]
+        );
+    }
+
+    #[test]
+    fn package_detection_emits_nothing_when_capture_formal_matching_fails() {
+        for code in [
+            r#"substitute(expr = library(substitutepkg), expr = x)"#,
+            r#"bquote(expr = library(bquotepkg), expr = x)"#,
+        ] {
+            let calls = detect_library_calls(&parse_r(code), code);
+            assert!(calls.is_empty(), "{code}: {calls:?}");
+            let attached = extract_attached_packages(code);
+            assert!(attached.is_empty(), "{code}: {attached:?}");
+        }
+    }
+
+    #[test]
+    fn bquote_unknown_splice_conservatively_invalidates_package_vectors() {
+        for (capture, preserves) in [
+            (
+                r#"bquote(..(base::assign("libs", c("tidyr"), envir = .GlobalEnv)))"#,
+                true,
+            ),
+            (
+                r#"bquote(..(base::assign("libs", c("tidyr"), envir = .GlobalEnv)), splice = FALSE)"#,
+                true,
+            ),
+            (
+                r#"bquote(..(base::assign("libs", c("tidyr"), envir = .GlobalEnv)), splice = flag)"#,
+                true,
+            ),
+            (
+                r#"bquote(list(..(base::assign("libs", c("tidyr"), envir = .GlobalEnv))), splice = flag)"#,
+                false,
+            ),
+            (
+                r#"bquote(..(base::assign("libs", c("tidyr"), envir = .GlobalEnv)), splice = TRUE)"#,
+                true,
+            ),
+            (
+                r#"bquote(list(..(base::assign("libs", c("tidyr"), envir = .GlobalEnv))), splice = TRUE)"#,
+                false,
+            ),
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{capture}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert_eq!(
+                calls.iter().any(|call| call.package == "dplyr"),
+                preserves,
+                "{capture}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_bquote_splice_false_branch_invalidates_package_vector() {
+        for (capture, preserves) in [
+            (
+                r#"base::bquote(list(..(1, .(base::assign("libs", c("tidyr"))))), splice = flag)"#,
+                false,
+            ),
+            (
+                r#"base::bquote(list(..(1, .(base::assign("libs", c("tidyr"))))), splice = TRUE)"#,
+                true,
+            ),
+            (
+                r#"base::bquote(list(..(base::quote(.(base::assign("libs", c("tidyr")))))), splice = flag)"#,
+                false,
+            ),
+            (
+                r#"base::bquote(list(..(base::quote(.(base::assign("libs", c("tidyr")))))), splice = TRUE)"#,
+                true,
+            ),
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{capture}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert_eq!(
+                calls.iter().any(|call| call.package == "dplyr"),
+                preserves,
+                "{capture}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluated_capture_mutations_invalidate_package_vectors() {
+        for evaluated in [
+            r#"bquote(.(base::assign("libs", c("tidyr"), envir = .GlobalEnv)))"#,
+            r#"substitute(x, env = base::assign("libs", c("tidyr"), envir = .GlobalEnv))"#,
+            r#"quote <- function(x) force(x)
+quote(base::assign("libs", c("tidyr"), envir = .GlobalEnv))"#,
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{evaluated}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "{evaluated}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transparent_wrapped_assignments_supply_package_candidates() {
+        for assignment in ["{ libs <- c(\"dplyr\") }", "(libs <- c(\"dplyr\"))"] {
+            let code = format!("{assignment}\nsapply(libs, library, character.only = TRUE)");
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().any(|call| call.package == "dplyr"),
+                "{assignment}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn immediate_bquote_bindings_resolve_package_vectors() {
+        for binding in [
+            r#"bquote(.(libs <- c("dplyr", "tidyr")))"#,
+            r#"bquote(.(assign("libs", c("dplyr", "tidyr"))))"#,
+        ] {
+            let code = format!("{binding}\nsapply(libs, library, character.only = TRUE)");
+            let packages: Vec<_> = detect_library_calls(&parse_r(&code), &code)
+                .into_iter()
+                .map(|call| call.package)
+                .collect();
+            assert_eq!(packages, ["dplyr", "tidyr"], "{binding}");
+        }
+    }
+
+    #[test]
+    fn immediate_bquote_package_bindings_preserve_conservative_gates() {
+        for setup in [
+            r#"assign <- function(...) NULL
+bquote(.(assign("libs", c("dplyr"))))"#,
+            r#"c <- function(...) "dplyr"
+bquote(.(libs <- c("dplyr")))"#,
+            r#"c <- function(...) "dplyr"
+bquote(.(assign("libs", c("dplyr"))))"#,
+            r#"bquote(.(libs <- c("dplyr")), where = new.env())"#,
+            r#"bquote(.(assign("libs", c("dplyr"))), where = new.env())"#,
+            r#"bquote(.(assign("libs", c("dplyr"), envir = new.env())))"#,
+            r#"f <- function() bquote(.(libs <- c("dplyr")))"#,
+            r#"f <- function() bquote(.(assign("libs", c("dplyr"))))"#,
+        ] {
+            let code = format!("{setup}\nsapply(libs, library, character.only = TRUE)");
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "{setup}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_apply_var_equals_assignment() {
         let code = "libs = c(\"dplyr\", \"tidyr\")\nsapply(libs, library, character.only = TRUE)";
         let tree = parse_r(code);
@@ -3539,6 +5825,98 @@ library(ggplot2)"#;
         assert_eq!(lib_calls.len(), 2);
         assert_eq!(lib_calls[0].package, "dplyr");
         assert_eq!(lib_calls[1].package, "tidyr");
+    }
+
+    #[test]
+    fn test_apply_var_base_qualified_assign_call() {
+        for assign in [
+            "base::assign",
+            "base:::assign",
+            "\"base\"::assign",
+            "base::\"assign\"",
+            "base::`assign`",
+        ] {
+            let code = format!(
+                "{assign}(\"libs\", c(\"dplyr\", \"tidyr\"))\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let lib_calls = detect_library_calls(&tree, &code);
+            assert_eq!(lib_calls.len(), 2, "{assign}");
+            assert_eq!(lib_calls[0].package, "dplyr", "{assign}");
+            assert_eq!(lib_calls[1].package, "tidyr", "{assign}");
+        }
+    }
+
+    #[test]
+    fn test_apply_var_assign_inherits_false_uses_default_destination() {
+        for assign in ["assign", "base::assign", "base:::assign"] {
+            let code = format!(
+                "{assign}(\"libs\", c(\"dplyr\", \"tidyr\"), inherits = FALSE)\nsapply(libs, library, character.only = TRUE)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert_eq!(calls.len(), 2, "{assign}: {calls:?}");
+            assert_eq!(calls[0].package, "dplyr");
+            assert_eq!(calls[1].package, "tidyr");
+        }
+    }
+
+    #[test]
+    fn test_apply_and_tar_assign_pos_one_is_global() {
+        for assign in ["assign", "base::assign", "base:::assign"] {
+            let code = format!(
+                "{assign}(\"libs\", c(\"dplyr\"), pos = 1, inherits = FALSE)\nsapply(libs, library, character.only = TRUE)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().any(|call| call.package == "dplyr"),
+                "{assign}: {calls:?}"
+            );
+
+            let code = format!(
+                "library(targets)\n{assign}(\"libs\", c(\"shiny\"), pos = 1)\ntar_option_set(packages = libs)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().any(|call| call.package == "shiny"),
+                "{assign}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_var_assign_dynamic_inherits_is_not_a_candidate() {
+        for inherits in ["F", "flag"] {
+            let code = format!(
+                "assign(\"libs\", c(\"dplyr\"), inherits = {inherits})\nsapply(libs, library, character.only = TRUE)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "{inherits}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_var_qualified_or_non_global_assign_is_not_a_candidate() {
+        for assignment in [
+            "other::assign(\"libs\", c(\"dplyr\"))",
+            "base::assign(\"libs\", c(\"dplyr\"), envir = new.env())",
+            "base::assign(\"libs\", c(\"dplyr\"), pos = 2)",
+            "base::assign(\"libs\", c(\"dplyr\"), pos = flag)",
+            "base::assign(\"libs\", c(\"dplyr\"), pos = 1, envir = .GlobalEnv)",
+            "base::assign(\"libs\", c(\"dplyr\"), pos = 1, inherits = TRUE)",
+            "f <- function() base::assign(\"libs\", c(\"dplyr\"))",
+            "f <- function() libs <- c(\"dplyr\")",
+        ] {
+            let code = format!("{assignment}\nsapply(libs, library, character.only = TRUE)");
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "assignment `{assignment}` supplied a package candidate: {calls:?}"
+            );
+        }
     }
 
     #[test]
@@ -3576,6 +5954,222 @@ library(ggplot2)"#;
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_shared_binding_invalidators_disqualify() {
+        // These forms were already load-bearing invalidators for static path
+        // folding. Package-vector detection must count the same bindings so
+        // the two consumers cannot drift back to stale single-assignment data.
+        for mutation in [
+            "libs[1] <- \"tidyr\"",
+            "names(libs) <- \"package\"",
+            "rm(libs)",
+            "rm(list = c(\"libs\", \"other\"))",
+            "remove(list = c(\"other\", \"libs\"))",
+            "rm(list = base::c(\"libs\", \"other\"))",
+            "rm(list = `c`(\"other\", \"libs\"))",
+            "base::rm(libs)",
+            "base:::remove(\"libs\")",
+            "base::assign(\"libs\", c(\"tidyr\"))",
+            "other::assign(\"libs\", c(\"tidyr\"))",
+            "other::rm(libs)",
+            "for (libs in list(c(\"tidyr\"))) {}",
+            "libs %<>% identity()",
+            "\"libs\" <- c(\"tidyr\")",
+            "`libs` <- c(\"tidyr\")",
+            "assign(\"x\" = \"libs\", \"value\" = c(\"tidyr\"))",
+            r#"assign(`\x78` = "libs", value = c("tidyr"))"#,
+            "rm(\"list\" = c(\"libs\"))",
+            r#"rm(`l\x69st` = c("libs"))"#,
+            "libs <- # changed\n  c(\"tidyr\")",
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{mutation}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "mutation `{mutation}` left a stale package candidate: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_var_load_invalidation_is_destination_and_scope_aware() {
+        for loader in [
+            r#"load("state.RData")"#,
+            r#"base::load("state.RData")"#,
+            r#"sys.load.image("state.RData", quiet = TRUE)"#,
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{loader}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "{loader}: {calls:?}"
+            );
+        }
+
+        for loader in [
+            r#"base::load("state.RData", envir = base::new.env())"#,
+            r#"f <- function() base::load("state.RData")"#,
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{loader}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let calls = detect_library_calls(&parse_r(&code), &code);
+            assert!(
+                calls.iter().any(|call| call.package == "dplyr"),
+                "{loader}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_var_backtick_reference_uses_canonical_binding_key() {
+        let code = "libs <- c(\"dplyr\")\nsapply(`libs`, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().any(|call| call.package == "dplyr"));
+
+        let code = "sapply(c(\"dplyr\"), library, character.only = TRUE)\nrm(c)";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().any(|call| call.package == "dplyr"));
+    }
+
+    #[test]
+    fn test_apply_var_malformed_remove_vector_does_not_invalidate() {
+        for vector in [
+            "c()",
+            "c(\"libs\",)",
+            "c(,\"libs\")",
+            "c(\"other\",,\"libs\")",
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\nrm(list = {vector})\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(
+                calls.iter().any(|call| call.package == "dplyr"),
+                "malformed vector `{vector}` invalidated the package candidate: {calls:?}"
+            );
+        }
+
+        for remove in [
+            r#"rm(list = c("libs"), list = c("other"))"#,
+            "rm(libs, pos = 1, pos = 2)",
+            r#"rm(libs, pos = 1, pos = 2, `\x6cist` = c("libs"))"#,
+            r#"assign(x = "libs", x = "other", `\x76alue` = c("tidyr"))"#,
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{remove}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(
+                calls.iter().any(|call| call.package == "dplyr"),
+                "{remove}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_var_dynamic_remove_list_invalidates_prior_candidates() {
+        for (remove, setup, list) in [
+            ("rm", "libs <- c(\"dplyr\")\ndplyr <- 1", "libs"),
+            ("remove", "libs <- c(\"libs\")", "libs"),
+            ("rm", "victims <- \"libs\"\nlibs <- c(\"dplyr\")", "victims"),
+        ] {
+            let code = format!(
+                "{setup}\n{remove}(list = {list})\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "{remove}(list = {list}) retained a stale package candidate: {calls:?}"
+            );
+        }
+
+        let code = "victims <- \"libs\"\nrm(list = victims)\nlibs <- c(\"dplyr\")\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        // Evaluating an identifier-valued list may force an active or delayed
+        // binding with arbitrary side effects, so helper trust stays disabled
+        // even for a syntactically later vector assignment.
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        // A known base removal cannot shadow `c`, so a later package-vector
+        // assignment remains usable. An unknown escaped binding target, by
+        // contrast, may itself denote `c` and must disable helper-dependent
+        // candidates even though it does not invalidate later literal paths.
+        let code = r#"rm("\x6cibs")
+libs <- c("dplyr")
+sapply(libs, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().any(|call| call.package == "dplyr"));
+
+        let code = r#"`\x6cibs` <- c("old")
+libs <- c("dplyr")
+sapply(libs, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"f <- function() {
+  sapply(c("dplyr"), library, character.only = TRUE)
+}
+x <- {
+  get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+  1
+}
+f()"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"
+name <- "c"
+assign(name, function(...) "libs")
+libs <- c("dplyr")
+rm(list = c("other"))
+sapply(libs, library, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"
+name <- "c"
+assign(name, function(...) "tidyr")
+libs <- c("dplyr")
+sapply(libs, library, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        for list in [
+            "c <- function(...) \"libs\"\nrm(list = c(\"other\"))",
+            "`c` <- function(...) \"libs\"\nrm(list = c(\"other\"))",
+            "rm(list = other::c(\"other\"))",
+        ] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{list}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "{list} retained a stale package candidate: {calls:?}"
+            );
+        }
     }
 
     #[test]
@@ -3721,6 +6315,264 @@ library(ggplot2)"#;
     }
 
     #[test]
+    fn test_apply_var_dynamic_assign_name_invalidates_prior_candidate() {
+        for (setup, target) in [
+            ("n <- \"libs\"\nlibs <- c(\"dplyr\")", "n"),
+            ("libs <- c(\"dplyr\")", r#""\x6cibs""#),
+        ] {
+            let code = format!(
+                "{setup}\nassign({target}, c(\"tidyr\"))\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(
+                calls.iter().all(|call| call.package != "dplyr"),
+                "{target}: {calls:?}"
+            );
+        }
+
+        let code = r#"
+f <- function() assign("\x6cibs", c("tidyr"), envir = .GlobalEnv)
+libs <- c("dplyr")
+f()
+sapply(libs, library, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"
+f <- function() rm(list = c("other"), envir = .GlobalEnv)
+libs <- c("dplyr")
+c <- function(...) "libs"
+f()
+sapply(libs, library, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"
+f <- function() rm(list = c("other",), envir = .GlobalEnv)
+libs <- c("dplyr")
+c <- function(...) "libs"
+f()
+sapply(libs, library, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"
+later <- function(x) function() x
+g <- later(rm(list = victims, envir = .GlobalEnv))
+victims <- "libs"
+libs <- c("dplyr")
+g()
+sapply(libs, library, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"
+`%delay%` <- function(x, y) function() x
+n <- "libs"
+trigger <- assign(n, c("tidyr"), envir = .GlobalEnv) %delay% NULL
+libs <- c("dplyr")
+trigger()
+sapply(libs, library, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"
+f <- function() assign("ignored", "x")
+assign <- function(...) base::assign("libs", c("tidyr"), envir = .GlobalEnv)
+libs <- c("dplyr")
+f()
+sapply(libs, library, character.only = TRUE)
+"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"base::rm(`l\x69st` = {
+  get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+  character()
+})
+libs <- c("dplyr")
+sapply(libs, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+    }
+
+    #[test]
+    fn test_apply_var_shadowed_c_is_not_a_static_package_vector() {
+        let code = r#"c <- function(...) "tidyr"
+libs <- c("dplyr")
+sapply(libs, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"sapply(c("dplyr"), library, character.only = TRUE)
+c <- function(...) "tidyr""#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().any(|call| call.package == "dplyr"));
+
+        let code = r#"f <- function() {
+  sapply(c("dplyr"), library, character.only = TRUE)
+}
+g <- function() {
+  assign("\x63", function(...) "tidyr", envir = .GlobalEnv)
+}
+g()
+f()"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"for (i in {
+  get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+  list()
+}) {}
+libs <- c("dplyr")
+sapply(libs, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"x <- 0
+x[{
+  get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+  1
+}] <- 1
+libs <- c("dplyr")
+sapply(libs, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code =
+            "x <- 1\ny <- x\nlibs <- c(\"dplyr\")\nsapply(libs, library, character.only = TRUE)";
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().any(|call| call.package == "dplyr"));
+
+        for vector in [
+            "c(\"dplyr\",)",
+            "c(,\"dplyr\")",
+            "c(\"dplyr\",,\"tidyr\")",
+            r#"c("dpl\x79r")"#,
+        ] {
+            let code = format!("libs <- {vector}\nsapply(libs, library, character.only = TRUE)");
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(calls.iter().all(|call| call.package != "dplyr"));
+        }
+
+        let code = r#"c <- function(...) "tidyr"
+assign("libs", c("dplyr"))
+sapply(libs, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+    }
+
+    #[test]
+    fn test_deferred_unknown_mutation_disables_inline_c() {
+        let code = r#"name <- "c"
+f <- function() assign(name, function(...) "tidyr", envir = .GlobalEnv)
+f()
+sapply(c("dplyr"), library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+
+        let code = r#"try(base::assign({
+  get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+  "unused"
+}), silent = TRUE)
+libs <- c("dplyr")
+sapply(libs, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+    }
+
+    #[test]
+    fn test_dynamic_rm_arguments_can_shadow_inline_c() {
+        for (setup, argument) in [
+            (
+                "",
+                r#"list = {
+  get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+  character()
+}"#,
+            ),
+            (
+                "",
+                r#"envir = {
+  get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+  .GlobalEnv
+}"#,
+            ),
+            (
+                r#"delayedAssign("e", {
+  get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+  .GlobalEnv
+})
+"#,
+                "list = base::c(), envir = e",
+            ),
+            (
+                r#"`-` <- function(x) {
+  get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+  .GlobalEnv
+}
+"#,
+                "list = base::c(), pos = -1",
+            ),
+        ] {
+            let code = format!(
+                "{setup}rm({argument})\nsapply(c(\"dplyr\"), library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(calls.iter().all(|call| call.package != "dplyr"));
+        }
+
+        let code = r#"try(
+  base::rm(list = base::c({
+    get("assign", baseenv())("c", function(...) "tidyr", envir = .GlobalEnv)
+    "other"
+  },)),
+  silent = TRUE
+)
+libs <- c("dplyr")
+sapply(libs, library, character.only = TRUE)"#;
+        let tree = parse_r(code);
+        let calls = detect_library_calls(&tree, code);
+        assert!(calls.iter().all(|call| call.package != "dplyr"));
+    }
+
+    #[test]
+    fn test_apply_var_variadic_parameter_does_not_invalidate_candidate() {
+        for parameter in ["...", "..1"] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\nf <- function({parameter}) NULL\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(calls.iter().any(|call| call.package == "dplyr"));
+        }
+    }
+
+    #[test]
     fn test_apply_var_assign_named_overrides_disqualifies() {
         // libs is assigned twice — once via `<-`, once via named-arg assign().
         // The named assign() must count toward the multi-assignment rule.
@@ -3783,6 +6635,35 @@ library(ggplot2)"#;
         let tree = parse_r(code);
         let lib_calls = detect_library_calls(&tree, code);
         assert_eq!(lib_calls.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_var_assign_rejects_errors_in_other_formals() {
+        // assign() has no `...`: an unknown name, an ambiguous partial name,
+        // or a duplicate non-x/value formal errors before the binding occurs.
+        for args in [
+            r#"x = "libs", value = c("dplyr"), bogus = 1"#,
+            r#"x = "libs", value = c("dplyr"), i = TRUE"#,
+            r#"x = "libs", value = c("dplyr"), pos = 1, pos = 2"#,
+            r#""libs", c("dplyr"), , , , , 1"#,
+        ] {
+            let code = format!("assign({args})\nsapply(libs, library, character.only = TRUE)");
+            let tree = parse_r(&code);
+            let lib_calls = detect_library_calls(&tree, &code);
+            assert!(
+                lib_calls.is_empty(),
+                "unexpected calls for {args}: {lib_calls:?}"
+            );
+        }
+
+        for assign in [r#"assign("libs")"#, r#"assign("libs", value = )"#] {
+            let code = format!(
+                "libs <- c(\"dplyr\")\n{assign}\nsapply(libs, library, character.only = TRUE)"
+            );
+            let tree = parse_r(&code);
+            let calls = detect_library_calls(&tree, &code);
+            assert!(calls.iter().any(|call| call.package == "dplyr"));
+        }
     }
 
     // ==================== tar_option_set package detection (#637) ====================
@@ -3885,6 +6766,12 @@ library(ggplot2)"#;
         assert_eq!(calls[0].column, calls[1].column);
         let call_len = "tar_option_set(packages = pkgs)".len() as u32;
         assert_eq!(calls[0].column, call_len);
+    }
+
+    #[test]
+    fn test_tar_option_set_var_replacement_binding_disqualifies() {
+        let code = "library(targets)\npkgs <- c(\"dplyr\")\npkgs[1] <- \"tidyr\"\ntar_option_set(packages = pkgs)";
+        assert!(tar_calls(code).is_empty());
     }
 
     #[test]
@@ -3997,16 +6884,11 @@ library(ggplot2)"#;
         assert_eq!(calls.len(), 1, "got: {calls:?}");
         assert_eq!(calls[0].package, "targets");
 
-        // Deliberate asymmetry (locked here): a plain library() inside
-        // quote() IS still recorded on this position-aware path — that
-        // leniency predates tar_option_set detection and is out of scope.
-        // (The top-level walker behind extract_attached_packages excludes
-        // it; see extract_attached_packages_excludes_quote_wrapper.)
+        // Direct package loads obey the same proven-capture boundary.
         let code = "q <- quote(library(dplyr))";
         let tree = parse_r(code);
         let calls = detect_library_calls(&tree, code);
-        assert_eq!(calls.len(), 1, "got: {calls:?}");
-        assert_eq!(calls[0].package, "dplyr");
+        assert!(calls.is_empty(), "got: {calls:?}");
     }
 
     #[test]

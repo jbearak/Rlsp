@@ -659,10 +659,9 @@ pub fn parse_directives(content: &str) -> CrossFileMetadata {
                 line: call_site_line,
                 column: 0, // Always 0 for directive-based sources
                 is_directive: true,
-                local: false,
+                locality: super::types::SourceLocality::Global,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 explicit_line: has_explicit_line,
                 directive_line: line_num,
                 user_line_zero: is_line_zero,

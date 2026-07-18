@@ -9,18 +9,16 @@ use crate::package_namespace::parse_dcf_field_pub;
 ///
 /// # Why `_delta` is ignored
 ///
-/// The `_delta` parameter is intentionally unused: this function always
-/// performs a full from-scratch recomputation over `inputs`. Any incremental
-/// speedup comes from memoization *inside* the function (per-file facts are
-/// reused when the `ContentDigest` matches `prev`), not from delta-driven
-/// short-circuiting at the call boundary.
+/// This function always performs a full from-scratch semantic recomputation
+/// over `inputs`. Any incremental speedup comes from memoization *inside* the
+/// function (per-file facts are reused when the `ContentDigest` matches
+/// `prev`), not from delta-driven short-circuiting at the call boundary.
 ///
-/// This contract is exercised by
-/// `proptest_machine::advisory_delta_does_not_affect_correctness`, which
-/// asserts that passing `Initial` instead of the "correct" delta still yields
-/// the same `PackageState`. Future maintainers must not introduce
-/// delta-driven branches here: callers treat the delta as advisory and
-/// correctness must not depend on which variant is passed.
+/// Operational seed freshness is owned by `WorldState`'s
+/// `PackageInputLifecycle`, not by semantic `PackageState`, so index application
+/// and derivation cannot reset it. This preserves
+/// `proptest_machine::advisory_delta_does_not_affect_correctness`: callers may
+/// pass `Initial` without changing derived meaning.
 pub fn derive_package_state(
     prev: &PackageState,
     inputs: &PackageInputs,

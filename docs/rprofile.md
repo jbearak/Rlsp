@@ -32,9 +32,14 @@ The startup prelude contributes:
   followed transitively through those files' own literal `source()` calls.
 
 Raven ignores dynamic `source()` paths, `source()` calls inside function bodies,
-and calls that do not put symbols into the global script scope, such as
-`source(..., local = TRUE)` and `sys.source(...)` without
-`envir = globalenv()` or `.GlobalEnv`. It also recognizes `renv`'s
+and calls that do not put symbols into the global script scope. For `source()`,
+omitted `local`, `FALSE`, an unshadowed `F`, and the unshadowed forms
+`.GlobalEnv` and `globalenv()` are global; `TRUE` and an unshadowed `T` are not.
+For `sys.source()`, only an unshadowed `.GlobalEnv` or `globalenv()` supplied as
+`envir` is global. Shadowed aliases or environment names, and other dynamic
+expressions, are treated conservatively as non-global and are not followed.
+For `chdir`, Raven recognizes `TRUE`/`FALSE` and unshadowed `T`/`F`; shadowed or
+dynamic values are not assumed to enable it. Raven also recognizes `renv`'s
 `source("renv/activate.R")` line and does not follow it, since that file
 activates the project library rather than defining user globals.
 
@@ -102,8 +107,11 @@ Closing `.Rprofile` with unsaved edits reverts the prelude to the on-disk
 content, because those edits have been discarded.
 
 Editing a helper file that `.Rprofile` sources refreshes the prelude when that
-helper changes on disk, either from a save or an external edit. Unsaved edits in
-an open helper reach the prelude on the next save.
+helper changes on disk, either from a save or an external edit. Raven retains
+static source routing even while a referenced helper is missing or unreadable,
+so creating an initially missing helper or deleting and recreating one also
+refreshes the prelude. Unsaved edits in an open helper reach the prelude on the
+next save.
 
 ## Configuration
 

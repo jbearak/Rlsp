@@ -30,14 +30,29 @@ This happens automatically for standard `source()` patterns.
 Raven detects `source()` and `sys.source()` calls:
 - Single and double quotes: `source("path.R")` or `source('path.R')`
 - Named arguments: `source(file = "path.R")`
-- `local = TRUE` and `chdir = TRUE` parameters
+- Static `local` and `chdir` values: `TRUE`/`FALSE` and the unshadowed aliases `T`/`F`
 - `source(system.file("helper.R", package = "pkg"))` — the `system.file()` path is resolved statically: for the package being analyzed it maps to the source-tree `inst/` directory, and for an installed package it is found under the library paths (so a helper sourced this way contributes its definitions like any other `source()` target). Resolution tracks package lifecycle events live: installing or removing the referenced package mid-session, or renaming the workspace package in `DESCRIPTION`, re-resolves these edges without editing the file or restarting
 - **Computed paths** built from statically-known parts are folded to a plain path (issue #638): `file.path("scripts", "helpers.R")` (all parts must fold; `fsep` accepted only as the default `"/"`; any other named argument bails), a `normalizePath(...)` wrapper (peeled syntactically; `winslash`/`mustWork` ignored), and a local variable assigned exactly once at the top level before use — so the common testthat idiom `repo_root <- normalizePath(file.path("..", "..")); source(file.path(repo_root, "scripts/helpers.R"))` resolves. Folding is strict all-or-nothing: any component that isn't statically known (another function call, a reassigned, replacement-modified, removed, or conditionally-assigned variable, a shadowed `file.path`/`normalizePath`, or a string literal containing escape sequences) makes Raven skip the call rather than guess. It is also a purely lexical analysis — `setwd()` calls and symlink resolution that runtime `normalizePath()` would perform are ignored, the same limitation every literal path already has. Folded paths work across dependency edges, scope, missing-file diagnostics, and cmd-click navigation — a click on any string segment of the expression (e.g. `"scripts/helpers.R"` inside `file.path(repo_root, "scripts/helpers.R")`) opens the full joined target, while a click on an identifier segment such as `repo_root` keeps its usual go-to-definition to the variable's assignment
 - Other dynamic paths (e.g. `paste0(...)`, `Sys.getenv(...)`) are skipped gracefully
 
-`sys.source()` defaults to a non-global environment, so its symbols are treated as local and do **not** propagate to the calling file unless you pass `envir = globalenv()` (or `.GlobalEnv`).
+For `source()` scope propagation, omitted `local`, `FALSE`, an unshadowed `F`,
+and the unshadowed global-environment forms `.GlobalEnv` and `globalenv()` use
+global-source behavior. `TRUE` and an unshadowed `T` use local behavior. A
+shadowed alias or global-environment name, or any other dynamic `local`
+expression, is treated conservatively as a non-inheriting destination so an
+uncertain child neither borrows ordinary caller bindings nor lends symbols to
+the caller. The dependency edge is still retained for path diagnostics,
+revalidation, and graph traversal; declarations such as `# raven: var` remain
+visible to the child. For `chdir`, Raven recognizes `TRUE`/`FALSE` and
+unshadowed `T`/`F`; shadowed or dynamic values are not assumed to enable it.
 
-**`local = TRUE` inheritance.** `source("child.R", local = TRUE)` evaluates the child in the environment from which `source()` is called. At the **top level** of a script that environment is the global environment, so the child sees all of the parent's bindings defined before the call — exactly like the default `local = FALSE` — and Raven resolves the parent's earlier definitions in the child accordingly. Only when the `source(local = TRUE)` call sits **inside a function body** does the child bind to that function's frame rather than the globals; in that case the child does not inherit the parent's top-level symbols through the relationship (declared symbols from `# raven: var` directives still flow). The child's *own* new definitions never leak back out to the parent's global scope under `local = TRUE`.
+`sys.source()` remains distinct: it defaults to a non-inheriting environment,
+so its child receives declarations but not ordinary caller bindings, and its
+symbols do **not** propagate to the calling file unless `envir` is the
+unshadowed `globalenv()` or `.GlobalEnv` form. Its `chdir` argument follows the
+same static boolean rules above.
+
+**`local = TRUE` inheritance.** `source("child.R", local = TRUE)` evaluates the child in the environment from which `source()` is called. At the **top level** of a script that environment is the global environment, so the child sees all of the parent's bindings defined before the call — exactly like the default `local = FALSE` — and Raven resolves the parent's earlier definitions in the child accordingly. Only when the `source(local = TRUE)` call sits **inside a function body** does the child bind to that function's frame rather than the globals; in that case the child does not inherit the parent's top-level symbols through the relationship (declared symbols from `# raven: var` directives still flow). The child's *own* new definitions never leak back out to the parent's global scope under `local = TRUE`. This proven-current-frame case is distinct from `local = some_environment`, `local = new.env()`, or another unknown expression: those are non-inheriting even at top level. The same composition applies inside evaluated capture code: for example, `base::bquote(.(source("child.R", local = TRUE)), where = env)` is non-inheriting when `env` cannot be proven to be the caller or global environment, while a proven `.GlobalEnv` `where` promotes the call to global behavior.
 
 **Case-only filename mismatches.** On macOS and Windows, `source("helpers.r")` resolves to an on-disk `helpers.R` (and vice versa): Raven matches the resolved path to the real directory entry's capitalization, so the sourced file's symbols are found regardless of the case used in the `source()` string. On case-sensitive filesystems (typical Linux) `source("helpers.r")` would not find `helpers.R` at runtime — but rather than drop the file from the graph and bury the real problem under a flood of false `undefined-variable` warnings, Raven resolves the single case-insensitive match into the graph anyway and reports the case mismatch once, at the `source()` call. Either way Raven flags it as [`source-path-case-mismatch`](diagnostics.md#source-path-case-mismatch) (information on a case-insensitive filesystem, warning on a case-sensitive one). See [Path Resolution → Case-only mismatches](#case-only-mismatches) for the exact rules (exact match always wins; an ambiguous 2+-match stays unresolved).
 
@@ -200,12 +215,23 @@ sapply(libs, require, character.only = TRUE)
 
 This works for `sapply`, `lapply`, `vapply`, `mapply`, and the purrr forms
 (`map`, `walk`, `map_chr`, etc., bare or `purrr::`-qualified). The package
-vector must be either an inline `c("a","b",...)` of string literals, or a
-same-file variable assigned exactly once via `<-`, `=`, or `assign()` to such
-a literal vector. `character.only = TRUE` must be present (without it, R
-itself would not load the strings as packages). Dynamic constructions such as
-`paste0(...)`, `tolower(x)`, `c(libs1, libs2)`, function-parameter origins,
-or values defined in another file are silently ignored.
+vector must be either an inline non-empty `c("a","b",...)` of string literals,
+or a same-file variable assigned exactly once at the top level to such a vector
+via `<-`/`=` or eligible bare/base-qualified `assign()`. For `assign()`, Raven
+accepts only destinations proven to create the file's top-level binding: the
+default current frame when the call is top-level (`pos` and `envir` omitted),
+`pos = 1` or `1L` with `envir` omitted, or `envir = .GlobalEnv`,
+`globalenv()`, or `base::globalenv()` with `pos` omitted; bare `.GlobalEnv` and
+`globalenv()` must be unshadowed. In each form, `inherits` must be omitted,
+missing, or literal `FALSE` (destination-equivalent to omission for these
+otherwise compatible forms). Supplying both `pos` and `envir`, a dynamic or
+non-global destination, any other `inherits` value, or a nested call cannot
+supply a candidate. Other conditional, reassigned, or removed bindings likewise only invalidate the
+variable. `character.only = TRUE` must be present (without it, R itself would
+not load the strings as packages). Empty vectors (`c()`, `character(0)`),
+dynamic constructions such as `paste0(...)`, `tolower(x)`, or
+`c(libs1, libs2)`, function-parameter origins, and values defined in another
+file are silently ignored.
 
 ### targets::tar_option_set() Loads
 
@@ -234,10 +260,12 @@ Details:
   `tidy_eval`, not `packages`, so positional forms like
   `tar_option_set(TRUE, c("dplyr"))` are deliberately not matched.
 - **Accepted value shapes.** A single string literal
-  (`packages = "dplyr"`), an inline `c("a", "b", ...)` of string literals, or
-  a same-file variable assigned exactly once to such a literal vector (the
-  same rule as apply-family loads). Dynamic values, `character(0)`, and empty
-  `c()` are ignored.
+  (`packages = "dplyr"`), an inline non-empty `c("a", "b", ...)` of string
+  literals, or a same-file variable assigned exactly once at the top level to
+  such a vector (including eligible bare/base-qualified `assign()` with the
+  same global-destination rules as apply-family loads). Nested, conditional,
+  dynamic, non-global, reassigned, or removed bindings, `character(0)`, and
+  empty `c()` are ignored.
 - **Per-literal anchoring.** `tar_option_set()` calls routinely span many
   lines, so each package's missing-package diagnostic is anchored at that
   package's own string literal — a `# nolint` on the literal's line suppresses
@@ -387,7 +415,7 @@ testthat's `test_dir()`/`test_local()` (and testit's `test_dir()`) evaluate help
 - For a file **nested below** the anchor (e.g. `tests/testthat/fixtures/helper.R`), the file's own directory is tried as a compatibility fallback when the anchor-relative resolution misses, so file-relative paths that worked before keep working.
 - Backward directives are unaffected: they always resolve relative to the file's own directory.
 
-Path completion inside a `source()` string in a testthat file offers entries from the anchor directory, matching where the path will actually resolve.
+Path completion inside a `source()` string or forward directive in a testthat/testit file offers entries from the anchor directory. For a file nested below the anchor, it also offers entries from the file's own directory, matching the compatibility fallback above. If both directories contain the same name, Raven shows it once and the anchor entry wins, just as it does during resolution. An explicit or inherited `# raven: cd` suppresses both implicit bases and completion uses only that working directory.
 
 #### Case-only mismatches
 

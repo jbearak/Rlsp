@@ -19,20 +19,13 @@ use tower_lsp::lsp_types::Url;
 pub struct RprofileScan {
     pub symbols: BTreeSet<String>,
     pub attached_packages: BTreeSet<String>,
-    /// Canonicalized paths of files followed out of `.Rprofile` via literal
-    /// `source()` (the `.Rprofile` file itself is NOT included). Used by the
-    /// optional transitive-freshness wiring (Task 12) to rescan when one of
-    /// these helper files is edited. Empty in the single-file harvest.
+    /// Routing paths of accepted literal `source()` targets from `.Rprofile`
+    /// (the `.Rprofile` file itself is NOT included), including targets that are
+    /// currently missing or unreadable. Existing paths are canonicalized;
+    /// missing paths use a canonical parent when possible. Used to rescan on
+    /// edits, later creation, and delete/recreate cycles.
     pub sourced_files: BTreeSet<PathBuf>,
 }
-
-/// Maximum depth of `source()` chains followed out of `.Rprofile`. Mirrors the
-/// cross-file `max_chain_depth` default (64) so a profile that sources a large
-/// helper tree cannot blow up the scan.
-const RPROFILE_MAX_SOURCE_DEPTH: usize = 64;
-/// Maximum number of distinct files visited while following `source()` chains
-/// (cycle + fan-out guard). Far above any real `.Rprofile` helper tree.
-const RPROFILE_MAX_SOURCE_FILES: usize = 1000;
 
 /// Synchronously scan `<workspace_root>/.Rprofile` (never executing it) into a
 /// script-scope prelude. Returns empty when the file is absent or unreadable.
@@ -44,7 +37,7 @@ pub fn scan_workspace_rprofile(workspace_root: &Path) -> RprofileScan {
     let Ok(text) = crate::state::read_source(&rprofile_path) else {
         return RprofileScan::default();
     };
-    scan_rprofile_worklist::<false>(workspace_root, text, None)
+    scan_rprofile_worklist(workspace_root, text, None)
 }
 
 /// Like [`scan_workspace_rprofile`], but skips the root `.Rprofile` and any
@@ -67,7 +60,7 @@ pub fn scan_workspace_rprofile_with_exclusions(
     let Ok(text) = crate::state::read_source(&rprofile_path) else {
         return RprofileScan::default();
     };
-    scan_rprofile_worklist::<true>(workspace_root, text, Some(exclusions))
+    scan_rprofile_worklist(workspace_root, text, Some(exclusions))
 }
 
 /// Like [`scan_workspace_rprofile`], but seeds the scan with the GIVEN root
@@ -80,7 +73,7 @@ pub fn scan_workspace_rprofile_with_root_text(
     workspace_root: &Path,
     root_text: &str,
 ) -> RprofileScan {
-    scan_rprofile_worklist::<false>(workspace_root, root_text.to_string(), None)
+    scan_rprofile_worklist(workspace_root, root_text.to_string(), None)
 }
 
 /// Like [`scan_workspace_rprofile_with_root_text`], but applies
@@ -98,150 +91,65 @@ pub fn scan_workspace_rprofile_with_root_text_and_exclusions(
     if exclusions.is_excluded_path(&rprofile_path) {
         return RprofileScan::default();
     }
-    scan_rprofile_worklist::<true>(workspace_root, root_text.to_string(), Some(exclusions))
+    scan_rprofile_worklist(workspace_root, root_text.to_string(), Some(exclusions))
 }
 
-/// Shared worklist runner: harvest top-level defs + attached packages from the
-/// root `.Rprofile` text (`root_text`), then follow its transitive literal
-/// `source()` targets from disk. Both public entry points differ only in where
-/// the root text comes from (disk vs. in-memory buffer).
-fn scan_rprofile_worklist<const USE_EXCLUSIONS: bool>(
+/// Shared scan runner: harvest top-level defs + attached packages from the root
+/// `.Rprofile` text, then follow its transitive literal `source()` targets from
+/// disk through the package-state static-source closure walker. Both public entry
+/// points differ only in where the root text comes from (disk vs. live buffer).
+fn scan_rprofile_worklist(
     workspace_root: &Path,
     root_text: String,
     exclusions: Option<&crate::config_file::CompiledWorkspaceExclusions>,
 ) -> RprofileScan {
-    let mut scan = RprofileScan::default();
     let rprofile_path = workspace_root.join(".Rprofile");
-    let text = root_text;
     let workspace_url = Url::from_file_path(workspace_root).ok();
     let renv_activate = workspace_root.join("renv").join("activate.R");
-    // Hoist the canonicalization outside the inner loop — computed once instead of N×M times.
-    let canonical_renv_activate = renv_activate
-        .canonicalize()
-        .unwrap_or_else(|_| renv_activate.clone());
-
-    // Worklist of (file_path, file_text, depth). Visited is keyed by the
-    // canonicalized path so cycles and re-sources collapse to one visit.
-    let mut visited: BTreeSet<std::path::PathBuf> = BTreeSet::new();
-    let mut worklist: Vec<(std::path::PathBuf, String, usize)> =
-        vec![(rprofile_path.clone(), text, 0)];
-    visited.insert(rprofile_path.canonicalize().unwrap_or(rprofile_path));
-
-    while let Some((path, text, depth)) = worklist.pop() {
-        harvest_file(&text, &mut scan);
-        if depth >= RPROFILE_MAX_SOURCE_DEPTH || visited.len() >= RPROFILE_MAX_SOURCE_FILES {
-            continue;
-        }
-        // PathContext is invariant for all targets within a single file; build it once.
-        let Some(file_uri) = Url::from_file_path(&path).ok() else {
-            continue;
-        };
-        // DELIBERATE EXCEPTION: `# raven: cd` is intentionally NOT honored here.
-        // `.Rprofile` and its transitively-sourced helpers are resolved relative to
-        // the file's directory with the workspace-root fallback, matching how R sources
-        // the profile from the project root. Honoring `# raven: cd` is skipped because
-        // (a) it is essentially never used in R startup files, and (b) the prelude is
-        // suppressive-only — a mis-resolved source() target merely under-harvests
-        // (a real diagnostic survives), never fabricates one.
-        let Some(ctx) = crate::cross_file::path_resolve::PathContext::from_metadata(
-            &file_uri,
-            &crate::cross_file::types::CrossFileMetadata::default(),
-            workspace_url.as_ref(),
-        ) else {
-            continue;
-        };
-        for target in static_source_targets(&text) {
-            let Some(resolved) =
-                crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
-                    &target, &ctx,
-                )
-            else {
-                continue;
-            };
-            if USE_EXCLUSIONS && exclusions.is_some_and(|e| e.is_excluded_path(&resolved)) {
-                continue;
-            }
-            // Skip renv's activate.R (defines internal machinery, no user globals).
-            let canonical_resolved = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
-            if canonical_resolved == canonical_renv_activate || resolved == renv_activate {
-                continue;
-            }
-            if !visited.insert(canonical_resolved.clone()) {
-                continue;
-            }
-            if visited.len() >= RPROFILE_MAX_SOURCE_FILES {
-                break;
-            }
-            if let Ok(sourced_text) = crate::state::read_source(&resolved) {
-                // Record the canonical path so a later edit to this helper can
-                // trigger a prelude rescan (Task 12 transitive freshness).
-                scan.sourced_files.insert(canonical_resolved.clone());
-                worklist.push((resolved, sourced_text, depth + 1));
-            }
-        }
-    }
-    scan
-}
-
-/// Harvest top-level defs + attached packages from one file's text into `scan`.
-fn harvest_file(text: &str, scan: &mut RprofileScan) {
-    for def in crate::roxygen::extract_top_level_defs(text) {
-        scan.symbols.insert(def);
-    }
-    for pkg in crate::cross_file::source_detect::extract_attached_packages(text) {
-        scan.attached_packages.insert(pkg);
-    }
-    // A `devtools::load_all()` / `pkgload::load_all()` / bare `load_all()` call
-    // in the profile (or a transitively-sourced helper) attaches the package
-    // under development. Model it like an attached package via the load_all
-    // sentinel; the package library's local-dev overlay then resolves the
-    // package's own internal symbols (the `rprofile_prelude_applies` gate still
-    // withholds it in R/, tests/, and built-doc dirs in package mode).
-    if crate::cross_file::scope::text_calls_dev_load_all(text) {
-        scan.attached_packages
-            .insert(crate::package_library::LOAD_ALL_SENTINEL.to_string());
-    }
-}
-
-/// Statically-known `source()` target paths in `text` that contribute to the
-/// GLOBAL / script scope: literal paths plus computed paths folded by
-/// `cross_file::static_path` (`file.path()` of literals, `normalizePath()`
-/// wrappers, single-assignment variables — issue #638). Following folded
-/// computed profiles is intentional: folding is strict all-or-nothing over
-/// unconditional top-level bindings, so a folded path is the path R computes
-/// (modulo the documented `setwd()`/symlink blindness shared by all of
-/// Raven's static path analysis). Excludes:
-/// - `# raven:` directives (`is_directive`);
-/// - calls that do not inherit symbols — `source(..., local = TRUE)` and
-///   `sys.source(...)` without `envir = globalenv()` (`!inherits_symbols()`);
-/// - calls lexically inside a function body (`is_function_scoped`) — they only
-///   run when that function is invoked, so they are not load-time globals;
-/// - paths that are neither literal nor foldable (`detect_source_calls`
-///   yields an empty `path` for those).
-///
-/// `detect_source_calls` walks the WHOLE tree (not just top level), so these
-/// filters are load-bearing — without them a `.Rprofile` like
-/// `f <- function() source("dev.R")` would wrongly pull `dev.R` into the
-/// suppressive prelude.
-fn static_source_targets(text: &str) -> Vec<String> {
-    use tree_sitter::Parser;
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_r::LANGUAGE.into())
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(text, None) else {
-        return Vec::new();
+    let mut policy = RprofileClosurePolicy {
+        exclusions,
+        renv_activate: super::preamble::canonicalize_for_routing(&renv_activate),
+        scan: RprofileScan::default(),
     };
-    crate::cross_file::source_detect::detect_source_calls(&tree, text)
-        .into_iter()
-        .filter(|s| {
-            !s.is_directive && s.inherits_symbols() && !s.is_function_scoped && !s.path.is_empty()
-        })
-        .map(|s| s.path)
-        .collect()
+    let closure = super::walk_static_source_closure(
+        &rprofile_path,
+        root_text,
+        workspace_url.as_ref(),
+        &mut policy,
+    );
+    policy.scan.sourced_files = closure.sourced_files;
+    policy.scan
+}
+
+struct RprofileClosurePolicy<'a> {
+    exclusions: Option<&'a crate::config_file::CompiledWorkspaceExclusions>,
+    renv_activate: PathBuf,
+    scan: RprofileScan,
+}
+
+impl super::StaticSourceClosurePolicy for RprofileClosurePolicy<'_> {
+    fn harvest_root(&self) -> bool {
+        true
+    }
+
+    fn accept_target(&self, resolved: &Path, routing_path: &Path) -> bool {
+        !self
+            .exclusions
+            .is_some_and(|exclusions| exclusions.is_excluded_path(resolved))
+            && routing_path != self.renv_activate
+    }
+
+    fn read_source(&mut self, resolved: &Path) -> Option<String> {
+        crate::state::read_source(resolved).ok()
+    }
+
+    fn harvest(&mut self, facts: &crate::cross_file::source_detect::StaticScriptFacts) {
+        super::merge_static_script_prelude(
+            facts,
+            &mut self.scan.symbols,
+            &mut self.scan.attached_packages,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +201,63 @@ mod tests {
     }
 
     #[test]
+    fn unified_facts_honor_capture_removal_and_reachable_attachment() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            r#"x <- 1
+bquote(expr = .(library(dplyr)), where = { rm(x); parent.frame() })
+"#,
+        )
+        .unwrap();
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(!scan.symbols.contains("x"), "got {:?}", scan.symbols);
+        assert!(
+            scan.attached_packages.contains("dplyr"),
+            "runtime-reachable attachment must survive final prelude harvest: {:?}",
+            scan.attached_packages
+        );
+    }
+
+    #[test]
+    fn bquote_function_syntax_facts_follow_runtime_scope() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "child_bound <- 1\n").unwrap();
+        fs::write(tmp.path().join("outer.R"), "outer_sourced <- 1\n").unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            r#"
+                bquote(function() .({
+                    top_bound <- 1
+                    removed <- 1
+                    rm(removed)
+                    source("child.R")
+                    library(dplyr)
+                }))
+                outer <- function() {
+                    bquote(function() .({
+                        outer_only <- 1
+                        source("outer.R")
+                        library(tidyr)
+                    }))
+                }
+                ordinary <- function() ordinary_only <- 1
+            "#,
+        )
+        .unwrap();
+
+        let scan = scan_workspace_rprofile(tmp.path());
+        for name in ["top_bound", "child_bound", "outer", "ordinary"] {
+            assert!(scan.symbols.contains(name), "{name}: {:?}", scan.symbols);
+        }
+        for name in ["removed", "outer_only", "outer_sourced", "ordinary_only"] {
+            assert!(!scan.symbols.contains(name), "{name}: {:?}", scan.symbols);
+        }
+        assert!(scan.attached_packages.contains("dplyr"));
+        assert!(!scan.attached_packages.contains("tidyr"));
+    }
+
+    #[test]
     fn function_body_assignments_are_not_harvested() {
         let tmp = TempDir::new().unwrap();
         fs::write(
@@ -307,6 +272,30 @@ mod tests {
             "function-local must not leak: {:?}",
             scan.symbols
         );
+    }
+
+    #[test]
+    fn deferred_body_assignments_are_not_harvested() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            r#"
+                top_level <- 1
+                shiny::reactive({ reactive_local <- 2 })
+                foreach::foreach(i = 1:3) %do% { foreach_local <- i }
+            "#,
+        )
+        .unwrap();
+
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(scan.symbols.contains("top_level"), "got {:?}", scan.symbols);
+        for name in ["reactive_local", "foreach_local"] {
+            assert!(
+                !scan.symbols.contains(name),
+                "deferred local {name} must not leak: {:?}",
+                scan.symbols
+            );
+        }
     }
 
     #[test]
@@ -394,6 +383,49 @@ mod tests {
             scan.symbols.contains("r_bind"),
             "transitive source() helpers still resolve from disk: {:?}",
             scan.symbols
+        );
+    }
+
+    #[test]
+    fn missing_source_target_stays_routed_and_is_harvested_after_creation() {
+        let tmp = TempDir::new().unwrap();
+        let helper = tmp.path().join("scripts/later.R");
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "source(\"scripts/later.R\")\n",
+        )
+        .unwrap();
+
+        let initial = scan_workspace_rprofile(tmp.path());
+        let routed = super::super::preamble::canonicalize_for_routing(&helper);
+        assert!(initial.sourced_files.contains(&routed));
+        assert!(!initial.symbols.contains("created_def"));
+
+        fs::write(&helper, "created_def <- 1\n").unwrap();
+        let created = scan_workspace_rprofile(tmp.path());
+        assert!(created.sourced_files.contains(&routed));
+        assert!(created.symbols.contains("created_def"));
+    }
+
+    #[test]
+    fn missing_transitive_source_target_stays_routed() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("scripts/parent.R");
+        let missing = tmp.path().join("scripts/missing.R");
+        fs::create_dir_all(parent.parent().unwrap()).unwrap();
+        fs::write(&parent, "source(\"missing.R\")\nparent_def <- 1\n").unwrap();
+        fs::write(
+            tmp.path().join(".Rprofile"),
+            "source(\"scripts/parent.R\")\n",
+        )
+        .unwrap();
+
+        let scan = scan_workspace_rprofile(tmp.path());
+        assert!(scan.symbols.contains("parent_def"));
+        assert!(
+            scan.sourced_files
+                .contains(&super::super::preamble::canonicalize_for_routing(&missing))
         );
     }
 

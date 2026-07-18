@@ -832,6 +832,15 @@ pub struct WorldState {
     pub libpath_watcher_handle:
         Option<std::sync::Arc<super::libpath_watcher::LibpathWatcherHandle>>,
     pub package_library_ready: bool,
+    /// ABA-safe ownership token for detached full-workspace scans.
+    ///
+    /// Closed-file writers and scan-affecting configuration changes advance
+    /// this before their state can race a scan. A scan claims the exact token
+    /// under the final write lock before installing its complete candidate.
+    workspace_scan_generation: u64,
+    /// Monotonic identity for graph/open-metadata mutations that do not
+    /// necessarily change document text or either workspace-index version.
+    workspace_graph_authority_generation: u64,
     /// Whether the background workspace scan has completed and the dependency
     /// graph has been populated from workspace entries. In `Auto` backward
     /// dependency mode, undefined variable diagnostics are deferred for files
@@ -842,6 +851,14 @@ pub struct WorldState {
     /// Inputs to the package-mode `derive` function. Updated by event handlers
     /// before calling `apply_package_event`. See package_state::PackageInputs.
     pub package_inputs: crate::package_state::PackageInputs,
+    /// Operational freshness identity for detached package-input seeds.
+    ///
+    /// Kept separate from semantic `package_state` so workspace-index
+    /// application or derivation cannot reset freshness and make an older seed
+    /// current again.
+    pub(crate) package_input_lifecycle: crate::package_state::PackageInputLifecycle,
+    /// Coalescing lifecycle for the one delayed package-seed convergence task.
+    pub(crate) package_seed_retry: crate::package_state::PackageSeedRetryLifecycle,
 }
 
 /// A snapshot of the lifecycle state a diagnostics run was triggered
@@ -980,8 +997,51 @@ impl WorldState {
         self.package_config_generation = self.package_config_generation.wrapping_add(1);
     }
 
+    pub(crate) fn workspace_scan_generation(&self) -> u64 {
+        self.workspace_scan_generation
+    }
+
+    pub(crate) fn workspace_graph_authority_generation(&self) -> u64 {
+        self.workspace_graph_authority_generation
+    }
+
+    pub(crate) fn advance_workspace_graph_authority_generation(&mut self) {
+        self.workspace_graph_authority_generation =
+            self.workspace_graph_authority_generation.wrapping_add(1);
+    }
+
+    /// Retire detached scans captured before a closed-file or scan-input write.
+    pub(crate) fn advance_workspace_scan_generation(&mut self) {
+        self.workspace_scan_generation = self.workspace_scan_generation.wrapping_add(1);
+    }
+
+    /// Atomically claim one scan generation. Advancing on success prevents two
+    /// peers captured from the same state from both installing.
+    pub(crate) fn claim_workspace_scan_generation(&mut self, expected: u64) -> bool {
+        if self.workspace_scan_generation != expected {
+            return false;
+        }
+        self.advance_workspace_scan_generation();
+        true
+    }
+
+    /// Current operational generation of raw package inputs.
+    pub(crate) fn package_input_generation(&self) -> u64 {
+        self.package_input_lifecycle.generation()
+    }
+
+    /// Record one raw package-input write or lifecycle/configuration transition.
+    ///
+    /// Call at the same lock-protected seam that mutates the input. Value-equal
+    /// writes still advance: a detached seed must not infer freshness from
+    /// semantic equality.
+    pub(crate) fn record_package_input_mutation(&mut self) {
+        self.package_input_lifecycle.advance();
+    }
+
     /// Apply a `PackageInputDelta` produced by an event handler.
-    /// Caller has already mutated `self.package_inputs` to reflect the event.
+    /// Caller has already mutated `self.package_inputs` to reflect the event and
+    /// recorded that mutation through `record_package_input_mutation`.
     /// Recomputes `package_state` as a pure function of inputs.
     pub fn apply_package_event(&mut self, delta: &crate::package_state::PackageInputDelta) {
         let new_package_state = crate::package_state::derive_package_state(
@@ -1152,7 +1212,7 @@ impl WorldState {
     /// and cap it here, so the raised #473 default (50_000) cannot drive a walk
     /// to millions of nodes when many files are open. Far above any real
     /// workspace's file count, so it never trims coverage in practice.
-    const MULTI_SEED_VISITED_CEILING: usize = 200_000;
+    pub(crate) const MULTI_SEED_VISITED_CEILING: usize = 200_000;
 
     /// Creates a new WorldState initialized with default cross-file configuration and empty caches.
     ///
@@ -1261,9 +1321,13 @@ impl WorldState {
             watched_file_resync_generations: HashMap::new(),
             libpath_watcher_handle: None,
             package_library_ready: false,
+            workspace_scan_generation: 0,
+            workspace_graph_authority_generation: 0,
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
             package_inputs: crate::package_state::PackageInputs::default(),
+            package_input_lifecycle: crate::package_state::PackageInputLifecycle::default(),
+            package_seed_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
         }
     }
 
@@ -1321,6 +1385,13 @@ impl WorldState {
     pub(crate) fn retire_all_diagnostic_lifecycles(&self) {
         self.cross_file_revalidation.cancel_all();
         self.diagnostics_gate.clear_all();
+    }
+
+    /// Cancel the delayed package-seed convergence task, if one is pending.
+    /// Called during server shutdown so a sleeping retry cannot resume disk I/O
+    /// after the shutdown response.
+    pub(crate) fn cancel_package_seed_retry(&self) {
+        self.package_seed_retry.cancel();
     }
 
     fn open_alias_candidates_for_uri(&self, uri: &Url) -> Vec<Url> {
@@ -1982,18 +2053,16 @@ impl WorldState {
 
     /// Apply pre-scanned workspace index results (for non-blocking initialization).
     ///
-    /// Package-mode state is *not* set from parameters: this function
-    /// resets `self.package_state` to its default (neutral) value, and
-    /// the caller is expected to follow with
-    /// `apply_package_event(PackageInputDelta::Initial)` — which in turn
-    /// derives `workspace` / `namespace_model` / `r_file_facts` /
-    /// `scope_contribution` from `self.package_inputs` via
-    /// `derive_package_state`. This keeps package derivation single-sourced.
+    /// Package-mode state is not set from index parameters. The existing
+    /// semantic package state remains live until the caller atomically installs
+    /// a fresh package-input seed and derives its replacement. This matters when
+    /// a detached seed is invalidated by a concurrent watcher update: index
+    /// application must not leave package semantics temporarily reset or empty
+    /// while the seed recomputes off-lock.
     ///
-    /// Tests and benchmarks that only exercise cross-file / workspace
-    /// scanning behavior (and don't care about package state) can rely on
-    /// the post-reset `PackageState::default()` — they don't need to call
-    /// `apply_package_event` themselves.
+    /// Package-input freshness is owned separately by
+    /// `package_input_lifecycle`, so applying an index neither advances nor
+    /// resets the generation captured by a seed computed for this application.
     ///
     /// **Validates: Requirements 11.1, 13.1**
     pub fn apply_workspace_index(
@@ -2003,14 +2072,6 @@ impl WorldState {
         new_index_entries: HashMap<Url, crate::workspace_index::IndexEntry>,
     ) {
         self.workspace_index = index;
-
-        // Atomic reset of package state. Per-mode transitions (e.g. toggling
-        // packageMode) must never leave stale `r_file_facts` or
-        // `scope_contribution` from a prior mode, so we always start from a
-        // neutral default here. The scan-completion caller follows this
-        // with `apply_package_event`, which repopulates every field from
-        // `package_inputs` via `derive_package_state`.
-        self.package_state = crate::package_state::PackageState::default();
 
         // Populate cross-file workspace index (legacy)
         for (uri, entry) in cross_file_entries {
@@ -2050,6 +2111,49 @@ impl WorldState {
         // Now that the graph reflects the workspace, refresh the document_store
         // pin set so any file opened before the scan completes picks up its
         // neighborhood.
+        self.recompute_open_neighborhood_pins();
+    }
+
+    /// Install a complete workspace-scan candidate whose graph was derived
+    /// off-lock from the exact post-commit unified entry set.
+    ///
+    /// Callers validate every captured authority identity and claim the scan
+    /// generation under the surrounding write lock immediately before calling.
+    /// This method performs only in-memory replacement.
+    pub(crate) fn apply_prepared_workspace_index(
+        &mut self,
+        index: HashMap<Url, Document>,
+        cross_file_entries: HashMap<Url, crate::cross_file::workspace_index::IndexEntry>,
+        new_index_entries: Vec<(Url, crate::workspace_index::IndexEntry)>,
+        graph: DependencyGraph,
+        open_metadata: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+        prepared_pins: HashSet<Url>,
+    ) {
+        let old_scan_uris: Vec<Url> = self.workspace_index.keys().cloned().collect();
+        for uri in old_scan_uris {
+            self.cross_file_workspace_index.invalidate(&uri);
+        }
+        self.workspace_index = index;
+        self.cross_file_workspace_index
+            .set_pinned_uris(prepared_pins.clone());
+        self.document_store.set_pinned_uris(prepared_pins.clone());
+        for (uri, entry) in cross_file_entries {
+            self.cross_file_workspace_index.insert(uri, entry);
+        }
+
+        for uri in self.workspace_index_new.uris() {
+            self.workspace_index_new.invalidate(&uri);
+        }
+        self.workspace_index_new.set_pinned_uris(prepared_pins);
+        for (uri, entry) in new_index_entries {
+            self.workspace_index_new.insert(uri, entry);
+        }
+
+        self.cross_file_graph = graph;
+        for (uri, metadata) in open_metadata {
+            self.document_store.replace_metadata(&uri, metadata);
+        }
+        self.workspace_scan_complete = true;
         self.recompute_open_neighborhood_pins();
     }
 
@@ -2340,6 +2444,9 @@ impl WorldState {
         // Drop external entries the changed resolutions no longer point at.
         self.drop_orphaned_external_entries(old_targets);
 
+        if !changed_uris.is_empty() {
+            self.advance_workspace_graph_authority_generation();
+        }
         changed_uris
     }
 
@@ -2516,6 +2623,432 @@ impl WorldState {
             self.workspace_index_new.insert(uri, entry);
         }
     }
+}
+
+/// Authoritative open-buffer input layered over a workspace-scan candidate.
+#[derive(Clone)]
+pub(crate) struct WorkspaceGraphOverlay {
+    pub(crate) uri: Url,
+    pub(crate) content: Rope,
+    pub(crate) chunk_kind: ChunkKind,
+    /// Normally supplied by `DocumentStore`; tests and compatibility callers
+    /// may omit it, in which case derivation reparses the Rope off-lock.
+    pub(crate) metadata: Option<Arc<crate::cross_file::CrossFileMetadata>>,
+    pub(crate) graph_roots: Vec<Url>,
+    pub(crate) excluded: bool,
+}
+
+/// Owned inputs required to derive a complete graph off the `WorldState` lock.
+pub(crate) struct WorkspaceGraphDerivationContext {
+    pub(crate) workspace_root: Option<Url>,
+    pub(crate) max_depth: usize,
+    pub(crate) exclusions: crate::config_file::CompiledWorkspaceExclusions,
+    pub(crate) system_file_workspace_name: Option<String>,
+    pub(crate) system_file_workspace_root: Option<PathBuf>,
+    pub(crate) system_file_library_paths: Vec<PathBuf>,
+}
+
+/// Recompute closed-file inherited working directories from immutable metadata.
+///
+/// Each round starts from `base_closed_metadata`, so a disk-derived inherited
+/// directory cannot survive merely because an authoritative open parent removed
+/// or rerouted the source edge that used to reach it. Forward proposals use the
+/// previous mixed candidate and converge through the outer bounded fixpoint.
+fn derive_closed_descendant_metadata(
+    base_closed_metadata: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    entries: &mut HashMap<Url, crate::workspace_index::IndexEntry>,
+    open_metadata: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+) -> bool {
+    let mut closed_uris: Vec<_> = base_closed_metadata.keys().cloned().collect();
+    closed_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    let mut next = HashMap::with_capacity(base_closed_metadata.len());
+    for uri in closed_uris {
+        let mut metadata = (**base_closed_metadata
+            .get(&uri)
+            .expect("URI came from base closed metadata"))
+        .clone();
+        metadata.inherited_working_directory = None;
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut metadata,
+            &uri,
+            workspace_root,
+            |parent_uri| {
+                open_metadata
+                    .get(parent_uri)
+                    .cloned()
+                    .or_else(|| entries.get(parent_uri).map(|entry| entry.metadata.clone()))
+            },
+            max_depth,
+        );
+        next.insert(uri, Arc::new(metadata));
+    }
+
+    let mut parents: Vec<_> = entries
+        .iter()
+        .filter(|(uri, _)| !open_metadata.contains_key(*uri))
+        .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+        .chain(
+            open_metadata
+                .iter()
+                .map(|(uri, metadata)| (uri.clone(), metadata.clone())),
+        )
+        .collect();
+    parents.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+    let mut forward_proposals = HashMap::new();
+    for (parent_uri, parent_metadata) in parents {
+        let Some(path_context) = crate::cross_file::path_resolve::PathContext::from_metadata(
+            &parent_uri,
+            &parent_metadata,
+            workspace_root,
+        ) else {
+            continue;
+        };
+        for source in &parent_metadata.sources {
+            let resolved = source
+                .resolved_uri
+                .as_ref()
+                .and_then(|uri| uri.to_file_path().ok())
+                .or_else(|| {
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        &path_context,
+                    )
+                });
+            let Some(resolved) = resolved else { continue };
+            let Ok(child_uri) = Url::from_file_path(&resolved) else {
+                continue;
+            };
+            let Some(child) = next.get(&child_uri) else {
+                continue;
+            };
+            if child.working_directory.is_some()
+                || child.inherited_working_directory.is_some()
+                || forward_proposals.contains_key(&child_uri)
+            {
+                continue;
+            }
+            if let Some(inherited) =
+                path_context.forward_child_inherited_wd(&resolved, source.chdir)
+            {
+                forward_proposals.insert(child_uri, inherited.to_string_lossy().to_string());
+            }
+        }
+    }
+    for (uri, inherited) in forward_proposals {
+        if let Some(metadata) = next.get_mut(&uri) {
+            Arc::make_mut(metadata).inherited_working_directory = Some(inherited);
+        }
+    }
+
+    let changed = next.iter().any(|(uri, metadata)| {
+        entries.get(uri).is_none_or(|entry| {
+            entry.metadata.inherited_working_directory.as_deref()
+                != metadata.inherited_working_directory.as_deref()
+        })
+    });
+    for (uri, metadata) in next {
+        if let Some(entry) = entries.get_mut(&uri) {
+            entry.metadata = metadata;
+        }
+    }
+    changed
+}
+
+/// Recompute open-buffer inherited working directories against the current
+/// mixed open/closed candidate.
+///
+/// Backward directives win when they produce a context. Forward proposals are
+/// deterministic (URI-sorted parent order) and cover open children that have no
+/// backward directive. Re-running this together with
+/// [`derive_closed_descendant_metadata`] reaches alternating
+/// open → closed → open chains without consulting live `WorldState`.
+fn derive_open_candidate_metadata(
+    base_open_metadata: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    current_open_metadata: &HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    entries: &HashMap<Url, crate::workspace_index::IndexEntry>,
+    workspace_root: Option<&Url>,
+    max_depth: usize,
+) -> (
+    HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    bool,
+) {
+    let mut open_uris: Vec<_> = base_open_metadata.keys().cloned().collect();
+    open_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    let mut next = HashMap::with_capacity(base_open_metadata.len());
+    for uri in open_uris {
+        let mut metadata = (**base_open_metadata
+            .get(&uri)
+            .expect("URI came from base open metadata"))
+        .clone();
+        metadata.inherited_working_directory = None;
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut metadata,
+            &uri,
+            workspace_root,
+            |parent_uri| {
+                current_open_metadata
+                    .get(parent_uri)
+                    .cloned()
+                    .or_else(|| entries.get(parent_uri).map(|entry| entry.metadata.clone()))
+            },
+            max_depth,
+        );
+        next.insert(uri, Arc::new(metadata));
+    }
+
+    let mut parents: Vec<_> = entries
+        .iter()
+        .filter(|(uri, _)| !current_open_metadata.contains_key(*uri))
+        .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+        .chain(
+            next.iter()
+                .map(|(uri, metadata)| (uri.clone(), metadata.clone())),
+        )
+        .collect();
+    parents.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+    let mut forward_proposals = HashMap::new();
+    for (parent_uri, parent_metadata) in parents {
+        let Some(path_context) = crate::cross_file::path_resolve::PathContext::from_metadata(
+            &parent_uri,
+            &parent_metadata,
+            workspace_root,
+        ) else {
+            continue;
+        };
+        for source in &parent_metadata.sources {
+            let resolved = source
+                .resolved_uri
+                .as_ref()
+                .and_then(|uri| uri.to_file_path().ok())
+                .or_else(|| {
+                    crate::cross_file::path_resolve::resolve_path_with_workspace_fallback(
+                        &source.path,
+                        &path_context,
+                    )
+                });
+            let Some(resolved) = resolved else { continue };
+            let Ok(child_uri) = Url::from_file_path(&resolved) else {
+                continue;
+            };
+            let Some(child) = next.get(&child_uri) else {
+                continue;
+            };
+            if child.working_directory.is_some()
+                || child.inherited_working_directory.is_some()
+                || forward_proposals.contains_key(&child_uri)
+            {
+                continue;
+            }
+            if let Some(inherited) =
+                path_context.forward_child_inherited_wd(&resolved, source.chdir)
+            {
+                forward_proposals.insert(child_uri, inherited.to_string_lossy().to_string());
+            }
+        }
+    }
+    for (uri, inherited) in forward_proposals {
+        if let Some(metadata) = next.get_mut(&uri) {
+            Arc::make_mut(metadata).inherited_working_directory = Some(inherited);
+        }
+    }
+
+    let changed = next.iter().any(|(uri, metadata)| {
+        current_open_metadata.get(uri).is_none_or(|previous| {
+            previous.inherited_working_directory != metadata.inherited_working_directory
+        })
+    });
+    (next, changed)
+}
+
+/// Derive a deterministic complete graph from closed entries plus open overlays.
+///
+/// This function may resolve filesystem paths and therefore must run off any
+/// shared `WorldState` lock.
+pub(crate) fn derive_workspace_dependency_graph(
+    entries: &mut HashMap<Url, crate::workspace_index::IndexEntry>,
+    graph_roots: Option<&HashSet<Url>>,
+    open_overlays: &[WorkspaceGraphOverlay],
+    context: &WorkspaceGraphDerivationContext,
+) -> (
+    DependencyGraph,
+    HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+) {
+    let workspace_root = context.workspace_root.as_ref();
+    let base_open_metadata: HashMap<_, _> = open_overlays
+        .iter()
+        .map(|open| {
+            let metadata = open.metadata.clone().unwrap_or_else(|| {
+                let raw = open.content.to_string();
+                let analysis = crate::cross_file::analysis_text_for_kind(open.chunk_kind, &raw);
+                Arc::new(crate::cross_file::extract_metadata(&analysis))
+            });
+            (open.uri.clone(), metadata)
+        })
+        .collect();
+    let mut base_open_metadata = base_open_metadata;
+    for metadata in base_open_metadata.values_mut() {
+        if metadata
+            .sources
+            .iter()
+            .any(|source| source.system_file.is_some())
+        {
+            crate::cross_file::resolve_system_file_sources(
+                Arc::make_mut(metadata),
+                context.system_file_workspace_name.as_deref(),
+                context.system_file_workspace_root.as_deref(),
+                &context.system_file_library_paths,
+            );
+        }
+    }
+
+    for entry in entries.values_mut() {
+        if entry
+            .metadata
+            .sources
+            .iter()
+            .any(|source| source.system_file.is_some())
+        {
+            crate::cross_file::resolve_system_file_sources(
+                Arc::make_mut(&mut entry.metadata),
+                context.system_file_workspace_name.as_deref(),
+                context.system_file_workspace_root.as_deref(),
+                &context.system_file_library_paths,
+            );
+        }
+    }
+    let mut base_closed_metadata: HashMap<_, _> = entries
+        .iter()
+        .map(|(uri, entry)| (uri.clone(), entry.metadata.clone()))
+        .collect();
+    for metadata in base_closed_metadata.values_mut() {
+        Arc::make_mut(metadata).inherited_working_directory = None;
+    }
+    for (uri, metadata) in &base_closed_metadata {
+        if let Some(entry) = entries.get_mut(uri) {
+            entry.metadata = metadata.clone();
+        }
+    }
+    let mut open_metadata = base_open_metadata.clone();
+    for metadata in open_metadata.values_mut() {
+        Arc::make_mut(metadata).inherited_working_directory = None;
+    }
+    for _ in 0..context.max_depth.max(1) {
+        let closed_changed = derive_closed_descendant_metadata(
+            &base_closed_metadata,
+            entries,
+            &open_metadata,
+            workspace_root,
+            context.max_depth,
+        );
+        let (next_open_metadata, open_changed) = derive_open_candidate_metadata(
+            &base_open_metadata,
+            &open_metadata,
+            entries,
+            workspace_root,
+            context.max_depth,
+        );
+        open_metadata = next_open_metadata;
+        if !closed_changed && !open_changed {
+            break;
+        }
+    }
+
+    let mut content: HashMap<Url, String> = entries
+        .iter()
+        .map(|(uri, entry)| (uri.clone(), entry.contents.to_string()))
+        .collect();
+    for open in open_overlays {
+        let open_content = open.content.to_string();
+        content.insert(open.uri.clone(), open_content.clone());
+        for root in &open.graph_roots {
+            content.insert(root.clone(), open_content.clone());
+        }
+    }
+
+    let mut graph = DependencyGraph::new();
+    let mut closed_uris: Vec<_> = entries.keys().cloned().collect();
+    closed_uris.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    for uri in closed_uris {
+        if graph_roots.is_some_and(|roots| !roots.contains(&uri)) {
+            continue;
+        }
+        let Some(entry) = entries.get(&uri) else {
+            continue;
+        };
+        let graph_metadata = WorldState::metadata_for_dependency_graph_with_exclusions(
+            &context.exclusions,
+            &uri,
+            entry.metadata.as_ref(),
+            workspace_root,
+        );
+        graph.update_file(
+            &uri,
+            graph_metadata.as_ref(),
+            workspace_root,
+            |parent_uri| content.get(parent_uri).cloned(),
+        );
+    }
+
+    let metadata_lookup = |uri: &Url| {
+        open_metadata
+            .get(uri)
+            .cloned()
+            .or_else(|| entries.get(uri).map(|entry| entry.metadata.clone()))
+    };
+    let mut open_roots = Vec::new();
+    for open in open_overlays {
+        for root in &open.graph_roots {
+            open_roots.push((root.clone(), open));
+        }
+    }
+    open_roots.sort_unstable_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+    for (root, open) in open_roots {
+        let mut metadata = open_metadata
+            .get(&open.uri)
+            .map(|value| (**value).clone())
+            .expect("open metadata is derived above")
+            .clone();
+        if root != open.uri {
+            metadata.inherited_working_directory = None;
+            crate::cross_file::enrich_metadata_with_inherited_wd(
+                &mut metadata,
+                &root,
+                workspace_root,
+                metadata_lookup,
+                context.max_depth,
+            );
+        }
+        if metadata
+            .sources
+            .iter()
+            .any(|source| source.system_file.is_some())
+        {
+            crate::cross_file::resolve_system_file_sources(
+                &mut metadata,
+                context.system_file_workspace_name.as_deref(),
+                context.system_file_workspace_root.as_deref(),
+                &context.system_file_library_paths,
+            );
+        }
+        let graph_metadata = WorldState::metadata_for_dependency_graph_with_exclusions(
+            &context.exclusions,
+            &root,
+            &metadata,
+            workspace_root,
+        );
+        graph.update_file(
+            &root,
+            graph_metadata.as_ref(),
+            workspace_root,
+            |parent_uri| content.get(parent_uri).cloned(),
+        );
+        if open.excluded {
+            graph.make_forward_edges_non_lending(&root);
+        }
+    }
+    (graph, open_metadata)
 }
 
 /// Scan workspace folders for R files without holding any locks (Requirement 13a)
@@ -2790,16 +3323,11 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, SourceReadE
         .map_err(|_| SourceReadError::InvalidEncoding { offset: 0, byte: 0 })
 }
 
-/// Process a single file: read, parse, compute metadata and artifacts.
-/// Returns `None` if the file can't be read or converted to a URI.
-fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
-    let text = read_source(path).ok()?;
-    let uri = Url::from_file_path(path).ok()?;
-    let metadata_result = fs::metadata(path).ok()?;
-
-    log::trace!("Scanning file: {}", uri);
-    let doc = Document::new_with_uri(&text, None, &uri);
-
+fn processed_workspace_document(
+    uri: Url,
+    doc: Document,
+    snapshot: crate::cross_file::file_cache::FileSnapshot,
+) -> ProcessedFile {
     // Pair `doc.tree` with the analysis text it was parsed from (masked for
     // Rmd/Quarto, raw otherwise) for both metadata extraction and artifact
     // computation, so byte offsets align (#343). The scan currently never sees
@@ -2823,8 +3351,6 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
         crate::cross_file::scope::ScopeArtifacts::default()
     });
 
-    let snapshot =
-        crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata_result, &text);
     let cross_file_meta = Arc::new(cross_file_meta);
 
     let cross_file_entry = crate::cross_file::workspace_index::IndexEntry {
@@ -2844,12 +3370,58 @@ fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
         indexed_at_version: 0,
     };
 
-    Some(ProcessedFile {
+    ProcessedFile {
         uri,
         document: doc,
         cross_file_entry,
         new_index_entry,
-    })
+    }
+}
+
+/// Process a single file: read, parse, compute metadata and artifacts.
+/// Returns `None` if the file can't be read or converted to a URI.
+fn process_workspace_file(path: &Path) -> Option<ProcessedFile> {
+    let text = read_source(path).ok()?;
+    let uri = Url::from_file_path(path).ok()?;
+    let metadata_result = fs::metadata(path).ok()?;
+
+    log::trace!("Scanning file: {}", uri);
+    let doc = Document::new_with_uri(&text, None, &uri);
+    let snapshot =
+        crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata_result, &text);
+    Some(processed_workspace_document(uri, doc, snapshot))
+}
+
+/// Reparse scanned files whose last editor language supplied a chunk
+/// classification different from their path.
+///
+/// A detached scan reads disk before it can snapshot live `WorldState`.
+/// Applying these captured overrides to the caller-owned result keeps parsing
+/// and metadata derivation off-lock while preserving the closed-file language
+/// signal. Final apply validates the workspace-index version and open-document
+/// identities that protect this override snapshot from concurrent changes.
+pub(crate) fn apply_workspace_scan_chunk_overrides(
+    result: &mut WorkspaceScanResult,
+    overrides: &HashMap<Url, ChunkKind>,
+) {
+    let (documents, legacy_entries, new_entries) = result;
+    for (uri, chunk_kind) in overrides {
+        let Some(document) = documents.get(uri) else {
+            continue;
+        };
+        if document.chunk_kind == *chunk_kind {
+            continue;
+        }
+        let Some(snapshot) = new_entries.get(uri).map(|entry| entry.snapshot.clone()) else {
+            continue;
+        };
+        let raw = document.contents.to_string();
+        let document = Document::new_with_kind(&raw, None, file_type_from_uri(uri), *chunk_kind);
+        let processed = processed_workspace_document(uri.clone(), document, snapshot);
+        documents.insert(uri.clone(), processed.document);
+        legacy_entries.insert(uri.clone(), processed.cross_file_entry);
+        new_entries.insert(uri.clone(), processed.new_index_entry);
+    }
 }
 
 pub fn scan_workspace(folders: &[Url], max_chain_depth: usize) -> WorkspaceScanResult {
@@ -3724,10 +4296,8 @@ mod tests {
                         line: 1,
                         column: 0,
                         is_directive: false,
-                        local: false,
                         chdir: false,
                         is_sys_source: false,
-                        sys_source_global_env: true,
                         ..Default::default()
                     }],
                     ..Default::default()

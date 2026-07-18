@@ -17,7 +17,7 @@ use crate::cross_file::file_cache::CrossFileFileCache;
 use crate::cross_file::scope::{self, ScopeArtifacts};
 use crate::cross_file::types::CrossFileMetadata;
 use crate::cross_file::workspace_index::CrossFileWorkspaceIndex;
-use crate::document_store::DocumentStore;
+use crate::document_store::{DocumentState, DocumentStore};
 use crate::state::{Document, OpenDocumentAliases};
 use crate::workspace_index::WorkspaceIndex;
 
@@ -184,6 +184,34 @@ impl<'a> DefaultContentProvider<'a> {
             .filter(|aliases| !aliases.is_empty())
             .and_then(|aliases| aliases.open_uris_for_canonical(uri))
     }
+
+    /// Project a value from the authoritative open-document sources.
+    ///
+    /// Lookup order is exact `DocumentStore`, exact legacy document, then each
+    /// canonical alias in registration order with `DocumentStore` before legacy.
+    fn project_open_document<T>(
+        &self,
+        uri: &Url,
+        mut from_store: impl FnMut(&Url, &DocumentState) -> Option<T>,
+        mut from_legacy: impl FnMut(&Url, &Document) -> Option<T>,
+    ) -> Option<T> {
+        let alias_uris = self.open_alias_uris(uri).into_iter().flatten();
+        for open_uri in std::iter::once(uri).chain(alias_uris) {
+            if let Some(doc) = self.document_store.get_without_touch(open_uri)
+                && let Some(value) = from_store(open_uri, doc)
+            {
+                return Some(value);
+            }
+            if let Some(doc) = self
+                .legacy_documents
+                .and_then(|documents| documents.get(open_uri))
+                && let Some(value) = from_legacy(open_uri, doc)
+            {
+                return Some(value);
+            }
+        }
+        None
+    }
 }
 
 impl<'a> ContentProvider for DefaultContentProvider<'a> {
@@ -198,29 +226,12 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_content(&self, uri: &Url) -> Option<String> {
-        // 1. Check DocumentStore (open docs are authoritative)
-        if let Some(doc) = self.document_store.get_without_touch(uri) {
-            return Some(doc.contents.to_string());
-        }
-
-        // 2. Check legacy documents HashMap (for migration compatibility)
-        if let Some(legacy_docs) = self.legacy_documents
-            && let Some(doc) = legacy_docs.get(uri)
-        {
-            return Some(doc.text());
-        }
-
-        if let Some(open_uris) = self.open_alias_uris(uri) {
-            for open_uri in open_uris {
-                if let Some(doc) = self.document_store.get_without_touch(open_uri) {
-                    return Some(doc.contents.to_string());
-                }
-                if let Some(legacy_docs) = self.legacy_documents
-                    && let Some(doc) = legacy_docs.get(open_uri)
-                {
-                    return Some(doc.text());
-                }
-            }
+        if let Some(content) = self.project_open_document(
+            uri,
+            |_open_uri, doc| Some(doc.contents.to_string()),
+            |_open_uri, doc| Some(doc.text()),
+        ) {
+            return Some(content);
         }
 
         // 3. Check WorkspaceIndex
@@ -250,34 +261,18 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_metadata(&self, uri: &Url) -> Option<Arc<CrossFileMetadata>> {
-        // 1. Check DocumentStore
-        if let Some(doc) = self.document_store.get_without_touch(uri) {
-            return Some(doc.metadata.clone());
-        }
-
-        // 2. Check legacy documents HashMap (for migration compatibility).
-        //    Use the analysis text (masked for Rmd/Quarto, raw otherwise) so
-        //    directives/source()/library() come from chunk bodies, not prose
-        //    (#343), and so byte offsets stay consistent with downstream uses.
-        if let Some(legacy_docs) = self.legacy_documents
-            && let Some(doc) = legacy_docs.get(uri)
-        {
-            let text = doc.analysis_text();
-            return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
-        }
-
-        if let Some(open_uris) = self.open_alias_uris(uri) {
-            for open_uri in open_uris {
-                if let Some(doc) = self.document_store.get_without_touch(open_uri) {
-                    return Some(doc.metadata.clone());
-                }
-                if let Some(legacy_docs) = self.legacy_documents
-                    && let Some(doc) = legacy_docs.get(open_uri)
-                {
-                    let text = doc.analysis_text();
-                    return Some(Arc::new(crate::cross_file::extract_metadata(&text)));
-                }
-            }
+        // Legacy documents use analysis text (masked for Rmd/Quarto, raw
+        // otherwise) so metadata comes from chunk bodies and byte offsets stay
+        // consistent with downstream uses (#343).
+        if let Some(metadata) = self.project_open_document(
+            uri,
+            |_open_uri, doc| Some(doc.metadata.clone()),
+            |_open_uri, doc| {
+                let text = doc.analysis_text();
+                Some(Arc::new(crate::cross_file::extract_metadata(&text)))
+            },
+        ) {
+            return Some(metadata);
         }
 
         // 3. Check WorkspaceIndex
@@ -315,50 +310,24 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// **Validates: Requirements 3.1, 7.2, 13.2**
     fn get_artifacts(&self, uri: &Url) -> Option<Arc<ScopeArtifacts>> {
-        // 1. Check DocumentStore
-        if let Some(doc) = self.document_store.get_without_touch(uri) {
-            return Some(doc.artifacts.clone());
-        }
-
-        // 2. Check legacy documents HashMap (for migration compatibility).
-        //    Pair the tree with the analysis text it was parsed from (masked
-        //    for Rmd, raw otherwise) so artifact byte offsets align and never
-        //    mis-slice on a non-UTF-8 boundary.
-        if let Some(legacy_docs) = self.legacy_documents
-            && let Some(doc) = legacy_docs.get(uri)
-            && let Some(tree) = &doc.tree
-        {
-            let text = doc.analysis_text();
-            // Extract metadata and use compute_artifacts_with_metadata to include declared symbols
-            // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression for declared symbols)
-            let metadata = crate::cross_file::extract_metadata(&text);
-            return Some(Arc::new(scope::compute_artifacts_with_metadata(
-                uri,
-                tree,
-                &text,
-                Some(&metadata),
-            )));
-        }
-
-        if let Some(open_uris) = self.open_alias_uris(uri) {
-            for open_uri in open_uris {
-                if let Some(doc) = self.document_store.get_without_touch(open_uri) {
-                    return Some(doc.artifacts.clone());
-                }
-                if let Some(legacy_docs) = self.legacy_documents
-                    && let Some(doc) = legacy_docs.get(open_uri)
-                    && let Some(tree) = &doc.tree
-                {
-                    let text = doc.analysis_text();
-                    let metadata = crate::cross_file::extract_metadata(&text);
-                    return Some(Arc::new(scope::compute_artifacts_with_metadata(
-                        open_uri,
-                        tree,
-                        &text,
-                        Some(&metadata),
-                    )));
-                }
-            }
+        // Legacy documents pair the tree with its analysis text (masked for
+        // Rmd/Quarto, raw otherwise) so artifact byte offsets stay aligned.
+        if let Some(artifacts) = self.project_open_document(
+            uri,
+            |_open_uri, doc| Some(doc.artifacts.clone()),
+            |open_uri, doc| {
+                let tree = doc.tree.as_ref()?;
+                let text = doc.analysis_text();
+                let metadata = crate::cross_file::extract_metadata(&text);
+                Some(Arc::new(scope::compute_artifacts_with_metadata(
+                    open_uri,
+                    tree,
+                    &text,
+                    Some(&metadata),
+                )))
+            },
+        ) {
+            return Some(artifacts);
         }
 
         // 3. Check WorkspaceIndex
@@ -401,18 +370,8 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// **Validates: Requirements 14.3**
     fn exists_cached(&self, uri: &Url) -> bool {
-        self.document_store.contains(uri)
-            || self
-                .legacy_documents
-                .is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
-            || self.open_alias_uris(uri).is_some_and(|open_uris| {
-                open_uris.iter().any(|open_uri| {
-                    self.document_store.contains(open_uri)
-                        || self
-                            .legacy_documents
-                            .is_some_and(|docs| docs.contains_key(open_uri))
-                })
-            })
+        self.project_open_document(uri, |_open_uri, _doc| Some(()), |_open_uri, _doc| Some(()))
+            .is_some()
             || self.workspace_index.contains(uri)
             || self
                 .legacy_workspace_index
@@ -429,18 +388,8 @@ impl<'a> ContentProvider for DefaultContentProvider<'a> {
     ///
     /// **Validates: Requirements 3.3, 7.1**
     fn is_open(&self, uri: &Url) -> bool {
-        self.document_store.contains(uri)
-            || self
-                .legacy_documents
-                .is_some_and(|docs: &HashMap<Url, Document>| docs.contains_key(uri))
-            || self.open_alias_uris(uri).is_some_and(|open_uris| {
-                open_uris.iter().any(|open_uri| {
-                    self.document_store.contains(open_uri)
-                        || self
-                            .legacy_documents
-                            .is_some_and(|docs| docs.contains_key(open_uri))
-                })
-            })
+        self.project_open_document(uri, |_open_uri, _doc| Some(()), |_open_uri, _doc| Some(()))
+            .is_some()
     }
 }
 
@@ -748,6 +697,78 @@ mod tests {
 
         assert!(provider.is_open(&uri));
         assert!(!provider.is_open(&test_uri("other.R")));
+    }
+
+    #[tokio::test]
+    async fn test_default_provider_open_lookup_precedence() {
+        let mut doc_store = make_test_document_store();
+        let workspace_index = make_test_workspace_index();
+        let file_cache = CrossFileFileCache::new();
+        let mut legacy_documents = HashMap::new();
+        let legacy_workspace_index = HashMap::new();
+        let legacy_cross_file_workspace_index = CrossFileWorkspaceIndex::new();
+        let mut open_aliases = OpenDocumentAliases::default();
+
+        let canonical_uri = test_uri("canonical.R");
+        let first_alias = test_uri("first-alias.R");
+        let second_alias = test_uri("second-alias.R");
+        open_aliases.open(first_alias.clone(), vec![canonical_uri.clone()]);
+        open_aliases.open(second_alias.clone(), vec![canonical_uri.clone()]);
+
+        doc_store
+            .open(canonical_uri.clone(), "exact store", 1)
+            .await;
+        doc_store.open(first_alias.clone(), "first store", 1).await;
+        doc_store
+            .open(second_alias.clone(), "second store", 1)
+            .await;
+        legacy_documents.insert(
+            canonical_uri.clone(),
+            Document::new("exact legacy", Some(1)),
+        );
+        legacy_documents.insert(first_alias.clone(), Document::new("first legacy", Some(1)));
+
+        let content = |doc_store: &DocumentStore, legacy_documents: &HashMap<Url, Document>| {
+            DefaultContentProvider::with_legacy(
+                doc_store,
+                &workspace_index,
+                &file_cache,
+                legacy_documents,
+                &legacy_workspace_index,
+                &legacy_cross_file_workspace_index,
+                &open_aliases,
+            )
+            .get_content(&canonical_uri)
+        };
+
+        assert_eq!(
+            content(&doc_store, &legacy_documents).as_deref(),
+            Some("exact store")
+        );
+
+        doc_store.close(&canonical_uri);
+        assert_eq!(
+            content(&doc_store, &legacy_documents).as_deref(),
+            Some("exact legacy")
+        );
+
+        legacy_documents.remove(&canonical_uri);
+        assert_eq!(
+            content(&doc_store, &legacy_documents).as_deref(),
+            Some("first store")
+        );
+
+        doc_store.close(&first_alias);
+        assert_eq!(
+            content(&doc_store, &legacy_documents).as_deref(),
+            Some("first legacy")
+        );
+
+        legacy_documents.remove(&first_alias);
+        assert_eq!(
+            content(&doc_store, &legacy_documents).as_deref(),
+            Some("second store")
+        );
     }
 
     #[tokio::test]
@@ -2017,6 +2038,10 @@ mod integration_tests {
             line: 0,
             column: u32::MAX,
             symbol: declared_var.clone(),
+            runtime_function_scope: crate::cross_file::binding::RuntimeFunctionScope::Explicit(
+                None,
+            ),
+            function_scope: None,
         });
         artifacts
             .exported_interface
@@ -2037,6 +2062,10 @@ mod integration_tests {
             line: 1,
             column: u32::MAX,
             symbol: declared_func.clone(),
+            runtime_function_scope: crate::cross_file::binding::RuntimeFunctionScope::Explicit(
+                None,
+            ),
+            function_scope: None,
         });
         artifacts
             .exported_interface
@@ -2156,6 +2185,10 @@ mod integration_tests {
             line: 0,
             column: u32::MAX,
             symbol: old_symbol.clone(),
+            runtime_function_scope: crate::cross_file::binding::RuntimeFunctionScope::Explicit(
+                None,
+            ),
+            function_scope: None,
         });
         old_artifacts
             .exported_interface
@@ -2280,6 +2313,10 @@ mod integration_tests {
             line: 0,
             column: u32::MAX,
             symbol: child_declared.clone(),
+            runtime_function_scope: crate::cross_file::binding::RuntimeFunctionScope::Explicit(
+                None,
+            ),
+            function_scope: None,
         });
         child_artifacts
             .exported_interface
@@ -2323,10 +2360,8 @@ mod integration_tests {
                 line: 0,
                 column: 0,
                 is_directive: false,
-                local: false,
                 chdir: false,
                 is_sys_source: false,
-                sys_source_global_env: true,
                 ..Default::default()
             }],
             ..Default::default()
