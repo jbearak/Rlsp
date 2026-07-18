@@ -215,7 +215,11 @@ impl super::StaticSourceClosurePolicy for RprofileClosurePolicy<'_> {
 
     fn read_source(&mut self, resolved: &Path) -> Option<String> {
         self.overrides
-            .and_then(|overrides| overrides.get(resolved))
+            .and_then(|overrides| {
+                overrides
+                    .get(resolved)
+                    .or_else(|| overrides.get(&super::preamble::canonicalize_for_routing(resolved)))
+            })
             .map(ToString::to_string)
             .or_else(|| {
                 self.allow_disk_fallback

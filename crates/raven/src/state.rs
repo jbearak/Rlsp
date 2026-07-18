@@ -893,6 +893,12 @@ pub struct WorldState {
     pub(crate) workspace_scan_pre_commit_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
     #[cfg(test)]
+    pub(crate) watched_package_pre_commit_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
+    pub(crate) watched_batch_pre_finalize_test_pause:
+        crate::cross_file::revalidation::DiagnosticsPublishPause,
+    #[cfg(test)]
     pub(crate) diagnostics_post_publish_lock_test_pause:
         crate::cross_file::revalidation::DiagnosticsPublishPause,
     /// Deterministic barrier after alias-reconcile derivation and before its
@@ -1124,6 +1130,8 @@ pub struct WorldState {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) watched_batch_test_reject_once: bool,
     #[cfg(any(test, feature = "test-support"))]
+    pub(crate) watched_batch_test_reject_remaining: usize,
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) watched_batch_test_commit_attempts: usize,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) analysis_revalidation_reservation_count: usize,
@@ -1147,6 +1155,7 @@ pub struct WorldState {
     pub(crate) package_input_lifecycle: crate::package_state::PackageInputLifecycle,
     /// Coalescing lifecycle for the one delayed package-seed convergence task.
     pub(crate) package_seed_retry: crate::package_state::PackageSeedRetryLifecycle,
+    pub(crate) watched_package_retry: crate::package_state::PackageSeedRetryLifecycle,
 }
 
 /// A snapshot of the lifecycle state a diagnostics run was triggered
@@ -1681,7 +1690,7 @@ impl PreparedOpenCloseAnalysis {
 pub(crate) enum PreparedAnalysisCommit {
     Upsert(Box<PreparedClosedAnalysis>),
     Remove { basis: Box<AnalysisBasis>, uri: Url },
-    Batch(Vec<PreparedClosedMutation>),
+    WatchedBatch(Box<PreparedWatchedBatchAnalysis>),
     WorkspaceScan(Box<PreparedWorkspaceScanAnalysis>),
     SystemFile(Box<PreparedSystemFileAnalysis>),
     OpenEdit(Box<PreparedOpenEditAnalysis>),
@@ -1689,6 +1698,28 @@ pub(crate) enum PreparedAnalysisCommit {
     OpenAliasReconcile(Box<PreparedOpenAliasReconcileAnalysis>),
     OpenInstall(Box<PreparedOpenInstallAnalysis>),
     OpenClose(Box<PreparedOpenCloseAnalysis>),
+}
+
+/// One all-or-none watched-file transaction spanning closed-file and package
+/// authorities. Every basis is preflighted before either projection mutates
+/// central state.
+pub(crate) struct PreparedWatchedBatchAnalysis {
+    pub(crate) mutations: Vec<PreparedClosedMutation>,
+    pub(crate) package: Option<(PackageProjectionBasis, PreparedPackageProjection)>,
+    pub(crate) package_open_records: std::collections::BTreeMap<Url, OpenRecordToken>,
+    pub(crate) watched_generations: Vec<(Url, u64)>,
+}
+
+#[cfg(test)]
+impl PreparedWatchedBatchAnalysis {
+    pub(crate) fn closed_for_test(mutations: Vec<PreparedClosedMutation>) -> Self {
+        Self {
+            mutations,
+            package: None,
+            package_open_records: Default::default(),
+            watched_generations: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1997,6 +2028,10 @@ pub(crate) struct PackageProjectionBasis {
     package_config_generation: u64,
     open_context_authority_generation: OpenContextAuthorityGeneration,
     workspace_root: Option<std::path::PathBuf>,
+    workspace_folders: Vec<Url>,
+    exclusion_patterns: Vec<String>,
+    package_mode: crate::cross_file::config::PackageMode,
+    model_rprofile: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3072,6 +3107,10 @@ impl WorldState {
             package_config_generation: self.package_config_generation,
             open_context_authority_generation: self.open_context_authority_generation,
             workspace_root: self.package_inputs.workspace_root.clone(),
+            workspace_folders: self.workspace_folders.clone(),
+            exclusion_patterns: self.workspace_exclusions.patterns().to_vec(),
+            package_mode: self.package_inputs.package_mode,
+            model_rprofile: self.package_inputs.model_rprofile,
         }
     }
 
@@ -3080,16 +3119,23 @@ impl WorldState {
         basis: &PackageProjectionBasis,
         prepared: PreparedPackageProjection,
     ) -> Result<Option<SystemFileRoutingOwnerIdentity>, PackageProjectionInstallRejected> {
-        if self.package_input_generation() != basis.package_input_generation
-            || self.package_state_record_generation != basis.package_state_record_generation
-            || self.workspace_scan_generation != basis.workspace_scan_generation
-            || self.package_config_generation != basis.package_config_generation
-            || self.open_context_authority_generation != basis.open_context_authority_generation
-            || self.package_inputs.workspace_root != basis.workspace_root
-        {
+        if !self.package_projection_basis_is_current(basis) {
             return Err(PackageProjectionInstallRejected::StaleBasis);
         }
         Ok(self.install_prepared_package_projection(prepared))
+    }
+
+    fn package_projection_basis_is_current(&self, basis: &PackageProjectionBasis) -> bool {
+        self.package_input_generation() == basis.package_input_generation
+            && self.package_state_record_generation == basis.package_state_record_generation
+            && self.workspace_scan_generation == basis.workspace_scan_generation
+            && self.package_config_generation == basis.package_config_generation
+            && self.open_context_authority_generation == basis.open_context_authority_generation
+            && self.package_inputs.workspace_root == basis.workspace_root
+            && self.workspace_folders == basis.workspace_folders
+            && self.workspace_exclusions.patterns() == basis.exclusion_patterns
+            && self.package_inputs.package_mode == basis.package_mode
+            && self.package_inputs.model_rprofile == basis.model_rprofile
     }
 
     /// Shared derived-record tail for both legacy in-place input adapters and
@@ -3398,6 +3444,12 @@ impl WorldState {
             workspace_scan_pre_commit_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
+            watched_package_pre_commit_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
+            watched_batch_pre_finalize_test_pause:
+                crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
+            #[cfg(test)]
             diagnostics_post_publish_lock_test_pause:
                 crate::cross_file::revalidation::DiagnosticsPublishPause::default(),
             #[cfg(test)]
@@ -3475,6 +3527,8 @@ impl WorldState {
             #[cfg(any(test, feature = "test-support"))]
             watched_batch_test_reject_once: false,
             #[cfg(any(test, feature = "test-support"))]
+            watched_batch_test_reject_remaining: 0,
+            #[cfg(any(test, feature = "test-support"))]
             watched_batch_test_commit_attempts: 0,
             #[cfg(any(test, feature = "test-support"))]
             analysis_revalidation_reservation_count: 0,
@@ -3484,6 +3538,7 @@ impl WorldState {
             package_inputs: crate::package_state::PackageInputs::default(),
             package_input_lifecycle: crate::package_state::PackageInputLifecycle::default(),
             package_seed_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
+            watched_package_retry: crate::package_state::PackageSeedRetryLifecycle::default(),
         }
     }
 
@@ -3826,6 +3881,7 @@ impl WorldState {
     /// after the shutdown response.
     pub(crate) fn cancel_package_seed_retry(&self) {
         self.package_seed_retry.cancel();
+        self.watched_package_retry.cancel();
     }
 
     fn open_alias_candidates_for_uri(&self, uri: &Url) -> Vec<Url> {
@@ -5033,9 +5089,37 @@ impl WorldState {
             PreparedAnalysisCommit::Remove { basis, uri } => {
                 vec![PreparedClosedMutation::Remove { basis, uri }]
             }
-            PreparedAnalysisCommit::Batch(mutations) => mutations,
+            PreparedAnalysisCommit::WatchedBatch(prepared) => {
+                return self.try_commit_watched_batch(*prepared);
+            }
         };
-        self.try_commit_closed_batch(mutations)
+        self.try_commit_closed_batch(mutations, None)
+    }
+
+    fn try_commit_watched_batch(
+        &mut self,
+        prepared: PreparedWatchedBatchAnalysis,
+    ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        if prepared
+            .watched_generations
+            .iter()
+            .any(|(uri, generation)| {
+                self.watched_file_resync_generations.get(uri).copied() != Some(*generation)
+            })
+            || prepared
+                .package
+                .as_ref()
+                .is_some_and(|(basis, _)| !self.package_projection_basis_is_current(basis))
+            || (prepared.package.is_some()
+                && (self.documents.keys().count() != prepared.package_open_records.len()
+                    || prepared
+                        .package_open_records
+                        .values()
+                        .any(|token| !self.documents.record_token_is_current(token))))
+        {
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+        self.try_commit_closed_batch(prepared.mutations, prepared.package)
     }
 
     /// Atomically install one complete workspace-scan projection.
@@ -5792,6 +5876,7 @@ impl WorldState {
     fn try_commit_closed_batch(
         &mut self,
         mutations: Vec<PreparedClosedMutation>,
+        package: Option<(PackageProjectionBasis, PreparedPackageProjection)>,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
         let mut targets = HashSet::with_capacity(mutations.len());
         let no_duplicates = mutations.iter().all(|mutation| {
@@ -5966,8 +6051,14 @@ impl WorldState {
         }
         affected_candidates.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
         affected_candidates.dedup();
+        let package_routing_owner =
+            package.and_then(|(_, prepared)| self.install_prepared_package_projection(prepared));
         let mut effects = self.reserve_analysis_revalidations(affected);
         effects.affected_candidates = affected_candidates;
+        effects.package_routing = package_routing_owner.map(|owner| PackageRoutingCommitEffects {
+            owner,
+            candidates: Vec::new(),
+        });
         Ok(effects)
     }
 

@@ -37,11 +37,11 @@ use crate::state::{
     PreparedAnalysisCommit, PreparedOpenAliasReconcileAnalysis, PreparedOpenCloseAnalysis,
     PreparedOpenCloseDiskInstall, PreparedOpenCommitPlan, PreparedOpenEditAnalysis,
     PreparedOpenGraphProjection, PreparedOpenInstallAnalysis, PreparedOpenLifecycleBatch,
-    PreparedPackageProjection, PreparedWorkspaceOpenMetadata, PreparedWorkspaceScanAnalysis,
-    SymbolConfig, SystemFileRoutingOwnerIdentity, SystemFileTransferredEffects,
-    WorkspaceGraphDerivationContext, WorkspaceGraphOverlay, WorkspaceScanDerivationBasis,
-    WorkspaceScanInputBasis, WorkspaceScanIntentToken, WorkspaceScanTransferredEffects, WorldState,
-    derive_workspace_dependency_graph,
+    PreparedPackageProjection, PreparedWatchedBatchAnalysis, PreparedWorkspaceOpenMetadata,
+    PreparedWorkspaceScanAnalysis, SymbolConfig, SystemFileRoutingOwnerIdentity,
+    SystemFileTransferredEffects, WorkspaceGraphDerivationContext, WorkspaceGraphOverlay,
+    WorkspaceScanDerivationBasis, WorkspaceScanInputBasis, WorkspaceScanIntentToken,
+    WorkspaceScanTransferredEffects, WorldState, derive_workspace_dependency_graph,
 };
 use crate::utf16::utf16_column_to_byte_offset;
 tokio::task_local! {
@@ -1849,21 +1849,6 @@ impl Backend {
     }
 }
 
-fn extend_with_open_package_docs(
-    affected: &mut Vec<Url>,
-    affected_set: &mut std::collections::HashSet<Url>,
-    state: &WorldState,
-    workspace_root: &std::path::Path,
-) {
-    for open_uri in state.documents.keys() {
-        if is_authoritative_package_source_open_uri(state, open_uri, workspace_root)
-            && affected_set.insert(open_uri.clone())
-        {
-            affected.push(open_uri.clone());
-        }
-    }
-}
-
 fn extend_with_watched_pre_update_dependents(
     affected: &mut Vec<Url>,
     affected_set: &mut std::collections::HashSet<Url>,
@@ -1887,8 +1872,7 @@ fn extend_with_watched_pre_update_dependents(
 /// `load_all()` sentinel package, so an `R/`-change-driven recompute of the
 /// [`crate::package_state::PackageScopeContribution`] re-diagnoses them.
 ///
-/// The package-visibility fanout in `did_change_watched_files`
-/// ([`extend_with_open_package_docs`] / its async-path twin) only force-marks
+/// The package-visibility fanout in `did_change_watched_files` only force-marks
 /// open files that are `is_r_source_path` (under `R/` or `tests/testthat/`).
 /// A `devtools::load_all()` *carrier* — e.g. a root-level `analysis.R` or a
 /// `scripts/` file — is not `is_r_source_path`, so a change to the loaded
@@ -2031,24 +2015,6 @@ fn extend_affected_for_load_all_revalidation_from_state(
     );
 }
 
-/// Whether the DELETED-only branch of `did_change_watched_files` should
-/// run `apply_package_event(Initial)` to re-derive package state.
-///
-/// `derive_package_state` walks every R file's roxygen tags and rebuilds
-/// the namespace model from inputs. Skip when no package-relevant
-/// deletions occurred in this batch — non-R deletions (e.g.
-/// `data/foo.csv`) leave `package_inputs` untouched, and re-deriving
-/// from unchanged inputs cannot change `package_state`.
-///
-/// Matches the gate in the parallel mixed-batch branch:
-/// `else if had_pkg_deletion && state.package_inputs.workspace_root.is_some()`.
-fn should_rederive_after_deletion_batch(
-    workspace_is_package: bool,
-    had_pkg_deletion: bool,
-) -> bool {
-    workspace_is_package && had_pkg_deletion
-}
-
 #[cfg(test)]
 fn extend_affected_for_manifest_change(
     affected_open_docs: &mut Vec<Url>,
@@ -2121,19 +2087,6 @@ fn translate_package_event(
     })
 }
 
-/// Exclusion-aware watched-event variant of [`translate_package_event`]. A
-/// directory deletion batch advances once for the cohesive batch mutation,
-/// which is sufficient to invalidate every seed computed before the batch.
-fn translate_watched_package_event(
-    state: &mut WorldState,
-    event: crate::package_state::event::HandlerEvent,
-    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
-) -> Option<crate::package_state::PackageInputDelta> {
-    mutate_package_inputs(state, |inputs| {
-        crate::package_state::event::translate_with_exclusions(inputs, event, exclusions)
-    })
-}
-
 fn apply_rprofile_scan_to_state(
     state: &mut WorldState,
     scan: Option<crate::package_state::rprofile::RprofileScan>,
@@ -2150,264 +2103,6 @@ fn apply_preamble_scan_to_state(
     mutate_package_inputs(state, |inputs| {
         crate::package_state::event::apply_preamble_scan(inputs, scan)
     })
-}
-
-enum WatchedManifestPayload {
-    Text(Option<Arc<str>>),
-    Rprofile(Box<WatchedRprofilePayload>),
-}
-
-struct WatchedRprofilePayload {
-    scan: Option<crate::package_state::rprofile::RprofileScan>,
-    root: std::path::PathBuf,
-    input_snapshot: PackageSeedInputSnapshot,
-    exclusions: crate::config_file::CompiledWorkspaceExclusions,
-}
-
-/// Apply an off-lock watched `.Rprofile` scan only while every package-input
-/// identity it observed is still current. Returning no delta for stale work is
-/// intentional: the current seed/reload/live-buffer convergence owner will
-/// install its own data, while this watcher performs no mutation, derive, or
-/// diagnostic fanout.
-fn apply_watched_rprofile_scan_to_state(
-    state: &mut WorldState,
-    scan: Option<crate::package_state::rprofile::RprofileScan>,
-    root: &std::path::Path,
-    input_snapshot: &PackageSeedInputSnapshot,
-    exclusions: &crate::config_file::CompiledWorkspaceExclusions,
-) -> Option<crate::package_state::PackageInputDelta> {
-    if !input_snapshot.is_current_for(state, root, exclusions) {
-        log::trace!(
-            "Skipping stale watched .Rprofile scan for {} (captured generation {}, current generation {})",
-            root.display(),
-            input_snapshot.generation,
-            state.package_input_generation()
-        );
-        return None;
-    }
-
-    apply_rprofile_scan_to_state(state, scan)
-}
-
-/// Apply watched DESCRIPTION/NAMESPACE/`.Rprofile` changes to package inputs,
-/// collect manifest fanout, then run detached `system.file()` convergence.
-///
-/// Content and `.Rprofile` scans usually run off-lock; if a non-deleted
-/// DESCRIPTION/NAMESPACE read returns no text, the existing
-/// `WatchedFileChanged` translator may still fall back to a best-effort disk
-/// read under the write lock. Input mutation, package re-derivation, and
-/// manifest fanout collection share one short write section. Delayed
-/// undecodable-retry callers attach per-entry generation expectations; each is
-/// checked immediately before mutation, so a stale retry cannot apply captured
-/// state after a newer watcher event or close takes ownership. The lock is then
-/// released for system-file filesystem/graph work. The returned transfer is
-/// unmarked; the enclosing watched batch finalizes it once with every
-/// collect-only fanout candidate.
-async fn apply_watched_manifest_changes(
-    state_arc: &Arc<RwLock<WorldState>>,
-    affected_open_docs: &mut Vec<Url>,
-    pkg_manifest_changes: &[WatchedManifestChange],
-    _sync_publish_path: bool,
-) -> Option<SystemFileTransferredEffects> {
-    if pkg_manifest_changes.is_empty() {
-        return None;
-    }
-
-    // Snapshot the cohesive package-input identity with the root, modeling
-    // flag, and exclusions so the `.Rprofile` prelude scan can run OFF-lock
-    // below and be rejected atomically if any of those inputs changes before
-    // commit. The scan follows transitive source(); the locking-discipline
-    // invariant forbids that work under the write lock — see
-    // `initialize_package_inputs_from_state_with_exclusions`.
-    let (ws_root, model_rprofile, workspace_exclusions, rprofile_input_snapshot) = {
-        let state = state_arc.read().await;
-        let workspace_exclusions = state.workspace_exclusions.clone();
-        (
-            state.package_inputs.workspace_root.clone(),
-            state.package_inputs.model_rprofile,
-            workspace_exclusions.clone(),
-            PackageSeedInputSnapshot::capture(&state, &workspace_exclusions),
-        )
-    };
-    let rprofile_path = ws_root.as_ref().map(|r| r.join(".Rprofile"));
-
-    // DESCRIPTION/NAMESPACE carry on-disk text for `translate`; the
-    // `.Rprofile` payload is a prelude scan precomputed off-lock (None when
-    // deleted or modeling disabled — both clear the prelude).
-    let mut manifest_contents: Vec<(
-        Url,
-        WatchedManifestPayload,
-        bool,
-        Option<WatchedPackageInputGenerationExpectation>,
-    )> = Vec::new();
-    for change in pkg_manifest_changes {
-        let is_rprofile = change.uri.to_file_path().ok().as_deref() == rprofile_path.as_deref();
-        let payload = if is_rprofile {
-            let Some(root) = ws_root.clone() else {
-                continue;
-            };
-            let scan = if change.deleted || !model_rprofile {
-                None
-            } else {
-                let root_for_scan = root.clone();
-                let exclusions_for_scan = workspace_exclusions.clone();
-                tokio::task::spawn_blocking(move || {
-                    crate::package_state::rprofile::scan_workspace_rprofile_with_exclusions(
-                        &root_for_scan,
-                        &exclusions_for_scan,
-                    )
-                })
-                .await
-                .ok()
-            };
-            WatchedManifestPayload::Rprofile(Box::new(WatchedRprofilePayload {
-                scan,
-                root,
-                input_snapshot: rprofile_input_snapshot.clone(),
-                exclusions: workspace_exclusions.clone(),
-            }))
-        } else if change.deleted {
-            WatchedManifestPayload::Text(None)
-        } else if let Ok(path) = change.uri.to_file_path() {
-            let on_disk_text = tokio::task::spawn_blocking(move || {
-                std::fs::read_to_string(path)
-                    .ok()
-                    .map(|s| Arc::from(s.as_str()))
-            })
-            .await
-            .unwrap_or(None);
-            WatchedManifestPayload::Text(on_disk_text)
-        } else {
-            WatchedManifestPayload::Text(None)
-        };
-        manifest_contents.push((
-            change.uri.clone(),
-            payload,
-            change.deleted,
-            change.generation_expectation,
-        ));
-    }
-    // The freshness snapshot predates every mutation in this cohesive watcher
-    // batch. Apply `.Rprofile` first so a sibling DESCRIPTION/NAMESPACE delta
-    // cannot make the scan look externally stale merely by advancing the shared
-    // package-input generation. The sort is stable within each payload kind.
-    manifest_contents
-        .sort_by_key(|(_, payload, _, _)| matches!(payload, WatchedManifestPayload::Text(_)));
-
-    let mut state = state_arc.write().await;
-    let workspace_exclusions = state.workspace_exclusions.clone();
-    let mut deltas = Vec::new();
-    for (uri, payload, deleted, generation_expectation) in manifest_contents {
-        if state.is_document_open_or_alias(&uri) {
-            log::trace!(
-                "Skipping watched manifest package-input event for open document: {}",
-                uri
-            );
-            continue;
-        }
-        if !watched_package_input_generation_is_current(&state, &uri, generation_expectation) {
-            if let Some(expectation) = generation_expectation {
-                log::trace!(
-                    "Skipping stale watched manifest package-input event for {} ({:?}, generation {})",
-                    uri,
-                    expectation.kind,
-                    expectation.generation
-                );
-            }
-            continue;
-        }
-        let delta = match payload {
-            WatchedManifestPayload::Text(on_disk_text) => {
-                let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                    uri,
-                    on_disk_text,
-                    deleted,
-                };
-                translate_watched_package_event(&mut state, event, &workspace_exclusions)
-            }
-            // Apply the off-lock prelude scan via the lock-safe seam. `None`
-            // (delete/disabled) clears; the deletion delta is still emitted
-            // when enabled so the script fanout fires.
-            WatchedManifestPayload::Rprofile(payload) => apply_watched_rprofile_scan_to_state(
-                &mut state,
-                payload.scan,
-                &payload.root,
-                &payload.input_snapshot,
-                &payload.exclusions,
-            ),
-        };
-        if let Some(delta) = delta {
-            deltas.push(delta);
-        }
-    }
-    if deltas.is_empty() {
-        return None;
-    }
-
-    let rprofile_changed = batch_contains_rprofile_changed(&deltas);
-    let batch = crate::package_state::PackageInputDelta::Batch(deltas);
-    state.apply_package_event(&batch);
-    log::info!("Updated package state after DESCRIPTION/NAMESPACE/.Rprofile change");
-    // Force republish for all open R files so namespace model changes
-    // propagate (they're not dependency-graph neighbors of
-    // DESCRIPTION/NAMESPACE). Marking is gated on the publish path: the async
-    // block applies `max_revalidations_per_trigger` and force-marks only the
-    // post-cap survivors, so marking everything here would leave orphan
-    // markers on cap-dropped URIs.
-    let open_keys_filtered: Vec<Url> = state
-        .package_inputs
-        .workspace_root
-        .as_ref()
-        .map(|root| {
-            state
-                .documents
-                .keys()
-                .filter(|uri| {
-                    // DESCRIPTION/NAMESPACE: package-relevant files.
-                    // .Rprofile prelude: any workspace R-language file (the
-                    // prelude reaches scripts/, which are not
-                    // "package-relevant").
-                    authoritative_package_input_uri_for_open_document(&state, uri, root).is_some()
-                        || (rprofile_changed
-                            && is_package_scope_workspace_r_open_document(&state, uri, root))
-                })
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    drop(state);
-
-    let transfer = run_system_file_convergence_transfer(state_arc, None).await;
-    affected_open_docs.extend(open_keys_filtered);
-    affected_open_docs.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-    affected_open_docs.dedup();
-    transfer
-}
-
-#[cfg(test)]
-mod deletion_rederive_decision_tests {
-    use super::*;
-
-    #[test]
-    fn rederive_after_pkg_deletion_in_package_workspace() {
-        assert!(should_rederive_after_deletion_batch(true, true));
-    }
-
-    #[test]
-    fn no_rederive_for_non_pkg_deletion_in_package_workspace() {
-        // Regression: previously the DELETED-only branch unconditionally
-        // re-derived whenever workspace_root.is_some(), even if no package
-        // source files were deleted. `derive_package_state` walks every R
-        // file's roxygen tags — wasted work per non-package deletion in a
-        // package workspace (e.g. deleting `data/foo.csv`).
-        assert!(!should_rederive_after_deletion_batch(true, false));
-    }
-
-    #[test]
-    fn no_rederive_outside_package_workspace() {
-        assert!(!should_rederive_after_deletion_batch(false, true));
-        assert!(!should_rederive_after_deletion_batch(false, false));
-    }
 }
 
 #[cfg(test)]
@@ -2850,18 +2545,6 @@ fn path_in_rprofile_sourced_set(
 ) -> bool {
     sourced.contains(p)
         || sourced.contains(&crate::package_state::preamble::canonicalize_for_routing(p))
-}
-
-/// Returns `true` when any delta in `deltas` is `RProfileChanged`, or when any
-/// nested [`crate::package_state::PackageInputDelta::Batch`] recursively contains one.
-fn batch_contains_rprofile_changed(deltas: &[crate::package_state::PackageInputDelta]) -> bool {
-    deltas.iter().any(|d| match d {
-        crate::package_state::PackageInputDelta::RProfileChanged => true,
-        crate::package_state::PackageInputDelta::Batch(inner) => {
-            batch_contains_rprofile_changed(inner)
-        }
-        _ => false,
-    })
 }
 
 #[cfg(test)]
@@ -4378,8 +4061,8 @@ impl PackageSeedInputSnapshot {
             generation: state.package_input_generation(),
             exclusion_patterns: exclusions.patterns().to_vec(),
             workspace_folders: state.workspace_folders.clone(),
-            package_mode: state.cross_file_config.package_mode,
-            model_rprofile: state.cross_file_config.model_rprofile,
+            package_mode: state.package_inputs.package_mode,
+            model_rprofile: state.package_inputs.model_rprofile,
         }
     }
 
@@ -4406,8 +4089,8 @@ impl PackageSeedInputSnapshot {
             && state.workspace_exclusions.patterns() == self.exclusion_patterns.as_slice()
             && exclusions.patterns() == self.exclusion_patterns.as_slice()
             && state.workspace_folders == self.workspace_folders
-            && state.cross_file_config.package_mode == self.package_mode
-            && state.cross_file_config.model_rprofile == self.model_rprofile
+            && state.package_inputs.package_mode == self.package_mode
+            && state.package_inputs.model_rprofile == self.model_rprofile
     }
 }
 
@@ -4534,6 +4217,12 @@ struct PackageSeedProjectionCapture {
     open_records: std::collections::BTreeMap<Url, crate::open_document_store::OpenRecordToken>,
 }
 
+struct PreparedWatchedPackageCandidate {
+    package: (PackageProjectionBasis, PreparedPackageProjection),
+    disk_projection: PackageSeedDiskProjection,
+    open_records: std::collections::BTreeMap<Url, crate::open_document_store::OpenRecordToken>,
+}
+
 #[derive(Debug)]
 struct PackageSeedComputeError {
     message: String,
@@ -4546,6 +4235,47 @@ impl std::fmt::Display for PackageSeedComputeError {
 }
 
 impl PrecomputedPackageSeed {
+    fn into_watched_package_candidate(self) -> Option<PreparedWatchedPackageCandidate> {
+        let (basis, mut prepared) = self.prepared?;
+        let open_r_paths: std::collections::BTreeSet<_> = self
+            .open_records
+            .as_ref()?
+            .keys()
+            .filter_map(|uri| uri.to_file_path().ok())
+            .flat_map(|path| {
+                let routing = crate::package_state::preamble::canonicalize_for_routing(&path);
+                [path, routing]
+            })
+            .collect();
+        let open_r_files: Vec<_> = prepared
+            .inputs
+            .r_files
+            .iter()
+            .filter(|(path, _)| {
+                open_r_paths.contains(*path)
+                    || open_r_paths.contains(
+                        &crate::package_state::preamble::canonicalize_for_routing(path),
+                    )
+            })
+            .map(|(path, input)| (path.clone(), input.clone()))
+            .collect();
+        prepared.inputs.r_files = self.install.disk_r_files;
+        prepared.inputs.r_files.extend(open_r_files);
+        prepared.state = crate::package_state::derive_package_state(
+            &prepared.state,
+            &prepared.inputs,
+            &crate::package_state::PackageInputDelta::Initial,
+        );
+        Some(PreparedWatchedPackageCandidate {
+            package: (
+                basis,
+                PreparedPackageProjection::new(prepared.inputs, prepared.state),
+            ),
+            disk_projection: self.disk_projection?,
+            open_records: self.open_records?,
+        })
+    }
+
     fn disk_is_current(&self) -> bool {
         self.disk_projection
             .as_ref()
@@ -4598,8 +4328,8 @@ impl PrecomputedPackageSeed {
             (
                 snapshot_preamble_text_overrides(&state),
                 PackageSeedInputSnapshot::capture(&state, exclusions),
-                state.cross_file_config.package_mode,
-                state.cross_file_config.model_rprofile,
+                state.package_inputs.package_mode,
+                state.package_inputs.model_rprofile,
                 PackageSeedProjectionCapture {
                     basis: state.capture_package_projection_basis(),
                     inputs: state.package_inputs.clone(),
@@ -7976,7 +7706,6 @@ enum ResyncOutcome {
     /// Preparation completed without mutation for a watched multi-file batch.
     Prepared {
         mutation: crate::state::PreparedClosedMutation,
-        deleted: bool,
     },
     /// The URI was an open document at commit time, so the disk state was
     /// discarded untouched: the open buffer is authoritative, and its own
@@ -8019,7 +7748,7 @@ struct WatchedResyncBatch {
     reserved_tickets: Vec<crate::state::AnalysisRevalidationTicket>,
     transfer_handles: Vec<AnalysisTransferHandle>,
     mode: WatchedResyncBatchMode,
-    retry_remaining: bool,
+    attempts_remaining: usize,
 }
 
 struct WatchedClosedBatchOverlay {
@@ -8174,10 +7903,6 @@ fn rederive_watched_closed_batch_overlay(
 }
 
 impl WatchedResyncBatchMode {
-    fn include_uncommitted_package_events(self) -> bool {
-        matches!(self, Self::Immediate)
-    }
-
     fn schedule_undecodable_retries(self) -> bool {
         matches!(self, Self::Immediate)
     }
@@ -8187,33 +7912,37 @@ impl WatchedResyncBatchMode {
     }
 }
 
-struct WatchedPackageInputEvent {
-    uri: Url,
-    deleted: bool,
-    committed: bool,
-    generation_expectation: Option<WatchedPackageInputGenerationExpectation>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WatchedPackageInputOutcomeKind {
-    Updated,
-    Removed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct WatchedPackageInputGenerationExpectation {
-    generation: u64,
-    kind: WatchedPackageInputOutcomeKind,
-}
-
-#[derive(Clone)]
-struct WatchedManifestChange {
-    uri: Url,
-    deleted: bool,
-    generation_expectation: Option<WatchedPackageInputGenerationExpectation>,
+fn watched_items_touch_package_inputs(
+    state: &WorldState,
+    mut items: impl Iterator<Item = Url>,
+) -> bool {
+    let Some(root) = state.package_inputs.workspace_root.as_ref() else {
+        return false;
+    };
+    items.any(|uri| {
+        watched_manifest_change_for_uri(state, &uri, false).is_some()
+            || uri.to_file_path().ok().is_some_and(|path| {
+                crate::package_state::is_r_source_path(&path, root).is_some()
+                    || is_package_source_dir(&path, root)
+                    || is_package_data_path(&path, root)
+                    || (state.package_inputs.model_rprofile
+                        && path_in_rprofile_sourced_set(
+                            &path,
+                            &state.package_inputs.rprofile_sourced_files,
+                        ))
+                    || path_in_rprofile_sourced_set(
+                        &path,
+                        &state.package_inputs.preamble_sourced_files,
+                    )
+            })
+    })
 }
 
 const WATCHED_UNDECODABLE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const WATCHED_PACKAGE_PRE_COMMIT_PAUSE_URI: &str = "raven-test://watched-package-pre-commit";
+#[cfg(test)]
+const WATCHED_BATCH_PRE_FINALIZE_PAUSE_URI: &str = "raven-test://watched-batch-pre-finalize";
 
 fn bump_watched_file_resync_generation(state: &mut WorldState, uri: &Url) -> u64 {
     state.watched_file_resync_generation_counter =
@@ -8240,100 +7969,6 @@ fn expected_watched_generation_is_current(
 ) -> bool {
     expected_generation
         .is_none_or(|generation| watched_file_resync_generation_matches(state, uri, generation))
-}
-
-fn watched_package_input_generation_is_current(
-    state: &WorldState,
-    uri: &Url,
-    expectation: Option<WatchedPackageInputGenerationExpectation>,
-) -> bool {
-    match expectation {
-        None => true,
-        Some(WatchedPackageInputGenerationExpectation {
-            generation,
-            kind: WatchedPackageInputOutcomeKind::Updated,
-        }) => watched_file_resync_generation_matches(state, uri, generation),
-        Some(WatchedPackageInputGenerationExpectation {
-            generation: _,
-            kind: WatchedPackageInputOutcomeKind::Removed,
-        }) => !state.watched_file_resync_generations.contains_key(uri),
-    }
-}
-
-#[cfg(test)]
-mod watched_package_input_generation_tests {
-    use super::*;
-
-    #[test]
-    fn watched_package_input_generation_currentness_matches_retry_outcome() {
-        let uri = Url::parse("file:///workspace/R/helper.R").unwrap();
-        let mut state = WorldState::new();
-        state.watched_file_resync_generations.insert(uri.clone(), 7);
-
-        assert!(
-            watched_package_input_generation_is_current(
-                &state,
-                &uri,
-                Some(WatchedPackageInputGenerationExpectation {
-                    generation: 7,
-                    kind: WatchedPackageInputOutcomeKind::Updated,
-                }),
-            ),
-            "Updated is current while the table still holds the captured generation"
-        );
-        assert!(
-            !watched_package_input_generation_is_current(
-                &state,
-                &uri,
-                Some(WatchedPackageInputGenerationExpectation {
-                    generation: 6,
-                    kind: WatchedPackageInputOutcomeKind::Updated,
-                }),
-            ),
-            "Updated is stale after a newer event changes the table entry"
-        );
-        assert!(
-            !watched_package_input_generation_is_current(
-                &state,
-                &uri,
-                Some(WatchedPackageInputGenerationExpectation {
-                    generation: 7,
-                    kind: WatchedPackageInputOutcomeKind::Removed,
-                }),
-            ),
-            "Removed is stale when a newer CREATE/CHANGE reinserted the entry"
-        );
-
-        state.watched_file_resync_generations.remove(&uri);
-        assert!(
-            watched_package_input_generation_is_current(
-                &state,
-                &uri,
-                Some(WatchedPackageInputGenerationExpectation {
-                    generation: 7,
-                    kind: WatchedPackageInputOutcomeKind::Removed,
-                }),
-            ),
-            "Removed is current after its successful removal pruned the entry"
-        );
-
-        let close_generation = bump_watched_file_resync_generation(&mut state, &uri);
-        assert!(
-            state.watched_file_resync_generations.contains_key(&uri),
-            "precondition: did_close-style ownership bump recreates the entry"
-        );
-        assert!(
-            !watched_package_input_generation_is_current(
-                &state,
-                &uri,
-                Some(WatchedPackageInputGenerationExpectation {
-                    generation: close_generation.wrapping_sub(1),
-                    kind: WatchedPackageInputOutcomeKind::Removed,
-                }),
-            ),
-            "Removed is stale after did_close recreated the generation entry"
-        );
-    }
 }
 
 /// The "file is gone" tail of [`resync_file_from_disk`]: veto if the URI was
@@ -8415,7 +8050,6 @@ async fn resync_missing_file(
                 basis: Box::new(basis),
                 uri: uri.clone(),
             },
-            deleted: true,
         };
     }
     let effects = state
@@ -8511,7 +8145,6 @@ async fn resync_file_from_disk(
                         basis: Box::new(basis),
                         uri: uri.clone(),
                     },
-                    deleted: true,
                 };
             }
             let effects = state
@@ -8799,7 +8432,6 @@ async fn resync_file_from_disk(
     if commit_mode == ResyncCommitMode::Batch {
         return ResyncOutcome::Prepared {
             mutation: crate::state::PreparedClosedMutation::Upsert(Box::new(prepared)),
-            deleted: false,
         };
     }
     #[cfg(test)]
@@ -9088,10 +8720,33 @@ fn spawn_watched_undecodable_retry(
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
-                retry_remaining: true,
+                attempts_remaining: 2,
             },
         )
         .await;
+    });
+}
+
+fn spawn_watched_package_retry(
+    state_arc: Arc<RwLock<WorldState>>,
+    client: Client,
+    traversal_truncation: Arc<TraversalTruncationState>,
+    mut batch: WatchedResyncBatch,
+    generation: u64,
+    token: tokio_util::sync::CancellationToken,
+) {
+    batch.attempts_remaining = 2;
+    tokio::spawn(async move {
+        tokio::time::sleep(PACKAGE_SEED_RETRY_DELAY).await;
+        if token.is_cancelled() {
+            return;
+        }
+        run_watched_resync_batch(state_arc.clone(), client, traversal_truncation, batch).await;
+        state_arc
+            .read()
+            .await
+            .watched_package_retry
+            .complete(generation);
     });
 }
 
@@ -9122,21 +8777,19 @@ async fn run_watched_resync_batch(
 ) {
     let WatchedResyncBatch {
         updates: uris_to_update,
-        affected: mut affected_for_async,
+        affected: affected_for_async,
         deletions: deleted_uris,
         mut reserved_tickets,
         mut transfer_handles,
         mode,
-        retry_remaining,
+        attempts_remaining,
     } = batch;
     let await_reserved_tickets =
         matches!(mode, WatchedResyncBatchMode::Immediate) && uris_to_update.is_empty();
-    let mut affected_for_async_set: std::collections::HashSet<Url> =
-        affected_for_async.iter().cloned().collect();
-    let mut package_input_events: Vec<WatchedPackageInputEvent> = Vec::new();
+    let mut package_transfer_candidates = Vec::new();
     let mut prepared_mutations = Vec::new();
-    let mut prepared_event_indices = Vec::new();
-    for item in &uris_to_update {
+    let mut eligible_update_indices = std::collections::HashSet::new();
+    for (item_index, item) in uris_to_update.iter().enumerate() {
         // Capture old metadata before the disk read (for WD change
         // detection). The file was never open — the sync pass skips open
         // documents — so every metadata tier already reflects the last-known
@@ -9162,58 +8815,17 @@ async fn run_watched_resync_batch(
         {
             ResyncOutcome::Updated { effects, .. } => {
                 reserved_tickets.extend(effects.revalidations);
-                package_input_events.push(WatchedPackageInputEvent {
-                    uri: item.uri.clone(),
-                    deleted: false,
-                    committed: true,
-                    generation_expectation: matches!(
-                        mode,
-                        WatchedResyncBatchMode::DelayedUndecodableRetry
-                    )
-                    .then_some(WatchedPackageInputGenerationExpectation {
-                        generation: item.generation,
-                        kind: WatchedPackageInputOutcomeKind::Updated,
-                    }),
-                });
+                eligible_update_indices.insert(item_index);
                 log::trace!("Updated workspace index for: {}", item.uri);
             }
             ResyncOutcome::Removed { effects } => {
                 reserved_tickets.extend(effects.revalidations);
-                package_input_events.push(WatchedPackageInputEvent {
-                    uri: item.uri.clone(),
-                    deleted: true,
-                    committed: true,
-                    generation_expectation: matches!(
-                        mode,
-                        WatchedResyncBatchMode::DelayedUndecodableRetry
-                    )
-                    .then_some(WatchedPackageInputGenerationExpectation {
-                        generation: item.generation,
-                        kind: WatchedPackageInputOutcomeKind::Removed,
-                    }),
-                });
+                eligible_update_indices.insert(item_index);
                 log::trace!("Removed watched file state during resync: {}", item.uri);
             }
-            ResyncOutcome::Prepared { mutation, deleted } => {
+            ResyncOutcome::Prepared { mutation } => {
                 prepared_mutations.push(mutation);
-                prepared_event_indices.push(package_input_events.len());
-                package_input_events.push(WatchedPackageInputEvent {
-                    uri: item.uri.clone(),
-                    deleted,
-                    committed: false,
-                    generation_expectation: matches!(
-                        mode,
-                        WatchedResyncBatchMode::DelayedUndecodableRetry
-                    )
-                    .then_some(WatchedPackageInputGenerationExpectation {
-                        generation: item.generation,
-                        kind: if deleted {
-                            WatchedPackageInputOutcomeKind::Removed
-                        } else {
-                            WatchedPackageInputOutcomeKind::Updated
-                        },
-                    }),
-                });
+                eligible_update_indices.insert(item_index);
             }
             ResyncOutcome::SkippedInvalidEncoding if mode.schedule_undecodable_retries() => {
                 spawn_watched_undecodable_retry(
@@ -9222,54 +8834,55 @@ async fn run_watched_resync_batch(
                     traversal_truncation.clone(),
                     item.clone(),
                 );
-                package_input_events.push(WatchedPackageInputEvent {
-                    uri: item.uri.clone(),
-                    deleted: false,
-                    committed: false,
-                    generation_expectation: None,
-                });
             }
             ResyncOutcome::Vetoed
             | ResyncOutcome::SkippedInvalidEncoding
-            | ResyncOutcome::Skipped => {
-                package_input_events.push(WatchedPackageInputEvent {
-                    uri: item.uri.clone(),
-                    deleted: false,
-                    committed: false,
-                    generation_expectation: None,
-                });
-            }
+            | ResyncOutcome::Skipped => {}
         }
     }
 
-    let deletion_event_indices: Vec<Option<usize>> = deleted_uris
+    let watched_items: Vec<_> = uris_to_update
         .iter()
-        .map(|item| {
-            if matches!(mode, WatchedResyncBatchMode::Immediate) {
-                return None;
-            }
-            let index = package_input_events.len();
-            package_input_events.push(WatchedPackageInputEvent {
-                uri: item.uri.clone(),
-                deleted: true,
-                committed: false,
-                generation_expectation: matches!(
-                    mode,
-                    WatchedResyncBatchMode::DelayedUndecodableRetry
-                )
-                .then_some(WatchedPackageInputGenerationExpectation {
-                    generation: item.generation,
-                    kind: WatchedPackageInputOutcomeKind::Removed,
-                }),
-            });
-            Some(index)
+        .enumerate()
+        .filter(|(index, item)| {
+            matches!(mode, WatchedResyncBatchMode::DelayedUndecodableRetry)
+                || eligible_update_indices.contains(index)
+                || item
+                    .uri
+                    .to_file_path()
+                    .ok()
+                    .is_some_and(|path| path.is_dir())
         })
+        .map(|(_, item)| item)
+        .chain(deleted_uris.iter())
+        .cloned()
         .collect();
-
-    if !prepared_mutations.is_empty() || !deleted_uris.is_empty() {
+    let package_target = {
+        let state = state_arc.read().await;
+        if watched_items_touch_package_inputs(
+            &state,
+            watched_items.iter().map(|item| item.uri.clone()),
+        ) {
+            Some((
+                state.package_inputs.workspace_root.clone(),
+                state.workspace_exclusions.clone(),
+            ))
+        } else {
+            None
+        }
+    };
+    let mut watched_package = if let Some((Some(root), exclusions)) = package_target {
+        PrecomputedPackageSeed::compute_from_state(&state_arc, &root, &exclusions, true)
+            .await
+            .ok()
+            .and_then(PrecomputedPackageSeed::into_watched_package_candidate)
+    } else {
+        None
+    };
+    if !prepared_mutations.is_empty() || !deleted_uris.is_empty() || watched_package.is_some() {
         {
             let state = state_arc.read().await;
-            for (item, event_index) in deleted_uris.iter().zip(deletion_event_indices) {
+            for item in &deleted_uris {
                 if !watched_file_resync_generation_matches(&state, &item.uri, item.generation) {
                     continue;
                 }
@@ -9278,9 +8891,6 @@ async fn run_watched_resync_batch(
                     basis: Box::new(basis),
                     uri: item.uri.clone(),
                 });
-                if let Some(event_index) = event_index {
-                    prepared_event_indices.push(event_index);
-                }
             }
         }
         let overlay = {
@@ -9292,13 +8902,14 @@ async fn run_watched_resync_batch(
             return;
         };
         rederive_watched_closed_batch_overlay(overlay, &mut prepared_mutations);
-        let retry_batch = retry_remaining.then(|| {
+        let retry_batch = {
             let targets: std::collections::HashSet<_> = prepared_mutations
                 .iter()
                 .map(|mutation| match mutation {
                     crate::state::PreparedClosedMutation::Upsert(prepared) => prepared.uri.clone(),
                     crate::state::PreparedClosedMutation::Remove { uri, .. } => uri.clone(),
                 })
+                .chain(watched_items.iter().map(|item| item.uri.clone()))
                 .collect();
             WatchedResyncBatch {
                 updates: uris_to_update
@@ -9315,9 +8926,9 @@ async fn run_watched_resync_batch(
                 reserved_tickets: reserved_tickets.clone(),
                 transfer_handles: transfer_handles.clone(),
                 mode,
-                retry_remaining: false,
+                attempts_remaining: attempts_remaining.saturating_sub(1),
             }
-        });
+        };
         #[cfg(any(test, feature = "test-support"))]
         {
             let mut state = state_arc.write().await;
@@ -9325,71 +8936,125 @@ async fn run_watched_resync_batch(
             if state.watched_batch_test_reject_once {
                 state.watched_batch_test_reject_once = false;
                 state.advance_workspace_graph_authority_generation();
+            } else if state.watched_batch_test_reject_remaining > 0 {
+                state.watched_batch_test_reject_remaining -= 1;
+                state.advance_workspace_graph_authority_generation();
             }
         }
-        let committed = state_arc.write().await.try_commit_analysis(
-            crate::state::PreparedAnalysisCommit::Batch(prepared_mutations),
-        );
+        #[cfg(test)]
+        {
+            let pause = state_arc
+                .read()
+                .await
+                .watched_package_pre_commit_test_pause
+                .take_armed(&Url::parse(WATCHED_PACKAGE_PRE_COMMIT_PAUSE_URI).unwrap());
+            if let Some(pause) = pause {
+                pause.pause().await;
+            }
+        }
+        if watched_package
+            .as_ref()
+            .is_some_and(|candidate| !candidate.disk_projection.is_current())
+        {
+            if attempts_remaining > 0 {
+                Box::pin(run_watched_resync_batch(
+                    state_arc.clone(),
+                    client.clone(),
+                    traversal_truncation.clone(),
+                    retry_batch,
+                ))
+                .await;
+            } else {
+                let (generation, token) = state_arc.read().await.watched_package_retry.schedule();
+                spawn_watched_package_retry(
+                    state_arc.clone(),
+                    client.clone(),
+                    traversal_truncation.clone(),
+                    retry_batch,
+                    generation,
+                    token,
+                );
+            }
+            return;
+        }
+        let watched_generations = watched_items
+            .iter()
+            .map(|item| (item.uri.clone(), item.generation))
+            .collect();
+        let package_open_records = watched_package
+            .as_ref()
+            .map(|candidate| candidate.open_records.clone())
+            .unwrap_or_default();
+        let package = watched_package.take().map(|candidate| candidate.package);
+        let had_package = package.is_some();
+        let (committed, exact_package_candidates) = {
+            let mut state = state_arc.write().await;
+            let committed =
+                state.try_commit_analysis(crate::state::PreparedAnalysisCommit::WatchedBatch(
+                    Box::new(PreparedWatchedBatchAnalysis {
+                        mutations: prepared_mutations,
+                        package,
+                        package_open_records,
+                        watched_generations,
+                    }),
+                ));
+            let candidates = if committed.is_ok() && had_package {
+                let open_uris: Vec<_> = state.documents.keys().cloned().collect();
+                state.capture_analysis_transfer_candidates(open_uris)
+            } else {
+                Vec::new()
+            };
+            (committed, candidates)
+        };
         match committed {
             Ok(effects) => {
                 reserved_tickets.extend(effects.revalidations);
-                for index in prepared_event_indices {
-                    package_input_events[index].committed = true;
+                package_transfer_candidates = exact_package_candidates;
+                if let Some(routing) = effects.package_routing {
+                    match run_system_file_convergence_transaction_for_routing_owner(
+                        &state_arc,
+                        routing.owner,
+                    )
+                    .await
+                    {
+                        SystemFileConvergenceOutcome::Committed(transfer)
+                        | SystemFileConvergenceOutcome::Superseded(transfer) => {
+                            transfer_handles.push(transfer.handle);
+                        }
+                        SystemFileConvergenceOutcome::Deferred => {
+                            let state = state_arc.clone();
+                            tokio::spawn(async move {
+                                let _ = await_open_package_routing(&state, routing).await;
+                            });
+                        }
+                    }
                 }
             }
-            Err(_) if retry_batch.is_some() => {
+            Err(_) if attempts_remaining > 0 => {
                 log::trace!("Retrying watched closed batch from a fresh authority snapshot");
                 Box::pin(run_watched_resync_batch(
                     state_arc.clone(),
                     client.clone(),
                     traversal_truncation.clone(),
-                    retry_batch.expect("guarded above"),
+                    retry_batch,
                 ))
                 .await;
                 return;
             }
-            Err(_) => return,
+            Err(_) => {
+                let (generation, token) = state_arc.read().await.watched_package_retry.schedule();
+                spawn_watched_package_retry(
+                    state_arc.clone(),
+                    client.clone(),
+                    traversal_truncation.clone(),
+                    retry_batch,
+                    generation,
+                    token,
+                );
+                return;
+            }
         }
     }
-
-    if matches!(mode, WatchedResyncBatchMode::DelayedUndecodableRetry) {
-        let pkg_manifest_changes: Vec<WatchedManifestChange> = {
-            let state = state_arc.read().await;
-            package_input_events
-                .iter()
-                .filter(|event| event.committed)
-                .filter_map(|event| {
-                    watched_manifest_change_for_uri(&state, &event.uri, event.deleted).map(
-                        |(uri, deleted)| WatchedManifestChange {
-                            uri,
-                            deleted,
-                            generation_expectation: event.generation_expectation,
-                        },
-                    )
-                })
-                .collect()
-        };
-        if let Some(transfer) = apply_watched_manifest_changes(
-            &state_arc,
-            &mut affected_for_async,
-            &pkg_manifest_changes,
-            false,
-        )
-        .await
-        {
-            transfer_handles.push(transfer.handle);
-        }
-        affected_for_async_set.extend(affected_for_async.iter().cloned());
-    }
-
-    apply_watched_r_file_package_input_events(
-        &state_arc,
-        &mut affected_for_async,
-        &mut affected_for_async_set,
-        package_input_events,
-        mode,
-    )
-    .await;
 
     // Now that the graph reflects every committed CREATED/CHANGED file in
     // this batch, cap and force-mark the full union of affected open documents
@@ -9397,6 +9062,17 @@ async fn run_watched_resync_batch(
     // guarantees the debounced diagnostic pass builds its snapshot from the
     // post-update graph, and prevents post-update edge fanout from bypassing
     // `max_revalidations_per_trigger`.
+    #[cfg(test)]
+    {
+        let pause = state_arc
+            .read()
+            .await
+            .watched_batch_pre_finalize_test_pause
+            .take_armed(&Url::parse(WATCHED_BATCH_PRE_FINALIZE_PAUSE_URI).unwrap());
+        if let Some(pause) = pause {
+            pause.pause().await;
+        }
+    }
     let transfer_tickets = {
         let mut state = state_arc.write().await;
         let reserved_current_uris: std::collections::HashSet<Url> = reserved_tickets
@@ -9405,6 +9081,7 @@ async fn run_watched_resync_batch(
             .map(|ticket| ticket.uri.clone())
             .collect();
         let mut additional = state.capture_analysis_transfer_candidates(affected_for_async);
+        additional.extend(package_transfer_candidates);
         additional.retain(|candidate| !reserved_current_uris.contains(&candidate.uri));
         let fallback: Vec<_> = state
             .documents
@@ -9442,164 +9119,6 @@ async fn run_watched_resync_batch(
         Some(traversal_truncation),
     )
     .await;
-}
-
-/// Update package inputs and derive state for committed CREATED/CHANGED
-/// R/*.R files so roxygen tag changes from external edits (e.g. git checkout)
-/// propagate to the namespace model and internal symbols. A delayed
-/// invalid-final retry records `deleted: true`, mirroring the synchronous
-/// DELETED watched branch.
-async fn apply_watched_r_file_package_input_events(
-    state_arc: &Arc<RwLock<WorldState>>,
-    affected_for_async: &mut Vec<Url>,
-    affected_for_async_set: &mut std::collections::HashSet<Url>,
-    package_input_events: Vec<WatchedPackageInputEvent>,
-    mode: WatchedResyncBatchMode,
-) {
-    let mut state = state_arc.write().await;
-    let workspace_exclusions = state.workspace_exclusions.clone();
-    let package_events: Vec<_> = package_input_events
-        .iter()
-        .filter(|event| event.committed || mode.include_uncommitted_package_events())
-        .filter(|event| {
-            !matches!(mode, WatchedResyncBatchMode::DelayedUndecodableRetry)
-                || watched_manifest_change_for_uri(&state, &event.uri, event.deleted).is_none()
-        })
-        .filter(|event| {
-            let current = watched_package_input_generation_is_current(
-                &state,
-                &event.uri,
-                event.generation_expectation,
-            );
-            if !current
-                && let Some(expectation) = event.generation_expectation
-            {
-                log::trace!(
-                    "Skipping stale watched R-file package-input event for {} ({:?}, generation {})",
-                    event.uri,
-                    expectation.kind,
-                    expectation.generation
-                );
-            }
-            current
-        })
-        .collect();
-    // Gate on any package source file — `is_r_source_path` matches both
-    // `R/` and `tests/testthat/`. Without the `tests/` branch, external
-    // edits that touch only test files (e.g. `git checkout` on a topic
-    // branch) would leave their RFileFacts stale in `package_state`.
-    let root_for_check = state.package_inputs.workspace_root.clone();
-    let model_rprofile = state.package_inputs.model_rprofile;
-    let rprofile_sourced = &state.package_inputs.rprofile_sourced_files;
-    let preamble_sourced = &state.package_inputs.preamble_sourced_files;
-    let has_pkg_files = root_for_check.as_ref().is_some_and(|root| {
-        package_events.iter().any(|event| {
-            event.uri.to_file_path().ok().is_some_and(|p| {
-                crate::package_state::is_r_source_path(&p, root).is_some()
-                    || is_package_source_dir(&p, root)
-                    // data/ and data-raw/ CREATED/CHANGED events also
-                    // have dedicated translate() handlers (dataset_names /
-                    // sysdata_names rescans).
-                    || is_package_data_path(&p, root)
-                    // A helper that `.Rprofile` transitively source()s can
-                    // live outside the package's tracked R dirs (e.g.
-                    // scripts/, inst/). Editing it isn't an RFileChanged,
-                    // but it must still reach translate() so the prelude is
-                    // re-scanned and its symbols/packages reach open
-                    // `scripts/` files (Task 12).
-                    || (model_rprofile && path_in_rprofile_sourced_set(&p, rprofile_sourced))
-                    // Same for a helper that a testthat preamble transitively
-                    // source()s (issue #638): editing scripts/helpers.R must
-                    // reach translate() so the preamble closure is re-scanned
-                    // and its symbols reach open test files.
-                    || path_in_rprofile_sourced_set(&p, preamble_sourced)
-            })
-        })
-    });
-    if has_pkg_files {
-        let mut deltas = Vec::new();
-        let mut ns_changed = false;
-        let old_ns_model = state.package_state.namespace_model().cloned();
-        // Snapshot the package's visibility/contribution state (Arc-backed
-        // clones are cheap) so visibility-only changes — e.g. internal symbol
-        // or NAMESPACE-import edits that don't alter exports — also trigger the
-        // open-file fanout below.
-        let old_contribution = state.package_state.scope_contribution().clone();
-        for event in package_events {
-            if state.is_document_open_or_alias(&event.uri) {
-                continue; // open docs are authoritative; skip
-            }
-            // Use the file cache content (already inserted above). Removal
-            // outcomes deliberately carry `None` and `deleted: true` so package
-            // inputs drop the file instead of preserving stale text.
-            // Uncommitted immediate-pass events carry `deleted: false`; because
-            // the sync pass invalidated the file cache, skipped directory/file
-            // events naturally pass `None`, matching the old inline watched
-            // loop's disk-fallback behavior.
-            let on_disk_text: Option<std::sync::Arc<str>> = if event.deleted {
-                None
-            } else {
-                state
-                    .cross_file_file_cache
-                    .get(&event.uri)
-                    .map(|s| std::sync::Arc::from(s.as_str()))
-            };
-            let event = crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                uri: event.uri.clone(),
-                on_disk_text,
-                deleted: event.deleted,
-            };
-            if let Some(delta) =
-                translate_watched_package_event(&mut state, event, &workspace_exclusions)
-            {
-                deltas.push(delta);
-            }
-        }
-        // Detect whether this batch carries a prelude rescan (Task 12):
-        // editing a helper that `.Rprofile` sources re-scans the prelude, whose
-        // symbols/packages reach `scripts/` files — files that are NOT
-        // `is_r_source_path` and so are missed by the R/+tests fanout below.
-        // The RProfileChanged delta may appear top-level or nested in the
-        // per-file Batch built by `translate_watched`, so check both. Computed
-        // BEFORE `deltas` is moved into `Batch`.
-        let rprofile_changed = batch_contains_rprofile_changed(&deltas);
-        if !deltas.is_empty() {
-            let batch = crate::package_state::PackageInputDelta::Batch(deltas);
-            state.apply_package_event(&batch);
-            ns_changed = state.package_state.namespace_model() != old_ns_model.as_ref()
-                || state.package_state.scope_contribution() != &old_contribution;
-        }
-        if ns_changed {
-            // Namespace model changed (e.g. roxygen tags changed in an external
-            // edit). Add all open package files (R/ and tests/testthat/) to
-            // affected set so their @import diagnostics are refreshed. When the
-            // prelude rescanned, also add every open workspace R-language file
-            // (incl. `scripts/`), since the prelude contributes to their script
-            // scope.
-            if let Some(ref root) = state.package_inputs.workspace_root.clone() {
-                for open_uri in state.documents.keys() {
-                    let is_package_source =
-                        is_authoritative_package_source_open_uri(&state, open_uri, root);
-                    let is_rprofile_workspace_r = rprofile_changed
-                        && is_package_scope_workspace_r_open_document(&state, open_uri, root);
-                    if (is_package_source || is_rprofile_workspace_r)
-                        && affected_for_async_set.insert(open_uri.clone())
-                    {
-                        affected_for_async.push(open_uri.clone());
-                    }
-                }
-                // The fanout above misses arbitrary load_all carriers
-                // (root-level analysis.R / scripts/) and their source-graph
-                // neighborhood; widen for them on the async path too.
-                extend_affected_for_load_all_revalidation_from_state(
-                    affected_for_async,
-                    affected_for_async_set,
-                    &state,
-                    root,
-                );
-            }
-        }
-    }
 }
 
 /// Sort watched-file diagnostic fanout by activity and enforce the configured
@@ -12483,6 +12002,7 @@ impl LanguageServer for Backend {
         let params = DidChangeWatchedFilesParams {
             changes: remaining_changes,
         };
+        self.state.read().await.watched_package_retry.cancel();
 
         // A watcher notification for the exact spelling the client opened is
         // also the filesystem signal that a symlink/case alias topology may
@@ -12503,10 +12023,9 @@ impl LanguageServer for Backend {
         }
 
         // Collect URIs to update and affected open documents
-        let (uris_to_update, mut affected_open_docs, pkg_manifest_changes, deleted_uris): (
+        let (uris_to_update, affected_open_docs, deleted_uris): (
             Vec<WatchedResyncItem>,
             Vec<Url>,
-            Vec<WatchedManifestChange>,
             Vec<WatchedResyncItem>,
         ) = {
             let mut state = self.state.write().await;
@@ -12516,7 +12035,6 @@ impl LanguageServer for Backend {
             // watched-file changes can otherwise spend the lock-hold time
             // doing Vec::contains scans per dependent.
             let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
-            let workspace_exclusions = state.workspace_exclusions.clone();
             // Track whether any deletion touched `package_inputs`, so that
             // mixed batches (deletions + non-R creates/changes) still trigger
             // a re-derive. Without this, a batch like
@@ -12527,7 +12045,6 @@ impl LanguageServer for Backend {
             // symbols from the deleted R file stale in
             // `scope_contribution.r_internal_symbols` until the next R/
             // edit happened to trigger a derive.
-            let mut had_pkg_deletion = false;
             let mut deleted_uris = Vec::new();
 
             for change in &params.changes {
@@ -12561,21 +12078,6 @@ impl LanguageServer for Backend {
                                 &state,
                                 uri,
                             );
-                            let event =
-                                crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                                    uri: uri.clone(),
-                                    on_disk_text: None,
-                                    deleted: true,
-                                };
-                            if translate_watched_package_event(
-                                &mut state,
-                                event,
-                                &workspace_exclusions,
-                            )
-                            .is_some()
-                            {
-                                had_pkg_deletion = true;
-                            }
                             log::trace!(
                                 "Queued excluded file removal in watched closed batch: {}",
                                 uri
@@ -12587,7 +12089,7 @@ impl LanguageServer for Backend {
                         // Schedule debounced update in new WorkspaceIndex (Requirement 5.1)
                         state.workspace_index.schedule_update(uri.clone());
 
-                        // Schedule for async update (legacy)
+                        // Schedule detached disk/package convergence.
                         to_update.push(WatchedResyncItem {
                             uri: uri.clone(),
                             generation,
@@ -12608,27 +12110,6 @@ impl LanguageServer for Backend {
                             generation,
                         });
 
-                        // Update package inputs for deleted R/*.R or DESCRIPTION/NAMESPACE files.
-                        // The event-driven path in the post-loop block handles the derive.
-                        // (Accumulated here; apply_package_event called once after the loop.)
-                        {
-                            let event =
-                                crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                                    uri: uri.clone(),
-                                    on_disk_text: None,
-                                    deleted: true,
-                                };
-                            if translate_watched_package_event(
-                                &mut state,
-                                event,
-                                &workspace_exclusions,
-                            )
-                            .is_some()
-                            {
-                                had_pkg_deletion = true;
-                            }
-                        }
-
                         log::trace!("Removed deleted file from cross-file state: {}", uri);
                     }
                     _ => {}
@@ -12640,112 +12121,13 @@ impl LanguageServer for Backend {
             // force-republish marking until after the post-update graph walk
             // has added newly reachable open documents. For DELETED-only
             // batches, the graph is already updated here, so cap and mark now.
-            if to_update.is_empty() {
-                // Derive package state after processing all deletions.
-                // The translate calls above accumulated input mutations; now
-                // derive the final state from the updated inputs. Skip the
-                // re-derive when no package source files were deleted —
-                // non-package deletions (e.g. `data/foo.csv`) leave
-                // `package_inputs` untouched, and a re-derive from
-                // unchanged inputs cannot change `package_state`.
-                if should_rederive_after_deletion_batch(
-                    state.package_inputs.workspace_root.is_some(),
-                    had_pkg_deletion,
-                ) {
-                    let old_ns_model = state.package_state.namespace_model().cloned();
-                    let old_contribution = state.package_state.scope_contribution().clone();
-                    state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
-                    let pkg_visibility_changed = state.package_state.namespace_model()
-                        != old_ns_model.as_ref()
-                        || state.package_state.scope_contribution() != &old_contribution;
-                    if pkg_visibility_changed
-                        && let Some(root) = state.package_inputs.workspace_root.clone()
-                    {
-                        extend_with_open_package_docs(
-                            &mut affected,
-                            &mut affected_set,
-                            &state,
-                            &root,
-                        );
-                        // R/+tests/ fanout above misses arbitrary load_all
-                        // carriers (e.g. root-level analysis.R / scripts/) and
-                        // their source-graph neighborhood; widen for them too.
-                        extend_affected_for_load_all_revalidation_from_state(
-                            &mut affected,
-                            &mut affected_set,
-                            &state,
-                            &root,
-                        );
-                    }
-                }
-            } else if had_pkg_deletion && state.package_inputs.workspace_root.is_some() {
-                // Mixed batch: deletions of package source files were applied
-                // above but `to_update` is non-empty, so the DELETED-only
-                // branch doesn't run. The async block below gates its derive
-                // on `uris_to_update` containing a package source path, which
-                // doesn't cover deletion-only mutations to `package_inputs`.
-                // Run the derive eagerly here so sibling diagnostics don't
-                // see stale `r_internal_symbols` entries for the deleted
-                // files until some later edit happens to trigger a derive.
-                let old_ns_model = state.package_state.namespace_model().cloned();
-                let old_contribution = state.package_state.scope_contribution().clone();
-                state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
-                let pkg_visibility_changed = state.package_state.namespace_model()
-                    != old_ns_model.as_ref()
-                    || state.package_state.scope_contribution() != &old_contribution;
-                if pkg_visibility_changed
-                    && let Some(root) = state.package_inputs.workspace_root.clone()
-                {
-                    extend_with_open_package_docs(&mut affected, &mut affected_set, &state, &root);
-                    extend_affected_for_load_all_revalidation_from_state(
-                        &mut affected,
-                        &mut affected_set,
-                        &state,
-                        &root,
-                    );
-                }
-            }
             // Watched-file deletions can drop edges that put a closed neighbor
             // outside the open-document neighborhood; refresh the pin set so
             // newly unreachable URIs become LRU-evictable again.
 
-            // Identify DESCRIPTION/NAMESPACE changes for the event-driven path.
-            // Content is read outside the lock (spawn_blocking) below.
-            let pkg_manifest_changes: Vec<WatchedManifestChange> = {
-                params
-                    .changes
-                    .iter()
-                    .filter_map(|c| {
-                        watched_manifest_change_for_uri(
-                            &state,
-                            &c.uri,
-                            c.typ == FileChangeType::DELETED,
-                        )
-                        .map(|(uri, deleted)| WatchedManifestChange {
-                            uri,
-                            deleted,
-                            generation_expectation: None,
-                        })
-                    })
-                    .collect()
-            };
-
-            (to_update, affected, pkg_manifest_changes, deleted_uris)
+            (to_update, affected, deleted_uris)
         };
 
-        // --- Package manifest (DESCRIPTION/NAMESPACE/.Rprofile) event-driven update ---
-        // For each changed manifest file, read content outside the lock then
-        // translate into package input mutations and re-derive state.
-        let manifest_transfer = apply_watched_manifest_changes(
-            &self.state,
-            &mut affected_open_docs,
-            &pkg_manifest_changes,
-            uris_to_update.is_empty(),
-        )
-        .await;
-        let manifest_transfer_handles = manifest_transfer
-            .map(|transfer| vec![transfer.handle])
-            .unwrap_or_default();
         // Schedule async disk reads to update workspace index for changed files.
         // CREATED/CHANGED graph mutations happen inside the spawned task, so
         // diagnostic publishes for `affected_open_docs` must be deferred to
@@ -12766,9 +12148,9 @@ impl LanguageServer for Backend {
                         affected: affected_open_docs,
                         deletions: deleted_uris,
                         reserved_tickets: Vec::new(),
-                        transfer_handles: manifest_transfer_handles.clone(),
+                        transfer_handles: Vec::new(),
                         mode: WatchedResyncBatchMode::Immediate,
-                        retry_remaining: true,
+                        attempts_remaining: 2,
                     },
                 )
                 .await;
@@ -12785,9 +12167,9 @@ impl LanguageServer for Backend {
                     affected: affected_open_docs,
                     deletions: deleted_uris,
                     reserved_tickets: Vec::new(),
-                    transfer_handles: manifest_transfer_handles,
+                    transfer_handles: Vec::new(),
                     mode: WatchedResyncBatchMode::Immediate,
-                    retry_remaining: true,
+                    attempts_remaining: 2,
                 },
             )
             .await;
@@ -19380,7 +18762,7 @@ mod tests {
     /// Regression tests for package path and input helpers.
     mod package_input_helpers {
         use super::super::{
-            collect_package_r_file_inputs_from_disk, extend_with_open_package_docs,
+            collect_package_r_file_inputs_from_disk,
             initialize_package_inputs_from_state_with_exclusions, is_package_data_path,
             is_package_relevant_open_uri, is_package_source_dir,
             package_scope_workspace_r_path_for_open_document, path_in_rprofile_sourced_set,
@@ -19391,51 +18773,6 @@ mod tests {
 
         fn pkg_root() -> PathBuf {
             PathBuf::from("/work/pkg")
-        }
-
-        fn r_uri(name: &str) -> Url {
-            Url::from_file_path(pkg_root().join("R").join(name)).unwrap()
-        }
-
-        fn make_state_with_open_pkg_docs(names: &[&str]) -> WorldState {
-            let mut state = WorldState::new();
-            state
-                .workspace_folders
-                .push(Url::from_file_path(pkg_root()).unwrap());
-            // Deterministic cap for tests; explicit overrides come per-test.
-            state.cross_file_config.max_revalidations_per_trigger = 10;
-            for name in names {
-                state
-                    .documents
-                    .insert(r_uri(name), Document::new("x <- 1\n", Some(1)));
-            }
-            state
-        }
-
-        #[test]
-        fn open_package_doc_extension_dedupes_and_includes_tests() {
-            let mut state = make_state_with_open_pkg_docs(&["a.R", "b.R"]);
-            let test_uri =
-                Url::from_file_path(pkg_root().join("tests").join("testthat").join("test-a.R"))
-                    .unwrap();
-            state
-                .documents
-                .insert(test_uri.clone(), Document::new("helper()\n", Some(1)));
-            let scratch = Url::from_file_path(pkg_root().join("scratch.R")).unwrap();
-            state
-                .documents
-                .insert(scratch.clone(), Document::new("scratch <- 1\n", Some(1)));
-
-            let existing = r_uri("a.R");
-            let mut affected = vec![existing.clone()];
-            let mut affected_set = std::collections::HashSet::from([existing.clone()]);
-
-            extend_with_open_package_docs(&mut affected, &mut affected_set, &state, &pkg_root());
-
-            assert_eq!(affected.iter().filter(|u| *u == &existing).count(), 1);
-            assert!(affected.contains(&r_uri("b.R")));
-            assert!(affected.contains(&test_uri));
-            assert!(!affected.contains(&scratch));
         }
 
         #[test]
@@ -29607,15 +28944,17 @@ mod project_config_initialize_tests {
             root.join(".Rprofile"),
             preamble.clone(),
         ] {
-            let delta = translate_watched_package_event(
-                &mut state,
-                crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                    uri: Url::from_file_path(path).unwrap(),
-                    on_disk_text: None,
-                    deleted: false,
-                },
-                &exclusions,
-            )
+            let delta = mutate_package_inputs(&mut state, |inputs| {
+                crate::package_state::event::translate_with_exclusions(
+                    inputs,
+                    crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                        uri: Url::from_file_path(path).unwrap(),
+                        on_disk_text: None,
+                        deleted: false,
+                    },
+                    &exclusions,
+                )
+            })
             .expect("closed package input watcher must mutate inputs");
             state.apply_package_event(&delta);
         }
@@ -29692,15 +29031,17 @@ mod project_config_initialize_tests {
         fs::write(root.join("DESCRIPTION"), "Package: after\n").unwrap();
         {
             let mut state = state_arc.write().await;
-            let delta = translate_watched_package_event(
-                &mut state,
-                crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                    uri: Url::from_file_path(root.join("DESCRIPTION")).unwrap(),
-                    on_disk_text: None,
-                    deleted: false,
-                },
-                &exclusions,
-            )
+            let delta = mutate_package_inputs(&mut state, |inputs| {
+                crate::package_state::event::translate_with_exclusions(
+                    inputs,
+                    crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                        uri: Url::from_file_path(root.join("DESCRIPTION")).unwrap(),
+                        on_disk_text: None,
+                        deleted: false,
+                    },
+                    &exclusions,
+                )
+            })
             .unwrap();
             state.apply_package_event(&delta);
         }
@@ -30576,15 +29917,17 @@ mod project_config_initialize_tests {
         let replacement = root.join("data/replacement.rda");
         fs::write(&replacement, b"replacement").unwrap();
         let mut state = state_arc.write().await;
-        let delta = translate_watched_package_event(
-            &mut state,
-            crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                uri: Url::from_file_path(&replacement).unwrap(),
-                on_disk_text: None,
-                deleted: false,
-            },
-            &exclusions,
-        )
+        let delta = mutate_package_inputs(&mut state, |inputs| {
+            crate::package_state::event::translate_with_exclusions(
+                inputs,
+                crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                    uri: Url::from_file_path(&replacement).unwrap(),
+                    on_disk_text: None,
+                    deleted: false,
+                },
+                &exclusions,
+            )
+        })
         .expect("dataset watcher event must rescan package data");
         state.apply_package_event(&delta);
         assert!(state.package_inputs.dataset_names.contains("replacement"));
@@ -30623,15 +29966,17 @@ mod project_config_initialize_tests {
         )
         .unwrap();
         let mut state = state_arc.write().await;
-        let delta = translate_watched_package_event(
-            &mut state,
-            crate::package_state::event::HandlerEvent::WatchedFileChanged {
-                uri: Url::from_file_path(&replacement).unwrap(),
-                on_disk_text: None,
-                deleted: false,
-            },
-            &exclusions,
-        )
+        let delta = mutate_package_inputs(&mut state, |inputs| {
+            crate::package_state::event::translate_with_exclusions(
+                inputs,
+                crate::package_state::event::HandlerEvent::WatchedFileChanged {
+                    uri: Url::from_file_path(&replacement).unwrap(),
+                    on_disk_text: None,
+                    deleted: false,
+                },
+                &exclusions,
+            )
+        })
         .expect("sysdata watcher event must rescan package data-raw");
         state.apply_package_event(&delta);
         assert!(
@@ -31170,83 +30515,6 @@ mod project_config_initialize_tests {
         assert!(!symbols.contains("from_a"), "got {symbols:?}");
     }
 
-    /// A watched closed-file `.Rprofile` scan may finish after another package
-    /// input owner has installed newer symbols/routing and exclusions. Exercising
-    /// the commit seam directly makes that ordering deterministic: the old scan
-    /// must return no delta, which is what prevents the caller from deriving or
-    /// scheduling diagnostic fanout.
-    #[test]
-    fn stale_watched_rprofile_scan_cannot_overwrite_newer_package_inputs() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        let stale_helper = root.join("stale-helper.R");
-        let newer_helper = root.join("newer-helper.R");
-        let captured_exclusions = crate::config_file::CompiledWorkspaceExclusions::default();
-        let mut state = WorldState::new();
-        establish_package_event_translation_state(&mut state, root.clone());
-        state.workspace_exclusions = captured_exclusions.clone();
-
-        let stale_snapshot = PackageSeedInputSnapshot::capture(&state, &captured_exclusions);
-        let stale_scan = crate::package_state::rprofile::RprofileScan {
-            symbols: std::collections::BTreeSet::from(["stale_profile".to_string()]),
-            attached_packages: std::collections::BTreeSet::from(["stalePackage".to_string()]),
-            sourced_files: std::collections::BTreeSet::from([stale_helper]),
-        };
-
-        let newer_scan = crate::package_state::rprofile::RprofileScan {
-            symbols: std::collections::BTreeSet::from(["newer_profile".to_string()]),
-            attached_packages: std::collections::BTreeSet::from(["newerPackage".to_string()]),
-            sourced_files: std::collections::BTreeSet::from([newer_helper.clone()]),
-        };
-        let newer_delta = apply_rprofile_scan_to_state(&mut state, Some(newer_scan)).unwrap();
-        state.apply_package_event(&newer_delta);
-        state.workspace_exclusions = crate::config_file::compile_workspace_exclusions(
-            &serde_json::json!({ "workspace": { "exclude": ["stale/**"] } }),
-            vec![root.clone()],
-        );
-        state.record_package_input_mutation();
-
-        let generation_before_stale_commit = state.package_input_generation();
-        let package_state_before_stale_commit = state.package_state.clone();
-        let mut deltas = Vec::new();
-        if let Some(delta) = apply_watched_rprofile_scan_to_state(
-            &mut state,
-            Some(stale_scan),
-            &root,
-            &stale_snapshot,
-            &captured_exclusions,
-        ) {
-            deltas.push(delta);
-        }
-
-        assert!(
-            deltas.is_empty(),
-            "a stale watcher payload must not request derive or diagnostic fanout"
-        );
-        assert_eq!(
-            state.package_input_generation(),
-            generation_before_stale_commit,
-            "rejecting stale work must not count as a package-input mutation"
-        );
-        assert_eq!(state.package_state, package_state_before_stale_commit);
-        assert_eq!(
-            state.package_inputs.rprofile_symbols,
-            std::collections::BTreeSet::from(["newer_profile".to_string()])
-        );
-        assert_eq!(
-            state.package_inputs.rprofile_attached_packages,
-            std::collections::BTreeSet::from(["newerPackage".to_string()])
-        );
-        assert_eq!(
-            state.package_inputs.rprofile_sourced_files,
-            std::collections::BTreeSet::from([newer_helper])
-        );
-        assert_eq!(
-            state.workspace_exclusions.patterns(),
-            ["stale/**".to_string()].as_slice()
-        );
-    }
-
     /// While `.Rprofile` is OPEN with unsaved edits, a file-watcher event for it
     /// (external disk touch, or the editor's own save) must NOT overwrite the
     /// live-buffer prelude with the on-disk scan — open documents are
@@ -31406,22 +30674,17 @@ mod project_config_initialize_tests {
         }
 
         let rprofile_uri = Url::from_file_path(root_path.join(".Rprofile")).unwrap();
-        let mut affected = Vec::new();
-        let _ = apply_watched_manifest_changes(
-            &backend.state,
-            &mut affected,
-            &[WatchedManifestChange {
-                uri: rprofile_uri,
-                deleted: false,
-                generation_expectation: None,
-            }],
-            true,
-        )
-        .await;
+        send_watched_change(backend, &rprofile_uri).await;
 
         assert!(
-            affected.contains(&alias_script_uri),
-            "watched .Rprofile fanout must schedule diagnostics for the opened alias URI, got {affected:?}"
+            wait_for_state(backend, 5_000, |state| {
+                state
+                    .package_inputs
+                    .rprofile_symbols
+                    .contains("helper_from_profile")
+            })
+            .await,
+            "watched .Rprofile must commit through the combined package projection"
         );
     }
 
@@ -32706,6 +31969,85 @@ mod project_config_initialize_tests {
         assert!(
             !snapshot_diagnostics(&state, &main_uri).is_empty(),
             "helper_fn must be flagged once the sourced file is gone"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_updates_spawn_while_delete_only_awaits_finalization() {
+        let tmp = TempDir::new().unwrap();
+        let child_path = tmp.path().join("child.R");
+        fs::write(&child_path, "child_value <- 1\n").unwrap();
+        let parent = "source(\"child.R\")\nchild_value\n";
+        fs::write(tmp.path().join("parent.R"), parent).unwrap();
+        let (svc, _parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
+        let backend = svc.inner();
+        let child_uri = Url::from_file_path(&child_path).unwrap();
+
+        fs::write(&child_path, "child_value <- 2\n").unwrap();
+        let update_pause = backend
+            .state
+            .read()
+            .await
+            .watched_batch_pre_finalize_test_pause
+            .arm(Url::parse(WATCHED_BATCH_PRE_FINALIZE_PAUSE_URI).unwrap());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            backend.did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: child_uri.clone(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            }),
+        )
+        .await
+        .expect("an update batch must acknowledge while its spawned finalizer is paused");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            update_pause.wait_arrived(),
+        )
+        .await
+        .expect("spawned update batch must reach finalization");
+        update_pause.release();
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.cross_file_file_cache.get(&child_uri).as_deref() == Some("child_value <- 2\n")
+            })
+            .await
+        );
+
+        fs::remove_file(&child_path).unwrap();
+        let delete_pause = backend
+            .state
+            .read()
+            .await
+            .watched_batch_pre_finalize_test_pause
+            .arm(Url::parse(WATCHED_BATCH_PRE_FINALIZE_PAUSE_URI).unwrap());
+        let deletion = backend.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: child_uri.clone(),
+                typ: FileChangeType::DELETED,
+            }],
+        });
+        tokio::pin!(deletion);
+        tokio::select! {
+            _ = delete_pause.wait_arrived() => {}
+            _ = &mut deletion => panic!("delete-only handler returned before finalization"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("delete-only handler did not reach finalization")
+            }
+        }
+        delete_pause.release();
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut deletion)
+            .await
+            .expect("delete-only handler must finish after finalization is released");
+        assert!(
+            backend
+                .state
+                .read()
+                .await
+                .cross_file_file_cache
+                .get(&child_uri)
+                .is_none()
         );
     }
 
@@ -35150,6 +34492,131 @@ mod project_config_initialize_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_mixed_package_inputs_commit_from_one_full_projection() {
+        let tmp = TempDir::new().unwrap();
+        for directory in ["R", "data", "data-raw", "tests/testthat", "scripts"] {
+            fs::create_dir_all(tmp.path().join(directory)).unwrap();
+        }
+        let description = tmp.path().join("DESCRIPTION");
+        let namespace = tmp.path().join("NAMESPACE");
+        let r_file = tmp.path().join("R/new.R");
+        let dataset = tmp.path().join("data/new.csv");
+        let data_raw = tmp.path().join("data-raw/new.R");
+        let preamble = tmp.path().join("tests/testthat/helper-project.R");
+        let preamble_source = tmp.path().join("scripts/preamble.R");
+        fs::write(&description, "Package: newpkg\nVersion: 1.0.0\n").unwrap();
+        fs::write(&namespace, "export(new_fun)\n").unwrap();
+        fs::write(&r_file, "new_fun <- function() 1\n").unwrap();
+        fs::write(&dataset, "value\n1\n").unwrap();
+        fs::write(
+            &data_raw,
+            "usethis::use_data(new_internal, internal = TRUE)\n",
+        )
+        .unwrap();
+        fs::write(&preamble, "source(\"../../scripts/preamble.R\")\n").unwrap();
+        fs::write(&preamble_source, "preamble_value <- 1\n").unwrap();
+        fs::write(tmp.path().join("main.R"), "new_fun()\n").unwrap();
+
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "new_fun()\n").await;
+        let backend = svc.inner();
+        {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+            state.package_inputs.package_mode = crate::cross_file::config::PackageMode::Auto;
+        }
+        let (routing_before, reservations_before) = {
+            let state = backend.state.read().await;
+            (
+                state.system_file_routing_owner_generation(),
+                state.analysis_revalidation_reservation_count,
+            )
+        };
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: [
+                    &description,
+                    &namespace,
+                    &r_file,
+                    &dataset,
+                    &data_raw,
+                    &preamble,
+                    &preamble_source,
+                ]
+                .into_iter()
+                .map(|path| FileEvent {
+                    uri: Url::from_file_path(path).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                })
+                .collect(),
+            })
+            .await;
+
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state
+                    .package_state
+                    .workspace()
+                    .map(|workspace| workspace.name.as_str())
+                    == Some("newpkg")
+                    && state
+                        .package_inputs
+                        .namespace
+                        .as_ref()
+                        .is_some_and(|input| input.text.as_ref() == "export(new_fun)\n")
+                    && state
+                        .package_inputs
+                        .r_files
+                        .get(&r_file)
+                        .is_some_and(|input| input.text.as_ref() == "new_fun <- function() 1\n")
+                    && state.package_inputs.dataset_names.contains("new")
+                    && state.package_inputs.sysdata_names.contains("new_internal")
+                    && state
+                        .package_inputs
+                        .preamble_sourced_symbols
+                        .values()
+                        .any(|symbols| symbols.contains("preamble_value"))
+                    && state.analysis_revalidation_reservation_count > reservations_before
+            })
+            .await,
+            "one watched projection must converge every package-backed input tier"
+        );
+        let (routing_after, reservations_after, attempts_after) = {
+            let state = backend.state.read().await;
+            (
+                state.system_file_routing_owner_generation(),
+                state.analysis_revalidation_reservation_count,
+                state.watched_batch_test_commit_attempts,
+            )
+        };
+        assert_ne!(
+            routing_after, routing_before,
+            "DESCRIPTION package-name installation must own routing convergence"
+        );
+        assert_eq!(
+            reservations_after - reservations_before,
+            1,
+            "package, system-file, and file candidates must merge into one final reservation"
+        );
+
+        send_watched_change(backend, &Url::from_file_path(&description).unwrap()).await;
+        assert!(
+            wait_for_state(backend, 5_000, |state| {
+                state.watched_batch_test_commit_attempts > attempts_after
+            })
+            .await
+        );
+        assert_eq!(
+            backend
+                .state
+                .read()
+                .await
+                .system_file_routing_owner_generation(),
+            routing_after,
+            "a value-equal DESCRIPTION projection must not mint a routing owner"
+        );
+    }
+
     /// Issue #564: when a watched CHANGED read sees invalid UTF-8 and the
     /// delayed retry still sees invalid UTF-8, the file converges like a
     /// deletion instead of retaining its previous graph/index/package state
@@ -35291,7 +34758,7 @@ mod project_config_initialize_tests {
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
-                retry_remaining: true,
+                attempts_remaining: 2,
             },
         )
         .await;
@@ -35346,7 +34813,7 @@ mod project_config_initialize_tests {
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
-                retry_remaining: true,
+                attempts_remaining: 2,
             },
         )
         .await;
@@ -35397,7 +34864,7 @@ mod project_config_initialize_tests {
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
-                retry_remaining: true,
+                attempts_remaining: 2,
             },
         )
         .await;
@@ -35454,7 +34921,7 @@ mod project_config_initialize_tests {
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
-                retry_remaining: true,
+                attempts_remaining: 2,
             },
         )
         .await;
@@ -35473,282 +34940,6 @@ mod project_config_initialize_tests {
             state.package_state.workspace().map(|ws| ws.name.as_str()),
             Some("oldpkg"),
             "superseded removal retry must not re-derive package state"
-        );
-    }
-
-    /// Pin the manifest apply-time guard: a removed retry outcome is current
-    /// only while the URI's generation entry is absent. If a newer event has
-    /// reinserted an entry, the stale `deleted: true` package event must not
-    /// clear DESCRIPTION.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watched_manifest_apply_skips_stale_removed_expectation() {
-        let tmp = TempDir::new().unwrap();
-        let old_desc = "Package: oldpkg\nVersion: 0.1.0\n";
-        let desc_path = tmp.path().join("DESCRIPTION");
-        fs::write(&desc_path, old_desc).unwrap();
-        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
-        let backend = svc.inner();
-        let desc_uri = Url::from_file_path(&desc_path).unwrap();
-        seed_package_description_input(backend, tmp.path(), old_desc).await;
-        let stale_generation = {
-            let mut state = backend.state.write().await;
-            let stale = bump_watched_file_resync_generation(&mut state, &desc_uri);
-            bump_watched_file_resync_generation(&mut state, &desc_uri);
-            stale
-        };
-
-        let mut affected = Vec::new();
-        let _ = apply_watched_manifest_changes(
-            &backend.state,
-            &mut affected,
-            &[WatchedManifestChange {
-                uri: desc_uri,
-                deleted: true,
-                generation_expectation: Some(WatchedPackageInputGenerationExpectation {
-                    generation: stale_generation,
-                    kind: WatchedPackageInputOutcomeKind::Removed,
-                }),
-            }],
-            false,
-        )
-        .await;
-
-        let state = backend.state.read().await;
-        assert_eq!(
-            state
-                .package_inputs
-                .description
-                .as_ref()
-                .map(|input| input.text.as_ref()),
-            Some(old_desc),
-            "stale removed manifest event must not clear DESCRIPTION at apply time"
-        );
-        assert_eq!(
-            state.package_state.workspace().map(|ws| ws.name.as_str()),
-            Some("oldpkg"),
-            "stale removed manifest event must not re-derive package state"
-        );
-        assert!(
-            affected.is_empty(),
-            "stale manifest event must not add publish fanout"
-        );
-    }
-
-    /// A manifest change collected while the file was closed must still lose
-    /// to an open document at apply time.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watched_manifest_apply_skips_open_document_at_apply_time() {
-        let tmp = TempDir::new().unwrap();
-        let old_desc = "Package: oldpkg\nVersion: 0.1.0\n";
-        let open_desc = "Package: openpkg\nVersion: 0.1.0\n";
-        let desc_path = tmp.path().join("DESCRIPTION");
-        fs::write(&desc_path, old_desc).unwrap();
-        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
-        let backend = svc.inner();
-        let desc_uri = Url::from_file_path(&desc_path).unwrap();
-        seed_package_description_input(backend, tmp.path(), old_desc).await;
-        open_doc(backend, &desc_uri, "plaintext", 1, open_desc).await;
-
-        let mut affected = Vec::new();
-        let _ = apply_watched_manifest_changes(
-            &backend.state,
-            &mut affected,
-            &[WatchedManifestChange {
-                uri: desc_uri,
-                deleted: true,
-                generation_expectation: None,
-            }],
-            false,
-        )
-        .await;
-
-        let state = backend.state.read().await;
-        assert_eq!(
-            state
-                .package_inputs
-                .description
-                .as_ref()
-                .map(|input| input.text.as_ref()),
-            Some(open_desc),
-            "apply-time manifest guard must not let a watched deletion clobber an open buffer"
-        );
-        assert_eq!(
-            state.package_state.workspace().map(|ws| ws.name.as_str()),
-            Some("openpkg"),
-            "open DESCRIPTION state must remain the derived package state"
-        );
-        assert!(
-            affected.is_empty(),
-            "skipped open manifest event must not add publish fanout"
-        );
-    }
-
-    /// Pin the R-file package apply-time generation guard directly: stale
-    /// removed retry events must not clear package inputs, while current
-    /// removed retry events still do.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watched_r_file_apply_respects_removed_expectation_currentness() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir(tmp.path().join("R")).unwrap();
-        let helper_path = tmp.path().join("R").join("helper.R");
-        let helper = "helper_fn <- function() 1\n";
-        fs::write(&helper_path, helper).unwrap();
-        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
-        let backend = svc.inner();
-        let helper_uri = Url::from_file_path(&helper_path).unwrap();
-        seed_package_r_file_input(backend, tmp.path(), "R/helper.R", helper).await;
-        let stale_generation = {
-            let mut state = backend.state.write().await;
-            let stale = bump_watched_file_resync_generation(&mut state, &helper_uri);
-            bump_watched_file_resync_generation(&mut state, &helper_uri);
-            stale
-        };
-
-        let mut affected = Vec::new();
-        let mut affected_set = std::collections::HashSet::new();
-        apply_watched_r_file_package_input_events(
-            &backend.state,
-            &mut affected,
-            &mut affected_set,
-            vec![WatchedPackageInputEvent {
-                uri: helper_uri.clone(),
-                deleted: true,
-                committed: true,
-                generation_expectation: Some(WatchedPackageInputGenerationExpectation {
-                    generation: stale_generation,
-                    kind: WatchedPackageInputOutcomeKind::Removed,
-                }),
-            }],
-            WatchedResyncBatchMode::DelayedUndecodableRetry,
-        )
-        .await;
-        assert_eq!(
-            backend
-                .state
-                .read()
-                .await
-                .package_inputs
-                .r_files
-                .get(&helper_path)
-                .map(|input| input.text.as_ref()),
-            Some(helper),
-            "stale removed R-file event must not clear package input at apply time"
-        );
-        assert!(affected.is_empty());
-
-        seed_package_r_file_input(backend, tmp.path(), "R/helper.R", helper).await;
-        {
-            let mut state = backend.state.write().await;
-            state.watched_file_resync_generations.remove(&helper_uri);
-        }
-        let mut affected = Vec::new();
-        let mut affected_set = std::collections::HashSet::new();
-        apply_watched_r_file_package_input_events(
-            &backend.state,
-            &mut affected,
-            &mut affected_set,
-            vec![WatchedPackageInputEvent {
-                uri: helper_uri.clone(),
-                deleted: true,
-                committed: true,
-                generation_expectation: Some(WatchedPackageInputGenerationExpectation {
-                    generation: stale_generation,
-                    kind: WatchedPackageInputOutcomeKind::Removed,
-                }),
-            }],
-            WatchedResyncBatchMode::DelayedUndecodableRetry,
-        )
-        .await;
-
-        assert!(
-            !backend
-                .state
-                .read()
-                .await
-                .package_inputs
-                .r_files
-                .contains_key(&helper_path),
-            "current removed R-file event must clear package input"
-        );
-    }
-
-    /// Closing a file after a retry removal pruned the generation entry
-    /// recreates that entry under the close write lock, so stale removed retry
-    /// package events cannot clear the disk truth installed by close.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn did_close_generation_bump_blocks_stale_removed_r_file_retry_apply() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir(tmp.path().join("R")).unwrap();
-        let helper_path = tmp.path().join("R").join("helper.R");
-        let helper = "helper_fn <- function() 1\n";
-        fs::write(&helper_path, helper).unwrap();
-        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
-        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
-        let backend = svc.inner();
-        let helper_uri = Url::from_file_path(&helper_path).unwrap();
-        seed_package_r_file_input(backend, tmp.path(), "R/helper.R", helper).await;
-        {
-            let mut state = backend.state.write().await;
-            state.watched_file_resync_generations.remove(&helper_uri);
-            assert!(
-                !state
-                    .watched_file_resync_generations
-                    .contains_key(&helper_uri),
-                "precondition: retry removal pruned the generation entry"
-            );
-        }
-
-        open_doc(backend, &helper_uri, "r", 1, helper).await;
-        close_doc(backend, &helper_uri).await;
-        let close_generation = {
-            let state = backend.state.read().await;
-            *state
-                .watched_file_resync_generations
-                .get(&helper_uri)
-                .expect("did_close must recreate the generation entry")
-        };
-
-        let mut affected = Vec::new();
-        let mut affected_set = std::collections::HashSet::new();
-        apply_watched_r_file_package_input_events(
-            &backend.state,
-            &mut affected,
-            &mut affected_set,
-            vec![WatchedPackageInputEvent {
-                uri: helper_uri.clone(),
-                deleted: true,
-                committed: true,
-                generation_expectation: Some(WatchedPackageInputGenerationExpectation {
-                    generation: close_generation.wrapping_sub(1),
-                    kind: WatchedPackageInputOutcomeKind::Removed,
-                }),
-            }],
-            WatchedResyncBatchMode::DelayedUndecodableRetry,
-        )
-        .await;
-
-        let state = backend.state.read().await;
-        assert_eq!(
-            state
-                .package_inputs
-                .r_files
-                .get(&helper_path)
-                .map(|input| input.text.as_ref()),
-            Some(helper),
-            "stale removed retry event must not clear package input after close owns the URI"
-        );
-        assert!(
-            state
-                .watched_file_resync_generations
-                .contains_key(&helper_uri),
-            "close-owned generation entry must remain present"
-        );
-        assert!(
-            affected.is_empty(),
-            "stale removed R-file event must not add publish fanout"
         );
     }
 
@@ -35804,7 +34995,7 @@ mod project_config_initialize_tests {
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
-                retry_remaining: true,
+                attempts_remaining: 2,
             },
         )
         .await;
@@ -41033,6 +40224,14 @@ infixContinuationStyle = "aligned"
         ))
     }
 
+    fn watched_closed_commit(
+        mutations: Vec<crate::state::PreparedClosedMutation>,
+    ) -> crate::state::PreparedAnalysisCommit {
+        crate::state::PreparedAnalysisCommit::WatchedBatch(Box::new(
+            PreparedWatchedBatchAnalysis::closed_for_test(mutations),
+        ))
+    }
+
     fn complete_refresh_token(
         state: &WorldState,
         uri: &Url,
@@ -41373,7 +40572,7 @@ infixContinuationStyle = "aligned"
             .expect("retry overlay fits");
         rederive_watched_closed_batch_overlay(overlay, std::slice::from_mut(&mut retry));
         state
-            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(vec![retry]))
+            .try_commit_analysis(watched_closed_commit(vec![retry]))
             .expect("fresh retry observes the parent and commits");
         assert!(state.workspace_index.get(&child).is_some());
     }
@@ -41421,7 +40620,7 @@ infixContinuationStyle = "aligned"
         let overlay = snapshot_watched_closed_batch_overlay(&state, &mutations).unwrap();
         rederive_watched_closed_batch_overlay(overlay, &mut mutations);
         state
-            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations))
+            .try_commit_analysis(watched_closed_commit(mutations))
             .expect("peer overlay commits atomically");
 
         assert_eq!(
@@ -41458,7 +40657,7 @@ infixContinuationStyle = "aligned"
         let overlay = snapshot_watched_closed_batch_overlay(&state, &mutations).unwrap();
         rederive_watched_closed_batch_overlay(overlay, &mut mutations);
         state
-            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations))
+            .try_commit_analysis(watched_closed_commit(mutations))
             .expect("parent removal and child rederive commit together");
 
         assert!(state.workspace_index.get_artifacts(&parent).is_none());
@@ -41533,7 +40732,7 @@ infixContinuationStyle = "aligned"
         let overlay = snapshot_watched_closed_batch_overlay(&state, &mutations).unwrap();
         rederive_watched_closed_batch_overlay(overlay, &mut mutations);
         let effects = state
-            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations))
+            .try_commit_analysis(watched_closed_commit(mutations))
             .expect("raw-only old WD transition commits");
 
         assert!(state.cross_file_meta.get(&child).is_none());
@@ -41561,7 +40760,7 @@ infixContinuationStyle = "aligned"
         rederive_watched_closed_batch_overlay(overlay, &mut stale);
         state.advance_workspace_graph_authority_generation();
         assert_eq!(
-            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(stale)),
+            state.try_commit_analysis(watched_closed_commit(stale)),
             Err(crate::state::AnalysisCommitRejected::StaleBasis)
         );
         assert!(state.workspace_index.get(&uri).is_none());
@@ -41575,7 +40774,7 @@ infixContinuationStyle = "aligned"
         let overlay = snapshot_watched_closed_batch_overlay(&state, &fresh).unwrap();
         rederive_watched_closed_batch_overlay(overlay, &mut fresh);
         state
-            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(fresh))
+            .try_commit_analysis(watched_closed_commit(fresh))
             .expect("one fresh recapture and rederive commits");
         assert_eq!(
             state
@@ -41586,6 +40785,102 @@ infixContinuationStyle = "aligned"
                 .to_string(),
             "fresh <- 2\n"
         );
+    }
+
+    #[test]
+    fn watched_package_basis_rejection_is_atomic_with_closed_mutation() {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/workspace"));
+        state.package_inputs.description = Some(crate::package_state::DescriptionInput {
+            text: Arc::from("Package: oldpkg\n"),
+        });
+        state.apply_package_event(&crate::package_state::PackageInputDelta::Initial);
+
+        let uri = Url::parse("file:///workspace/R/helper.R").unwrap();
+        state.watched_file_resync_generations.insert(uri.clone(), 7);
+        let mutation = observed_test_upsert(&state, &uri, "helper <- 1\n", Vec::new());
+        let basis = state.capture_package_projection_basis();
+        let mut inputs = state.package_inputs.clone();
+        inputs.description = Some(crate::package_state::DescriptionInput {
+            text: Arc::from("Package: candidate\n"),
+        });
+        let derived = crate::package_state::derive_package_state(
+            &state.package_state,
+            &inputs,
+            &crate::package_state::PackageInputDelta::Initial,
+        );
+
+        state.record_package_input_mutation();
+        let package_generation_before = state.package_input_generation();
+        let result = state.try_commit_analysis(crate::state::PreparedAnalysisCommit::WatchedBatch(
+            Box::new(PreparedWatchedBatchAnalysis {
+                mutations: vec![mutation],
+                package: Some((basis, PreparedPackageProjection::new(inputs, derived))),
+                package_open_records: Default::default(),
+                watched_generations: vec![(uri.clone(), 7)],
+            }),
+        ));
+
+        assert_eq!(
+            result,
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.get(&uri).is_none());
+        assert_eq!(
+            state
+                .package_inputs
+                .description
+                .as_ref()
+                .map(|input| input.text.as_ref()),
+            Some("Package: oldpkg\n")
+        );
+        assert_eq!(state.package_input_generation(), package_generation_before);
+    }
+
+    #[test]
+    fn watched_generation_and_open_record_rejections_are_atomic() {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
+        state.package_inputs.workspace_root = Some(std::path::PathBuf::from("/workspace"));
+        let uri = Url::parse("file:///workspace/R/helper.R").unwrap();
+        state.watched_file_resync_generations.insert(uri.clone(), 8);
+        let stale_generation = observed_test_upsert(&state, &uri, "stale <- 1\n", Vec::new());
+        assert_eq!(
+            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::WatchedBatch(
+                Box::new(PreparedWatchedBatchAnalysis {
+                    mutations: vec![stale_generation],
+                    package: None,
+                    package_open_records: Default::default(),
+                    watched_generations: vec![(uri.clone(), 7)],
+                },)
+            ),),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.get(&uri).is_none());
+
+        let open_uri = Url::parse("file:///workspace/R/open.R").unwrap();
+        state.open_document(open_uri, "open <- 1\n", Some(1));
+        let mutation = observed_test_upsert(&state, &uri, "candidate <- 2\n", Vec::new());
+        let basis = state.capture_package_projection_basis();
+        let inputs = state.package_inputs.clone();
+        let derived = crate::package_state::derive_package_state(
+            &state.package_state,
+            &inputs,
+            &crate::package_state::PackageInputDelta::Initial,
+        );
+        assert_eq!(
+            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::WatchedBatch(
+                Box::new(PreparedWatchedBatchAnalysis {
+                    mutations: vec![mutation],
+                    package: Some((basis, PreparedPackageProjection::new(inputs, derived))),
+                    package_open_records: Default::default(),
+                    watched_generations: vec![(uri.clone(), 8)],
+                },)
+            ),),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.get(&uri).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -41625,7 +40920,7 @@ infixContinuationStyle = "aligned"
                 reserved_tickets: Vec::new(),
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
-                retry_remaining: true,
+                attempts_remaining: 2,
             },
         )
         .await;
@@ -41659,6 +40954,122 @@ infixContinuationStyle = "aligned"
                 .any(|edge| edge.to.path().ends_with("/grand.R"))
         );
         assert!(state.documents.contains_key(&parent_uri));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_batch_exhausts_exactly_three_attempts_before_deferring() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("DESCRIPTION"), "Package: deferred\n").unwrap();
+        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let description_uri = Url::from_file_path(tmp.path().join("DESCRIPTION")).unwrap();
+        let (generation, attempts) = {
+            let mut state = backend.state.write().await;
+            state.package_inputs.workspace_root = Some(tmp.path().to_path_buf());
+            state.watched_batch_test_reject_remaining = 3;
+            (
+                bump_watched_file_resync_generation(&mut state, &description_uri),
+                state.watched_batch_test_commit_attempts,
+            )
+        };
+
+        run_watched_resync_batch(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            WatchedResyncBatch {
+                updates: vec![WatchedResyncItem {
+                    uri: description_uri,
+                    generation,
+                }],
+                affected: Vec::new(),
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                transfer_handles: Vec::new(),
+                mode: WatchedResyncBatchMode::Immediate,
+                attempts_remaining: 2,
+            },
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state.watched_batch_test_commit_attempts - attempts,
+            3,
+            "the initial candidate plus exactly two fresh recaptures run inline"
+        );
+        assert!(
+            state.watched_package_retry.has_pending(),
+            "exhaustion must hand one coalesced owner to delayed convergence"
+        );
+        state.watched_package_retry.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_frozen_disk_rejection_is_atomic_before_deferred_retry() {
+        let tmp = TempDir::new().unwrap();
+        let description_path = tmp.path().join("DESCRIPTION");
+        fs::write(&description_path, "Package: candidate\n").unwrap();
+        fs::write(tmp.path().join("main.R"), "x <- 1\n").unwrap();
+        let (svc, _main_uri) = open_in_workspace(&tmp, "main.R", "r", "x <- 1\n").await;
+        let backend = svc.inner();
+        let description_uri = Url::from_file_path(&description_path).unwrap();
+        seed_package_description_input(backend, tmp.path(), "Package: baseline\nVersion: 1.0.0\n")
+            .await;
+        let (generation, pause) = {
+            let mut state = backend.state.write().await;
+            let generation = bump_watched_file_resync_generation(&mut state, &description_uri);
+            let pause = state
+                .watched_package_pre_commit_test_pause
+                .arm(Url::parse(WATCHED_PACKAGE_PRE_COMMIT_PAUSE_URI).unwrap());
+            (generation, pause)
+        };
+
+        let run = run_watched_resync_batch(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            WatchedResyncBatch {
+                updates: vec![WatchedResyncItem {
+                    uri: description_uri.clone(),
+                    generation,
+                }],
+                affected: Vec::new(),
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                transfer_handles: Vec::new(),
+                mode: WatchedResyncBatchMode::Immediate,
+                attempts_remaining: 0,
+            },
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            _ = pause.wait_arrived() => {}
+            _ = &mut run => panic!("watched batch skipped the frozen-disk barrier"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("watched batch did not reach the frozen-disk barrier")
+            }
+        }
+        fs::write(&description_path, "Package: changed-after-capture\n").unwrap();
+        pause.release();
+        run.await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .package_inputs
+                .description
+                .as_ref()
+                .map(|input| input.text.as_ref()),
+            Some("Package: baseline\nVersion: 1.0.0\n")
+        );
+        assert!(
+            state.workspace_index.get(&description_uri).is_none(),
+            "disk rejection must not install the paired closed-file mutation"
+        );
+        assert!(state.watched_package_retry.has_pending());
+        state.watched_package_retry.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -41710,7 +41121,7 @@ infixContinuationStyle = "aligned"
                 reserved_tickets: Vec::new(),
                 transfer_handles: vec![transfer.handle],
                 mode: WatchedResyncBatchMode::Immediate,
-                retry_remaining: true,
+                attempts_remaining: 2,
             },
         )
         .await;
@@ -41781,7 +41192,7 @@ infixContinuationStyle = "aligned"
                 reserved_tickets: vec![old_ticket],
                 transfer_handles: Vec::new(),
                 mode: WatchedResyncBatchMode::Immediate,
-                retry_remaining: true,
+                attempts_remaining: 2,
             },
         )
         .await;
@@ -41829,7 +41240,7 @@ infixContinuationStyle = "aligned"
         ));
 
         assert_eq!(
-            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(vec![
+            state.try_commit_analysis(watched_closed_commit(vec![
                 crate::state::PreparedClosedMutation::Remove {
                     basis: Box::new(excluded_basis),
                     uri: excluded.clone(),
@@ -41961,7 +41372,7 @@ infixContinuationStyle = "aligned"
             .collect();
 
         let effects = state
-            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations))
+            .try_commit_analysis(watched_closed_commit(mutations))
             .expect("all batch bases are current");
 
         assert_eq!(effects.revalidations.len(), 1);
@@ -41998,7 +41409,7 @@ infixContinuationStyle = "aligned"
         ];
 
         assert_eq!(
-            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations)),
+            state.try_commit_analysis(watched_closed_commit(mutations)),
             Err(crate::state::AnalysisCommitRejected::StaleBasis)
         );
         assert!(state.workspace_index.get(&uri).is_some());
@@ -42039,7 +41450,7 @@ infixContinuationStyle = "aligned"
         let pin_count = state.open_pin_recompute_count;
 
         assert_eq!(
-            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(vec![
+            state.try_commit_analysis(watched_closed_commit(vec![
                 mutation(a_basis, &a, "a <- 1\n"),
                 mutation(b_basis, &b, "b <- 1\n"),
             ])),

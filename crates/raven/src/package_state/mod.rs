@@ -1452,6 +1452,24 @@ mod scan_data_tests {
     use tempfile::TempDir;
 
     #[test]
+    fn package_seed_retry_lifecycle_coalesces_and_completes_exact_owner() {
+        let lifecycle = PackageSeedRetryLifecycle::default();
+        let (first_generation, first) = lifecycle.schedule();
+        let (second_generation, second) = lifecycle.schedule();
+
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        assert!(lifecycle.has_pending());
+        lifecycle.complete(first_generation);
+        assert!(
+            lifecycle.has_pending(),
+            "an older completion must not retire the newer owner"
+        );
+        lifecycle.complete(second_generation);
+        assert!(!lifecycle.has_pending());
+    }
+
+    #[test]
     fn scan_finds_rda_file_stems() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
