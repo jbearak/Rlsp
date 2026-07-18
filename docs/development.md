@@ -209,6 +209,24 @@ and one version increment under the authority lock, retaining Dynamic
 artifact-only entries. CLI per-file overlays project an indexed payload without
 rereading or reparsing the file.
 
+Detached closed-file analysis commits through
+`WorldState::try_commit_analysis`. Its `AnalysisBasis` captures the exact
+subject record plus every authority consumed while preparing the result:
+watched generation, graph/config/package routing inputs, open-document context,
+and bounded exact closed/raw context identities. The write-lock commit validates
+the whole basis before mutating the index, raw cache, graph, metadata cache, or
+fanout state. Rejection is otherwise a no-op; the sole exception is releasing
+an exact still-current Pending lease so on-demand work remains retryable.
+Watched-file groups use `ClosedBatch`, which rejects duplicate or stale members
+before the first mutation, then applies the group with one pin recomputation and
+one deduplicated, activity-capped fanout reservation. Before commit, peer
+upserts/removals are overlaid on every Complete artifact resident (using the
+full payload when resident and an empty-content projection after full-payload
+eviction) and passed through the same bounded deterministic graph-derivation
+fixpoint as workspace scans. Thus a changed child never commits metadata
+derived from the pre-batch version of a parent changed or removed in the same
+watcher group. Authority rejection permits one fresh reread/rederive retry.
+
 The package-state-local static-source closure walker in `package_state/mod.rs`
 owns the traversal mechanics shared by `.Rprofile` and testthat preambles: LIFO
 order, visited/routing deduplication, rich forward path resolution, and the common
@@ -361,19 +379,19 @@ Eligibility is checked both before diagnostic computation and at the final atomi
 
 Raven intentionally keeps `tower-lsp` at `.concurrency_level(1)` so text-sync notifications remain ordered. Do not use global LSP concurrency to speed up diagnostics. Dependency-triggered fan-out is localized in `crates/raven/src/backend.rs`: `publish_diagnostics_for_uris_bounded` runs the normal debounced diagnostic pipeline for an already-computed URI set with a small fixed concurrency limit (`DIAGNOSTIC_FANOUT_CONCURRENCY`). Each worker rebuilds its own snapshot and commits through the monotonic gate.
 
-### Single-file disk resync (watched files & document close, #558)
+### Closed-file disk resync and commit (#558, #650)
 
 `resync_file_from_disk` in `crates/raven/src/backend.rs` is the shared primitive that converges one file's cross-file state (disk-content cache, workspace index, dependency graph) to its on-disk content. Two callers use it, so their semantics cannot drift:
 
 - the `did_change_watched_files` CREATED/CHANGED async pass (external disk edits to closed files), and
 - the `did_close` resync (`run_close_resync`), which discards graph topology derived from a discarded unsaved buffer.
 
-Key properties (details in the function's doc comment):
+Key properties (details in the function and commit-seam doc comments):
 
-- All disk I/O and parsing run off-lock; every mutation happens in **one** write-lock critical section whose first statement is an unconditional reopen veto — if the URI is an open document at commit time, nothing is mutated (the open buffer's own `did_open`/`did_change` pipeline is authoritative). This veto also closed a pre-#558 race where a watched-file disk commit could clobber a buffer opened during the async gap.
-- A missing file routes to `remove_file_from_cross_file_state`, the same removal primitive the watched-files DELETED branch uses.
+- All disk I/O, parsing, path-context discovery, and graph projection run off-lock. The resulting `PreparedClosedAnalysis` carries its `AnalysisBasis` to `WorldState::try_commit_analysis`, which performs the reopen veto and every authority mutation synchronously under one write lock.
+- A missing file prepares a `ClosedRemove` mutation through the same seam. The watched-files path combines CREATED/CHANGED upserts and DELETED removals in one `ClosedBatch`, so the entire observed event group is prevalidated before any raw/index/graph tier changes.
 - `old_meta` (for working-directory-change child invalidation) is caller-supplied: the close path must capture it **before** the document stores are wiped, because the unsaved buffer's metadata lives only there.
-- The publish tail (activity-capped fanout → `mark_force_republish_many` → `publish_diagnostics_for_uris_bounded`) stays caller-owned: watched-files defers it to the end of its batch; the close path runs it per close after unioning its pre-close dependent walk with the post-commit one.
+- The commit seam owns mutation-side fanout reservation: removal dependents are derived from the pre-commit graph, upsert dependents from the post-commit graph, then the union is deduplicated, activity-capped, force-marked, and assigned tickets once. Callers only await/publish the returned tickets.
 
 Watched-file invalid UTF-8 is treated as potentially transient on the immediate pass: the resync skips state removal and schedules one delayed retry. The retry captures the watched-file generation for that URI, so any newer CREATE/CHANGE/DELETE supersedes it before disk I/O or under the commit lock. `did_close` also bumps that generation under the same write lock that switches the URI from open-buffer truth back to disk/package truth, covering watcher events that were skipped while the document was open. If the delayed retry still sees invalid bytes and its generation is current, it runs with invalid-encoding-as-missing semantics and reports the same removal outcome a missing file would. `run_watched_resync_batch` owns the package-input convergence for committed retry outcomes, including DESCRIPTION, NAMESPACE, workspace `.Rprofile` manifest updates, and package R-file inputs. Those package mutations re-check retry currency under the same `WorldState` write lock that applies the mutation: an `Updated` retry requires the URI's generation table entry to still equal the captured generation, while a `Removed` retry requires the entry to still be absent after the removal commit pruned it. After package convergence, the batch caps, force-marks, and publishes affected open documents.
 

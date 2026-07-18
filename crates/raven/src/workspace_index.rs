@@ -181,6 +181,12 @@ pub struct EnrichmentClaim {
     generation: u64,
 }
 
+impl EnrichmentClaim {
+    pub(crate) fn uri(&self) -> &Url {
+        &self.uri
+    }
+}
+
 /// Exact identity authorizing refresh of one existing Complete record.
 ///
 /// Unlike the index-wide version, this remains current across unrelated URI
@@ -190,6 +196,32 @@ pub struct EnrichmentClaim {
 pub struct CompleteRefreshToken {
     uri: Url,
     record_generation: u64,
+}
+
+/// Non-mutating identity for removing exactly the observed closed slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClosedRecordToken {
+    uri: Url,
+    identity: ClosedRecordIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosedRecordIdentity {
+    Absent,
+    Pending(u64),
+    Complete(u64),
+}
+
+impl ClosedRecordToken {
+    pub(crate) fn uri(&self) -> &Url {
+        &self.uri
+    }
+}
+
+impl CompleteRefreshToken {
+    pub(crate) fn uri(&self) -> &Url {
+        &self.uri
+    }
 }
 
 /// Result of atomically claiming context-dependent enrichment.
@@ -678,6 +710,38 @@ impl WorkspaceIndex {
             .unwrap_or_default()
     }
 
+    /// Snapshot every Complete artifact resident as a full-shaped graph
+    /// derivation input. Full payloads win when resident; artifact-only
+    /// records use empty content while retaining their authoritative metadata
+    /// and artifacts.
+    pub(crate) fn graph_derivation_entries(&self) -> Vec<(Url, IndexEntry)> {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .artifacts
+                    .iter()
+                    .filter_map(|(uri, slot)| {
+                        let ArtifactSlot::Complete(artifact) = slot else {
+                            return None;
+                        };
+                        let entry = guard.full.peek(uri).cloned().unwrap_or_else(|| IndexEntry {
+                            contents: Rope::new(),
+                            tree: None,
+                            loaded_packages: Vec::new(),
+                            data_packages: Vec::new(),
+                            snapshot: artifact.snapshot.clone(),
+                            metadata: artifact.metadata.clone(),
+                            artifacts: artifact.artifacts.clone(),
+                            indexed_at_version: artifact.indexed_at_version,
+                        });
+                        Some((uri.clone(), entry))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Whether any entry satisfies `pred`, without cloning entries.
     ///
     /// Read-lock + iteration only (no LRU promotion); use as a cheap
@@ -976,6 +1040,56 @@ impl WorkspaceIndex {
         );
         state.version = next_version;
         Ok(state.full.contains(&claim.uri))
+    }
+
+    pub(crate) fn enrichment_claim_is_current(&self, claim: &EnrichmentClaim) -> bool {
+        self.inner.read().is_ok_and(|state| {
+            matches!(
+                state.artifacts.peek(&claim.uri),
+                Some(ArtifactSlot::Pending { claim_generation, .. })
+                    if *claim_generation == claim.generation
+            )
+        })
+    }
+
+    pub(crate) fn complete_refresh_is_current(&self, token: &CompleteRefreshToken) -> bool {
+        self.inner.read().is_ok_and(|state| {
+            matches!(
+                state.artifacts.peek(&token.uri),
+                Some(ArtifactSlot::Complete(entry))
+                    if entry.record_generation == token.record_generation
+            )
+        })
+    }
+
+    pub(crate) fn closed_record_token(&self, uri: &Url) -> ClosedRecordToken {
+        let identity = self
+            .inner
+            .read()
+            .ok()
+            .and_then(|state| {
+                state.artifacts.peek(uri).map(|slot| match slot {
+                    ArtifactSlot::Pending {
+                        claim_generation, ..
+                    } => ClosedRecordIdentity::Pending(*claim_generation),
+                    ArtifactSlot::Complete(entry) => {
+                        ClosedRecordIdentity::Complete(entry.record_generation)
+                    }
+                })
+            })
+            .unwrap_or(ClosedRecordIdentity::Absent);
+        ClosedRecordToken {
+            uri: uri.clone(),
+            identity,
+        }
+    }
+
+    pub(crate) fn closed_record_token_is_current(&self, token: &ClosedRecordToken) -> bool {
+        self.closed_record_token(&token.uri).identity == token.identity
+    }
+
+    pub(crate) fn closed_record_token_is_present(&self, token: &ClosedRecordToken) -> bool {
+        !matches!(token.identity, ClosedRecordIdentity::Absent)
     }
 
     /// Replace the exact Complete record captured by `token`.

@@ -4809,15 +4809,11 @@ pub(crate) fn sysdata_r_fallback_needed(state: &WorldState) -> bool {
 /// source the removed file lose its symbols) and forward (children that were
 /// sourced by it lose their inherited parent scope).
 ///
-/// Deliberately caller-owned, because batching differs per caller:
-/// - `package_inputs` translation (`HandlerEvent::WatchedFileChanged { deleted: true }`);
-/// - `recompute_open_neighborhood_pins` — the watched-files DELETED loop
-///   recomputes pins once per batch, not once per file;
-/// - force-republish marking and diagnostics publishing.
-///
-/// Shared by the watched-files `FileChangeType::DELETED` branch and the
-/// `did_close` disk-resync path (issue #558), so removal semantics cannot
-/// drift between them.
+/// This is retained for synchronous live-document and exclusion transitions.
+/// Detached disk resync and watched-file batches must instead prepare a
+/// [`crate::state::PreparedClosedMutation::Remove`] and commit through
+/// [`WorldState::try_commit_analysis`] so validation, pins, and fanout remain
+/// atomic with removal.
 fn remove_file_from_cross_file_state(state: &mut WorldState, uri: &Url) -> Vec<Url> {
     let neighbors = state.affected_open_dependents_after_edit(uri, true, false);
 
@@ -4880,17 +4876,41 @@ fn collect_backward_parent_content(
     workspace_root: Option<&Url>,
     meta: &crate::cross_file::CrossFileMetadata,
 ) -> std::collections::HashMap<Url, String> {
+    collect_backward_parent_content_with(uri, workspace_root, meta, |parent_uri| {
+        state.content_provider().get_content(parent_uri)
+    })
+    .0
+}
+
+/// Collect both successful backward-parent content and every resolved URI
+/// whose content authority was consulted. Missing content is an observation:
+/// detached analysis must validate that `None` remains current at commit.
+fn collect_backward_parent_content_with(
+    uri: &Url,
+    workspace_root: Option<&Url>,
+    meta: &crate::cross_file::CrossFileMetadata,
+    mut get_content: impl FnMut(&Url) -> Option<String>,
+) -> (std::collections::HashMap<Url, String>, Vec<Url>) {
     let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(uri, workspace_root);
-    meta.sourced_by
-        .iter()
-        .filter_map(|d| {
-            let ctx = backward_path_ctx.as_ref()?;
-            let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-            let parent_uri = Url::from_file_path(resolved).ok()?;
-            let content = state.content_provider().get_content(&parent_uri)?;
-            Some((parent_uri, content))
-        })
-        .collect()
+    let mut content = std::collections::HashMap::new();
+    let mut attempted = Vec::new();
+    for directive in &meta.sourced_by {
+        let Some(ctx) = backward_path_ctx.as_ref() else {
+            continue;
+        };
+        let Some(resolved) = crate::cross_file::path_resolve::resolve_path(&directive.path, ctx)
+        else {
+            continue;
+        };
+        let Ok(parent_uri) = Url::from_file_path(resolved) else {
+            continue;
+        };
+        attempted.push(parent_uri.clone());
+        if let Some(parent_content) = get_content(&parent_uri) {
+            content.insert(parent_uri, parent_content);
+        }
+    }
+    (content, attempted)
 }
 
 fn extract_enriched_live_metadata(
@@ -4951,41 +4971,6 @@ fn source_targets_to_index_for_live_diagnostics(
     }
 
     files_to_index
-}
-
-/// Commit one on-demand analysis before publishing its associated raw-content
-/// cache memo. A stale claim therefore mutates neither authority.
-fn commit_on_demand_record(
-    state: &mut WorldState,
-    uri: &Url,
-    claim: Option<&crate::workspace_index::EnrichmentClaim>,
-    refresh: Option<&crate::workspace_index::CompleteRefreshToken>,
-    entry: crate::workspace_index::IndexEntry,
-    snapshot: crate::cross_file::file_cache::FileSnapshot,
-    content: String,
-) -> bool {
-    if state.is_document_open_or_alias(uri) {
-        return false;
-    }
-    let committed = match (claim, refresh) {
-        (Some(claim), None) => state
-            .workspace_index
-            .commit_enrichment(claim, entry)
-            .is_ok(),
-        (None, Some(refresh)) => state
-            .workspace_index
-            .commit_complete_refresh(refresh, entry)
-            .is_ok(),
-        _ => false,
-    };
-    if !committed {
-        return false;
-    }
-    state.advance_workspace_scan_generation();
-    state
-        .cross_file_file_cache
-        .insert(uri.clone(), snapshot, content);
-    true
 }
 
 fn update_project_excluded_live_graph(
@@ -5083,25 +5068,30 @@ fn update_cross_file_graph_for_roots(
     result
 }
 
-/// What a single-file disk resync did, so the caller can fold the affected
-/// open dependents into its own fanout batch (capping, force-republish
-/// marking, and publishing stay caller-owned — callers batch differently).
+/// What a single-file disk resync did. Immediate commits return their atomic
+/// fanout reservation; watched batches return a prepared mutation so the
+/// group can validate and reserve once.
 enum ResyncOutcome {
-    /// Disk content was committed. `affected_after_commit` is the deduped
-    /// union of open working-directory-invalidated children and — when the
-    /// commit changed edges — the post-update
-    /// `compute_affected_dependents_after_edit` walk. `new_interface_hash`
-    /// is the committed disk artifacts' `interface_hash`, so callers that
-    /// know the pre-resync hash (the close path captures the buffer's) can
-    /// widen their fanout on interface-only changes.
+    /// Disk content was committed. `effects` owns the exact force-marked
+    /// post-commit fanout reserved atomically with the record/graph/cache
+    /// transaction. `new_interface_hash` is the committed disk artifacts'
+    /// `interface_hash`, so callers that know the pre-resync hash (the close
+    /// path captures the buffer's) can widen their remaining fanout.
     Updated {
-        affected_after_commit: Vec<Url>,
+        effects: crate::state::AnalysisCommitEffects,
         new_interface_hash: u64,
     },
-    /// The file no longer exists on disk; its cross-file state was removed
-    /// via `remove_file_from_cross_file_state`. `affected_dependents` comes
-    /// from the pre-removal graph.
-    Removed { affected_dependents: Vec<Url> },
+    /// The file no longer exists on disk; its closed authority, graph, raw
+    /// memo, metadata memo, pins, and fanout reservation were removed in one
+    /// analysis transaction.
+    Removed {
+        effects: crate::state::AnalysisCommitEffects,
+    },
+    /// Preparation completed without mutation for a watched multi-file batch.
+    Prepared {
+        mutation: crate::state::PreparedClosedMutation,
+        deleted: bool,
+    },
     /// The URI was an open document at commit time, so the disk state was
     /// discarded untouched: the open buffer is authoritative, and its own
     /// `did_open`/`did_change` pipeline has already installed fresher state.
@@ -5118,6 +5108,12 @@ enum ResyncOutcome {
     Skipped,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResyncCommitMode {
+    Immediate,
+    Batch,
+}
+
 #[derive(Clone)]
 struct WatchedResyncItem {
     uri: Url,
@@ -5128,6 +5124,166 @@ struct WatchedResyncItem {
 enum WatchedResyncBatchMode {
     Immediate,
     DelayedUndecodableRetry,
+}
+
+struct WatchedResyncBatch {
+    updates: Vec<WatchedResyncItem>,
+    affected: Vec<Url>,
+    deletions: Vec<WatchedResyncItem>,
+    reserved_tickets: Vec<crate::state::AnalysisRevalidationTicket>,
+    mode: WatchedResyncBatchMode,
+    retry_remaining: bool,
+}
+
+struct WatchedClosedBatchOverlay {
+    entries: HashMap<Url, crate::workspace_index::IndexEntry>,
+    open_overlays: Vec<WorkspaceGraphOverlay>,
+    context: WorkspaceGraphDerivationContext,
+    old_metadata: HashMap<Url, Arc<crate::cross_file::CrossFileMetadata>>,
+    old_graph: crate::cross_file::dependency::DependencyGraph,
+}
+
+fn snapshot_watched_closed_batch_overlay(
+    state: &WorldState,
+    mutations: &[crate::state::PreparedClosedMutation],
+) -> Option<WatchedClosedBatchOverlay> {
+    let open_overlays = snapshot_workspace_graph_overlays(state);
+    let mut entries: HashMap<_, _> = state
+        .workspace_index
+        .graph_derivation_entries()
+        .into_iter()
+        .collect();
+    let mut old_metadata = HashMap::new();
+    for mutation in mutations {
+        match mutation {
+            crate::state::PreparedClosedMutation::Upsert(prepared) => {
+                if let Some(entry) = entries.get(&prepared.uri) {
+                    old_metadata.insert(prepared.uri.clone(), entry.metadata.clone());
+                }
+                entries.insert(prepared.uri.clone(), prepared.entry.clone());
+            }
+            crate::state::PreparedClosedMutation::Remove { uri, .. } => {
+                if let Some(entry) = entries.remove(uri) {
+                    old_metadata.insert(uri.clone(), entry.metadata);
+                }
+            }
+        }
+    }
+    let budget = state
+        .cross_file_config
+        .max_transitive_dependents_visited
+        .min(WorldState::MULTI_SEED_VISITED_CEILING);
+    if entries.len().saturating_add(open_overlays.len()) > budget {
+        return None;
+    }
+    let (system_file_workspace_name, system_file_workspace_root, system_file_library_paths) =
+        state.snapshot_system_file_inputs();
+    Some(WatchedClosedBatchOverlay {
+        entries,
+        open_overlays,
+        context: WorkspaceGraphDerivationContext {
+            workspace_root: state.workspace_folders.first().cloned(),
+            max_depth: state.cross_file_config.max_chain_depth,
+            exclusions: state.workspace_exclusions.clone(),
+            system_file_workspace_name,
+            system_file_workspace_root,
+            system_file_library_paths,
+        },
+        old_metadata,
+        old_graph: state.cross_file_graph.clone(),
+    })
+}
+
+/// Re-derive every watched candidate against the same all-member overlay.
+fn rederive_watched_closed_batch_overlay(
+    mut overlay: WatchedClosedBatchOverlay,
+    mutations: &mut [crate::state::PreparedClosedMutation],
+) {
+    let targets: std::collections::HashSet<Url> = mutations
+        .iter()
+        .map(|mutation| match mutation {
+            crate::state::PreparedClosedMutation::Upsert(prepared) => prepared.uri.clone(),
+            crate::state::PreparedClosedMutation::Remove { uri, .. } => uri.clone(),
+        })
+        .collect();
+    let (_, open_metadata) = derive_workspace_dependency_graph(
+        &mut overlay.entries,
+        None,
+        &overlay.open_overlays,
+        &overlay.context,
+    );
+    let peer_content: HashMap<_, _> = overlay
+        .entries
+        .iter()
+        .filter(|(uri, _)| targets.contains(*uri))
+        .map(|(uri, entry)| (uri.clone(), entry.contents.to_string()))
+        .collect();
+
+    for mutation in mutations {
+        let crate::state::PreparedClosedMutation::Upsert(prepared) = mutation else {
+            continue;
+        };
+        let Some(derived) = overlay.entries.get(&prepared.uri) else {
+            continue;
+        };
+        prepared.entry = derived.clone();
+        prepared.graph_metadata = Arc::new(
+            WorldState::metadata_for_dependency_graph_with_exclusions(
+                &overlay.context.exclusions,
+                &prepared.uri,
+                prepared.entry.metadata.as_ref(),
+                overlay.context.workspace_root.as_ref(),
+            )
+            .into_owned(),
+        );
+        for target in &targets {
+            if let Some(content) = peer_content.get(target) {
+                prepared
+                    .parent_content
+                    .insert(target.clone(), content.clone());
+            } else {
+                prepared.parent_content.remove(target);
+            }
+        }
+        for projection in &mut prepared.additional_graph {
+            if let Some(metadata) = open_metadata.get(&projection.uri) {
+                projection.metadata = Arc::new(
+                    WorldState::metadata_for_dependency_graph_with_exclusions(
+                        &overlay.context.exclusions,
+                        &projection.uri,
+                        metadata,
+                        overlay.context.workspace_root.as_ref(),
+                    )
+                    .into_owned(),
+                );
+            }
+            for target in &targets {
+                if let Some(content) = peer_content.get(target) {
+                    projection
+                        .parent_content
+                        .insert(target.clone(), content.clone());
+                } else {
+                    projection.parent_content.remove(target);
+                }
+            }
+        }
+        prepared.wd_children.extend(
+            crate::cross_file::revalidation::detect_parent_wd_change_affected_children(
+                &prepared.uri,
+                overlay
+                    .old_metadata
+                    .get(&prepared.uri)
+                    .map(|metadata| metadata.as_ref()),
+                prepared.entry.metadata.as_ref(),
+                &overlay.old_graph,
+            ),
+        );
+        prepared
+            .wd_children
+            .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        prepared.wd_children.dedup();
+        prepared.declare_batch_overlay_contexts(&targets);
+    }
 }
 
 impl WatchedResyncBatchMode {
@@ -5300,6 +5456,7 @@ async fn resync_missing_file(
     state_arc: &Arc<RwLock<WorldState>>,
     uri: &Url,
     expected_watched_generation: Option<u64>,
+    commit_mode: ResyncCommitMode,
 ) -> ResyncOutcome {
     let mut state = state_arc.write().await;
     if state.is_document_open_or_alias(uri) {
@@ -5312,11 +5469,23 @@ async fn resync_missing_file(
         );
         return ResyncOutcome::Skipped;
     }
-    let affected_dependents = remove_file_from_cross_file_state(&mut state, uri);
-    state.recompute_open_neighborhood_pins();
-    ResyncOutcome::Removed {
-        affected_dependents,
+    let basis = state.capture_closed_removal_analysis_basis(uri);
+    if commit_mode == ResyncCommitMode::Batch {
+        return ResyncOutcome::Prepared {
+            mutation: crate::state::PreparedClosedMutation::Remove {
+                basis: Box::new(basis),
+                uri: uri.clone(),
+            },
+            deleted: true,
+        };
     }
+    let effects = state
+        .try_commit_analysis(crate::state::PreparedAnalysisCommit::Remove {
+            basis: Box::new(basis),
+            uri: uri.clone(),
+        })
+        .expect("basis captured under the same WorldState write lock");
+    ResyncOutcome::Removed { effects }
 }
 
 /// Re-sync one file's cross-file state (disk-content cache, workspace index,
@@ -5377,6 +5546,7 @@ async fn resync_file_from_disk(
     old_meta: Option<std::sync::Arc<crate::cross_file::CrossFileMetadata>>,
     undecodable_as_missing: bool,
     expected_watched_generation: Option<u64>,
+    commit_mode: ResyncCommitMode,
 ) -> ResyncOutcome {
     {
         let mut state = state_arc.write().await;
@@ -5395,11 +5565,23 @@ async fn resync_file_from_disk(
                 );
                 return ResyncOutcome::Skipped;
             }
-            let affected_dependents = remove_file_from_cross_file_state(&mut state, uri);
-            state.recompute_open_neighborhood_pins();
-            return ResyncOutcome::Removed {
-                affected_dependents,
-            };
+            let basis = state.capture_closed_removal_analysis_basis(uri);
+            if commit_mode == ResyncCommitMode::Batch {
+                return ResyncOutcome::Prepared {
+                    mutation: crate::state::PreparedClosedMutation::Remove {
+                        basis: Box::new(basis),
+                        uri: uri.clone(),
+                    },
+                    deleted: true,
+                };
+            }
+            let effects = state
+                .try_commit_analysis(crate::state::PreparedAnalysisCommit::Remove {
+                    basis: Box::new(basis),
+                    uri: uri.clone(),
+                })
+                .expect("basis captured under the same WorldState write lock");
+            return ResyncOutcome::Removed { effects };
         }
     }
 
@@ -5431,7 +5613,8 @@ async fn resync_file_from_disk(
     let content = match crate::state::read_source_async(&path).await {
         Ok(c) => c,
         Err(crate::state::SourceReadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return resync_missing_file(state_arc, uri, expected_watched_generation).await;
+            return resync_missing_file(state_arc, uri, expected_watched_generation, commit_mode)
+                .await;
         }
         Err(e @ crate::state::SourceReadError::InvalidEncoding { .. }) => {
             // See the doc comment: removal for the close path (converge with
@@ -5439,7 +5622,13 @@ async fn resync_file_from_disk(
             // watched path (transient non-atomic writes).
             if undecodable_as_missing {
                 log::trace!("Disk resync removing undecodable file state {}: {}", uri, e);
-                return resync_missing_file(state_arc, uri, expected_watched_generation).await;
+                return resync_missing_file(
+                    state_arc,
+                    uri,
+                    expected_watched_generation,
+                    commit_mode,
+                )
+                .await;
             }
             log::trace!("Disk resync skipping undecodable file {}: {}", uri, e);
             return ResyncOutcome::SkippedInvalidEncoding;
@@ -5455,7 +5644,8 @@ async fn resync_file_from_disk(
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return resync_missing_file(state_arc, uri, expected_watched_generation).await;
+            return resync_missing_file(state_arc, uri, expected_watched_generation, commit_mode)
+                .await;
         }
         Err(_) => return ResyncOutcome::Skipped,
     };
@@ -5468,21 +5658,143 @@ async fn resync_file_from_disk(
     let mut cross_file_meta =
         crate::cross_file::extract_metadata_with_tree(&analysis, tree.as_ref());
 
-    // Resolve system.file() source entries into concrete paths BEFORE
-    // computing artifacts (artifact computation consumes the resolved meta).
-    {
+    let snapshot =
+        crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
+
+    // Prepare every state-derived input under one coherent read lock. Content
+    // parsing happened above and the transaction below performs no path
+    // resolution or metadata enrichment while holding the write lock.
+    let (
+        analysis_basis,
+        workspace_root,
+        graph_metadata,
+        parent_content,
+        additional_graph,
+        wd_children,
+    ) = {
         let state = state_arc.read().await;
+        if state.is_document_open_or_alias(uri) {
+            log::trace!("Disk resync preparation vetoed by reopen: {}", uri);
+            return ResyncOutcome::Vetoed;
+        }
+        if !expected_watched_generation_is_current(&state, uri, expected_watched_generation) {
+            log::trace!(
+                "Disk resync preparation skipped because a newer watched event superseded it: {}",
+                uri
+            );
+            return ResyncOutcome::Skipped;
+        }
+
         let ws = state.package_state.workspace();
         let ws_name = ws.map(|w| w.name.as_str());
         let ws_root = ws.map(|w| w.root.as_path());
-        let lib_paths = state.package_library.lib_paths();
         crate::cross_file::resolve_system_file_sources(
             &mut cross_file_meta,
             ws_name,
             ws_root,
-            lib_paths,
+            state.package_library.lib_paths(),
         );
-    }
+
+        let workspace_root = state.workspace_folders.first().cloned();
+        let consumed_context_uris = std::cell::RefCell::new(Vec::new());
+        crate::cross_file::enrich_metadata_with_inherited_wd(
+            &mut cross_file_meta,
+            uri,
+            workspace_root.as_ref(),
+            |parent_uri| {
+                consumed_context_uris.borrow_mut().push(parent_uri.clone());
+                state.get_enriched_metadata(parent_uri)
+            },
+            state.cross_file_config.max_chain_depth,
+        );
+
+        let (parent_content, attempted_parents) = collect_backward_parent_content_with(
+            uri,
+            workspace_root.as_ref(),
+            &cross_file_meta,
+            |parent_uri| state.content_provider().get_content(parent_uri),
+        );
+        consumed_context_uris.borrow_mut().extend(attempted_parents);
+        let graph_metadata = Arc::new(
+            state
+                .metadata_for_dependency_graph(uri, &cross_file_meta, workspace_root.as_ref())
+                .into_owned(),
+        );
+
+        // Recreate incoming edges owned by open parents after an
+        // exists -> missing -> exists cycle. The graph revision in the basis
+        // makes the no-incoming-edge observation and these projections part
+        // of the same transaction.
+        let has_incoming_forward = state
+            .cross_file_graph
+            .get_dependents(uri)
+            .iter()
+            .any(|edge| !edge.is_backward_directive && !edge.non_lending);
+        let mut additional_graph = Vec::new();
+        if !has_incoming_forward {
+            let target_name = path.file_name();
+            for parent in state.documents.keys().filter(|parent| *parent != uri) {
+                let Some(parent_meta) = state
+                    .documents
+                    .get_record(parent)
+                    .map(|record| record.metadata().clone())
+                else {
+                    continue;
+                };
+                if !parent_meta.sources.iter().any(|source| {
+                    source.resolved_uri.as_ref() == Some(uri)
+                        || std::path::Path::new(&source.path).file_name() == target_name
+                }) {
+                    continue;
+                }
+                let (parent_content, attempted_parents) = collect_backward_parent_content_with(
+                    parent,
+                    workspace_root.as_ref(),
+                    &parent_meta,
+                    |parent_uri| state.content_provider().get_content(parent_uri),
+                );
+                consumed_context_uris.borrow_mut().extend(attempted_parents);
+                let metadata = Arc::new(
+                    state
+                        .metadata_for_dependency_graph(
+                            parent,
+                            &parent_meta,
+                            workspace_root.as_ref(),
+                        )
+                        .into_owned(),
+                );
+                additional_graph.push(crate::state::PreparedGraphProjection::new(
+                    parent.clone(),
+                    metadata,
+                    parent_content,
+                    state.is_project_excluded_uri(parent),
+                ));
+            }
+        }
+
+        let wd_children =
+            crate::cross_file::revalidation::detect_parent_wd_change_affected_children(
+                uri,
+                old_meta.as_deref(),
+                &cross_file_meta,
+                &state.cross_file_graph,
+            );
+        let basis = state.capture_closed_removal_analysis_basis(uri);
+        let Some(basis) =
+            state.attach_analysis_context_authorities(basis, consumed_context_uris.into_inner())
+        else {
+            log::trace!("Disk resync context authority budget exceeded: {}", uri);
+            return ResyncOutcome::Skipped;
+        };
+        (
+            basis,
+            workspace_root,
+            graph_metadata,
+            parent_content,
+            additional_graph,
+            wd_children,
+        )
+    };
 
     // **Validates: Requirements 5.1, 5.2, 5.3, 5.4** (Diagnostic suppression
     // for declared symbols)
@@ -5500,71 +5812,6 @@ async fn resync_file_from_disk(
         extract_loaded_packages_from_library_calls(&cross_file_meta.library_calls);
     let data_packages = crate::state::extract_data_packages(&tree, &analysis);
 
-    let snapshot =
-        crate::cross_file::file_cache::FileSnapshot::with_content_hash(&metadata, &content);
-
-    // Single write-lock commit. The reopen veto MUST stay the first statement
-    // under the lock: nothing above mutated shared state, so a veto is total.
-    let mut state = state_arc.write().await;
-    if state.is_document_open_or_alias(uri) {
-        log::trace!("Disk resync vetoed by reopen: {}", uri);
-        return ResyncOutcome::Vetoed;
-    }
-    if !expected_watched_generation_is_current(&state, uri, expected_watched_generation) {
-        log::trace!(
-            "Disk resync commit skipped because a newer watched event superseded it: {}",
-            uri
-        );
-        return ResyncOutcome::Skipped;
-    }
-
-    // Staleness veto: a concurrent resync of the SAME file (a close resync
-    // racing a watched CHANGED event, or two watched batches) may have
-    // committed a NEWER disk snapshot between our off-lock read and this
-    // commit. The open-document vetoes are blind to that — they check
-    // openness, not freshness — so compare against the snapshot the earlier
-    // commit stored and abort rather than overwrite fresher state with an
-    // older read. (Same-mtime writes within the filesystem's timestamp
-    // granularity are not distinguished; the next watcher event converges
-    // them.)
-    if let Some(existing) = state.cross_file_file_cache.get_snapshot(uri)
-        && existing.mtime > snapshot.mtime
-    {
-        log::trace!(
-            "Disk resync staleness-vetoed (newer snapshot already committed): {}",
-            uri
-        );
-        return ResyncOutcome::Skipped;
-    }
-
-    // Inherit the parent's working directory for `# raven: sourced-by` files
-    // with no own `# raven: cd`, matching `did_open`/`did_change` and the
-    // startup scan's WD fixpoint — without it, the commit below would resolve
-    // this file's forward `source()` paths file-relative and drop edges the
-    // open buffer (or the scan) had correctly formed through the parent's WD.
-    {
-        let workspace_root = state.workspace_folders.first().cloned();
-        let max_chain_depth = state.cross_file_config.max_chain_depth;
-        crate::cross_file::enrich_metadata_with_inherited_wd(
-            &mut cross_file_meta,
-            uri,
-            workspace_root.as_ref(),
-            |parent_uri| state.get_enriched_metadata(parent_uri),
-            max_chain_depth,
-        );
-    }
-
-    // Replace the unified-index entry IN PLACE with fresh disk state.
-    // `workspace_index` outranks `workspace_index` in
-    // `get_enriched_metadata` and the content provider, so a stale scan-time
-    // entry would shadow the commit below — but merely invalidating it would
-    // drop the file from reference search, which walks this index for closed
-    // files and nothing repopulates it outside the scan / on-demand
-    // indexing. Raw contents + analysis-tree pair is the scan's own convention
-    // (masking is geometry-preserving). State-aware
-    // readers that reconstruct the analysis text from RAW contents consult
-    // `WorldState::chunk_kind_for_closed_file`, so a persisted editor-language
-    // classification keeps this tree/text pair aligned after close (#563).
     let fresh_entry = crate::workspace_index::IndexEntry {
         contents: ropey::Rope::from_str(&content),
         tree,
@@ -5575,133 +5822,43 @@ async fn resync_file_from_disk(
         artifacts: artifacts.clone(),
         indexed_at_version: 0,
     };
-    state
-        .workspace_index
-        .install_complete_preserving_provenance(uri.clone(), fresh_entry);
-
-    // Cache RAW content for future match/inference resolution (readers mask).
-    state
-        .cross_file_file_cache
-        .insert(uri.clone(), snapshot.clone(), content);
-
-    let workspace_root = state.workspace_folders.first().cloned();
-
-    let parent_content =
-        collect_backward_parent_content(&state, uri, workspace_root.as_ref(), &cross_file_meta);
-
-    let graph_meta =
-        state.metadata_for_dependency_graph(uri, &cross_file_meta, workspace_root.as_ref());
-    let graph_result = state.cross_file_graph.update_file(
-        uri,
-        graph_meta.as_ref(),
-        workspace_root.as_ref(),
-        |parent_uri| parent_content.get(parent_uri).cloned(),
+    let prepared = crate::state::PreparedClosedAnalysis::new(
+        analysis_basis,
+        uri.clone(),
+        fresh_entry,
+        snapshot,
+        content,
+        graph_metadata,
+        workspace_root,
+        parent_content,
+        additional_graph,
+        wd_children,
     );
-
-    // Restore incoming edges from OPEN parents after an exists -> missing ->
-    // exists cycle: `remove_file` strips parent -> child edges (they are
-    // owned by PARENT metadata), and updating the recreated child cannot
-    // re-derive them. Open parents still carry the resolved reference in
-    // their metadata, so when this file has no incoming forward edges,
-    // re-run `update_file` for each open parent that references it. (Closed
-    // parents converge on their own watched events or reopen — their stale
-    // edges were removed with the file, matching pre-existing behavior.)
-    let mut parent_edges_restored = false;
-    let has_incoming_forward = state
-        .cross_file_graph
-        .get_dependents(uri)
-        .iter()
-        .any(|e| !e.is_backward_directive && !e.non_lending);
-    if !has_incoming_forward {
-        // Candidate filter: ordinary `source()` entries carry only their raw
-        // path string (`resolved_uri` is populated for `system.file()`
-        // resolution only), so pre-match on the target's file name and let
-        // `update_file` do the real path resolution — a false positive is a
-        // no-op re-derivation of edges the parent already has.
-        let target_name = path.file_name();
-        let candidate_parents: Vec<Url> = state
-            .documents
-            .keys()
-            .filter(|p| *p != uri)
-            .filter(|p| {
-                state.documents.get_record(p).is_some_and(|record| {
-                    record.metadata().sources.iter().any(|s| {
-                        s.resolved_uri.as_ref() == Some(uri)
-                            || std::path::Path::new(&s.path).file_name() == target_name
-                    })
-                })
-            })
-            .cloned()
-            .collect();
-        for parent in candidate_parents {
-            let Some(parent_meta) = state
-                .documents
-                .get_record(&parent)
-                .map(|record| record.metadata().clone())
-            else {
-                continue;
-            };
-            let pc = collect_backward_parent_content(
-                &state,
-                &parent,
-                workspace_root.as_ref(),
-                &parent_meta,
-            );
-            let graph_meta =
-                state.metadata_for_dependency_graph(&parent, &parent_meta, workspace_root.as_ref());
-            let res = state.cross_file_graph.update_file(
-                &parent,
-                graph_meta.as_ref(),
-                workspace_root.as_ref(),
-                |u| pc.get(u).cloned(),
-            );
-            let mut parent_edges_changed = res.edges_changed;
-            if state.is_project_excluded_uri(&parent) {
-                parent_edges_changed |= state
-                    .cross_file_graph
-                    .make_forward_edges_non_lending(&parent);
-            }
-            parent_edges_restored |= parent_edges_changed;
-        }
+    if commit_mode == ResyncCommitMode::Batch {
+        return ResyncOutcome::Prepared {
+            mutation: crate::state::PreparedClosedMutation::Upsert(Box::new(prepared)),
+            deleted: false,
+        };
     }
-
-    // Invalidate children affected by working directory change (Requirement 8).
-    let wd_children = crate::cross_file::revalidation::invalidate_children_on_parent_wd_change(
-        uri,
-        old_meta.as_deref(),
-        &cross_file_meta,
-        &state.cross_file_graph,
-        &state.cross_file_meta,
-    );
-
-    let mut affected: Vec<Url> = Vec::new();
-    let mut affected_set: std::collections::HashSet<Url> = std::collections::HashSet::new();
-    for child in wd_children {
-        if let Some(open_child) = state.open_document_uri_for_authoritative_uri(&child)
-            && affected_set.insert(open_child.clone())
-        {
-            affected.push(open_child);
-        }
-    }
-
-    // Recompute neighbors against the POST-update graph: any forward/backward
-    // edge the new disk content introduces (e.g. a freshly-added `source()`
-    // call) — or a restored open-parent edge — is invisible to pre-update
-    // walks the caller may have done.
-    if graph_result.edges_changed || parent_edges_restored {
-        let post_neighbors = state.affected_open_dependents_after_edit(uri, true, true);
-        for dep in post_neighbors {
-            if affected_set.insert(dep.clone()) {
-                affected.push(dep);
+    let effects = {
+        let mut state = state_arc.write().await;
+        match state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Upsert(Box::new(
+            prepared,
+        ))) {
+            Ok(effects) => effects,
+            Err(crate::state::AnalysisCommitRejected::StaleBasis) => {
+                log::trace!("Disk resync transaction rejected as stale: {}", uri);
+                return if state.is_document_open_or_alias(uri) {
+                    ResyncOutcome::Vetoed
+                } else {
+                    ResyncOutcome::Skipped
+                };
             }
         }
-        // Edges moved: URIs reachable (or no longer reachable) from open
-        // documents changed, so refresh the LRU pin set.
-        state.recompute_open_neighborhood_pins();
-    }
+    };
 
     ResyncOutcome::Updated {
-        affected_after_commit: affected,
+        effects,
         new_interface_hash,
     }
 }
@@ -5782,35 +5939,54 @@ async fn run_close_resync(
         state.affected_open_dependents_after_edit(&uri, true, false)
     };
 
-    let (post, interface_changed, committed) =
-        match resync_file_from_disk(&state_arc, &uri, chunk_kind, old_meta, true, None).await {
-            ResyncOutcome::Updated {
-                affected_after_commit,
-                new_interface_hash,
-            } => {
-                // `None` (no buffer artifacts survived to the capture) is
-                // treated as changed — the safe direction.
-                let changed = old_interface_hash != Some(new_interface_hash);
-                (affected_after_commit, changed, true)
-            }
-            ResyncOutcome::Removed {
-                affected_dependents,
-            } => (affected_dependents, false, true),
-            ResyncOutcome::Vetoed
-            | ResyncOutcome::SkippedInvalidEncoding
-            | ResyncOutcome::Skipped => (Vec::new(), false, false),
-        };
+    let mut reserved_tickets = Vec::new();
+    let (post, interface_changed, committed) = match resync_file_from_disk(
+        &state_arc,
+        &uri,
+        chunk_kind,
+        old_meta,
+        true,
+        None,
+        ResyncCommitMode::Immediate,
+    )
+    .await
+    {
+        ResyncOutcome::Updated {
+            effects,
+            new_interface_hash,
+        } => {
+            reserved_tickets = effects.revalidations;
+            // `None` (no buffer artifacts survived to the capture) is
+            // treated as changed — the safe direction.
+            let changed = old_interface_hash != Some(new_interface_hash);
+            (Vec::new(), changed, true)
+        }
+        ResyncOutcome::Removed { effects } => {
+            reserved_tickets = effects.revalidations;
+            (Vec::new(), false, true)
+        }
+        ResyncOutcome::Prepared { .. } => {
+            unreachable!("close resync uses immediate commit mode")
+        }
+        ResyncOutcome::Vetoed | ResyncOutcome::SkippedInvalidEncoding | ResyncOutcome::Skipped => {
+            (Vec::new(), false, false)
+        }
+    };
 
     let mut affected: Vec<Url> = Vec::new();
     let mut seen: std::collections::HashSet<Url> = std::collections::HashSet::new();
+    let reserved_uris: std::collections::HashSet<Url> = reserved_tickets
+        .iter()
+        .map(|ticket| ticket.uri.clone())
+        .collect();
     for dep in package_sibling_fanout {
-        if seen.insert(dep.clone()) {
+        if !reserved_uris.contains(&dep) && seen.insert(dep.clone()) {
             affected.push(dep);
         }
     }
     if committed {
         for dep in pre_affected.into_iter().chain(post) {
-            if seen.insert(dep.clone()) {
+            if !reserved_uris.contains(&dep) && seen.insert(dep.clone()) {
                 affected.push(dep);
             }
         }
@@ -5828,7 +6004,7 @@ async fn run_close_resync(
         if committed && interface_changed {
             let post_commit_deps = state.affected_open_dependents_after_edit(&uri, true, false);
             for dep in post_commit_deps {
-                if seen.insert(dep.clone()) {
+                if !reserved_uris.contains(&dep) && seen.insert(dep.clone()) {
                     affected.push(dep);
                 }
             }
@@ -5837,17 +6013,29 @@ async fn run_close_resync(
         // URI would leave an orphan force-republish counter for a later
         // reopen to inherit (`did_close` clears the gate only at ITS close).
         affected.retain(|u| state.documents.contains_key(u));
-        if affected.is_empty() {
-            return;
+        if !affected.is_empty() {
+            cap_watched_file_revalidations(
+                &mut affected,
+                &state.cross_file_activity,
+                state.cross_file_config.max_revalidations_per_trigger,
+            );
+            state
+                .diagnostics_gate
+                .mark_force_republish_many(affected.iter());
         }
-        cap_watched_file_revalidations(
-            &mut affected,
-            &state.cross_file_activity,
-            state.cross_file_config.max_revalidations_per_trigger,
-        );
-        state
-            .diagnostics_gate
-            .mark_force_republish_many(affected.iter());
+    }
+    if affected.is_empty() && reserved_tickets.is_empty() {
+        return;
+    }
+    for ticket in reserved_tickets {
+        tokio::spawn(run_debounced_diagnostics(
+            state_arc.clone(),
+            client.clone(),
+            ticket.uri,
+            ticket.debounce_ms,
+            ticket.trigger,
+            Some(traversal_truncation.clone()),
+        ));
     }
     Backend::publish_diagnostics_for_uris_bounded(
         state_arc,
@@ -5894,9 +6082,14 @@ fn spawn_watched_undecodable_retry(
             state_arc,
             client,
             traversal_truncation,
-            vec![item],
-            affected,
-            WatchedResyncBatchMode::DelayedUndecodableRetry,
+            WatchedResyncBatch {
+                updates: vec![item],
+                affected,
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
+                retry_remaining: true,
+            },
         )
         .await;
     });
@@ -5925,14 +6118,23 @@ async fn run_watched_resync_batch(
     state_arc: Arc<RwLock<WorldState>>,
     client: Client,
     traversal_truncation: Arc<TraversalTruncationState>,
-    uris_to_update: Vec<WatchedResyncItem>,
-    mut affected_for_async: Vec<Url>,
-    mode: WatchedResyncBatchMode,
+    batch: WatchedResyncBatch,
 ) {
+    let WatchedResyncBatch {
+        updates: uris_to_update,
+        affected: mut affected_for_async,
+        deletions: deleted_uris,
+        mut reserved_tickets,
+        mode,
+        retry_remaining,
+    } = batch;
+    let await_reserved_tickets =
+        matches!(mode, WatchedResyncBatchMode::Immediate) && uris_to_update.is_empty();
     let mut affected_for_async_set: std::collections::HashSet<Url> =
         affected_for_async.iter().cloned().collect();
     let mut package_input_events: Vec<WatchedPackageInputEvent> = Vec::new();
-
+    let mut prepared_mutations = Vec::new();
+    let mut prepared_event_indices = Vec::new();
     for item in &uris_to_update {
         // Capture old metadata before the disk read (for WD change
         // detection). The file was never open — the sync pass skips open
@@ -5953,18 +6155,12 @@ async fn run_watched_resync_batch(
             old_meta,
             mode.undecodable_as_missing(),
             Some(item.generation),
+            ResyncCommitMode::Batch,
         )
         .await
         {
-            ResyncOutcome::Updated {
-                affected_after_commit: deps,
-                ..
-            } => {
-                for dep in deps {
-                    if affected_for_async_set.insert(dep.clone()) {
-                        affected_for_async.push(dep);
-                    }
-                }
+            ResyncOutcome::Updated { effects, .. } => {
+                reserved_tickets.extend(effects.revalidations);
                 package_input_events.push(WatchedPackageInputEvent {
                     uri: item.uri.clone(),
                     deleted: false,
@@ -5980,14 +6176,8 @@ async fn run_watched_resync_batch(
                 });
                 log::trace!("Updated workspace index for: {}", item.uri);
             }
-            ResyncOutcome::Removed {
-                affected_dependents: deps,
-            } => {
-                for dep in deps {
-                    if affected_for_async_set.insert(dep.clone()) {
-                        affected_for_async.push(dep);
-                    }
-                }
+            ResyncOutcome::Removed { effects } => {
+                reserved_tickets.extend(effects.revalidations);
                 package_input_events.push(WatchedPackageInputEvent {
                     uri: item.uri.clone(),
                     deleted: true,
@@ -6002,6 +6192,27 @@ async fn run_watched_resync_batch(
                     }),
                 });
                 log::trace!("Removed watched file state during resync: {}", item.uri);
+            }
+            ResyncOutcome::Prepared { mutation, deleted } => {
+                prepared_mutations.push(mutation);
+                prepared_event_indices.push(package_input_events.len());
+                package_input_events.push(WatchedPackageInputEvent {
+                    uri: item.uri.clone(),
+                    deleted,
+                    committed: false,
+                    generation_expectation: matches!(
+                        mode,
+                        WatchedResyncBatchMode::DelayedUndecodableRetry
+                    )
+                    .then_some(WatchedPackageInputGenerationExpectation {
+                        generation: item.generation,
+                        kind: if deleted {
+                            WatchedPackageInputOutcomeKind::Removed
+                        } else {
+                            WatchedPackageInputOutcomeKind::Updated
+                        },
+                    }),
+                });
             }
             ResyncOutcome::SkippedInvalidEncoding if mode.schedule_undecodable_retries() => {
                 spawn_watched_undecodable_retry(
@@ -6027,6 +6238,115 @@ async fn run_watched_resync_batch(
                     generation_expectation: None,
                 });
             }
+        }
+    }
+
+    let deletion_event_indices: Vec<Option<usize>> = deleted_uris
+        .iter()
+        .map(|item| {
+            if matches!(mode, WatchedResyncBatchMode::Immediate) {
+                return None;
+            }
+            let index = package_input_events.len();
+            package_input_events.push(WatchedPackageInputEvent {
+                uri: item.uri.clone(),
+                deleted: true,
+                committed: false,
+                generation_expectation: matches!(
+                    mode,
+                    WatchedResyncBatchMode::DelayedUndecodableRetry
+                )
+                .then_some(WatchedPackageInputGenerationExpectation {
+                    generation: item.generation,
+                    kind: WatchedPackageInputOutcomeKind::Removed,
+                }),
+            });
+            Some(index)
+        })
+        .collect();
+
+    if !prepared_mutations.is_empty() || !deleted_uris.is_empty() {
+        {
+            let state = state_arc.read().await;
+            for (item, event_index) in deleted_uris.iter().zip(deletion_event_indices) {
+                if !watched_file_resync_generation_matches(&state, &item.uri, item.generation) {
+                    continue;
+                }
+                let basis = state.capture_closed_removal_analysis_basis(&item.uri);
+                prepared_mutations.push(crate::state::PreparedClosedMutation::Remove {
+                    basis: Box::new(basis),
+                    uri: item.uri.clone(),
+                });
+                if let Some(event_index) = event_index {
+                    prepared_event_indices.push(event_index);
+                }
+            }
+        }
+        let overlay = {
+            let state = state_arc.read().await;
+            snapshot_watched_closed_batch_overlay(&state, &prepared_mutations)
+        };
+        let Some(overlay) = overlay else {
+            log::trace!("Watched closed batch overlay exceeded the traversal budget");
+            return;
+        };
+        rederive_watched_closed_batch_overlay(overlay, &mut prepared_mutations);
+        let retry_batch = retry_remaining.then(|| {
+            let targets: std::collections::HashSet<_> = prepared_mutations
+                .iter()
+                .map(|mutation| match mutation {
+                    crate::state::PreparedClosedMutation::Upsert(prepared) => prepared.uri.clone(),
+                    crate::state::PreparedClosedMutation::Remove { uri, .. } => uri.clone(),
+                })
+                .collect();
+            WatchedResyncBatch {
+                updates: uris_to_update
+                    .iter()
+                    .filter(|item| targets.contains(&item.uri))
+                    .cloned()
+                    .collect(),
+                affected: affected_for_async.clone(),
+                deletions: deleted_uris
+                    .iter()
+                    .filter(|item| targets.contains(&item.uri))
+                    .cloned()
+                    .collect(),
+                reserved_tickets: reserved_tickets.clone(),
+                mode,
+                retry_remaining: false,
+            }
+        });
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut state = state_arc.write().await;
+            state.watched_batch_test_commit_attempts += 1;
+            if state.watched_batch_test_reject_once {
+                state.watched_batch_test_reject_once = false;
+                state.advance_workspace_graph_authority_generation();
+            }
+        }
+        let committed = state_arc.write().await.try_commit_analysis(
+            crate::state::PreparedAnalysisCommit::Batch(prepared_mutations),
+        );
+        match committed {
+            Ok(effects) => {
+                reserved_tickets.extend(effects.revalidations);
+                for index in prepared_event_indices {
+                    package_input_events[index].committed = true;
+                }
+            }
+            Err(_) if retry_batch.is_some() => {
+                log::trace!("Retrying watched closed batch from a fresh authority snapshot");
+                Box::pin(run_watched_resync_batch(
+                    state_arc.clone(),
+                    client.clone(),
+                    traversal_truncation.clone(),
+                    retry_batch.expect("guarded above"),
+                ))
+                .await;
+                return;
+            }
+            Err(_) => return,
         }
     }
 
@@ -6072,6 +6392,11 @@ async fn run_watched_resync_batch(
     // guarantees the debounced diagnostic pass builds its snapshot from the
     // post-update graph, and prevents post-update edge fanout from bypassing
     // `max_revalidations_per_trigger`.
+    let reserved_uris: std::collections::HashSet<Url> = reserved_tickets
+        .iter()
+        .map(|ticket| ticket.uri.clone())
+        .collect();
+    affected_for_async.retain(|uri| !reserved_uris.contains(uri));
     {
         let state = state_arc.read().await;
         cap_watched_file_revalidations(
@@ -6082,6 +6407,21 @@ async fn run_watched_resync_batch(
         state
             .diagnostics_gate
             .mark_force_republish_many(affected_for_async.iter());
+    }
+    for ticket in reserved_tickets {
+        let task = run_debounced_diagnostics(
+            state_arc.clone(),
+            client.clone(),
+            ticket.uri,
+            ticket.debounce_ms,
+            ticket.trigger,
+            Some(traversal_truncation.clone()),
+        );
+        if await_reserved_tickets {
+            task.await;
+        } else {
+            tokio::spawn(task);
+        }
     }
     Backend::publish_diagnostics_for_uris_bounded(
         state_arc,
@@ -9970,10 +10310,11 @@ impl LanguageServer for Backend {
         };
 
         // Collect URIs to update and affected open documents
-        let (uris_to_update, mut affected_open_docs, pkg_manifest_changes): (
+        let (uris_to_update, mut affected_open_docs, pkg_manifest_changes, deleted_uris): (
             Vec<WatchedResyncItem>,
             Vec<Url>,
             Vec<WatchedManifestChange>,
+            Vec<WatchedResyncItem>,
         ) = {
             let mut state = self.state.write().await;
             let mut to_update = Vec::new();
@@ -9994,6 +10335,7 @@ impl LanguageServer for Backend {
             // `scope_contribution.r_internal_symbols` until the next R/
             // edit happened to trigger a derive.
             let mut had_pkg_deletion = false;
+            let mut deleted_uris = Vec::new();
 
             for change in &params.changes {
                 let uri = &change.uri;
@@ -10014,14 +10356,18 @@ impl LanguageServer for Backend {
 
                 match change.typ {
                     FileChangeType::CREATED | FileChangeType::CHANGED => {
-                        if let Some(neighbors) =
-                            remove_project_excluded_file_from_cross_file_state(&mut state, uri)
-                        {
-                            for dep in neighbors {
-                                if affected_set.insert(dep.clone()) {
-                                    affected.push(dep);
-                                }
-                            }
+                        if state.is_project_excluded_uri(uri) {
+                            let generation = bump_watched_file_resync_generation(&mut state, uri);
+                            deleted_uris.push(WatchedResyncItem {
+                                uri: uri.clone(),
+                                generation,
+                            });
+                            extend_with_watched_pre_update_dependents(
+                                &mut affected,
+                                &mut affected_set,
+                                &state,
+                                uri,
+                            );
                             let event =
                                 crate::package_state::event::HandlerEvent::WatchedFileChanged {
                                     uri: uri.clone(),
@@ -10037,13 +10383,14 @@ impl LanguageServer for Backend {
                             {
                                 had_pkg_deletion = true;
                             }
-                            log::trace!("Removed excluded file from cross-file state: {}", uri);
+                            log::trace!(
+                                "Queued excluded file removal in watched closed batch: {}",
+                                uri
+                            );
                             continue;
                         }
                         let generation = bump_watched_file_resync_generation(&mut state, uri);
 
-                        // Invalidate disk-backed caches
-                        state.cross_file_file_cache.invalidate(uri);
                         // Schedule debounced update in new WorkspaceIndex (Requirement 5.1)
                         state.workspace_index.schedule_update(uri.clone());
 
@@ -10062,13 +10409,11 @@ impl LanguageServer for Backend {
                         log::trace!("Invalidated caches for changed file: {}", uri);
                     }
                     FileChangeType::DELETED => {
-                        bump_watched_file_resync_generation(&mut state, uri);
-                        let neighbors = remove_file_from_cross_file_state(&mut state, uri);
-                        for dep in neighbors {
-                            if affected_set.insert(dep.clone()) {
-                                affected.push(dep);
-                            }
-                        }
+                        let generation = bump_watched_file_resync_generation(&mut state, uri);
+                        deleted_uris.push(WatchedResyncItem {
+                            uri: uri.clone(),
+                            generation,
+                        });
 
                         // Update package inputs for deleted R/*.R or DESCRIPTION/NAMESPACE files.
                         // The event-driven path in the post-loop block handles the derive.
@@ -10140,17 +10485,6 @@ impl LanguageServer for Backend {
                         );
                     }
                 }
-
-                cap_watched_file_revalidations(
-                    &mut affected,
-                    &state.cross_file_activity,
-                    state.cross_file_config.max_revalidations_per_trigger,
-                );
-                // Bulk-mark force-republish on the post-truncation set under a
-                // single write-lock acquisition.
-                state
-                    .diagnostics_gate
-                    .mark_force_republish_many(affected.iter());
             } else if had_pkg_deletion && state.package_inputs.workspace_root.is_some() {
                 // Mixed batch: deletions of package source files were applied
                 // above but `to_update` is non-empty, so the DELETED-only
@@ -10181,7 +10515,6 @@ impl LanguageServer for Backend {
             // Watched-file deletions can drop edges that put a closed neighbor
             // outside the open-document neighborhood; refresh the pin set so
             // newly unreachable URIs become LRU-evictable again.
-            state.recompute_open_neighborhood_pins();
 
             // Identify DESCRIPTION/NAMESPACE changes for the event-driven path.
             // Content is read outside the lock (spawn_blocking) below.
@@ -10204,7 +10537,7 @@ impl LanguageServer for Backend {
                     .collect()
             };
 
-            (to_update, affected, pkg_manifest_changes)
+            (to_update, affected, pkg_manifest_changes, deleted_uris)
         };
 
         // --- Package manifest (DESCRIPTION/NAMESPACE/.Rprofile) event-driven update ---
@@ -10217,7 +10550,6 @@ impl LanguageServer for Backend {
             uris_to_update.is_empty(),
         )
         .await;
-
         // Schedule async disk reads to update workspace index for changed files.
         // CREATED/CHANGED graph mutations happen inside the spawned task, so
         // diagnostic publishes for `affected_open_docs` must be deferred to
@@ -10233,19 +10565,34 @@ impl LanguageServer for Backend {
                     state_arc,
                     client,
                     traversal_truncation,
-                    uris_to_update,
-                    affected_open_docs,
-                    WatchedResyncBatchMode::Immediate,
+                    WatchedResyncBatch {
+                        updates: uris_to_update,
+                        affected: affected_open_docs,
+                        deletions: deleted_uris,
+                        reserved_tickets: Vec::new(),
+                        mode: WatchedResyncBatchMode::Immediate,
+                        retry_remaining: true,
+                    },
                 )
                 .await;
             });
         } else {
-            // DELETED-only path: the sync block already mutated the graph
-            // (`remove_file` + `recompute_open_neighborhood_pins`), so
-            // publishing synchronously sees the post-update state.
-            for uri in affected_open_docs {
-                self.publish_diagnostics(&uri).await;
-            }
+            // Preserve the synchronous delete-only handler contract while
+            // routing all removals through the same atomic closed batch.
+            run_watched_resync_batch(
+                self.state.clone(),
+                self.client.clone(),
+                self.traversal_truncation.clone(),
+                WatchedResyncBatch {
+                    updates: Vec::new(),
+                    affected: affected_open_docs,
+                    deletions: deleted_uris,
+                    reserved_tickets: Vec::new(),
+                    mode: WatchedResyncBatchMode::Immediate,
+                    retry_remaining: true,
+                },
+            )
+            .await;
         }
     }
 
@@ -11400,6 +11747,19 @@ impl Backend {
     /// - If profiling shows I/O wait time dominates (e.g., network filesystems)
     /// - If files are independent (no cross-references between them)
     /// - Consider batching: read all files concurrently, then process sequentially
+    fn spawn_analysis_commit_effects(&self, effects: crate::state::AnalysisCommitEffects) {
+        for ticket in effects.revalidations {
+            tokio::spawn(run_debounced_diagnostics(
+                self.state.clone(),
+                self.client.clone(),
+                ticket.uri,
+                ticket.debounce_ms,
+                ticket.trigger,
+                Some(self.traversal_truncation.clone()),
+            ));
+        }
+    }
+
     async fn index_file_on_demand(
         &self,
         file_uri: &Url,
@@ -11501,44 +11861,54 @@ impl Backend {
             sys_file_ws_name,
             sys_file_ws_root,
             sys_file_lib_paths,
+            analysis_basis,
         ) = {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let max_chain_depth = state.cross_file_config.max_chain_depth;
             let packages_enabled = state.cross_file_config.packages_enabled;
+            let consumed_context_uris = std::cell::RefCell::new(Vec::new());
 
             crate::cross_file::enrich_metadata_with_inherited_wd(
                 &mut cross_file_meta,
                 file_uri,
                 workspace_root.as_ref(),
-                |parent_uri| state.get_enriched_metadata(parent_uri),
+                |parent_uri| {
+                    consumed_context_uris.borrow_mut().push(parent_uri.clone());
+                    state.get_enriched_metadata(parent_uri)
+                },
                 max_chain_depth,
             );
 
-            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+            let (parent_content, attempted_parents) = collect_backward_parent_content_with(
                 file_uri,
                 workspace_root.as_ref(),
-            );
-            let parent_content: std::collections::HashMap<Url, String> = cross_file_meta
-                .sourced_by
-                .iter()
-                .filter_map(|d| {
-                    let ctx = backward_path_ctx.as_ref()?;
-                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                    let parent_uri = Url::from_file_path(resolved).ok()?;
-                    let content = state
+                &cross_file_meta,
+                |parent_uri| {
+                    state
                         .documents
-                        .get(&parent_uri)
+                        .get(parent_uri)
                         .map(|doc| doc.text())
-                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                    Some((parent_uri, content))
-                })
-                .collect();
+                        .or_else(|| state.cross_file_file_cache.get(parent_uri))
+                },
+            );
 
             let workspace_index_version = state.workspace_index.version();
 
             // Capture system.file() resolution inputs for post-enrich resolve
             let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
+            consumed_context_uris.borrow_mut().extend(attempted_parents);
+            let analysis_basis = state.capture_closed_pending_analysis_basis(claim.clone());
+            let Some(analysis_basis) = state.attach_analysis_context_authorities(
+                analysis_basis,
+                consumed_context_uris.into_inner(),
+            ) else {
+                state
+                    .workspace_index
+                    .abort_enrichment(&claim)
+                    .expect("over-budget Pending preparation releases its exact lease");
+                return None;
+            };
 
             (
                 workspace_root,
@@ -11548,6 +11918,7 @@ impl Backend {
                 ws_name,
                 ws_root,
                 lib_paths,
+                analysis_basis,
             )
         };
 
@@ -11588,36 +11959,37 @@ impl Backend {
             indexed_at_version: workspace_index_version,
         };
 
-        {
+        let effects = {
             let mut state = self.state.write().await;
-            if !commit_on_demand_record(
-                &mut state,
-                file_uri,
-                Some(&claim),
-                None,
+            let graph_meta = Arc::new(
+                state
+                    .metadata_for_dependency_graph(
+                        file_uri,
+                        &cross_file_meta,
+                        workspace_root.as_ref(),
+                    )
+                    .into_owned(),
+            );
+            let prepared = crate::state::PreparedClosedAnalysis::new(
+                analysis_basis,
+                file_uri.clone(),
                 index_entry,
                 snapshot.clone(),
                 content.clone(),
-            ) {
+                graph_meta,
+                workspace_root.clone(),
+                parent_content,
+                Vec::new(),
+                Vec::new(),
+            );
+            let Ok(effects) = state.try_commit_analysis(
+                crate::state::PreparedAnalysisCommit::Upsert(Box::new(prepared)),
+            ) else {
                 return state.workspace_index.get_metadata(file_uri);
-            }
-            let graph_meta = state.metadata_for_dependency_graph(
-                file_uri,
-                &cross_file_meta,
-                workspace_root.as_ref(),
-            );
-            state.cross_file_graph.update_file(
-                file_uri,
-                graph_meta.as_ref(),
-                workspace_root.as_ref(),
-                |parent_uri| parent_content.get(parent_uri).cloned(),
-            );
-            // The graph just got new edges for `file_uri`; refresh pins so
-            // callers reached via index_backward_chain / index_forward_chain
-            // (which don't run their own pin recompute) see the updated
-            // open-doc neighborhood.
-            state.recompute_open_neighborhood_pins();
-        }
+            };
+            effects
+        };
+        self.spawn_analysis_commit_effects(effects);
 
         if !packages_to_prefetch.is_empty() {
             let ready = self.ensure_package_library_initialized().await;
@@ -11952,35 +12324,50 @@ impl Backend {
             sys_file_ws_name,
             sys_file_ws_root,
             sys_file_lib_paths,
+            analysis_basis,
         ) = {
             let state = self.state.read().await;
             let workspace_root = state.workspace_folders.first().cloned();
             let packages_enabled = state.cross_file_config.packages_enabled;
 
-            let backward_path_ctx = crate::cross_file::path_resolve::PathContext::new(
+            let (parent_content, attempted_parents) = collect_backward_parent_content_with(
                 file_uri,
                 workspace_root.as_ref(),
-            );
-            let parent_content: std::collections::HashMap<Url, String> = cross_file_meta
-                .sourced_by
-                .iter()
-                .filter_map(|d| {
-                    let ctx = backward_path_ctx.as_ref()?;
-                    let resolved = crate::cross_file::path_resolve::resolve_path(&d.path, ctx)?;
-                    let parent_uri = Url::from_file_path(resolved).ok()?;
-                    let content = state
+                &cross_file_meta,
+                |parent_uri| {
+                    state
                         .documents
-                        .get(&parent_uri)
+                        .get(parent_uri)
                         .map(|doc| doc.text())
-                        .or_else(|| state.cross_file_file_cache.get(&parent_uri))?;
-                    Some((parent_uri, content))
-                })
-                .collect();
+                        .or_else(|| state.cross_file_file_cache.get(parent_uri))
+                },
+            );
 
             let workspace_index_version = state.workspace_index.version();
 
             // Capture system.file() resolution inputs for post-enrich resolve
             let (ws_name, ws_root, lib_paths) = state.snapshot_system_file_inputs();
+            let analysis_basis = if let Some(claim) = &claim {
+                state.capture_closed_pending_analysis_basis(claim.clone())
+            } else {
+                state.capture_closed_refresh_analysis_basis(
+                    refresh
+                        .as_ref()
+                        .expect("Complete path carries a refresh token")
+                        .clone(),
+                )
+            };
+            let Some(analysis_basis) =
+                state.attach_analysis_context_authorities(analysis_basis, attempted_parents)
+            else {
+                if let Some(claim) = &claim {
+                    state
+                        .workspace_index
+                        .abort_enrichment(claim)
+                        .expect("over-budget Pending preparation releases its exact lease");
+                }
+                return None;
+            };
 
             (
                 workspace_root,
@@ -11990,6 +12377,7 @@ impl Backend {
                 ws_name,
                 ws_root,
                 lib_paths,
+                analysis_basis,
             )
         };
 
@@ -12027,35 +12415,37 @@ impl Backend {
             indexed_at_version: workspace_index_version,
         };
 
-        {
+        let effects = {
             let mut state = self.state.write().await;
-            if !commit_on_demand_record(
-                &mut state,
-                file_uri,
-                claim.as_ref(),
-                refresh.as_ref(),
+            let graph_meta = Arc::new(
+                state
+                    .metadata_for_dependency_graph(
+                        file_uri,
+                        &cross_file_meta,
+                        workspace_root.as_ref(),
+                    )
+                    .into_owned(),
+            );
+            let prepared = crate::state::PreparedClosedAnalysis::new(
+                analysis_basis,
+                file_uri.clone(),
                 index_entry,
                 snapshot.clone(),
                 content.clone(),
-            ) {
+                graph_meta,
+                workspace_root.clone(),
+                parent_content,
+                Vec::new(),
+                Vec::new(),
+            );
+            let Ok(effects) = state.try_commit_analysis(
+                crate::state::PreparedAnalysisCommit::Upsert(Box::new(prepared)),
+            ) else {
                 return state.workspace_index.get_metadata(file_uri);
-            }
-            let graph_meta = state.metadata_for_dependency_graph(
-                file_uri,
-                &cross_file_meta,
-                workspace_root.as_ref(),
-            );
-            state.cross_file_graph.update_file(
-                file_uri,
-                graph_meta.as_ref(),
-                workspace_root.as_ref(),
-                |parent_uri| parent_content.get(parent_uri).cloned(),
-            );
-            // Same rationale as `index_file_on_demand`: refresh pins after
-            // graph mutation so callers without their own recompute see the
-            // post-update open-doc neighborhood.
-            state.recompute_open_neighborhood_pins();
-        }
+            };
+            effects
+        };
+        self.spawn_analysis_commit_effects(effects);
 
         if !packages_to_prefetch.is_empty() {
             let ready = self.ensure_package_library_initialized().await;
@@ -20406,8 +20796,16 @@ mod project_config_initialize_tests {
                         bump_watched_file_resync_generation(&mut state, &uri)
                     };
                     assert!(matches!(
-                        resync_file_from_disk(&state, &uri, None, None, false, Some(generation),)
-                            .await,
+                        resync_file_from_disk(
+                            &state,
+                            &uri,
+                            None,
+                            None,
+                            false,
+                            Some(generation),
+                            ResyncCommitMode::Immediate,
+                        )
+                        .await,
                         ResyncOutcome::Updated { .. }
                     ));
                 }
@@ -26344,8 +26742,16 @@ mod project_config_initialize_tests {
         }
 
         fs::write(tmp.path().join("child.r"), "child_fn <- function() 1\n").unwrap();
-        let outcome =
-            resync_file_from_disk(&backend.state, &child_real_uri, None, None, true, None).await;
+        let outcome = resync_file_from_disk(
+            &backend.state,
+            &child_real_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
         assert!(
             matches!(outcome, ResyncOutcome::Vetoed),
             "direct resync of the canonical URI must veto while alias-open"
@@ -26544,8 +26950,16 @@ mod project_config_initialize_tests {
             Url::from_file_path(tmp.path().join("link").join("sub").join("child.R")).unwrap();
 
         for parent_root in [&link_parent_uri, &parent_uri] {
-            let outcome =
-                resync_file_from_disk(&backend.state, parent_root, None, None, true, None).await;
+            let outcome = resync_file_from_disk(
+                &backend.state,
+                parent_root,
+                None,
+                None,
+                true,
+                None,
+                ResyncCommitMode::Immediate,
+            )
+            .await;
             assert!(
                 matches!(outcome, ResyncOutcome::Updated { .. }),
                 "precondition: parent content must be available for {parent_root}"
@@ -27602,8 +28016,16 @@ mod project_config_initialize_tests {
         let backend = svc.inner();
         let extra_uri = Url::from_file_path(tmp.path().join("extra.R")).unwrap();
 
-        let outcome =
-            resync_file_from_disk(&backend.state, &helper_uri, None, None, true, None).await;
+        let outcome = resync_file_from_disk(
+            &backend.state,
+            &helper_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
         assert!(
             matches!(outcome, ResyncOutcome::Vetoed),
             "resync must veto while the document is open"
@@ -27672,8 +28094,16 @@ mod project_config_initialize_tests {
             );
         }
 
-        let outcome =
-            resync_file_from_disk(&backend.state, &helper_uri, None, None, true, None).await;
+        let outcome = resync_file_from_disk(
+            &backend.state,
+            &helper_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
         assert!(
             matches!(outcome, ResyncOutcome::Updated { .. }),
             "helper resync should commit disk state"
@@ -27728,8 +28158,16 @@ mod project_config_initialize_tests {
             );
         }
 
-        let outcome =
-            resync_file_from_disk(&backend.state, &helper_uri, None, None, true, None).await;
+        let outcome = resync_file_from_disk(
+            &backend.state,
+            &helper_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
         assert!(
             matches!(outcome, ResyncOutcome::Skipped),
             "an older disk read must not overwrite a newer committed snapshot"
@@ -27914,8 +28352,16 @@ mod project_config_initialize_tests {
         let helper_uri = Url::from_file_path(&helper_path).unwrap();
         backend.state.write().await.workspace_scan_complete = true;
 
-        let install =
-            resync_file_from_disk(&backend.state, &helper_uri, None, None, true, None).await;
+        let install = resync_file_from_disk(
+            &backend.state,
+            &helper_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
         assert!(
             matches!(install, ResyncOutcome::Updated { .. }),
             "precondition: helper disk state installed"
@@ -28019,12 +28465,17 @@ mod project_config_initialize_tests {
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
-            vec![WatchedResyncItem {
-                uri: desc_uri,
-                generation,
-            }],
-            Vec::new(),
-            WatchedResyncBatchMode::DelayedUndecodableRetry,
+            WatchedResyncBatch {
+                updates: vec![WatchedResyncItem {
+                    uri: desc_uri,
+                    generation,
+                }],
+                affected: Vec::new(),
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
+                retry_remaining: true,
+            },
         )
         .await;
 
@@ -28068,12 +28519,17 @@ mod project_config_initialize_tests {
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
-            vec![WatchedResyncItem {
-                uri: desc_uri,
-                generation,
-            }],
-            Vec::new(),
-            WatchedResyncBatchMode::DelayedUndecodableRetry,
+            WatchedResyncBatch {
+                updates: vec![WatchedResyncItem {
+                    uri: desc_uri,
+                    generation,
+                }],
+                affected: Vec::new(),
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
+                retry_remaining: true,
+            },
         )
         .await;
 
@@ -28113,12 +28569,17 @@ mod project_config_initialize_tests {
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
-            vec![WatchedResyncItem {
-                uri: desc_uri,
-                generation: stale_generation,
-            }],
-            Vec::new(),
-            WatchedResyncBatchMode::DelayedUndecodableRetry,
+            WatchedResyncBatch {
+                updates: vec![WatchedResyncItem {
+                    uri: desc_uri,
+                    generation: stale_generation,
+                }],
+                affected: Vec::new(),
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
+                retry_remaining: true,
+            },
         )
         .await;
 
@@ -28164,12 +28625,17 @@ mod project_config_initialize_tests {
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
-            vec![WatchedResyncItem {
-                uri: desc_uri,
-                generation: stale_generation,
-            }],
-            Vec::new(),
-            WatchedResyncBatchMode::DelayedUndecodableRetry,
+            WatchedResyncBatch {
+                updates: vec![WatchedResyncItem {
+                    uri: desc_uri,
+                    generation: stale_generation,
+                }],
+                affected: Vec::new(),
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
+                retry_remaining: true,
+            },
         )
         .await;
 
@@ -28481,8 +28947,16 @@ mod project_config_initialize_tests {
         let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent).await;
         let backend = svc.inner();
         let helper_uri = Url::from_file_path(&helper_path).unwrap();
-        let install =
-            resync_file_from_disk(&backend.state, &helper_uri, None, None, true, None).await;
+        let install = resync_file_from_disk(
+            &backend.state,
+            &helper_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
         assert!(
             matches!(install, ResyncOutcome::Updated { .. }),
             "precondition: helper disk state installed"
@@ -28500,12 +28974,17 @@ mod project_config_initialize_tests {
             backend.state.clone(),
             backend.client.clone(),
             backend.traversal_truncation.clone(),
-            vec![WatchedResyncItem {
-                uri: helper_uri.clone(),
-                generation: stale_generation,
-            }],
-            Vec::new(),
-            WatchedResyncBatchMode::DelayedUndecodableRetry,
+            WatchedResyncBatch {
+                updates: vec![WatchedResyncItem {
+                    uri: helper_uri.clone(),
+                    generation: stale_generation,
+                }],
+                affected: Vec::new(),
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                mode: WatchedResyncBatchMode::DelayedUndecodableRetry,
+                retry_remaining: true,
+            },
         )
         .await;
 
@@ -28682,7 +29161,13 @@ mod project_config_initialize_tests {
         // Call the missing-file branch directly (the resync entry point
         // would preflight-veto before ever reaching it) with the document
         // open, as a racing reopen would leave it.
-        let outcome = resync_missing_file(&backend.state, &helper_uri, None).await;
+        let outcome = resync_missing_file(
+            &backend.state,
+            &helper_uri,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
         assert!(
             matches!(outcome, ResyncOutcome::Vetoed),
             "the missing-file branch must veto while the document is open"
@@ -29169,8 +29654,16 @@ mod project_config_initialize_tests {
         let helpers_uri = Url::from_file_path(tmp.path().join("helpers.R")).unwrap();
         let prose_call_uri = Url::from_file_path(tmp.path().join("prose_call.R")).unwrap();
 
-        let outcome =
-            resync_file_from_disk(&backend.state, &report_uri, None, None, true, None).await;
+        let outcome = resync_file_from_disk(
+            &backend.state,
+            &report_uri,
+            None,
+            None,
+            true,
+            None,
+            ResyncCommitMode::Immediate,
+        )
+        .await;
         assert!(
             matches!(outcome, ResyncOutcome::Updated { .. }),
             ".Rmarkdown disk resync must commit without an editor language signal"
@@ -31290,6 +31783,48 @@ infixContinuationStyle = "aligned"
         )
     }
 
+    fn analyzed_test_record(
+        content: &str,
+    ) -> (
+        crate::workspace_index::IndexEntry,
+        crate::cross_file::file_cache::FileSnapshot,
+        String,
+    ) {
+        let (mut entry, snapshot, content) = complete_refresh_test_record(content);
+        entry.metadata = Arc::new(crate::cross_file::extract_metadata(&content));
+        (entry, snapshot, content)
+    }
+
+    fn observed_test_upsert(
+        state: &WorldState,
+        uri: &Url,
+        text: &str,
+        contexts: Vec<Url>,
+    ) -> crate::state::PreparedClosedMutation {
+        let basis = state
+            .attach_analysis_context_authorities(
+                state.capture_closed_removal_analysis_basis(uri),
+                contexts,
+            )
+            .expect("test context fits the traversal budget");
+        let (entry, snapshot, content) = analyzed_test_record(text);
+        let metadata = entry.metadata.clone();
+        crate::state::PreparedClosedMutation::Upsert(Box::new(
+            crate::state::PreparedClosedAnalysis::new(
+                basis,
+                uri.clone(),
+                entry,
+                snapshot,
+                content,
+                metadata,
+                state.workspace_folders.first().cloned(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ))
+    }
+
     fn complete_refresh_token(
         state: &WorldState,
         uri: &Url,
@@ -31303,6 +31838,984 @@ infixContinuationStyle = "aligned"
         }
     }
 
+    fn try_commit_test_closed_analysis(
+        state: &mut WorldState,
+        basis: crate::state::AnalysisBasis,
+        uri: &Url,
+        entry: crate::workspace_index::IndexEntry,
+        snapshot: crate::cross_file::file_cache::FileSnapshot,
+        content: String,
+    ) -> std::result::Result<
+        crate::state::AnalysisCommitEffects,
+        crate::state::AnalysisCommitRejected,
+    > {
+        let graph_metadata = entry.metadata.clone();
+        let prepared = crate::state::PreparedClosedAnalysis::new(
+            basis,
+            uri.clone(),
+            entry,
+            snapshot,
+            content,
+            graph_metadata,
+            None,
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Upsert(Box::new(
+            prepared,
+        )))
+    }
+
+    fn test_open_parent(
+        state: &mut WorldState,
+        parent: &Url,
+        child: &Url,
+    ) -> Arc<crate::cross_file::CrossFileMetadata> {
+        let child_name = std::path::Path::new(child.path())
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        state.open_document(
+            parent.clone(),
+            &format!("source(\"{child_name}\")\n"),
+            Some(1),
+        );
+        state
+            .documents
+            .get_record(parent)
+            .expect("open parent record")
+            .metadata()
+            .clone()
+    }
+
+    fn commit_test_closed_removal(
+        state: &mut WorldState,
+        basis: crate::state::AnalysisBasis,
+        uri: &Url,
+    ) -> std::result::Result<
+        crate::state::AnalysisCommitEffects,
+        crate::state::AnalysisCommitRejected,
+    > {
+        state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Remove {
+            basis: Box::new(basis),
+            uri: uri.clone(),
+        })
+    }
+
+    #[test]
+    fn on_demand_commit_preserves_existing_fanout_ownership() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///workspace/on-demand.R").unwrap();
+        let owner = Url::parse("file:///workspace/owner.R").unwrap();
+        state.diagnostics_gate.mark_force_republish(&owner);
+        let claim = match state.workspace_index.claim_enrichment(
+            uri.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        ) {
+            crate::workspace_index::ClaimEnrichment::Claimed(claim) => claim,
+            other => panic!("expected Pending claim, got {other:?}"),
+        };
+        let basis = state.capture_closed_pending_analysis_basis(claim);
+        let (entry, snapshot, content) = complete_refresh_test_record("value <- 1\n");
+
+        let effects =
+            try_commit_test_closed_analysis(&mut state, basis, &uri, entry, snapshot, content)
+                .expect("current Pending analysis commits");
+
+        assert!(effects.revalidations.is_empty());
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&owner),
+            1,
+            "on-demand enrichment must neither reserve nor consume another pipeline's marker"
+        );
+    }
+
+    #[test]
+    fn stale_non_subject_basis_releases_pending_lease_for_retry() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///workspace/pending-retry.R").unwrap();
+        let claim = match state.workspace_index.claim_enrichment(
+            uri.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        ) {
+            crate::workspace_index::ClaimEnrichment::Claimed(claim) => claim,
+            other => panic!("expected Pending claim, got {other:?}"),
+        };
+        let basis = state.capture_closed_pending_analysis_basis(claim);
+        state.advance_workspace_graph_authority_generation();
+        let (entry, snapshot, content) = complete_refresh_test_record("stale <- 1\n");
+
+        assert_eq!(
+            try_commit_test_closed_analysis(&mut state, basis, &uri, entry, snapshot, content,),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.enrichment_status(&uri).is_none());
+
+        let retry = match state.workspace_index.claim_enrichment(
+            uri.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        ) {
+            crate::workspace_index::ClaimEnrichment::Claimed(claim) => claim,
+            other => panic!("released slot must be reclaimable, got {other:?}"),
+        };
+        let retry_basis = state.capture_closed_pending_analysis_basis(retry);
+        let (entry, snapshot, content) = complete_refresh_test_record("fresh <- 2\n");
+        assert!(
+            try_commit_test_closed_analysis(
+                &mut state,
+                retry_basis,
+                &uri,
+                entry,
+                snapshot,
+                content,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn observed_upsert_rejects_absent_pending_and_complete_replacements() {
+        let uri = Url::parse("file:///workspace/observed-stale.R").unwrap();
+
+        let mut absent = WorldState::new();
+        let basis = absent.capture_closed_removal_analysis_basis(&uri);
+        let (replacement, _, _) = complete_refresh_test_record("replacement <- 1\n");
+        absent.workspace_index.insert(uri.clone(), replacement);
+        let (entry, snapshot, content) = complete_refresh_test_record("stale <- 0\n");
+        assert_eq!(
+            try_commit_test_closed_analysis(&mut absent, basis, &uri, entry, snapshot, content,),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(
+            absent
+                .workspace_index
+                .get(&uri)
+                .unwrap()
+                .contents
+                .to_string(),
+            "replacement <- 1\n"
+        );
+
+        let mut pending = WorldState::new();
+        let _claim = pending.workspace_index.claim_enrichment(
+            uri.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        );
+        let basis = pending.capture_closed_removal_analysis_basis(&uri);
+        pending.workspace_index.invalidate(&uri);
+        let _replacement = pending.workspace_index.claim_enrichment(
+            uri.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        );
+        let (entry, snapshot, content) = complete_refresh_test_record("stale <- 0\n");
+        assert_eq!(
+            try_commit_test_closed_analysis(&mut pending, basis, &uri, entry, snapshot, content,),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(
+            pending.workspace_index.enrichment_status(&uri),
+            Some(crate::workspace_index::EnrichmentStatus::Pending)
+        );
+
+        let mut complete = WorldState::new();
+        let (old, _, _) = complete_refresh_test_record("old <- 1\n");
+        complete.workspace_index.insert(uri.clone(), old);
+        let basis = complete.capture_closed_removal_analysis_basis(&uri);
+        let (replacement, _, _) = complete_refresh_test_record("replacement <- 2\n");
+        complete.workspace_index.insert(uri.clone(), replacement);
+        let (entry, snapshot, content) = complete_refresh_test_record("stale <- 0\n");
+        assert_eq!(
+            try_commit_test_closed_analysis(&mut complete, basis, &uri, entry, snapshot, content,),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(
+            complete
+                .workspace_index
+                .get(&uri)
+                .unwrap()
+                .contents
+                .to_string(),
+            "replacement <- 2\n"
+        );
+    }
+
+    #[test]
+    fn observed_upsert_rejects_every_consumed_context_authority_change() {
+        let target = Url::parse("file:///workspace/target.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+
+        let mut open = WorldState::new();
+        open.open_document(parent.clone(), "parent <- 1\n", Some(1));
+        let basis = open.capture_closed_removal_analysis_basis(&target);
+        let generation = open.documents.get_record(&parent).unwrap().generation();
+        let mut metadata = crate::cross_file::CrossFileMetadata::default();
+        metadata.working_directory = Some("/changed".to_string());
+        open.replace_open_document_metadata_if_current(&parent, generation, Arc::new(metadata))
+            .unwrap();
+        let (entry, snapshot, content) = complete_refresh_test_record("stale <- 0\n");
+        assert_eq!(
+            try_commit_test_closed_analysis(&mut open, basis, &target, entry, snapshot, content,),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+
+        let mut closed = WorldState::new();
+        let (parent_entry, _, _) = complete_refresh_test_record("parent <- 1\n");
+        closed.workspace_index.insert(parent.clone(), parent_entry);
+        let basis = closed
+            .attach_analysis_context_authorities(
+                closed.capture_closed_removal_analysis_basis(&target),
+                vec![parent.clone()],
+            )
+            .unwrap();
+        let (replacement, _, _) = complete_refresh_test_record("parent <- 2\n");
+        closed.workspace_index.insert(parent, replacement);
+        let (entry, snapshot, content) = complete_refresh_test_record("stale <- 0\n");
+        assert_eq!(
+            try_commit_test_closed_analysis(&mut closed, basis, &target, entry, snapshot, content,),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+
+        let mut graph = WorldState::new();
+        let basis = graph.capture_closed_removal_analysis_basis(&target);
+        graph.apply_prepared_workspace_index(
+            Vec::new(),
+            Vec::new(),
+            crate::cross_file::DependencyGraph::new(),
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let (entry, snapshot, content) = complete_refresh_test_record("stale <- 0\n");
+        assert_eq!(
+            try_commit_test_closed_analysis(&mut graph, basis, &target, entry, snapshot, content,),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+    }
+
+    #[test]
+    fn analysis_context_authority_overflow_fails_closed_at_traversal_budget() {
+        let mut state = WorldState::new();
+        state.cross_file_config.max_transitive_dependents_visited = 0;
+        let target = Url::parse("file:///workspace/target.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let basis = state.capture_closed_removal_analysis_basis(&target);
+        assert!(
+            state
+                .attach_analysis_context_authorities(basis, vec![parent])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_backward_parent_appearance_rejects_then_fresh_retry_commits() {
+        let mut state = WorldState::new();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
+        let text = "# raven: cd /explicit\n# raven: sourced-by parent.R\nchild <- parent\n";
+        let (entry, snapshot, content) = analyzed_test_record(text);
+        let (parent_content, attempted) = collect_backward_parent_content_with(
+            &child,
+            state.workspace_folders.first(),
+            entry.metadata.as_ref(),
+            |uri| state.content_provider().get_content(uri),
+        );
+        assert!(parent_content.is_empty());
+        assert_eq!(attempted, vec![parent.clone()]);
+        let basis = state
+            .attach_analysis_context_authorities(
+                state.capture_closed_removal_analysis_basis(&child),
+                attempted,
+            )
+            .unwrap();
+        let prepared = crate::state::PreparedClosedAnalysis::new(
+            basis,
+            child.clone(),
+            entry,
+            snapshot,
+            content,
+            Arc::new(crate::cross_file::extract_metadata(text)),
+            state.workspace_folders.first().cloned(),
+            parent_content,
+            Vec::new(),
+            Vec::new(),
+        );
+        let pin_count = state.open_pin_recompute_count;
+        state.cross_file_file_cache.insert(
+            parent.clone(),
+            crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 12,
+                content_hash: None,
+            },
+            "parent <- 1\n".to_string(),
+        );
+
+        assert_eq!(
+            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Upsert(Box::new(
+                prepared,
+            ))),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.get(&child).is_none());
+        assert_eq!(state.open_pin_recompute_count, pin_count);
+        assert_eq!(
+            state.cross_file_file_cache.get(&parent).as_deref(),
+            Some("parent <- 1\n")
+        );
+
+        let mut retry = observed_test_upsert(&state, &child, text, vec![parent.clone()]);
+        let overlay = snapshot_watched_closed_batch_overlay(&state, std::slice::from_ref(&retry))
+            .expect("retry overlay fits");
+        rederive_watched_closed_batch_overlay(overlay, std::slice::from_mut(&mut retry));
+        state
+            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(vec![retry]))
+            .expect("fresh retry observes the parent and commits");
+        assert!(state.workspace_index.get(&child).is_some());
+    }
+
+    #[test]
+    fn watched_overlay_rederives_changed_child_from_artifact_only_changed_parent() {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let (old_parent, _, _) = analyzed_test_record("# raven: cd /old\nparent <- 1\n");
+        let artifact = crate::workspace_index::ArtifactEntry {
+            snapshot: old_parent.snapshot.clone(),
+            metadata: old_parent.metadata.clone(),
+            artifacts: old_parent.artifacts.clone(),
+            indexed_at_version: old_parent.indexed_at_version,
+            provenance: crate::workspace_index::ClosedProvenance::Dynamic,
+            record_generation: 0,
+        };
+        state.apply_prepared_workspace_index(
+            vec![(parent.clone(), artifact)],
+            Vec::new(),
+            crate::cross_file::DependencyGraph::new(),
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        assert!(state.workspace_index.get(&parent).is_none());
+        assert!(state.workspace_index.get_artifacts(&parent).is_some());
+
+        let mut mutations = vec![
+            observed_test_upsert(
+                &state,
+                &child,
+                "# raven: sourced-by parent.R\nchild <- parent\n",
+                vec![parent.clone()],
+            ),
+            observed_test_upsert(
+                &state,
+                &parent,
+                "# raven: cd /new\nparent <- 2\n",
+                Vec::new(),
+            ),
+        ];
+        let overlay = snapshot_watched_closed_batch_overlay(&state, &mutations).unwrap();
+        rederive_watched_closed_batch_overlay(overlay, &mut mutations);
+        state
+            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations))
+            .expect("peer overlay commits atomically");
+
+        assert_eq!(
+            state
+                .workspace_index
+                .get_metadata(&child)
+                .unwrap()
+                .inherited_working_directory
+                .as_deref(),
+            Some("/workspace/new")
+        );
+    }
+
+    #[test]
+    fn watched_overlay_rederives_changed_child_when_parent_is_removed() {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let (old_parent, _, _) = analyzed_test_record("# raven: cd /old\nparent <- 1\n");
+        state.workspace_index.insert(parent.clone(), old_parent);
+        let mut mutations = vec![
+            observed_test_upsert(
+                &state,
+                &child,
+                "# raven: sourced-by parent.R\nchild <- parent\n",
+                vec![parent.clone()],
+            ),
+            crate::state::PreparedClosedMutation::Remove {
+                basis: Box::new(state.capture_closed_removal_analysis_basis(&parent)),
+                uri: parent.clone(),
+            },
+        ];
+        let overlay = snapshot_watched_closed_batch_overlay(&state, &mutations).unwrap();
+        rederive_watched_closed_batch_overlay(overlay, &mut mutations);
+        state
+            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations))
+            .expect("parent removal and child rederive commit together");
+
+        assert!(state.workspace_index.get_artifacts(&parent).is_none());
+        assert_ne!(
+            state
+                .workspace_index
+                .get_metadata(&child)
+                .unwrap()
+                .inherited_working_directory
+                .as_deref(),
+            Some("/workspace/old"),
+            "removed peer parent must not lend its pre-batch working directory"
+        );
+    }
+
+    #[test]
+    fn watched_overlay_preserves_raw_only_old_wd_child_invalidation() {
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::parse("file:///workspace/").unwrap()];
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let child_text = "# raven: sourced-by parent.R\nchild <- parent\n";
+        state.open_document(child.clone(), child_text, Some(1));
+        let child_meta = crate::cross_file::extract_metadata(child_text);
+        state.cross_file_graph.update_file(
+            &child,
+            &child_meta,
+            state.workspace_folders.first(),
+            |_| Some("# raven: cd /old\nparent <- 1\n".to_string()),
+        );
+        state.cross_file_meta.insert(
+            child.clone(),
+            crate::cross_file::CrossFileMetadata::default(),
+        );
+        let old_parent = crate::cross_file::extract_metadata("# raven: cd /old\nparent <- 1\n");
+        state.cross_file_file_cache.insert(
+            parent.clone(),
+            crate::cross_file::file_cache::FileSnapshot {
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                size: 35,
+                content_hash: None,
+            },
+            "# raven: cd /old\nparent <- 1\n".to_string(),
+        );
+        assert!(state.workspace_index.get_artifacts(&parent).is_none());
+
+        let basis = state.capture_closed_removal_analysis_basis(&parent);
+        let (entry, snapshot, content) = analyzed_test_record("parent <- 2\n");
+        let initial_wd_children =
+            crate::cross_file::revalidation::detect_parent_wd_change_affected_children(
+                &parent,
+                Some(&old_parent),
+                entry.metadata.as_ref(),
+                &state.cross_file_graph,
+            );
+        assert_eq!(initial_wd_children, vec![child.clone()]);
+        let metadata = entry.metadata.clone();
+        let mut mutations = vec![crate::state::PreparedClosedMutation::Upsert(Box::new(
+            crate::state::PreparedClosedAnalysis::new(
+                basis,
+                parent.clone(),
+                entry,
+                snapshot,
+                content,
+                metadata,
+                state.workspace_folders.first().cloned(),
+                HashMap::new(),
+                Vec::new(),
+                initial_wd_children,
+            ),
+        ))];
+        let overlay = snapshot_watched_closed_batch_overlay(&state, &mutations).unwrap();
+        rederive_watched_closed_batch_overlay(overlay, &mut mutations);
+        let effects = state
+            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations))
+            .expect("raw-only old WD transition commits");
+
+        assert!(state.cross_file_meta.get(&child).is_none());
+        assert_eq!(
+            effects
+                .revalidations
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&child]
+        );
+    }
+
+    #[test]
+    fn watched_overlay_authority_rejection_is_noop_then_fresh_rederive_commits() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///workspace/retry.R").unwrap();
+        let mut stale = vec![observed_test_upsert(
+            &state,
+            &uri,
+            "stale <- 1\n",
+            Vec::new(),
+        )];
+        let overlay = snapshot_watched_closed_batch_overlay(&state, &stale).unwrap();
+        rederive_watched_closed_batch_overlay(overlay, &mut stale);
+        state.advance_workspace_graph_authority_generation();
+        assert_eq!(
+            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(stale)),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.get(&uri).is_none());
+
+        let mut fresh = vec![observed_test_upsert(
+            &state,
+            &uri,
+            "fresh <- 2\n",
+            Vec::new(),
+        )];
+        let overlay = snapshot_watched_closed_batch_overlay(&state, &fresh).unwrap();
+        rederive_watched_closed_batch_overlay(overlay, &mut fresh);
+        state
+            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(fresh))
+            .expect("one fresh recapture and rederive commits");
+        assert_eq!(
+            state
+                .workspace_index
+                .get(&uri)
+                .unwrap()
+                .contents
+                .to_string(),
+            "fresh <- 2\n"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_batch_runner_rejects_once_then_commits_exactly_one_fresh_retry() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("child.R"), "old_value <- 1\n").unwrap();
+        fs::write(tmp.path().join("grand.R"), "grand_value <- 1\n").unwrap();
+        let parent_text = "source(\"child.R\")\nparent_value <- child_value\n";
+        fs::write(tmp.path().join("parent.R"), parent_text).unwrap();
+        let (svc, parent_uri) = open_in_workspace(&tmp, "parent.R", "r", parent_text).await;
+        let backend = svc.inner();
+        let child_uri = Url::from_file_path(tmp.path().join("child.R")).unwrap();
+        let new_content = "child_value <- 2\nsource(\"grand.R\")\n";
+        fs::write(tmp.path().join("child.R"), new_content).unwrap();
+        let (generation, attempts, pins, reservations) = {
+            let mut state = backend.state.write().await;
+            state.watched_batch_test_reject_once = true;
+            (
+                bump_watched_file_resync_generation(&mut state, &child_uri),
+                state.watched_batch_test_commit_attempts,
+                state.open_pin_recompute_count,
+                state.analysis_revalidation_reservation_count,
+            )
+        };
+
+        run_watched_resync_batch(
+            backend.state.clone(),
+            backend.client.clone(),
+            backend.traversal_truncation.clone(),
+            WatchedResyncBatch {
+                updates: vec![WatchedResyncItem {
+                    uri: child_uri.clone(),
+                    generation,
+                }],
+                affected: Vec::new(),
+                deletions: Vec::new(),
+                reserved_tickets: Vec::new(),
+                mode: WatchedResyncBatchMode::Immediate,
+                retry_remaining: true,
+            },
+        )
+        .await;
+
+        let state = backend.state.read().await;
+        assert_eq!(
+            state
+                .workspace_index
+                .get(&child_uri)
+                .unwrap()
+                .contents
+                .to_string(),
+            new_content
+        );
+        assert_eq!(
+            state.watched_batch_test_commit_attempts - attempts,
+            2,
+            "one rejected attempt plus one fresh retry; no third attempt"
+        );
+        assert_eq!(state.open_pin_recompute_count - pins, 1);
+        assert_eq!(
+            state.analysis_revalidation_reservation_count - reservations,
+            1,
+            "the rejected candidate reserves nothing and the retry owns one fanout ticket"
+        );
+        assert!(
+            state
+                .cross_file_graph
+                .get_dependencies(&child_uri)
+                .iter()
+                .any(|edge| edge.to.path().ends_with("/grand.R"))
+        );
+        assert!(state.documents.contains_key(&parent_uri));
+    }
+
+    #[test]
+    fn excluded_remove_in_mixed_stale_batch_has_no_partial_state() {
+        let mut state = WorldState::new();
+        let excluded = Url::parse("file:///workspace/excluded.R").unwrap();
+        let stale = Url::parse("file:///workspace/stale.R").unwrap();
+        let (excluded_entry, excluded_snapshot, excluded_content) =
+            analyzed_test_record("excluded <- 1\n");
+        state
+            .workspace_index
+            .insert(excluded.clone(), excluded_entry);
+        state
+            .cross_file_file_cache
+            .insert(excluded.clone(), excluded_snapshot, excluded_content);
+        let excluded_basis = state.capture_closed_removal_analysis_basis(&excluded);
+        let stale_basis = state.capture_closed_removal_analysis_basis(&stale);
+        let (replacement, _, _) = analyzed_test_record("replacement <- 2\n");
+        state.workspace_index.insert(stale.clone(), replacement);
+        let (entry, snapshot, content) = analyzed_test_record("stale <- 0\n");
+        let metadata = entry.metadata.clone();
+        let stale_upsert = crate::state::PreparedClosedMutation::Upsert(Box::new(
+            crate::state::PreparedClosedAnalysis::new(
+                stale_basis,
+                stale.clone(),
+                entry,
+                snapshot,
+                content,
+                metadata,
+                None,
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ));
+
+        assert_eq!(
+            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(vec![
+                crate::state::PreparedClosedMutation::Remove {
+                    basis: Box::new(excluded_basis),
+                    uri: excluded.clone(),
+                },
+                stale_upsert,
+            ])),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.get(&excluded).is_some());
+        assert!(state.cross_file_file_cache.get(&excluded).is_some());
+    }
+
+    #[test]
+    fn observed_upsert_reserves_post_commit_fanout_once() {
+        let mut state = WorldState::new();
+        let child = Url::parse("file:///workspace/child.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let parent_meta = test_open_parent(&mut state, &parent, &child);
+        let basis = state.capture_closed_removal_analysis_basis(&child);
+        let (entry, snapshot, content) = complete_refresh_test_record("child_value <- 1\n");
+        let prepared = crate::state::PreparedClosedAnalysis::new(
+            basis,
+            child.clone(),
+            entry.clone(),
+            snapshot,
+            content,
+            entry.metadata,
+            None,
+            HashMap::new(),
+            vec![crate::state::PreparedGraphProjection::new(
+                parent.clone(),
+                parent_meta,
+                HashMap::new(),
+                false,
+            )],
+            Vec::new(),
+        );
+
+        let effects = state
+            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Upsert(Box::new(
+                prepared,
+            )))
+            .expect("current observed upsert commits");
+
+        assert_eq!(
+            effects
+                .revalidations
+                .iter()
+                .map(|ticket| &ticket.uri)
+                .collect::<Vec<_>>(),
+            vec![&parent]
+        );
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent),
+            1
+        );
+    }
+
+    #[test]
+    fn closed_remove_reserves_pre_commit_fanout_once_and_cleans_all_tiers() {
+        let mut state = WorldState::new();
+        let child = Url::parse("file:///workspace/removed.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        let parent_meta = test_open_parent(&mut state, &parent, &child);
+        state
+            .cross_file_graph
+            .update_file(&parent, &parent_meta, None, |_| None);
+        let (entry, snapshot, content) = complete_refresh_test_record("removed_value <- 1\n");
+        state.workspace_index.insert(child.clone(), entry);
+        state
+            .cross_file_file_cache
+            .insert(child.clone(), snapshot, content);
+        state.cross_file_meta.insert(
+            child.clone(),
+            crate::cross_file::CrossFileMetadata::default(),
+        );
+        let basis = state.capture_closed_removal_analysis_basis(&child);
+
+        let effects =
+            commit_test_closed_removal(&mut state, basis, &child).expect("current removal commits");
+
+        assert_eq!(effects.revalidations.len(), 1);
+        assert_eq!(effects.revalidations[0].uri, parent);
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent),
+            1
+        );
+        assert!(state.workspace_index.get(&child).is_none());
+        assert!(state.cross_file_file_cache.get(&child).is_none());
+        assert!(state.cross_file_meta.get(&child).is_none());
+        assert!(state.cross_file_graph.get_dependents(&child).is_empty());
+    }
+
+    #[test]
+    fn closed_batch_dedupes_shared_fanout_and_recomputes_pins_once() {
+        let mut state = WorldState::new();
+        let a = Url::parse("file:///workspace/a.R").unwrap();
+        let b = Url::parse("file:///workspace/b.R").unwrap();
+        let parent = Url::parse("file:///workspace/parent.R").unwrap();
+        state.open_document(
+            parent.clone(),
+            "source(\"a.R\")\nsource(\"b.R\")\n",
+            Some(1),
+        );
+        let parent_meta = state
+            .documents
+            .get_record(&parent)
+            .unwrap()
+            .metadata()
+            .clone();
+        state
+            .cross_file_graph
+            .update_file(&parent, &parent_meta, None, |_| None);
+        for uri in [&a, &b] {
+            let (entry, _, _) = complete_refresh_test_record("value <- 1\n");
+            state.workspace_index.insert(uri.clone(), entry);
+        }
+        let pin_count = state.open_pin_recompute_count;
+        let mutations = [&a, &b]
+            .into_iter()
+            .map(|uri| crate::state::PreparedClosedMutation::Remove {
+                basis: Box::new(state.capture_closed_removal_analysis_basis(uri)),
+                uri: uri.clone(),
+            })
+            .collect();
+
+        let effects = state
+            .try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations))
+            .expect("all batch bases are current");
+
+        assert_eq!(effects.revalidations.len(), 1);
+        assert_eq!(effects.revalidations[0].uri, parent);
+        assert_eq!(
+            state
+                .diagnostics_gate
+                .force_republish_count_for_test(&parent),
+            1
+        );
+        assert_eq!(state.open_pin_recompute_count, pin_count + 1);
+    }
+
+    #[test]
+    fn closed_batch_rejects_duplicate_targets_without_mutation() {
+        let mut state = WorldState::new();
+        let uri = Url::parse("file:///workspace/duplicate.R").unwrap();
+        let (entry, snapshot, content) = complete_refresh_test_record("value <- 1\n");
+        state.workspace_index.insert(uri.clone(), entry);
+        state
+            .cross_file_file_cache
+            .insert(uri.clone(), snapshot, content);
+        let basis = state.capture_closed_removal_analysis_basis(&uri);
+        let pin_count = state.open_pin_recompute_count;
+        let mutations = vec![
+            crate::state::PreparedClosedMutation::Remove {
+                basis: Box::new(basis.clone()),
+                uri: uri.clone(),
+            },
+            crate::state::PreparedClosedMutation::Remove {
+                basis: Box::new(basis),
+                uri: uri.clone(),
+            },
+        ];
+
+        assert_eq!(
+            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(mutations)),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.get(&uri).is_some());
+        assert_eq!(
+            state.cross_file_file_cache.get(&uri).as_deref(),
+            Some("value <- 1\n")
+        );
+        assert_eq!(state.open_pin_recompute_count, pin_count);
+    }
+
+    #[test]
+    fn closed_batch_stale_member_rejects_every_member_before_mutation() {
+        let mut state = WorldState::new();
+        let a = Url::parse("file:///workspace/a.R").unwrap();
+        let b = Url::parse("file:///workspace/b.R").unwrap();
+        let a_basis = state.capture_closed_removal_analysis_basis(&a);
+        let b_basis = state.capture_closed_removal_analysis_basis(&b);
+        let (replacement, _, _) = complete_refresh_test_record("replacement <- 2\n");
+        state.workspace_index.insert(b.clone(), replacement);
+        let mutation = |basis, uri: &Url, text| {
+            let (entry, snapshot, content) = complete_refresh_test_record(text);
+            let metadata = entry.metadata.clone();
+            crate::state::PreparedClosedMutation::Upsert(Box::new(
+                crate::state::PreparedClosedAnalysis::new(
+                    basis,
+                    uri.clone(),
+                    entry,
+                    snapshot,
+                    content,
+                    metadata,
+                    None,
+                    HashMap::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ))
+        };
+        let pin_count = state.open_pin_recompute_count;
+
+        assert_eq!(
+            state.try_commit_analysis(crate::state::PreparedAnalysisCommit::Batch(vec![
+                mutation(a_basis, &a, "a <- 1\n"),
+                mutation(b_basis, &b, "b <- 1\n"),
+            ])),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.get(&a).is_none());
+        assert!(state.cross_file_file_cache.get(&a).is_none());
+        assert_eq!(
+            state.workspace_index.get(&b).unwrap().contents.to_string(),
+            "replacement <- 2\n"
+        );
+        assert_eq!(state.open_pin_recompute_count, pin_count);
+    }
+
+    #[test]
+    fn stale_remove_rejects_absent_pending_and_complete_record_replacements() {
+        let uri = Url::parse("file:///workspace/remove-stale.R").unwrap();
+
+        let mut absent = WorldState::new();
+        let absent_basis = absent.capture_closed_removal_analysis_basis(&uri);
+        let (entry, _, _) = complete_refresh_test_record("new <- 1\n");
+        absent.workspace_index.insert(uri.clone(), entry);
+        assert_eq!(
+            commit_test_closed_removal(&mut absent, absent_basis, &uri),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(absent.workspace_index.get(&uri).is_some());
+
+        let mut pending = WorldState::new();
+        let _first_claim = pending.workspace_index.claim_enrichment(
+            uri.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        );
+        let pending_basis = pending.capture_closed_removal_analysis_basis(&uri);
+        pending.workspace_index.invalidate(&uri);
+        let _replacement_claim = pending.workspace_index.claim_enrichment(
+            uri.clone(),
+            crate::workspace_index::ClosedProvenance::Dynamic,
+        );
+        assert_eq!(
+            commit_test_closed_removal(&mut pending, pending_basis, &uri),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(
+            pending.workspace_index.enrichment_status(&uri),
+            Some(crate::workspace_index::EnrichmentStatus::Pending)
+        );
+
+        let mut complete = WorldState::new();
+        let (old, _, _) = complete_refresh_test_record("old <- 1\n");
+        complete.workspace_index.insert(uri.clone(), old);
+        let complete_basis = complete.capture_closed_removal_analysis_basis(&uri);
+        let (replacement, _, _) = complete_refresh_test_record("replacement <- 2\n");
+        complete.workspace_index.insert(uri.clone(), replacement);
+        assert_eq!(
+            commit_test_closed_removal(&mut complete, complete_basis, &uri),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(
+            complete
+                .workspace_index
+                .get(&uri)
+                .unwrap()
+                .contents
+                .to_string(),
+            "replacement <- 2\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_remove_rejects_when_target_gains_an_open_symlink_alias() {
+        let tmp = TempDir::new().unwrap();
+        let real_path = tmp.path().join("real.R");
+        let alias_path = tmp.path().join("alias.R");
+        fs::write(&real_path, "value <- 1\n").unwrap();
+        std::os::unix::fs::symlink(&real_path, &alias_path).unwrap();
+        let real_uri = Url::from_file_path(&real_path).unwrap();
+        let alias_uri = Url::from_file_path(&alias_path).unwrap();
+        let mut state = WorldState::new();
+        state.workspace_folders = vec![Url::from_directory_path(tmp.path()).unwrap()];
+        let (entry, snapshot, content) = complete_refresh_test_record("value <- 1\n");
+        state.workspace_index.insert(real_uri.clone(), entry);
+        let basis = state.capture_closed_removal_analysis_basis(&real_uri);
+        let upsert_basis = basis.clone();
+        state.open_document(alias_uri, "open_value <- 2\n", Some(1));
+        state
+            .cross_file_file_cache
+            .insert(real_uri.clone(), snapshot, content);
+
+        assert_eq!(
+            commit_test_closed_removal(&mut state, basis, &real_uri),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        let (entry, snapshot, content) = complete_refresh_test_record("stale <- 3\n");
+        assert_eq!(
+            try_commit_test_closed_analysis(
+                &mut state,
+                upsert_basis,
+                &real_uri,
+                entry,
+                snapshot,
+                content,
+            ),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert!(state.workspace_index.get(&real_uri).is_some());
+        assert_eq!(
+            state.cross_file_file_cache.get(&real_uri).as_deref(),
+            Some("value <- 1\n")
+        );
+    }
+
     #[test]
     fn complete_on_demand_refresh_commits_exact_record_then_raw_cache() {
         let mut state = WorldState::new();
@@ -31314,17 +32827,25 @@ infixContinuationStyle = "aligned"
             crate::workspace_index::ClosedProvenance::WorkspaceScan { generation: 7 },
         );
         let token = complete_refresh_token(&state, &uri);
+        let basis = state.capture_closed_refresh_analysis_basis(token);
+        let (unrelated, _, _) = complete_refresh_test_record("unrelated <- 0\n");
+        state.workspace_index.insert(
+            Url::parse("file:///unrelated-complete-refresh.R").unwrap(),
+            unrelated,
+        );
         let (fresh_entry, snapshot, content) = complete_refresh_test_record("fresh_value <- 2\n");
 
-        assert!(commit_on_demand_record(
-            &mut state,
-            &uri,
-            None,
-            Some(&token),
-            fresh_entry,
-            snapshot,
-            content.clone(),
-        ));
+        assert!(
+            try_commit_test_closed_analysis(
+                &mut state,
+                basis,
+                &uri,
+                fresh_entry,
+                snapshot,
+                content.clone(),
+            )
+            .is_ok()
+        );
         assert_eq!(
             state
                 .workspace_index
@@ -31351,20 +32872,34 @@ infixContinuationStyle = "aligned"
         let (old_entry, _, _) = complete_refresh_test_record("old_value <- 1\n");
         state.workspace_index.insert(uri.clone(), old_entry);
         let token = complete_refresh_token(&state, &uri);
+        let basis = state.capture_closed_refresh_analysis_basis(token);
+        let sentinel = crate::cross_file::file_cache::FileSnapshot {
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 9,
+            content_hash: Some(9),
+        };
+        state
+            .cross_file_file_cache
+            .insert(uri.clone(), sentinel, "sentinel\n".to_string());
         state.workspace_index.invalidate(&uri);
         let (stale_entry, snapshot, content) = complete_refresh_test_record("stale_value <- 2\n");
 
-        assert!(!commit_on_demand_record(
-            &mut state,
-            &uri,
-            None,
-            Some(&token),
-            stale_entry,
-            snapshot,
-            content,
-        ));
+        assert_eq!(
+            try_commit_test_closed_analysis(
+                &mut state,
+                basis,
+                &uri,
+                stale_entry,
+                snapshot,
+                content,
+            ),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
         assert!(state.workspace_index.enrichment_status(&uri).is_none());
-        assert!(state.cross_file_file_cache.get(&uri).is_none());
+        assert_eq!(
+            state.cross_file_file_cache.get(&uri).as_deref(),
+            Some("sentinel\n")
+        );
     }
 
     #[test]
@@ -31374,18 +32909,21 @@ infixContinuationStyle = "aligned"
         let (old_entry, _, _) = complete_refresh_test_record("closed_value <- 1\n");
         state.workspace_index.insert(uri.clone(), old_entry);
         let token = complete_refresh_token(&state, &uri);
+        let basis = state.capture_closed_refresh_analysis_basis(token);
         state.open_document(uri.clone(), "open_value <- 3\n", Some(1));
         let (stale_entry, snapshot, content) = complete_refresh_test_record("stale_value <- 2\n");
 
-        assert!(!commit_on_demand_record(
-            &mut state,
-            &uri,
-            None,
-            Some(&token),
-            stale_entry,
-            snapshot,
-            content,
-        ));
+        assert_eq!(
+            try_commit_test_closed_analysis(
+                &mut state,
+                basis,
+                &uri,
+                stale_entry,
+                snapshot,
+                content,
+            ),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
         assert_eq!(
             state
                 .workspace_index
@@ -31409,6 +32947,7 @@ infixContinuationStyle = "aligned"
         let (old_entry, _, _) = complete_refresh_test_record("old_value <- 1\n");
         state.workspace_index.insert(uri.clone(), old_entry);
         let token = complete_refresh_token(&state, &uri);
+        let basis = state.capture_closed_refresh_analysis_basis(token);
         let (scan_entry, _, scan_content) = complete_refresh_test_record("scan_value <- 3\n");
         state.workspace_index.replace_all_complete(
             Vec::new(),
@@ -31421,15 +32960,17 @@ infixContinuationStyle = "aligned"
         );
         let (stale_entry, snapshot, content) = complete_refresh_test_record("stale_value <- 2\n");
 
-        assert!(!commit_on_demand_record(
-            &mut state,
-            &uri,
-            None,
-            Some(&token),
-            stale_entry,
-            snapshot,
-            content,
-        ));
+        assert_eq!(
+            try_commit_test_closed_analysis(
+                &mut state,
+                basis,
+                &uri,
+                stale_entry,
+                snapshot,
+                content,
+            ),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
         assert_eq!(
             state
                 .workspace_index
@@ -31457,6 +32998,15 @@ infixContinuationStyle = "aligned"
             crate::workspace_index::ClaimEnrichment::Claimed(claim) => claim,
             other => panic!("expected claim, got {other:?}"),
         };
+        let basis = state.capture_closed_pending_analysis_basis(claim);
+        let sentinel = crate::cross_file::file_cache::FileSnapshot {
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 9,
+            content_hash: Some(9),
+        };
+        state
+            .cross_file_file_cache
+            .insert(uri.clone(), sentinel, "sentinel\n".to_string());
         state.workspace_index.invalidate(&uri);
         let snapshot = crate::cross_file::file_cache::FileSnapshot {
             mtime: std::time::SystemTime::UNIX_EPOCH,
@@ -31474,16 +33024,21 @@ infixContinuationStyle = "aligned"
             indexed_at_version: 0,
         };
 
-        assert!(!commit_on_demand_record(
-            &mut state,
-            &uri,
-            Some(&claim),
-            None,
-            entry,
-            snapshot,
-            "stale_value <- 1\n".to_string(),
-        ));
-        assert!(state.cross_file_file_cache.get(&uri).is_none());
+        assert_eq!(
+            try_commit_test_closed_analysis(
+                &mut state,
+                basis,
+                &uri,
+                entry,
+                snapshot,
+                "stale_value <- 1\n".to_string(),
+            ),
+            Err(crate::state::AnalysisCommitRejected::StaleBasis)
+        );
+        assert_eq!(
+            state.cross_file_file_cache.get(&uri).as_deref(),
+            Some("sentinel\n")
+        );
         assert!(state.workspace_index.enrichment_status(&uri).is_none());
     }
 }

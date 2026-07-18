@@ -183,7 +183,9 @@ use crate::open_document_store::{
 };
 use crate::package_library::PackageLibrary;
 use crate::parameter_resolver::SignatureCache;
-use crate::workspace_index::WorkspaceIndex;
+use crate::workspace_index::{
+    ClosedRecordToken, CompleteRefreshToken, EnrichmentClaim, IndexEntry, WorkspaceIndex,
+};
 
 /// A parsed document.
 ///
@@ -900,6 +902,20 @@ pub struct WorldState {
     /// Monotonic identity for graph/open-metadata mutations that do not
     /// necessarily change document text or either workspace-index version.
     workspace_graph_authority_generation: u64,
+    /// Monotonic identity for the open URI set and immutable open metadata.
+    ///
+    /// Detached closed preparation enumerates open parents and consumes their
+    /// metadata, so open/install/close/metadata-only replacements all advance
+    /// this stamp even when the graph's edge set is unchanged.
+    open_context_authority_generation: u64,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) open_pin_recompute_count: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) watched_batch_test_reject_once: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) watched_batch_test_commit_attempts: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) analysis_revalidation_reservation_count: usize,
     /// Whether the background workspace scan has completed and the dependency
     /// graph has been populated from workspace entries. In `Auto` backward
     /// dependency mode, undefined variable diagnostics are deferred for files
@@ -988,6 +1004,175 @@ impl DiagnosticsTrigger {
     }
 }
 
+/// Exact authority snapshot consumed by one prepared analysis transaction.
+///
+/// Fields are private so production callers can only obtain a basis through a
+/// named [`WorldState`] capture method. Family-specific constructors include
+/// every input read by that preparation path.
+#[derive(Clone)]
+pub(crate) struct AnalysisBasis {
+    subject: AnalysisSubjectBasis,
+    watched_file_generation: Option<u64>,
+    graph_revision: u64,
+    graph_authority_generation: u64,
+    open_context_authority_generation: u64,
+    context_authorities: Vec<AnalysisContextAuthority>,
+    batch_overlay_contexts: Vec<Url>,
+    package_input_generation: u64,
+    package_config_generation: u64,
+    system_file_routing: SystemFileRoutingStamp,
+    analysis_config: AnalysisConfigStamp,
+}
+
+#[derive(Clone)]
+enum AnalysisSubjectBasis {
+    Pending(EnrichmentClaim),
+    Complete(CompleteRefreshToken),
+    Observed(ClosedRecordToken),
+}
+
+#[derive(Clone)]
+enum AnalysisContextAuthority {
+    Closed(ClosedRecordToken),
+    Raw {
+        uri: Url,
+        snapshot: Option<crate::cross_file::file_cache::FileSnapshot>,
+    },
+}
+
+impl AnalysisContextAuthority {
+    fn uri(&self) -> &Url {
+        match self {
+            Self::Closed(token) => token.uri(),
+            Self::Raw { uri, .. } => uri,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SystemFileRoutingStamp {
+    workspace_name: Option<String>,
+    workspace_root: Option<PathBuf>,
+    library_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AnalysisConfigStamp {
+    workspace_folders: Vec<Url>,
+    max_chain_depth: usize,
+    exclusion_patterns: Vec<String>,
+    chunk_kind: ChunkKind,
+}
+
+/// One closed analysis derived off-lock and ready for an all-or-nothing commit.
+pub(crate) struct PreparedClosedAnalysis {
+    pub(crate) basis: AnalysisBasis,
+    pub(crate) uri: Url,
+    pub(crate) entry: IndexEntry,
+    pub(crate) snapshot: crate::cross_file::file_cache::FileSnapshot,
+    pub(crate) content: String,
+    pub(crate) graph_metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    pub(crate) workspace_root: Option<Url>,
+    pub(crate) parent_content: HashMap<Url, String>,
+    pub(crate) additional_graph: Vec<PreparedGraphProjection>,
+    pub(crate) wd_children: Vec<Url>,
+}
+
+pub(crate) struct PreparedGraphProjection {
+    pub(crate) uri: Url,
+    pub(crate) metadata: Arc<crate::cross_file::CrossFileMetadata>,
+    pub(crate) parent_content: HashMap<Url, String>,
+    pub(crate) make_non_lending: bool,
+}
+
+impl PreparedGraphProjection {
+    pub(crate) fn new(
+        uri: Url,
+        metadata: Arc<crate::cross_file::CrossFileMetadata>,
+        parent_content: HashMap<Url, String>,
+        make_non_lending: bool,
+    ) -> Self {
+        Self {
+            uri,
+            metadata,
+            parent_content,
+            make_non_lending,
+        }
+    }
+}
+
+impl PreparedClosedAnalysis {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        basis: AnalysisBasis,
+        uri: Url,
+        entry: IndexEntry,
+        snapshot: crate::cross_file::file_cache::FileSnapshot,
+        content: String,
+        graph_metadata: Arc<crate::cross_file::CrossFileMetadata>,
+        workspace_root: Option<Url>,
+        parent_content: HashMap<Url, String>,
+        additional_graph: Vec<PreparedGraphProjection>,
+        wd_children: Vec<Url>,
+    ) -> Self {
+        Self {
+            basis,
+            uri,
+            entry,
+            snapshot,
+            content,
+            graph_metadata,
+            workspace_root,
+            parent_content,
+            additional_graph,
+            wd_children,
+        }
+    }
+
+    pub(crate) fn declare_batch_overlay_contexts(&mut self, targets: &HashSet<Url>) {
+        self.basis.batch_overlay_contexts = self
+            .basis
+            .context_authorities
+            .iter()
+            .map(AnalysisContextAuthority::uri)
+            .filter(|uri| targets.contains(*uri))
+            .cloned()
+            .collect();
+        self.basis
+            .batch_overlay_contexts
+            .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        self.basis.batch_overlay_contexts.dedup();
+    }
+}
+
+pub(crate) enum PreparedAnalysisCommit {
+    Upsert(Box<PreparedClosedAnalysis>),
+    Remove { basis: Box<AnalysisBasis>, uri: Url },
+    Batch(Vec<PreparedClosedMutation>),
+}
+
+pub(crate) enum PreparedClosedMutation {
+    Upsert(Box<PreparedClosedAnalysis>),
+    Remove { basis: Box<AnalysisBasis>, uri: Url },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnalysisRevalidationTicket {
+    pub(crate) uri: Url,
+    pub(crate) trigger: DiagnosticsTrigger,
+    pub(crate) debounce_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AnalysisCommitEffects {
+    pub(crate) revalidations: Vec<AnalysisRevalidationTicket>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnalysisCommitRejected {
+    StaleBasis,
+}
+
 impl WorldState {
     /// Passthrough for legacy `state.package_workspace` reads.
     pub fn package_workspace(&self) -> Option<&crate::package_namespace::PackageWorkspace> {
@@ -1067,6 +1252,11 @@ impl WorldState {
     pub(crate) fn advance_workspace_graph_authority_generation(&mut self) {
         self.workspace_graph_authority_generation =
             self.workspace_graph_authority_generation.wrapping_add(1);
+    }
+
+    fn advance_open_context_authority_generation(&mut self) {
+        self.open_context_authority_generation =
+            self.open_context_authority_generation.wrapping_add(1);
     }
 
     /// Retire detached scans captured before a closed-file or scan-input write.
@@ -1378,6 +1568,15 @@ impl WorldState {
             package_library_ready: false,
             workspace_scan_generation: 0,
             workspace_graph_authority_generation: 0,
+            open_context_authority_generation: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            open_pin_recompute_count: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            watched_batch_test_reject_once: false,
+            #[cfg(any(test, feature = "test-support"))]
+            watched_batch_test_commit_attempts: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            analysis_revalidation_reservation_count: 0,
             workspace_scan_complete: false,
             package_state: crate::package_state::PackageState::new(),
             package_inputs: crate::package_state::PackageInputs::default(),
@@ -1844,6 +2043,10 @@ impl WorldState {
     /// Call after the open set changes (`did_open` / `did_close`) or after a
     /// dependency-graph edge change touches an open file.
     pub fn recompute_open_neighborhood_pins(&mut self) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.open_pin_recompute_count += 1;
+        }
         let mut open_uris: Vec<Url> = self.documents.uris();
         let mut seen_open_roots: HashSet<Url> = open_uris.iter().cloned().collect();
         for open_uri in self.documents.uris() {
@@ -1900,6 +2103,7 @@ impl WorldState {
         }
         self.documents
             .insert(uri.clone(), Document::new_with_uri(text, version, &uri));
+        self.advance_open_context_authority_generation();
     }
 
     /// Open one editor-owned document with its already-enriched metadata.
@@ -1933,8 +2137,11 @@ impl WorldState {
         for alias in aliases {
             self.cross_file_file_cache.invalidate(&alias);
         }
-        self.documents
-            .open(uri, document, metadata, lifecycle_epoch)
+        let record = self
+            .documents
+            .open(uri, document, metadata, lifecycle_epoch);
+        self.advance_open_context_authority_generation();
+        record
     }
 
     pub fn open_document_with_language_id(
@@ -1959,7 +2166,9 @@ impl WorldState {
 
     pub fn close_document(&mut self, uri: &Url) -> Vec<Url> {
         let aliases = self.open_document_aliases.close(uri);
-        self.documents.close(uri);
+        if self.documents.close(uri).is_some() {
+            self.advance_open_context_authority_generation();
+        }
         if let Ok(mut cache) = self.effective_lint_config_cache.lock() {
             cache.remove(uri.as_str());
         }
@@ -2054,6 +2263,380 @@ impl WorldState {
         self.documents.prepare_changes(uri, changes, version)
     }
 
+    fn capture_closed_analysis_basis(
+        &self,
+        subject: AnalysisSubjectBasis,
+        uri: &Url,
+    ) -> AnalysisBasis {
+        let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
+        AnalysisBasis {
+            subject,
+            watched_file_generation: self.watched_file_resync_generations.get(uri).copied(),
+            graph_revision: self.cross_file_graph.edge_revision(),
+            graph_authority_generation: self.workspace_graph_authority_generation(),
+            open_context_authority_generation: self.open_context_authority_generation,
+            context_authorities: Vec::new(),
+            batch_overlay_contexts: Vec::new(),
+            package_input_generation: self.package_input_generation(),
+            package_config_generation: self.package_config_generation,
+            system_file_routing: SystemFileRoutingStamp {
+                workspace_name,
+                workspace_root,
+                library_paths,
+            },
+            analysis_config: AnalysisConfigStamp {
+                workspace_folders: self.workspace_folders.clone(),
+                max_chain_depth: self.cross_file_config.max_chain_depth,
+                exclusion_patterns: self.workspace_exclusions.patterns().to_vec(),
+                chunk_kind: self.chunk_kind_for_closed_file(uri),
+            },
+        }
+    }
+
+    /// Attach exact authority identities for closed metadata/content consumed
+    /// while preparing inherited-WD and backward-parent projections.
+    ///
+    /// Open records are covered by the open-context generation. Closed index
+    /// records use per-record ABA-safe tokens; raw-cache fallbacks use their
+    /// exact snapshot. An over-budget preparation fails closed.
+    pub(crate) fn attach_analysis_context_authorities(
+        &self,
+        mut basis: AnalysisBasis,
+        mut uris: Vec<Url>,
+    ) -> Option<AnalysisBasis> {
+        uris.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        uris.dedup();
+        // Use the same visited budget and absolute ceiling as cross-file
+        // neighborhood traversal. Preparation must not carry more authority
+        // identities than the traversal it supports could legally visit.
+        let context_budget = self
+            .cross_file_config
+            .max_transitive_dependents_visited
+            .min(Self::MULTI_SEED_VISITED_CEILING);
+        if uris.len() > context_budget {
+            return None;
+        }
+        basis.context_authorities = uris
+            .into_iter()
+            .filter_map(|uri| {
+                if self.open_document_uri_for_authoritative_uri(&uri).is_some() {
+                    return None;
+                }
+                let token = self.workspace_index.closed_record_token(&uri);
+                if self.workspace_index.closed_record_token_is_present(&token) {
+                    Some(AnalysisContextAuthority::Closed(token))
+                } else {
+                    Some(AnalysisContextAuthority::Raw {
+                        snapshot: self.cross_file_file_cache.get_snapshot(&uri),
+                        uri,
+                    })
+                }
+            })
+            .collect();
+        Some(basis)
+    }
+
+    pub(crate) fn capture_closed_pending_analysis_basis(
+        &self,
+        claim: EnrichmentClaim,
+    ) -> AnalysisBasis {
+        let uri = claim.uri().clone();
+        self.capture_closed_analysis_basis(AnalysisSubjectBasis::Pending(claim), &uri)
+    }
+
+    pub(crate) fn capture_closed_refresh_analysis_basis(
+        &self,
+        token: CompleteRefreshToken,
+    ) -> AnalysisBasis {
+        let uri = token.uri().clone();
+        self.capture_closed_analysis_basis(AnalysisSubjectBasis::Complete(token), &uri)
+    }
+
+    pub(crate) fn capture_closed_removal_analysis_basis(&self, uri: &Url) -> AnalysisBasis {
+        self.capture_closed_analysis_basis(
+            AnalysisSubjectBasis::Observed(self.workspace_index.closed_record_token(uri)),
+            uri,
+        )
+    }
+
+    fn analysis_basis_is_current(
+        &self,
+        basis: &AnalysisBasis,
+        uri: &Url,
+        batch_targets: &HashSet<Url>,
+    ) -> bool {
+        let subject_current = match &basis.subject {
+            AnalysisSubjectBasis::Pending(claim) => {
+                claim.uri() == uri && self.workspace_index.enrichment_claim_is_current(claim)
+            }
+            AnalysisSubjectBasis::Complete(token) => {
+                token.uri() == uri && self.workspace_index.complete_refresh_is_current(token)
+            }
+            AnalysisSubjectBasis::Observed(token) => {
+                token.uri() == uri && self.workspace_index.closed_record_token_is_current(token)
+            }
+        };
+        if !subject_current
+            || self.is_document_open_or_alias(uri)
+            || self.watched_file_resync_generations.get(uri).copied()
+                != basis.watched_file_generation
+            || self.cross_file_graph.edge_revision() != basis.graph_revision
+            || self.workspace_graph_authority_generation() != basis.graph_authority_generation
+            || self.open_context_authority_generation != basis.open_context_authority_generation
+            || self.package_input_generation() != basis.package_input_generation
+            || self.package_config_generation != basis.package_config_generation
+        {
+            return false;
+        }
+        if basis
+            .batch_overlay_contexts
+            .iter()
+            .any(|context| !batch_targets.contains(context))
+        {
+            return false;
+        }
+        if basis
+            .context_authorities
+            .iter()
+            .any(|authority| match authority {
+                _ if basis
+                    .batch_overlay_contexts
+                    .iter()
+                    .any(|context| context == authority.uri()) =>
+                {
+                    false
+                }
+                AnalysisContextAuthority::Closed(token) => {
+                    !self.workspace_index.closed_record_token_is_current(token)
+                }
+                AnalysisContextAuthority::Raw { uri, snapshot } => {
+                    self.cross_file_file_cache.get_snapshot(uri) != *snapshot
+                }
+            })
+        {
+            return false;
+        }
+        let (workspace_name, workspace_root, library_paths) = self.snapshot_system_file_inputs();
+        basis.system_file_routing
+            == (SystemFileRoutingStamp {
+                workspace_name,
+                workspace_root,
+                library_paths,
+            })
+            && basis.analysis_config
+                == (AnalysisConfigStamp {
+                    workspace_folders: self.workspace_folders.clone(),
+                    max_chain_depth: self.cross_file_config.max_chain_depth,
+                    exclusion_patterns: self.workspace_exclusions.patterns().to_vec(),
+                    chunk_kind: self.chunk_kind_for_closed_file(uri),
+                })
+    }
+
+    fn reserve_analysis_revalidations(&mut self, mut affected: Vec<Url>) -> AnalysisCommitEffects {
+        affected.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        affected.dedup();
+        affected.truncate(self.cross_file_config.max_revalidations_per_trigger);
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.analysis_revalidation_reservation_count += affected.len();
+        }
+        self.diagnostics_gate
+            .mark_force_republish_many(affected.iter());
+        AnalysisCommitEffects {
+            revalidations: affected
+                .into_iter()
+                .map(|uri| AnalysisRevalidationTicket {
+                    trigger: DiagnosticsTrigger::capture(self, &uri),
+                    debounce_ms: self.cross_file_config.revalidation_debounce_ms,
+                    uri,
+                })
+                .collect(),
+        }
+    }
+
+    /// Validate and commit one prepared analysis transaction while the caller
+    /// holds the sole `WorldState` write lock.
+    ///
+    /// Rejection leaves analysis authorities unchanged, except that an exact
+    /// still-current Pending lease is released for retry. On success the
+    /// record, graph projection, raw-content memo, authority generations,
+    /// pins, and revalidation reservation are updated before immutable tickets
+    /// are returned.
+    pub(crate) fn try_commit_analysis(
+        &mut self,
+        prepared: PreparedAnalysisCommit,
+    ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        let mutations = match prepared {
+            PreparedAnalysisCommit::Upsert(prepared) => {
+                vec![PreparedClosedMutation::Upsert(prepared)]
+            }
+            PreparedAnalysisCommit::Remove { basis, uri } => {
+                vec![PreparedClosedMutation::Remove { basis, uri }]
+            }
+            PreparedAnalysisCommit::Batch(mutations) => mutations,
+        };
+        self.try_commit_closed_batch(mutations)
+    }
+
+    fn try_commit_closed_batch(
+        &mut self,
+        mutations: Vec<PreparedClosedMutation>,
+    ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
+        let mut targets = HashSet::with_capacity(mutations.len());
+        let no_duplicates = mutations.iter().all(|mutation| {
+            let uri = match mutation {
+                PreparedClosedMutation::Upsert(prepared) => &prepared.uri,
+                PreparedClosedMutation::Remove { uri, .. } => uri,
+            };
+            targets.insert(uri.clone())
+        });
+        let all_current = no_duplicates
+            && mutations.iter().all(|mutation| {
+                let (basis, uri) = match mutation {
+                    PreparedClosedMutation::Upsert(prepared) => (&prepared.basis, &prepared.uri),
+                    PreparedClosedMutation::Remove { basis, uri } => (basis.as_ref(), uri),
+                };
+                self.analysis_basis_is_current(basis, uri, &targets)
+                    && match mutation {
+                        PreparedClosedMutation::Upsert(prepared) => self
+                            .cross_file_file_cache
+                            .get_snapshot(uri)
+                            .is_none_or(|existing| existing.mtime <= prepared.snapshot.mtime),
+                        PreparedClosedMutation::Remove { .. } => true,
+                    }
+            });
+        if !all_current {
+            // Pending is a lease over an otherwise absent slot. A rejected
+            // detached computation releases only the exact still-current
+            // leases in this rejected batch; replaced claims remain untouched.
+            for mutation in &mutations {
+                let PreparedClosedMutation::Upsert(prepared) = mutation else {
+                    continue;
+                };
+                let AnalysisSubjectBasis::Pending(claim) = &prepared.basis.subject else {
+                    continue;
+                };
+                if self.workspace_index.enrichment_claim_is_current(claim) {
+                    self.workspace_index
+                        .abort_enrichment(claim)
+                        .expect("current Pending lease aborts under the state write lock");
+                }
+            }
+            return Err(AnalysisCommitRejected::StaleBasis);
+        }
+
+        // Removal fanout must be derived from the old graph. Collect every
+        // target before applying the first mutation so a multi-file batch is
+        // all-or-none both for authority mutation and fanout ownership.
+        let mut affected: Vec<Url> = mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                PreparedClosedMutation::Remove { uri, .. } => Some(uri),
+                PreparedClosedMutation::Upsert(_) => None,
+            })
+            .flat_map(|uri| self.affected_open_dependents_after_edit(uri, true, false))
+            .collect();
+        let mut post_fanout = Vec::new();
+        let mut graph_changed = false;
+        for mutation in mutations {
+            match mutation {
+                PreparedClosedMutation::Upsert(prepared) => {
+                    let prepared = *prepared;
+                    let old_interface = self
+                        .workspace_index
+                        .get_artifacts(&prepared.uri)
+                        .map(|artifacts| artifacts.interface_hash);
+                    let new_interface = Some(prepared.entry.artifacts.interface_hash);
+                    let reserve_fanout =
+                        matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
+                    let committed = match &prepared.basis.subject {
+                        AnalysisSubjectBasis::Pending(claim) => self
+                            .workspace_index
+                            .commit_enrichment(claim, prepared.entry)
+                            .is_ok(),
+                        AnalysisSubjectBasis::Complete(token) => self
+                            .workspace_index
+                            .commit_complete_refresh(token, prepared.entry)
+                            .is_ok(),
+                        AnalysisSubjectBasis::Observed(_) => {
+                            self.workspace_index.install_complete_preserving_provenance(
+                                prepared.uri.clone(),
+                                prepared.entry,
+                            );
+                            true
+                        }
+                    };
+                    debug_assert!(committed, "prevalidated closed CAS remains current");
+
+                    let result = self.cross_file_graph.update_file(
+                        &prepared.uri,
+                        prepared.graph_metadata.as_ref(),
+                        prepared.workspace_root.as_ref(),
+                        |parent_uri| prepared.parent_content.get(parent_uri).cloned(),
+                    );
+                    let mut edges_changed = result.edges_changed;
+                    for projection in prepared.additional_graph {
+                        let result = self.cross_file_graph.update_file(
+                            &projection.uri,
+                            projection.metadata.as_ref(),
+                            prepared.workspace_root.as_ref(),
+                            |parent_uri| projection.parent_content.get(parent_uri).cloned(),
+                        );
+                        edges_changed |= result.edges_changed;
+                        if projection.make_non_lending {
+                            edges_changed |= self
+                                .cross_file_graph
+                                .make_forward_edges_non_lending(&projection.uri);
+                        }
+                    }
+                    self.cross_file_file_cache.insert(
+                        prepared.uri.clone(),
+                        prepared.snapshot,
+                        prepared.content,
+                    );
+                    self.cross_file_meta.invalidate_many(&prepared.wd_children);
+                    if reserve_fanout {
+                        affected.extend(prepared.wd_children.iter().filter_map(|child| {
+                            self.open_document_uri_for_authoritative_uri(child)
+                        }));
+                        post_fanout.push((
+                            prepared.uri,
+                            old_interface != new_interface,
+                            edges_changed,
+                        ));
+                    }
+                    graph_changed |= edges_changed;
+                }
+                PreparedClosedMutation::Remove { basis: _, uri } => {
+                    self.workspace_index.invalidate(&uri);
+                    self.cross_file_graph.remove_file(&uri);
+                    self.cross_file_file_cache.invalidate(&uri);
+                    self.cross_file_meta.remove(&uri);
+                    self.prune_editor_chunk_kind_override(&uri);
+                    self.watched_file_resync_generations.remove(&uri);
+                    graph_changed = true;
+                }
+            }
+        }
+        for (uri, interface_changed, edges_changed) in post_fanout {
+            if interface_changed || edges_changed {
+                affected.extend(self.affected_open_dependents_after_edit(
+                    &uri,
+                    interface_changed,
+                    edges_changed,
+                ));
+            }
+        }
+        if !targets.is_empty() {
+            self.advance_workspace_scan_generation();
+        }
+        if graph_changed {
+            self.advance_workspace_graph_authority_generation();
+            self.recompute_open_neighborhood_pins();
+        }
+        Ok(self.reserve_analysis_revalidations(affected))
+    }
+
     /// Install a prepared document plus its enriched metadata if still current.
     pub(crate) fn commit_document_changes(
         &mut self,
@@ -2061,8 +2644,12 @@ impl WorldState {
         prepared: PreparedOpenDocument,
         metadata: Arc<crate::cross_file::CrossFileMetadata>,
     ) -> Result<Arc<OpenDocumentRecord>, OpenDocumentCommitError> {
-        self.documents
-            .commit_prepared_if_current(uri, prepared, metadata)
+        let committed = self
+            .documents
+            .commit_prepared_if_current(uri, prepared, metadata)?;
+        self.advance_workspace_graph_authority_generation();
+        self.advance_open_context_authority_generation();
+        Ok(committed)
     }
 
     /// Guarded replacement for metadata/artifacts derived off the current text.
@@ -2072,8 +2659,12 @@ impl WorldState {
         generation: AnalysisGeneration,
         metadata: Arc<crate::cross_file::CrossFileMetadata>,
     ) -> Result<Arc<OpenDocumentRecord>, OpenDocumentCommitError> {
-        self.documents
-            .replace_metadata_if_current(uri, generation, metadata)
+        let committed = self
+            .documents
+            .replace_metadata_if_current(uri, generation, metadata)?;
+        self.advance_workspace_graph_authority_generation();
+        self.advance_open_context_authority_generation();
+        Ok(committed)
     }
 
     pub fn get_document(&self, uri: &Url) -> Option<&Document> {
@@ -2270,6 +2861,7 @@ impl WorldState {
             .replace_all_complete(artifact_only, full_records, prepared_pins);
 
         self.cross_file_graph = graph;
+        self.advance_workspace_graph_authority_generation();
         for (uri, (generation, metadata)) in open_metadata {
             self.replace_open_document_metadata_if_current(&uri, generation, metadata)
                 .expect("workspace replay basis was validated immediately before apply");
