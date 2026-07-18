@@ -72,7 +72,7 @@ impl PackageInputLifecycle {
 /// more filesystem work.
 #[derive(Debug, Default)]
 pub(crate) struct PackageSeedRetryLifecycle {
-    pending: RwLock<Option<(u64, CancellationToken)>>,
+    pending: RwLock<std::collections::BTreeMap<u64, CancellationToken>>,
     next_generation: AtomicU64,
 }
 
@@ -80,31 +80,38 @@ impl PackageSeedRetryLifecycle {
     pub(crate) fn schedule(&self) -> (u64, CancellationToken) {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut pending = self.pending.write().unwrap();
-        if let Some((_, token)) = pending.take() {
+        for (_, token) in std::mem::take(&mut *pending) {
             token.cancel();
         }
         let token = CancellationToken::new();
-        *pending = Some((generation, token.clone()));
+        pending.insert(generation, token.clone());
+        (generation, token)
+    }
+
+    pub(crate) fn schedule_additive(&self) -> (u64, CancellationToken) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let token = CancellationToken::new();
+        self.pending
+            .write()
+            .unwrap()
+            .insert(generation, token.clone());
         (generation, token)
     }
 
     pub(crate) fn complete(&self, generation: u64) {
-        let mut pending = self.pending.write().unwrap();
-        if pending.as_ref().map(|(current, _)| *current) == Some(generation) {
-            pending.take();
-        }
+        self.pending.write().unwrap().remove(&generation);
     }
 
     pub(crate) fn cancel(&self) {
         let mut pending = self.pending.write().unwrap();
-        if let Some((_, token)) = pending.take() {
+        for (_, token) in std::mem::take(&mut *pending) {
             token.cancel();
         }
     }
 
     #[cfg(test)]
     pub(crate) fn has_pending(&self) -> bool {
-        self.pending.read().unwrap().is_some()
+        !self.pending.read().unwrap().is_empty()
     }
 }
 
@@ -1464,6 +1471,23 @@ mod scan_data_tests {
         assert!(
             lifecycle.has_pending(),
             "an older completion must not retire the newer owner"
+        );
+        lifecycle.complete(second_generation);
+        assert!(!lifecycle.has_pending());
+    }
+
+    #[test]
+    fn package_seed_retry_lifecycle_keeps_additive_owners_independent() {
+        let lifecycle = PackageSeedRetryLifecycle::default();
+        let (first_generation, first) = lifecycle.schedule_additive();
+        let (second_generation, second) = lifecycle.schedule_additive();
+
+        assert!(!first.is_cancelled());
+        assert!(!second.is_cancelled());
+        lifecycle.complete(first_generation);
+        assert!(
+            lifecycle.has_pending(),
+            "one completion must not retire an unrelated deferred owner"
         );
         lifecycle.complete(second_generation);
         assert!(!lifecycle.has_pending());

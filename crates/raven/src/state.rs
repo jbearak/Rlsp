@@ -1132,6 +1132,8 @@ pub struct WorldState {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) watched_batch_test_reject_remaining: usize,
     #[cfg(any(test, feature = "test-support"))]
+    pub(crate) watched_package_test_compute_fail_remaining: usize,
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) watched_batch_test_commit_attempts: usize,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) analysis_revalidation_reservation_count: usize,
@@ -3529,6 +3531,8 @@ impl WorldState {
             #[cfg(any(test, feature = "test-support"))]
             watched_batch_test_reject_remaining: 0,
             #[cfg(any(test, feature = "test-support"))]
+            watched_package_test_compute_fail_remaining: 0,
+            #[cfg(any(test, feature = "test-support"))]
             watched_batch_test_commit_attempts: 0,
             #[cfg(any(test, feature = "test-support"))]
             analysis_revalidation_reservation_count: 0,
@@ -5093,7 +5097,7 @@ impl WorldState {
                 return self.try_commit_watched_batch(*prepared);
             }
         };
-        self.try_commit_closed_batch(mutations, None)
+        self.try_commit_closed_batch(mutations, None, true)
     }
 
     fn try_commit_watched_batch(
@@ -5119,7 +5123,7 @@ impl WorldState {
         {
             return Err(AnalysisCommitRejected::StaleBasis);
         }
-        self.try_commit_closed_batch(prepared.mutations, prepared.package)
+        self.try_commit_closed_batch(prepared.mutations, prepared.package, false)
     }
 
     /// Atomically install one complete workspace-scan projection.
@@ -5877,6 +5881,7 @@ impl WorldState {
         &mut self,
         mutations: Vec<PreparedClosedMutation>,
         package: Option<(PackageProjectionBasis, PreparedPackageProjection)>,
+        reserve_closed_fanout: bool,
     ) -> Result<AnalysisCommitEffects, AnalysisCommitRejected> {
         let mut targets = HashSet::with_capacity(mutations.len());
         let no_duplicates = mutations.iter().all(|mutation| {
@@ -5924,7 +5929,7 @@ impl WorldState {
         // Removal fanout must be derived from the old graph. Collect every
         // target before applying the first mutation so a multi-file batch is
         // all-or-none both for authority mutation and fanout ownership.
-        let mut affected: Vec<Url> = mutations
+        let removal_affected: Vec<Url> = mutations
             .iter()
             .filter_map(|mutation| match mutation {
                 PreparedClosedMutation::Remove { uri, .. } => Some(uri),
@@ -5932,7 +5937,16 @@ impl WorldState {
             })
             .flat_map(|uri| self.affected_open_dependents_after_edit(uri, true, false))
             .collect();
-        let mut affected_candidates = Vec::new();
+        let mut affected = if reserve_closed_fanout {
+            removal_affected.clone()
+        } else {
+            Vec::new()
+        };
+        let mut affected_candidates = if reserve_closed_fanout {
+            Vec::new()
+        } else {
+            removal_affected
+        };
         let mut post_fanout = Vec::new();
         let mut graph_changed = false;
         for mutation in mutations {
@@ -5944,10 +5958,10 @@ impl WorldState {
                         .get_artifacts(&prepared.uri)
                         .map(|artifacts| artifacts.interface_hash);
                     let new_interface = Some(prepared.entry.artifacts.interface_hash);
-                    let reserve_fanout =
-                        matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
-                    let report_unmarked_fanout =
-                        matches!(&prepared.basis.subject, AnalysisSubjectBasis::Pending(_));
+                    let reserve_fanout = reserve_closed_fanout
+                        && matches!(&prepared.basis.subject, AnalysisSubjectBasis::Observed(_));
+                    let report_unmarked_fanout = !reserve_closed_fanout
+                        || matches!(&prepared.basis.subject, AnalysisSubjectBasis::Pending(_));
                     let committed = match &prepared.basis.subject {
                         AnalysisSubjectBasis::Pending(claim) => self
                             .workspace_index
